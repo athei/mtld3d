@@ -21,17 +21,22 @@ test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 
 The API thread (the game's calling thread) is the bottleneck and must be unblocked fast. Every D3D9 call snapshots the relevant state (cheap u32 copies, vertex memcpy) into a closure and pushes it onto the current frame's op list — no translation, no Metal lookup, no encoding.
 
-A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) does the real work. On `Present()`, the API thread sends the accumulated frame and immediately starts collecting the next. The encoder thread runs each closure with mutable access to a `FrameEncoder` that owns persistent caches (pipeline states, depth/stencil states), translates D3D9 → Metal commands into a fixed-size array, and submits across the PE/Unix boundary.
+A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) does the real work. On `Present()`, the API thread sends the accumulated frame and immediately starts collecting the next. The encoder thread runs each closure with mutable access to a `FrameEncoder` that owns persistent caches (pipeline states, depth/stencil states) and translates D3D9 → Metal commands into a fixed-size array.
+
+A dedicated **submit thread** (one per device) executes the `SubmitFrame` thunk — the cross-boundary command replay, the `nextDrawable` wait, present, and commit — overlapping the encoder's build of the next frame. The frame crosses as an owned `FramePayload` holding every buffer the thunk aliases by raw pointer; two payloads ping-pong over a cap-1 work channel, so render-ahead is bounded at one frame. Rare synchronous submits (`Reset`, mid-frame flushes, GPU capture) first drain the submit thread to idle, then run the thunk inline on the encoder thread — the two paths never call `SubmitFrame` concurrently and present order is preserved.
 
 ```
-API thread                          Encoder thread
-──────────                          ──────────────
-D3D9 call → snapshot state          (blocked on channel)
+API thread                     Encoder thread              Submit thread
+──────────                     ──────────────              ─────────────
+D3D9 call → snapshot state     (blocked on channel)        (blocked on channel)
          → push closure
          ...
-Present() → send frame ──────────→ run closures
-         → start next frame         translate D3D9 → Metal
-                                    submit command buffer
+Present() → send frame ─────→ run closures
+          → start next frame   translate D3D9 → Metal
+                               finalize payload ─────────→ SubmitFrame unix call:
+                                                           replay commands,
+                                                           nextDrawable,
+                                                           present + commit
 ```
 
 ## Thunk vs Command

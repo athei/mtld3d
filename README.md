@@ -4,6 +4,108 @@ Direct3D 9 translation layer for Wine on macOS, backed by Metal.
 
 mtld3d replaces Wine's built-in `d3d9.dll` with an implementation that translates D3D9 calls through Wine's PE/Unix boundary into Metal command buffers on the host. The pure-Rust core (`mtld3d-core`) handles DXSO → MSL shader translation, render-pass scheduling, and fixed-function state.
 
+## Status
+
+mtld3d aims to be the most faithful Direct3D 9 implementation available for
+Wine on Apple Silicon — correctness against native D3D9 behaviour first,
+performance second. Direct3D 8 support on the same core is a planned goal.
+Every other Direct3D version is an explicit non-goal: D3D10/11/12 are already
+well served on macOS by Apple's D3DMetal and by DXMT, and there is nothing
+useful for mtld3d to add there.
+
+Whatever is not implemented is reported honestly — through capability bits or
+the documented error returns — so applications take their own fallback paths
+instead of breaking.
+
+### Implemented
+
+- **Programmable pipeline** — vertex and pixel shader models 1.x through 3.0
+  (DXSO bytecode → MSL translation), including vPos/vFace, flat shading, and
+  the D3D9 half-pixel rasterization convention.
+- **Fixed-function pipeline**, vertex and pixel — lighting (directional,
+  point, spot), texture-coordinate generation, the full texture-stage
+  cascade, material color sources, hardware vertex blending.
+- **Fog** — vertex fog and per-pixel table fog, across the fixed-function,
+  pre-transformed (RHW), and programmable paths.
+- **All four draw paths** — DrawPrimitive / DrawIndexedPrimitive and both UP
+  variants.
+- **State blocks** — recorded (Begin/End) and D3DSBT_* snapshots.
+- **Queries** — occlusion queries backed by real Metal visibility results;
+  event queries.
+- **Resources** — DXT1–5 and ATI1 compressed textures, the common
+  uncompressed integer and float formats, volume textures, mipmap
+  auto-generation, managed-pool dirty-region uploads, StretchRect (including
+  cross-format blits via a conversion pass), GetDC read-back.
+- **Depth** — sampleable depth textures (INTZ, DF16, DF24) with hardware
+  shadow-compare PCF, depth bias and slope-scale bias, depth clamp for
+  pre-transformed geometry.
+- **Sampling and output** — anisotropic filtering, sRGB read (compressed
+  formats) and sRGB write, alpha test, scissor, separate alpha blend,
+  blend factor, color write masks.
+- **Presentation** — windowed and borderless-fullscreen swap chains, adapter
+  mode enumeration, hardware color cursors.
+
+### Not implemented yet
+
+Missing features a D3D9 application can reasonably want; each fails cleanly
+(absent cap bit or documented error return) so applications fall back:
+
+- **Stencil** — the caps report no stencil support; stencil render states are
+  ignored and stencil clears are skipped.
+- **MSAA** — multisampled creates are rejected; CheckDeviceMultiSampleType
+  only accepts D3DMULTISAMPLE_NONE.
+- **Multiple render targets** — a single simultaneous render target is
+  advertised.
+- **Cube-map sampling** — the cap is off and cube textures are never
+  GPU-backed. CreateCubeTexture in the CPU pools still returns a real,
+  lockable cube texture (faces work via GetCubeMapSurface/LockRect), so
+  applications that probe cube support degrade gracefully; DEFAULT-pool
+  creates are rejected.
+- **Point sprites** and non-solid fill modes (Metal has no native wireframe).
+- **TIMESTAMP and the other niche query types** — creation reports
+  NOTAVAILABLE, as the spec allows.
+- **YUV conversion** — YUY2/UYVY surfaces can be created and locked, but no
+  YUV→RGB blit is performed.
+- Depth→depth StretchRect.
+
+### Deliberately not implemented
+
+- **D3D9Ex** — no Direct3DCreate9Ex, no shared resource handles, no
+  D3D9On12. The extended interface is a different contract (device removal,
+  OS-managed memory) built for the Vista+ compositor; the games this project
+  targets are plain D3D9.
+- **Exclusive fullscreen and display-mode switching** — presentation is a
+  composited Metal layer; fullscreen means borderless at desktop resolution.
+  The Win32 fullscreen lifecycle (mode changes, device-lost focus dance) is
+  not emulated.
+- **Software paths** — no reference or software rasterizer, no software
+  vertex processing, no ProcessVertices, no RegisterSoftwareDevice. HAL on
+  the default Metal device is the only device type; multi-adapter setups are
+  not enumerated.
+- **Hardware instancing** (SetStreamSourceFreq) — the renderer is
+  single-stream by architecture.
+- **Clip-plane application** — SetClipPlane state round-trips but planes are
+  not applied on the GPU.
+- **Legacy remnants** — N-patch/RT-patch tessellation, vertex tweening,
+  palettized textures, gamma ramp: dead features in real-world content,
+  accepted or rejected per spec but non-functional.
+
+### Testing
+
+mtld3d is developed and tested against **World of Warcraft 1.12 and 3.3.5a**
+under Wine and CrossOver. No other games have been exercised yet — it may
+well work, but expect rough edges, and reports are welcome.
+
+Beyond the game workloads, the implementation is hardened against **Wine's
+d3d9 test suite** — the de-facto D3D9 conformance suite. A dedicated runner
+(`make conformance`) executes it against the installed builtin on both PE
+architectures and gates on a per-site tracked baseline in which every
+remaining divergence is triaged and classified with a documented rationale.
+The methodology, classification scheme, and the current audit live in
+[`unix/conformance/CONFORMANCE.md`](unix/conformance/CONFORMANCE.md). The
+unit and end-to-end suites (`make test`) run the pure-Rust core natively on
+the host and the full stack under Wine.
+
 ## Prerequisites
 
 mtld3d builds and runs on **Apple Silicon macOS**. The shipped `mtld3d.so` is
@@ -64,7 +166,33 @@ test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 - `mtld3d.so` — native macOS side, a pure Metal abstraction layer.
 - `mtld3d-core` — host-testable pure-Rust rlib linked into `d3d9.dll`.
 
-For threading, the PE/Unix boundary contract, perf instrumentation, and the shader/heap debugging toolkits, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+At runtime the frame flows through a three-thread pipeline:
+
+```
+API thread (the game's)     Encoder thread            Submit thread
+───────────────────────     ──────────────            ─────────────
+record frame N+1        →   encode frame N        →   submit + present frame N−1
+```
+
+- The **API thread** is the game's own render thread. The D3D9-era games this
+  project targets drive the API from a single thread, so that thread is the
+  frame-time bottleneck — it must never wait on translation, Metal, or the
+  GPU. Every D3D9 call therefore only snapshots the state it needs into a
+  closure and appends it to the current frame's op list; `Present` hands the
+  finished frame to the encoder and immediately starts recording the next.
+  No translation or encoding work runs on the API thread.
+- The **encoder thread** (one per device) runs the closures: D3D9 → Metal
+  translation, render-pass scheduling and load/store optimization, pipeline
+  and sampler caches, lazy resource creation and texture uploads.
+- The **submit thread** takes the encoder's finished frame payload, crosses
+  the PE/Unix boundary to replay the command stream into Metal encoders,
+  waits for the drawable, and presents and commits — overlapping the
+  encoder's build of the following frame.
+
+Each hand-off has capacity one, so the pipeline never runs more than one
+frame ahead per stage — backpressure, not queueing, bounds latency.
+
+For the PE/Unix boundary contract, the threading details, perf instrumentation, and the shader/heap debugging toolkits, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Workspaces
 

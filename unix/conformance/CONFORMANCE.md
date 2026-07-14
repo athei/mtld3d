@@ -102,8 +102,8 @@ Wine test function, and each cluster audited against the Wine test source, the
 *actual-vs-expected* runtime values, and our implementation — then the
 classification was adversarially re-verified.
 
-Headline (per-(arch,subtest) site-lines, both PE arches): **87 `real` · 28
-`caps` · 315 `expected` · 2 `flaky` · 0 `untriaged`**; all 8 subtest-arches
+Headline (per-(arch,subtest) site-lines, both PE arches): **0 `real` · 34
+`caps` · 336 `expected` · 4 `flaky` · 0 `untriaged`**; all 8 subtest-arches
 `crash=0`, gate green. The audit retagged 24 clusters: the prior tags had filed
 a number of *fixable* defects as `caps`/`expected`. Tags do not affect the gate
 (which rejects count/site/crash regressions), so the retag is documentation-only.
