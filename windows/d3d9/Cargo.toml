@@ -1,0 +1,23 @@
+[package]
+name = "d3d9"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bitflags = { workspace = true }
+mtld3d-core = { workspace = true }
+mtld3d-shared = { workspace = true }
+mtld3d-types = { workspace = true }
+log = { workspace = true }
+rustc-hash = { workspace = true }
+snmalloc-rs = { workspace = true }
+xbr = { workspace = true }
+
+[lints]
+workspace = true

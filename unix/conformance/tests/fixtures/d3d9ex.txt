@@ -1,0 +1,3 @@
+d3d9ex.c: starting d3d9ex tests
+d3d9ex.c:55: Test failed: Direct3DCreate9Ex not available, skipping tests.
+d3d9ex.c: 1 tests executed (0 marked as todo, 1 failures), 0 skipped.

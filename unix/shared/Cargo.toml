@@ -1,0 +1,19 @@
+[package]
+name = "mtld3d-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitflags = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

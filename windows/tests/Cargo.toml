@@ -1,0 +1,13 @@
+[package]
+name = "mtld3d-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[dependencies]
+mtld3d-types = { workspace = true }
+
+[lints]
+workspace = true

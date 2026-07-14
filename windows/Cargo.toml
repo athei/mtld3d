@@ -1,0 +1,107 @@
+[workspace]
+members = ["shim", "d3d9", "core", "tests", "types"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Zlib"
+description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
+authors = ["Alexander Theissen <alex.theissen@me.com>"]
+keywords = ["direct3d", "d3d9", "metal", "wine", "macos"]
+categories = ["graphics", "emulators", "api-bindings"]
+repository = "https://github.com/atheissen/mtld3d"
+homepage = "https://github.com/atheissen/mtld3d"
+
+[workspace.dependencies]
+mtld3d-core = { path = "core" }
+mtld3d-shared = { path = "../unix/shared" }
+mtld3d-types = { path = "types" }
+bitflags = "2"
+log = "0.4"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary"] }
+rustc-hash = "2"
+snmalloc-rs = { version = "0.7", features = ["build_cc"] }
+strum = { version = "0.28", default-features = false }
+xbr = { version = "0.2", default-features = false }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+# Limited debug info for post-mortem symbolication of crash backtraces
+# (the `abort_backtrace` handler in d3d9, and any game-side crash dumper).
+# Function names + line tables + inline frame chain — last bit is
+# load-bearing because the codebase uses `#[inline(always)]` heavily,
+# so `line-tables-only` would collapse most call sites into their
+# parents. Skips variable type info (only useful in a live debugger).
+# On MSVC the bytes land in the side-by-side `.pdb`, not the shipped DLL.
+debug = 1
+
+# `release` is our dev/debug profile — the everyday `make` build and the e2e
+# both run against release-built DLLs, so a `cfg(debug_assertions)` guard (and
+# `overflow-checks`) would otherwise be compiled out of exactly the build under
+# test. Both are on so bugs trip during dev + testing: `debug-assertions`
+# carries every `debug_assert!` including the `LastBoundCache` cache-in-sync
+# guard; `overflow-checks` turns silent integer wraps into panics. `production`
+# (PROD=1, the only shipped artifact) overrides both back off below.
+debug-assertions = true
+overflow-checks = true
+
+# snmalloc-sys 0.7's build.rs reads cargo's `DEBUG` env var (set when the
+# package's debuginfo is enabled) and switches its cmake build to `Debug`
+# mode + `cargo:rustc-link-lib=msvcrtd`. xwin only ships `msvcrt.lib`, and
+# mixing CRTs in one DLL is unsound — force `DEBUG=false` for snmalloc-sys
+# alone so its build script picks the release CRT. Applied to both
+# profiles since dev defaults to `debug = 2`.
+[profile.release.package.snmalloc-sys]
+debug = 0
+
+[profile.dev.package.snmalloc-sys]
+debug = 0
+
+# zstd-sys's build.rs goes through the `cc` crate, which reads cargo's
+# `DEBUG` env var the same way snmalloc-sys does and would link `msvcrtd`
+# on i686/x64 windows-msvc when our workspace `debug = 1` is set. Same
+# mitigation: force `DEBUG=false` so its `cc::Build` picks the release
+# CRT (`/MD`, not `/MDd`).
+[profile.release.package.zstd-sys]
+debug = 0
+
+[profile.dev.package.zstd-sys]
+debug = 0
+
+# Shipped builds — fat cross-crate LTO + a single codegen unit so the
+# linker can inline and DCE across the whole DLL. Inherits everything
+# else from `release`, including the per-package `debug = 0` overrides
+# on `snmalloc-sys` / `zstd-sys` (cargo merges per-package overrides
+# through the `inherits` chain), but overrides `debug-assertions` +
+# `overflow-checks` back off (release carries them for dev/test; the shipped
+# artifact must not pay the cost or panic in users' hands). Activated by
+# `PROD=1 make`.
+[profile.production]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug-assertions = false
+overflow-checks = false
+
+[workspace.lints.clippy]
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Length is a poor proxy for complexity; allow long procedural functions
+# (frame encoder, MSL codegen templates, per-opcode dispatchers) where the
+# structural alternative is fragmented helpers threading the same state.
+too_many_lines = "allow"
+# Stricter unsafe discipline (see docs/CONVENTIONS.md §"Unsafe is a last resort").
+missing_safety_doc = "deny"
+not_unsafe_ptr_arg_deref = "deny"
+transmute_ptr_to_ref = "deny"
+multiple_unsafe_ops_per_block = "deny"
+undocumented_unsafe_blocks = "deny"

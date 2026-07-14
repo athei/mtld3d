@@ -1,0 +1,32 @@
+[package]
+name = "mtld3d-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[dependencies]
+mtld3d-shared = { workspace = true }
+mtld3d-types = { workspace = true }
+bitflags = { workspace = true }
+log = { workspace = true }
+rustc-hash = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+xxhash-rust = { workspace = true }
+zstd = { workspace = true }
+
+# Used by the `dxso::emit_tests` MSL-compile checks (`metal_compile_or_fail`)
+# to compile every emitted shader through
+# `MTLDevice::newLibraryWithSource_options_error`. Same crates the
+# production unix .so uses (`unix/unix/Cargo.toml`) so test and runtime
+# stay aligned. mtld3d-core tests only ever build on macOS (`make clippy`
+# only passes `--all-targets` for the unix target), so no target-gate is
+# needed.
+[dev-dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+
+[lints]
+workspace = true

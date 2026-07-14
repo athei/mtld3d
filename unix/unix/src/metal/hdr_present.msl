@@ -1,0 +1,180 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct VsOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VsOut mtld3d_hdr_present_vs(uint vid [[vertex_id]]) {
+    // Fullscreen triangle: vid=0 (-1,-1), vid=1 (3,-1), vid=2 (-1,3).
+    // Mask bit 0 (×4-1): -1 or 3 along x. Mask bit 1 (×2-1): -1 or 3 along y.
+    float2 pos = float2(float(vid & 1u) * 4.0 - 1.0,
+                        float(vid & 2u) * 2.0 - 1.0);
+    VsOut out;
+    out.position = float4(pos, 0.0, 1.0);
+    // Metal NDC y+ is up; texture v+ is down. Flip y so display-top
+    // samples texture-top (game writes top-of-frame at texture row 0).
+    out.uv = float2((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5);
+    return out;
+}
+
+struct HdrUniforms {
+    float l_hdr_nits;
+    float p_hdr;            // 1 + 32 * pow(l_hdr_nits/10000, 1/2.4)
+    float log2_p_hdr;       // log2(p_hdr)
+    float inv_p_minus_one;  // 1 / (p_hdr - 1)
+};
+
+constant float L_SDR = 100.0;
+// P_SDR = 1 + 32 * pow(L_SDR / 10000, 1/2.4) at L_SDR = 100. Folded.
+constant float P_SDR = 5.4395284707f;
+constant float LOG_P_SDR = 1.6937747f; // log(P_SDR)
+
+fragment float4 mtld3d_hdr_present_ps_passthrough(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    // sRGB → linear EOTF (IEC 61966-2-1, piecewise).
+    float3 lin = select(
+        pow((sample.rgb + 0.055) / 1.055, float3(2.4)),
+        sample.rgb / 12.92,
+        sample.rgb <= float3(0.04045)
+    );
+    return float4(lin, sample.a);
+}
+
+// BT.709 linear-light → LMS (combined BT.709 → BT.2020 → LMS).
+// Values from Lilium's `colour_space.fxh`. Stored as column-major
+// `float3x3` per Metal's MSL convention — `float3x3(col0, col1, col2)`.
+constant float3x3 M_BT709_TO_LMS = float3x3(
+    float3(0.2958197875977f, 0.1562652587891f, 0.0351760864258f), // col 0
+    float3(0.6230921020508f, 0.7272338867188f, 0.1564789062500f), // col 1
+    float3(0.0810847778320f, 0.1164960937500f, 0.8083459472656f)  // col 2
+);
+
+// LMS → BT.709 linear-light (combined inverse).
+constant float3x3 M_LMS_TO_BT709 = float3x3(
+    float3( 6.1729507446289f, -1.3236293334961f, -0.0118084289551f),
+    float3(-5.3198394775391f,  2.5602416992188f, -0.2641143798828f),
+    float3( 0.1465606689453f, -0.2363464355469f,  1.2761764526367f)
+);
+
+// LMS-PQ → ICtCp (BT.2100-2 §3.4 / Lilium `colour_space/ictcp.fxh`
+// matched pair). Each row of the spec table becomes a column here.
+// Ct/Cp rows are the standard /4096 form; the inverse below is the
+// matching /4096 inverse so the round-trip is identity. A /8192-form
+// forward (half these Ct/Cp values) paired with this /4096 inverse
+// silently drops chromatic deltas by ~50% — invisible on grey
+// (Ct=Cp=0), catastrophic on saturated content.
+constant float3x3 M_LMS_PQ_TO_ICTCP = float3x3(
+    float3(0.5f,  1.61370003f,  4.37806224f), // col 0  (L' coeffs)
+    float3(0.5f, -3.32339620f, -4.24553966f), // col 1  (M' coeffs)
+    float3(0.0f,  1.70969617f, -0.13252264f)  // col 2  (S' coeffs)
+);
+
+// ICtCp → LMS-PQ (BT.2100-2 §3.4 inverse). Matched pair with
+// M_LMS_PQ_TO_ICTCP above.
+constant float3x3 M_ICTCP_TO_LMS_PQ = float3x3(
+    float3(1.0f, 1.0f, 1.0f),                       // col 0  (I coeffs)
+    float3(0.00860903f, -0.00860903f,  0.56003270f),// col 1  (Ct coeffs)
+    float3(0.11102963f, -0.11102963f, -0.32062717f) // col 2  (Cp coeffs)
+);
+
+// PQ OETF: linear nits (0..10000) → PQ-encoded [0..1]. ST.2084 inverse
+// EOTF expressed in the BT.2100 form.
+inline float3 pq_oetf(float3 nits) {
+    constexpr float M1 = 2610.0f / 16384.0f;
+    constexpr float M2 = 2523.0f / 4096.0f * 128.0f;
+    constexpr float C1 = 3424.0f / 4096.0f;
+    constexpr float C2 = 2413.0f / 4096.0f * 32.0f;
+    constexpr float C3 = 2392.0f / 4096.0f * 32.0f;
+    float3 y = pow(max(nits, float3(0.0f)) / 10000.0f, float3(M1));
+    return pow((float3(C1) + C2 * y) / (float3(1.0f) + C3 * y), float3(M2));
+}
+
+// PQ EOTF: PQ-encoded [0..1] → linear nits (0..10000). ST.2084 forward.
+inline float3 pq_eotf(float3 pq) {
+    constexpr float M1 = 2610.0f / 16384.0f;
+    constexpr float M2 = 2523.0f / 4096.0f * 128.0f;
+    constexpr float C1 = 3424.0f / 4096.0f;
+    constexpr float C2 = 2413.0f / 4096.0f * 32.0f;
+    constexpr float C3 = 2392.0f / 4096.0f * 32.0f;
+    float3 e = pow(max(pq, float3(0.0f)), float3(1.0f / M2));
+    float3 num = max(e - float3(C1), float3(0.0f));
+    float3 den = max(float3(C2) - C3 * e, float3(1e-20f));
+    return 10000.0f * pow(num / den, float3(1.0f / M1));
+}
+
+fragment float4 mtld3d_hdr_present_ps_bt2446(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    // sRGB → linear EOTF (IEC 61966-2-1, piecewise).
+    float3 lin = select(
+        pow((sample.rgb + 0.055) / 1.055, float3(2.4)),
+        sample.rgb / 12.92,
+        sample.rgb <= float3(0.04045)
+    );
+
+    // ── BT.2446 Method A in ICtCp ──
+    // Run the inverse tone-map curve on BT.709 luminance (`yp_sdr →
+    // yp_c → yp_p → yp_hdr → y_hdr_linear`). Then transplant the new
+    // luminance into the pixel's ICtCp representation while leaving
+    // Ct/Cp untouched — that's the chroma-preserving step that saves
+    // saturated highlights from desaturating toward white.
+    float y_sdr = max(dot(lin, float3(0.2126f, 0.7152f, 0.0722f)), 1e-20f);
+    float yp_sdr = pow(y_sdr, 1.0f / 2.4f);
+    float yp_c = log((yp_sdr * (P_SDR - 1.0f)) + 1.0f) / LOG_P_SDR;
+    // Three-segment piecewise inversion of the SDR mapping; the
+    // branching order covers float-precision edge cases where the
+    // segment thresholds straddle.
+    float yp_0 = yp_c / 1.0770f;
+    float yp_1 = (-2.7811f + sqrt(4.83307641f - 4.604f * yp_c)) / -2.302f;
+    float yp_2 = (yp_c - 0.5f) / 0.5f;
+    float yp_p = yp_0 <= 0.7399f ? yp_0
+               : (yp_2 >= 0.9909f ? yp_2 : yp_1);
+    // CPU-hoisted constants: pow(p_hdr, yp_p) → exp2(yp_p * log2_p_hdr);
+    // 1/(p_hdr-1) replaces the divide.
+    float yp_hdr = (exp2(yp_p * u.log2_p_hdr) - 1.0f) * u.inv_p_minus_one;
+    float y_hdr_linear_nits = pow(yp_hdr, 2.4f) * u.l_hdr_nits;
+
+    // Forward into ICtCp to extract the pixel's chroma signature.
+    // Multiply by L_SDR to enter the absolute-nits domain that PQ
+    // expects.
+    float3 lms_nits = M_BT709_TO_LMS * (lin * L_SDR);
+    float3 lms_pq = pq_oetf(lms_nits);
+    float3 ictcp_in = M_LMS_PQ_TO_ICTCP * lms_pq;
+
+    // Derive the new I corresponding to `y_hdr_linear_nits`. For a
+    // neutral grey, I = pq_oetf(Y).x; for chromatic pixels the actual
+    // I mixes the PQ-encoded LMS values and differs from this
+    // grey-equivalent, but as the luminance transplant target it's the
+    // right thing to put on the I axis.
+    float i_hdr = pq_oetf(float3(y_hdr_linear_nits)).x;
+
+    // Scale Ct, Cp by the **same ratio** as I — keeps chroma proportional
+    // to intensity so saturated content (spells, fire, neon, sunset) stays
+    // saturated under the HDR boost instead of bleaching toward white.
+    // Without this, ICtCp's absolute Ct/Cp + a larger I produce
+    // Hunt-effect-style perceived desaturation (the chroma-to-luminance
+    // ratio drops as I rises). Matches the chroma-preserving upmap pattern
+    // used in Lilium's ICtCp port.
+    float i_ratio = i_hdr / max(ictcp_in.x, 1e-6f);
+    float3 ictcp_out = float3(i_hdr, ictcp_in.y * i_ratio, ictcp_in.z * i_ratio);
+    float3 lms_pq_out = M_ICTCP_TO_LMS_PQ * ictcp_out;
+    float3 lms_nits_out = pq_eotf(lms_pq_out);
+    float3 rgb_nits_out = M_LMS_TO_BT709 * lms_nits_out;
+
+    // Back to normalised linear BT.709 (1.0 = paper-white = 100 nits).
+    // The layer's `ExtendedLinear*` tag will gamut-convert + OETF-encode
+    // for the actual display.
+    return float4(max(rgb_nits_out, float3(0.0f)) / L_SDR, sample.a);
+}

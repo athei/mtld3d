@@ -1,0 +1,21 @@
+# No `[build] target` here: a bare `cargo build`/`test` in this workspace
+# defaults to the native host arch (fast, no Rosetta), which is what unit
+# tests and clippy want. Shipped artifacts are built for x86_64-apple-darwin
+# by passing `--target` explicitly (see the Makefile `unix:` recipe) — Wine's
+# unix-call boundary requires the `.so` to be x86_64 Mach-O.
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=x86-64-v2",
+    "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
+]
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"
+# `-march=x86-64-v2` mirrors the rustflags `target-cpu=x86-64-v2` baseline so
+# build-script C/C++ code (snmalloc-sys, zstd-sys) gets the same ISA. This `.so`
+# runs under x86-on-ARM translation, whose vector unit is 128-bit: 256-bit
+# AVX/AVX2 ops are split across two halves and underperform plain SSE, so the
+# baseline caps at SSE4.2 (128-bit, 1:1 with the host vector unit) plus the
+# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT).
+CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"
+CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"

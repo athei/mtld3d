@@ -1,0 +1,5 @@
+visual.c: starting visual tests
+visual.c:3201: Test failed: Got color 0x00ff0000, expected 0x0000ff00.
+visual.c:3202: Test failed: Got color 0x00ff0000, expected 0x0000ff00.
+visual.c:9100: Test failed: CreateRenderTarget failed, hr 0x8876086c.
+Unhandled exception: page fault on read access to 0x00000000 in 32-bit code.

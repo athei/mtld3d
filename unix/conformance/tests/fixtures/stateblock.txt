@@ -1,0 +1,5 @@
+stateblock.c: starting stateblock tests
+stateblock.c: 412 tests executed (0 marked as todo, 0 failures), 0 skipped.
+-[MTLTextureDescriptorInternal validateWithDevice:]: Texture Descriptor Validation
+MTLTextureDescriptor has width (0) of zero.
+libc++abi: terminating with uncaught exception of type NSException

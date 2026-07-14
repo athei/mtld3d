@@ -1,0 +1,7 @@
+device.c: starting device tests
+device.c:125: Test failed: GetDeclaration returned element 0 usage 0, expected 5.
+device.c:792: Test failed: Got unexpected hr 0x80004005.
+device.c:816: Test failed: Got unexpected element count 0, expected 3.
+device.c:125: Test failed: GetDeclaration returned element 1 usage 0, expected 5.
+device.c:125: Test failed: GetDeclaration returned element 2 usage 0, expected 5.
+wine: Unhandled exception 0xc0000005 (access violation) in 32-bit code (0x004012ab).

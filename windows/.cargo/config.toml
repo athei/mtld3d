@@ -1,0 +1,51 @@
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.i686-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+    "-C", "target-cpu=nehalem",
+    "-C", "target-feature=-crt-static",
+    "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
+    "-Lnative=/opt/xwin/crt/lib/x86",
+    "-Lnative=/opt/xwin/sdk/lib/um/x86",
+    "-Lnative=/opt/xwin/sdk/lib/ucrt/x86",
+]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+    "-C", "target-cpu=x86-64-v2",
+    "-C", "target-feature=-crt-static",
+    "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
+    "-Lnative=/opt/xwin/crt/lib/x86_64",
+    "-Lnative=/opt/xwin/sdk/lib/um/x86_64",
+    "-Lnative=/opt/xwin/sdk/lib/ucrt/x86_64",
+]
+
+[env]
+# xwin include paths repeated for C and C++ — cc-rs reads CFLAGS_<target>
+# and CXXFLAGS_<target> separately with no cross-fallback, and TOML has
+# no variable substitution. snmalloc-sys needs the C++ path for <atomic>;
+# libmimalloc-sys only needs the C one.
+#
+# `-march` mirrors the rustflags `target-cpu` baseline so build-script C/C++
+# code (snmalloc-sys is the big one — ~300 KB of object in release on x86_64)
+# gets the same ISA: `x86-64-v2` on 64-bit, `nehalem` on 32-bit (which has no
+# x86-64-vN level). These DLLs run under x86-on-ARM translation, whose vector
+# unit is 128-bit: 256-bit AVX/AVX2 ops are split across two halves and
+# underperform plain SSE, so the baseline caps at SSE4.2 (128-bit, 1:1 with the
+# host vector unit) plus the AVX-independent GPR bit-manipulation features
+# (BMI1/BMI2/LZCNT via `-mbmi -mbmi2 -mlzcnt`). cc-rs invokes clang for these
+# targets (the `-idirafter` flags here are clang-style), so these flags
+# propagate without needing an MSVC `/arch:` spelling.
+CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+# `llvm-lib` from the Homebrew llvm keg (keg-only, not on PATH). These paths
+# assume an Apple-Silicon Homebrew prefix; for a different prefix (Intel
+# `/usr/local`, MacPorts, a versioned `llvm@N` keg) override per target via the
+# `AR_<target>` environment variable.
+AR_i686-pc-windows-msvc         = "/opt/homebrew/opt/llvm/bin/llvm-lib"
+AR_x86_64-pc-windows-msvc       = "/opt/homebrew/opt/llvm/bin/llvm-lib"

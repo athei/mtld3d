@@ -1,0 +1,16 @@
+# nextest configuration for the mtld3d workspaces.
+#
+# The end-to-end tests (package `mtld3d-tests`) each spawn a Wine process that
+# creates a Metal device + window, so they are GPU/window-server-bound rather
+# than CPU-bound. The `gpu` test-group caps how many run at once, and a
+# slow-timeout kills any test that hangs (e.g. a wedged encoder thread) instead
+# of stalling the whole run. The host-native unit tests (`mtld3d-core`,
+# `mtld3d-shared`) are unaffected and run at full parallelism.
+
+[test-groups]
+gpu = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = "package(mtld3d-tests)"
+test-group = "gpu"
+slow-timeout = { period = "30s", terminate-after = 2 }

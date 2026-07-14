@@ -1,0 +1,29 @@
+[package]
+name = "mtld3d-unix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bitflags = { workspace = true }
+block2 = { workspace = true }
+libc = { workspace = true }
+libloading = { workspace = true }
+mtld3d-shared = { workspace = true }
+log = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-quartz-core = { workspace = true }
+strum = { workspace = true }
+
+[lints]
+workspace = true

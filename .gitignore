@@ -1,0 +1,10 @@
+/target
+/windows/target
+/unix/target
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
