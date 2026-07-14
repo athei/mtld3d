@@ -10,8 +10,8 @@ description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
 authors = ["Alexander Theissen <alex.theissen@me.com>"]
 keywords = ["direct3d", "d3d9", "metal", "wine", "macos"]
 categories = ["graphics", "emulators", "api-bindings"]
-repository = "https://github.com/atheissen/mtld3d"
-homepage = "https://github.com/atheissen/mtld3d"
+repository = "https://github.com/athei/mtld3d"
+homepage = "https://github.com/athei/mtld3d"
 
 [workspace.dependencies]
 mtld3d-core = { path = "core" }
