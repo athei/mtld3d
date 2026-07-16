@@ -50,6 +50,16 @@ every prefix needs the `mtld3d.fake.dll` markers copied in once.
   **CrossOver 24 or newer**.
 - A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
 
+## x87 performance
+
+D3D9-era games do their floating-point math in x87 instructions, which
+Rosetta 2 translates slowly. For full performance, run the game together with
+[x87sidecar](https://github.com/athei/x87sidecar), a JIT that replaces
+Rosetta's x87 handling. Its cooperative attach mode requires a Wine that
+performs the sidecar handshake at startup: the Wine builds from
+[wine-build](https://github.com/athei/wine-build) carry that patch, which
+lets the x87sidecar binary work without any entitlements.
+
 ## Choosing a route
 
 **Builtin** — for a Wine installation you own (your own build, an app-bundled
