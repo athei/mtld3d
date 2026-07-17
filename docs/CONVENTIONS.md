@@ -4,7 +4,7 @@ Code-organisation and style rules enforced across the codebase. New code follows
 
 ## Mechanical audit
 
-Most of this document is enforced by `make check`: `cargo +nightly fmt --check`, then clippy at `-D warnings` with `nursery` + `pedantic` denied, then `make audit`, then `make doc`. But a lint can only express a lint-shaped rule, and the rules a lint *can't* express are exactly the ones that drift — nothing runs them, so they decay into prose nobody rereads.
+Most of this document is enforced by `make check`: `cargo +nightly fmt --check`, then clippy with `nursery` + `pedantic` enabled workspace-wide, then `make audit`, then `make doc`. Lint levels are `warn` in the Cargo manifests so a plain `cargo clippy` (or an editor) reports without blocking a build; the `check` legs pass cargo's `build.warnings = "deny"` config, which fails the run if any warning was emitted — so `make check` is the hard gate, and it shares the build cache with plain invocations because no compiler flags change. But a lint can only express a lint-shaped rule, and the rules a lint *can't* express are exactly the ones that drift — nothing runs them, so they decay into prose nobody rereads.
 
 `make audit` (`scripts/audit.sh`) closes that gap, and `make check` runs it — so a violation fails the same gate as a clippy warning, and the tree stays at zero rather than drifting until someone notices. It covers:
 
@@ -27,7 +27,7 @@ Every finding names the section it came from. The confined-pattern checks compar
 
 ### `make doc`
 
-`make check` also builds the docs with `RUSTDOCFLAGS="-D warnings"`, because rustdoc holds the last set of rules nothing else sees: whether a doc link actually **resolves**. Audit gates the *shape* of a doc block and clippy gates its *prose*; only rustdoc knows that `[`foo`]` points at something real, that a public item isn't linking to a private one the reader can't open, and that `"D3DFMT_<code>"` in running text is a malformed HTML tag rather than words.
+`make check` also builds the docs (with the same `build.warnings = "deny"` config, which counts rustdoc warnings too), because rustdoc holds the last set of rules nothing else sees: whether a doc link actually **resolves**. Audit gates the *shape* of a doc block and clippy gates its *prose*; only rustdoc knows that `[`foo`]` points at something real, that a public item isn't linking to a private one the reader can't open, and that `"D3DFMT_<code>"` in running text is a malformed HTML tag rather than words.
 
 Two traps worth knowing, since both were live in the tree:
 
@@ -272,11 +272,11 @@ For `AddRef`/`Release`/`QueryInterface` thunks where D3D9 spec leaves null-`this
 
 ### No `unsafe_code` rustc lint
 
-This codebase deliberately does not enable the rustc `unsafe_code` lint. Every crate structurally bears unsafe (FFI extern blocks, COM dispatch, Metal handle conversion, allocator), so blanket per-crate `#![allow(unsafe_code)]` would just be noise. The enforcement is layered: clippy lints (`missing_safety_doc`, `transmute_ptr_to_ref`, `not_unsafe_ptr_arg_deref`) plus `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` — all four are `deny` workspace-wide in `windows/Cargo.toml` and `unix/Cargo.toml`. Together they require every `unsafe {}` block to carry a `// SAFETY:` comment naming the invariant and to perform exactly one unsafe operation; new code that drifts fails `make clippy`.
+This codebase deliberately does not enable the rustc `unsafe_code` lint. Every crate structurally bears unsafe (FFI extern blocks, COM dispatch, Metal handle conversion, allocator), so blanket per-crate `#![allow(unsafe_code)]` would just be noise. The enforcement is layered: clippy lints (`missing_safety_doc`, `transmute_ptr_to_ref`, `not_unsafe_ptr_arg_deref`) plus `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` — all enabled workspace-wide in `windows/Cargo.toml` and `unix/Cargo.toml`. Together they require every `unsafe {}` block to carry a `// SAFETY:` comment naming the invariant and to perform exactly one unsafe operation; new code that drifts fails `make check`.
 
 ## Warning suppressions
 
-Default rule: **never** `#[allow(...)]`, `#[expect(...)]`, or `#[cfg_attr(..., allow(...))]`. The lint is followed. `make clippy` runs at `-D warnings` with `clippy::nursery` and `clippy::pedantic` denied workspace-wide and **stays clean by fixing the code, not by silencing the lint**. Every lint is treated as serious — refactor by default; reaching for `#[allow]` is the absolute last resort.
+Default rule: **never** `#[allow(...)]`, `#[expect(...)]`, or `#[cfg_attr(..., allow(...))]`. The lint is followed. `make check` runs clippy with `clippy::nursery` and `clippy::pedantic` enabled workspace-wide, denies every warning via `build.warnings = "deny"`, and **stays clean by fixing the code, not by silencing the lint**. Every lint is treated as serious — refactor by default; reaching for `#[allow]` is the absolute last resort.
 
 The tree carries exactly **three** per-site `#[allow(clippy::...)]` attributes, plus one workspace-level `too_many_lines = "allow"`. Each is listed under "Accepted per-site exceptions" below. Adding another per-site allow needs a rationale comment that names which of the accepted exception classes applies — and the structural fix (a non-panicking `cast_unsigned`/`to_le_bytes` reinterpret, `try_from(..).expect(..)`, or a literal cross-checked by a `const` assert) clears the great majority of numeric-cast lints without one.
 

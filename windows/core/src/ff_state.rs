@@ -831,11 +831,16 @@ impl FfState {
         let mut r = [0.0f32; 16];
         for i in 0..4 {
             for j in 0..4 {
-                let mut s = 0.0;
-                for k in 0..4 {
-                    s += a.m[i * 4 + k] * b.m[k * 4 + j];
-                }
-                r[i * 4 + j] = s;
+                // Array-sum, not an accumulate loop — see `view_transform_point`
+                // (avoids an `fmaf` libcall on the no-FMA i686 baseline).
+                r[i * 4 + j] = [
+                    a.m[i * 4] * b.m[j],
+                    a.m[i * 4 + 1] * b.m[4 + j],
+                    a.m[i * 4 + 2] * b.m[8 + j],
+                    a.m[i * 4 + 3] * b.m[12 + j],
+                ]
+                .iter()
+                .sum();
             }
         }
         D3DMATRIX { m: r }

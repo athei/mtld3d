@@ -41,6 +41,14 @@ OUT_unix := unix/target/$(UNIX_RELEASE_TARGET)/$(PROFILE)
 
 XWIN_CACHE := $(HOME)/Library/Caches/xwin
 
+# Hard-fail on any warning (cargo counts emitted warnings, including ones
+# replayed from cache, and errors at the end of the run) — applied only to the
+# `check` legs so normal builds and a plain `cargo clippy` stay
+# warning-tolerant. Unlike `-D warnings` (via clippy args or RUSTDOCFLAGS)
+# this changes no compiler flags, so check runs share the build cache with
+# plain invocations.
+DENY_WARNINGS := --config 'build.warnings="deny"'
+
 INSTALL_DIRS := $(WINE_SDK) $(WINE_INSTALL_DIR)
 
 export MTL_HUD_ENABLED = 1
@@ -186,14 +194,14 @@ clippy:
 	# member's test targets for PE, including mtld3d-core's apple-only objc2
 	# dev-deps (the SM3 corpus test), which hard `compile_error!` off Apple.
 	# Lib/bin only here; test targets are linted per-crate below.
-	cd windows && cargo clippy --target $(PE_i386) -- -D warnings
-	cd windows && cargo clippy --target $(PE_x64)  -- -D warnings
-	cd windows && cargo clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets -- -D warnings
+	cd windows && cargo clippy --target $(PE_i386) $(DENY_WARNINGS)
+	cd windows && cargo clippy --target $(PE_x64)  $(DENY_WARNINGS)
+	cd windows && cargo clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
 	# mtld3d-tests' integration tests aren't covered by the whole-workspace
 	# lib/bin runs; lint all its targets on both PE archs (no apple dev-deps).
-	cd windows && cargo clippy -p mtld3d-tests --target $(PE_i386) --all-targets -- -D warnings
-	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64)  --all-targets  -- -D warnings
-	cd unix && cargo clippy --all-targets -- -D warnings
+	cd windows && cargo clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
+	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64)  --all-targets $(DENY_WARNINGS)
+	cd unix && cargo clippy --all-targets $(DENY_WARNINGS)
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
@@ -204,13 +212,14 @@ audit:
 # rustdoc's own lints, which no other target sees: broken and private intra-doc
 # links, malformed HTML in doc comments. `audit` gates the *shape* of a doc block
 # and clippy gates its prose; only rustdoc knows whether its links resolve.
+# `build.warnings` covers rustdoc warnings too, so no RUSTDOCFLAGS needed.
 #
 # The windows workspace is documented for a PE target, not the host: d3d9 and the
 # shim are `cdylib`s with raw-dylib imports and only build for *-pc-windows-msvc,
 # so a host run would silently skip them. i686 covers every member.
 doc:
-	cd windows && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --target $(PE_i386)
-	cd unix && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	cd windows && cargo doc --no-deps --target $(PE_i386) $(DENY_WARNINGS)
+	cd unix && cargo doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
 # conventions audit, and the doc build. fmt-check first (fast, fails early on

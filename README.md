@@ -149,8 +149,9 @@ The following must be available on `PATH`:
   `wineboot`, plus its development tree (`lib/wine/{i386,x86_64}-windows/` and
   `libwinecrt0.a`).
 - **Homebrew**, which `make setup` uses to install LLVM and lld.
-- A **rustup** toolchain: stable for builds, nightly for `make fmt`
-  (`rustfmt.toml` uses nightly-only options).
+- A **rustup** toolchain: stable (1.97 or newer, per `rust-version` in the
+  Cargo manifests) for builds, nightly for `make fmt` (`rustfmt.toml` uses
+  nightly-only options).
 
 Two environment variables drive the Makefile. `WINE_SDK` points at the Wine
 development tree consumed by `windows/shim/build.rs` for `libwinecrt0.a` /
@@ -308,10 +309,11 @@ The development conventions (module layout, visibility, encapsulation,
 doc-comment shape, typed `objc2-*` bindings) live in
 [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
 
-Run **`make check`** before every commit: `cargo fmt --check`, clippy at
-`-D warnings` with `nursery` and `pedantic` denied, `make audit` (the rules
-clippy cannot express), and `make doc` (rustdoc with warnings denied, so doc
-links have to resolve). Each audit finding names the section of
+Run **`make check`** before every commit: `cargo fmt --check`, clippy with
+`nursery` and `pedantic` enabled, `make audit` (the rules clippy cannot
+express), and `make doc` (rustdoc, so doc links have to resolve). The check
+legs deny every warning via cargo's `build.warnings = "deny"`; normal builds
+and a plain `cargo clippy` only warn. Each audit finding names the section of
 `docs/CONVENTIONS.md` it comes from.
 
 ## License
