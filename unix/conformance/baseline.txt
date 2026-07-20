@@ -1,388 +1,390 @@
-# mtld3d d3d9 conformance baseline — per-site failure counts + classification.
+# mtld3d d3d9 conformance baseline — per-site failure counts.
 # Wine: wine-11.0-6-g55511a628cd
-# Regenerate with 'make conformance-baseline'. Triage prose in CONFORMANCE.md.
+# Regenerate with 'make conformance-baseline'. Classifications + triage prose
+# live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test
+# keeps the two files covering the same sites.
 # Format: "[arch/subtest] crash=<0|1>" header, then indented
-#         "  <file>.c:<line> count=<n> class=<real|caps|expected|crash|flaky|untriaged>".
+#         "  <file>.c:<line> count=<n>".
 
 [i686/device] crash=0
-  device.c:4480 count=1 class=flaky
-  device.c:2126 count=1 class=expected
-  device.c:2127 count=1 class=expected
-  device.c:2179 count=1 class=expected
-  device.c:2180 count=1 class=expected
-  device.c:2234 count=1 class=expected
-  device.c:2237 count=1 class=expected
-  device.c:2238 count=1 class=expected
-  device.c:2250 count=1 class=expected
-  device.c:2251 count=1 class=expected
-  device.c:2370 count=1 class=real
-  device.c:2372 count=1 class=real
-  device.c:2496 count=1 class=real
-  device.c:2498 count=1 class=real
-  device.c:2519 count=1 class=expected
-  device.c:2521 count=1 class=expected
-  device.c:2529 count=1 class=expected
-  device.c:2531 count=1 class=expected
-  device.c:2541 count=1 class=real
-  device.c:4161 count=2 class=expected
-  device.c:4207 count=2 class=expected
-  device.c:4212 count=2 class=expected
-  device.c:4214 count=2 class=expected
-  device.c:4219 count=2 class=expected
-  device.c:4223 count=2 class=expected
-  device.c:4231 count=2 class=expected
-  device.c:4248 count=2 class=expected
-  device.c:4257 count=2 class=expected
-  device.c:4293 count=1 class=expected
-  device.c:4298 count=2 class=expected
-  device.c:4319 count=2 class=expected
-  device.c:4340 count=2 class=expected
-  device.c:4410 count=2 class=expected
-  device.c:4420 count=1 class=expected
-  device.c:4424 count=2 class=expected
-  device.c:4432 count=2 class=expected
-  device.c:4475 count=1 class=flaky
-  device.c:4487 count=2 class=expected
-  device.c:4525 count=2 class=expected
-  device.c:4545 count=2 class=expected
-  device.c:4551 count=1 class=real
-  device.c:4568 count=1 class=real
-  device.c:4572 count=2 class=expected
-  device.c:4681 count=1 class=expected
-  device.c:4697 count=1 class=expected
-  device.c:4701 count=1 class=expected
-  device.c:4708 count=1 class=expected
-  device.c:4751 count=1 class=expected
-  device.c:4774 count=1 class=expected
-  device.c:4778 count=1 class=expected
-  device.c:4785 count=1 class=expected
-  device.c:4871 count=1 class=expected
-  device.c:5041 count=1 class=expected
-  device.c:5051 count=1 class=expected
-  device.c:5200 count=2 class=expected
-  device.c:5215 count=1 class=real
-  device.c:5220 count=1 class=expected
-  device.c:5509 count=1 class=expected
-  device.c:5533 count=1 class=expected
-  device.c:5537 count=1 class=expected
-  device.c:5542 count=1 class=expected
-  device.c:5584 count=1 class=expected
-  device.c:5602 count=1 class=expected
-  device.c:5622 count=1 class=expected
-  device.c:5636 count=1 class=expected
-  device.c:5639 count=1 class=expected
-  device.c:5646 count=1 class=expected
-  device.c:5662 count=1 class=expected
-  device.c:5671 count=1 class=expected
-  device.c:5674 count=1 class=expected
-  device.c:5951 count=1 class=expected
-  device.c:5968 count=1 class=expected
-  device.c:5971 count=1 class=expected
-  device.c:6780 count=1 class=real
-  device.c:7866 count=1 class=real
-  device.c:7868 count=1 class=real
-  device.c:8664 count=30 class=expected
-  device.c:8682 count=30 class=expected
-  device.c:8701 count=39 class=expected
-  device.c:10074 count=1 class=expected
-  device.c:10079 count=1 class=expected
-  device.c:10178 count=1 class=caps
-  device.c:12144 count=1 class=expected
-  device.c:12146 count=1 class=expected
-  device.c:12153 count=1 class=expected
-  device.c:12155 count=1 class=expected
-  device.c:12199 count=1 class=expected
-  device.c:12689 count=1 class=expected
-  device.c:12694 count=1 class=expected
-  device.c:12784 count=72 class=expected
-  device.c:13838 count=1 class=real
-  device.c:13853 count=3 class=caps
-  device.c:14383 count=1 class=expected
-  device.c:14384 count=1 class=expected
-  device.c:14451 count=2 class=expected
-  device.c:14454 count=2 class=expected
-  device.c:14472 count=2 class=expected
-  device.c:14474 count=2 class=expected
-  device.c:14480 count=2 class=expected
-  device.c:14482 count=2 class=expected
-  device.c:14491 count=2 class=expected
-  device.c:14493 count=2 class=expected
-  device.c:14967 count=1 class=expected
-  device.c:14970 count=1 class=expected
-  device.c:14987 count=1 class=expected
-  device.c:15035 count=1 class=expected
-  device.c:15053 count=1 class=expected
-  device.c:15088 count=1 class=expected
-  device.c:15160 count=1 class=expected
+  device.c:4480 count=1
+  device.c:2126 count=1
+  device.c:2127 count=1
+  device.c:2179 count=1
+  device.c:2180 count=1
+  device.c:2234 count=1
+  device.c:2237 count=1
+  device.c:2238 count=1
+  device.c:2250 count=1
+  device.c:2251 count=1
+  device.c:2370 count=1
+  device.c:2372 count=1
+  device.c:2496 count=1
+  device.c:2498 count=1
+  device.c:2519 count=1
+  device.c:2521 count=1
+  device.c:2529 count=1
+  device.c:2531 count=1
+  device.c:2541 count=1
+  device.c:4161 count=2
+  device.c:4207 count=2
+  device.c:4212 count=2
+  device.c:4214 count=2
+  device.c:4219 count=2
+  device.c:4223 count=2
+  device.c:4231 count=2
+  device.c:4248 count=2
+  device.c:4257 count=2
+  device.c:4293 count=1
+  device.c:4298 count=2
+  device.c:4319 count=2
+  device.c:4340 count=2
+  device.c:4410 count=2
+  device.c:4420 count=1
+  device.c:4424 count=2
+  device.c:4432 count=2
+  device.c:4475 count=1
+  device.c:4487 count=2
+  device.c:4525 count=2
+  device.c:4545 count=2
+  device.c:4551 count=1
+  device.c:4568 count=1
+  device.c:4572 count=2
+  device.c:4681 count=1
+  device.c:4697 count=1
+  device.c:4701 count=1
+  device.c:4708 count=1
+  device.c:4751 count=1
+  device.c:4774 count=1
+  device.c:4778 count=1
+  device.c:4785 count=1
+  device.c:4871 count=1
+  device.c:5041 count=1
+  device.c:5051 count=1
+  device.c:5200 count=2
+  device.c:5215 count=1
+  device.c:5220 count=1
+  device.c:5509 count=1
+  device.c:5533 count=1
+  device.c:5537 count=1
+  device.c:5542 count=1
+  device.c:5584 count=1
+  device.c:5602 count=1
+  device.c:5622 count=1
+  device.c:5636 count=1
+  device.c:5639 count=1
+  device.c:5646 count=1
+  device.c:5662 count=1
+  device.c:5671 count=1
+  device.c:5674 count=1
+  device.c:5951 count=1
+  device.c:5968 count=1
+  device.c:5971 count=1
+  device.c:6780 count=1
+  device.c:7866 count=1
+  device.c:7868 count=1
+  device.c:8664 count=30
+  device.c:8682 count=30
+  device.c:8701 count=39
+  device.c:10074 count=1
+  device.c:10079 count=1
+  device.c:10178 count=1
+  device.c:12144 count=1
+  device.c:12146 count=1
+  device.c:12153 count=1
+  device.c:12155 count=1
+  device.c:12199 count=1
+  device.c:12689 count=1
+  device.c:12694 count=1
+  device.c:12784 count=72
+  device.c:13838 count=1
+  device.c:13853 count=3
+  device.c:14383 count=1
+  device.c:14384 count=1
+  device.c:14451 count=2
+  device.c:14454 count=2
+  device.c:14472 count=2
+  device.c:14474 count=2
+  device.c:14480 count=2
+  device.c:14482 count=2
+  device.c:14491 count=2
+  device.c:14493 count=2
+  device.c:14967 count=1
+  device.c:14970 count=1
+  device.c:14987 count=1
+  device.c:15035 count=1
+  device.c:15053 count=1
+  device.c:15088 count=1
+  device.c:15160 count=1
 [i686/visual] crash=0
-  visual.c:24133 count=1 class=expected
-  visual.c:713 count=3 class=real
-  visual.c:1473 count=1 class=real
-  visual.c:1525 count=1 class=real
-  visual.c:3887 count=1 class=expected
-  visual.c:3889 count=1 class=expected
-  visual.c:3891 count=1 class=expected
-  visual.c:3894 count=1 class=expected
-  visual.c:3963 count=1 class=expected
-  visual.c:3965 count=1 class=expected
-  visual.c:5360 count=1 class=expected
-  visual.c:5398 count=1 class=expected
-  visual.c:5436 count=1 class=expected
-  visual.c:5454 count=1 class=expected
-  visual.c:9632 count=1 class=expected
-  visual.c:9638 count=1 class=expected
-  visual.c:9641 count=1 class=expected
-  visual.c:9645 count=1 class=expected
-  visual.c:9651 count=1 class=expected
-  visual.c:9654 count=1 class=expected
-  visual.c:12258 count=1 class=real
-  visual.c:12261 count=1 class=real
-  visual.c:12265 count=1 class=real
-  visual.c:12275 count=1 class=real
-  visual.c:12276 count=1 class=real
-  visual.c:12278 count=1 class=real
-  visual.c:12280 count=1 class=real
-  visual.c:12281 count=1 class=real
-  visual.c:12283 count=1 class=real
-  visual.c:12285 count=1 class=real
-  visual.c:12286 count=1 class=real
-  visual.c:12288 count=1 class=real
-  visual.c:12290 count=1 class=real
-  visual.c:12291 count=1 class=real
-  visual.c:12295 count=1 class=real
-  visual.c:12296 count=1 class=real
-  visual.c:12300 count=1 class=real
-  visual.c:12393 count=4 class=real
-  visual.c:12398 count=16 class=real
-  visual.c:12404 count=16 class=real
-  visual.c:12410 count=16 class=real
-  visual.c:12423 count=16 class=expected
-  visual.c:12448 count=16 class=real
-  visual.c:12452 count=16 class=real
-  visual.c:12456 count=16 class=real
-  visual.c:12464 count=16 class=expected
-  visual.c:12466 count=14 class=expected
-  visual.c:12468 count=12 class=expected
-  visual.c:12470 count=9 class=expected
-  visual.c:14835 count=12 class=real
-  visual.c:15617 count=144 class=caps
-  visual.c:15668 count=17 class=caps
-  visual.c:15824 count=16 class=caps
-  visual.c:15829 count=16 class=caps
-  visual.c:16129 count=4 class=expected
-  visual.c:16131 count=4 class=expected
-  visual.c:16433 count=2 class=expected
-  visual.c:19210 count=1 class=expected
-  visual.c:19217 count=1 class=expected
-  visual.c:19232 count=1 class=expected
-  visual.c:22053 count=1 class=expected
-  visual.c:22055 count=1 class=expected
-  visual.c:22064 count=1 class=expected
-  visual.c:22066 count=1 class=expected
-  visual.c:22072 count=1 class=expected
-  visual.c:24135 count=1 class=expected
-  visual.c:25148 count=1 class=expected
-  visual.c:25431 count=1 class=real
-  visual.c:25436 count=4 class=real
-  visual.c:25505 count=1 class=expected
-  visual.c:25518 count=1 class=expected
-  visual.c:25565 count=1 class=expected
-  visual.c:27550 count=5 class=expected
-  visual.c:27902 count=2 class=expected
-  visual.c:28024 count=3 class=real
+  visual.c:24133 count=1
+  visual.c:713 count=3
+  visual.c:1473 count=1
+  visual.c:1525 count=1
+  visual.c:3887 count=1
+  visual.c:3889 count=1
+  visual.c:3891 count=1
+  visual.c:3894 count=1
+  visual.c:3963 count=1
+  visual.c:3965 count=1
+  visual.c:5360 count=1
+  visual.c:5398 count=1
+  visual.c:5436 count=1
+  visual.c:5454 count=1
+  visual.c:9632 count=1
+  visual.c:9638 count=1
+  visual.c:9641 count=1
+  visual.c:9645 count=1
+  visual.c:9651 count=1
+  visual.c:9654 count=1
+  visual.c:12258 count=1
+  visual.c:12261 count=1
+  visual.c:12265 count=1
+  visual.c:12275 count=1
+  visual.c:12276 count=1
+  visual.c:12278 count=1
+  visual.c:12280 count=1
+  visual.c:12281 count=1
+  visual.c:12283 count=1
+  visual.c:12285 count=1
+  visual.c:12286 count=1
+  visual.c:12288 count=1
+  visual.c:12290 count=1
+  visual.c:12291 count=1
+  visual.c:12295 count=1
+  visual.c:12296 count=1
+  visual.c:12300 count=1
+  visual.c:12393 count=4
+  visual.c:12398 count=16
+  visual.c:12404 count=16
+  visual.c:12410 count=16
+  visual.c:12423 count=16
+  visual.c:12448 count=16
+  visual.c:12452 count=16
+  visual.c:12456 count=16
+  visual.c:12464 count=16
+  visual.c:12466 count=14
+  visual.c:12468 count=12
+  visual.c:12470 count=9
+  visual.c:14835 count=12
+  visual.c:15617 count=144
+  visual.c:15668 count=17
+  visual.c:15824 count=16
+  visual.c:15829 count=16
+  visual.c:16129 count=4
+  visual.c:16131 count=4
+  visual.c:16433 count=2
+  visual.c:19210 count=1
+  visual.c:19217 count=1
+  visual.c:19232 count=1
+  visual.c:22053 count=1
+  visual.c:22055 count=1
+  visual.c:22064 count=1
+  visual.c:22066 count=1
+  visual.c:22072 count=1
+  visual.c:24135 count=1
+  visual.c:25148 count=1
+  visual.c:25431 count=1
+  visual.c:25436 count=4
+  visual.c:25505 count=1
+  visual.c:25518 count=1
+  visual.c:25565 count=1
+  visual.c:27550 count=5
+  visual.c:27902 count=2
+  visual.c:28024 count=3
 [i686/stateblock] crash=0
-  stateblock.c:1810 count=77 class=real
-  stateblock.c:1812 count=61 class=real
-  stateblock.c:1813 count=77 class=real
+  stateblock.c:1810 count=77
+  stateblock.c:1812 count=61
+  stateblock.c:1813 count=77
 [i686/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1 class=expected
+  d3d9ex.c:5184 count=1
 [x86_64/device] crash=0
-  device.c:4480 count=1 class=flaky
-  device.c:2126 count=1 class=expected
-  device.c:2127 count=1 class=expected
-  device.c:2179 count=1 class=expected
-  device.c:2180 count=1 class=expected
-  device.c:2234 count=1 class=expected
-  device.c:2237 count=1 class=expected
-  device.c:2238 count=1 class=expected
-  device.c:2250 count=1 class=expected
-  device.c:2251 count=1 class=expected
-  device.c:2370 count=1 class=real
-  device.c:2372 count=1 class=real
-  device.c:2496 count=1 class=real
-  device.c:2498 count=1 class=real
-  device.c:2519 count=1 class=expected
-  device.c:2521 count=1 class=expected
-  device.c:2529 count=1 class=expected
-  device.c:2531 count=1 class=expected
-  device.c:2541 count=1 class=real
-  device.c:4161 count=2 class=expected
-  device.c:4207 count=2 class=expected
-  device.c:4212 count=2 class=expected
-  device.c:4214 count=2 class=expected
-  device.c:4219 count=2 class=expected
-  device.c:4223 count=2 class=expected
-  device.c:4231 count=2 class=expected
-  device.c:4248 count=2 class=expected
-  device.c:4257 count=2 class=expected
-  device.c:4293 count=1 class=expected
-  device.c:4298 count=2 class=expected
-  device.c:4319 count=2 class=expected
-  device.c:4340 count=2 class=expected
-  device.c:4410 count=2 class=expected
-  device.c:4420 count=1 class=expected
-  device.c:4424 count=2 class=expected
-  device.c:4432 count=2 class=expected
-  device.c:4475 count=1 class=flaky
-  device.c:4487 count=2 class=expected
-  device.c:4525 count=2 class=expected
-  device.c:4545 count=2 class=expected
-  device.c:4551 count=1 class=real
-  device.c:4568 count=1 class=real
-  device.c:4572 count=2 class=expected
-  device.c:4681 count=1 class=expected
-  device.c:4697 count=1 class=expected
-  device.c:4701 count=1 class=expected
-  device.c:4708 count=1 class=expected
-  device.c:4751 count=1 class=expected
-  device.c:4774 count=1 class=expected
-  device.c:4778 count=1 class=expected
-  device.c:4785 count=1 class=expected
-  device.c:4871 count=1 class=expected
-  device.c:5200 count=2 class=expected
-  device.c:5215 count=1 class=real
-  device.c:5220 count=1 class=expected
-  device.c:5509 count=1 class=expected
-  device.c:5533 count=1 class=expected
-  device.c:5537 count=1 class=expected
-  device.c:5542 count=1 class=expected
-  device.c:5584 count=1 class=expected
-  device.c:5602 count=1 class=expected
-  device.c:5622 count=1 class=expected
-  device.c:5636 count=1 class=expected
-  device.c:5639 count=1 class=expected
-  device.c:5646 count=1 class=expected
-  device.c:5662 count=1 class=expected
-  device.c:5671 count=1 class=expected
-  device.c:5674 count=1 class=expected
-  device.c:5951 count=1 class=expected
-  device.c:5968 count=1 class=expected
-  device.c:5971 count=1 class=expected
-  device.c:6780 count=1 class=real
-  device.c:7866 count=1 class=real
-  device.c:7868 count=1 class=real
-  device.c:8664 count=30 class=expected
-  device.c:8682 count=30 class=expected
-  device.c:8701 count=39 class=expected
-  device.c:10074 count=1 class=expected
-  device.c:10079 count=1 class=expected
-  device.c:10178 count=1 class=caps
-  device.c:12144 count=1 class=expected
-  device.c:12146 count=1 class=expected
-  device.c:12153 count=1 class=expected
-  device.c:12155 count=1 class=expected
-  device.c:12199 count=1 class=expected
-  device.c:12689 count=1 class=expected
-  device.c:12694 count=1 class=expected
-  device.c:12784 count=72 class=expected
-  device.c:13838 count=1 class=real
-  device.c:13853 count=3 class=caps
-  device.c:14383 count=1 class=expected
-  device.c:14384 count=1 class=expected
-  device.c:14451 count=2 class=expected
-  device.c:14454 count=2 class=expected
-  device.c:14472 count=2 class=expected
-  device.c:14474 count=2 class=expected
-  device.c:14480 count=2 class=expected
-  device.c:14482 count=2 class=expected
-  device.c:14491 count=2 class=expected
-  device.c:14493 count=2 class=expected
-  device.c:14967 count=1 class=expected
-  device.c:14970 count=1 class=expected
-  device.c:14987 count=1 class=expected
-  device.c:15035 count=1 class=expected
-  device.c:15053 count=1 class=expected
-  device.c:15088 count=1 class=expected
-  device.c:15160 count=1 class=expected
+  device.c:4480 count=1
+  device.c:2126 count=1
+  device.c:2127 count=1
+  device.c:2179 count=1
+  device.c:2180 count=1
+  device.c:2234 count=1
+  device.c:2237 count=1
+  device.c:2238 count=1
+  device.c:2250 count=1
+  device.c:2251 count=1
+  device.c:2370 count=1
+  device.c:2372 count=1
+  device.c:2496 count=1
+  device.c:2498 count=1
+  device.c:2519 count=1
+  device.c:2521 count=1
+  device.c:2529 count=1
+  device.c:2531 count=1
+  device.c:2541 count=1
+  device.c:4161 count=2
+  device.c:4207 count=2
+  device.c:4212 count=2
+  device.c:4214 count=2
+  device.c:4219 count=2
+  device.c:4223 count=2
+  device.c:4231 count=2
+  device.c:4248 count=2
+  device.c:4257 count=2
+  device.c:4293 count=1
+  device.c:4298 count=2
+  device.c:4319 count=2
+  device.c:4340 count=2
+  device.c:4410 count=2
+  device.c:4420 count=1
+  device.c:4424 count=2
+  device.c:4432 count=2
+  device.c:4475 count=1
+  device.c:4487 count=2
+  device.c:4525 count=2
+  device.c:4545 count=2
+  device.c:4551 count=1
+  device.c:4568 count=1
+  device.c:4572 count=2
+  device.c:4681 count=1
+  device.c:4697 count=1
+  device.c:4701 count=1
+  device.c:4708 count=1
+  device.c:4751 count=1
+  device.c:4774 count=1
+  device.c:4778 count=1
+  device.c:4785 count=1
+  device.c:4871 count=1
+  device.c:5200 count=2
+  device.c:5215 count=1
+  device.c:5220 count=1
+  device.c:5509 count=1
+  device.c:5533 count=1
+  device.c:5537 count=1
+  device.c:5542 count=1
+  device.c:5584 count=1
+  device.c:5602 count=1
+  device.c:5622 count=1
+  device.c:5636 count=1
+  device.c:5639 count=1
+  device.c:5646 count=1
+  device.c:5662 count=1
+  device.c:5671 count=1
+  device.c:5674 count=1
+  device.c:5951 count=1
+  device.c:5968 count=1
+  device.c:5971 count=1
+  device.c:6780 count=1
+  device.c:7866 count=1
+  device.c:7868 count=1
+  device.c:8664 count=30
+  device.c:8682 count=30
+  device.c:8701 count=39
+  device.c:10074 count=1
+  device.c:10079 count=1
+  device.c:10178 count=1
+  device.c:12144 count=1
+  device.c:12146 count=1
+  device.c:12153 count=1
+  device.c:12155 count=1
+  device.c:12199 count=1
+  device.c:12689 count=1
+  device.c:12694 count=1
+  device.c:12784 count=72
+  device.c:13838 count=1
+  device.c:13853 count=3
+  device.c:14383 count=1
+  device.c:14384 count=1
+  device.c:14451 count=2
+  device.c:14454 count=2
+  device.c:14472 count=2
+  device.c:14474 count=2
+  device.c:14480 count=2
+  device.c:14482 count=2
+  device.c:14491 count=2
+  device.c:14493 count=2
+  device.c:14967 count=1
+  device.c:14970 count=1
+  device.c:14987 count=1
+  device.c:15035 count=1
+  device.c:15053 count=1
+  device.c:15088 count=1
+  device.c:15160 count=1
 [x86_64/visual] crash=0
-  visual.c:24133 count=1 class=expected
-  visual.c:713 count=3 class=real
-  visual.c:1473 count=1 class=real
-  visual.c:1525 count=1 class=real
-  visual.c:3887 count=1 class=expected
-  visual.c:3889 count=1 class=expected
-  visual.c:3891 count=1 class=expected
-  visual.c:3894 count=1 class=expected
-  visual.c:3963 count=1 class=expected
-  visual.c:3965 count=1 class=expected
-  visual.c:5360 count=1 class=expected
-  visual.c:5398 count=1 class=expected
-  visual.c:5436 count=1 class=expected
-  visual.c:5454 count=1 class=expected
-  visual.c:9632 count=1 class=expected
-  visual.c:9638 count=1 class=expected
-  visual.c:9641 count=1 class=expected
-  visual.c:9645 count=1 class=expected
-  visual.c:9651 count=1 class=expected
-  visual.c:9654 count=1 class=expected
-  visual.c:12258 count=1 class=real
-  visual.c:12261 count=1 class=real
-  visual.c:12265 count=1 class=real
-  visual.c:12275 count=1 class=real
-  visual.c:12276 count=1 class=real
-  visual.c:12278 count=1 class=real
-  visual.c:12280 count=1 class=real
-  visual.c:12281 count=1 class=real
-  visual.c:12283 count=1 class=real
-  visual.c:12285 count=1 class=real
-  visual.c:12286 count=1 class=real
-  visual.c:12288 count=1 class=real
-  visual.c:12290 count=1 class=real
-  visual.c:12291 count=1 class=real
-  visual.c:12295 count=1 class=real
-  visual.c:12296 count=1 class=real
-  visual.c:12300 count=1 class=real
-  visual.c:12393 count=4 class=real
-  visual.c:12398 count=16 class=real
-  visual.c:12404 count=16 class=real
-  visual.c:12410 count=16 class=real
-  visual.c:12423 count=16 class=expected
-  visual.c:12448 count=16 class=real
-  visual.c:12452 count=16 class=real
-  visual.c:12456 count=16 class=real
-  visual.c:12464 count=16 class=expected
-  visual.c:12466 count=14 class=expected
-  visual.c:12468 count=12 class=expected
-  visual.c:12470 count=9 class=expected
-  visual.c:14835 count=12 class=real
-  visual.c:15617 count=144 class=caps
-  visual.c:15668 count=15 class=caps
-  visual.c:15824 count=16 class=caps
-  visual.c:15829 count=16 class=caps
-  visual.c:16129 count=4 class=expected
-  visual.c:16131 count=4 class=expected
-  visual.c:16433 count=2 class=expected
-  visual.c:19210 count=1 class=expected
-  visual.c:19217 count=1 class=expected
-  visual.c:19232 count=1 class=expected
-  visual.c:22053 count=1 class=expected
-  visual.c:22055 count=1 class=expected
-  visual.c:22064 count=1 class=expected
-  visual.c:22066 count=1 class=expected
-  visual.c:22072 count=1 class=expected
-  visual.c:24135 count=1 class=expected
-  visual.c:25148 count=1 class=expected
-  visual.c:25431 count=1 class=real
-  visual.c:25436 count=4 class=real
-  visual.c:25505 count=1 class=expected
-  visual.c:25518 count=1 class=expected
-  visual.c:25565 count=1 class=expected
-  visual.c:27550 count=5 class=expected
-  visual.c:27902 count=2 class=expected
-  visual.c:28024 count=3 class=real
+  visual.c:24133 count=1
+  visual.c:713 count=3
+  visual.c:1473 count=1
+  visual.c:1525 count=1
+  visual.c:3887 count=1
+  visual.c:3889 count=1
+  visual.c:3891 count=1
+  visual.c:3894 count=1
+  visual.c:3963 count=1
+  visual.c:3965 count=1
+  visual.c:5360 count=1
+  visual.c:5398 count=1
+  visual.c:5436 count=1
+  visual.c:5454 count=1
+  visual.c:9632 count=1
+  visual.c:9638 count=1
+  visual.c:9641 count=1
+  visual.c:9645 count=1
+  visual.c:9651 count=1
+  visual.c:9654 count=1
+  visual.c:12258 count=1
+  visual.c:12261 count=1
+  visual.c:12265 count=1
+  visual.c:12275 count=1
+  visual.c:12276 count=1
+  visual.c:12278 count=1
+  visual.c:12280 count=1
+  visual.c:12281 count=1
+  visual.c:12283 count=1
+  visual.c:12285 count=1
+  visual.c:12286 count=1
+  visual.c:12288 count=1
+  visual.c:12290 count=1
+  visual.c:12291 count=1
+  visual.c:12295 count=1
+  visual.c:12296 count=1
+  visual.c:12300 count=1
+  visual.c:12393 count=4
+  visual.c:12398 count=16
+  visual.c:12404 count=16
+  visual.c:12410 count=16
+  visual.c:12423 count=16
+  visual.c:12448 count=16
+  visual.c:12452 count=16
+  visual.c:12456 count=16
+  visual.c:12464 count=16
+  visual.c:12466 count=14
+  visual.c:12468 count=12
+  visual.c:12470 count=9
+  visual.c:14835 count=12
+  visual.c:15617 count=144
+  visual.c:15668 count=15
+  visual.c:15824 count=16
+  visual.c:15829 count=16
+  visual.c:16129 count=4
+  visual.c:16131 count=4
+  visual.c:16433 count=2
+  visual.c:19210 count=1
+  visual.c:19217 count=1
+  visual.c:19232 count=1
+  visual.c:22053 count=1
+  visual.c:22055 count=1
+  visual.c:22064 count=1
+  visual.c:22066 count=1
+  visual.c:22072 count=1
+  visual.c:24135 count=1
+  visual.c:25148 count=1
+  visual.c:25431 count=1
+  visual.c:25436 count=4
+  visual.c:25505 count=1
+  visual.c:25518 count=1
+  visual.c:25565 count=1
+  visual.c:27550 count=5
+  visual.c:27902 count=2
+  visual.c:28024 count=3
 [x86_64/stateblock] crash=0
-  stateblock.c:1810 count=77 class=real
-  stateblock.c:1812 count=61 class=real
-  stateblock.c:1813 count=77 class=real
+  stateblock.c:1810 count=77
+  stateblock.c:1812 count=61
+  stateblock.c:1813 count=77
 [x86_64/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1 class=expected
+  d3d9ex.c:5184 count=1

@@ -1,18 +1,19 @@
 //! Data model for the conformance baseline plus its text (de)serializer.
 //!
 //! The on-disk `baseline.txt` is the single source of truth for *which* Wine
-//! `d3d9_test.exe` assertions fail (per `file:line`, with a hit count) and *why*
-//! (a per-site [`Classification`] that a human assigns and that survives
-//! re-baselining). The format is deliberately a hand-parsed, diff-friendly text
-//! file — see [`Baseline::to_text`] for the exact shape.
+//! `d3d9_test.exe` assertions fail (per `file:line`, with a hit count) and how
+//! often. *Why* a site fails — its classification — lives with the rationale
+//! prose in CONFORMANCE.md and is loaded by [`crate::triage`]; keeping the two
+//! concerns in separate files means the machine can freely rewrite counts on a
+//! re-baseline without ever touching human prose. The format is deliberately a
+//! hand-parsed, diff-friendly text file — see [`Baseline::to_text`] for the
+//! exact shape.
 
 use std::{
     collections::BTreeMap,
     fmt::{self, Write as _},
     str::FromStr,
 };
-
-use crate::classify::Classification;
 
 /// The PE architectures the suite runs against, in baseline-output order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -41,20 +42,17 @@ pub struct Site {
     pub line: u32,
 }
 
-/// A baseline entry for one failing site: how many times it fired and its tag.
-#[derive(PartialEq, Eq, Debug)]
-pub struct SiteEntry {
-    pub count: u32,
-    pub class: Classification,
-}
-
 /// The recorded baseline for one `(arch, subtest)`.
 ///
-/// The crash bit plus every failing site keyed by location.
+/// The crash bit plus every failing site's hit count. Counts only — the
+/// classification for a site lives in CONFORMANCE.md's per-cluster section
+/// (see [`crate::triage`]), so each datum has exactly one authoritative home:
+/// machine-recorded counts here, human-assigned classes with their rationale
+/// prose there.
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct SubtestBaseline {
     pub crash: bool,
-    pub sites: BTreeMap<Site, SiteEntry>,
+    pub sites: BTreeMap<Site, u32>,
 }
 
 /// The full checked-in baseline.
@@ -189,20 +187,22 @@ impl Baseline {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(
-            "# mtld3d d3d9 conformance baseline — per-site failure counts + classification.\n",
-        );
+        out.push_str("# mtld3d d3d9 conformance baseline — per-site failure counts.\n");
         let _ = writeln!(out, "# Wine: {}", self.wine_version);
         out.push_str(
-            "# Regenerate with 'make conformance-baseline'. Triage prose in CONFORMANCE.md.\n",
+            "# Regenerate with 'make conformance-baseline'. Classifications + triage prose\n",
         );
+        out.push_str(
+            "# live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test\n",
+        );
+        out.push_str("# keeps the two files covering the same sites.\n");
         out.push_str("# Format: \"[arch/subtest] crash=<0|1>\" header, then indented\n");
-        out.push_str("#         \"  <file>.c:<line> count=<n> class=<real|caps|expected|crash|flaky|untriaged>\".\n");
+        out.push_str("#         \"  <file>.c:<line> count=<n>\".\n");
         out.push('\n');
         for (&(arch, subtest), sub) in &self.entries {
             let _ = writeln!(out, "[{arch}/{subtest}] crash={}", u8::from(sub.crash));
-            for (site, entry) in &sub.sites {
-                let _ = writeln!(out, "  {site} count={} class={}", entry.count, entry.class);
+            for (site, count) in &sub.sites {
+                let _ = writeln!(out, "  {site} count={count}");
             }
         }
         out
@@ -213,8 +213,8 @@ impl Baseline {
     /// # Errors
     ///
     /// Returns a `baseline:<line>: …` message on a malformed header, a site line
-    /// before any header, an unparseable arch/subtest/count/classification, or a
-    /// line that is neither a comment, a header, nor an indented site.
+    /// before any header, an unparseable arch/subtest/count, or a line that is
+    /// neither a comment, a header, nor an indented site.
     pub fn from_text(text: &str) -> Result<Self, String> {
         let mut baseline = Self::default();
         let mut current: Option<(Arch, Subtest)> = None;
@@ -280,7 +280,7 @@ fn parse_header(line: &str) -> Result<((Arch, Subtest), SubtestBaseline), String
     ))
 }
 
-fn parse_site(line: &str) -> Result<(Site, SiteEntry), String> {
+fn parse_site(line: &str) -> Result<(Site, u32), String> {
     let mut toks = line.split_whitespace();
     let loc = toks
         .next()
@@ -288,9 +288,11 @@ fn parse_site(line: &str) -> Result<(Site, SiteEntry), String> {
     let count_tok = toks
         .next()
         .ok_or_else(|| format!("site line missing count: {line:?}"))?;
-    let class_tok = toks
-        .next()
-        .ok_or_else(|| format!("site line missing class: {line:?}"))?;
+    if let Some(extra) = toks.next() {
+        return Err(format!(
+            "unexpected trailing token {extra:?} (classes moved to CONFORMANCE.md): {line:?}"
+        ));
+    }
     let (file, line_str) = loc
         .rsplit_once(':')
         .ok_or_else(|| format!("site location missing ':': {loc:?}"))?;
@@ -302,16 +304,12 @@ fn parse_site(line: &str) -> Result<(Site, SiteEntry), String> {
         .ok_or_else(|| format!("expected 'count=<n>': {count_tok:?}"))?
         .parse::<u32>()
         .map_err(|_| format!("count not an integer: {count_tok:?}"))?;
-    let class = class_tok
-        .strip_prefix("class=")
-        .ok_or_else(|| format!("expected 'class=<tag>': {class_tok:?}"))?
-        .parse::<Classification>()?;
     Ok((
         Site {
             file: file.to_owned(),
             line: line_no,
         },
-        SiteEntry { count, class },
+        count,
     ))
 }
 
@@ -319,8 +317,7 @@ fn parse_site(line: &str) -> Result<(Site, SiteEntry), String> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Arch, Baseline, Site, SiteEntry, Subtest, SubtestBaseline};
-    use crate::classify::Classification;
+    use super::{Arch, Baseline, Site, Subtest, SubtestBaseline};
 
     fn sample() -> Baseline {
         let mut device = SubtestBaseline {
@@ -332,20 +329,14 @@ mod tests {
                 file: "device.c".to_owned(),
                 line: 125,
             },
-            SiteEntry {
-                count: 37,
-                class: Classification::Real,
-            },
+            37,
         );
         device.sites.insert(
             Site {
                 file: "device.c".to_owned(),
                 line: 792,
             },
-            SiteEntry {
-                count: 18,
-                class: Classification::Real,
-            },
+            18,
         );
         let mut d3d9ex = SubtestBaseline {
             crash: false,
@@ -356,10 +347,7 @@ mod tests {
                 file: "d3d9ex.c".to_owned(),
                 line: 55,
             },
-            SiteEntry {
-                count: 1,
-                class: Classification::Expected,
-            },
+            1,
         );
         let mut entries = BTreeMap::new();
         entries.insert((Arch::I686, Subtest::Device), device);
@@ -387,15 +375,15 @@ mod tests {
 
     #[test]
     fn parse_rejects_site_before_header() {
-        let err = Baseline::from_text("  device.c:1 count=1 class=real\n").unwrap_err();
+        let err = Baseline::from_text("  device.c:1 count=1\n").unwrap_err();
         assert!(err.contains("before any header"), "{err}");
     }
 
     #[test]
-    fn parse_rejects_unknown_class() {
-        let err = Baseline::from_text("[i686/device] crash=0\n  device.c:1 count=1 class=bogus\n")
+    fn parse_rejects_legacy_class_token() {
+        let err = Baseline::from_text("[i686/device] crash=0\n  device.c:1 count=1 class=real\n")
             .unwrap_err();
-        assert!(err.contains("unknown classification"), "{err}");
+        assert!(err.contains("classes moved to CONFORMANCE.md"), "{err}");
     }
 
     #[test]

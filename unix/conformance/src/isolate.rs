@@ -8,7 +8,7 @@
 //! `(arch, subtest)` N times and prints a per-site flap report: a site that
 //! fired in every run at the same count is deterministic; one that fired in only
 //! some runs, or at a varying count, is flaky. The output is the evidence for
-//! tagging a site `flaky` in `baseline.txt` (see [`crate::classify`]). This is
+//! tagging a site `flaky` in `CONFORMANCE.md` (see [`crate::triage`]). This is
 //! measurement, not a gate — it never sets a non-zero exit code.
 
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};

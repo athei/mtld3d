@@ -13,6 +13,7 @@ use std::{
 use crate::{
     classify::Classification,
     model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult},
+    triage::DocSite,
 };
 
 /// The diff outcome: whether any regression was found, plus the rendered report.
@@ -22,8 +23,16 @@ pub struct Report {
 }
 
 /// Compare `current` against `baseline` for every `(arch, subtest)`.
+///
+/// `classes` is the per-site triage loaded from CONFORMANCE.md — the diff
+/// consults it for the flaky tolerance and to flag baseline sites that have
+/// no prose entry yet.
 #[must_use]
-pub fn diff(baseline: &Baseline, current: &BTreeMap<(Arch, Subtest), SubtestResult>) -> Report {
+pub fn diff(
+    baseline: &Baseline,
+    classes: &BTreeMap<Site, DocSite>,
+    current: &BTreeMap<(Arch, Subtest), SubtestResult>,
+) -> Report {
     let mut text = String::new();
     let mut regressed = false;
     for arch in Arch::ALL {
@@ -47,15 +56,17 @@ pub fn diff(baseline: &Baseline, current: &BTreeMap<(Arch, Subtest), SubtestResu
             }
             locs.extend(cur.sites.keys());
             for site in locs {
-                let bc = base.and_then(|b| b.sites.get(site)).map_or(0, |e| e.count);
+                let in_baseline = base.is_some_and(|b| b.sites.contains_key(site));
+                let bc = base.and_then(|b| b.sites.get(site)).copied().unwrap_or(0);
                 let cc = cur.sites.get(site).copied().unwrap_or(0);
                 // A site a human pinned `flaky` fails non-deterministically on the
                 // identical binary; its count is not load-bearing, so a delta in
                 // *either* direction is a tolerated flutter, not a verdict — it
-                // sets neither `sub_regressed` nor `sub_improved`. (A brand-new
-                // un-pinned site has `bc == 0` and no class, so it still
-                // regresses.)
-                let flaky = site_class(base, site) == Some(Classification::Flaky);
+                // sets neither `sub_regressed` nor `sub_improved`. The pin only
+                // applies to sites already in the baseline: a brand-new site
+                // regresses even if prose for it already exists.
+                let class = classes.get(site).map(|doc| doc.class);
+                let flaky = in_baseline && class == Some(Classification::Flaky);
                 if cc > bc {
                     if flaky {
                         details.push(format!(
@@ -84,9 +95,9 @@ pub fn diff(baseline: &Baseline, current: &BTreeMap<(Arch, Subtest), SubtestResu
                         };
                         details.push(format!("  {site}  {bc} -> {cc}  {label}"));
                     }
-                } else if bc > 0 && site_class(base, site) == Some(Classification::Untriaged) {
+                } else if bc > 0 && matches!(class, None | Some(Classification::Untriaged)) {
                     details.push(format!(
-                        "  {site}  {cc}  untriaged - classify in baseline.txt"
+                        "  {site}  {cc}  untriaged - add to CONFORMANCE.md per-cluster section"
                     ));
                 }
             }
@@ -136,15 +147,7 @@ pub fn diff(baseline: &Baseline, current: &BTreeMap<(Arch, Subtest), SubtestResu
 }
 
 fn total_failed(sub: &SubtestBaseline) -> u32 {
-    sub.sites.values().map(|e| e.count).sum()
-}
-
-/// The baseline classification recorded for `site`.
-///
-/// `None` if the site is not in the baseline (a brand-new failure).
-fn site_class(base: Option<&SubtestBaseline>, site: &Site) -> Option<Classification> {
-    base.and_then(|b| b.sites.get(site))
-        .map(|entry| entry.class)
+    sub.sites.values().sum()
 }
 
 #[cfg(test)]
@@ -154,7 +157,8 @@ mod tests {
     use super::diff;
     use crate::{
         classify::Classification,
-        model::{Arch, Baseline, Site, SiteEntry, Subtest, SubtestBaseline, SubtestResult},
+        model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult},
+        triage::DocSite,
     };
 
     fn key() -> (Arch, Subtest) {
@@ -168,17 +172,32 @@ mod tests {
         }
     }
 
-    fn baseline_with(sites: &[(u32, u32, Classification)], crash: bool) -> Baseline {
+    fn baseline_with(sites: &[(u32, u32)], crash: bool) -> Baseline {
         let mut sub = SubtestBaseline {
             crash,
             sites: BTreeMap::new(),
         };
-        for &(line, count, class) in sites {
-            sub.sites.insert(site(line), SiteEntry { count, class });
+        for &(line, count) in sites {
+            sub.sites.insert(site(line), count);
         }
         let mut baseline = Baseline::default();
         baseline.entries.insert(key(), sub);
         baseline
+    }
+
+    fn classes_with(entries: &[(u32, Classification)]) -> BTreeMap<Site, DocSite> {
+        entries
+            .iter()
+            .map(|&(line, class)| {
+                (
+                    site(line),
+                    DocSite {
+                        class,
+                        cluster: "device.c/test".to_owned(),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn current_with(sites: &[(u32, u32)], crash: bool) -> BTreeMap<(Arch, Subtest), SubtestResult> {
@@ -201,11 +220,12 @@ mod tests {
 
     #[test]
     fn crash_with_panic_surfaces_the_location() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], false);
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let mut cur = current_with(&[(1, 5)], true);
         cur.get_mut(&key()).unwrap().panic =
             Some("panicked at d3d9/src/device.rs:1080:22 — misaligned pointer dereference".into());
-        let report = diff(&base, &cur);
+        let report = diff(&base, &classes, &cur);
         assert!(report.regressed, "new crash is a regression");
         assert!(
             report
@@ -218,46 +238,52 @@ mod tests {
 
     #[test]
     fn count_up_is_regression() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], false);
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 6)], false);
-        assert!(diff(&base, &cur).regressed);
+        assert!(diff(&base, &classes, &cur).regressed);
     }
 
     #[test]
     fn new_site_is_regression() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], false);
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 5), (2, 1)], false);
-        assert!(diff(&base, &cur).regressed);
+        assert!(diff(&base, &classes, &cur).regressed);
     }
 
     #[test]
     fn new_crash_is_regression() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], false);
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 5)], true);
-        assert!(diff(&base, &cur).regressed);
+        assert!(diff(&base, &classes, &cur).regressed);
     }
 
     #[test]
     fn count_down_and_crash_gone_are_improvements_not_regressions() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], true);
+        let base = baseline_with(&[(1, 5)], true);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 3)], false);
-        let report = diff(&base, &cur);
+        let report = diff(&base, &classes, &cur);
         assert!(!report.regressed);
         assert!(report.text.contains("improved"), "{}", report.text);
     }
 
     #[test]
     fn unchanged_is_ok() {
-        let base = baseline_with(&[(1, 5, Classification::Real)], false);
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 5)], false);
-        assert!(!diff(&base, &cur).regressed);
+        assert!(!diff(&base, &classes, &cur).regressed);
     }
 
     #[test]
     fn flaky_site_count_up_is_tolerated_not_a_regression() {
-        let base = baseline_with(&[(5368, 1, Classification::Flaky)], false);
+        let base = baseline_with(&[(5368, 1)], false);
+        let classes = classes_with(&[(5368, Classification::Flaky)]);
         let cur = current_with(&[(5368, 2)], false);
-        let report = diff(&base, &cur);
+        let report = diff(&base, &classes, &cur);
         assert!(!report.regressed, "a flaky site flutter must not gate");
         assert!(report.text.contains("flaky (count up"), "{}", report.text);
         assert!(report.text.contains("ok"), "{}", report.text);
@@ -265,9 +291,10 @@ mod tests {
 
     #[test]
     fn flaky_site_count_down_is_tolerated_not_an_improvement() {
-        let base = baseline_with(&[(5368, 1, Classification::Flaky)], false);
+        let base = baseline_with(&[(5368, 1)], false);
+        let classes = classes_with(&[(5368, Classification::Flaky)]);
         let cur = current_with(&[(5368, 0)], false);
-        let report = diff(&base, &cur);
+        let report = diff(&base, &classes, &cur);
         assert!(!report.regressed);
         // A flaky flutter down is noise, not a celebrated improvement.
         assert!(report.text.contains("flaky (count down"), "{}", report.text);
@@ -279,19 +306,21 @@ mod tests {
     }
 
     #[test]
-    fn new_site_still_regresses_even_alongside_a_flaky_site() {
-        // `Flaky` only applies to sites already pinned; a brand-new failing site
-        // is still an untriaged regression.
-        let base = baseline_with(&[(5368, 1, Classification::Flaky)], false);
+    fn new_site_still_regresses_even_with_a_flaky_class_entry() {
+        // The flaky pin applies only to sites already in the baseline; a
+        // brand-new failing site regresses even if prose for it exists.
+        let base = baseline_with(&[(5368, 1)], false);
+        let classes = classes_with(&[(5368, Classification::Flaky), (9999, Classification::Flaky)]);
         let cur = current_with(&[(5368, 1), (9999, 1)], false);
-        assert!(diff(&base, &cur).regressed);
+        assert!(diff(&base, &classes, &cur).regressed);
     }
 
     #[test]
-    fn persisted_untriaged_site_is_flagged() {
-        let base = baseline_with(&[(1, 5, Classification::Untriaged)], false);
+    fn baseline_site_without_a_class_entry_is_flagged_untriaged() {
+        let base = baseline_with(&[(1, 5)], false);
+        let classes = classes_with(&[]);
         let cur = current_with(&[(1, 5)], false);
-        let report = diff(&base, &cur);
+        let report = diff(&base, &classes, &cur);
         assert!(!report.regressed);
         assert!(report.text.contains("untriaged"), "{}", report.text);
     }

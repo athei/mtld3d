@@ -14,13 +14,12 @@
 mod classify;
 mod cli;
 mod diff;
-#[cfg(test)]
-mod docsync;
 mod isolate;
 mod merge;
 mod model;
 mod run;
 mod scan;
+mod triage;
 
 use std::{
     collections::BTreeMap,
@@ -77,19 +76,35 @@ fn real_main() -> Result<ExitCode, String> {
 
     if config.update {
         // Re-baselining must never be blocked by an unparseable prior (a
-        // legacy-format or corrupt file): at worst we lose classification
-        // carry-over for this run, which the human re-seeds.
+        // legacy-format or corrupt file): the prior is consulted only to
+        // report which sites are new or gone.
         let prior = load_optional(&baseline_path).unwrap_or_else(|e| {
-            eprintln!("warning: ignoring unparseable prior baseline ({e}); classifications reset to untriaged");
+            eprintln!("warning: ignoring unparseable prior baseline ({e}); new/dropped reporting incomplete");
             Baseline::default()
         });
         let (next, summary) = merge::merge(&prior, &current, wine_version);
         std::fs::write(&baseline_path, next.to_text())
             .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
         println!(
-            "wrote baseline ({}): {} carried, {} untriaged, {} dropped",
-            next.wine_version, summary.carried, summary.untriaged, summary.dropped
+            "wrote baseline ({}): {} carried, {} new, {} dropped",
+            next.wine_version,
+            summary.carried,
+            summary.new_sites.len(),
+            summary.dropped_sites.len()
         );
+        // Point the human at the exact CONFORMANCE.md edits the re-baseline
+        // requires; `make test` (the triage sync test) stays red until done.
+        // Loaded tolerantly: the doc may be mid-edit during a re-baseline.
+        let classes = triage::load(&assets).unwrap_or_default();
+        for site in &summary.new_sites {
+            println!("  new: {site} - add to its CONFORMANCE.md cluster with a rationale");
+        }
+        for site in &summary.dropped_sites {
+            let cluster = classes
+                .get(site)
+                .map_or_else(|| "not documented".to_owned(), |doc| doc.cluster.clone());
+            println!("  dropped: {site} - remove its CONFORMANCE.md entry ({cluster})");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -106,7 +121,8 @@ fn real_main() -> Result<ExitCode, String> {
             baseline.wine_version, wine_version
         );
     }
-    let report = diff::diff(&baseline, &current);
+    let classes = triage::load(&assets)?;
+    let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
     if report.regressed {
         println!("conformance: REGRESSIONS detected");

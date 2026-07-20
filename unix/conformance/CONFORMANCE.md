@@ -45,17 +45,29 @@ failing site, or a subtest that started crashing. Improvements (a count that
 dropped, a site that disappeared, a crash that cleared) are reported but do not
 fail the gate; they are a cue to re-record the baseline.
 
-## What the baseline records
+## What the baseline records — and where classes live
 
-`baseline.txt` is the single source of truth for the current results. For each
-`(arch, subtest)` it records the crash bit plus every failing assertion as a
-`<file>.c:<line>` site with a hit count and a classification tag:
+Each datum has exactly one authoritative home, split by who writes it:
 
-```
-[i686/device] crash=1
-  device.c:125 count=28 class=real
-  ...
-```
+- **`baseline.txt` (machine-owned)** records the current *results*: for each
+  `(arch, subtest)`, the crash bit plus every failing assertion as a
+  `<file>.c:<line>` site with a hit count. No classifications — the file is
+  freely rewritten by `make conformance-baseline` without ever touching prose.
+
+  ```
+  [i686/device] crash=1
+    device.c:125 count=28
+    ...
+  ```
+
+- **This document (human-owned)** records *why* each site fails: the
+  per-cluster section below declares every site's classification as a
+  `<line>=<class>` token on a `Sites:` line, next to the rationale prose.
+  The runner loads classes from here (for the flaky tolerance and untriaged
+  reporting); a unit test in the runner crate fails `make test` unless the
+  two files cover exactly the same sites — so a new baseline site stays loud
+  until someone writes its rationale, and a fixed site's prose must be
+  removed rather than lingering as history.
 
 Per-site granularity is what makes the score actionable: the 74 `device`
 failures, for instance, are really three source lines hit repeatedly in a loop,
@@ -63,13 +75,12 @@ not 74 distinct defects. Recording the location (not just a total) means a fixed
 bug and a new regression can no longer net out to the same number and hide each
 other.
 
-`make conformance-baseline` re-records the file. The merge **preserves** the
-classification a human assigned to any site that still fails, marks
-newly-appeared sites `untriaged`, and drops sites that no longer fail — so triage
-survives across runs while genuinely new failures stay loud. A run whose Wine
-version differs from the baseline's recorded version warns that `file:line`
-sites may have drifted (a Wine update renumbers source lines) and a re-baseline
-is expected.
+`make conformance-baseline` re-records `baseline.txt` and prints exactly which
+sites are new (add them to a cluster below, with a rationale) and which were
+dropped (delete their tokens and trim the prose). A run whose Wine version
+differs from the baseline's recorded version warns that `file:line` sites may
+have drifted (a Wine update renumbers source lines) and a re-baseline is
+expected — the `Sites:` tokens here renumber with it.
 
 ## Classification tags
 
@@ -101,9 +112,11 @@ hard-to-fix or low-value defect is still `real`):
   Tag reactively — only once a flutter actually trips the gate — and pin the
   HIGHER observed count so a flutter back up is not a false regression.
 - **`crash`** — a site attributed to a crash/abort path.
-- **`untriaged`** — newly appeared and not yet classified by a human. The runner
-  flags these on every run; they should be triaged and re-tagged in
-  `baseline.txt`.
+- **`untriaged`** — an explicit placeholder for a site a human has not yet
+  triaged. Normally untriaged means *absent from this document* (the sync test
+  stays red until prose exists); writing `=untriaged` is the escape hatch for
+  landing a re-baseline before the triage is done — the runner still flags it
+  on every run.
 
 The counts are the signal, not a target of zero. Wine's `todo_wine`/`broken()`
 annotations are tuned for a real-GPU driver, not for us, so a raw failure is
@@ -113,13 +126,13 @@ failures reached *before* the crash truncated the run.
 
 ## Per-cluster classification
 
-This section is the authoritative rationale for every failing site in
-`baseline.txt`, grouped by enclosing Wine test function. It is kept in exact
-sync with the baseline: a unit test in the runner crate parses the `Sites:`
-lines below and fails if any baseline site is missing here, listed twice, or
-tagged differently than the baseline. When a re-baseline adds or removes
-sites, update the matching cluster block (and its rationale) in the same
-commit.
+This section is the authoritative home of every failing site's classification
+and rationale, grouped by enclosing Wine test function. The classes exist only
+here (`baseline.txt` holds counts); the runner loads them at gate time, and a
+unit test in the runner crate fails if any baseline site has no `Sites:` entry
+below, any entry names a site that no longer fails, or a site is declared
+twice. When a re-baseline adds or removes sites, update the matching cluster
+block (and its rationale) in the same commit.
 
 Line numbers refer to the Wine version recorded in the baseline header. A
 `Sites:` line lists every baseline site of the cluster as `<line>=<class>`;

@@ -1,9 +1,9 @@
 //! The per-site failure classification.
 //!
-//! A human assigns one of these to every failing site in `baseline.txt`; the
-//! `--update-baseline` merge then carries the tag forward across re-baselines
-//! (see [`crate::merge`]). The tags are explained for readers in the
-//! `CONFORMANCE.md` alongside this crate.
+//! A human assigns one of these to every failing site, in the per-cluster
+//! section of `CONFORMANCE.md` alongside its rationale prose (loaded by
+//! [`crate::triage`]). The tag definitions and the audit rubric live in that
+//! document.
 
 use std::{fmt, str::FromStr};
 
