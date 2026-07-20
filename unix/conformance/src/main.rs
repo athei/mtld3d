@@ -14,6 +14,8 @@
 mod classify;
 mod cli;
 mod diff;
+#[cfg(test)]
+mod docsync;
 mod isolate;
 mod merge;
 mod model;

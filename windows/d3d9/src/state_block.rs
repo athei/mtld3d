@@ -102,8 +102,9 @@ pub enum StateOp {
     StreamSource {
         /// Null for SetStreamSource(stream, NULL, ..).
         ///
-        /// Only stream 0 reaches the recorder — higher streams are
-        /// rejected upstream with INVALIDCALL, same as the live setter.
+        /// Only stream 0 reaches the recorder — the live setter stores
+        /// higher streams for the Get round-trip, but state blocks do not
+        /// capture them (single-stream architecture).
         vb: CachedComPtr<Direct3DVertexBuffer9>,
         offset: u32,
         stride: u32,

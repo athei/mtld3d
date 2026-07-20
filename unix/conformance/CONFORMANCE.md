@@ -73,14 +73,33 @@ is expected.
 
 ## Classification tags
 
-Each failing site carries one tag, explaining *why* it fails:
+Each failing site carries one tag. The tag is a deterministic property of the
+divergence's NATURE — never of fixability, difficulty, or in-game value (a
+hard-to-fix or low-value defect is still `real`):
 
-- **`real`** — a genuine defect we intend to fix.
-- **`caps`** — the test takes a different expected-value branch because our
-  capability bits omit something; our actual pixels/values are correct, so this
-  is not a defect.
-- **`expected`** — we deliberately do not implement this (e.g. D3D9Ex); the
-  failure is the documented, by-design outcome.
+- **`real`** — a genuine defect we intend to fix: our output/behavior is wrong
+  and no deliberate design rationale covers the divergence. A mixed line (any
+  intend-to-fix component alongside by-design assertions) is `real`, with the
+  remainder explained in prose.
+- **`caps`** — the failure exists only because the test assumes a capability we
+  deliberately don't advertise, AND our actual behavior is the conformant
+  response for a device without that capability (correct pixels, or the
+  spec-correct rejection). A cap-*respecting* test simply passes and never
+  lands here; `caps` covers cap-*blind* assertions (Wine's tests assume caps
+  that real desktop drivers always have) and escapes offered only under
+  `broken()`, which the runner does not honor. If our response to the missing
+  capability is itself non-conformant, the site is `real`.
+- **`expected`** — we deliberately do not implement this and intend to keep it
+  that way, for a positive, documented reason: a scope decision (D3D9Ex,
+  desktop mode switching), a kept perf tradeoff (the TBDR depth-store elision,
+  buffer-rename over stalls), or an accepted platform limitation (Metal's
+  0xffff primitive restart, GPU-defined NaN encodings). "We don't want to fix
+  it" or "the fix is invasive" is not a rationale — without a positive reason
+  to keep the divergence, the site is `real`.
+- **`flaky`** — environmental/non-deterministic (display config, Retina scale,
+  macdrv window-manager timing). Count changes in either direction never gate.
+  Tag reactively — only once a flutter actually trips the gate — and pin the
+  HIGHER observed count so a flutter back up is not a false regression.
 - **`crash`** — a site attributed to a crash/abort path.
 - **`untriaged`** — newly appeared and not yet classified by a human. The runner
   flags these on every run; they should be triaged and re-tagged in
@@ -92,204 +111,478 @@ not necessarily a real defect — the classification is what turns the number in
 something actionable. Note that when a subtest crashes, the counts cover only the
 failures reached *before* the crash truncated the run.
 
-## Per-cluster audit — current authoritative picture
+## Per-cluster classification
 
-This section is the authoritative current state of every failing site. Every
-failing assertion was captured with its real message
-(`MTLD3D_CONFORMANCE_RAW_DIR=<dir> make conformance` dumps each subtest's raw
-output to `<dir>/<arch>-<subtest>.log`), grouped into 66 clusters by enclosing
-Wine test function, and each cluster audited against the Wine test source, the
-*actual-vs-expected* runtime values, and our implementation — then the
-classification was adversarially re-verified.
+This section is the authoritative rationale for every failing site in
+`baseline.txt`, grouped by enclosing Wine test function. It is kept in exact
+sync with the baseline: a unit test in the runner crate parses the `Sites:`
+lines below and fails if any baseline site is missing here, listed twice, or
+tagged differently than the baseline. When a re-baseline adds or removes
+sites, update the matching cluster block (and its rationale) in the same
+commit.
 
-Headline (per-(arch,subtest) site-lines, both PE arches): **0 `real` · 34
-`caps` · 336 `expected` · 4 `flaky` · 0 `untriaged`**; all 8 subtest-arches
-`crash=0`, gate green. The audit retagged 24 clusters: the prior tags had filed
-a number of *fixable* defects as `caps`/`expected`. Tags do not affect the gate
-(which rejects count/site/crash regressions), so the retag is documentation-only.
+Line numbers refer to the Wine version recorded in the baseline header. A
+`Sites:` line lists every baseline site of the cluster as `<line>=<class>`;
+prose explains why. One source line can fire many assertions and can mix
+sub-causes — a `real` line may carry a by-design remainder (noted in prose),
+per the mixed-site rule: if any intend-to-fix component remains on a line,
+the line is `real`.
 
-**Already cleared, each gate-verified (no NET regression, `crash=0`):**
-`test_get_display_mode` (swapchain GetDisplayMode stub,
-14356/14389/14390/14391/14489), `test_swapchain_parameters` (CreateDevice/Reset
-present-param validation + caller writeback,
-12439/12449/12477/12527/12558/12560/12562/12564), `test_getdc` backbuffer
-(lockable-backbuffer GetDC via read-back, 9329/9330/9332), `test_stretch_rect`
-cross-format RT blit (13357/13386/13427 — 13412 offscreen→offscreen deferred),
-`stretchrect_test` (4247, offscreen staging refresh), `test_draw_mapped_buffer`
-(26251/26276), `add_dirty_rect_test` (19156/19163, managed READONLY-first upload),
-`srgbtexture_test` (8532, stop advertising SRGBREAD without a sampling decode),
-and `fog_test` linear-fog math (2410/2412/2450/2454/2458/2462,
-reversed/equal-range). Also pinned `device.c:4475` (wndproc) `flaky` — it flutters
-cross-environment and now trips the gate. **`test_format_conversion` (28024) was
-attempted then REVERTED: broadening `CheckDeviceFormatConversion` past
-`is_present_compatible` regresses `test_display_formats` (which asserts
-`CheckDeviceType(windowed)` agrees with it) and `yuv_color/layout_test` (which
-gate their unsupported YUV→RGB blit on it) — it must stay narrow; deferred.**
+Audit provenance: every cluster below was re-derived on 2026-07-20 from the
+Wine test source, the raw actual-vs-expected failure messages
+(`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
+re-checked before retagging. Headline: **46 `real` · 134 `expected` ·
+6 `caps` · 2 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
+`crash=0`. Tags do not affect the gate (which rejects count/site/crash
+regressions), so tag corrections are documentation, not gate changes.
 
-**Cleared since the audit** (these rows are removed from the actionable table
-below): `test_clip_planes_limits` (clip-plane CPU round-trip), `test_viewport`
-(z-range fixup), `test_device_caps` (PERSPECTIVE bit), `test_multi_adapter`
-(GetAdapterMonitor → primary), `test_occlusion_query` 6590 (never-issued 0xdd
-poison), and the `test_check_device_format` real sub-set (UNKNOWN adapter format →
-INVALIDCALL; SRGBWRITE-without-RENDERTARGET surface rejected). Implementing
-GetAdapterMonitor let `test_multi_adapter` run into its fullscreen
-window-rect-vs-monitor section (device.c:14987/15035/15053), now tagged `expected`
-(a display/window environment we don't implement).
+### The `real` backlog (13 distinct defects behind the 46 sites)
 
-**`DrawIndexedPrimitiveUP` is now implemented** (inline `IndexSource::Up` +
-a transient per-draw Metal index buffer). That un-gated the draw clusters that
-routed every draw through the former stub: `test_drawindexedprimitiveup` (fully
-cleared), `fog_test`, `lighting_test`, and `test_specular_lighting` (the
-DIPUP-driven sites cleared; residual sites remain — see the per-line notes), and
-the `test_draw_primitive` DIPUP sites (3265/3283/3290/3292). All un-gated draws
-rendered correctly with no new failing sites.
+| defect | cluster(s) | sites |
+|---|---|---:|
+| SetStreamSourceFreq/GetStreamSourceFreq are INVALIDCALL stubs (state round-trip, independent of instancing) | stream_test | 24 |
+| Reset: no outstanding-DEFAULT-pool / implicit-surface-ref rejection | test_reset | 4 |
+| TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
+| StateSnapshot (D3DSBT_ALL) never captures the stream-0 vertex buffer | resource_check_data | 3 |
+| Reset does not re-show a device window whose WS_VISIBLE was cleared | test_wndproc, test_window_style | 3 |
+| Clears ignore D3DRS_SRGBWRITEENABLE (draw path honors it) | clear_test | 2 |
+| FF lighting renders black for default-light/world-matrix cases | lighting_test | 1 |
+| ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
+| Depth→depth StretchRect is an S_OK no-op | depth_blit_test | 1 |
+| CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
+| Cube-cap-off rejection shape too permissive (MANAGED/SYSTEMMEM accepted) | test_cube_textures | 2 |
+| CreateTexture(depth) succeeds while our own CheckDeviceFormat denies it | test_resource_access | 1 |
+| Occlusion query undercounts a >2^32-sample span (cause unproven) | test_occlusion_query | 1 |
 
-A `caps`/`expected` line means "not a defect / by design"; a `real` line is a
-defect we could fix. One source line can fire many assertions and can mix
-sub-cases, so a line tagged `real` may still include some by-design assertions —
-see the per-line notes.
+Coupling note for the stream-frequency fix: implementing the Set/Get round-trip
+un-gates the instanced draws behind it, so the by-design instancing pixel sites
+(12423/12464/12466/12468/12470) will rise in count — re-baseline in the same
+commit.
 
-### Key findings (highest value)
+### device.c clusters
 
-- **stateblock `D3DSBT_ALL` stream-0 vertex-buffer snapshot gap** — a real,
-  **in-game-relevant** bug (portrait/state save-restore): `StateSnapshot` captures
-  the index buffer but not the stream-0 VB. It shares baseline lines with the
-  by-design multi-stream cluster, so it is documented here rather than separately
-  tagged.
-- **`test_filling_convention` (336, caps→real, HIGH in-game risk)** — missing the
-  D3D9 half-pixel rasterization fixup (the pixel-center clip-space position
-  offset a native D3D9 driver applies); our own `vPos` handling already
-  contradicts the "pixel-center parity" premise the `caps` tag assumed. Likely
-  the systematic sub-pixel offset behind past jitter hunts.
-  **Touches all geometry — verify in-game before any fix.**
+### device.c/test_wndproc
+Sites: 4161=expected 4207=expected 4212=expected 4214=expected 4219=expected
+Sites: 4223=expected 4231=expected 4248=expected 4257=expected 4293=expected
+Sites: 4298=expected 4319=expected 4340=expected 4410=expected 4420=expected
+Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
+Sites: 4572=expected 4551=real 4568=real 4475=flaky 4480=flaky
 
-### Per-line / mixed-cluster notes (line tag = its primary cause)
+Fullscreen focus/mode lifecycle we deliberately do not drive: no desktop
+mode switch (4161/4231), no focus/foreground mutation (4212/4214), no focus-
+window subclass (4223/4572), no WM_* activation/mode message generation
+(4207/4248/4293/4319/4340/4410/4432/4525/4545), no focus-window minimize
+(4420), device-never-lost TestCooperativeLevel (4257/4298/4424/4487).
+Caveat on 4219: it fails because OUR cursor wndproc subclass replaced the
+device window's proc — a deliberate, load-bearing hook we keep (cursor
+realization), not a missing feature. 4551/4568 are `real`: after Reset a
+device window whose WS_VISIBLE was cleared must be re-shown
+(SWP_SHOWWINDOW); the test cites a real title relying on it. 4475/4480 are
+the only flaky pins: macdrv WM timing, no SetWindowPos/MoveWindow anywhere
+in our code.
 
-- `visual.c:28481` (`test_fog`, real): 64/160 assertions are the real
-  RHW/programmable-VS fog-fallback; 96/160 are by-design table fog. `28475` stays
-  `expected` (pure table fog).
-- `visual.c:15727` (`test_fetch4`, real): the 3D-volume box-upload gap. The other
-  lines (`15617`/`15668` fetch4 gather, `15824`/`15829` DF16/DF24→Depth32) stay
-  `caps`.
-- stateblock `1810`/`1812`/`1813` (`expected`): dominantly by-design multi-stream
-  capture/apply; the real `D3DSBT_ALL` stream-0 VB bug (~12 lines) is embedded in
-  these counts and cannot be isolated to its own line.
-- device `test_get_display_mode`: `14356`/`14389`/`14390`/`14391`/`14489` real
-  (`swapchain_get_display_mode` stub); the rest `expected` (fullscreen
-  mode/monitor environment we don't implement).
-- device `test_check_device_format`: the former real sub-set
-  (`12619`/`12626`/`12629`/`12632`/`12635` — SRGBWRITE-without-RT surface +
-  `UNKNOWN`→`INVALIDCALL`) is **fixed**; `12689`/`12694` `caps` (D32 is genuinely
-  creatable for us).
-- device `test_occlusion_query`: `6590` (NeverIssued `0xdd` poison) is **fixed**;
-  `6780` `caps` (Apple TBDR visibility undercount).
-- device `test_draw_primitive`: the DIPUP sites `3265`/`3283`/`3290`/`3292` are
-  **cleared**; `3269`/`3295` real (a residual DIPUP draw sub-case) + `3330` real
-  (refcount).
-- `add_dirty_rect_test`: `19156`/`19163` real (managed READONLY-first-lock never
-  uploaded); `19210`/`19217`/`19232` `expected` (NO_DIRTY_UPDATE / explicit
-  `AddDirtyRect` by design).
-- device `test_stretch_rect`: `13357`/`13386`/`13427` real (cross-format RT blit,
-  clearable via the render-quad path); `13412` real but harder (offscreen→
-  offscreen, no clean Metal path).
+### device.c/test_reset
+Sites: 2126=expected 2127=expected 2179=expected 2180=expected 2234=expected
+Sites: 2237=expected 2238=expected 2250=expected 2251=expected 2519=expected
+Sites: 2521=expected 2529=expected 2531=expected
+Sites: 2370=real 2372=real 2496=real 2498=real 2541=real
 
-### Reclassifications applied (24 clusters, 196 site-lines)
+The expected half is the fullscreen mode environment: screen-resolution
+asserts after fullscreen create/Reset (2126–2251) and fullscreen Reset to
+non-enumerable modes 32x32/801x600 (2519–2531) — with no exclusive display
+modes, any backbuffer size is valid for us, so accepting is internally
+consistent. The real half is windowed API contract, not environment:
+Reset must return INVALIDCALL with an outstanding DEFAULT-pool surface
+(2370) or a held implicit-backbuffer reference (2496), with
+TestCooperativeLevel reporting DEVICENOTRESET afterwards (2372/2498); and
+a failed Reset (0x0 — which we do reject) must latch DEVICENOTRESET until
+a successful Reset (2541). `device_test_cooperative_level` hardcodes S_OK.
 
-- **caps→real**: `test_clip_planes_limits`, `test_device_caps`,
-  `test_multi_adapter`, `test_check_device_format` (A/B sites), `test_viewport`,
-  `test_filling_convention`, `test_fetch4` (volume site), `test_shademode`,
-  `z_range_test`, `srgbwrite_format_test`, `test_get_display_mode` (swapchain
-  sites).
-- **expected→real**: `test_swapchain_parameters`, `test_stretch_rect`,
-  `test_occlusion_query` (6590), `test_vidmem_accounting`, `test_fog` (28481),
-  `fog_test`, `zenable_test`, `test_drawindexedprimitiveup`, `srgbtexture_test`,
-  `test_draw_primitive` (6 DIPUP sites).
-- **caps→expected**: `test_get_display_mode` (mode/monitor sites),
-  `test_window_position`.
-- **expected→caps**: `test_occlusion_query` (6780, TBDR undercount).
-- **real→caps**: `test_max_index16` (Metal `0xffff` primitive-restart +
-  write-outside-lock UB; `broken(warp)` confirms).
+### device.c/test_wndproc_windowed
+Sites: 4681=expected 4697=expected 4701=expected 4708=expected 4751=expected
+Sites: 4774=expected 4778=expected 4785=expected
 
-### Actionable clusters (a `real` defect present)
+4701/4778 expect the focus window subclassed in fullscreen (we don't).
+The other six expect the device window's wndproc UNCHANGED and fail because
+of our cursor subclass — the same deliberate hook as test_wndproc 4219,
+kept on purpose (cursor realization is driven from it).
 
-Sorted by assertion count. The `caps`/`expected` remainder of mixed clusters is
-in the per-line notes above. Lines column may be elided (`+N`).
+### device.c/test_reset_fullscreen
+Sites: 4871=expected
 
-> **Note:** the cleared batch listed under the headline already covers
-> `test_get_display_mode`, `test_swapchain_parameters`, `test_getdc` (backbuffer),
-> `test_stretch_rect` (13357/13386/13427), `stretchrect_test`,
-> `test_draw_mapped_buffer`, `add_dirty_rect_test`, `srgbtexture_test`, and
-> `fog_test` (linear math). Those rows below are kept for history; the live
-> backlog is the remainder (`test_fog` 28481, `test_fetch4`, `test_filling_
-> convention`, `test_miptree_layout`, `test_shademode`, `zenable_test`,
-> `depth_blit_test`, `clear_test`, the passes.rs depth/store family, …).
+WM_ACTIVATEAPP delivery on a windowed→fullscreen Reset; we do not
+force-show/activate the window.
 
-| cluster | lines | cnt | root cause | fix (size) |
-|---|---|---:|---|---|
-| visual/`test_fog` | — | 0 | **FIXED (schema 54)**: RHW-with-bound-VS bypass + programmable-VS no-`oFog` specular-alpha fallback + per-pixel table fog (Z source = the `fog_z [[center_no_perspective]]` varying + raw `D3DRS_DEPTHBIAS` — Metal folds `setDepthBias` into `[[position]].z` scaled to float-buffer ulps, so the fragcoord depth is unusable as the fog source; W source = `1/in.position.w`). Surviving todo_wine configs pass-inside-todo, which the runner doesn't count. | done |
-| visual/`test_fetch4` | 15617,15668,15727,15824,15829 | 438 | fetch4 gather = AMD vendor ext (caps); real gap is 3D-volume box-upload (15727) — `lock_box` contents never uploaded (slice0/z0/depth1 hardwired). | volume box upload (~150-250 lines + 1 wire field); fetch4 itself not worth it |
-| stateblock/`resource_check_data` | 1810,1812,1813 | 430 | (a) multi-stream capture by-design (expected); (b) hidden real: `StateSnapshot` (D3DSBT_ALL) never captures the stream-0 VB (only index buffer). | hidden bug ~12 lines (snapshot+restore stream-0 VB); multi-stream stays deferred |
-| visual/`test_filling_convention` | 27409 | 336 | missing the D3D9 half-pixel rasterization fixup (the pixel-center clip-space position offset); our `vPos` path already assumes the opposite convention. **HIGH in-game risk.** | medium (~40-80 lines, sign/Y-flip care + in-game smoke) |
-| device/`test_miptree_layout` | 12784 | 144 | per-mip non-contiguous staging (`Vec<Arc<PageBox>>`); test checks the contiguous single-lock mip layout. | invasive refactor to one contiguous per-texture PageBox (deferred) |
-| device/`test_swapchain_parameters` | 12439,12449,12477,12527,+4 | 126 | `d3d9_create_device` does no present-param validation and no resolved-param writeback (the Reset path does both). | shared `validate_present_params` + writeback (~80-120 lines, d3d9 only) |
-| device/`test_stretch_rect` | 13357,13386,13412,13427 | 72 | `check_stretch_rect_formats` rejects cross-Metal-format pairs before the scaling decision; the converting render-quad path is never reached. | relax + route cross-format to render-quad (~40-80 lines); offscreen→offscreen harder |
-| device/`test_get_display_mode` | 14356,14383,14384,14389,+11 | 48 | mostly by-design (CAMetalLayer no desktop mode-switch / monitor enum); real sub-set = `swapchain_get_display_mode` stub. | swapchain stub ~8-10 lines; the mode/monitor sites are expected |
-| visual/`fog_test` | — | 0 | **FIXED** with the `test_fog` fallback work (RHW / programmable-VS fog fallback family). | done |
-| visual/`zenable_test` | — | 0 | **FIXED**: `SetDepthClipMode` command driven by the D3D9 depth-clamp rule — clamp ⇔ depth test inactive (`ZENABLE` off OR no depth attachment) AND pre-transformed (RHW). Both conjuncts load-bearing: the S13 unconditional-RHW clamp broke `depth_clamp_test` (test live ⇒ clip, any `D3DRS_CLIPPING`), and a depth-test-only predicate broke zenable's second half (18152: regular-VS quad still clips with ZENABLE off). The RHW-with-bound-VS bypass makes the FF key's `has_rhw` cover every pre-transformed draw. | done |
-| visual/`test_shademode` | 8852,8854 | 28 | `D3DRS_SHADEMODE` stored but never consumed; varyings always smooth (no `[[flat]]`). | FLAT variant + `[[flat]]` on diffuse/specular, cache-key bump (~100-200 lines) |
-| visual/`depth_blit_test` | 14835 | 24 | depth-stencil `StretchRect` branch is a deliberate no-op (returns S_OK, emits no GPU copy). | emit a real depth→depth blit (non-trivial) |
-| visual/`clear_test` | 1292,1294,1296,1303,+6 | 20 | NULL-rect clear fold path uses a full-attachment `loadAction=Clear` that ignores the viewport (only has-work/cross-pass paths emit a viewport-clipped clear-quad). | viewport-vs-attachment check in the fold path (~small) |
-| device/`test_draw_primitive` | 3269,3295,3330 | 3 | DIPUP now implemented (3265/3283/3290/3292 cleared); residual = a DIPUP draw sub-case (3269/3295) + a refcount tail (3330). | investigate the residual sub-case + refcount |
-| device/`test_getdc` | 9124,9329,9330,9332 | 14 | (A) `CreateDIBSection` `biSizeImage=0` DIB mismatch under Wine; (B) backbuffer GetDC readback. | two separable fixes in surface.rs |
-| visual/`test_draw_mapped_buffer` | 26251,26276 | 12 | a draw from a mapped/relocked staged buffer reads stale interior; staged-buffer draw snapshot doesn't flush the pending map. | flush pending stage on draw-while-mapped (~30-60 lines) |
-| visual/`z_range_test` | 3887,3889,3891,3894,3963,3965 | 12 | store-action Rule B flips depth-store to DontCare; a Clear(z) before Present is computed but never committed, next frame reads stale depth. | optional, **NOT recommended** (re-adds per-frame depth bandwidth for nil game gain) |
-| visual/`add_dirty_rect_test` | 19156,19163,19210,19217,19232 | 10 | real: a managed mip whose first lock is READONLY is never GPU-uploaded (black). other sites NO_DIRTY_UPDATE/explicit-AddDirtyRect = expected. | real part ~6-10 lines (gate the READONLY early-return for managed-not-yet-uploaded) |
-| visual/`test_mipmap_upload` | 27550 | 10 | per-mip non-contiguous staging can't satisfy a single full-chain `LockRect(0)` contiguous pointer walk. | contiguous per-texture PageBox refactor (sizable) |
-| device/`test_resource_access` | 13838,13853 | 8 | (1) DEFAULT cube rejected (cube cap off); (2) a volume/usage access check. | both fixable but in-game risk for nil gain (LARGE for cube) |
-| visual/`texdepth_test` | 5360,5398,5436,5454 | 8 | NOT a shader bug — the ps_1_4 `saturate(src.x/min(src.y,1.0))` clamp is present and matches the D3D9 ps_1_4 reference behavior. The 4 sites fail because Rule B (`finalize_store_actions`) flips the auto depth-stencil store to `DontCare` at `Present`, so the gradient depth buffer doesn't survive to data2-7. | real, in the passes.rs depth/store family — HIGH WoW risk, deferred (see test_fog/z_range Rule B group) |
-| visual/`srgbwrite_format_test` | 16575 | 6 | sRGB-write not implemented + a loose cap advertises SRGBWRITE for formats without a Metal sRGB twin + a dropped TFACTOR fill. | tighten cap (~3 lines) + sRGB-write views (~60-120) + repro the drop |
-| visual/`test_format_conversion` | 28024 | 6 | `CheckDeviceFormatConversion` gates on `is_present_compatible` (a present-time predicate) and rejects pairs the D3D9 spec permits. | dedicated conversion predicate in direct3d9.rs |
-| device/`test_vidmem_accounting` | 10248,10250 | 4 | `GetAvailableTextureMem` returns a constant 512MB; no allocation accounting. | `vram_bytes_used` accounting per create/release (~80-130 lines) |
-| visual/`vface_register_test` | 10124,10126 | 4 | render-to-texture quad never reaches the later blit's sampler — we sample the clear colour (front/back both wrong). | reproduce via e2e, then fix the RT→sample ordering |
-| visual/`offscreen_test` | 2944 | 2 | load/store Rule E drops a depth clear that crosses a mid-frame RT switch. | treat an intervening LOAD as blocking the clear merge (passes.rs) |
-| visual/`srgbtexture_test` | 8532 | 2 | cap advertises SRGBREAD for A8R8G8B8 but sRGB decode is never applied (sampler has no decode property). | minimal: stop advertising SRGBREAD (→caps-skip, ~3-5 lines); or full sRGB views (perf cost) |
-| visual/`stretchrect_test` | 4247 | 2 | non-scaling offscreen→offscreen StretchRect copies into the Metal texture but the CPU staging mirror isn't refreshed, so a later Lock reads stale. | ~20-40 lines: refresh staging after the GPU copy |
-| visual/`test_blend` | 9029 | 2 | `X8R8G8B8` maps to a real-alpha `Bgra8Unorm` RT; DSTALPHA blend reads the written alpha instead of the implied 1.0. | format_has_alpha + force-opaque for X8 RTs (~40-60 lines) |
-| visual/`test_map_synchronisation` | 25148 | 2 | a plain (no NOOVERWRITE/DISCARD) PARTIAL lock of a contended Direct buffer isn't synchronised. | deferred (rare contended-direct case) |
-| visual/`test_max_index16` | 24135 | 2 | **caps**: Metal treats `0xffff` as primitive-restart for strips (no disable) + test writes outside its lock (UB); `broken(warp)` confirms. | n/a (caps) |
+### device.c/test_fpu_setup
+Sites: 5041=expected 5051=expected
 
-### Confirmed non-`real` (do-not-chase / acceptable) — audit upheld the tag
+i686 only. Native D3D9 rewrites the x87 control word to single precision
+(0x7f) at device creation and keeps it for callbacks; we deliberately never
+touch the FPU control word. On x86_64 the same checks are todo_wine (free).
 
-| cluster | cnt | tag | why |
-|---|---:|---|---|
-| visual/`fog_special_test` | 0 | — | **FIXED** by the fog overhaul (18342/18345 → 0 both arches). |
-| device/`test_pinned_buffers` | 4 | caps | a D3D9-driver "pinned buffer" optimization probe; not a correctness requirement |
-| visual/`fp_special_test` | 4 | caps | NaN/±inf special-value categories; GPU-specific encodings |
-| visual/`test_default_attribute_components` | 4 | caps | FLOAT3 unorm rounding (76.5→77 vs refrast 76) |
-| visual/`fog_with_shader_test` | 0 | — | **FIXED** by the fog overhaul (3350: 198/arch → 0 both arches). |
-| visual/`stream_test` | 368 | expected | hardware geometry instancing (single-stream architecture) |
-| device/`test_lockrect_invalid` | 198 | expected | `broken()`-only offset checks our runner doesn't honor |
-| device/`test_wndproc` | 84 | expected | fullscreen Win32 wndproc/mode environment |
-| device/`test_reset` | 36 | expected | fullscreen Win32 Reset contract (mode change / focus) |
-| visual/`lighting_test` | 3 | expected | DIPUP-driven sites cleared; residual `713` is a minor FF-lighting fidelity difference |
-| device/`test_mode_change` | 26 | expected | desktop display-mode-change lifecycle |
-| device/`test_wndproc_windowed` | 16 | expected | windowed wndproc-hook environment |
-| visual/`clip_planes` | 16 | expected | `SetClipPlane` GPU application is a no-op (state round-trip is separate) |
-| visual/`test_sysmem_draw` | 16 | expected | ProcessVertices SW transform / SYSTEMMEM draw |
-| visual/`fixed_function_decl_test` | 12 | expected | two-sided-stencil / color-ubyte switching loop |
-| device/`test_lost_device` | 10 | expected | fullscreen lost-device focus lifecycle |
-| visual/`test_flip` | 10 | expected | windowed flip/present-flag behaviour |
-| device/`test_window_style` | 8 | expected | fullscreen window-style adoption |
-| device/`test_device_window_reset` | 6 | expected | fullscreen device-window management |
-| device/`test_cube_textures` | 4 | expected | cube create rejection when CUBEMAP cap off (by design) |
-| device/`test_window_position` | 4 | expected | fullscreen window repositioning / monitor enum (env we don't implement) |
-| d3d9ex/`test_scene` | 2 | expected | whole d3d9ex file `win_skip`s (no `Direct3DCreate9Ex`) |
-| device/`init_d3d9on12_modules` | 2 | expected | no `Direct3DCreate9On12` export |
-| device/`test_d3d9on12` | 2 | expected | D3D9-on-12 interop N/A |
-| device/`test_fpu_setup` | 2 | expected | i686 x87 control-word rewrite we don't (and shouldn't) do |
-| device/`test_npot_textures` | 2 | expected | NPOT cube create when POW2 cap unset |
-| device/`test_reset_fullscreen` | 2 | expected | windowed→fullscreen Reset activation (WM_ACTIVATEAPP) |
+### device.c/test_window_style
+Sites: 5200=expected 5220=expected 5215=real
 
-*(The `test_cursor_pos` `device.c:5368` site is pinned-flaky: it fluttered to 0 on
-both arches during this audit's capture, confirming non-determinism; it is left at
-its existing tag and handled by the flaky-tolerant gate.)*
+5200: fullscreen window-rect adoption we don't perform. 5220: fullscreen
+extended-style (TOPMOST) management. 5215 is `real`: the windowed-Reset
+re-show contract (WS_VISIBLE) — same defect as test_wndproc 4551/4568.
+
+### device.c/test_mode_change
+Sites: 5509=expected 5533=expected 5537=expected 5542=expected 5584=expected
+Sites: 5602=expected 5622=expected 5636=expected 5639=expected 5646=expected
+Sites: 5662=expected 5671=expected 5674=expected
+
+Desktop display-mode-change lifecycle (ChangeDisplaySettingsW success,
+EnumDisplaySettings reflecting changes/restores, fullscreen window resize).
+We never switch the desktop mode by design (CAMetalLayer).
+
+### device.c/test_device_window_reset
+Sites: 5951=expected 5968=expected 5971=expected
+
+Fullscreen device-window resize to the full screen rect across Reset; not
+performed by design.
+
+### device.c/test_occlusion_query
+Sites: 6780=real
+
+A query spanning ~2^32+ samples returns a genuine undercount (this run:
+0x1de98f00 — a non-integer multiple of one fullscreen quad). The test
+accepts the exact 64-bit count or 32-bit saturation; our own fallback paths
+(slot exhaustion → u32::MAX) would have passed the saturation clause, so
+the undercount is unexplained. No capability branch is involved, so the old
+`caps` tag was wrong. Tagged `real` pending investigation of the visibility
+span/slot summation; if the undercount is proven intrinsic to Metal
+visibility counting, retag `expected` with that evidence.
+
+### device.c/test_cube_textures
+Sites: 7866=real 7868=real
+
+We do not advertise D3DPTEXTURECAPS_CUBEMAP, and the test's cap-off branch
+asserts a cube-less device rejects ALL cube creates with INVALIDCALL. We
+correctly reject DEFAULT (7864 passes) but accept MANAGED/SYSTEMMEM as
+CPU-only shells — a too-permissive rejection shape vs a native cube-less
+device. Faithful fix: reject non-SCRATCH pools while the cap is off
+(SCRATCH is asserted creatable, 7871, and passes).
+
+### device.c/test_lockrect_invalid
+Sites: 8664=expected 8682=expected 8701=expected
+
+We PASS the accept-invalid lock checks (the `broken()`-guarded Win7 reject
+alternative is not what we take). These offset assertions then compare our
+returned pointer against blind `top*pitch + left*bpp` arithmetic on the
+invalid rect. `parse_rect` clamps invalid rects (negatives→0,
+inverted/zero-area→full mip), so our offsets differ; matching XP exactly
+would require handing out pointers OUTSIDE the staging allocation, which
+the lock-safety model forbids (`lock_region_ptr` bounds assert). Deliberate
+safety tradeoff, kept. (Cube's garbage offsets are pointer diffs across
+unrelated per-lock allocations — meaningless, not out-of-bounds.)
+
+### device.c/test_pinned_buffers
+Sites: 10074=expected 10079=expected
+
+The test expects a DISCARD re-lock to return the same pinned pointer with
+prior contents intact — a driver-specific optimization probe with no cap
+branch. Our rename-on-DISCARD model returns fresh backing by design, and
+DISCARD contents are spec-undefined, so our behavior is legal. Intent-to-
+keep (the rename model is core); previously mis-tagged `caps`.
+
+### device.c/test_npot_textures
+Sites: 10178=caps
+
+The no-POW2 branch asserts CreateCubeTexture(EdgeLength=3) succeeds without
+checking D3DPTEXTURECAPS_CUBEMAP — cap-blind. Our INVALIDCALL for the
+DEFAULT pool is the correct cube-less answer (the cap-off branch of
+test_cube_textures asserts exactly that at 7864). Note: fixing the
+test_cube_textures rejection shape will make the MANAGED/SYSTEMMEM
+iterations here fail too (count 1→3, still `caps`) — re-baseline together.
+
+### device.c/test_lost_device
+Sites: 12144=expected 12146=expected 12153=expected 12155=expected
+Sites: 12199=expected
+
+Focus-loss/device-lost lifecycle: TestCooperativeLevel/Present/Reset must
+report DEVICELOST/DEVICENOTRESET across a fullscreen focus cycle. Our
+device is never lost by design (no exclusive fullscreen, no GPU loss on
+Metal). Unlike the test_reset real subset, these are all genuinely
+focus-driven.
+
+### device.c/test_check_device_format
+Sites: 12689=expected 12694=expected
+
+CheckDepthStencilMatch(..., D3DFMT_D32) — native returns NOTAVAILABLE; we
+return D3D_OK because D32 genuinely maps to Depth32Float and works. We
+advertise MORE than native here, deliberately; not an omitted-cap (`caps`)
+case, and our answer is truthful for our backend.
+
+### device.c/test_miptree_layout
+Sites: 12784=expected
+
+The test asserts each mip's lock pointer sits at a contiguous offset from
+level 0 (single-allocation mip chain). Our staging is one PageBox per mip,
+which is load-bearing for the rename-at-overlap versioning model (each
+mip's Arc swaps independently); a contiguous chain is structurally
+incompatible with that design, which we keep. Per-mip pixel data is
+correct.
+
+### device.c/test_resource_access
+Sites: 13838=real 13853=caps
+
+13838 ("Test 2D 6": DEFAULT pool, depth format, USAGE_DEPTHSTENCIL
+texture): the test derives its expectation from OUR OWN CheckDeviceFormat,
+which denies depth textures — yet the create succeeds. Internal
+inconsistency between the capability report and the create path = defect
+(either advertise or reject; decide with the usual never-advertise-what-we-
+fail rule in mind). 13853 (CUBE 0/3/7, valid DEFAULT colour cubes): the
+formula is cap-blind on CUBEMAP; our INVALIDCALL is the correct cube-less
+response — `caps`.
+
+### device.c/test_get_display_mode
+Sites: 14383=expected 14384=expected 14451=expected 14454=expected
+Sites: 14472=expected 14474=expected 14480=expected 14482=expected
+Sites: 14491=expected 14493=expected
+
+14383/14384: GetAdapterDisplayMode after a fullscreen 640x480 create must
+reflect the switched desktop mode; we never switch (device/swapchain
+GetDisplayMode correctly return 640x480 and pass). The rest are a
+monitor-environment cascade: GetAdapterMonitor/GetMonitorInfoW can fail on
+the conformance desktop (display-config dependent — absent in some runs),
+poisoning the width/height comparisons downstream. GetAdapterMonitor itself
+is implemented (MonitorFromPoint → primary).
+
+### device.c/test_window_position
+Sites: 14967=expected 14970=expected 14987=expected 15035=expected
+Sites: 15053=expected
+
+14987/15035/15053: fullscreen device window must fill the monitor rect
+(create / Reset / activation); we don't reposition windows. 14967/14970:
+the same GetAdapterMonitor/GetMonitorInfoW environment cascade as
+test_get_display_mode (absent in some display configs).
+
+### device.c/init_d3d9on12_modules
+Sites: 15088=expected
+
+`win_skip("Direct3DCreate9On12 is not supported…")` — under Wine, win_skip
+counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
+Metal. (This site was previously mis-clustered under test_window_position.)
+
+### device.c/test_d3d9on12
+Sites: 15160=expected
+
+The `win_skip("Failed to load d3d9on12 modules…")` companion to 15088,
+same rationale.
+
+### visual.c clusters
+
+### visual.c/lighting_test
+Sites: 713=real
+
+The world-matrix loop: a lit quad with a default light must render blue
+(0x000000ff) under identity/singular/rotation matrices; we render BLACK for
+all three (the non-affine black case passes trivially). No broken()/todo
+escapes — the result is well-defined across drivers. This is a genuine FF
+lighting defect (default-light parameters and/or normal transform), not the
+"minor fidelity difference" it was previously filed as.
+
+### visual.c/clear_test
+Sites: 1473=real 1525=real
+
+With D3DRS_SRGBWRITEENABLE on, Clear(0x7f7f7f7f) must produce the
+sRGB-encoded 0xbbbbbb (asserted unconditionally; the CheckDeviceFormat
+probe above feeds only a trace). Our draw pipelines honor sRGB write, but
+the clear paths (loadAction fold and clear-quad) never consume it — we
+output raw 0x7f. Same root for both: 1473 backbuffer, 1525 offscreen RT.
+(Previously and inconsistently tagged caps/expected.)
+
+### visual.c/z_range_test
+Sites: 3887=expected 3889=expected 3891=expected 3894=expected
+Sites: 3963=expected 3965=expected
+
+All six depend on a depth clear (0.75) written BEFORE a Present surviving
+into later frames with ZWRITE off. Store-action Rule B flips the auto DS
+store to DontCare at Present — the deliberate TBDR depth-store elision (the
+preserve fix was implemented and reverted to keep the optimization). The
+broken() r500 alternatives are ignored by the runner; the primary
+assertions need cross-Present depth.
+
+### visual.c/texdepth_test
+Sites: 5360=expected 5398=expected 5436=expected 5454=expected
+
+The ps_1_4 depth-gradient math is correct (the same-frame cycle passes and
+is absent here). The failing cycles read the gradient across Presents —
+the same Rule B depth-store elision as z_range_test.
+
+### visual.c/fixed_function_decl_test
+Sites: 9632=expected 9638=expected 9641=expected 9645=expected
+Sites: 9651=expected 9654=expected
+
+The failing draws source the color attribute from STREAM 1 (position from
+stream 0) via the D3DCOLOR/UBYTE4N declarations; we render stream 0 only
+(single-stream architecture, kept). The previous "two-sided-stencil /
+color-ubyte switching" rationale was wrong about the mechanism.
+
+### visual.c/stream_test
+Sites: 12258=real 12261=real 12265=real 12275=real 12276=real 12278=real
+Sites: 12280=real 12281=real 12283=real 12285=real 12286=real 12288=real
+Sites: 12290=real 12291=real 12295=real 12296=real 12300=real 12393=real
+Sites: 12398=real 12404=real 12410=real 12448=real 12452=real 12456=real
+Sites: 12423=expected 12464=expected 12466=expected 12468=expected
+Sites: 12470=expected
+
+The real block is the Set/GetStreamSourceFreq STATE ROUND-TRIP: both entry
+points are INVALIDCALL stubs, so every set/get/value assertion fails (the
+sibling INVALIDCALL-expecting checks pass by accident of the stub). Storing
+the frequency state is plain D3D9 API surface, independent of rendering
+instancing — previously mis-filed under "single-stream architecture". The
+expected block is actual instanced RENDERING output (INSTANCEDATA freq
+dividers), which single-stream rendering deliberately does not implement.
+See the coupling note in the backlog table: fixing the round-trip un-gates
+the instanced draws and their counts will rise.
+
+### visual.c/depth_blit_test
+Sites: 14835=real
+
+Depth→depth StretchRect returns S_OK but emits no GPU copy, so the
+destination keeps its cleared depth and 12 of 16 probe pixels mismatch —
+all within one frame (readback precedes the Present), so this is NOT the
+Rule B family. The no-op exists because a naive copyFromTexture didn't
+survive the bound-DS pass reload, i.e. "the naive fix was wrong" — not a
+kept tradeoff (it buys no perf). Real: emit the copy and order it against
+the deferred depth clear.
+
+### visual.c/test_fetch4
+Sites: 15617=caps 15668=caps 15824=caps 15829=caps
+
+Fetch4 is an AMD vendor extension enabled via a magic FOURCC through
+D3DSAMP_MIPMAPLODBIAS; DF16/DF24 are vendor depth-texture FOURCCs we map to
+Depth32. We deliberately advertise none of it; our output is the correct
+fetch4-off/format-absent result (accepted by the test only under broken()).
+15668/15824/15829 counts wobble with display environment — keep the higher
+pin (a count-down is tolerated; a low pin makes the flutter-back a false
+regression).
+
+### visual.c/clip_planes
+Sites: 16129=expected 16131=expected
+
+The test applies FF clip planes without branching on MaxUserClipPlanes (we
+report 0). SetClipPlane/GetClipPlane are a CPU round-trip store with no GPU
+application, consistent with the zero cap: a conformant app would not use
+clip planes on this device. Deliberate scope decision. Becomes `real` the
+moment a target title needs user clip planes.
+
+### visual.c/fp_special_test
+Sites: 16433=expected
+
+VS special-float ops on NaN/±inf: the test accepts four distinct vendor
+results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
+GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
+result matching no vendor's encoding. Matching a specific vendor is neither
+feasible nor desirable. No capability involved (old `caps` tag incoherent).
+
+### visual.c/add_dirty_rect_test
+Sites: 19210=expected 19217=expected 19232=expected
+
+The surviving sites require STALE data to be shown: a NO_DIRTY_UPDATE lock
+must NOT be uploaded (19210/19217), and after AddDirtyRect only the dirty
+sub-rect may refresh (19232). Our design uploads whole mips eagerly with
+self-tracked dirtiness and treats AddDirtyRect as a no-op — we show fresher
+data than required. Deliberate; the READONLY-first-lock upload defect that
+used to live here (19156/19163) is fixed.
+
+### visual.c/test_flip
+Sites: 22053=expected 22055=expected 22064=expected 22066=expected
+Sites: 22072=expected
+
+The device is created with D3DSWAPEFFECT_DISCARD, under which post-Present
+backbuffer contents are UNDEFINED by spec; the test observes native's
+incidental flip-chain content rotation. Not emulating that is
+spec-compliant. Surface identity and lockable read-back pass. A title
+relying on flip-chain read-back under FLIP/COPY swap effects would be a
+different (real) matter.
+
+### visual.c/test_max_index16
+Sites: 24133=expected 24135=expected
+
+Metal treats index 0xffff as the un-disableable uint16 primitive-restart
+sentinel, dropping the triangle that uses it; the test additionally writes
+vertex 0xffff OUTSIDE its lock (UB, may never reach the GPU). broken(warp)
+shows even the MS reference rasterizer fails this; the runner ignores
+broken(). Accepted platform limitation (no cap branch — old `caps` tag was
+wrong).
+
+### visual.c/test_map_synchronisation
+Sites: 25148=expected
+
+The failing config is exactly the plain (no DISCARD/NOOVERWRITE) PARTIAL
+lock of a contended Direct buffer, which native stalls for. Our buffer-
+rename design deliberately removed that stall (`plan_lock` → WriteInPlace);
+re-adding it is the only fix and is a rejected perf regression.
+
+### visual.c/test_sysmem_draw
+Sites: 25431=real 25436=real 25505=expected 25518=expected 25565=expected
+
+25431/25436: ProcessVertices is an INVALIDCALL stub — unimplemented SW
+vertex processing, no design rationale (real). 25505/25518/25565: the
+colour attribute comes from stream 1 of a two-stream SYSTEMMEM declaration;
+single-stream rendering by design. Note single-stream SYSTEMMEM draws
+themselves work (those checks pass) — the old "SYSTEMMEM draw" rationale
+was wrong.
+
+### visual.c/test_mipmap_upload
+Sites: 27550=expected
+
+The app writes the whole mip chain through a single level-0 lock pointer;
+with per-mip PageBox staging the upper mips never receive the data. Same
+architecture-we-keep rationale as test_miptree_layout — but this is the
+weakest `expected` in the file: it produces wrong rendered pixels for a
+real-app pattern (Wine cites shipped titles). If the per-mip staging
+commitment is ever softened, retag `real` first.
+
+### visual.c/test_default_attribute_components
+Sites: 27902=expected
+
+FLOAT→unorm rounding at exactly .5: Metal rounds 76.5 up (77), refrast
+truncates (76). A ±1 GPU rounding-convention difference with no cap branch;
+mimicking refrast exactly is not feasible or desirable.
+
+### visual.c/test_format_conversion
+Sites: 28024=real
+
+Three rows fail, all expecting S_OK from CheckDeviceFormatConversion:
+R5G6B5→X8R8G8B8 (no escape — every real driver converts this, and our own
+StretchRect render-quad path CAN, so our NOTAVAILABLE is a false report =
+the real component) plus YUY2→X8R8G8B8/R5G6B5 (broken_warp rows — our
+NOTAVAILABLE is the honest answer for a device without YUV conversion; the
+runner ignores broken()). Mixed line ⇒ real. The fix is the dedicated
+conversion predicate (decoupled from `is_present_compatible`); note the
+known coupling: test_display_formats asserts CheckDeviceType(windowed)
+agrees, and the YUV blit tests gate on this predicate — change all three
+consistently.
+
+### stateblock.c clusters
+
+### stateblock.c/resource_check_data
+Sites: 1810=real 1812=real 1813=real
+
+The 16-stream verification loop (VB pointer / offset / stride). Two causes
+share these lines: (a) ~210 of 215 assertions are streams 1–15, which state
+blocks deliberately don't capture (single-stream architecture — the
+recorder path stores stream 0 only); (b) the intend-to-fix core: the
+snapshot path (`StateSnapshot`, D3DSBT_ALL) captures the index buffer but
+has NO stream-0 vertex-buffer/offset/stride field at all, so the two
+CreateStateBlock(ALL)→Apply chains lose the stream-0 binding (5 assertions:
+2 on 1810, 1 on 1812, 2 on 1813 — stream-0 failures confirmed in raw logs).
+Mixed-site rule ⇒ real. Fix: capture/apply stream 0 in StateSnapshot like
+the recorder already does. (The 77/61/77 counts: the offset quirk
+SB_QUIRK_STREAM_OFFSET_NOT_UPDATED lets 16 offset asserts pass in one
+chain.)
+
+### d3d9ex.c clusters
+
+### d3d9ex.c/START_TEST
+Sites: 5184=expected
+
+`win_skip("Failed to get address of Direct3DCreate9Ex")` — win_skip counts
+as a failure under Wine, and START_TEST returns immediately, so no d3d9ex
+test ever runs. We deliberately don't export Direct3DCreate9Ex (D3D9Ex out
+of scope; target titles use plain D3D9). (Previously mis-attributed to
+test_scene, which never executes.)
