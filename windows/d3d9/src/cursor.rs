@@ -45,6 +45,7 @@ unsafe extern "system" {
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetCursorPos(p: *mut POINT) -> i32;
     fn CreateIconIndirect(info: *const ICONINFO) -> *mut c_void;
+    fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
     fn CallWindowProcW(
         prev_proc: *mut c_void,
         hwnd: *mut c_void,
@@ -53,6 +54,11 @@ unsafe extern "system" {
         lp: isize,
     ) -> isize;
     fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
 }
 
 // Win32 LONG is 32-bit; `SetWindowLongPtrW` only exists on 64-bit Windows,
@@ -105,6 +111,26 @@ fn get_cursor_pos() -> Option<POINT> {
     // from an owned local, so non-null + aligned + writable holds.
     let ok = unsafe { GetCursorPos(&raw mut p) };
     (ok != 0).then_some(p)
+}
+
+/// Win32 thread id of the caller.
+///
+/// Cursor realization only reaches the Mac driver when it runs on the thread
+/// that owns the cursor window: wine's `set_cursor` server request notifies
+/// the driver from `update_desktop_cursor_handle` only when the calling
+/// thread's input is the cursor window's input. A game that drives
+/// `ShowCursor` / `SetCursorProperties` from a worker thread therefore
+/// updates nothing on screen, which is invisible without this id in the log.
+fn current_thread_id() -> u32 {
+    // SAFETY: GetCurrentThreadId takes no arguments and cannot fail.
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Win32 thread id that owns `hwnd`, or `0` if the window is gone.
+fn window_thread_id(hwnd: *mut c_void) -> u32 {
+    // SAFETY: GetWindowThreadProcessId accepts any HWND and a null
+    // process-id out-pointer; returns 0 for an invalid window.
+    unsafe { GetWindowThreadProcessId(hwnd, null_mut()) }
 }
 
 fn def_window_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
@@ -326,8 +352,13 @@ impl CursorState {
         self.original_wndproc = prev as *mut c_void;
         debug!(
             target: LOG_TARGET,
-            "install_subclass: hwnd={:p} dev={:p} prev_wndproc={:p} scale={}",
-            self.hwnd, dev_ptr, self.original_wndproc, self.scale,
+            "install_subclass: hwnd={:p} dev={:p} prev_wndproc={:p} scale={} window_tid={} caller_tid={}",
+            self.hwnd,
+            dev_ptr,
+            self.original_wndproc,
+            self.scale,
+            window_thread_id(self.hwnd),
+            current_thread_id(),
         );
     }
 
@@ -476,8 +507,8 @@ pub extern "system" fn device_set_cursor_properties(
     let visible = cur.effective_visible();
     debug!(
         target: LOG_TARGET,
-        "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} cache_entries={}",
-        desc.format, desc.pool, cur.cache.len(),
+        "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} cache_entries={} tid={}",
+        desc.format, desc.pool, cur.cache.len(), current_thread_id(),
     );
     // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
     // While hidden the game owns the win32 cursor — pushing null here clobbers
@@ -519,7 +550,8 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     if !next && cur.force_visible_after_resize() {
         debug!(
             target: LOG_TARGET,
-            "ShowCursor(show=0) suppressed by force_visible_after_resize (post-resize hide pre-empted)",
+            "ShowCursor(show=0) suppressed by force_visible_after_resize (post-resize hide pre-empted) tid={}",
+            current_thread_id(),
         );
         return i32::from(prev);
     }
@@ -538,21 +570,31 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     }
     cur.set_visible(next);
     // Realize on EVERY call, not only on transitions: a transition-gated
-    // SetCursor leaves the display stale whenever the previous realize didn't
-    // stick (pointer outside the window at the time) or a latch-suppressed
+    // SetCursor leaves wine's cursor state stale whenever a latch-suppressed
     // hide ate the transition — the game then believes the cursor visible
-    // while nothing is displayed until its next full hide/show cycle.
+    // while wine still holds the hidden state until its next full hide/show
+    // cycle.
+    //
+    // What this does NOT recover from is a pointer image replaced *below*
+    // wine: wine's `set_cursor` server request only notifies its display
+    // driver when the handle changes (`prev_cursor != new_cursor`), so
+    // re-pushing the handle wine already holds is dropped before it reaches
+    // the driver. Only a different handle, the null-then-handle kick in the
+    // WM_SETCURSOR branch below, or the pointer re-entering the window gets
+    // through.
     let handle = if next { cur.handle } else { null_mut() };
     set_cursor(handle);
     if prev == next {
         trace!(
             target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} handle={handle:p} (re-assert)",
+            "ShowCursor(show={show}) → prev={prev} handle={handle:p} tid={} (re-assert)",
+            current_thread_id(),
         );
     } else {
         debug!(
             target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} (transition)",
+            "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} tid={} (transition)",
+            current_thread_id(),
         );
     }
     i32::from(prev)
@@ -602,14 +644,16 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             if was_dirty {
                 debug!(
                     target: LOG_TARGET,
-                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=true → re-asserted handle={:p} → consumed",
+                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=true → re-asserted handle={:p} tid={} → consumed",
                     cur.handle,
+                    current_thread_id(),
                 );
             } else if log_enabled!(target: LOG_TARGET, Level::Trace) {
                 trace!(
                     target: LOG_TARGET,
-                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=false handle={:p} → consumed",
+                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=false handle={:p} tid={} → consumed",
                     cur.handle,
+                    current_thread_id(),
                 );
             }
             return 1;
@@ -617,8 +661,8 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         if log_enabled!(target: LOG_TARGET, Level::Trace) {
             trace!(
                 target: LOG_TARGET,
-                "wndproc WM_SETCURSOR: hit_test={hit_test:#x} visible={} handle={:p} → forwarded",
-                cur.effective_visible(), cur.handle,
+                "wndproc WM_SETCURSOR: hit_test={hit_test:#x} visible={} handle={:p} tid={} → forwarded",
+                cur.effective_visible(), cur.handle, current_thread_id(),
             );
         }
     } else if msg == WM_ACTIVATE {
@@ -632,8 +676,8 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         }
         debug!(
             target: LOG_TARGET,
-            "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={}",
-            cur.dirty(),
+            "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={} tid={}",
+            cur.dirty(), current_thread_id(),
         );
     } else if msg == WM_SIZE {
         // Implicit client-area resize from Wine's macdrv (e.g. macOS
@@ -675,6 +719,11 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         if !cur.handle.is_null() {
             set_cursor(cur.handle);
         }
+        debug!(
+            target: LOG_TARGET,
+            "wndproc WM_SIZE: {new_width}x{new_height} → pinned visible, dirty armed, handle={:p} tid={}",
+            cur.handle, current_thread_id(),
+        );
     }
 
     // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
