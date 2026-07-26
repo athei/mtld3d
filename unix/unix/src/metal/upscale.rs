@@ -10,30 +10,29 @@
 //! half-resolution frame comes back materially sharper than the compositor's
 //! own scaling would give. It writes the drawable directly.
 //!
-//! The scaler runs on the game's `BGRA8Unorm` back buffer in `Perceptual`
-//! colour-processing mode, which is what an sRGB-encoded 8-bit surface wants.
+//! In SDR the scaler runs on the game's `BGRA8Unorm` back buffer in
+//! `Perceptual` colour-processing mode, which is what an sRGB-encoded 8-bit
+//! surface wants. In HDR the present shader tone-maps first, at render
+//! resolution, and the scaler runs on that `RGBA16Float` result in `HDR` mode —
+//! the mode built for values beyond `[0, 1]`.
 //!
-//! Two cases it does not serve, both handled by the caller:
+//! One case it does not serve: **a GPU without `MetalFX`**. [`is_supported`]
+//! answers that once at layer attach and the PE side then keeps the drawable
+//! the same size as the back buffer, so present stays a 1:1 copy.
 //!
-//! - **A GPU without `MetalFX`.** [`is_supported`] answers this once at layer
-//!   attach and the PE side then keeps the drawable the same size as the back
-//!   buffer, so present stays a 1:1 copy.
-//! - **HDR.** The drawable is float and the inverse tone map has to run after
-//!   the upscale, so the scaler cannot write it. The present shader's own
-//!   bilinear sample covers the resample instead.
-//!
-//! Scalers are cached per (input size, output size, format) and leaked for
-//! process lifetime, the same posture as `blit.rs` / `clear_quad.rs` /
-//! `hdr_present.rs`. A resize changes the key, so a `Reset` builds a new one
+//! Scalers are cached per (input size, output size, format, colour mode) and
+//! leaked for process lifetime, the same posture as `blit.rs` / `clear_quad.rs`
+//! / `hdr_present.rs`. A resize changes the key, so a `Reset` builds a new one
 //! and the old entry is simply never looked up again.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{Mutex, OnceLock},
 };
 
 use mtld3d_shared::{
     MetalHandle,
+    mtl::PixelFormat,
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -45,10 +44,10 @@ use objc2_metal_fx::{
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
-/// Cache key: a scaler is bound to its exact geometry and formats.
+/// Cache key: a scaler is bound to its exact geometry, formats and colour mode.
 ///
-/// `MTLFXSpatialScaler` fixes input/output size and pixel format at creation,
-/// so a change in any of them needs a new instance rather than a mutation.
+/// `MTLFXSpatialScaler` fixes all of these at creation, so a change in any of
+/// them needs a new instance rather than a mutation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScalerKey {
     input_width: u32,
@@ -57,6 +56,7 @@ struct ScalerKey {
     output_height: u32,
     color_format: usize,
     output_format: usize,
+    mode: MTLFXSpatialScalerColorProcessingMode,
 }
 
 /// Process-lifetime scaler cache, `None` once the device is known unsupported.
@@ -86,39 +86,10 @@ pub fn encode(
     device: &ProtocolObject<dyn MTLDevice>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
+    mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> bool {
-    let (in_w, in_h) = (src.width(), src.height());
-    let (out_w, out_h) = (dst.width(), dst.height());
-    // Defensive: the scaler only enlarges, and `render.scale` is capped at
-    // 1.0 precisely so this cannot happen. Declining beats asking Metal to
-    // build a scaler it will refuse.
-    if in_w > out_w || in_h > out_h {
+    let Some(slot) = scaler_for(device, src, dst, mode) else {
         return false;
-    }
-
-    let Some(cache) = CACHE.get_or_init(|| init_cache(device)).as_ref() else {
-        return false;
-    };
-    let key = ScalerKey {
-        input_width: truncate(in_w),
-        input_height: truncate(in_h),
-        output_width: truncate(out_w),
-        output_height: truncate(out_h),
-        color_format: src.pixelFormat().0,
-        output_format: dst.pixelFormat().0,
-    };
-
-    let Ok(mut scalers) = cache.lock() else {
-        return false;
-    };
-    let slot = if let Some(&slot) = scalers.get(&key) {
-        slot
-    } else {
-        let Some(built) = build_scaler(device, &key) else {
-            return false;
-        };
-        scalers.insert(key, built);
-        built
     };
     // SAFETY: `slot.0` is a leaked `Retained` produced by `build_scaler` and
     // never released, so the pointee outlives this borrow.
@@ -136,6 +107,58 @@ pub fn encode(
     true
 }
 
+/// Whether [`encode`] would serve this pair, without encoding anything.
+///
+/// The HDR present path has to tone-map into a scratch texture *before* the
+/// upscale can run, and a scaler that declines after that point would strand
+/// the tone-mapped frame: the 1:1 fallback blit copies the source extent, so it
+/// cannot stand in for a resample. Asking first keeps the fallback free.
+///
+/// Builds and caches the scaler on the way, so the [`encode`] that follows a
+/// `true` answer is a hash lookup.
+pub fn can_scale(
+    device: &ProtocolObject<dyn MTLDevice>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    mode: MTLFXSpatialScalerColorProcessingMode,
+) -> bool {
+    scaler_for(device, src, dst, mode).is_some()
+}
+
+/// Look up, or build and cache, the scaler for this pair.
+fn scaler_for(
+    device: &ProtocolObject<dyn MTLDevice>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    mode: MTLFXSpatialScalerColorProcessingMode,
+) -> Option<ScalerSlot> {
+    let (in_w, in_h) = (src.width(), src.height());
+    let (out_w, out_h) = (dst.width(), dst.height());
+    // Defensive: the scaler only enlarges, and `render.scale` is capped at
+    // 1.0 precisely so this cannot happen. Declining beats asking Metal to
+    // build a scaler it will refuse.
+    if in_w > out_w || in_h > out_h {
+        return None;
+    }
+
+    let cache = CACHE.get_or_init(|| init_cache(device)).as_ref()?;
+    let key = ScalerKey {
+        input_width: truncate(in_w),
+        input_height: truncate(in_h),
+        output_width: truncate(out_w),
+        output_height: truncate(out_h),
+        color_format: src.pixelFormat().0,
+        output_format: dst.pixelFormat().0,
+        mode,
+    };
+
+    let mut scalers = cache.lock().ok()?;
+    match scalers.entry(key) {
+        Entry::Occupied(entry) => Some(*entry.get()),
+        Entry::Vacant(entry) => Some(*entry.insert(build_scaler(device, &key)?)),
+    }
+}
+
 /// Whether this GPU can run a `MetalFX` spatial upscale.
 ///
 /// Answered once at layer attach so the PE side knows whether it may size the
@@ -145,7 +168,16 @@ pub fn encode(
 pub fn is_supported(device_handle: MetalHandle<MTLDeviceKind>) -> bool {
     device_handle
         .into_retained()
-        .is_some_and(|device| CACHE.get_or_init(|| init_cache(&device)).is_some())
+        .is_some_and(|device| is_available(&device))
+}
+
+/// [`is_supported`] for a device already in hand.
+///
+/// Present-time callers reach the device through `cmd_buf.device()` and hold no
+/// handle. They ask this before allocating anything a declined scaler would
+/// orphan.
+pub fn is_available(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    CACHE.get_or_init(|| init_cache(device)).is_some()
 }
 
 /// One-shot `supportsDevice` probe, latched for the process.
@@ -185,10 +217,11 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     unsafe { desc.setColorTextureFormat(MTLPixelFormat(key.color_format)) };
     // SAFETY: scalar property write; the format came from a live texture.
     unsafe { desc.setOutputTextureFormat(MTLPixelFormat(key.output_format)) };
-    // `Perceptual` is the default and the right one for our sRGB-encoded
-    // BGRA8 back buffer; set it explicitly so the choice is visible.
+    // `Perceptual` for the sRGB-encoded BGRA8 back buffer, `HDR` for the
+    // tone-mapped float scratch the HDR present path feeds in. The caller
+    // picks; there is no format-sniffing here.
     // SAFETY: scalar property write on an owned descriptor.
-    unsafe { desc.setColorProcessingMode(MTLFXSpatialScalerColorProcessingMode::Perceptual) };
+    unsafe { desc.setColorProcessingMode(key.mode) };
     // `inputContentWidth`/`inputContentHeight` are left at their defaults:
     // they mark the used sub-rect of the colour texture, and we always feed
     // the whole back buffer.
@@ -214,22 +247,60 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     Some(ScalerSlot(Retained::into_raw(scaler)))
 }
 
-/// Cache key for a readback resolve target: one scratch texture per size.
+/// Cache key for a scratch target: one texture per size and format.
 ///
-/// No format component: [`resolve_for_readback`] only serves the `BGRA8Unorm`
-/// back buffer, so the format is fixed by the same gate that admits the call.
+/// Two callers share the cache — [`resolve_for_readback`] wants a `BGRA8Unorm`
+/// target at the reported back-buffer size, the HDR present path wants an
+/// `Rgba16Float` one at render size — so the format is what tells their
+/// entries apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScratchKey {
     width: u32,
     height: u32,
+    format: PixelFormat,
 }
 
-/// Process-lifetime cache of readback resolve targets, by raw texture handle.
+/// Process-lifetime cache of scratch targets, by raw texture handle.
 ///
 /// Stores the wire handle rather than a `Retained` so the map is trivially
 /// `Send`; each use re-borrows through `IntoRetained`, which bumps the refcount
 /// and leaves the cache's own retain live.
 static SCRATCH: OnceLock<Mutex<HashMap<ScratchKey, u64>>> = OnceLock::new();
+
+/// Get, or create and cache, a `Private` scratch texture of this size and format.
+///
+/// `Private` is not a preference: `MTLFXSpatialScaler` rejects an output
+/// texture in any other storage mode, and only the Metal debug layer reports
+/// it. [`super::texture::create_upscale_target`] pins it.
+///
+/// Returns `None` if Metal declines the texture; the caller decides what a
+/// missing scratch means for its path.
+pub fn scratch_target(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let key = ScratchKey {
+        width,
+        height,
+        format,
+    };
+    let cache = SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let handle = {
+        let mut scratch = cache.lock().ok()?;
+        match scratch.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let built = super::texture::create_upscale_target(device, width, height, format)?;
+                *entry.insert(built.raw())
+            }
+        }
+    };
+    // SAFETY: the handle came from `create_upscale_target`, which adopted the
+    // texture's canonical retain; the cache holds it for process lifetime.
+    unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()
+}
 
 /// Resolve `src` to `out_w` x `out_h` for a CPU readback, returning the resolved texture.
 ///
@@ -244,57 +315,44 @@ static SCRATCH: OnceLock<Mutex<HashMap<ScratchKey, u64>>> = OnceLock::new();
 /// and the readback are one command buffer and one wait. Returns `None` when
 /// `MetalFX` cannot serve the pair, leaving the caller to read `src` directly.
 ///
-/// The scaler cache key is the same one present uses, so the common case
-/// (readback at the frame's own scale) reuses an already-built scaler.
+/// In SDR the scaler cache key is the same one present uses, so a readback at
+/// the frame's own scale reuses an already-built scaler. In HDR present scales
+/// a float texture instead, so the two keys diverge and this path builds its
+/// own — which is right, because the back buffer it reads is still `BGRA8Unorm`
+/// and still wants `Perceptual`.
 pub fn resolve_for_readback(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
-    device_handle: MetalHandle<MTLDeviceKind>,
     src: &ProtocolObject<dyn MTLTexture>,
     out_w: u32,
     out_h: u32,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     // The resolve target has to match the source's format, and the only source
     // that ever needs resolving is the back buffer, which is pinned to
-    // `BGRA8Unorm`. Gating on that keeps the cache key free of a format it
-    // could never vary in, and declines rather than guessing if it ever does.
+    // `BGRA8Unorm`. Gating on that declines rather than guessing if it ever
+    // does vary.
     if src.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
         return None;
     }
-    let key = ScratchKey {
-        width: out_w,
-        height: out_h,
-    };
-    let cache = SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut scratch) = cache.lock() else {
+    let target = scratch_target(device, out_w, out_h, PixelFormat::Bgra8Unorm);
+    let Some(target) = target else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve target {out_w}x{out_h} could not be created — readback reads \
+             the render-resolution frame instead and will be the wrong size"
+        );
         return None;
     };
-    let handle = if let Some(&handle) = scratch.get(&key) {
-        handle
-    } else {
-        // Same shape as any other colour attachment we own, so it goes through
-        // the shared creator rather than repeating the descriptor dance.
-        let built = super::texture::create_upscale_target(
-            device_handle,
-            out_w,
-            out_h,
-            mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
-        );
-        let Some(built) = built else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "readback resolve target {out_w}x{out_h} could not be created — readback reads \
-                 the render-resolution frame instead and will be the wrong size"
-            );
-            return None;
-        };
-        scratch.insert(key, built.raw());
-        built.raw()
-    };
-    // SAFETY: the handle came from `create_color_target`, which adopted the
-    // texture's canonical retain; the cache holds it for process lifetime.
-    let target = unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()?;
-    if !encode(cmd_buf, device, src, &target) {
+    // The back buffer is sRGB-encoded, the same input the display path feeds
+    // the scaler, so the readback resolve shares its colour mode and its
+    // cached scaler.
+    if !encode(
+        cmd_buf,
+        device,
+        src,
+        &target,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual,
+    ) {
         return None;
     }
     Some(target)

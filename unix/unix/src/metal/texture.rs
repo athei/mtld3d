@@ -102,8 +102,9 @@ pub fn create_color_target(
     height: u32,
     pixel_format: PixelFormat,
 ) -> Option<MetalHandle<MTLTextureKind>> {
+    let device = device_handle.into_retained()?;
     create_color_texture(
-        device_handle,
+        &device,
         width,
         height,
         mtl_pixel_format(pixel_format),
@@ -112,26 +113,31 @@ pub fn create_color_target(
     )
 }
 
-/// Creates the `Private` colour texture a `MetalFX` upscale resolves into.
+/// Creates the `Private` colour texture a `MetalFX` upscale reads or writes.
 ///
 /// Same shape as [`create_color_target`] but with the storage mode pinned:
 /// `MTLFXSpatialScaler` rejects an output texture that is not `Private`
 /// (`outputTexture must have private storage mode`), and the descriptor's
-/// default is not. Nothing CPU-visible is needed anyway — the readback blit
-/// copies out of this into the caller's buffer.
+/// default is not. Nothing CPU-visible is needed by either consumer — the
+/// readback resolve is copied out by a blit, and the HDR tone-map scratch is
+/// only ever read by the scaler.
+///
+/// Takes the device by reference rather than by handle because `submit_frame`
+/// reaches this through `cmd_buf.device()` and carries no device handle of its
+/// own.
 pub fn create_upscale_target(
-    device_handle: MetalHandle<MTLDeviceKind>,
+    device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
     height: u32,
     pixel_format: PixelFormat,
 ) -> Option<MetalHandle<MTLTextureKind>> {
     create_color_texture(
-        device_handle,
+        device,
         width,
         height,
         mtl_pixel_format(pixel_format),
         Some(MTLStorageMode::Private),
-        "mtld3d-readback-resolve",
+        "mtld3d-upscale-scratch",
     )
 }
 
@@ -140,15 +146,13 @@ pub fn create_upscale_target(
 /// `storage_mode` of `None` leaves the descriptor's default, which is what the
 /// D3D9-facing render targets have always used.
 fn create_color_texture(
-    device_handle: MetalHandle<MTLDeviceKind>,
+    device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
     height: u32,
     mtl_format: objc2_metal::MTLPixelFormat,
     storage_mode: Option<MTLStorageMode>,
     label: &str,
 ) -> Option<MetalHandle<MTLTextureKind>> {
-    let device = device_handle.into_retained()?;
-
     // SAFETY: objc2 typed binding; class-method constructor on
     // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
     let desc = unsafe {

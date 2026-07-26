@@ -12,7 +12,10 @@ use log::error;
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle, PassDescriptor,
     SubmitFrameParams,
-    mtl::{CullMode, IndexType, LoadAction, PrimitiveType, StoreAction, VisibilityResultMode},
+    mtl::{
+        CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
+        VisibilityResultMode,
+    },
     mtl_handle::{
         MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
         MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
@@ -28,6 +31,7 @@ use objc2_metal::{
     MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture,
     MTLViewport, MTLVisibilityResultMode,
 };
+use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -298,32 +302,28 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             let rescaled = present_texture.width() != drawable_texture.width()
                 || present_texture.height() != drawable_texture.height();
             let hdr = super::macdrv::hdr_active();
-            if rescaled && hdr {
-                // The HDR drawable is float and the inverse tone map has to
-                // run after the upscale, so the scaler cannot write it
-                // directly. Rather than carry a drawable-sized scratch target
-                // for an opt-in path, HDR keeps the present shader's own
-                // bilinear stretch. Tone-mapping at render resolution and
-                // running MetalFX in its HDR colour mode straight to the
-                // drawable is the cheaper fix if this ever matters.
-                mtld3d_shared::log_once_info!(
-                    target: LOG_TARGET,
-                    "present: HDR is active, so the frame is scaled by the present shader \
-                     rather than MetalFX"
-                );
-            }
 
             let presented = if hdr {
                 let view_ptr = params.present_view.raw() as *mut c_void;
                 let current = super::macdrv::poll_current_headroom(view_ptr);
                 super::macdrv::log_headroom_change_if_any(current, view_ptr);
-                encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
+                if rescaled {
+                    encode_hdr_present_upscaled(
+                        &cmd_buf,
+                        &present_texture,
+                        &drawable_texture,
+                        current,
+                    )
+                } else {
+                    encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
+                }
             } else if rescaled {
                 super::upscale::encode(
                     &cmd_buf,
                     &cmd_buf.device(),
                     &present_texture,
                     &drawable_texture,
+                    MTLFXSpatialScalerColorProcessingMode::Perceptual,
                 )
             } else {
                 false
@@ -475,10 +475,84 @@ fn submit_upload_cmd_buf(
     true
 }
 
-/// HDR present pass: the game's `BGRA8` backbuffer onto the drawable's `RGBA16Float` surface.
+/// HDR present of a `render.scale`-d frame: tone-map at render size, then upscale.
+///
+/// The two operations do not commute in the obvious direction. The drawable is
+/// `RGBA16Float` and the tone map has to produce it, so `MTLFXSpatialScaler`
+/// cannot be the last step *on the back buffer* — but it can be the last step
+/// on the tone map's output. Running the present pass into a scratch texture
+/// the size of the back buffer and handing that to the scaler in
+/// `ColorProcessingMode::HDR` gets both: the frame is tone-mapped, and it is
+/// enlarged by the same edge-aware upscaler SDR gets rather than by the present
+/// shader's own bilinear sample.
+///
+/// `HDR` is the mode built for exactly this input — extended-range linear
+/// values past `1.0`, which is what the present shader emits (`1.0` = SDR paper
+/// white). `MetalFX` applies its own reversible tone map internally to work in
+/// `[0, 1]`.
+///
+/// Keeping the scratch at *render* resolution rather than drawable resolution
+/// is what makes this cheap: the ICtCp/PQ math runs over fewer pixels than it
+/// does at scale 1.0, and `MetalFX` replaces a full-resolution shader pass.
+///
+/// Returns `false` when the scratch or the scaler is unavailable, which the
+/// caller answers by tone-mapping straight to the drawable — softer, but a
+/// frame. Every probe runs before the tone-map pass is encoded, because a
+/// decline afterwards would strand it: the present fallback blit is a 1:1 copy
+/// and cannot resample. The GPU-capability check comes first of all, so a
+/// machine without `MetalFX` never allocates the float scratch it could not
+/// consume.
+fn encode_hdr_present_upscaled(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+) -> bool {
+    let device = cmd_buf.device();
+    let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
+    let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
+    let scratch = if super::upscale::is_available(&device) {
+        super::upscale::scratch_target(&device, width, height, PixelFormat::Rgba16Float)
+    } else {
+        None
+    };
+    let Some(scratch) = scratch.filter(|scratch| {
+        super::upscale::can_scale(
+            &device,
+            scratch,
+            drawable,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+        )
+    }) else {
+        // Unreachable in practice: `render.scale` is held at 1.0 whenever the
+        // GPU has no MetalFX (`AttachMetalLayerParams::metalfx_available`), so
+        // a scaled frame implies a working scaler.
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
+             the present shader instead and will look softer"
+        );
+        return encode_hdr_present(cmd_buf, src, drawable, peak);
+    };
+
+    encode_hdr_present(cmd_buf, src, &scratch, peak)
+        && super::upscale::encode(
+            cmd_buf,
+            &device,
+            &scratch,
+            drawable,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+        )
+}
+
+/// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
 ///
 /// Rendered via a fullscreen triangle that sRGB-decodes each sample and
 /// multiplies by the EDR boost factor.
+///
+/// `dst` is the drawable at the default scale, and the render-resolution
+/// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
+/// are `RGBA16Float`, which is what the present pipelines are built against.
 ///
 /// Returns `false` (with a once-warn at the call site of
 /// `ensure_resources`) if pipeline creation failed; the caller falls
@@ -1440,7 +1514,6 @@ pub struct BlitArgs {
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
-    device_handle: MetalHandle<MTLDeviceKind>,
     texture: &ProtocolObject<dyn MTLTexture>,
     source_width: u32,
     source_height: u32,
@@ -1452,14 +1525,8 @@ fn resolve_readback_source(
     if tex_w == source_width as usize && tex_h == source_height as usize {
         return None;
     }
-    let resolved = super::upscale::resolve_for_readback(
-        cmd_buf,
-        device,
-        device_handle,
-        texture,
-        source_width,
-        source_height,
-    );
+    let resolved =
+        super::upscale::resolve_for_readback(cmd_buf, device, texture, source_width, source_height);
     if resolved.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -1560,14 +1627,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // command buffer, ahead of the blit encoder, since the scaler cannot be
     // encoded while an encoder is open. The readback then reads the same image
     // the display shows. Sizes match at the default scale and this is skipped.
-    let source = resolve_readback_source(
-        &cmd_buf,
-        &device,
-        device_handle,
-        &texture,
-        source_width,
-        source_height,
-    );
+    let source = resolve_readback_source(&cmd_buf, &device, &texture, source_width, source_height);
     let texture = source.as_deref().unwrap_or(&*texture);
 
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
