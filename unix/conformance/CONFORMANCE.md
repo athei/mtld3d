@@ -102,7 +102,8 @@ hard-to-fix or low-value defect is still `real`):
   capability is itself non-conformant, the site is `real`.
 - **`expected`** — we deliberately do not implement this and intend to keep it
   that way, for a positive, documented reason: a scope decision (D3D9Ex,
-  desktop mode switching), a kept perf tradeoff (the TBDR depth-store elision,
+  device loss, desktop mode switching — see below), a kept perf tradeoff
+  (the TBDR depth-store elision,
   buffer-rename over stalls), or an accepted platform limitation (Metal's
   0xffff primitive restart, GPU-defined NaN encodings). "We don't want to fix
   it" or "the fix is invasive" is not a rationale — without a positive reason
@@ -144,12 +145,39 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **46 `real` · 134 `expected` ·
+re-checked before retagging. Headline: **45 `real` · 136 `expected` ·
 6 `caps` · 2 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
 `crash=0`. Tags do not affect the gate (which rejects count/site/crash
 regressions), so tag corrections are documentation, not gate changes.
 
-### The `real` backlog (13 distinct defects behind the 46 sites)
+#### Desktop mode switching, and why fullscreen ignores the requested size
+
+A fullscreen device takes a borderless window over the monitor and never
+changes the display mode. Wine's mac driver would hand a mode change to
+`CGDisplaySetDisplayMode`, reconfiguring the user's screen and rearranging
+every other window, and dodging that would depend on the `EmulateModeset`
+registry setting the user has to know about. It also leaves the z-order alone:
+raising the window to the topmost level deadlocks winemac (see
+test_window_style 5220).
+
+Without a mode change, `GetClientRect` necessarily reports the monitor. So the
+back buffer follows the client rect and the resolution the app requested is
+ignored — that is the only assignment under which D3D9's coordinate space,
+`GetClientRect` and mouse input agree. Reporting the request instead would
+reintroduce exactly the disagreement the mode-set existed to hide, and would
+render the game's UI at the requested size only to upscale it, which is worse
+output than rendering at the monitor's. `render.scale` is the resolution
+control that replaces the mode.
+
+Every site asserting the old contract — the desktop mode following a create,
+`GetSystemMetrics` reporting it, a non-enumerable mode being rejected, or the
+back buffer / viewport / `GetPresentParameters` / `GetDisplayMode` reporting
+the request — is `expected` under this decision. The same decision is what
+makes the window-management sites (rect adoption, monitor coverage, and the
+`GetMonitorInfo` cascade that depended on it) pass. Net 15 sites gone, 14
+gained, and the mode-set backlog row retired.
+
+### The `real` backlog (12 distinct defects behind the 45 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
@@ -157,7 +185,7 @@ regressions), so tag corrections are documentation, not gate changes.
 | Reset: no outstanding-DEFAULT-pool / implicit-surface-ref rejection | test_reset | 4 |
 | TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
 | StateSnapshot (D3DSBT_ALL) never captures the stream-0 vertex buffer | resource_check_data | 3 |
-| Reset does not re-show a device window whose WS_VISIBLE was cleared | test_wndproc, test_window_style | 3 |
+| Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
 | Clears ignore D3DRS_SRGBWRITEENABLE (draw path honors it) | clear_test | 2 |
 | FF lighting renders black for default-light/world-matrix cases | lighting_test | 1 |
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
@@ -175,41 +203,81 @@ commit.
 ### device.c clusters
 
 ### device.c/test_wndproc
-Sites: 4161=expected 4207=expected 4212=expected 4214=expected 4219=expected
-Sites: 4223=expected 4231=expected 4248=expected 4257=expected 4293=expected
+Sites: 4207=expected 4212=expected 4214=expected 4219=expected
+Sites: 4223=expected 4248=expected 4257=expected 4293=expected
 Sites: 4298=expected 4319=expected 4340=expected 4410=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
-Sites: 4572=expected 4551=real 4568=real 4475=flaky 4480=flaky
+Sites: 4572=expected 4161=expected 4231=expected 4551=real 4475=flaky
+Sites: 4480=flaky
 
-Fullscreen focus/mode lifecycle we deliberately do not drive: no desktop
-mode switch (4161/4231), no focus/foreground mutation (4212/4214), no focus-
+4161/4231 are the test's *own* `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
+failing, before any D3D9 object is involved — Wine's mac driver does not
+deliver the requested desktop mode. No mtld3d code participates, so there is
+nothing here for us to implement. The rest of the fullscreen focus lifecycle we
+deliberately do not drive: no focus/foreground mutation (4212/4214), no focus-
 window subclass (4223/4572), no WM_* activation/mode message generation
 (4207/4248/4293/4319/4340/4410/4432/4525/4545), no focus-window minimize
 (4420), device-never-lost TestCooperativeLevel (4257/4298/4424/4487).
 Caveat on 4219: it fails because OUR cursor wndproc subclass replaced the
 device window's proc — a deliberate, load-bearing hook we keep (cursor
-realization), not a missing feature. 4551/4568 are `real`: after Reset a
-device window whose WS_VISIBLE was cleared must be re-shown
-(SWP_SHOWWINDOW); the test cites a real title relying on it. 4475/4480 are
+realization), not a missing feature. 4551 is `real`: a windowed Reset must
+emit exactly one `WM_WINDOWPOSCHANGING` on the device window carrying
+`SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE` and a zeroed rect; the
+`SetWindowPos` our fullscreen restore issues carries different flags. (4568,
+the WS_VISIBLE re-show on the same path, now passes — leaving fullscreen
+re-shows the window.) 4475/4480 are
 the only flaky pins: macdrv WM timing, no SetWindowPos/MoveWindow anywhere
 in our code.
 
 ### device.c/test_reset
-Sites: 2126=expected 2127=expected 2179=expected 2180=expected 2234=expected
-Sites: 2237=expected 2238=expected 2250=expected 2251=expected 2519=expected
-Sites: 2521=expected 2529=expected 2531=expected
+Sites: 2126=expected 2127=expected 2179=expected 2180=expected
+Sites: 2234=expected 2237=expected 2238=expected 2250=expected
+Sites: 2251=expected 2519=expected 2521=expected 2529=expected
+Sites: 2531=expected 2133=expected 2134=expected 2172=expected
+Sites: 2173=expected 2187=expected 2189=expected
 Sites: 2370=real 2372=real 2496=real 2498=real 2541=real
 
-The expected half is the fullscreen mode environment: screen-resolution
-asserts after fullscreen create/Reset (2126–2251) and fullscreen Reset to
-non-enumerable modes 32x32/801x600 (2519–2531) — with no exclusive display
-modes, any backbuffer size is valid for us, so accepting is internally
-consistent. The real half is windowed API contract, not environment:
+Everything fullscreen in this cluster follows from one decision: we never
+change the desktop mode, and a fullscreen device's back buffer follows its
+monitor-covering window instead of the resolution it was asked for.
+
+- 2126/2127, 2179/2180, 2250/2251 read `GetSystemMetrics(SM_CXSCREEN)` and
+  expect the requested mode. The desktop keeps its own resolution.
+- 2234/2237/2238 are the test's own `ChangeDisplaySettingsW` call failing,
+  before any D3D9 object is involved. Not ours to implement.
+- 2519/2521, 2529/2531 expect a fullscreen Reset to a non-enumerable mode
+  (32x32, 801x600) to return INVALIDCALL. We do not validate the requested
+  resolution because we do not use it: the only mode list worth validating
+  against is Wine's own, which is what the mode-set used to consult, and
+  rejecting against our narrower synthetic `ADAPTER_MODES` table would fail
+  resolutions Wine really does enumerate. Zero dimensions are still rejected,
+  since the D3D9 "zero means the client area" rule is windowed-only.
+- 2133/2134, 2172/2173 want the default viewport to match the request;
+  2187/2189 want the swap chain's `GetPresentParameters` to report it.
+  Reporting the request while rendering at the window's size would put D3D9's
+  coordinate space out of step with `GetClientRect` and mouse input, which is
+  the disagreement the mode-set used to paper over.
+
+The rest is windowed API contract, not environment:
 Reset must return INVALIDCALL with an outstanding DEFAULT-pool surface
 (2370) or a held implicit-backbuffer reference (2496), with
 TestCooperativeLevel reporting DEVICENOTRESET afterwards (2372/2498); and
 a failed Reset (0x0 — which we do reject) must latch DEVICENOTRESET until
 a successful Reset (2541). `device_test_cooperative_level` hardcodes S_OK.
+
+### device.c/test_scissor_size
+Sites: 3685=expected 3700=expected
+
+The default scissor rect must equal the back buffer the app asked for, both
+after create (3685) and after a Reset (3700). Every window in this test is
+created `WS_MAXIMIZE`, and a maximized window is sized by the window manager
+rather than the app, so we take its client rect and ignore the requested size
+— the same rule as fullscreen, for the same reason. The scissor itself is
+correct: it matches the back buffer we actually created.
+
+Note 3700 additionally expects the *full screen* size, while a maximized
+window's client rect is the work area (screen minus menu bar and Dock), so
+this line would differ even if the create path honoured the request.
 
 ### device.c/test_wndproc_windowed
 Sites: 4681=expected 4697=expected 4701=expected 4708=expected 4751=expected
@@ -234,26 +302,38 @@ i686 only. Native D3D9 rewrites the x87 control word to single precision
 touch the FPU control word. On x86_64 the same checks are todo_wine (free).
 
 ### device.c/test_window_style
-Sites: 5200=expected 5220=expected 5215=real
+Sites: 5220=expected 5215=real
 
-5200: fullscreen window-rect adoption we don't perform. 5220: fullscreen
-extended-style (TOPMOST) management. 5215 is `real`: the windowed-Reset
-re-show contract (WS_VISIBLE) — same defect as test_wndproc 4551/4568.
+5220 is `expected`: the fullscreen extended style must carry `WS_EX_TOPMOST`.
+We deliberately leave the z-order alone, because raising a window to the
+topmost level makes Wine's mac driver re-derive the Cocoa window's level and
+parent while holding winemac's per-window lock and hop to the main thread to
+do it; a focus event arriving meanwhile re-enters `NtUserSetWindowPos` on
+another thread and the process deadlocks. Reproduced in the `visual` subtest.
+A borderless window covering the monitor already presents as fullscreen, so
+the z-order buys nothing. (5200, the window-rect adoption, now passes.)
+
+5215 is a separate defect: the windowed-Reset re-show contract (WS_VISIBLE)
+— same one as test_wndproc 4551.
 
 ### device.c/test_mode_change
 Sites: 5509=expected 5533=expected 5537=expected 5542=expected 5584=expected
+Sites: 5552=expected 5554=expected
 Sites: 5602=expected 5622=expected 5636=expected 5639=expected 5646=expected
 Sites: 5662=expected 5671=expected 5674=expected
 
-Desktop display-mode-change lifecycle (ChangeDisplaySettingsW success,
-EnumDisplaySettings reflecting changes/restores, fullscreen window resize).
-We never switch the desktop mode by design (CAMetalLayer).
+Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
+`EnumDisplaySettings` reflecting changes/restores, fullscreen window resize),
+plus 5552/5554: the back buffer must keep the size a fullscreen create asked
+for across an external mode change. All `expected` under the same decision —
+we never change the desktop mode, and the back buffer follows the window.
 
 ### device.c/test_device_window_reset
-Sites: 5951=expected 5968=expected 5971=expected
+Sites: 5968=expected
 
-Fullscreen device-window resize to the full screen rect across Reset; not
-performed by design.
+The device window must adopt the *requested mode's* rect across a fullscreen
+Reset. Ours adopts the monitor rect instead, since there is no mode. (5951 and
+5971, which check that the window covers the screen at all, now pass.)
 
 ### device.c/test_occlusion_query
 Sites: 6780=real
@@ -350,26 +430,27 @@ formula is cap-blind on CUBEMAP; our INVALIDCALL is the correct cube-less
 response — `caps`.
 
 ### device.c/test_get_display_mode
-Sites: 14383=expected 14384=expected 14451=expected 14454=expected
-Sites: 14472=expected 14474=expected 14480=expected 14482=expected
+Sites: 14378=expected 14379=expected 14383=expected 14384=expected
+Sites: 14390=expected 14391=expected 14480=expected 14482=expected
 Sites: 14491=expected 14493=expected
 
-14383/14384: GetAdapterDisplayMode after a fullscreen 640x480 create must
-reflect the switched desktop mode; we never switch (device/swapchain
-GetDisplayMode correctly return 640x480 and pass). The rest are a
-monitor-environment cascade: GetAdapterMonitor/GetMonitorInfoW can fail on
-the conformance desktop (display-config dependent — absent in some runs),
-poisoning the width/height comparisons downstream. GetAdapterMonitor itself
-is implemented (MonitorFromPoint → primary).
+All one decision. After a fullscreen 640x480 create, `GetAdapterDisplayMode`
+must report the switched desktop mode (14383/14384) and the device's and swap
+chain's `GetDisplayMode` must report 640x480 (14378/14379, 14390/14391). We
+change no mode, and the back buffer follows the monitor-covering window, so
+every one of these reports the monitor's size instead.
 
-### device.c/test_window_position
-Sites: 14967=expected 14970=expected 14987=expected 15035=expected
-Sites: 15053=expected
+14378/14379 and 14390/14391 used to pass, when a fullscreen device still
+rendered at the size it was asked for. Giving that up is what buys the
+window-management sites in test_window_position, test_device_window_reset and
+test_window_style — a net gain, and the only self-consistent choice without a
+mode-set.
 
-14987/15035/15053: fullscreen device window must fill the monitor rect
-(create / Reset / activation); we don't reposition windows. 14967/14970:
-the same GetAdapterMonitor/GetMonitorInfoW environment cascade as
-test_get_display_mode (absent in some display configs).
+14480/14482/14491/14493 are the separate GetAdapterMonitor/GetMonitorInfoW
+environment cascade: the call is display-config dependent and poisons the
+width/height comparisons downstream when it fails. GetAdapterMonitor itself is
+implemented (MonitorFromPoint → primary). Their sibling sites 14451/14454 and
+14472/14474 now pass, since the device window really does cover the monitor.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=expected
