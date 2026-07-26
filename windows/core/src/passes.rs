@@ -16,7 +16,7 @@ use mtld3d_shared::{
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::dirty_range::DirtyRange;
+use crate::{dirty_range::DirtyRange, render_scale::RenderScale};
 
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
@@ -547,8 +547,40 @@ pub struct PassState {
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule D (last-use color `Store=DontCare`) exempts this handle so
-    /// Present can still read the pixels from VRAM after submit.
+    /// Present can still read the pixels from VRAM after submit. Also the
+    /// left-hand side of [`Self::target_scale`]'s comparison: it is what makes
+    /// "is the back buffer bound" a handle identity rather than something the
+    /// D3D9 layer has to infer and pass down.
     backbuffer_texture: MetalHandle<MTLTextureKind>,
+    /// Fraction of the logical resolution the back buffer is rasterized at.
+    ///
+    /// Seeded per frame from `FrameData`. Applies to the back buffer alone: a
+    /// game-created render target is exactly the size the game asked for, so
+    /// coordinates aimed at one are already in that texture's space. See
+    /// [`Self::target_scale`].
+    render_scale: RenderScale,
+    /// The scale of the *currently bound* colour attachment.
+    ///
+    /// The back buffer's own scale while it is bound, and whatever
+    /// `set_color_render_target` was told for a game-created target: one sized
+    /// to the back buffer shares its scale, anything else is the identity.
+    /// Read by [`Self::target_scale`], which every coordinate conversion goes
+    /// through, so the rule lives in exactly one field.
+    current_color_scale: RenderScale,
+    /// The bound colour attachment's size as D3D9 reports it.
+    ///
+    /// `current_color_size` is this times [`Self::current_color_scale`]. Held
+    /// separately rather than divided back out, because the scale rounds and a
+    /// round trip through it would not be exact — and because the encoder's
+    /// scoped `StretchRect` pass has to restore the device's binding precisely.
+    current_color_logical_size: (u32, u32),
+    /// The frame's logical resolution, the one D3D9 reports.
+    ///
+    /// `backbuffer_texture` is `render_scale` of this. Held alongside the scale
+    /// because the pair is what defines the two coordinate spaces; the size a
+    /// game-created render target is measured against is this one, not the
+    /// rasterized extent.
+    backbuffer_logical_size: (u32, u32),
     /// Texture handles ever bound as a fragment sampler input in any pass this frame.
     ///
     /// Populated in `emit_command` from `SetFragmentTexture` commands.
@@ -670,6 +702,13 @@ impl PassState {
             seen_color_rts: HashSet::with_capacity(4),
             seen_depth_rts: HashSet::with_capacity(2),
             backbuffer_texture: MetalHandle::NULL,
+            // Placeholder; `reset_frame` reseeds it from the frame stamp.
+            // Identity means a `PassState` that never saw a frame cannot
+            // perturb a coordinate.
+            render_scale: RenderScale::IDENTITY,
+            current_color_scale: RenderScale::IDENTITY,
+            current_color_logical_size: (0, 0),
+            backbuffer_logical_size: (0, 0),
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
             seen_sampleable_depth_textures: HashSet::with_capacity(8),
@@ -689,6 +728,11 @@ impl PassState {
     /// Seeds the default attachments (frame's backbuffer + depth) and clears
     /// any leftover pending clears. Does not touch the sticky viewport — that
     /// survives across frames.
+    ///
+    /// `backbuffer_size` is **logical**, the resolution D3D9 reports;
+    /// `render_scale` converts it to the size of the texture actually bound.
+    /// Callers stay in the game's coordinate space and this is the one place
+    /// the two are reconciled.
     pub fn reset_frame(
         &mut self,
         backbuffer: MetalHandle<MTLTextureKind>,
@@ -696,6 +740,7 @@ impl PassState {
         backbuffer_format: PixelFormat,
         depth_texture: MetalHandle<MTLTextureKind>,
         depth_has_stencil: bool,
+        render_scale: RenderScale,
     ) {
         // Recycle each retired pass's `commands` Vec back into the pool
         // (capacity preserved, length zeroed). Once warm, the pool's
@@ -718,8 +763,15 @@ impl PassState {
         // No pass open → no viewport emitted yet; the next pass's open
         // reseeds this. (`set_viewport` only reads it inside an open pass.)
         self.last_emitted_viewport = None;
+        self.render_scale = render_scale;
+        self.current_color_scale = render_scale;
+        self.current_color_logical_size = backbuffer_size;
+        self.backbuffer_logical_size = backbuffer_size;
         self.current_color_texture = backbuffer;
-        self.current_color_size = backbuffer_size;
+        self.current_color_size = (
+            render_scale.dimension(backbuffer_size.0),
+            render_scale.dimension(backbuffer_size.1),
+        );
         self.current_color_format = backbuffer_format;
         // The backbuffer is an alpha-bearing (`Bgra8Unorm` / A8R8G8B8) target,
         // so destination-alpha blend factors resolve unclamped — byte-identical
@@ -985,15 +1037,20 @@ impl PassState {
     /// the encoder's clear-quad emit path can resolve the same scissor as the
     /// rest of the pass machine.
     #[must_use]
-    pub const fn effective_viewport(&self) -> (u32, u32, u32, u32) {
+    pub fn effective_viewport(&self) -> (u32, u32, u32, u32) {
         if self.viewport_width != 0 && self.viewport_height != 0 {
-            (
+            // The stored viewport is the game's own; convert against whatever
+            // is bound *now* rather than baking the scale in at `set_viewport`,
+            // so a viewport that outlives a render-target change is read in the
+            // space of the target it is actually clipping.
+            self.target_scale().rect(
                 self.viewport_x,
                 self.viewport_y,
                 self.viewport_width,
                 self.viewport_height,
             )
         } else {
+            // Already the bound texture's own size, so no conversion.
             (0, 0, self.current_color_size.0, self.current_color_size.1)
         }
     }
@@ -1006,7 +1063,7 @@ impl PassState {
     /// where the clear must be scissored to the viewport. With no color
     /// attachment bound there is nothing to bound, so fold.
     #[must_use]
-    pub const fn viewport_covers_color_attachment(&self) -> bool {
+    pub fn viewport_covers_color_attachment(&self) -> bool {
         if self.current_color_texture.is_null() {
             return true;
         }
@@ -1437,7 +1494,15 @@ impl PassState {
         width: u32,
         height: u32,
         format: PixelFormat,
+        scale: RenderScale,
     ) {
+        // `width`/`height` arrive logical, the size D3D9 reports for this
+        // target; `scale` says what it is actually rasterized at.
+        // `current_color_size` is the real texture extent.
+        self.current_color_scale = scale;
+        self.current_color_logical_size = (width, height);
+        self.warn_if_scale_wasted(width, height, scale);
+        let (width, height) = (scale.dimension(width), scale.dimension(height));
         if self.current_color_texture == texture {
             self.current_color_size = (width, height);
             self.current_color_format = format;
@@ -1829,19 +1894,76 @@ impl PassState {
         self.pending_color_clear = Some((r, g, b, a));
     }
 
+    /// Warn once when a near-full-screen target renders at full resolution anyway.
+    ///
+    /// A game-created target inherits the back buffer's scale only when it was
+    /// created at exactly the reported back-buffer size. One that is merely
+    /// *close* to it — a scene target rounded to a power of two, say — misses
+    /// that test and still costs full price, so `render.scale` buys much less
+    /// than the setting implies. Silence there reads as "the knob did nothing",
+    /// which is the one failure mode a user cannot diagnose from the output.
+    ///
+    /// Kept free of false positives by construction: it needs a non-default
+    /// scale, a target that did *not* inherit it, and coverage of most of the
+    /// back buffer on *both* axes. Shadow maps, glow chains and every other
+    /// sub-size intermediate stay quiet. Fires once per process.
+    fn warn_if_scale_wasted(&self, width: u32, height: u32, scale: RenderScale) {
+        /// Percent of each back-buffer axis a target must cover to count as full-screen.
+        ///
+        /// Below this it is an intermediate, not the scene.
+        const FULL_SCREEN_PERCENT: u64 = 90;
+
+        if self.render_scale.is_identity() || !scale.is_identity() {
+            return;
+        }
+        let (bw, bh) = self.backbuffer_logical_size;
+        let covers = |extent: u32, full: u32| {
+            full != 0 && u64::from(extent) * 100 >= u64::from(full) * FULL_SCREEN_PERCENT
+        };
+        if covers(width, bw) && covers(height, bh) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "render.scale = {}% saves less than it looks like here: the game renders into its \
+                 own {width}x{height} target, which is close to the {bw}x{bh} back buffer but not \
+                 equal to it, so it keeps its own size and rasterizes at full resolution",
+                self.render_scale.percent(),
+            );
+        }
+    }
+
+    /// The scale to apply to a game-supplied coordinate for the *currently bound* target.
+    ///
+    /// `render.scale` shrinks the back buffer alone, so this is the back
+    /// buffer's scale while it is bound and the identity otherwise. Keying on
+    /// handle identity (rather than on whether the D3D9 layer happens to hold a
+    /// null render-target pointer) is what makes the rule hold through an
+    /// explicit `SetRenderTarget` back to the back buffer.
+    #[must_use]
+    pub const fn target_scale(&self) -> RenderScale {
+        self.current_color_scale
+    }
+
+    /// The bound colour attachment's size as D3D9 reports it, with its scale.
+    ///
+    /// Pairs with [`Self::target_scale`] for a caller that binds a target of
+    /// its own and must put the device's binding back exactly as it was.
+    #[must_use]
+    pub const fn current_color_logical_size(&self) -> (u32, u32) {
+        self.current_color_logical_size
+    }
+
     /// Resolve the `(x, y, w, h)` rect that `emit_scissor` would emit for the given inputs.
     ///
     /// Exposed so the encoder wrapper can dedup against the *resolved*
     /// rect — when scissor test is disabled, the rect falls back to the
     /// current viewport, which can change mid-pass.
+    ///
+    /// `rect` arrives in the game's coordinate space and comes back in the
+    /// bound texture's, so the dedup upstream compares post-conversion rects.
     #[must_use]
-    pub const fn resolved_scissor_rect(
-        &self,
-        test_enable: bool,
-        rect: [u32; 4],
-    ) -> (u32, u32, u32, u32) {
+    pub fn resolved_scissor_rect(&self, test_enable: bool, rect: [u32; 4]) -> (u32, u32, u32, u32) {
         if test_enable && rect[2] != 0 && rect[3] != 0 {
-            (rect[0], rect[1], rect[2], rect[3])
+            self.target_scale().rect(rect[0], rect[1], rect[2], rect[3])
         } else {
             self.effective_viewport()
         }
@@ -1880,19 +2002,24 @@ impl PassState {
         self.viewport_height = height;
         self.viewport_min_z = min_z;
         self.viewport_max_z = max_z;
+        // The fields above keep the game's own numbers so a later render-target
+        // change re-reads them in the new target's space; only what reaches
+        // Metal is converted.
+        let (sx, sy, sw, sh) = self.target_scale().rect(x, y, width, height);
         // Re-emit only on an actual change. A fresh `set_viewport` whose
         // value matches what was last emitted on this encoder would be a
         // redundant Metal bind (Xcode's "bound … when it was already
         // bound"); the z-range is part of the key, compared by bits so a
-        // depth-range-only change (sky / weapon) still re-emits.
-        let key = (x, y, width, height, min_z.to_bits(), max_z.to_bits());
+        // depth-range-only change (sky / weapon) still re-emits. Keyed on the
+        // converted rect, which is what the encoder actually holds.
+        let key = (sx, sy, sw, sh, min_z.to_bits(), max_z.to_bits());
         if !self.current_pass_closed
             && self.last_emitted_viewport != Some(key)
             && let Some(pass) = self.passes.last_mut()
         {
             pass.commands
-                .push(Command::set_viewport(x, y, width, height, min_z, max_z));
-            pass.viewport = (x, y, width, height);
+                .push(Command::set_viewport(sx, sy, sw, sh, min_z, max_z));
+            pass.viewport = (sx, sy, sw, sh);
             self.last_emitted_viewport = Some(key);
         }
     }
@@ -2959,8 +3086,102 @@ mod tests {
 
     fn fresh() -> PassState {
         let mut s = PassState::new();
-        s.reset_frame(backbuffer(), BB_SIZE, BB_FORMAT, depth(), false);
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::IDENTITY,
+        );
         s
+    }
+
+    /// A frame rasterizing the back buffer at half the reported resolution.
+    fn fresh_scaled() -> PassState {
+        let mut s = PassState::new();
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::from_percent(50),
+        );
+        s
+    }
+
+    #[test]
+    fn scaled_frame_binds_the_backbuffer_at_render_resolution() {
+        let s = fresh_scaled();
+        // D3D9 still reports 640x480; the texture is half that.
+        assert_eq!(s.current_color_size, (320, 240));
+        assert_eq!(s.effective_viewport(), (0, 0, 320, 240));
+    }
+
+    #[test]
+    fn scaled_viewport_and_scissor_convert_on_the_backbuffer() {
+        let mut s = fresh_scaled();
+        s.set_viewport(100, 50, 400, 300, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (50, 25, 200, 150));
+        assert_eq!(
+            s.resolved_scissor_rect(true, [100, 50, 400, 300]),
+            (50, 25, 200, 150)
+        );
+    }
+
+    #[test]
+    fn a_game_render_target_is_never_scaled() {
+        // The game sized this texture itself, so its coordinates are already
+        // in its own space and must survive untouched even though the frame
+        // carries a non-default scale.
+        let mut s = fresh_scaled();
+        s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        assert_eq!(s.current_color_size, (256, 256));
+        assert!(s.target_scale().is_identity());
+        s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (0, 0, 256, 256));
+        assert_eq!(
+            s.resolved_scissor_rect(true, [16, 16, 64, 64]),
+            (16, 16, 64, 64)
+        );
+    }
+
+    #[test]
+    fn rebinding_the_backbuffer_restores_the_scale() {
+        // The regression this whole design turns on: D3D9 forbids a null RT0,
+        // so a game restoring the back buffer does it by binding the surface.
+        // Keying the scale on handle identity keeps it applied; inferring it
+        // from a null render-target pointer silently would not.
+        let mut s = fresh_scaled();
+        s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        assert!(s.target_scale().is_identity());
+
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        assert!(!s.target_scale().is_identity());
+        assert_eq!(s.current_color_size, (320, 240));
+        s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (0, 0, 320, 240));
+    }
+
+    #[test]
+    fn identity_scale_leaves_every_coordinate_alone() {
+        // The safety argument for shipping the default: at 100% nothing here
+        // can perturb a pixel.
+        let mut s = fresh();
+        s.set_viewport(37, 11, 501, 293, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (37, 11, 501, 293));
+        assert_eq!(
+            s.resolved_scissor_rect(true, [7, 9, 123, 456]),
+            (7, 9, 123, 456)
+        );
+        assert!(s.target_scale().is_identity());
     }
 
     fn dummy_draw() -> Command {
@@ -2999,7 +3220,14 @@ mod tests {
         let atlas = tex(0x7E10);
         s.emit_command(Command::set_fragment_texture(atlas.raw(), 0));
         assert!(s.texture_sampled_this_frame(atlas));
-        s.reset_frame(backbuffer(), BB_SIZE, BB_FORMAT, depth(), false);
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::IDENTITY,
+        );
         // Per-frame set resets — a next-frame upload before the first
         // sample goes to the live texture again.
         assert!(!s.texture_sampled_this_frame(atlas));
@@ -3056,7 +3284,7 @@ mod tests {
         let rt = tex(0x3000);
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 2);
         assert_eq!(s.passes()[0].color_texture(), backbuffer());
@@ -3071,7 +3299,13 @@ mod tests {
     fn set_render_target_same_handle_no_break() {
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
     }
@@ -3155,7 +3389,7 @@ mod tests {
         let mut s = fresh();
         s.set_viewport(0, 0, 320, 240, 0.0, 1.0);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 128, 128, RT_FORMAT);
+        s.set_color_render_target(rt, 128, 128, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 2);
         // Both passes use the 320x240 viewport (sticky). The first command
@@ -3173,7 +3407,7 @@ mod tests {
         // first-use in A and re-use (Load) in B.
         let mut s = fresh();
         s.emit_command(dummy_draw()); // pass A on backbuffer() + depth()
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw()); // pass B on rt + depth()
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
         assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
@@ -3199,7 +3433,14 @@ mod tests {
         let mut s = fresh();
         s.clear_color(1, 2, 3, 4);
         assert!(s.pending_color_clear().is_some());
-        s.reset_frame(backbuffer(), BB_SIZE, BB_FORMAT, depth(), false);
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::IDENTITY,
+        );
         assert!(s.pending_color_clear().is_none());
         assert!(s.passes().is_empty());
     }
@@ -3211,9 +3452,15 @@ mod tests {
         // game clears the rt and switches target without drawing, the old
         // rt must still receive the clear.
         let mut s = fresh();
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(1, 2, 3, 4);
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 2);
         // Old rt got the clear
@@ -3265,9 +3512,15 @@ mod tests {
         let rt = tex(0x3000);
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 3);
         assert_eq!(s.passes()[0].color_texture(), backbuffer());
@@ -3284,7 +3537,7 @@ mod tests {
         // so distinct rt formats must yield distinct Pass.color_format.
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, OTHER_FORMAT);
+        s.set_color_render_target(rt, 256, 256, OTHER_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes()[0].color_format(), BB_FORMAT);
         assert_eq!(s.passes()[1].color_format(), OTHER_FORMAT);
@@ -3476,7 +3729,7 @@ mod tests {
             VisibilityResultMode::Counting,
             0,
         ));
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 2);
         assert!(s.passes()[0].has_counting_visibility());
@@ -3769,9 +4022,15 @@ mod tests {
         // Load (Rule A would let DontCare slip otherwise).
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 3);
         assert_eq!(s.passes()[2].color_texture(), backbuffer());
@@ -3785,7 +4044,14 @@ mod tests {
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
         // Next frame: same backbuffer is "first use again" because the
         // seen set was reset.
-        s.reset_frame(backbuffer(), BB_SIZE, BB_FORMAT, depth(), false);
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::IDENTITY,
+        );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
@@ -3802,7 +4068,7 @@ mod tests {
         let mut s = fresh();
         // First pass on backbuffer() so rt_dst is first-use when it opens.
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt_dst, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt_dst, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.push_pending_leading_blit(BlitCommand::copy_texture_to_texture_full_mip(
             rt_src.raw(),
             rt_dst.raw(),
@@ -3837,9 +4103,9 @@ mod tests {
         let rt_b = tex(0x4000);
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt_a, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt_a, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt_b, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt_b, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_store_actions();
@@ -3902,9 +4168,15 @@ mod tests {
         // rt (non-backbuffer, last use, not sampled) to DontCare.
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_store_actions();
@@ -3924,10 +4196,16 @@ mod tests {
         // from Rule D, keeps Store (Present reads it).
         let mut s = fresh();
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(1, 2, 3, 4);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.clear_color(5, 6, 7, 8);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
@@ -3949,9 +4227,15 @@ mod tests {
         let mut s = fresh();
         s.emit_command(dummy_draw());
         // Force a pass break with no pending clear: bounce rt then back.
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_store_actions();
@@ -3977,19 +4261,25 @@ mod tests {
         // Pass 0: scene on backbuffer()
         s.emit_command(dummy_draw());
         // Pass 1: rt_a cascade A1, cleared on entry
-        s.set_color_render_target(rt_a, 1024, 512, RT_FORMAT);
+        s.set_color_render_target(rt_a, 1024, 512, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(0, 0, 0, 0);
         s.emit_command(dummy_draw());
         // Pass 2: rt_b cascade B1, cleared on entry
-        s.set_color_render_target(rt_b, 1024, 512, RT_FORMAT);
+        s.set_color_render_target(rt_b, 1024, 512, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(0, 0, 0, 0);
         s.emit_command(dummy_draw());
         // Pass 3: rt_a cascade A2, cleared on entry
-        s.set_color_render_target(rt_a, 1024, 512, RT_FORMAT);
+        s.set_color_render_target(rt_a, 1024, 512, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(0, 0, 0, 0);
         s.emit_command(dummy_draw());
         // Pass 4: UI on backbuffer() (loads scene)
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_store_actions();
@@ -4017,9 +4307,15 @@ mod tests {
         let mut s = fresh();
         s.emit_command(dummy_draw());
         // Force a pass break with a pending color clear on backbuffer().
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.clear_color(1, 1, 1, 1);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
@@ -4045,12 +4341,18 @@ mod tests {
         // tile memory that was never preserved to VRAM.
         let mut s = fresh();
         // Pass 0: cascade caster pass — write into cascade_depth.
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.set_depth_stencil_attachment(cascade_depth, false, false);
         s.clear_depth(f32::to_bits(1.0));
         s.emit_command(dummy_draw());
         // Pass 1: scene pass — different rt+depth, sample cascade_depth.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.set_depth_stencil_attachment(depth(), false, false);
         s.emit_command(Command::set_fragment_texture(cascade_depth.raw(), 4));
         s.emit_command(dummy_draw());
@@ -4079,12 +4381,18 @@ mod tests {
         let mut s = fresh();
         // Bounce off backbuffer() first so the next pass-open is first-use of rt.
         s.emit_command(dummy_draw());
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         // First-use ⇒ Rule A flipped Load=DontCare eagerly.
         assert_eq!(s.passes()[1].color_load(), ColorLoad::DontCare);
         // Bounce back to backbuffer() and sample rt.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
@@ -4107,7 +4415,7 @@ mod tests {
         // strip the color attachment so the pass becomes depth-only.
         let mut s = fresh();
         // Pass 0: cascade-color + cascade_d0, clear-only (no draws).
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.set_depth_stencil_attachment(cascade_d0, false, false);
         s.clear_color(1, 2, 3, 4);
         s.clear_depth(f32::to_bits(1.0));
@@ -4118,7 +4426,13 @@ mod tests {
         s.clear_depth(f32::to_bits(1.0));
         s.emit_command(dummy_draw());
         // Scene pass samples cascade_d0 so its Store must stay.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.set_depth_stencil_attachment(depth(), false, false);
         s.emit_command(Command::set_fragment_texture(cascade_d0.raw(), 4));
         s.emit_command(dummy_draw());
@@ -4155,13 +4469,19 @@ mod tests {
         // not sampled, last-use → Rule D flips color Store=DontCare.
         // Both Stores DontCare + no draws + no blits → Rule F culls.
         let mut s = fresh();
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.set_depth_stencil_attachment(cascade_depth, false, false);
         s.clear_color(1, 2, 3, 4);
         s.clear_depth(f32::to_bits(1.0));
         // No draws, no blits — pure clear-only pass.
         // Switch back to BB so this is the last cascade frame use.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.set_depth_stencil_attachment(depth(), false, false);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
@@ -4184,11 +4504,17 @@ mod tests {
         // performs observable work (depth clear lands in VRAM for the
         // sampler). Rule F must NOT cull.
         let mut s = fresh();
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.set_depth_stencil_attachment(cascade_depth, false, false);
         s.clear_color(1, 2, 3, 4);
         s.clear_depth(f32::to_bits(1.0));
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.set_depth_stencil_attachment(depth(), false, false);
         s.emit_command(Command::set_fragment_texture(cascade_depth.raw(), 4));
         s.emit_command(dummy_draw());
@@ -4216,10 +4542,16 @@ mod tests {
         let mut s = fresh();
         s.clear_color(7, 7, 7, 7);
         // Switch rt — currently materialises a spurious BB clear pass.
-        s.set_color_render_target(other_rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         // Come back to BB and draw.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.coalesce_clear_only_passes();
@@ -4247,16 +4579,16 @@ mod tests {
         // would change the read; the merge must be rejected.
         let mut s = fresh();
         // Pass 0: clear-only on rt.
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(1, 2, 3, 4);
         // Force the pending clear to materialise by hopping rt
         // (combined flush).
-        s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT);
+        s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
         s.emit_command(dummy_draw());
         // Re-attach rt and draw. Without the read at 0x5000 this would
         // be a valid merge target, but the intervening sample disables it.
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         let before = s.passes().len();
@@ -4286,10 +4618,16 @@ mod tests {
         // color in the next pass must stay Store (Present consumes it).
         let mut s = fresh();
         // Pass 0: cascade caster pass — color is junk, depth gets work.
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         // Pass 1: scene pass on backbuffer.
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_store_actions();
@@ -4308,9 +4646,15 @@ mod tests {
         // must preserve its content; Rule D must NOT flip Store to
         // DontCare for it.
         let mut s = fresh();
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
@@ -4332,7 +4676,7 @@ mod tests {
         // Without the split flush, this would produce a spurious
         // 1-cmd clear-only pass for C with the still-old depth.
         let mut s = fresh();
-        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT);
+        s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(1, 2, 3, 4);
         s.set_depth_stencil_attachment(cascade_depth, false, false);
         s.clear_depth(f32::to_bits(1.0));
@@ -4394,14 +4738,20 @@ mod tests {
         // VRAM. Sampler-aware Rule C keeps pass 0 Store.
         let mut s = fresh();
         // Pass 0: write to rt.
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         // Pass 1: sample rt into backbuffer().
-        s.set_color_render_target(backbuffer(), BB_SIZE.0, BB_SIZE.1, BB_FORMAT);
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
         s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
         s.emit_command(dummy_draw());
         // Pass 2: clear+rewrite rt.
-        s.set_color_render_target(rt, 256, 256, RT_FORMAT);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.clear_color(0, 0, 0, 0);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");

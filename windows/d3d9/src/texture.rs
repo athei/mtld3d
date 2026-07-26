@@ -6,6 +6,7 @@ use mtld3d_core::{
     dirty_rect::DirtyRect,
     ids::TextureId,
     page_box::PageBox,
+    render_scale::RenderScale,
     texture_staging::{LockAction, MipShape, PreserveKind, decide_lock_action},
 };
 use mtld3d_shared::{
@@ -147,6 +148,14 @@ pub struct TextureInner {
     /// Read by `lock_region_ptr` to detect the full-mip
     /// non-{DISCARD,READONLY,WRITEONLY} correctness gap.
     d3d_usage: u32,
+    /// What the backing Metal texture is rasterized at relative to `width`/`height`.
+    ///
+    /// Non-identity only for a render-target or depth-stencil texture created
+    /// at the reported back-buffer size, which is the game's main view and
+    /// shares the back buffer's `render.scale`. `width`/`height` and every mip
+    /// dimension stay logical, so `GetLevelDesc` and the game's coordinates are
+    /// unaffected; only [`TextureInner::texture_info`] converts.
+    render_scale: RenderScale,
     /// App-set `SetAutoGenFilterType` value, round-tripped by `GetAutoGenFilterType`.
     ///
     /// Metal's `generateMipmaps` is fixed-linear, so this is app-visible state
@@ -735,8 +744,11 @@ impl TextureInner {
     pub fn texture_info(&self) -> TextureInfo {
         TextureInfo {
             texture_id: self.texture_id,
-            width: self.width,
-            height: self.height,
+            // Render space: this snapshot is what creates and addresses the
+            // Metal texture. `self.width`/`self.height` stay logical for
+            // `GetLevelDesc` and for every rect the game supplies.
+            width: self.render_scale.dimension(self.width),
+            height: self.render_scale.dimension(self.height),
             depth: self.depth,
             levels: self.levels,
             pixel_format: self.metal_pixel_format,
@@ -1147,6 +1159,8 @@ pub struct TextureCreateInfo {
     /// `lock_region_ptr` can gate the non-WRITEONLY CPU-memcpy preserve on the
     /// contended-rename path.
     pub d3d_usage: u32,
+    /// Scale for the backing Metal texture; see [`TextureInner::render_scale`].
+    pub render_scale: RenderScale,
     /// The `D3DPOOL` the texture was created in.
     ///
     /// Drives device-refcount forwarding (see [`TextureInner::d3d_pool`]).
@@ -1230,6 +1244,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         swizzle: info.swizzle,
         usage_flags: info.usage_flags,
         d3d_usage: info.d3d_usage,
+        render_scale: info.render_scale,
         autogen_filter_type: D3DTEXF_LINEAR,
         lod: 0,
         d3d_pool: info.d3d_pool,

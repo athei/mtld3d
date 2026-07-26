@@ -1421,6 +1421,53 @@ pub struct BlitArgs {
     pub width: u32,
     pub height: u32,
     pub bytes_per_row: u32,
+    /// Full logical width the sub-rect coordinates are measured in.
+    ///
+    /// See `BlitTextureToBufferParams::source_width`. Differs from the source
+    /// texture's own width only under a non-default `render.scale`.
+    pub source_width: u32,
+    /// Full logical height the sub-rect coordinates are measured in.
+    pub source_height: u32,
+}
+
+/// Resolve a render-resolution source up to the size the caller's coordinates assume.
+///
+/// Returns `Some(resolved)` when a resolve happened, `None` to read the source
+/// as-is — which is both the default-scale path and the fallback if `MetalFX`
+/// declines. Reading as-is after a declined resolve yields a smaller image than
+/// requested, so it warns rather than failing the call: a wrong-sized readback
+/// is recoverable for the game, a failed `LockRect` often is not.
+fn resolve_readback_source(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    device_handle: MetalHandle<MTLDeviceKind>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    source_width: u32,
+    source_height: u32,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let (tex_w, tex_h) = (texture.width(), texture.height());
+    if tex_w == source_width as usize && tex_h == source_height as usize {
+        return None;
+    }
+    let resolved = super::upscale::resolve_for_readback(
+        cmd_buf,
+        device,
+        device_handle,
+        texture,
+        source_width,
+        source_height,
+    );
+    if resolved.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback: could not resolve a {tex_w}x{tex_h} frame up to {source_width}x\
+             {source_height}; the caller gets render-resolution pixels"
+        );
+    }
+    resolved
 }
 
 /// Synchronous texture→buffer readback into PE-addressable memory.
@@ -1450,6 +1497,8 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         width,
         height,
         bytes_per_row,
+        source_width,
+        source_height,
     } = *args;
 
     if dst_ptr == 0 || dst_len == 0 || width == 0 || height == 0 {
@@ -1506,6 +1555,21 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         let label = objc2_foundation::NSString::from_str("mtld3d-readback");
         cmd_buf.setLabel(Some(&label));
     }
+    // Under `render.scale` the source is rasterized smaller than the resolution
+    // the caller's coordinates are in, so resolve it up first — on this same
+    // command buffer, ahead of the blit encoder, since the scaler cannot be
+    // encoded while an encoder is open. The readback then reads the same image
+    // the display shows. Sizes match at the default scale and this is skipped.
+    let source = resolve_readback_source(
+        &cmd_buf,
+        &device,
+        device_handle,
+        &texture,
+        source_width,
+        source_height,
+    );
+    let texture = source.as_deref().unwrap_or(&*texture);
+
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
         return false;
@@ -1520,7 +1584,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // objects live for the call; geometry is caller-bounded.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-            &texture,
+            texture,
             0,
             mip_level as usize,
             MTLOrigin {

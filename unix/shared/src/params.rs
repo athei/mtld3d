@@ -177,9 +177,11 @@ impl Thunk for SetDisplaySyncEnabledParams {
 
 /// Update `CAMetalLayer.drawableSize` on an already-attached layer.
 ///
-/// Used by the D3D9 Reset path to honour a window resize: the rendering
-/// surface's pixel dimensions must match the new backbuffer texture so the
-/// `present` blit covers the drawable 1:1.
+/// Used by the D3D9 Reset path to honour a window resize. This is the
+/// *presented* size, which is the logical resolution D3D9 reports rather than
+/// the backbuffer texture's extent: under `render.scale` the two differ and
+/// `MTLFXSpatialScaler` bridges them at present. They coincide, and the present
+/// blit is a 1:1 copy, only at the default scale.
 #[repr(C, align(8))]
 pub struct SetLayerDrawableSizeParams {
     pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
@@ -764,8 +766,19 @@ pub struct BlitTextureToBufferParams {
     pub width: u32,         // in
     pub height: u32,        // in
     pub bytes_per_row: u32, // in: destination row stride
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
+    /// Full width of the image `origin_*` / `width` / `height` are measured in.
+    ///
+    /// The *logical* resolution: under `render.scale` the source texture is
+    /// rasterized smaller than what D3D9 reports, and readback has to hand the
+    /// caller the resolution it asked for. When this differs from the texture's
+    /// own width the unix side resolves the frame to this size through `MetalFX`
+    /// before reading, so the pixels match what the display shows. Equal to the
+    /// texture's width at the default scale, which makes the resolve a no-op.
+    pub source_width: u32, // in
+    /// Full height of the image the coordinates are measured in.
+    ///
+    /// See [`Self::source_width`].
+    pub source_height: u32, // in
 }
 
 impl Thunk for BlitTextureToBufferParams {
@@ -820,6 +833,16 @@ mod tests {
         // u64 + u32 + u32 = 8 + 4 + 4 = 16
         assert_eq!(core::mem::align_of::<SetLayerDrawableSizeParams>(), 8);
         assert_eq!(core::mem::size_of::<SetLayerDrawableSizeParams>(), 16);
+    }
+
+    #[test]
+    fn blit_texture_to_buffer_layout() {
+        use super::BlitTextureToBufferParams;
+        // 3*u64 (handles) + 2*u64 (dst ptr/len) + 8*u32
+        // = 24 + 16 + 32 = 72, already a multiple of the align-8 so the
+        // struct carries no trailing pad.
+        assert_eq!(core::mem::align_of::<BlitTextureToBufferParams>(), 8);
+        assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 72);
     }
 
     #[test]

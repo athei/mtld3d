@@ -33,6 +33,7 @@ use mtld3d_core::{
         PairShaderId, PairStatsSample,
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
+    render_scale::RenderScale,
     sampler_state,
     scratch::ScratchArena,
     shader_cache::{self, CachedKind},
@@ -1655,6 +1656,7 @@ impl FrameEncoder {
             frame.backbuffer_format,
             frame.depth_texture,
             frame.flags.contains(FrameDataFlags::DEPTH_HAS_STENCIL),
+            frame.render_scale,
         );
         mtld3d_shared::crumb!("phase:BfDone");
     }
@@ -2054,9 +2056,10 @@ impl FrameEncoder {
         height: u32,
         format: PixelFormat,
         has_alpha: bool,
+        scale: RenderScale,
     ) {
         self.pass_state
-            .set_color_render_target(texture, width, height, format);
+            .set_color_render_target(texture, width, height, format, scale);
         // Kept in lockstep with the format: the Metal pixel format alone can't
         // distinguish X8R8G8B8 (no alpha) from A8R8G8B8 (both `Bgra8Unorm`).
         self.pass_state.set_color_rt_has_alpha(has_alpha);
@@ -2084,7 +2087,7 @@ impl FrameEncoder {
     /// Falls back to the bound RT size when the game never set a
     /// viewport. Read at draw time to derive the half-pixel `pos_fixup`
     /// uniform (VS slot 13).
-    pub const fn effective_viewport(&self) -> (u32, u32, u32, u32) {
+    pub fn effective_viewport(&self) -> (u32, u32, u32, u32) {
         self.pass_state.effective_viewport()
     }
 
@@ -2143,7 +2146,10 @@ impl FrameEncoder {
                 vpx.saturating_add(vpw).cast_signed(),
                 vpy.saturating_add(vph).cast_signed(),
             );
-            self.clear_color_rects(r, g, b, a, &[rect]);
+            // Derived from `effective_viewport`, so already in the bound
+            // texture's space — goes to the resolved entry point, not the
+            // converting one.
+            self.clear_color_rects_resolved(r, g, b, a, &[rect]);
         }
     }
 
@@ -2156,6 +2162,31 @@ impl FrameEncoder {
     /// never a NULL encoder. `(r,g,b,a)` are f32 bits, as for
     /// `clear_color`.
     pub fn clear_color_rects(
+        &mut self,
+        r: u32,
+        g: u32,
+        b: u32,
+        a: u32,
+        rects: &[(i32, i32, i32, i32)],
+    ) {
+        // `rects` are the game's own; the viewport they clip against is already
+        // the bound texture's, so convert before clipping rather than after, or
+        // the intersection is taken between two different spaces.
+        let scale = self.pass_state.target_scale();
+        if scale.is_identity() {
+            self.clear_color_rects_resolved(r, g, b, a, rects);
+            return;
+        }
+        let scaled: Vec<(i32, i32, i32, i32)> =
+            rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
+        self.clear_color_rects_resolved(r, g, b, a, &scaled);
+    }
+
+    /// `clear_color_rects` for rects already in the bound texture's space.
+    ///
+    /// Split out so a caller that derived its rect from `effective_viewport`
+    /// (itself already converted) cannot scale it a second time.
+    fn clear_color_rects_resolved(
         &mut self,
         r: u32,
         g: u32,
@@ -2430,20 +2461,32 @@ impl FrameEncoder {
         // Save the device's current attachments + viewport so the one-off
         // destination pass doesn't perturb the live render target.
         let prev_color = self.pass_state.current_color_texture();
-        let prev_color_size = self.pass_state.current_color_size();
         let prev_color_format = self.pass_state.current_color_format();
         let prev_depth = self.pass_state.current_depth_texture();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
+        // The device's binding is restored verbatim below, scale included: the
+        // blit's own binds run in already-converted coordinates and so declare
+        // the identity, which would otherwise leak onto the device's target.
+        let prev_color_logical = self.pass_state.current_color_logical_size();
+        let prev_color_scale = self.pass_state.target_scale();
 
         // Bind the destination as the colour RT with no depth attachment, then
         // open a Load pass scoped to the destination rect via the viewport.
         // `set_color_render_target` / `set_depth_stencil_attachment` end the
         // current pass for us, so the quad never draws on a stale encoder.
-        self.pass_state
-            .set_color_render_target(dst_tex, dst_dims.0, dst_dims.1, dst_format);
+        // `dst_dims` and `dst_rect` are already in the destination texture's own
+        // space (the caller converted them), so this binding declares the
+        // identity rather than converting a second time.
+        self.pass_state.set_color_render_target(
+            dst_tex,
+            dst_dims.0,
+            dst_dims.1,
+            dst_format,
+            RenderScale::IDENTITY,
+        );
         self.pass_state
             .set_depth_stencil_attachment(MetalHandle::NULL, false, false);
         self.pass_state
@@ -2489,9 +2532,10 @@ impl FrameEncoder {
         // Restore the device's previous attachments + viewport.
         self.pass_state.set_color_render_target(
             prev_color,
-            prev_color_size.0,
-            prev_color_size.1,
+            prev_color_logical.0,
+            prev_color_logical.1,
             prev_color_format,
+            prev_color_scale,
         );
         self.pass_state.set_depth_stencil_attachment(
             prev_depth,
@@ -5048,8 +5092,16 @@ pub struct FrameData {
     /// HDR is active, which is decided unix-side and gated by the
     /// `macdrv::hdr_active()` global).
     view_handle: MetalHandle<NSViewKind>,
+    /// Logical back-buffer width, the resolution D3D9 reports.
+    ///
+    /// `render_scale` of this is the rasterized extent.
     backbuffer_width: u32,
+    /// Logical back-buffer height. See `backbuffer_width`.
     backbuffer_height: u32,
+    /// Fraction of the logical resolution the back buffer is rasterized at.
+    ///
+    /// Handed to `PassState::reset_frame`, which reconciles the two spaces.
+    render_scale: RenderScale,
     /// Metal pixel format of the backbuffer.
     ///
     /// Always `Bgra8Unorm` in mtld3d today — `unix/unix/src/metal/texture.rs`
@@ -5138,9 +5190,19 @@ pub struct FrameInit {
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     pub view_handle: MetalHandle<NSViewKind>,
+    /// The frame's **logical** back-buffer width, the one D3D9 reports.
+    ///
+    /// `render_scale` converts it to the rasterized extent; keeping the pair
+    /// separate means every consumer states which space it wants.
     pub backbuffer_width: u32,
+    /// The frame's **logical** back-buffer height. See `backbuffer_width`.
     pub backbuffer_height: u32,
     pub backbuffer_format: PixelFormat,
+    /// Fraction of the logical resolution the back buffer is rasterized at.
+    ///
+    /// Forwarded to `PassState::reset_frame`, which is the single place the
+    /// logical and render coordinate spaces are reconciled.
+    pub render_scale: RenderScale,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     /// `true` when the frame's default depth attachment is a combined depth+stencil format.
     ///
@@ -5169,6 +5231,7 @@ impl FrameData {
             backbuffer_width: init.backbuffer_width,
             backbuffer_height: init.backbuffer_height,
             backbuffer_format: init.backbuffer_format,
+            render_scale: init.render_scale,
             depth_texture: init.depth_texture,
             flags: if init.depth_has_stencil {
                 FrameDataFlags::DEPTH_HAS_STENCIL

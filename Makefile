@@ -136,7 +136,17 @@ bundle: all
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
 # MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
-MTLD3D_TEST_ENV := MTLD3D_CONFIG=shaderCache.enable=false WINEDEBUG=
+#
+# SCALE=<n> additionally reruns the whole e2e suite at `render.scale = <n>`,
+# i.e. rasterizing the back buffer smaller than the resolution D3D9 reports and
+# letting MetalFX resolve it. Every coordinate the suite asserts on is in the
+# reported space, so a passing scaled run is the evidence that the logical and
+# render spaces stayed separate. `make test SCALE=0.75` — try 0.5 and a
+# non-dividing 0.67 too, since those catch rounding that a clean fraction hides.
+MTLD3D_CONF_TEST := shaderCache.enable=false$(if $(SCALE),;render.scale=$(SCALE))
+# Quoted: the config separator is `;`, which the shell would otherwise read as
+# a command separator and run the rest of the line as its own command.
+MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
 
 test: install
 	# Host-native unit tests, built for this machine's native arch (no Rosetta).

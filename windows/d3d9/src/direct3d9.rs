@@ -969,11 +969,12 @@ extern "system" fn d3d9_create_device(
             backbuffer_handle: bb_params.texture_handle,
             layer_handle: layer_params.layer_handle,
             view_handle: layer_params.view_handle,
-            // The encoder works in render space: pass sizes, default
-            // viewports and full-attachment clears all derive from this.
-            backbuffer_width: render_width,
-            backbuffer_height: render_height,
+            // Logical, paired with the scale below: `PassState::reset_frame`
+            // derives the rasterized extent from the two.
+            backbuffer_width: pp.back_buffer_width,
+            backbuffer_height: pp.back_buffer_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+            render_scale,
             depth_texture: depth_handle,
             depth_has_stencil: depth_format_has_stencil(pp.auto_depth_stencil_format),
             apply_display_sync_enabled: None,

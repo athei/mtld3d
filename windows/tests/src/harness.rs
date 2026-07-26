@@ -358,6 +358,32 @@ impl Harness {
         self.clear(D3DCLEAR_TARGET, color, 1.0, 0)
     }
 
+    /// `Clear(D3DCLEAR_TARGET)` restricted to an explicit `pRects` array.
+    ///
+    /// Distinct from [`Self::clear_target`], which passes `NULL` and clears the
+    /// whole target: D3D9 gives the two different semantics, and only this form
+    /// exercises per-rect clipping.
+    ///
+    /// # Panics
+    ///
+    /// If `rects` holds more than `u32::MAX` entries, which no test writes.
+    pub fn clear_target_rects(&self, color: u32, rects: &[D3DRECT]) -> i32 {
+        let count = u32::try_from(rects.len()).expect("test rect count fits u32");
+        // SAFETY: vtable thunk; `rects` is a live slice of `count` D3DRECTs,
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().clear)(
+                self.device,
+                count,
+                rects.as_ptr().cast(),
+                D3DCLEAR_TARGET,
+                color,
+                1.0,
+                0,
+            )
+        }
+    }
+
     /// Run one frame: pump → begin → clear → `body` → end → present.
     ///
     /// Asserts each step succeeds. Pair with [`Self::read_pixel`] (which flushes)

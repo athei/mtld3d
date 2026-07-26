@@ -32,7 +32,10 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use mtld3d_shared::{MetalHandle, mtl_handle::MTLDeviceKind};
+use mtld3d_shared::{
+    MetalHandle,
+    mtl_handle::{MTLDeviceKind, MTLTextureKind},
+};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLTexture};
 use objc2_metal_fx::{
@@ -209,6 +212,92 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     // Leaked for process lifetime, same as the present/blit pipelines: the
     // Metal device and queue outlive every frame and are themselves leaked.
     Some(ScalerSlot(Retained::into_raw(scaler)))
+}
+
+/// Cache key for a readback resolve target: one scratch texture per size.
+///
+/// No format component: [`resolve_for_readback`] only serves the `BGRA8Unorm`
+/// back buffer, so the format is fixed by the same gate that admits the call.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ScratchKey {
+    width: u32,
+    height: u32,
+}
+
+/// Process-lifetime cache of readback resolve targets, by raw texture handle.
+///
+/// Stores the wire handle rather than a `Retained` so the map is trivially
+/// `Send`; each use re-borrows through `IntoRetained`, which bumps the refcount
+/// and leaves the cache's own retain live.
+static SCRATCH: OnceLock<Mutex<HashMap<ScratchKey, u64>>> = OnceLock::new();
+
+/// Resolve `src` to `out_w` x `out_h` for a CPU readback, returning the resolved texture.
+///
+/// `GetRenderTargetData`, a back-buffer `LockRect` and `GetDC` all owe the game
+/// pixels at the resolution D3D9 reports, but under `render.scale` the back
+/// buffer is rasterized smaller. Running the *same* upscale the display path
+/// runs, into a scratch texture of the reported size, is what makes a readback
+/// agree with what is on screen; resampling on the CPU instead would be both
+/// slower and visibly worse.
+///
+/// Encodes onto `cmd_buf` ahead of the caller's blit encoder, so the resolve
+/// and the readback are one command buffer and one wait. Returns `None` when
+/// `MetalFX` cannot serve the pair, leaving the caller to read `src` directly.
+///
+/// The scaler cache key is the same one present uses, so the common case
+/// (readback at the frame's own scale) reuses an already-built scaler.
+pub fn resolve_for_readback(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    device_handle: MetalHandle<MTLDeviceKind>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    out_w: u32,
+    out_h: u32,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    // The resolve target has to match the source's format, and the only source
+    // that ever needs resolving is the back buffer, which is pinned to
+    // `BGRA8Unorm`. Gating on that keeps the cache key free of a format it
+    // could never vary in, and declines rather than guessing if it ever does.
+    if src.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
+        return None;
+    }
+    let key = ScratchKey {
+        width: out_w,
+        height: out_h,
+    };
+    let cache = SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut scratch) = cache.lock() else {
+        return None;
+    };
+    let handle = if let Some(&handle) = scratch.get(&key) {
+        handle
+    } else {
+        // Same shape as any other colour attachment we own, so it goes through
+        // the shared creator rather than repeating the descriptor dance.
+        let built = super::texture::create_upscale_target(
+            device_handle,
+            out_w,
+            out_h,
+            mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+        );
+        let Some(built) = built else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "readback resolve target {out_w}x{out_h} could not be created — readback reads \
+                 the render-resolution frame instead and will be the wrong size"
+            );
+            return None;
+        };
+        scratch.insert(key, built.raw());
+        built.raw()
+    };
+    // SAFETY: the handle came from `create_color_target`, which adopted the
+    // texture's canonical retain; the cache holds it for process lifetime.
+    let target = unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()?;
+    if !encode(cmd_buf, device, src, &target) {
+        return None;
+    }
+    Some(target)
 }
 
 /// Narrow a Metal texture dimension to the `u32` the cache key stores.

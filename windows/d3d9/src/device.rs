@@ -696,13 +696,30 @@ bitflags::bitflags! {
 }
 
 impl DeviceInner {
-    /// The scale to apply to a game-supplied rect for the *currently bound* target.
+    /// The scale a game-created render target or depth-stencil of this size inherits.
     ///
-    /// `render.scale` shrinks the back buffer only. A render target the game
-    /// created is exactly the size it asked for, so a rect aimed at one is
-    /// already in that texture's space and must pass through untouched.
-    const fn rt_scale(&self) -> mtld3d_core::render_scale::RenderScale {
-        if self.bound_rt.render_target().is_null() {
+    /// A surface created at exactly the resolution D3D9 reports for the back
+    /// buffer is the game's main view: either it renders the scene there and
+    /// blits to the back buffer, or it is the depth buffer paired with it.
+    /// Either way it belongs to the same image, so it scales with it — which is
+    /// both what makes `render.scale` save anything for a game that does not
+    /// draw straight to the back buffer, and what keeps a colour/depth pair the
+    /// same size once one of them shrinks.
+    ///
+    /// Anything sized differently is an intermediate the game picked a
+    /// resolution for (a shadow map, a glow chain, a fixed-size scratch
+    /// target); its coordinates are its own and must pass through untouched.
+    ///
+    /// Only render targets and depth-stencils qualify. A surface the game
+    /// uploads pixels into has a CPU-side layout that must keep matching what
+    /// D3D9 reports.
+    pub const fn scale_for_created_target(
+        &self,
+        width: u32,
+        height: u32,
+        is_target: bool,
+    ) -> mtld3d_core::render_scale::RenderScale {
+        if is_target && width == self.backbuffer_width && height == self.backbuffer_height {
             self.render_scale
         } else {
             mtld3d_core::render_scale::RenderScale::IDENTITY
@@ -730,12 +747,12 @@ impl DeviceInner {
         // `self.viewport` keeps the raw values so GetViewport round-trips
         // unchanged. Ordinary `[min_z, max_z]` ranges (`max_z >= min_z + 0.001`)
         // are left untouched.
-        // Only the value handed to Metal is converted to render resolution;
-        // `self.viewport` above keeps the game's own numbers so `GetViewport`
-        // round-trips and, critically, so the fixed-function XYZRHW row stays
-        // in the game's screen space. A custom render target is never scaled:
-        // the game sized that texture itself.
-        let (x, y, width, height) = self.rt_scale().rect(v.x, v.y, v.width, v.height);
+        // The rect stays in the game's coordinate space all the way to the
+        // encoder: `PassState` converts it to render resolution against
+        // whichever target is bound when it becomes a Metal command. Keeping it
+        // logical here is also what holds the fixed-function XYZRHW row in the
+        // game's screen space.
+        let (x, y, width, height) = (v.x, v.y, v.width, v.height);
         let min_z = v.min_z;
         let max_z = v.max_z.max(v.min_z + 0.001);
         self.push_op(Box::new(move |enc| {
@@ -1113,19 +1130,20 @@ impl DeviceInner {
     /// `flush_current_frame_blocking`. Takes `&mut self` because a pending
     /// `PresentationInterval` change from `device_reset` is consumed here so
     /// the encoder can apply it on the next frame's first `nextDrawable`.
-    pub fn fresh_frame(&mut self) -> FrameData {
+    pub const fn fresh_frame(&mut self) -> FrameData {
         FrameData::new(&FrameInit {
             device_handle: self.device_handle,
             queue_handle: self.queue_handle,
             backbuffer_handle: self.backbuffer_handle,
             layer_handle: self.layer_handle,
             view_handle: self.view_handle,
-            // Render space: the encoder sizes passes, default viewports and
-            // full-attachment clears from these, and they all belong to the
-            // Metal texture rather than the resolution D3D9 reports.
-            backbuffer_width: self.render_scale.dimension(self.backbuffer_width),
-            backbuffer_height: self.render_scale.dimension(self.backbuffer_height),
+            // Logical, paired with the scale: `PassState::reset_frame` derives
+            // the rasterized extent from the two so the conversion lives in one
+            // place rather than at every producer of a frame stamp.
+            backbuffer_width: self.backbuffer_width,
+            backbuffer_height: self.backbuffer_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+            render_scale: self.render_scale,
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
             apply_display_sync_enabled: self.pending_display_sync_enabled.take(),
@@ -1240,6 +1258,17 @@ impl DeviceInner {
     /// Factored out of `device_set_render_target` so `flush_current_frame_
     /// blocking` can re-assert the persistent binding into the fresh frame.
     fn push_color_rt_binding_op(&mut self, info: RtBinding) {
+        // Every variant carries the size D3D9 reports for the target, and the
+        // same rule decides all three: the back buffer's own scale if it was
+        // created at the reported back-buffer resolution, the identity
+        // otherwise. Resolved here because the closure runs on the encoder
+        // thread, which cannot reach the device.
+        let (logical_w, logical_h) = match &info {
+            RtBinding::Backbuffer { width, height, .. }
+            | RtBinding::StandaloneColor { width, height, .. }
+            | RtBinding::Texture { width, height, .. } => (*width, *height),
+        };
+        let scale = self.scale_for_created_target(logical_w, logical_h, true);
         self.push_op(Box::new(move |enc| {
             let (handle, w, h, fmt, has_alpha) = match info {
                 RtBinding::Backbuffer {
@@ -1282,7 +1311,7 @@ impl DeviceInner {
                     )
                 }
             };
-            enc.set_color_render_target(handle, w, h, fmt, has_alpha);
+            enc.set_color_render_target(handle, w, h, fmt, has_alpha, scale);
         }));
     }
 
@@ -1869,6 +1898,8 @@ impl DeviceInner {
 
         self.set_backbuffer_dims(new_width, new_height);
 
+        // The drawable is the presented surface, so it follows the window's
+        // logical size; only the textures below shrink with `render.scale`.
         if !self.layer_handle.is_null() {
             let mut size = mtld3d_shared::SetLayerDrawableSizeParams {
                 layer_handle: self.layer_handle,
@@ -1880,8 +1911,8 @@ impl DeviceInner {
 
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
-            width: new_width,
-            height: new_height,
+            width: self.render_scale.dimension(new_width),
+            height: self.render_scale.dimension(new_height),
             texture_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut bb_params);
@@ -1908,10 +1939,11 @@ impl DeviceInner {
                 self.set_depth_stencil_handle(MetalHandle::NULL);
                 return;
             };
+            // Render space, matching the colour attachment exactly.
             let mut ds_params = CreateDepthTextureParams {
                 device_handle: self.device_handle,
-                width: new_width,
-                height: new_height,
+                width: bb_params.width,
+                height: bb_params.height,
                 pixel_format,
                 pad0: 0,
                 texture_handle: MetalHandle::NULL,
@@ -3154,9 +3186,10 @@ fn reset_recreate_resources(
     //    new dims for the post-Reset frame.
     dev.set_backbuffer_dims(pp.back_buffer_width, pp.back_buffer_height);
 
-    // 4. Push the new pixel size to CAMetalLayer so the next
-    //    `nextDrawable` matches the recreated backbuffer 1:1 and the
-    //    present blit covers it without scaling.
+    // 4. Push the new pixel size to CAMetalLayer. The drawable is the
+    //    *presented* surface, so it tracks the logical size even when
+    //    `render.scale` makes the backbuffer smaller; MetalFX bridges the
+    //    two at present.
     if !dev.layer_handle.is_null() {
         let mut size = mtld3d_shared::SetLayerDrawableSizeParams {
             layer_handle: dev.layer_handle,
@@ -3166,11 +3199,12 @@ fn reset_recreate_resources(
         unix_call(&mut size);
     }
 
-    // 5. Recreate the backbuffer at the new dims.
+    // 5. Recreate the backbuffer at the new dims, in render space — this is
+    //    the texture rasterization writes into.
     let mut bb_params = mtld3d_shared::CreateBackbufferParams {
         device_handle: dev.device_handle,
-        width: pp.back_buffer_width,
-        height: pp.back_buffer_height,
+        width: dev.render_scale.dimension(pp.back_buffer_width),
+        height: dev.render_scale.dimension(pp.back_buffer_height),
         texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
@@ -3197,10 +3231,12 @@ fn reset_recreate_resources(
             dev.set_depth_stencil_handle(MetalHandle::NULL);
             return Err(D3DERR_INVALIDCALL);
         };
+        // Render space, matching the colour attachment exactly — Metal
+        // rejects a pass whose attachments disagree on size.
         let mut ds_params = CreateDepthTextureParams {
             device_handle: dev.device_handle,
-            width: pp.back_buffer_width,
-            height: pp.back_buffer_height,
+            width: bb_params.width,
+            height: bb_params.height,
             pixel_format,
             pad0: 0,
             texture_handle: MetalHandle::NULL,
@@ -3258,10 +3294,12 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
             dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         };
+        // Render space, matching the backbuffer texture rather than the
+        // logical dims the device reports.
         let mut ds_params = CreateDepthTextureParams {
             device_handle: dev.device_handle,
-            width: dev.backbuffer_width,
-            height: dev.backbuffer_height,
+            width: dev.render_scale.dimension(dev.backbuffer_width),
+            height: dev.render_scale.dimension(dev.backbuffer_height),
             pixel_format,
             pad0: 0,
             texture_handle: MetalHandle::NULL,
@@ -3569,12 +3607,19 @@ extern "system" fn device_create_texture(
 
     let mut flags = TextureFlags::empty();
     flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
+    // A render target the game created at the reported back-buffer size is its
+    // main view and shares the back buffer's scale. A texture it uploads pixels
+    // into never does: its staging layout is keyed to the reported size.
+    let render_scale =
+        obj.inner()
+            .scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0);
     let tex = Direct3DTexture9::new(TextureCreateInfo {
         texture_id: TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
         device_inner: obj.inner as u64,
         width,
         height,
+        render_scale,
         depth: 1,
         levels: actual_levels,
         d3d_format: format,
@@ -3735,12 +3780,17 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // Sized to the back buffer, this is the depth buffer for the main view and
+    // has to keep matching the colour attachment it is bound with; any other
+    // size is a shadow map with its own resolution.
+    let render_scale = obj.inner().scale_for_created_target(width, height, true);
     let tex = Direct3DTexture9::new(TextureCreateInfo {
         texture_id: TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
         device_inner: obj.inner as u64,
         width,
         height,
+        render_scale,
         depth: 1,
         levels: actual_levels,
         d3d_format: format,
@@ -3899,6 +3949,8 @@ extern "system" fn device_create_volume_texture(
         device_inner: obj.inner as u64,
         width,
         height,
+        // A volume texture is never a render target, so it never scales.
+        render_scale: mtld3d_core::render_scale::RenderScale::IDENTITY,
         depth,
         levels: actual_levels,
         d3d_format: format,
@@ -4048,12 +4100,15 @@ extern "system" fn device_create_cube_texture(
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // A cube face is never the main view's colour or depth target, so it keeps
+    // whatever edge length the game asked for.
     let tex = crate::texture::Direct3DCubeTexture9::new(TextureCreateInfo {
         texture_id: mtld3d_core::ids::TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
         device_inner: obj.inner as u64,
         width: edge_length,
         height: edge_length,
+        render_scale: mtld3d_core::render_scale::RenderScale::IDENTITY,
         depth: 1,
         levels: actual_levels,
         d3d_format: format,
@@ -4249,10 +4304,23 @@ fn create_color_target_surface(
     if mapping.is_compressed() {
         return None;
     }
-    let mut params = CreateColorTargetParams {
-        device_handle,
+    // A render target created at the reported back-buffer size is the game's
+    // main view and shares its scale; the surface still reports `width`/`height`
+    // so `GetDesc` and every coordinate the game supplies stay logical.
+    // `D3DUSAGE_RENDERTARGET` gates it: this fn also serves
+    // `CreateOffscreenPlainSurface`, whose pixels the game reads and writes at
+    // the size it asked for.
+    // SAFETY: `device_inner` is the live owning device, non-null for every
+    // caller of this fn (they hold it from the device thunk).
+    let scale = unsafe { &*device_inner }.scale_for_created_target(
         width,
         height,
+        usage & D3DUSAGE_RENDERTARGET != 0,
+    );
+    let mut params = CreateColorTargetParams {
+        device_handle,
+        width: scale.dimension(width),
+        height: scale.dimension(height),
         pixel_format: mapping.metal_pixel_format(),
         pad0: 0,
         texture_handle: MetalHandle::NULL,
@@ -4401,10 +4469,16 @@ extern "system" fn device_create_depth_stencil_surface(
         return D3DERR_INVALIDCALL;
     };
     let device_handle = obj.inner().device_handle;
+    // A depth buffer created at the reported back-buffer size is the one paired
+    // with the main view, so it shares the back buffer's scale and stays the
+    // same size as the colour attachment it is bound with. The surface still
+    // reports `width`/`height`. A differently-sized depth surface is a shadow
+    // map or similar and keeps its own resolution.
+    let scale = obj.inner().scale_for_created_target(width, height, true);
     let mut params = CreateDepthTextureParams {
         device_handle,
-        width,
-        height,
+        width: scale.dimension(width),
+        height: scale.dimension(height),
         pixel_format,
         pad0: 0,
         texture_handle: MetalHandle::NULL,
@@ -4843,7 +4917,11 @@ fn blit_handle_to_systemmem(
         width,
         height,
         bytes_per_row,
-        pad0: 0,
+        // A whole-image read from the origin, so the region *is* the logical
+        // extent. If the source is a scaled back buffer its texture is
+        // smaller than this and the unix side resolves it up first.
+        source_width: width,
+        source_height: height,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -4893,7 +4971,7 @@ extern "system" fn device_stretch_rect(
     flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
     let dev = obj.inner();
 
-    let Some(src_info) = resolve_stretch_surface(src_surf) else {
+    let Some(src_info) = resolve_stretch_surface(dev, src_surf) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: RejectReason::UnsupportedSource.key(),
@@ -4902,7 +4980,7 @@ extern "system" fn device_stretch_rect(
         );
         return D3DERR_INVALIDCALL;
     };
-    let Some(dst_info) = resolve_stretch_surface(dst_surf) else {
+    let Some(dst_info) = resolve_stretch_surface(dev, dst_surf) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: RejectReason::UnsupportedDestination.key(),
@@ -5324,6 +5402,21 @@ fn parse_stretch_regions(
     Some((src_region, dst_region))
 }
 
+/// Convert a `StretchRect` region into the space of the texture it addresses.
+///
+/// A no-op for anything but the back buffer under a non-default
+/// `render.scale`, and an exact identity at the default.
+fn scale_stretch_region(
+    scale: mtld3d_core::render_scale::RenderScale,
+    region: mtld3d_core::stretch_rect::StretchRegion,
+) -> mtld3d_core::stretch_rect::StretchRegion {
+    if scale.is_identity() {
+        return region;
+    }
+    let (x, y, w, h) = scale.rect(region.x, region.y, region.w, region.h);
+    mtld3d_core::stretch_rect::StretchRegion { x, y, w, h }
+}
+
 /// Blit geometry + mode for [`emit_stretch_rect_blit`].
 struct StretchBlitParams {
     src_region: mtld3d_core::stretch_rect::StretchRegion,
@@ -5380,6 +5473,68 @@ fn emit_stretch_rect_blit(
         );
         return;
     }
+
+    // `render.scale` shrinks the back buffer, so an endpoint that *is* the back
+    // buffer has both its region and its extent converted; the ratio the blit
+    // VS builds from the two is preserved, while the destination rect (which
+    // drives an absolute viewport and scissor) lands on real pixels. An
+    // endpoint the game created keeps its own coordinates.
+    let (src_scale, dst_scale) = (src_info.scale, dst_info.scale);
+    let src_region = scale_stretch_region(src_scale, src_region);
+    let dst_region = scale_stretch_region(dst_scale, dst_region);
+    let src_dims = (
+        src_scale.dimension(src_info.width),
+        src_scale.dimension(src_info.height),
+    );
+    let dst_dims = (
+        dst_scale.dimension(dst_info.width),
+        dst_scale.dimension(dst_info.height),
+    );
+
+    // The API thread decided this from the game's own rects. Scaling only one
+    // endpoint can turn a logically 1:1 copy into a physical resize, which the
+    // blit encoder cannot do, so the transport choice is re-made here on the
+    // sizes that actually reach Metal.
+    let render_quad = render_quad || src_region.w != dst_region.w || src_region.h != dst_region.h;
+    if render_quad
+        && !dst_info
+            .flags
+            .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
+    {
+        // Only reachable with a non-default `render.scale`: the pair was 1:1
+        // in the game's coordinates (so D3D9 accepted it against a
+        // non-render-target destination) and only the back-buffer side shrank.
+        // The render-quad path would have to bind a surface that cannot be a
+        // colour attachment, so copy the overlapping region instead and say so
+        // rather than silently corrupting the destination.
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "StretchRect: render.scale made a 1:1 copy into a non-render-target destination a \
+             {}x{} → {}x{} resize, which a Metal blit cannot do; copying the overlap instead. \
+             Set render.scale = 1.0 if this surface's contents matter",
+            src_region.w, src_region.h, dst_region.w, dst_region.h,
+        );
+        enc.end_current_pass("stretch_rect");
+        let region_w = src_region.w.min(dst_region.w);
+        let region_h = src_region.h.min(dst_region.h);
+        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
+            &CopyTextureSubRectInfo {
+                src_texture: src_handle,
+                dst_texture: dst_handle,
+                mip_level,
+                src_origin_x: src_region.x,
+                src_origin_y: src_region.y,
+                dst_origin_x: dst_region.x,
+                dst_origin_y: dst_region.y,
+                region_w,
+                region_h,
+            },
+        ));
+        if dst_info.autogen_texture_id.is_some() {
+            enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(dst_handle));
+        }
+        return;
+    }
     if render_quad {
         // Render-quad path (a size change and/or a format conversion): render
         // the source onto a quad covering the destination rect. The
@@ -5401,12 +5556,12 @@ fn emit_stretch_rect_blit(
             &BlitSide {
                 handle: src_handle,
                 rect: src_region,
-                dims: (src_info.width, src_info.height),
+                dims: src_dims,
             },
             &BlitSide {
                 handle: dst_handle,
                 rect: dst_region,
-                dims: (dst_info.width, dst_info.height),
+                dims: dst_dims,
             },
             dst_format,
             filter,
@@ -5441,9 +5596,9 @@ fn emit_stretch_rect_blit(
         target: BLIT_TRACE_TARGET,
         "StretchRect src={src_handle:#x} {sw}x{sh} src_rect={sx},{sy}+{rw}x{rh} \
          dst={dst_handle:#x} {dw}x{dh} dst_rect={dx},{dy}+{rw}x{rh} mip={mip_level}",
-        sw = src_info.width, sh = src_info.height,
+        sw = src_dims.0, sh = src_dims.1,
         sx = src_region.x, sy = src_region.y,
-        dw = dst_info.width, dh = dst_info.height,
+        dw = dst_dims.0, dh = dst_dims.1,
         dx = dst_region.x, dy = dst_region.y,
         rw = src_region.w, rh = src_region.h,
     );
@@ -5478,8 +5633,18 @@ bitflags::bitflags! {
 /// (which may be released before the closure runs).
 struct StretchSurfaceInfo {
     kind: StretchKind,
+    /// Surface width as D3D9 reports it.
+    ///
+    /// The Metal texture behind it is `scale` of this.
     width: u32,
+    /// Surface height as D3D9 reports it. See [`Self::width`].
     height: u32,
+    /// What this endpoint's texture is rasterized at relative to `width`/`height`.
+    ///
+    /// Resolved on the API thread, where the device is reachable, so the
+    /// encoder-thread blit body can convert each endpoint without having to
+    /// re-derive which surfaces `render.scale` applies to.
+    scale: mtld3d_core::render_scale::RenderScale,
     format: u32,
     mip_level: u32,
     /// D3DPOOL_* of the backing resource.
@@ -5507,6 +5672,7 @@ enum StretchKind {
 }
 
 fn resolve_stretch_surface(
+    dev: &DeviceInner,
     surf: *mut crate::surface::Direct3DSurface9,
 ) -> Option<StretchSurfaceInfo> {
     if surf.is_null() {
@@ -5534,10 +5700,19 @@ fn resolve_stretch_surface(
             StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT,
             s.owns_parent_texture(),
         );
+        let (width, height) = (
+            tex.inner().mip_width(lvl_idx),
+            tex.inner().mip_height(lvl_idx),
+        );
+        // Only a render-target or depth-stencil texture ever inherits the back
+        // buffer's scale; one the game uploads pixels into keeps the size its
+        // CPU-side layout assumes.
+        let is_target = (tex.d3d_usage() & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0;
         return Some(StretchSurfaceInfo {
             kind: StretchKind::Texture(info),
-            width: tex.inner().mip_width(lvl_idx),
-            height: tex.inner().mip_height(lvl_idx),
+            width,
+            height,
+            scale: dev.scale_for_created_target(width, height, is_target),
             format: tex.d3d_format(),
             mip_level: level,
             pool: tex.d3d_pool(),
@@ -5554,6 +5729,7 @@ fn resolve_stretch_surface(
             kind: StretchKind::Backbuffer(color),
             width: s.standalone_width(),
             height: s.standalone_height(),
+            scale: dev.scale_for_created_target(s.standalone_width(), s.standalone_height(), true),
             format: s.standalone_format(),
             mip_level: 0,
             pool: D3DPOOL_DEFAULT,
@@ -5570,6 +5746,7 @@ fn resolve_stretch_surface(
             kind: StretchKind::DepthStencil(depth),
             width: s.standalone_width(),
             height: s.standalone_height(),
+            scale: dev.scale_for_created_target(s.standalone_width(), s.standalone_height(), true),
             format: s.standalone_format(),
             mip_level: 0,
             pool: D3DPOOL_DEFAULT,

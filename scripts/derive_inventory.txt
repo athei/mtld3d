@@ -41,6 +41,7 @@ unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScalerSlot Clone,Copy
+unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/buffer_rename.rs BufferMapMode Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs LockPlan Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq

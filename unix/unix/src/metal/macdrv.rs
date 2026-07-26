@@ -587,9 +587,11 @@ pub fn set_display_sync_enabled(
 
 /// Update `drawableSize` on an already-attached `CAMetalLayer`.
 ///
-/// Used by the D3D9 Reset path when the game requests a different
-/// backbuffer size — the rendering surface must match the new backbuffer
-/// texture pixel-for-pixel for the present blit to cover the drawable 1:1.
+/// Used by the D3D9 Reset path when the game requests a different backbuffer
+/// size. The value is the *presented* resolution, which `render.scale` lets
+/// diverge from the backbuffer texture's own extent; present resolves the
+/// difference through `MTLFXSpatialScaler`, and only a default scale makes the
+/// two match pixel-for-pixel.
 pub fn set_layer_drawable_size(
     layer_handle: MetalHandle<CAMetalLayerKind>,
     width: u32,

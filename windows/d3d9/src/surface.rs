@@ -1684,7 +1684,12 @@ fn backbuffer_lock_readback(
         width: w,
         height: h,
         bytes_per_row,
-        pad0: 0,
+        // `x/y/w/h` are a sub-rect of the full logical surface, which is what
+        // `parse_surface_rect` clamped them against. The unix side resolves the
+        // whole frame to this size before cropping, so the sub-rect lands where
+        // the game expects and `bytes_per_row` above stays logical.
+        source_width: full_w,
+        source_height: full_h,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -1744,7 +1749,11 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
         width: w,
         height: h,
         bytes_per_row,
-        pad0: 0,
+        // Whole-surface read at its logical size; a scaled back buffer's
+        // texture is smaller and gets resolved up to this first, so the DIB
+        // this seeds is the size `GetDC` promised.
+        source_width: w,
+        source_height: h,
     };
     if unix_call(&mut params) != 0 {
         return None;
@@ -1960,7 +1969,11 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         width,
         height,
         bytes_per_row,
-        pad0: 0,
+        // Whole-surface read. This path serves a lockable render target, which
+        // the game sized itself, so the region already equals the texture and
+        // the unix side skips the resolve.
+        source_width: width,
+        source_height: height,
     };
     let status = unix_call(&mut params);
     if status != 0 {

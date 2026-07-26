@@ -91,6 +91,28 @@ impl RenderScale {
         (x1, y1, x2 - x1, y2 - y1)
     }
 
+    /// Convert a logical half-open `(x1, y1, x2, y2)` rect to render resolution.
+    ///
+    /// The signed counterpart of [`Self::rect`], for the `D3DRECT`-shaped
+    /// coordinates `Clear` and `StretchRect` carry. Scales the same edges the
+    /// same way, so a rect converted through either entry point lands on the
+    /// same pixels.
+    ///
+    /// A negative edge lies outside the attachment and is clipped by the caller
+    /// either way, so it clamps to zero before the unsigned scale rather than
+    /// inventing a rounding rule for the half-plane D3D9 cannot address.
+    #[must_use]
+    pub fn rect_edges_i32(self, r: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+        if self.is_identity() {
+            return r;
+        }
+        let e = |v: i32| {
+            let scaled = self.edge(v.max(0).cast_unsigned());
+            i32::try_from(scaled).unwrap_or(i32::MAX)
+        };
+        (e(r.0), e(r.1), e(r.2), e(r.3))
+    }
+
     /// Scale a single rect edge, rounding to nearest.
     ///
     /// Rounding to nearest (rather than the `dimension` ceiling) is what makes
@@ -160,6 +182,38 @@ mod tests {
     fn rect_scales_origin_and_extent_together() {
         let s = RenderScale::from_percent(50);
         assert_eq!(s.rect(100, 200, 400, 300), (50, 100, 200, 150));
+    }
+
+    #[test]
+    fn signed_rect_matches_the_unsigned_one() {
+        // `Clear` carries D3DRECTs and the scissor carries (x, y, w, h); both
+        // must land on the same pixels or a clipped clear seams against the
+        // scissor that clipped it.
+        let scale = RenderScale::from_percent(75);
+        let (x, y, width, height) = scale.rect(40, 24, 120, 80);
+        assert_eq!(
+            scale.rect_edges_i32((40, 24, 160, 104)),
+            (
+                x.cast_signed(),
+                y.cast_signed(),
+                (x + width).cast_signed(),
+                (y + height).cast_signed()
+            )
+        );
+    }
+
+    #[test]
+    fn signed_rect_identity_is_exact() {
+        let s = RenderScale::IDENTITY;
+        assert_eq!(s.rect_edges_i32((-5, 0, 640, 480)), (-5, 0, 640, 480));
+    }
+
+    #[test]
+    fn signed_rect_clamps_negative_edges() {
+        // Off-attachment edges are the caller's to clip; scaling must not
+        // wrap or panic on them.
+        let s = RenderScale::from_percent(50);
+        assert_eq!(s.rect_edges_i32((-100, -20, 200, 100)), (0, 0, 100, 50));
     }
 
     #[test]
