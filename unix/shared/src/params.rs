@@ -142,9 +142,14 @@ pub struct AttachMetalLayerParams {
     /// duration — the lower rate wins. PE side reads this from
     /// `CONFIG.present_max_fps`.
     pub max_fps: u32, // in
-    // Keeps the struct repr(C, align(8)) layout deterministic across PE
-    // and Unix linkage units. Constructed by name from d3d9, hence pub.
-    pub pad0: u32,
+    /// Whether this GPU can run a `MetalFX` spatial upscale.
+    ///
+    /// Non-zero lets the PE side size the drawable to the window and leave
+    /// the resample to `MetalFX`. Zero means the drawable must keep the back
+    /// buffer's size so present stays a 1:1 copy and Core Animation scales
+    /// the layer instead — the pre-`MetalFX` behaviour, and the only correct
+    /// fallback since nothing else on the unix side can resize a frame.
+    pub metalfx_available: u32, // out
 }
 
 impl Thunk for AttachMetalLayerParams {

@@ -127,6 +127,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         params.view_handle = view;
         params.layer_handle = layer;
         params.backing_scale = caps.backing_scale;
+        params.metalfx_available = u32::from(metal::upscale_is_supported(params.device_handle));
         info!(
             target: LOG_TARGET,
             "attached Metal layer {}x{} (vsync {}, maxFps {})",

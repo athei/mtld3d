@@ -291,11 +291,40 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // requested_peak`), so any peak > current is a guaranteed
             // visible regression — the OS clamps and dims the entire
             // image. Following the live ceiling avoids that entirely.
-            let presented = if super::macdrv::hdr_active() {
+            // The back buffer is the grid we rasterized on; the drawable
+            // covers the window. When they differ the frame has to be
+            // resampled, and MetalFX is a better upscaler than either the
+            // compositor or a bilinear sample in the present shader.
+            let rescaled = present_texture.width() != drawable_texture.width()
+                || present_texture.height() != drawable_texture.height();
+            let hdr = super::macdrv::hdr_active();
+            if rescaled && hdr {
+                // The HDR drawable is float and the inverse tone map has to
+                // run after the upscale, so the scaler cannot write it
+                // directly. Rather than carry a drawable-sized scratch target
+                // for an opt-in path, HDR keeps the present shader's own
+                // bilinear stretch. Tone-mapping at render resolution and
+                // running MetalFX in its HDR colour mode straight to the
+                // drawable is the cheaper fix if this ever matters.
+                mtld3d_shared::log_once_info!(
+                    target: LOG_TARGET,
+                    "present: HDR is active, so the frame is scaled by the present shader \
+                     rather than MetalFX"
+                );
+            }
+
+            let presented = if hdr {
                 let view_ptr = params.present_view.raw() as *mut c_void;
                 let current = super::macdrv::poll_current_headroom(view_ptr);
                 super::macdrv::log_headroom_change_if_any(current, view_ptr);
                 encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
+            } else if rescaled {
+                super::upscale::encode(
+                    &cmd_buf,
+                    &cmd_buf.device(),
+                    &present_texture,
+                    &drawable_texture,
+                )
             } else {
                 false
             };

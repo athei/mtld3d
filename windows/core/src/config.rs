@@ -92,6 +92,16 @@ pub struct Mtld3dConfig {
     /// otherwise-unthrottled free-run. `0` = uncapped. Default: `0`.
     /// File key: `present.maxFps`.
     pub present_max_fps: u32,
+    /// Render resolution as a percentage of the back buffer D3D9 reports.
+    ///
+    /// `100` (the default) renders at the size the game sees, which is an
+    /// exact identity: every derived rect is unscaled and present stays a 1:1
+    /// copy. Below 100 the scene rasterizes on a smaller grid and `MetalFX`
+    /// upscales it on present, trading pixels for frame rate. Stored as a
+    /// percentage rather than a float so the arithmetic is integer-only and
+    /// the struct keeps its `Eq`; the file key is written as a float. File
+    /// key: `render.scale` (e.g. `0.75`), accepted range `(0, 1.0]`.
+    pub render_scale_percent: u32,
 }
 
 /// `cursor.scale` policy.
@@ -119,6 +129,7 @@ impl Default for Mtld3dConfig {
             query_flush_immediate: true,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             present_max_fps: 0,
+            render_scale_percent: 100,
         }
     }
 }
@@ -220,6 +231,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: present.maxFps = {}", cfg.present_max_fps
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: render.scale = {}",
+        f64::from(cfg.render_scale_percent) / 100.0
+    );
 }
 
 const fn color_space_label(p: ColorSpacePolicy) -> &'static str {
@@ -250,6 +266,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_retention_cap_mb(source, value, &mut cfg.vbib_retention_cap_bytes);
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
+        "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
@@ -310,6 +327,70 @@ fn assign_max_fps(source: &str, value: &str, slot: &mut u32) {
     }
 }
 
+/// Lowest render scale the knob accepts, as a percentage.
+///
+/// Just above zero: the only real constraint is that a scaled dimension must
+/// not collapse, and `RenderScale::dimension` already floors it at one pixel.
+/// Anything tighter would be an invented limit, and a user who asks for a
+/// silly resolution can see the result for themselves.
+const RENDER_SCALE_MIN_PERCENT: u32 = 1;
+
+/// Highest render scale the knob accepts, as a percentage.
+///
+/// Rendering *above* the presented size would need a downscale on present,
+/// and `MTLFXSpatialScaler` only ever enlarges. There is nothing else on the
+/// unix side that can resize a frame, so supersampling is simply not offered.
+const RENDER_SCALE_MAX_PERCENT: u32 = 100;
+
+fn assign_render_scale(source: &str, value: &str, slot: &mut u32) {
+    // Written as a decimal (`0.75`) because that is how a resolution scale
+    // reads, stored as a percentage because everything downstream is integer
+    // arithmetic.
+    let percent = parse_hundredths(value)
+        .filter(|p| (RENDER_SCALE_MIN_PERCENT..=RENDER_SCALE_MAX_PERCENT).contains(p));
+    if let Some(p) = percent {
+        *slot = p;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'render.scale = {value}' is not a number in [{min}, {max}] → kept {kept}",
+            min = f64::from(RENDER_SCALE_MIN_PERCENT) / 100.0,
+            max = f64::from(RENDER_SCALE_MAX_PERCENT) / 100.0,
+            kept = f64::from(*slot) / 100.0
+        );
+    }
+}
+
+/// Parse a non-negative decimal such as `0.75` into hundredths (`75`).
+///
+/// Deliberately integer-only. Going through `f32` would need a float-to-int
+/// cast that no bound check can make total, and it would put the exactness of
+/// a user-visible setting at the mercy of binary rounding. Digits past the
+/// hundredths place are truncated; anything that is not a plain decimal
+/// (`-1`, `1e20`, `inf`, `NaN`, `half`) fails the digit parse and returns
+/// `None`.
+fn parse_hundredths(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    let (int_part, frac_part) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    let units: u32 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let mut hundredths = 0;
+    for (i, ch) in frac_part.chars().enumerate() {
+        let digit = ch.to_digit(10)?;
+        if i < 2 {
+            hundredths = hundredths * 10 + digit;
+        }
+    }
+    // Pad a single fractional digit out to hundredths (`0.5` → 50).
+    if frac_part.len() == 1 {
+        hundredths *= 10;
+    }
+    units.checked_mul(100)?.checked_add(hundredths)
+}
+
 fn assign_bool(source: &str, key: &str, value: &str, slot: &mut bool) {
     match value.to_ascii_lowercase().as_str() {
         "true" => *slot = true,
@@ -366,6 +447,7 @@ mod tests {
         assert!(d.skip_shaders.is_empty());
         assert!(d.query_flush_immediate);
         assert_eq!(d.present_max_fps, 0);
+        assert_eq!(d.render_scale_percent, 100);
     }
 
     #[test]
@@ -384,6 +466,48 @@ mod tests {
     fn present_max_fps_garbage_keeps_default() {
         let cfg = parse("present.maxFps = fast\n", None);
         assert_eq!(cfg.present_max_fps, 0);
+    }
+
+    #[test]
+    fn render_scale_float_becomes_a_percentage() {
+        assert_eq!(parse("render.scale = 0.5\n", None).render_scale_percent, 50);
+        assert_eq!(
+            parse("render.scale = 0.75\n", None).render_scale_percent,
+            75
+        );
+        assert_eq!(parse("render.scale = 1\n", None).render_scale_percent, 100);
+    }
+
+    #[test]
+    fn render_scale_accepts_its_exact_bounds() {
+        assert_eq!(parse("render.scale = 0.01\n", None).render_scale_percent, 1);
+        assert_eq!(
+            parse("render.scale = 1.0\n", None).render_scale_percent,
+            100
+        );
+    }
+
+    #[test]
+    fn render_scale_out_of_range_keeps_default() {
+        for src in [
+            // Above 1.0 has no path home: the present-side scaler only
+            // enlarges, so a render bigger than the drawable cannot resolve.
+            "render.scale = 1.5\n",
+            "render.scale = 2.5\n",
+            "render.scale = 0\n",
+            "render.scale = -1\n",
+            // Far outside u32: must be rejected, not saturated into range.
+            "render.scale = 1e20\n",
+            "render.scale = inf\n",
+            "render.scale = NaN\n",
+            "render.scale = half\n",
+        ] {
+            assert_eq!(
+                parse(src, None).render_scale_percent,
+                100,
+                "{src:?} must keep the default"
+            );
+        }
     }
 
     #[test]
@@ -553,7 +677,8 @@ mod tests {
             ;debug.bytecodeDumpDir=/tmp/x\
             ;debug.skipShaders=0xabc,def\
             ;query.flushImmediate=false\
-            ;present.maxFps=72";
+            ;present.maxFps=72\
+            ;render.scale=0.5";
         let cfg = parse("", Some(env));
         assert!(cfg.caps_all);
         assert!(cfg.hdr_enable);
@@ -564,6 +689,7 @@ mod tests {
         assert_eq!(cfg.skip_shaders, vec![0xabc, 0xdef]);
         assert!(!cfg.query_flush_immediate);
         assert_eq!(cfg.present_max_fps, 72);
+        assert_eq!(cfg.render_scale_percent, 50);
     }
 
     #[test]

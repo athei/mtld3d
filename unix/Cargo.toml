@@ -71,6 +71,7 @@ objc2-metal = { version = "0.3", features = [
     "MTLTypes",
     "MTLVertexDescriptor",
 ] }
+objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
 strum = { version = "0.28", default-features = false }
 

@@ -26,7 +26,8 @@ windows/core/src/config.rs'
 
 ONCELOCK_SITES='unix/unix/src/metal/blit.rs
 unix/unix/src/metal/clear_quad.rs
-unix/unix/src/metal/hdr_present.rs'
+unix/unix/src/metal/hdr_present.rs
+unix/unix/src/metal/upscale.rs'
 
 INLINE_ALWAYS_SITES='unix/shared/src/crumb.rs'
 

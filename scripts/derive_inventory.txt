@@ -39,6 +39,8 @@ unix/unix/src/metal/hdr_present.rs HdrPresentResources Clone,Copy
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
+unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
+unix/unix/src/metal/upscale.rs ScalerSlot Clone,Copy
 windows/core/src/buffer_rename.rs BufferMapMode Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs LockPlan Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
@@ -108,6 +110,7 @@ windows/core/src/pipeline_state.rs PipelineRsBits Clone,Copy,Debug,Default,Parti
 windows/core/src/pipeline_state.rs PipelineRsFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineSnapshot Clone,PartialEq,Eq
 windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerKey Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/scratch.rs Slot Clone,Copy,Debug,PartialEq,Eq

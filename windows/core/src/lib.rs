@@ -27,6 +27,7 @@ pub mod passes;
 pub mod perf;
 pub mod pipeline_state;
 pub mod present;
+pub mod render_scale;
 pub mod sampler_state;
 pub mod scratch;
 pub mod shader_cache;

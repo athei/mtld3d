@@ -11,6 +11,7 @@ mod pipeline;
 mod sampler;
 mod shader;
 mod texture;
+mod upscale;
 
 pub use blit::ensure_blit_pipeline;
 pub use buffer::{create_buffer, destroy_buffer};
@@ -30,3 +31,4 @@ pub use texture::{
     create_backbuffer, create_color_target, create_depth_stencil_state, create_depth_texture,
     create_texture, destroy_depth_stencil_state, destroy_texture,
 };
+pub use upscale::is_supported as upscale_is_supported;
