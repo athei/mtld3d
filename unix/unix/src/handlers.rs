@@ -9,8 +9,8 @@ use mtld3d_shared::{
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetPrimaryDisplayModeParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
-    SetLayerDrawableSizeParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -162,15 +162,6 @@ pub extern "C" fn set_display_sync_enabled_handler(args: *mut c_void) -> i32 {
             max_fps: params.max_fps,
         },
     );
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn set_layer_drawable_size_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const SetLayerDrawableSizeParams.
-    let Some(params) = (unsafe { InPtr::<SetLayerDrawableSizeParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    metal::set_layer_drawable_size(params.layer_handle, params.width, params.height);
     STATUS_SUCCESS
 }
 

@@ -25,9 +25,9 @@ use mtld3d_shared::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCullMode, MTLDepthClipMode, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLCullMode, MTLDepthClipMode, MTLDevice, MTLIndexType, MTLLoadAction,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture,
     MTLViewport, MTLVisibilityResultMode,
 };
@@ -245,6 +245,12 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             mtld3d_shared::crumb!("submit:occluded-skip", params.present_layer.raw());
             None
         } else {
+            // Re-point the drawable at the layer's backing store before
+            // acquiring one. A window resize changes the layer under us and
+            // `drawableSize` does not follow on its own, so without this the
+            // frames between the resize and the guest's own reaction would
+            // be composited at the old size, which means rescaled.
+            super::macdrv::sync_drawable_size(&layer);
             mtld3d_shared::crumb!("submit:nextdraw", params.present_layer.raw());
             let drawable = {
                 let _wait = CycleSetTimer::start(&raw mut params.drawable_wait_tsc);
@@ -295,65 +301,78 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // requested_peak`), so any peak > current is a guaranteed
             // visible regression — the OS clamps and dims the entire
             // image. Following the live ceiling avoids that entirely.
-            // The back buffer is the grid we rasterized on; the drawable
-            // covers the window. When they differ the frame has to be
-            // resampled, and MetalFX is a better upscaler than either the
-            // compositor or a bilinear sample in the present shader.
-            let rescaled = present_texture.width() != drawable_texture.width()
-                || present_texture.height() != drawable_texture.height();
+            // The back buffer is the grid we rasterized on; the drawable is
+            // the layer's own surface. Whatever the two sizes are, present
+            // resolves them here — nothing downstream can, since the
+            // compositor sees only a finished drawable.
+            let device = cmd_buf.device();
+            let geometry = PresentGeometry {
+                src: (present_texture.width(), present_texture.height()),
+                dst: (drawable_texture.width(), drawable_texture.height()),
+            };
+            // An enlargement the geometry has not settled on yet takes the
+            // shader rather than building a scaler for a size that is about
+            // to change again. See `SETTLED_PRESENTS`.
+            let route = match present_route(
+                geometry.src,
+                geometry.dst,
+                super::upscale::is_available(&device),
+            ) {
+                PresentRoute::Upscale if !present_geometry_settled(geometry) => {
+                    PresentRoute::Stretch
+                }
+                route => route,
+            };
             let hdr = super::macdrv::hdr_active();
 
             let presented = if hdr {
                 let view_ptr = params.present_view.raw() as *mut c_void;
                 let current = super::macdrv::poll_current_headroom(view_ptr);
                 super::macdrv::log_headroom_change_if_any(current, view_ptr);
-                if rescaled {
-                    encode_hdr_present_upscaled(
+                match route {
+                    PresentRoute::Upscale => encode_hdr_present_upscaled(
                         &cmd_buf,
                         &present_texture,
                         &drawable_texture,
                         current,
-                    )
-                } else {
-                    encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
+                    ),
+                    // The tone-map pass samples through `filter::linear`, so
+                    // one encode covers both an exact present and a
+                    // minification.
+                    PresentRoute::Copy | PresentRoute::Stretch => {
+                        encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
+                    }
                 }
-            } else if rescaled {
-                super::upscale::encode(
+            } else {
+                match route {
+                    // Extents match: the blit below is exact and cheaper than
+                    // a render pass.
+                    PresentRoute::Copy => false,
+                    // A scaler Metal declines after `is_available` said yes
+                    // still has to write every drawable pixel, so it falls
+                    // through to the stretch rather than to the blit.
+                    PresentRoute::Upscale => {
+                        super::upscale::encode(
+                            &cmd_buf,
+                            &device,
+                            &present_texture,
+                            &drawable_texture,
+                            MTLFXSpatialScalerColorProcessingMode::Perceptual,
+                        ) || encode_present_copy(&cmd_buf, &present_texture, &drawable_texture)
+                    }
+                    PresentRoute::Stretch => {
+                        encode_present_copy(&cmd_buf, &present_texture, &drawable_texture)
+                    }
+                }
+            };
+            if !presented {
+                encode_present_blit(
                     &cmd_buf,
-                    &cmd_buf.device(),
                     &present_texture,
                     &drawable_texture,
-                    MTLFXSpatialScalerColorProcessingMode::Perceptual,
-                )
-            } else {
-                false
-            };
-            if !presented && let Some(blit) = cmd_buf.blitCommandEncoder() {
-                let label = objc2_foundation::NSString::from_str("mtld3d-present-blit");
-                blit.setLabel(Some(&label));
-                let width = present_texture.width();
-                let height = present_texture.height();
-
-                mtld3d_shared::crumb!(
-                    "submit:pblit",
+                    route,
                     params.present_texture.raw(),
-                    (width << 32) | height,
                 );
-                // SAFETY: objc2 typed binding; both textures are non-nil
-                // retained protocol objects valid for the call.
-                unsafe {
-                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        &present_texture,
-                        0, 0,
-                        MTLOrigin { x: 0, y: 0, z: 0 },
-                        MTLSize { width, height, depth: 1 },
-                        &drawable_texture,
-                        0, 0,
-                        MTLOrigin { x: 0, y: 0, z: 0 },
-                    );
-                }
-
-                blit.endEncoding();
             }
 
             mtld3d_shared::crumb!("submit:present", params.drawable_wait_tsc);
@@ -475,6 +494,192 @@ fn submit_upload_cmd_buf(
     true
 }
 
+/// How present resolves the back buffer onto the drawable.
+///
+/// The three arms are the three things Metal can do here, in preference
+/// order for the geometry that selects them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PresentRoute {
+    /// Extents match: a 1:1 blit, exact and costing no render pass.
+    Copy,
+    /// The drawable is larger in both axes and this GPU has `MetalFX`.
+    ///
+    /// An edge-aware upscale, materially sharper than a bilinear magnify.
+    Upscale,
+    /// Any other geometry.
+    ///
+    /// The present shader's filtered stretch, the only route that covers
+    /// every drawable pixel at any ratio.
+    Stretch,
+}
+
+/// One present's source and destination extents.
+///
+/// Only ever compared, never measured against, so the axes stay in the
+/// tuples the Metal texture accessors hand back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PresentGeometry {
+    src: (usize, usize),
+    dst: (usize, usize),
+}
+
+/// Consecutive presents at one geometry before `MetalFX` is worth building.
+///
+/// The drawable follows the layer every present, while the back buffer only
+/// follows the guest's `WM_SIZE`, so a window being dragged larger produces a
+/// *different* enlargement on almost every frame. Each one would be a fresh
+/// `newSpatialScalerWithDevice`, an expensive create that the scaler cache
+/// then keeps for the life of the process: a hitch per frame of the drag, and
+/// a leak that outlives it. Waiting for the geometry to hold still spends a
+/// scaler only on sizes the game settled on.
+///
+/// **Transience, not ratio, is the discriminator.** The tempting alternative
+/// is to skip the scaler for enlargements too small to see, but the two cases
+/// overlap: a live drag was measured producing ratios up to `1.004`
+/// (`2474x1546 → 2484x1552`) while `render.scale = 0.99` asks for `1.0098`.
+/// No threshold separates those without being a coincidence.
+///
+/// Half a second is long enough that a pause mid-drag rarely reaches it, and
+/// short enough to be invisible: the frames before it present through the
+/// shader's bilinear stretch, and they are frames right after a resize, a
+/// `Reset`, or device creation, which are about to change again anyway.
+const SETTLED_PRESENTS: u32 = 30;
+
+/// Advance the settle counter for `geometry`, and say whether it has settled.
+///
+/// A change of geometry restarts the count, so "settled" means
+/// [`SETTLED_PRESENTS`] presents in a row at the same pair rather than that
+/// many presents in total. `seen` is the caller's state so this stays a pure
+/// function of it.
+fn geometry_settled(seen: &mut Option<(PresentGeometry, u32)>, geometry: PresentGeometry) -> bool {
+    match seen {
+        Some((last, streak)) if *last == geometry => {
+            *streak = streak.saturating_add(1);
+            *streak >= SETTLED_PRESENTS
+        }
+        _ => {
+            *seen = Some((geometry, 1));
+            SETTLED_PRESENTS <= 1
+        }
+    }
+}
+
+/// [`geometry_settled`] against the encoder thread's own running count.
+fn present_geometry_settled(geometry: PresentGeometry) -> bool {
+    /// Last present geometry and how many consecutive presents have used it.
+    ///
+    /// Only `submit_frame` touches this, and only from the encoder thread;
+    /// the mutex is for the `static`, not for contention.
+    static SEEN: Mutex<Option<(PresentGeometry, u32)>> = Mutex::new(None);
+
+    SEEN.lock()
+        .is_ok_and(|mut seen| geometry_settled(&mut seen, geometry))
+}
+
+/// Pick the present route for one frame's geometry.
+///
+/// `MTLBlitCommandEncoder` only copies 1:1 and `MTLFXSpatialScaler` only
+/// enlarges, so anything else is the shader's. A drawable larger in one
+/// axis and smaller in the other is a stretch, not an upscale: the scaler
+/// rejects that pair, and routing it to the blit would leave the axis where
+/// the drawable is larger unwritten.
+///
+/// Whether an enlargement is *worth* a scaler is a separate question, and
+/// deliberately not asked here: see [`SETTLED_PRESENTS`].
+const fn present_route(
+    src: (usize, usize),
+    dst: (usize, usize),
+    metalfx_available: bool,
+) -> PresentRoute {
+    if src.0 == dst.0 && src.1 == dst.1 {
+        PresentRoute::Copy
+    } else if metalfx_available && src.0 <= dst.0 && src.1 <= dst.1 {
+        PresentRoute::Upscale
+    } else {
+        PresentRoute::Stretch
+    }
+}
+
+/// The 1:1 present blit, and the last resort when a shader route failed to encode.
+///
+/// The copy extent is clamped to the smaller texture in each axis. On the
+/// `Copy` route that changes nothing (the extents are equal); on any other
+/// route it is what keeps a source larger than the drawable from being an
+/// out-of-bounds copy. A clamped copy cannot fill a larger drawable, so the
+/// margin is cleared first, because undefined drawable memory reads as
+/// noise, and on an `RGBA16Float` layer that noise is magenta.
+fn encode_present_blit(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    route: PresentRoute,
+    src_handle: u64,
+) {
+    if route != PresentRoute::Copy {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: {}x{} → {}x{} needed a resample and none could be encoded; \
+             the frame is copied 1:1 into the corner of a cleared drawable",
+            src.width(), src.height(), drawable.width(), drawable.height(),
+        );
+        clear_drawable(cmd_buf, drawable);
+    }
+    let Some(blit) = cmd_buf.blitCommandEncoder() else {
+        return;
+    };
+    let label = objc2_foundation::NSString::from_str("mtld3d-present-blit");
+    blit.setLabel(Some(&label));
+    let width = src.width().min(drawable.width());
+    let height = src.height().min(drawable.height());
+
+    mtld3d_shared::crumb!("submit:pblit", src_handle, (width << 32) | height);
+    // SAFETY: objc2 typed binding; both textures are non-nil retained
+    // protocol objects valid for the call, and the extent is clamped to
+    // both above.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+            src,
+            0, 0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize { width, height, depth: 1 },
+            drawable,
+            0, 0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+
+    blit.endEncoding();
+}
+
+/// Clear the drawable to opaque black with an empty render pass.
+///
+/// Reached only when a shader route failed to encode, which for a
+/// process-lifetime pipeline means it will fail every frame. Black is not a
+/// correct frame, but it is a defined one.
+fn clear_drawable(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+) {
+    let pass_desc = MTLRenderPassDescriptor::new();
+    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+    // subscript 0 is always valid.
+    let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+    color0.setTexture(Some(drawable));
+    color0.setLoadAction(MTLLoadAction::Clear);
+    color0.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 1.0,
+    });
+    color0.setStoreAction(MTLStoreAction::Store);
+    if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
+        let label = objc2_foundation::NSString::from_str("mtld3d-present-clear");
+        enc.setLabel(Some(&label));
+        enc.endEncoding();
+    }
+}
+
 /// HDR present of a `render.scale`-d frame: tone-map at render size, then upscale.
 ///
 /// The two operations do not commute in the obvious direction. The drawable is
@@ -554,9 +759,9 @@ fn encode_hdr_present_upscaled(
 /// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
 /// are `RGBA16Float`, which is what the present pipelines are built against.
 ///
-/// Returns `false` (with a once-warn at the call site of
-/// `ensure_resources`) if pipeline creation failed; the caller falls
-/// back to the SDR blit-present so the frame still surfaces.
+/// Returns `false` (with an error at the call site of `ensure_resources`)
+/// if pipeline creation failed; the caller falls back to the blit-present
+/// so the frame still surfaces.
 fn encode_hdr_present(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
@@ -564,19 +769,74 @@ fn encode_hdr_present(
     peak: f32,
 ) -> bool {
     let device = cmd_buf.device();
-    let Some(resources) = super::hdr_present::ensure_resources(&device) else {
+    let Some(resources) = super::present::ensure_resources(&device) else {
         return false;
     };
     // Pick the pass-through pipeline when the panel reports no EDR
     // headroom this frame, BT.2446 otherwise. The two pipelines share
     // the vertex stage and the sRGB EOTF; pass-through skips the
-    // BT.2446 math and requires no uniforms. See `hdr_present.rs` for
+    // BT.2446 math and requires no uniforms. See `present.rs` for
     // the per-pipeline rationale.
-    let pipeline_handle = if peak <= 1.0 {
-        resources.pipeline_passthrough
+    let (pipeline_handle, uniforms) = if peak <= 1.0 {
+        (resources.passthrough, None)
     } else {
-        resources.pipeline_bt2446
+        // Fragment uniform block consumed by the BT.2446 pipeline:
+        // { float l_hdr_nits; float p_hdr; float log2_p_hdr;
+        //   float inv_p_minus_one; } — 16 bytes. MSL alignment for
+        // `constant T&` requires 16-byte alignment; a stack array of
+        // four f32 is naturally aligned and fits.
+        //
+        // BT.2446-A takes the target peak in nits, not a multiplier;
+        // Apple anchors scRGB 1.0 = 100 nits, so L_hdr = peak × 100.
+        // `p_hdr`, `log2(p_hdr)` and `1 / (p_hdr - 1)` only depend on
+        // `l_hdr_nits`, so we pre-compute them once per frame on the
+        // CPU instead of re-deriving them in every fragment.
+        let l_hdr_nits = peak * 100.0;
+        let p_hdr = 32.0_f32.mul_add((l_hdr_nits / 10000.0).powf(1.0 / 2.4), 1.0);
+        let log2_p_hdr = p_hdr.log2();
+        let inv_p_minus_one = 1.0 / (p_hdr - 1.0);
+        (
+            resources.bt2446,
+            Some([l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one]),
+        )
     };
+    encode_present_pass(cmd_buf, src, dst, pipeline_handle, uniforms)
+}
+
+/// SDR present pass: the game's back buffer onto a same-format drawable, resampled.
+///
+/// The route for every SDR geometry a blit and `MetalFX` cannot serve: a
+/// minification, a mixed-axis change, or a GPU with no `MetalFX` at all.
+/// The fragment stage is a plain sample, so an exact-extent call through
+/// here is bit-identical to the blit; it is the resample that needs the
+/// render pass.
+///
+/// Returns `false` (with an error at the call site of `ensure_resources`)
+/// if pipeline creation failed.
+fn encode_present_copy(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+) -> bool {
+    let device = cmd_buf.device();
+    let Some(resources) = super::present::ensure_resources(&device) else {
+        return false;
+    };
+    encode_present_pass(cmd_buf, src, dst, resources.copy, None)
+}
+
+/// Encode one present pass: a fullscreen triangle sampling `src` across `dst`.
+///
+/// Shared by every shader-driven route. `uniforms` is the BT.2446 fragment
+/// block at buffer slot 0; the copy and pass-through pipelines declare no
+/// uniforms and pass `None`.
+fn encode_present_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    pipeline_handle: u64,
+    uniforms: Option<[f32; 4]>,
+) -> bool {
     // SAFETY: pipeline_handle is a previously-retained MTLRenderPipelineState address.
     let Some(pipeline) =
         (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(pipeline_handle) })
@@ -604,23 +864,7 @@ fn encode_hdr_present(
     unsafe {
         enc.setFragmentTexture_atIndex(Some(src), 0);
     }
-    if peak > 1.0 {
-        // Fragment uniform block consumed by the BT.2446 pipeline:
-        // { float l_hdr_nits; float p_hdr; float log2_p_hdr;
-        //   float inv_p_minus_one; } — 16 bytes. MSL alignment for
-        // `constant T&` requires 16-byte alignment; a stack array of
-        // four f32 is naturally aligned and fits.
-        //
-        // BT.2446-A takes the target peak in nits, not a multiplier;
-        // Apple anchors scRGB 1.0 = 100 nits, so L_hdr = peak × 100.
-        // `p_hdr`, `log2(p_hdr)` and `1 / (p_hdr - 1)` only depend on
-        // `l_hdr_nits`, so we pre-compute them once per frame on the
-        // CPU instead of re-deriving them in every fragment.
-        let l_hdr_nits = peak * 100.0;
-        let p_hdr = 32.0_f32.mul_add((l_hdr_nits / 10000.0).powf(1.0 / 2.4), 1.0);
-        let log2_p_hdr = p_hdr.log2();
-        let inv_p_minus_one = 1.0 / (p_hdr - 1.0);
-        let uniforms: [f32; 4] = [l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one];
+    if let Some(uniforms) = uniforms {
         // SAFETY: `&uniforms` is a fresh stack reference; the raw pointer is
         // non-null by construction.
         let uniforms_ptr = unsafe {
@@ -1671,4 +1915,171 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // dst_buffer drops here — Metal wrapper released, caller's memory
     // untouched (deallocator was None).
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PresentGeometry, PresentRoute, SETTLED_PRESENTS, geometry_settled, present_route};
+
+    /// Matching extents take the blit whether or not `MetalFX` exists.
+    #[test]
+    fn equal_extents_route_to_the_blit() {
+        assert_eq!(
+            present_route((1920, 1080), (1920, 1080), true),
+            PresentRoute::Copy
+        );
+        assert_eq!(
+            present_route((1920, 1080), (1920, 1080), false),
+            PresentRoute::Copy
+        );
+    }
+
+    /// A larger drawable is `MetalFX`'s job, and the shader's without it.
+    #[test]
+    fn enlargement_routes_to_metalfx_when_present() {
+        assert_eq!(
+            present_route((1280, 720), (1920, 1080), true),
+            PresentRoute::Upscale
+        );
+        assert_eq!(
+            present_route((1280, 720), (1920, 1080), false),
+            PresentRoute::Stretch
+        );
+    }
+
+    /// The scaler only enlarges, so a smaller drawable is always the shader's.
+    #[test]
+    fn minification_routes_to_the_shader() {
+        assert_eq!(
+            present_route((1920, 1080), (1280, 720), true),
+            PresentRoute::Stretch
+        );
+    }
+
+    /// A drawable larger in one axis and smaller in the other is a stretch.
+    ///
+    /// `MTLFXSpatialScaler` rejects the pair, and the blit would leave the
+    /// axis where the drawable is larger unwritten.
+    #[test]
+    fn mixed_axis_change_routes_to_the_shader() {
+        assert_eq!(
+            present_route((1920, 720), (1280, 1080), true),
+            PresentRoute::Stretch
+        );
+        assert_eq!(
+            present_route((1280, 1080), (1920, 720), true),
+            PresentRoute::Stretch
+        );
+    }
+
+    /// One axis equal and the other larger still enlarges.
+    #[test]
+    fn single_axis_enlargement_routes_to_metalfx() {
+        assert_eq!(
+            present_route((1920, 1080), (1920, 1200), true),
+            PresentRoute::Upscale
+        );
+    }
+
+    /// Every `render.scale` the config accepts reaches the quality path.
+    ///
+    /// The knob's range is `(0, 1.0]`, and the smallest enlargement a user can
+    /// ask for deliberately (`0.99`, a ratio of 1.0098) sits *inside* the band
+    /// a live window resize produces, which is why routing does not judge an
+    /// enlargement by its ratio. The back-buffer dimension mirrors
+    /// `RenderScale::dimension` in `mtld3d-core`, which lives in the other
+    /// workspace and is not a dependency here.
+    #[test]
+    fn every_render_scale_setting_routes_to_metalfx() {
+        let dimension = |logical: usize, percent: usize| (logical * percent).div_ceil(100).max(1);
+        for percent in 1..100 {
+            let src = (dimension(2560, percent), dimension(1600, percent));
+            assert_eq!(
+                present_route(src, (2560, 1600), true),
+                PresentRoute::Upscale,
+                "render.scale = {percent}% must reach MetalFX"
+            );
+        }
+    }
+
+    /// A resize drag is filtered by never settling, not by its ratio.
+    ///
+    /// These are geometries measured off a live drag. Each is a legitimate
+    /// `Upscale` on geometry alone; what keeps them off the scaler is that
+    /// the next present carries a different pair.
+    #[test]
+    fn a_resize_drag_is_filtered_by_settling_not_by_geometry() {
+        let drag = [
+            ((2452, 1532), (2454, 1534)),
+            ((2474, 1546), (2484, 1552)),
+            ((2400, 1498), (2408, 1504)),
+        ];
+        let mut seen = None;
+        for (src, dst) in drag {
+            assert_eq!(present_route(src, dst, true), PresentRoute::Upscale);
+            assert!(
+                !geometry_settled(&mut seen, PresentGeometry { src, dst }),
+                "{src:?} → {dst:?} lasted one present and must not build a scaler"
+            );
+        }
+    }
+
+    /// A geometry settles only after holding still for consecutive presents.
+    #[test]
+    fn geometry_settles_after_holding_still() {
+        let steady = PresentGeometry {
+            src: (960, 540),
+            dst: (1920, 1080),
+        };
+        let mut seen = None;
+        let settled: Vec<bool> = (0..=SETTLED_PRESENTS)
+            .map(|_| geometry_settled(&mut seen, steady))
+            .collect();
+        let expected: Vec<bool> = (1..=SETTLED_PRESENTS + 1)
+            .map(|n| n >= SETTLED_PRESENTS)
+            .collect();
+        assert_eq!(settled, expected);
+    }
+
+    /// A window being dragged larger never settles, so it never builds a scaler.
+    ///
+    /// Each frame of the drag is a different enlargement, which is exactly the
+    /// case that would otherwise leak one `MTLFXSpatialScaler` per frame.
+    #[test]
+    fn a_geometry_that_changes_every_present_never_settles() {
+        let mut seen = None;
+        for height in 0..64 {
+            let dragging = PresentGeometry {
+                src: (960, 540),
+                dst: (1920, 1080 + height),
+            };
+            assert!(
+                !geometry_settled(&mut seen, dragging),
+                "a geometry seen once must not count as settled"
+            );
+        }
+    }
+
+    /// Settling restarts from scratch after the geometry changes.
+    #[test]
+    fn a_changed_geometry_restarts_the_count() {
+        let before = PresentGeometry {
+            src: (960, 540),
+            dst: (1920, 1080),
+        };
+        let after = PresentGeometry {
+            src: (960, 540),
+            dst: (1920, 1200),
+        };
+        let mut seen = None;
+        for _ in 0..SETTLED_PRESENTS * 2 {
+            geometry_settled(&mut seen, before);
+        }
+        assert!(!geometry_settled(&mut seen, after));
+        assert_eq!(
+            geometry_settled(&mut seen, before),
+            SETTLED_PRESENTS <= 2,
+            "returning to a geometry starts its count over, it does not resume"
+        );
+    }
 }

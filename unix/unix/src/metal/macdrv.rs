@@ -16,10 +16,7 @@ use objc2::{
 };
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
-use crate::{
-    LOG_TARGET,
-    metal::handle::{IntoRetained, IntoRetainedLayer},
-};
+use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 /// Whether the bound `CAMetalLayer` was configured for EDR at `AttachMetalLayer` time.
 ///
@@ -585,29 +582,6 @@ pub fn set_display_sync_enabled(
     store_min_present_duration(panel_max_hz, pacing);
 }
 
-/// Update `drawableSize` on an already-attached `CAMetalLayer`.
-///
-/// Used by the D3D9 Reset path when the game requests a different backbuffer
-/// size. The value is the *presented* resolution, which `render.scale` lets
-/// diverge from the backbuffer texture's own extent; present resolves the
-/// difference through `MTLFXSpatialScaler`, and only a default scale makes the
-/// two match pixel-for-pixel.
-pub fn set_layer_drawable_size(
-    layer_handle: MetalHandle<CAMetalLayerKind>,
-    width: u32,
-    height: u32,
-) {
-    use objc2_core_foundation::CGSize;
-
-    let Some(layer) = IntoRetainedLayer::into_retained(layer_handle) else {
-        return;
-    };
-    layer.setDrawableSize(CGSize {
-        width: f64::from(width),
-        height: f64::from(height),
-    });
-}
-
 /// Query the primary display's pixel size and refresh rate.
 ///
 /// Returns `(width, height, refresh_hz)`. `refresh_hz` is 0 if `NSScreen`
@@ -1149,7 +1123,6 @@ fn configure_metal_layer_inner(
     color: LayerColorRefs<'_>,
 ) {
     use mtld3d_shared::mtl::ColorSpacePolicy;
-    use objc2_core_foundation::CGSize;
     use objc2_foundation::NSString;
     use objc2_metal::MTLPixelFormat;
     use objc2_quartz_core::{CAMetalLayer, kCAGravityResizeAspect};
@@ -1234,13 +1207,15 @@ fn configure_metal_layer_inner(
     })));
     // Games are fullscreen-style — no alpha blending with desktop.
     layer.setOpaque(true);
-    // The drawable is the guest's back buffer, which is not always the size
-    // of the layer: a fullscreen device renders at its display mode while the
-    // window covers the monitor, so Core Animation scales the presented
-    // drawable up on the compositor's own pass — no work of ours. Aspect-fit
-    // rather than stretch, so a 4:3 mode on a 16:10 panel is pillarboxed
-    // instead of distorted; the bars are the layer's own background, which is
-    // why it gets an explicit opaque black.
+    // Gravity decides what Core Animation does when the drawable is not the
+    // size of the layer's backing store. We never leave it that way on
+    // purpose: `drawableSize` stays at its default (the layer's own
+    // `bounds × contentsScale`) and present resolves the back buffer onto
+    // it, so the composite pass is a 1:1 copy and this setting is inert.
+    // It is here for the frames where a resize has changed the layer but
+    // our next drawable has not caught up yet: aspect-fit centres the
+    // stale frame rather than distorting it, and the bars are the layer's
+    // own background, which is why it gets an explicit opaque black.
     //
     // SAFETY: `kCAGravityResizeAspect` is a CoreAnimation string constant
     // with static storage duration — reading it is a load of an immutable
@@ -1275,11 +1250,15 @@ fn configure_metal_layer_inner(
     layer.setAllowsNextDrawableTimeout(true);
     // Default false; no AppKit surface sync needed.
     layer.setPresentsWithTransaction(false);
-    // Guest's BackBufferWidth/Height in pixels (ignore contentsScale).
-    layer.setDrawableSize(CGSize {
-        width: f64::from(width),
-        height: f64::from(height),
-    });
+    // The drawable is the layer's own backing store, never the guest's
+    // back-buffer size: a drawable the layer has to rescale into its
+    // backing store is a second resample, after whatever present already
+    // did, with a phase we do not control. Owning the resample ourselves is
+    // what keeps the frame on the pixel grid the screen actually has.
+    // Present re-syncs this before every `nextDrawable`; the push here is
+    // so the first frame does not have to.
+    sync_drawable_size(&layer);
+    //
     // Confirm the install. `colorspace` is the label the SDR/HDR
     // applier picked at install time — distinguishes "screen profile
     // (standard-range)" from "kCGColorSpaceSRGB (fallback)" etc. Many
@@ -1292,9 +1271,89 @@ fn configure_metal_layer_inner(
         target: LOG_TARGET,
         "present: pixelFormat={pf:?} wantsEDR={wants} colorspace={cs_label}",
     );
+    log_layer_geometry(&layer, width, height);
     // Keep `device_handle` alive via local — the original was a raw
     // pointer parameter; the local `device` retained it briefly.
     drop(device);
+}
+
+/// Report the layer's geometry, and warn when present will have to resample.
+///
+/// The four numbers that decide whether a frame reaches the screen on the
+/// pixel grid it was drawn on: what the guest asked for, the layer's bounds
+/// in points, its `contentsScale`, and the drawable size those two imply.
+/// Reading them costs one log line at attach and turns "the image looks
+/// shifted" into a question with an answer in it.
+///
+/// The second line fires when the guest's back buffer is not the native
+/// drawable size, which is exactly the condition under which present
+/// resamples. That is a normal thing for it to do (`render.scale` asks for
+/// it deliberately, and D3D9 windowed present stretches a back buffer into
+/// a client area of a different size), so it stays informational; what it
+/// rules out is resampling every frame *silently*.
+fn log_layer_geometry(layer: &objc2_quartz_core::CAMetalLayer, width: u32, height: u32) {
+    let bounds = layer.bounds();
+    let scale = layer.contentsScale();
+    let drawable = layer.drawableSize();
+    info!(
+        target: LOG_TARGET,
+        "present: guest {width}x{height}, layer {:.0}x{:.0}pt @{scale:.2}x, drawable {:.0}x{:.0}",
+        bounds.size.width, bounds.size.height, drawable.width, drawable.height,
+    );
+    let (native_w, native_h) = natural_drawable_size(layer);
+    if native_w != width || native_h != height {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: back buffer {width}x{height} onto a {native_w}x{native_h} drawable, \
+             so present resamples every frame",
+        );
+    }
+}
+
+/// The drawable size the layer's own geometry asks for: `bounds × contentsScale`.
+///
+/// `(0, 0)` while the view has no frame yet, which the callers treat as "no
+/// answer" rather than a size.
+fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u32) {
+    let bounds = layer.bounds();
+    let scale = layer.contentsScale();
+    (
+        bounded_cast::f64_to_u32_saturating((bounds.size.width * scale).round()),
+        bounded_cast::f64_to_u32_saturating((bounds.size.height * scale).round()),
+    )
+}
+
+/// Point `drawableSize` at the layer's own backing store, and say whether it moved.
+///
+/// `CAMetalLayer` documents `drawableSize` as defaulting to `bounds ×
+/// contentsScale`, but it captures that once and does **not** follow the
+/// layer afterwards: a freshly created wine metal view reports a real
+/// `bounds` beside a `0x0` `drawableSize`. So the value has to be pushed,
+/// and pushed again whenever the window resizes.
+///
+/// Present calls this before every `nextDrawable`, which is what keeps the
+/// drawable equal to the backing store without waiting for a `WM_SIZE` to
+/// make its way through the guest. Pushing is not free (the layer drops its
+/// drawable pool), hence the compare first. Degenerate geometry is left
+/// alone rather than written as a zero size Metal would reject.
+///
+/// Reading `bounds`/`contentsScale` off the main thread races an in-flight
+/// `AppKit` resize; the cost of losing that race is one frame at the previous
+/// size, corrected on the next present.
+pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
+    use objc2_core_foundation::CGSize;
+
+    let (native_w, native_h) = natural_drawable_size(layer);
+    if native_w == 0 || native_h == 0 {
+        return;
+    }
+    let current = layer.drawableSize();
+    let width = f64::from(native_w);
+    let height = f64::from(native_h);
+    if (current.width - width).abs() <= 0.0 && (current.height - height).abs() <= 0.0 {
+        return;
+    }
+    layer.setDrawableSize(CGSize { width, height });
 }
 
 /// Set the SDR layer colorspace under the `Passthrough` policy.

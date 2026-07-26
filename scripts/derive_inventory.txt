@@ -35,10 +35,12 @@ unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,F
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy
 unix/unix/src/metal/clear_quad.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 unix/unix/src/metal/command.rs BlitSite Clone,Copy
-unix/unix/src/metal/hdr_present.rs HdrPresentResources Clone,Copy
+unix/unix/src/metal/command.rs PresentGeometry Clone,Copy,PartialEq,Eq
+unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
+unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScalerSlot Clone,Copy
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash

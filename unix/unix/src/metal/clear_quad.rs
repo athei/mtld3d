@@ -26,7 +26,7 @@
 //! casters land at one combo (`Depth32Float`, no color); games with a
 //! richer mid-pass `Clear` pattern grow the cache by a handful of
 //! entries. Pipelines + library are process-lifetime (leaked via
-//! `Retained::into_raw`) — same posture as `hdr_present`.
+//! `Retained::into_raw`) — same posture as `present`.
 
 use std::{
     collections::HashMap,

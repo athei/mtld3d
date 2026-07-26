@@ -14,7 +14,7 @@
 //! quad. It mirrors `clear_quad.rs`: one cached `MTLLibrary` + functions,
 //! and a `HashMap<color_format, MTLRenderPipelineState*>` of pipelines.
 //! Pipelines + library are process-lifetime (leaked via `Retained::into_raw`)
-//! — same posture as `clear_quad` / `hdr_present`.
+//! — same posture as `clear_quad` / `present`.
 
 use std::{
     collections::HashMap,

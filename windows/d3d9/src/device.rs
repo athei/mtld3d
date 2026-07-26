@@ -1898,17 +1898,6 @@ impl DeviceInner {
 
         self.set_backbuffer_dims(new_width, new_height);
 
-        // The drawable is the presented surface, so it follows the window's
-        // logical size; only the textures below shrink with `render.scale`.
-        if !self.layer_handle.is_null() {
-            let mut size = mtld3d_shared::SetLayerDrawableSizeParams {
-                layer_handle: self.layer_handle,
-                width: new_width,
-                height: new_height,
-            };
-            unix_call(&mut size);
-        }
-
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
             width: self.render_scale.dimension(new_width),
@@ -3186,21 +3175,10 @@ fn reset_recreate_resources(
     //    new dims for the post-Reset frame.
     dev.set_backbuffer_dims(pp.back_buffer_width, pp.back_buffer_height);
 
-    // 4. Push the new pixel size to CAMetalLayer. The drawable is the
-    //    *presented* surface, so it tracks the logical size even when
-    //    `render.scale` makes the backbuffer smaller; MetalFX bridges the
-    //    two at present.
-    if !dev.layer_handle.is_null() {
-        let mut size = mtld3d_shared::SetLayerDrawableSizeParams {
-            layer_handle: dev.layer_handle,
-            width: pp.back_buffer_width,
-            height: pp.back_buffer_height,
-        };
-        unix_call(&mut size);
-    }
-
-    // 5. Recreate the backbuffer at the new dims, in render space — this is
-    //    the texture rasterization writes into.
+    // 4. Recreate the backbuffer at the new dims, in render space — this is
+    //    the texture rasterization writes into. The drawable is not touched:
+    //    it is the layer's own surface, sized by Core Animation from the
+    //    view, and present resolves whatever difference remains.
     let mut bb_params = mtld3d_shared::CreateBackbufferParams {
         device_handle: dev.device_handle,
         width: dev.render_scale.dimension(pp.back_buffer_width),
@@ -3216,7 +3194,7 @@ fn reset_recreate_resources(
     }
     dev.set_backbuffer_handle(bb_params.texture_handle);
 
-    // 6. Recreate depth/stencil if the device had one. Format is taken
+    // 5. Recreate depth/stencil if the device had one. Format is taken
     //    from the saved depth_stencil_format captured at CreateDevice;
     //    Reset doesn't support format change.
     if dev.depth_stencil_format != 0 {

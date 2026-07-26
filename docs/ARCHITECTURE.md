@@ -74,6 +74,14 @@ How to apply:
 - Bit-flag fields use `bitflags!` (`TextureUsage`, `ColorWriteMask`).
 - `Command::param_a/b/c/d` carry polymorphic `u32`s whose meaning depends on `Command::cmd`. Stay `u32` on the struct; encode via `Enum::Variant as u32` in the `Command::foo` constructor and decode via `Enum::from_repr(raw)` (strum `FromRepr`) in the dispatcher — never a bare `match raw { 0 => …, 1 => …, … }`.
 
+## The drawable is the layer's size, and present owns the resample
+
+`CAMetalLayer.drawableSize` is kept at the layer's own `bounds × contentsScale`, never at the guest's back-buffer size. `macdrv::sync_drawable_size` pushes it at attach and again before every `nextDrawable`, because the documented default is captured once and does not follow the layer: a freshly created wine metal view reports a real `bounds` beside a `0x0` `drawableSize`, and a window resize moves `bounds` without moving `drawableSize`.
+
+That is what makes the composite pass a 1:1 copy. A drawable that is not the size of the layer's backing store gets rescaled by the compositor, on top of whatever present already did, and the phase of that second resample is not ours to control: a ratio near 1.0 shows up as the whole frame, interface included, sitting a pixel off where it was drawn. Re-syncing per present rather than per `Reset` is what covers the frames between a window resize and the guest reacting to it. The same reasoning is why `contentsGravity` is inert here rather than load-bearing.
+
+So every back-buffer-to-drawable difference is resolved in `submit_frame`, by exactly one of three routes (`present_route` in `command.rs`): a 1:1 blit at matching extents, `MTLFXSpatialScaler` when the drawable is larger in both axes and the GPU has MetalFX, and the present shader's filtered stretch for everything else. Only the third covers any ratio, so it is also the backstop when a scaler declines — `MTLBlitCommandEncoder` cannot resample, and a partial copy would leave the rest of the drawable undefined.
+
 ## Adding new thunks
 
 1. Add variant to `Thunks` enum in `mtld3d-shared` `lib.rs` (count and iteration via strum).

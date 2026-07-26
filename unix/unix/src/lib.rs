@@ -65,7 +65,6 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::BlitTextureToBuffer => arp!(handlers::blit_texture_to_buffer_handler),
         Thunks::SetDisplaySyncEnabled => arp!(handlers::set_display_sync_enabled_handler),
         Thunks::DestroyResourcesBulk => arp!(handlers::destroy_resources_bulk_handler),
-        Thunks::SetLayerDrawableSize => arp!(handlers::set_layer_drawable_size_handler),
         Thunks::WaitForGpuRetire => arp!(handlers::wait_for_gpu_retire_handler),
         Thunks::StartGpuCapture => arp!(handlers::start_gpu_capture_handler),
         Thunks::StopGpuCapture => arp!(handlers::stop_gpu_capture_handler),

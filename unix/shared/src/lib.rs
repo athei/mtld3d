@@ -28,8 +28,8 @@ pub use params::{
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetPrimaryDisplayModeParams, InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams,
-    SetLayerDrawableSizeParams, StartGpuCaptureParams, StopGpuCaptureParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    StartGpuCaptureParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, WaitForGpuRetireParams,
 };
 
 #[repr(u32)]
@@ -53,7 +53,6 @@ pub enum Thunks {
     BlitTextureToBuffer,
     SetDisplaySyncEnabled,
     DestroyResourcesBulk,
-    SetLayerDrawableSize,
     WaitForGpuRetire,
     StartGpuCapture,
     StopGpuCapture,

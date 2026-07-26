@@ -16,13 +16,18 @@
 //! resolution, and the scaler runs on that `RGBA16Float` result in `HDR` mode —
 //! the mode built for values beyond `[0, 1]`.
 //!
-//! One case it does not serve: **a GPU without `MetalFX`**. [`is_supported`]
-//! answers that once at layer attach and the PE side then keeps the drawable
-//! the same size as the back buffer, so present stays a 1:1 copy.
+//! Two cases it does not serve. **A drawable smaller than the back buffer**:
+//! the spatial scaler only enlarges, which is why `render.scale` is capped at
+//! `1.0`. And **a GPU without `MetalFX`**: [`is_supported`] answers that once
+//! at layer attach, and the PE side then holds `render.scale` at `1.0` so the
+//! scaler is not the only thing standing between a scaled frame and the
+//! screen. Both fall to the present shader's filtered stretch
+//! (`PresentPipelines::copy`), which covers any ratio; this module is the
+//! quality path, not the correctness one.
 //!
 //! Scalers are cached per (input size, output size, format, colour mode) and
 //! leaked for process lifetime, the same posture as `blit.rs` / `clear_quad.rs`
-//! / `hdr_present.rs`. A resize changes the key, so a `Reset` builds a new one
+//! / `present.rs`. A resize changes the key, so a `Reset` builds a new one
 //! and the old entry is simply never looked up again.
 
 use std::{
@@ -78,9 +83,9 @@ unsafe impl Send for ScalerSlot {}
 /// Encode a `MetalFX` spatial upscale of `src` into `dst`.
 ///
 /// Returns `false` when `MetalFX` cannot serve this pair: an unsupported GPU
-/// or a scaler Metal declined to build. The caller then leaves the frame to
-/// the 1:1 present blit, which is only correct because the PE side keeps the
-/// two sizes equal whenever [`is_supported`] said no.
+/// or a scaler Metal declined to build. The caller then falls to the present
+/// shader's stretch, which serves any pair; never to the 1:1 blit, which
+/// would leave part of the drawable unwritten.
 pub fn encode(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
@@ -111,8 +116,8 @@ pub fn encode(
 ///
 /// The HDR present path has to tone-map into a scratch texture *before* the
 /// upscale can run, and a scaler that declines after that point would strand
-/// the tone-mapped frame: the 1:1 fallback blit copies the source extent, so it
-/// cannot stand in for a resample. Asking first keeps the fallback free.
+/// the tone-mapped frame: the fallback tone-maps the back buffer again,
+/// straight to the drawable. Asking first keeps that fallback free.
 ///
 /// Builds and caches the scaler on the way, so the [`encode`] that follows a
 /// `true` answer is a hash lookup.
@@ -161,10 +166,10 @@ fn scaler_for(
 
 /// Whether this GPU can run a `MetalFX` spatial upscale.
 ///
-/// Answered once at layer attach so the PE side knows whether it may size the
-/// drawable independently of the back buffer. With no `MetalFX` there is no way
-/// to resize a frame at present time, so the two sizes have to stay equal and
-/// Core Animation scales the layer instead.
+/// Answered once at layer attach so the PE side knows whether `render.scale`
+/// can be honoured. Without `MetalFX` a scaled frame would reach the screen
+/// through the present shader's plain bilinear magnify, which is a worse
+/// picture than not scaling at all; the scale is held at `1.0` instead.
 pub fn is_supported(device_handle: MetalHandle<MTLDeviceKind>) -> bool {
     device_handle
         .into_retained()

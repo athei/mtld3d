@@ -175,24 +175,6 @@ impl Thunk for SetDisplaySyncEnabledParams {
     const CODE: u32 = Thunks::SetDisplaySyncEnabled as u32;
 }
 
-/// Update `CAMetalLayer.drawableSize` on an already-attached layer.
-///
-/// Used by the D3D9 Reset path to honour a window resize. This is the
-/// *presented* size, which is the logical resolution D3D9 reports rather than
-/// the backbuffer texture's extent: under `render.scale` the two differ and
-/// `MTLFXSpatialScaler` bridges them at present. They coincide, and the present
-/// blit is a 1:1 copy, only at the default scale.
-#[repr(C, align(8))]
-pub struct SetLayerDrawableSizeParams {
-    pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
-    pub width: u32,                                  // in: pixels
-    pub height: u32,                                 // in: pixels
-}
-
-impl Thunk for SetLayerDrawableSizeParams {
-    const CODE: u32 = Thunks::SetLayerDrawableSize as u32;
-}
-
 /// Block the caller until the GPU has retired the cmdbuf with `submit_seq >= target_seq`.
 ///
 /// Then bump `coherent_seq` so subsequent `Acquire` loaders observe the
@@ -825,14 +807,6 @@ mod tests {
         // u64 + u32 + u32 = 8 + 4 + 4 = 16
         assert_eq!(core::mem::align_of::<SetDisplaySyncEnabledParams>(), 8);
         assert_eq!(core::mem::size_of::<SetDisplaySyncEnabledParams>(), 16);
-    }
-
-    #[test]
-    fn set_layer_drawable_size_layout() {
-        use super::SetLayerDrawableSizeParams;
-        // u64 + u32 + u32 = 8 + 4 + 4 = 16
-        assert_eq!(core::mem::align_of::<SetLayerDrawableSizeParams>(), 8);
-        assert_eq!(core::mem::size_of::<SetLayerDrawableSizeParams>(), 16);
     }
 
     #[test]
