@@ -92,7 +92,7 @@ pub struct Mtld3dConfig {
     /// otherwise-unthrottled free-run. `0` = uncapped. Default: `0`.
     /// File key: `present.maxFps`.
     pub present_max_fps: u32,
-    /// Render resolution as a percentage of the back buffer D3D9 reports.
+    /// Render resolution as a percentage of the reported back buffer, `MetalFX`-upscaled.
     ///
     /// `100` (the default) renders at the size the game sees, which is an
     /// exact identity: every derived rect is unscaled and present stays a 1:1

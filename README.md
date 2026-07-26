@@ -75,7 +75,7 @@ instead of breaking.
   enumeration, hardware color cursors. A fullscreen device takes its window
   borderless over the monitor without ever changing the display mode; the back
   buffer follows the window, and `render.scale` decides how many pixels are
-  actually rendered before the result is upscaled to the screen.
+  actually rendered before MetalFX upscales the result to the screen.
 
 ### Not implemented yet
 
