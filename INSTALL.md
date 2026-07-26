@@ -208,3 +208,15 @@ Logging is controlled by `RUST_LOG`; `RUST_LOG=mtld3d=warn` is the single
 switch for the whole project. On stock Wine, export both in the environment
 that launches the game; on CrossOver, set them under
 `[EnvironmentVariables]` in the bottle's `cxbottle.conf`.
+
+## Fullscreen
+
+Nothing to configure. A fullscreen game gets a borderless window covering the
+monitor, and the display mode is never changed: the desktop keeps its
+resolution, other windows are not rearranged, and there is no mode switch on
+the way in or out.
+
+Because the window covers the monitor either way, the resolution picked in the
+game's own video options has no effect in fullscreen (or in a maximized
+window). Set `render.scale` in `mtld3d.conf` instead to choose how many pixels
+are actually rendered; the result is upscaled to the screen.

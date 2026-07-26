@@ -26,6 +26,7 @@ use mtld3d_types::{
 use super::{
     D3D_OK, D3DERR_INVALIDCALL,
     device::{DeviceInner, Direct3DDevice9},
+    fullscreen::set_window_long_ptr,
 };
 
 /// Cursor-specific log sub-target.
@@ -59,30 +60,6 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
-}
-
-// Win32 LONG is 32-bit; `SetWindowLongPtrW` only exists on 64-bit Windows,
-// while 32-bit user32 exports `SetWindowLongW` (the header is a #define
-// alias). Declare a single Rust-side `SetWindowLongPtrW` symbol per arch
-// and route the 32-bit one through `#[link_name = "SetWindowLongW"]` so
-// the call site stays uniform.
-#[cfg(target_pointer_width = "64")]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, new_long: isize) -> isize;
-}
-
-#[cfg(target_pointer_width = "32")]
-#[link(name = "user32")]
-unsafe extern "system" {
-    #[link_name = "SetWindowLongW"]
-    fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, new_long: isize) -> isize;
-}
-
-fn set_window_long_ptr(hwnd: *mut c_void, index: i32, new: isize) -> isize {
-    // SAFETY: SetWindowLongPtrW (or SetWindowLongW on 32-bit) accepts any
-    // HWND and isize; documented to return the previous value.
-    unsafe { SetWindowLongPtrW(hwnd, index, new) }
 }
 
 // Safe wrappers around the Win32 calls used by this module — each Win32
@@ -686,13 +663,21 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // are the new client width / height in pixels — trigger an
         // auto-resize so game-side `GetClientRect` and our
         // `GetDisplayMode` agree.
+        //
+        // Skipped only while mtld3d is the one moving a window: a
+        // fullscreen transition's own `SetWindowPos` bounces back here,
+        // and that path already sized the back buffer from the resulting
+        // client rect. The latch is process-global because the bounce is
+        // delivered to whichever device is subclassed on the window, which
+        // need not be the device doing the move. A fullscreen device's back
+        // buffer otherwise follows its window like any other's.
         let lp_bits = lp.cast_unsigned();
         let new_width = u32::try_from(lp_bits & 0xFFFF).expect("16-bit value fits u32");
         let new_height = u32::try_from((lp_bits >> 16) & 0xFFFF).expect("16-bit value fits u32");
-        if new_width != 0 && new_height != 0 {
-            // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for
-            // the lifetime of the subclass.
-            let dev = unsafe { &mut *dev_ptr };
+        // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for
+        // the lifetime of the subclass.
+        let dev = unsafe { &mut *dev_ptr };
+        if new_width != 0 && new_height != 0 && !crate::fullscreen::driving_window() {
             dev.apply_auto_resize(new_width, new_height);
         }
         // WoW's own `WM_SIZE` handler (about to run via the

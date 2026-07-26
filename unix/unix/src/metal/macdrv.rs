@@ -14,7 +14,7 @@ use objc2::{
     rc::Retained,
     runtime::{NSObjectProtocol, ProtocolObject},
 };
-use objc2_core_graphics::CGColorSpace;
+use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{
     LOG_TARGET,
@@ -1150,7 +1150,7 @@ fn configure_metal_layer_inner(
     use objc2_core_foundation::CGSize;
     use objc2_foundation::NSString;
     use objc2_metal::MTLPixelFormat;
-    use objc2_quartz_core::CAMetalLayer;
+    use objc2_quartz_core::{CAMetalLayer, kCAGravityResizeAspect};
 
     let LayerColorRefs {
         hdr_active,
@@ -1232,6 +1232,21 @@ fn configure_metal_layer_inner(
     })));
     // Games are fullscreen-style — no alpha blending with desktop.
     layer.setOpaque(true);
+    // The drawable is the guest's back buffer, which is not always the size
+    // of the layer: a fullscreen device renders at its display mode while the
+    // window covers the monitor, so Core Animation scales the presented
+    // drawable up on the compositor's own pass — no work of ours. Aspect-fit
+    // rather than stretch, so a 4:3 mode on a 16:10 panel is pillarboxed
+    // instead of distorted; the bars are the layer's own background, which is
+    // why it gets an explicit opaque black.
+    //
+    // SAFETY: `kCAGravityResizeAspect` is a CoreAnimation string constant
+    // with static storage duration — reading it is a load of an immutable
+    // global the framework initialised before `main`.
+    let gravity = unsafe { kCAGravityResizeAspect };
+    layer.setContentsGravity(gravity);
+    let backdrop = CGColor::new_generic_gray(0.0, 1.0);
+    layer.setBackgroundColor(Some(&backdrop));
     // `framebufferOnly = false` is slower than `true`, but required for
     // guest compat: D3D9 games commonly GetBackBuffer + StretchRect,
     // lock, or read the backbuffer.

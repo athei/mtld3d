@@ -289,8 +289,20 @@ pub struct DeviceInner {
     ///
     /// See [`DeviceFlags`].
     flags: DeviceFlags,
+    /// Window state saved when this device took its window fullscreen.
+    ///
+    /// `Some` exactly while the device is fullscreen. Restored (and cleared)
+    /// by a windowed `Reset` or by device destruction.
+    fullscreen: Option<crate::fullscreen::SavedWindow>,
     backbuffer_width: u32,
     backbuffer_height: u32,
+    /// Fraction of the logical back buffer that is actually rasterized.
+    ///
+    /// `backbuffer_width`/`backbuffer_height` above stay logical — the size
+    /// D3D9 reports and the space every game-supplied rect lives in. This
+    /// converts those to the Metal texture's own resolution at the point a
+    /// value becomes a Metal command. Identity unless `render.scale` is set.
+    render_scale: mtld3d_core::render_scale::RenderScale,
     fvf: u32,
     /// Currently-bound vertex declaration (null = none).
     ///
@@ -684,6 +696,19 @@ bitflags::bitflags! {
 }
 
 impl DeviceInner {
+    /// The scale to apply to a game-supplied rect for the *currently bound* target.
+    ///
+    /// `render.scale` shrinks the back buffer only. A render target the game
+    /// created is exactly the size it asked for, so a rect aimed at one is
+    /// already in that texture's space and must pass through untouched.
+    const fn rt_scale(&self) -> mtld3d_core::render_scale::RenderScale {
+        if self.bound_rt.render_target().is_null() {
+            self.render_scale
+        } else {
+            mtld3d_core::render_scale::RenderScale::IDENTITY
+        }
+    }
+
     pub const fn scissor_rect(&self) -> [u32; 4] {
         self.scissor_rect
     }
@@ -705,7 +730,13 @@ impl DeviceInner {
         // `self.viewport` keeps the raw values so GetViewport round-trips
         // unchanged. Ordinary `[min_z, max_z]` ranges (`max_z >= min_z + 0.001`)
         // are left untouched.
-        let (x, y, width, height, min_z) = (v.x, v.y, v.width, v.height, v.min_z);
+        // Only the value handed to Metal is converted to render resolution;
+        // `self.viewport` above keeps the game's own numbers so `GetViewport`
+        // round-trips and, critically, so the fixed-function XYZRHW row stays
+        // in the game's screen space. A custom render target is never scaled:
+        // the game sized that texture itself.
+        let (x, y, width, height) = self.rt_scale().rect(v.x, v.y, v.width, v.height);
+        let min_z = v.min_z;
         let max_z = v.max_z.max(v.min_z + 0.001);
         self.push_op(Box::new(move |enc| {
             enc.set_viewport(x, y, width, height, min_z, max_z);
@@ -1082,15 +1113,18 @@ impl DeviceInner {
     /// `flush_current_frame_blocking`. Takes `&mut self` because a pending
     /// `PresentationInterval` change from `device_reset` is consumed here so
     /// the encoder can apply it on the next frame's first `nextDrawable`.
-    pub const fn fresh_frame(&mut self) -> FrameData {
+    pub fn fresh_frame(&mut self) -> FrameData {
         FrameData::new(&FrameInit {
             device_handle: self.device_handle,
             queue_handle: self.queue_handle,
             backbuffer_handle: self.backbuffer_handle,
             layer_handle: self.layer_handle,
             view_handle: self.view_handle,
-            backbuffer_width: self.backbuffer_width,
-            backbuffer_height: self.backbuffer_height,
+            // Render space: the encoder sizes passes, default viewports and
+            // full-attachment clears from these, and they all belong to the
+            // Metal texture rather than the resolution D3D9 reports.
+            backbuffer_width: self.render_scale.dimension(self.backbuffer_width),
+            backbuffer_height: self.render_scale.dimension(self.backbuffer_height),
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
@@ -1757,6 +1791,39 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
     }
 
+    /// The window this device took fullscreen, or `None` when it is windowed.
+    pub fn fullscreen_window(&self) -> Option<*mut c_void> {
+        self.fullscreen
+            .as_ref()
+            .map(crate::fullscreen::SavedWindow::window)
+    }
+
+    /// Take `hwnd` fullscreen: borderless, topmost, covering the monitor.
+    ///
+    /// No display mode is set. The window covering the monitor is what makes
+    /// the image fill the screen, and the back buffer follows the resulting
+    /// client rect rather than the resolution the game asked for.
+    pub fn enter_fullscreen(&mut self, hwnd: *mut c_void) {
+        self.fullscreen = Some(crate::fullscreen::enter(hwnd));
+    }
+
+    /// Re-apply the window rect for a device that stays fullscreen across a `Reset`.
+    ///
+    /// No-op for a device that is not fullscreen — the caller decides the
+    /// transition, this only carries it out.
+    pub fn update_fullscreen(&self) {
+        if let Some(saved) = self.fullscreen.as_ref() {
+            crate::fullscreen::update(saved);
+        }
+    }
+
+    /// Give the window back. No-op unless the device is fullscreen.
+    pub fn leave_fullscreen(&mut self) {
+        if let Some(saved) = self.fullscreen.take() {
+            crate::fullscreen::leave(&saved);
+        }
+    }
+
     /// Apply an implicit backbuffer resize triggered by a chrome-shrink `WM_SIZE`.
     ///
     /// Mirrors `device_reset`'s size-change pipeline (drain → destroy
@@ -1893,6 +1960,8 @@ pub struct DeviceCreateInfo {
     pub depth_stencil_format: u32,
     pub backbuffer_width: u32,
     pub backbuffer_height: u32,
+    /// Resolved `render.scale`, already forced to identity where unusable.
+    pub render_scale: mtld3d_core::render_scale::RenderScale,
     pub encoder: EncoderThread,
     pub prewarm: crate::shader_prewarm::PrewarmHandle,
     pub current_frame: FrameData,
@@ -1919,6 +1988,12 @@ pub struct DeviceCreateInfo {
     /// from `AttachMetalLayerParams.backing_scale` on the unix side,
     /// clamped to `[1, 8]`. 1 is the no-op fast path.
     pub cursor_scale: u32,
+    /// Window state saved before a fullscreen `CreateDevice` took the window over.
+    ///
+    /// `None` for a windowed device. The device holds it for as long as it
+    /// stays fullscreen and hands it back to `fullscreen::leave` on the way
+    /// out (a windowed `Reset`, or device destruction).
+    pub fullscreen: Option<crate::fullscreen::SavedWindow>,
 }
 
 #[repr(C)]
@@ -1954,6 +2029,7 @@ impl Direct3DDevice9 {
             flags: DeviceFlags::empty(),
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
+            render_scale: info.render_scale,
             fvf: 0,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
@@ -1989,6 +2065,7 @@ impl Direct3DDevice9 {
             viewport,
             clip_planes: [[0.0; 4]; CLIP_PLANE_SLOTS],
             cursor: CursorState::new(info.hwnd, info.cursor_scale),
+            fullscreen: info.fullscreen,
             bound_rt: BoundRt::new(info.backbuffer_width, info.backbuffer_height),
             bound_buffers: BoundBuffers::new(),
             shader_bindings: ShaderBindings::new(),
@@ -2487,6 +2564,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         };
         let parent = device_inner.direct3d as *mut c_void;
 
+        // Hand the window back before the subclass goes: the restore issues a
+        // `SetWindowPos`, and the game's own wndproc should see it exactly as
+        // it sees any other window change.
+        device_inner.leave_fullscreen();
+
         // Restore the game's original window proc *before* freeing DeviceInner;
         // the subclass's global back-pointer becomes dangling once we drop.
         device_inner.cursor().uninstall_subclass();
@@ -2789,7 +2871,7 @@ extern "system" fn device_create_additional_swap_chain(
     } else {
         dev.window()
     };
-    crate::direct3d9::resolve_windowed_backbuffer_dims(target_window as u64, &mut pp);
+    crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     pp_in.back_buffer_width = pp.back_buffer_width;
     pp_in.back_buffer_height = pp.back_buffer_height;
@@ -2877,11 +2959,30 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return D3DERR_INVALIDCALL;
     }
-    if pp.windowed != 0 {
-        crate::direct3d9::resolve_windowed_backbuffer_dims(dev.window() as u64, &mut pp);
-        if pp.back_buffer_format == 0 {
-            pp.back_buffer_format = crate::direct3d9::adapter_display_format();
-        }
+    // A fullscreen request must still be well-formed even though its size is
+    // not used: the D3D9 "zero means the client area" rule is windowed-only,
+    // so zero dimensions here are a malformed request. Checked before the
+    // window moves, so a rejected Reset leaves the device exactly as it was.
+    if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
+            pp.back_buffer_width, pp.back_buffer_height,
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    // Window transition first, then size against the window it produced: a
+    // fullscreen or maximized Reset takes its back-buffer size from the client
+    // rect, which is only final once the window has moved.
+    let target_window = if pp.device_window == 0 {
+        dev.window()
+    } else {
+        pp.device_window
+    };
+    apply_reset_window_mode(dev, &pp);
+    crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
+    if pp.windowed != 0 && pp.back_buffer_format == 0 {
+        pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     warn_present_params_fields_once(&pp);
@@ -2890,8 +2991,8 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         "IDirect3DDevice9::Reset({}x{}, fmt={})",
         pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format
     );
-    // A fullscreen Reset (or a windowed one whose window has no client area)
-    // must still carry explicit dimensions.
+    // A Reset whose window has no readable client area must still carry
+    // explicit dimensions.
     if pp.back_buffer_width == 0 || pp.back_buffer_height == 0 {
         warn!(
             target: LOG_TARGET,
@@ -2900,6 +3001,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return D3DERR_INVALIDCALL;
     }
+
     // Report the resolved geometry back to the caller. D3D9 leaves
     // hDeviceWindow and the mode flags as the caller set them.
     pp_in.back_buffer_width = pp.back_buffer_width;
@@ -2982,6 +3084,32 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
 
     D3D_OK
+}
+
+/// Carry out the windowed/fullscreen transition a `Reset` asks for.
+///
+/// All four combinations are legal and a game picks freely between them:
+/// entering fullscreen, leaving it, staying fullscreen (possibly on a new
+/// device window), and staying windowed. Nothing here can fail: no display
+/// mode is involved, so there is no mode to reject.
+fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_PARAMETERS) {
+    if pp.windowed != 0 {
+        dev.leave_fullscreen();
+        return;
+    }
+    // A Reset may retarget the device at another window. The one we took over
+    // is the one we give back, so a retarget is a leave followed by an enter.
+    let target = if pp.device_window == 0 {
+        dev.window()
+    } else {
+        pp.device_window
+    } as *mut c_void;
+    if dev.fullscreen_window() == Some(target) {
+        dev.update_fullscreen();
+        return;
+    }
+    dev.leave_fullscreen();
+    dev.enter_fullscreen(target);
 }
 
 /// Steps 1-6 of the Reset protocol.
@@ -9846,8 +9974,13 @@ pub fn warn_present_params_fields_once(pp: &mtld3d_types::D3DPRESENT_PARAMETERS)
         );
     }
     if pp.full_screen_refresh_rate_in_hz != 0 {
+        // A fullscreen device takes a monitor-covering window rather than
+        // setting a display mode, so there is no mode for a refresh rate to
+        // select. Presentation pacing follows the panel, capped by
+        // `present.maxFps`.
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "CreateDevice: refresh_rate_in_hz={} set but display-mode control not implemented",
+            "CreateDevice: full_screen_refresh_rate_in_hz={} requested but the display mode is \
+             never changed — presentation follows the panel's own rate",
             pp.full_screen_refresh_rate_in_hz
         );
     }

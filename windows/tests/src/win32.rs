@@ -39,6 +39,9 @@ unsafe extern "system" {
     fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetCursor() -> usize;
     fn SetCursor(cursor: usize) -> usize;
+    fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
+    fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -79,7 +82,14 @@ const WM_QUIT: u32 = 0x0012;
 const CW_USEDEFAULT: i32 = 0x8000_0000_u32.cast_signed();
 /// `WS_OVERLAPPEDWINDOW` — a normal framed window, initially hidden.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
-const WS_VISIBLE: u32 = 0x1000_0000;
+/// `WS_VISIBLE` — the window is shown.
+pub const WS_VISIBLE: u32 = 0x1000_0000;
+/// `WS_POPUP` — no frame; what a fullscreen device window becomes.
+pub const WS_POPUP: u32 = 0x8000_0000;
+/// `WS_CAPTION` — title bar; dropped for a fullscreen device window.
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+/// `WS_EX_TOPMOST` — above every non-topmost window.
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
 /// `IDC_ARROW` standard cursor id (`MAKEINTRESOURCE(32512)`).
 const IDC_ARROW: usize = 32512;
 
@@ -191,6 +201,62 @@ pub fn get_cursor() -> usize {
 pub fn set_cursor(cursor: usize) -> usize {
     // SAFETY: Win32 thunk; 0 (no cursor) is a valid argument.
     unsafe { SetCursor(cursor) }
+}
+
+/// Win32 `RECT`, as reported by `Harness::window_rect`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// `GWL_STYLE` — a window's style bits.
+pub const GWL_STYLE: i32 = -16;
+/// `GWL_EXSTYLE` — a window's extended style bits.
+pub const GWL_EXSTYLE: i32 = -20;
+
+/// `GetWindowRect` — a window's outer rect in screen coordinates.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+pub fn window_rect(hwnd: usize) -> Rect {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and `rect`
+    // is an owned local.
+    let ok = unsafe { GetWindowRect(hwnd, &raw mut rect) };
+    assert!(ok != 0, "GetWindowRect failed");
+    rect
+}
+
+/// `GetWindowLongA` — one of a window's `GWL_*` longs, as a bit mask.
+pub fn window_long(hwnd: usize, index: i32) -> u32 {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is one of the documented constants.
+    unsafe { GetWindowLongA(hwnd, index) }.cast_unsigned()
+}
+
+/// The primary display's current resolution (`SM_CXSCREEN` / `SM_CYSCREEN`).
+pub fn screen_size() -> (u32, u32) {
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    // SAFETY: Win32 thunk; both indices are documented constants.
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    // SAFETY: as above.
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    (
+        u32::try_from(width).expect("screen width is positive"),
+        u32::try_from(height).expect("screen height is positive"),
+    )
 }
 
 /// Destroy a window created by [`create_window`].

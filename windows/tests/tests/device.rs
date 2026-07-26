@@ -3,7 +3,7 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
-use mtld3d_tests::{Harness, assert_pixel_eq};
+use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
     D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_X8R8G8B8,
@@ -313,6 +313,113 @@ fn reset_resize_grows_backbuffer() {
     assert_pixel_eq(h.read_pixel(400, 300), blue, "new center renders");
     // (700,500) only exists in the grown 800x600 backbuffer.
     assert_pixel_eq(h.read_pixel(700, 500), blue, "grown backbuffer reachable");
+}
+
+/// Present parameters for a fullscreen Reset at `width`x`height`.
+const fn fullscreen_params(hwnd: usize, width: u32, height: u32) -> D3DPRESENT_PARAMETERS {
+    D3DPRESENT_PARAMETERS {
+        back_buffer_width: width,
+        back_buffer_height: height,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        swap_effect: 1, // D3DSWAPEFFECT_DISCARD
+        device_window: hwnd,
+        windowed: 0,
+        enable_auto_depth_stencil: 0,
+        auto_depth_stencil_format: 0,
+        flags: 0,
+        full_screen_refresh_rate_in_hz: 0,
+        presentation_interval: 0,
+    }
+}
+
+#[test]
+fn reset_fullscreen_adopts_monitor_rect_and_restores() {
+    let h = Harness::new();
+    let hwnd = h.hwnd();
+    let windowed_rect = h.window_rect();
+    let windowed_style = h.window_style();
+
+    let (screen_w, screen_h) = Harness::screen_size();
+    let mut pp = fullscreen_params(hwnd, screen_w, screen_h);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+
+    let rect = h.window_rect();
+    assert_eq!(
+        (
+            u32::try_from(rect.right - rect.left).expect("width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("height is positive")
+        ),
+        (screen_w, screen_h),
+        "fullscreen device window must fill the monitor rect",
+    );
+    let style = h.window_style();
+    assert_ne!(style & WS_POPUP, 0, "fullscreen window must be a popup");
+    assert_eq!(
+        style & WS_CAPTION,
+        0,
+        "fullscreen window must lose its caption"
+    );
+    // Deliberately *not* topmost: raising the window's level deadlocks Wine's
+    // mac driver (see `fullscreen::apply_fullscreen_window`), and a borderless
+    // window covering the monitor needs no help from the z-order.
+    assert_eq!(
+        h.window_exstyle() & WS_EX_TOPMOST,
+        0,
+        "fullscreen window must leave the z-order alone",
+    );
+
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
+    assert_eq!(
+        (bb.width, bb.height),
+        (screen_w, screen_h),
+        "backbuffer follows the monitor-covering window",
+    );
+
+    // Back to windowed: the window we took over is handed back as it was.
+    assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+    assert_eq!(
+        h.window_rect(),
+        windowed_rect,
+        "leaving fullscreen restores the window rect",
+    );
+    assert_eq!(
+        h.window_style() & !WS_VISIBLE,
+        windowed_style & !WS_VISIBLE,
+        "leaving fullscreen restores the window style",
+    );
+}
+
+#[test]
+fn reset_fullscreen_ignores_the_requested_resolution() {
+    let h = Harness::new();
+    let (screen_w, screen_h) = Harness::screen_size();
+    // 137x101 is in no display-mode list, and it does not matter: a fullscreen
+    // device takes a monitor-covering window instead of setting a mode, so the
+    // back buffer follows the window and the request is ignored rather than
+    // rejected. The resolved size is reported back through the present params,
+    // which is how a game that re-reads them learns its real resolution.
+    let mut pp = fullscreen_params(h.hwnd(), 137, 101);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset at an arbitrary size must succeed",
+    );
+    assert_eq!(
+        (pp.back_buffer_width, pp.back_buffer_height),
+        (screen_w, screen_h),
+        "Reset must report the size it actually used",
+    );
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
+    assert_eq!(
+        (bb.width, bb.height),
+        (screen_w, screen_h),
+        "back buffer follows the monitor-covering window, not the request",
+    );
 }
 
 #[test]

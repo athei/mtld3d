@@ -71,8 +71,11 @@ instead of breaking.
 - **Sampling and output**: anisotropic filtering, sRGB read (compressed
   formats) and sRGB write, alpha test, scissor, separate alpha blend,
   blend factor, color write masks.
-- **Presentation**: windowed and borderless-fullscreen swap chains, adapter
-  mode enumeration, hardware color cursors.
+- **Presentation**: windowed and fullscreen swap chains, adapter mode
+  enumeration, hardware color cursors. A fullscreen device takes its window
+  borderless over the monitor without ever changing the display mode; the back
+  buffer follows the window, and `render.scale` decides how many pixels are
+  actually rendered before the result is upscaled to the screen.
 
 ### Not implemented yet
 
@@ -104,10 +107,18 @@ back:
   The extended interface is a different contract (device removal, OS-managed
   memory) built for the Vista+ compositor; the games this project targets are
   plain D3D9.
-- **Exclusive fullscreen and display-mode switching**: presentation is a
-  composited Metal layer; fullscreen means borderless at desktop resolution.
-  The Win32 fullscreen lifecycle (mode changes, device-lost focus dance) is
-  not emulated.
+- **Display-mode switching**: a fullscreen device owns its window but never
+  the desktop mode. Wine's mac driver would hand the request to
+  `CGDisplaySetDisplayMode`, which reconfigures the user's screen and
+  rearranges every other window, and avoiding that would depend on a Wine
+  registry setting. A monitor-covering borderless window keeps `GetClientRect`,
+  mouse input and the back buffer in agreement without any of it, so the
+  resolution a game picks in fullscreen is ignored and `render.scale` controls
+  the render resolution instead.
+- **The fullscreen focus lifecycle**: the focus dance around a fullscreen
+  device is not emulated — no device loss on deactivation, no focus-window
+  subclassing, no synthesized activation messages. Presentation is a composited
+  Metal layer, so a lost display is never a lost device.
 - **Software paths**: no reference or software rasterizer, no software
   vertex processing, no ProcessVertices, no RegisterSoftwareDevice. HAL on
   the default Metal device is the only device type; multi-adapter setups are

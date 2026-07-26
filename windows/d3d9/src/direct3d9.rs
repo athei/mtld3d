@@ -7,7 +7,7 @@ use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams,
     GetPrimaryDisplayModeParams, InPtr, InPtrMut, MetalHandle, OutPtr, VtableThis,
-    mtl_handle::MTLTextureKind,
+    mtl_handle::{MTLTextureKind, NSViewKind},
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A1R5G5B5,
@@ -23,6 +23,7 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, LOG_TARGET,
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
+    fullscreen::Rect,
     null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
@@ -484,16 +485,17 @@ extern "system" fn d3d9_get_adapter_display_mode(
         warn!(target: LOG_TARGET, "reject GetAdapterDisplayMode(adapter={adapter}) → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
-    // First entry is host native @ X8R8G8B8 by build_adapter_modes()
-    // construction.
+    // `ADAPTER_MODES[0]` is the host's native mode. Nothing we do changes the
+    // desktop mode — a fullscreen device takes a monitor-covering window
+    // instead — so the desktop is always in it.
+    let current = ADAPTER_MODES[0];
     // SAFETY: vtable out-param; `mode` is *mut D3DDISPLAYMODE per IDirect3D9 ABI.
-    unsafe { OutPtr::write_opt(mode.cast::<D3DDISPLAYMODE>(), ADAPTER_MODES[0]) };
+    unsafe { OutPtr::write_opt(mode.cast::<D3DDISPLAYMODE>(), current) };
     mtld3d_shared::log_once_trace_by!(
         target: DISPLAY_TRACE_TARGET,
         key: 0u64,
         "GetAdapterDisplayMode → {}x{}@{}Hz fmt={}",
-        ADAPTER_MODES[0].width, ADAPTER_MODES[0].height,
-        ADAPTER_MODES[0].refresh_rate, ADAPTER_MODES[0].format
+        current.width, current.height, current.refresh_rate, current.format
     );
     D3D_OK
 }
@@ -713,34 +715,15 @@ extern "system" fn d3d9_get_device_caps(
 }
 
 extern "system" fn d3d9_get_adapter_monitor(_this: *mut c_void, _adapter: u32) -> *mut c_void {
-    // Single-adapter model: resolve the monitor at the desktop origin (0,0),
-    // which is the primary display by definition, falling back to the primary if
-    // (0,0) is somehow uncovered. GetMonitorInfo on the result reports
-    // MONITORINFOF_PRIMARY, as the D3D9 spec requires for adapter 0.
-    const MONITOR_DEFAULTTOPRIMARY: u32 = 0x0000_0001;
-    // SAFETY: MonitorFromPoint takes a POINT by value plus a flags DWORD and
-    // returns an HMONITOR (or null); the arguments are plain scalars.
-    unsafe { MonitorFromPoint(Point { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) }
-}
-
-#[repr(C)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[repr(C)]
-struct Point {
-    x: i32,
-    y: i32,
+    // Single-adapter model: the primary display's monitor. GetMonitorInfo on
+    // the result reports MONITORINFOF_PRIMARY, as the D3D9 spec requires for
+    // adapter 0.
+    crate::fullscreen::primary_monitor()
 }
 
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
-    fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
 }
 
 /// Client-area pixel dimensions of `hwnd`, or `None` when the call fails or the rect is empty.
@@ -751,12 +734,7 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
     if hwnd.is_null() {
         return None;
     }
-    let mut rect = Rect {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
+    let mut rect = Rect::EMPTY;
     // SAFETY: GetClientRect accepts any HWND and writes a RECT through the
     // out pointer; `rect` is an owned local, so non-null + aligned + writable
     // holds. A bad HWND yields a zero return, handled below.
@@ -764,29 +742,53 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
     if ok == 0 {
         return None;
     }
-    let w = u32::try_from(rect.right.saturating_sub(rect.left)).ok()?;
-    let h = u32::try_from(rect.bottom.saturating_sub(rect.top)).ok()?;
+    let w = u32::try_from(rect.width()).ok()?;
+    let h = u32::try_from(rect.height()).ok()?;
     (w != 0 && h != 0).then_some((w, h))
 }
 
-/// Per the D3D9 spec, a zero `BackBufferWidth` / `BackBufferHeight` means the client area.
+/// Resolve the back buffer's *logical* size.
 ///
-/// The rule holds for a windowed `D3DPRESENT_PARAMETERS`, and the area is the
-/// device window's. Resolve those zeros against `GetClientRect` so a zeroed
-/// present-params struct (the conformance `stateblock` device, additional
-/// swap chains) never forwards a 0-dimension texture descriptor to Metal.
-pub fn resolve_windowed_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
-    if pp.windowed == 0 || (pp.back_buffer_width != 0 && pp.back_buffer_height != 0) {
-        return;
-    }
-    let Some((w, h)) = client_rect_dims(hwnd as *mut c_void) else {
+/// Logical size is what D3D9 reports and the space every game-supplied
+/// coordinate lives in. Two rules, keyed on who decides the window's geometry:
+///
+/// - **Fullscreen or maximized**: the window covers the monitor and the game
+///   does not size it, so the client area wins and the requested resolution is
+///   ignored. Honouring it would mean rendering at one size, letting the
+///   compositor stretch to another, and resampling twice for nothing;
+///   `render.scale` is the resolution control in that mode. This is also what
+///   keeps `GetClientRect`, mouse input and our geometry in agreement without
+///   changing the display mode.
+/// - **Ordinary window**: the game's explicit request stands. Only the D3D9
+///   "a zero dimension means the client area" rule is applied, so a zeroed
+///   present-params struct (the conformance `stateblock` device, additional
+///   swap chains) never forwards a 0-dimension texture descriptor to Metal.
+///
+/// A window whose client rect cannot be read leaves the request untouched; a
+/// dimension still zero afterwards is rejected by the caller.
+pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
+    let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void) else {
         return;
     };
+    if pp.windowed == 0 || crate::fullscreen::is_maximized(hwnd as *mut c_void) {
+        if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "{} device: back buffer follows the window ({}x{}), requested {}x{} ignored — \
+                 use render.scale to pick the render resolution",
+                if pp.windowed == 0 { "fullscreen" } else { "maximized" },
+                client_w, client_h, pp.back_buffer_width, pp.back_buffer_height,
+            );
+        }
+        pp.back_buffer_width = client_w;
+        pp.back_buffer_height = client_h;
+        return;
+    }
     if pp.back_buffer_width == 0 {
-        pp.back_buffer_width = w;
+        pp.back_buffer_width = client_w;
     }
     if pp.back_buffer_height == 0 {
-        pp.back_buffer_height = h;
+        pp.back_buffer_height = client_h;
     }
 }
 
@@ -847,9 +849,29 @@ extern "system" fn d3d9_create_device(
         focus_window as u64
     };
 
-    // Resolve a windowed zero-dimension backbuffer to the window's client
-    // area before any Metal resource is sized from these dimensions.
-    resolve_windowed_backbuffer_dims(hwnd, &mut pp);
+    // A fullscreen request must still be well-formed even though its size is
+    // not used: the D3D9 "zero means the client area" rule is windowed-only,
+    // so zero dimensions here are a malformed request. Checked before the
+    // window moves, so a rejected create leaves it untouched.
+    if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice({}x{}) — a fullscreen request may not carry zero dimensions",
+            pp.back_buffer_width, pp.back_buffer_height,
+        );
+        destroy_partial_device(&cq_params, MetalHandle::NULL, MetalHandle::NULL);
+        return D3DERR_INVALIDCALL;
+    }
+
+    // A fullscreen device owns its window. Take it over first: the back-buffer
+    // size is resolved from the resulting client rect, and the metal view is
+    // sized from the window Wine hands us at attach time, so both have to see
+    // the window already covering the monitor.
+    let fullscreen = (pp.windowed == 0).then(|| crate::fullscreen::enter(hwnd as *mut c_void));
+
+    // Resolve the logical backbuffer size against the window now that its
+    // geometry is final, before any Metal resource is sized from it.
+    resolve_backbuffer_dims(hwnd, &mut pp);
     // Resolve D3DFMT_UNKNOWN to the display format and a zero back-buffer count
     // to one, so the geometry written back to the caller's present params is
     // concrete.
@@ -872,7 +894,8 @@ extern "system" fn d3d9_create_device(
             "reject CreateDevice — zero backbuffer dims (windowed={}, hwnd=0x{hwnd:x})",
             pp.windowed,
         );
-        destroy_partial_device(&cq_params, &layer_params, MetalHandle::NULL);
+        destroy_partial_device(&cq_params, layer_params.view_handle, MetalHandle::NULL);
+        restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
     let (cursor_scale, scale_origin) = resolve_initial_cursor_scale(layer_params.backing_scale);
@@ -881,24 +904,37 @@ extern "system" fn d3d9_create_device(
         "hardware cursor scale: {cursor_scale}x ({scale_origin})"
     );
 
+    // `render.scale` splits the back buffer in two from here on: `pp` keeps
+    // the logical size D3D9 reports, while the Metal texture is rasterized at
+    // `render_scale` of it and MetalFX resamples on present. Without MetalFX
+    // there is nothing that could resample, so the scale is forced to
+    // identity rather than silently presenting a mis-sized frame.
+    let render_scale = resolve_render_scale(layer_params.metalfx_available != 0);
+    let render_width = render_scale.dimension(pp.back_buffer_width);
+    let render_height = render_scale.dimension(pp.back_buffer_height);
+
     // Create backbuffer texture
     let mut bb_params = CreateBackbufferParams {
         device_handle: cq_params.device_handle,
-        width: pp.back_buffer_width,
-        height: pp.back_buffer_height,
+        width: render_width,
+        height: render_height,
         texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
     if status != 0 {
         error!(target: LOG_TARGET, "CreateBackbuffer failed (0x{status:08X})");
-        destroy_partial_device(&cq_params, &layer_params, MetalHandle::NULL);
+        destroy_partial_device(&cq_params, layer_params.view_handle, MetalHandle::NULL);
+        restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
 
     // Create depth/stencil texture if requested
     let depth_handle = match create_auto_depth_stencil(&cq_params, &layer_params, &bb_params, &pp) {
         Ok(handle) => handle,
-        Err(hr) => return hr,
+        Err(hr) => {
+            restore_from_fullscreen(fullscreen.as_ref());
+            return hr;
+        }
     };
 
     let mut render_states = mtld3d_types::render_state_defaults();
@@ -924,6 +960,7 @@ extern "system" fn d3d9_create_device(
         },
         backbuffer_width: pp.back_buffer_width,
         backbuffer_height: pp.back_buffer_height,
+        render_scale,
         encoder,
         prewarm,
         current_frame: FrameData::new(&FrameInit {
@@ -932,8 +969,10 @@ extern "system" fn d3d9_create_device(
             backbuffer_handle: bb_params.texture_handle,
             layer_handle: layer_params.layer_handle,
             view_handle: layer_params.view_handle,
-            backbuffer_width: pp.back_buffer_width,
-            backbuffer_height: pp.back_buffer_height,
+            // The encoder works in render space: pass sizes, default
+            // viewports and full-attachment clears all derive from this.
+            backbuffer_width: render_width,
+            backbuffer_height: render_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
             depth_texture: depth_handle,
             depth_has_stencil: depth_format_has_stencil(pp.auto_depth_stencil_format),
@@ -962,6 +1001,7 @@ extern "system" fn d3d9_create_device(
         },
         hwnd: hwnd as *mut c_void,
         cursor_scale,
+        fullscreen,
     });
 
     // Install the cursor wndproc subclass. Must happen after `DeviceInner` is
@@ -1018,7 +1058,7 @@ fn attach_metal_layer(
         hdr_enable: u32::from(crate::config::CONFIG.hdr_enable),
         color_space: crate::config::CONFIG.color_space,
         max_fps: crate::config::CONFIG.present_max_fps,
-        pad0: 0,
+        metalfx_available: 0,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);
@@ -1111,20 +1151,62 @@ fn resolve_initial_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
     }
 }
 
+/// Resolve `render.scale` against what the GPU can actually do.
+///
+/// `MetalFX` is the only thing that can resample a frame at present time, so a
+/// GPU without it has to render at exactly the presented size. Say so once
+/// rather than quietly ignoring the user's setting.
+fn resolve_render_scale(metalfx_available: bool) -> mtld3d_core::render_scale::RenderScale {
+    use mtld3d_core::render_scale::RenderScale;
+
+    let requested = RenderScale::from_percent(crate::config::CONFIG.render_scale_percent);
+    if requested.is_identity() {
+        return RenderScale::IDENTITY;
+    }
+    if !metalfx_available {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "render.scale = {} ignored — this GPU has no MetalFX spatial upscaler, so the \
+             frame is rendered at full resolution",
+            f64::from(requested.percent()) / 100.0,
+        );
+        return RenderScale::IDENTITY;
+    }
+    info!(
+        target: LOG_TARGET,
+        "render.scale = {} — rendering at {}% of the presented resolution",
+        f64::from(requested.percent()) / 100.0,
+        requested.percent(),
+    );
+    requested
+}
+
+/// Give the window back when device creation fails mid-way.
+///
+/// A fullscreen `CreateDevice` takes the window over before it builds
+/// anything, so every later failure has to undo it. Otherwise a rejected
+/// device leaves the game's window stripped of its decoration and pinned over
+/// the monitor.
+fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
+    if let Some(saved) = saved {
+        crate::fullscreen::leave(saved);
+    }
+}
+
 /// Tear down the partial device handles assembled so far.
 ///
 /// Called on any failure between `CreateCommandQueue` and the final
-/// `Box::into_raw`. `backbuffer_handle` is `MetalHandle::NULL` when failure
-/// happens before the backbuffer was created.
+/// `Box::into_raw`. `view_handle` / `backbuffer_handle` are `MetalHandle::NULL`
+/// when the failure happens before that object was created.
 fn destroy_partial_device(
     cq: &CreateCommandQueueParams,
-    layer: &AttachMetalLayerParams,
+    view_handle: MetalHandle<NSViewKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
 ) {
     let mut destroy = DestroyCommandQueueParams {
         device_handle: cq.device_handle,
         queue_handle: cq.queue_handle,
-        view_handle: layer.view_handle,
+        view_handle,
         backbuffer_handle,
         pipeline_handle: MetalHandle::NULL,
         depth_texture_handle: MetalHandle::NULL,
@@ -1153,13 +1235,20 @@ fn create_auto_depth_stencil(
             "auto depth-stencil format {} has no Metal mapping",
             pp.auto_depth_stencil_format
         );
-        destroy_partial_device(cq_params, layer_params, bb_params.texture_handle);
+        destroy_partial_device(
+            cq_params,
+            layer_params.view_handle,
+            bb_params.texture_handle,
+        );
         return Err(D3DERR_INVALIDCALL);
     };
+    // Sized from the back buffer rather than the present params: the depth
+    // attachment has to match the colour one exactly, and the back buffer is
+    // already at render resolution when `render.scale` is in play.
     let mut ds_params = CreateDepthTextureParams {
         device_handle: cq_params.device_handle,
-        width: pp.back_buffer_width,
-        height: pp.back_buffer_height,
+        width: bb_params.width,
+        height: bb_params.height,
         pixel_format: ds_pixel_format,
         pad0: 0,
         texture_handle: MetalHandle::NULL,
@@ -1167,7 +1256,11 @@ fn create_auto_depth_stencil(
     let status = unix_call(&mut ds_params);
     if status != 0 {
         error!(target: LOG_TARGET, "CreateDepthTexture failed (0x{status:08X})");
-        destroy_partial_device(cq_params, layer_params, bb_params.texture_handle);
+        destroy_partial_device(
+            cq_params,
+            layer_params.view_handle,
+            bb_params.texture_handle,
+        );
         return Err(D3DERR_INVALIDCALL);
     }
     info!(

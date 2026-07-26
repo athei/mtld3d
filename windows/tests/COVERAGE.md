@@ -11,7 +11,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | File | Coverage |
 | --- | --- |
 | `smoke.rs` | Clear-to-colour fill; `DrawPrimitiveUP` triangle with interpolated diffuse. |
-| `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity; `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize). |
+| `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity; `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize, fullscreen monitor-rect + style adoption and restore, fullscreen ignores the requested resolution). |
 | `clear_present.rs` | (folded into smoke/device — clear flags exercised via `clear`). |
 | `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle-fan + `DrawIndexedPrimitiveUP` + `ProcessVertices` stubs. |
 | `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices`/`SetStreamSourceFreq` + non-zero stream stubs. |

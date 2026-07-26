@@ -11,6 +11,7 @@ mod device;
 mod direct3d9;
 mod draw;
 mod encoder;
+mod fullscreen;
 mod index_buffer;
 mod pixel_shader;
 mod private_data;

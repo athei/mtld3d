@@ -1674,6 +1674,33 @@ impl Harness {
         win32::set_cursor(cursor)
     }
 
+    /// user32 `GetWindowRect` — the device window's outer rect, in screen coordinates.
+    ///
+    /// A fullscreen device stretches that window over the monitor and puts it
+    /// back on the way out, so the rect is how tests observe both.
+    pub fn window_rect(&self) -> win32::Rect {
+        win32::window_rect(self.hwnd)
+    }
+
+    /// user32 `GetWindowLong(GWL_STYLE)` — the device window's style bits.
+    pub fn window_style(&self) -> u32 {
+        win32::window_long(self.hwnd, win32::GWL_STYLE)
+    }
+
+    /// user32 `GetWindowLong(GWL_EXSTYLE)` — the device window's extended style bits.
+    pub fn window_exstyle(&self) -> u32 {
+        win32::window_long(self.hwnd, win32::GWL_EXSTYLE)
+    }
+
+    /// The primary display's current resolution, straight from `GetSystemMetrics`.
+    ///
+    /// Win32's own answer, independent of anything d3d9 reports — which is what
+    /// makes it usable as the expectation in a display-mode test.
+    #[must_use]
+    pub fn screen_size() -> (u32, u32) {
+        win32::screen_size()
+    }
+
     /// `GetBackBuffer(0, index, MONO)`, asserting success.
     ///
     /// # Panics
