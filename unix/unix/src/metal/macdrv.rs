@@ -51,12 +51,56 @@ static BOUND_WINDOW_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Last per-frame headroom we emitted an `info!` for, encoded as `f32::to_bits`.
 ///
-/// `0` = never logged; the first call always logs to establish a baseline
-/// distinct from the attach-time line. Subsequent calls fire only when the
-/// dynamic headroom drifts more than 5% relative to the last-logged value —
+/// `0` = never logged; the first refresh always logs to establish a baseline
+/// distinct from the attach-time line. Subsequent refreshes fire only when the
+/// dynamic headroom drifts more than 5% relative to the last-logged value,
 /// diagnostic for steady-state brightness/thermal changes without per-frame
-/// spam.
+/// spam. Written only on the main thread, inside [`refresh_headroom_on_main`].
 static LAST_LOGGED_HEADROOM_BITS: AtomicU32 = AtomicU32::new(0);
+
+/// Live EDR headroom as `f32::to_bits`, published by the main thread.
+///
+/// `submit_frame` needs this every present to drive the HDR tone-map shader,
+/// but deriving it means walking `NSView.window → NSWindow.screen`, and those
+/// two are main-thread-only however read-only the `NSScreen` property at the
+/// end of the walk is. Doing that walk on the submit thread crashed inside
+/// `AppKit` roughly three seconds after a zone transition, which is exactly when
+/// the main thread is rebuilding window and screen state. So the walk moved to
+/// the main thread and the presenting thread reads this instead.
+///
+/// Seeded to `1.0`, which the HDR shader treats as the identity curve, so the
+/// presents before the first refresh lands are correct rather than merely safe.
+static CURRENT_HEADROOM_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
+
+/// Raw `NSView*` (as `usize`) the headroom refresh walks. `0` = none bound yet.
+///
+/// Seeded at attach so the main thread never has to be handed a view pointer by
+/// the presenting thread. Re-attach re-points it, the same posture as
+/// [`BOUND_WINDOW_PTR`].
+static BOUND_VIEW_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a headroom refresh is already queued on the main thread.
+///
+/// Bounds the main queue to one outstanding refresh no matter how far ahead the
+/// presenting thread runs, so a busy main thread cannot accumulate a backlog of
+/// them.
+static HEADROOM_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Presents since the last headroom refresh was queued.
+///
+/// Refreshing every present would put a main-queue block in every frame for a
+/// value that tracks display brightness, so it is sampled every
+/// [`HEADROOM_REFRESH_PRESENTS`] instead. A present counter rather than a clock
+/// because the call site is per-present and this needs no new time source; the
+/// cost is that the interval is measured in frames, which at 30 to 300 fps puts
+/// the refresh somewhere between one second and a tenth of one.
+///
+/// Starts already due so the first present after attach queues a refresh
+/// rather than waiting out a full interval on the seeded `1.0`.
+static PRESENTS_SINCE_HEADROOM_REFRESH: AtomicU64 = AtomicU64::new(HEADROOM_REFRESH_PRESENTS);
+
+/// How many presents may pass between headroom refreshes.
+const HEADROOM_REFRESH_PRESENTS: u64 = 32;
 
 /// Tell macOS this process is doing continuous, latency-critical, user-interactive work.
 ///
@@ -120,6 +164,10 @@ fn install_occlusion_tracking(view: *mut c_void) {
     use objc2_app_kit::{NSView, NSWindowOcclusionState};
 
     let view_addr = view as usize;
+    // The headroom refresh walks this same view, and stores it here rather
+    // than taking it per present so the presenting thread never hands an
+    // AppKit pointer across a thread boundary. Re-attach re-points it.
+    BOUND_VIEW_PTR.store(view_addr, Ordering::Relaxed);
     run_on_main_thread_sync(move || {
         // SAFETY: `view_addr` is the metal `NSView*` macdrv just created and
         // returned to attach; we are on the main thread (dispatch to the main
@@ -393,6 +441,13 @@ unsafe extern "C" {
     /// `(ctx, work_fn)` pair carries the closure state. Standard libSystem
     /// export.
     fn dispatch_sync_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
+    /// libdispatch's function-pointer `dispatch_async`.
+    ///
+    /// The asynchronous twin of `dispatch_sync_f`. Used where the presenting
+    /// thread needs main-thread work done but must not wait for it: waiting
+    /// would put the main run loop in the frame's critical path and deadlock
+    /// outright if the main thread is itself blocked on us.
+    fn dispatch_async_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
 /// Process-wide handle to the dynamic-symbol table, resolved once.
@@ -964,37 +1019,81 @@ fn resolve_hdr_active(
     true
 }
 
-/// Poll the *dynamic* `maximumExtendedDynamicRangeColorComponentValue` for `view`'s screen.
+/// The *dynamic* `maximumExtendedDynamicRangeColorComponentValue` of the bound view's screen.
 ///
 /// Distinct from the `…Potential…` value `view_display_caps` reads once at
 /// attach: this one tracks the panel's currently-available headroom, which
-/// on a Mac is `panel_peak_nits / current_paper_white_nits` — drops as the
+/// on a Mac is `panel_peak_nits / current_paper_white_nits`. It drops as the
 /// user raises display brightness, and under thermal load. `submit_frame`
 /// clamps the BT.2446-A target peak to it because macOS *global-scales*
 /// over-headroom EDR (crushes midtones), rather than soft-knee compressing
 /// the top.
 ///
+/// Reads the value the main thread last published and queues a refresh when
+/// one is due. Never touches `AppKit`, so it is safe to call from the
+/// presenting thread; see [`CURRENT_HEADROOM_BITS`] for why that matters.
+///
 /// Returns `1.0` on any lookup failure or while macOS hasn't yet
-/// transitioned the screen into EDR mode (the first present or two
-/// after `AttachMetalLayer` can land here). `1.0` is still safe for
-/// the HDR shader — BT.2446-A at `L_hdr = L_sdr = 100` is the identity
-/// curve, producing valid linear-DisplayP3 output.
-pub fn poll_current_headroom(view: *mut c_void) -> f32 {
+/// transitioned the screen into EDR mode (the first presents after
+/// `AttachMetalLayer` land here). `1.0` is still correct for the HDR
+/// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve,
+/// producing valid linear-DisplayP3 output.
+pub fn current_headroom() -> f32 {
+    let due = PRESENTS_SINCE_HEADROOM_REFRESH.fetch_add(1, Ordering::Relaxed)
+        >= HEADROOM_REFRESH_PRESENTS;
+    if due
+        && HEADROOM_REFRESH_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        PRESENTS_SINCE_HEADROOM_REFRESH.store(0, Ordering::Relaxed);
+        queue_headroom_refresh();
+    }
+    f32::from_bits(CURRENT_HEADROOM_BITS.load(Ordering::Relaxed))
+}
+
+/// Ask the main thread for a fresh headroom reading, without waiting for it.
+///
+/// The work function takes no context: everything it needs is in statics, so
+/// there is nothing to keep alive across the async hand-off and nothing to
+/// allocate or free.
+fn queue_headroom_refresh() {
+    extern "C" fn thunk(_ctx: *mut c_void) {
+        refresh_headroom_on_main();
+    }
+    // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton, a valid
+    // `dispatch_queue_t` for the process lifetime; the null context is never
+    // dereferenced because `thunk` ignores it.
+    unsafe {
+        let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
+        dispatch_async_f(main_q, core::ptr::null_mut(), thunk);
+    }
+}
+
+/// Read the live EDR headroom and publish it. **Main thread only.**
+///
+/// Walks `NSView.window → NSWindow.screen` and reads the screen's dynamic
+/// headroom, which is the walk that must not happen anywhere else: the first
+/// two are main-thread-only objects that the main thread rebuilds across a
+/// window or display change. Logs the drift line here too, for the same
+/// reason, since naming the screen means walking to it again.
+fn refresh_headroom_on_main() {
     use objc2::{MainThreadMarker, rc::Retained};
     use objc2_app_kit::{NSScreen, NSView};
 
-    if view.is_null() {
-        return 1.0;
+    HEADROOM_REFRESH_PENDING.store(false, Ordering::Release);
+    let view_addr = BOUND_VIEW_PTR.load(Ordering::Relaxed);
+    if view_addr == 0 {
+        return;
     }
-    // SAFETY: see `view_display_caps` for the off-main-thread NSScreen
-    // rationale — we read display capability properties only, which
-    // Apple's docs allow off the main thread.
+    // SAFETY: we are on the main thread (dispatched to the main queue), where
+    // NSScreen's main-thread-only class annotation is satisfied for real.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    // SAFETY: Wine's macdrv retained this NSView* for the layer's
-    // lifetime; `Retained::retain` bumps the count for the duration
-    // of the property walk.
-    let Some(view_obj) = (unsafe { Retained::retain(view.cast::<NSView>()) }) else {
-        return 1.0;
+    // SAFETY: `view_addr` is the metal `NSView*` macdrv created and attach
+    // stored; wine's macdrv retains it for the layer's lifetime, and
+    // `Retained::retain` bumps the count for the duration of the walk.
+    let Some(view_obj) = (unsafe { Retained::retain(view_addr as *mut NSView) }) else {
+        return;
     };
     let screen = view_obj
         .window()
@@ -1004,25 +1103,31 @@ pub fn poll_current_headroom(view: *mut c_void) -> f32 {
         1.0,
         NSScreen::maximumExtendedDynamicRangeColorComponentValue,
     );
-    if headroom.is_finite() && headroom >= 1.0 {
-        // EDR headroom is ≤ ~16× in practice (Apple Reference Display peaks
-        // at 16×); f32 mantissa loss is one ULP at the 1×–4× range — negligible
-        // for the Metal shader's float peak uniform.
+    let headroom = if headroom.is_finite() && headroom >= 1.0 {
+        // EDR headroom is at most ~16x in practice (Apple Reference Display
+        // peaks at 16x); f32 mantissa loss is one ULP at the 1x to 4x range,
+        // negligible for the Metal shader's float peak uniform.
         bounded_cast::f64_to_f32(headroom)
     } else {
         1.0
-    }
+    };
+    CURRENT_HEADROOM_BITS.store(headroom.to_bits(), Ordering::Relaxed);
+    log_headroom_change_if_any(headroom, view_addr as *mut c_void);
 }
 
 /// Emit one `info!` line when the live headroom drifts more than 5% from the last logged value.
 ///
-/// First call (`last == 0`) always logs so the encoder-thread baseline is
-/// distinct from the attach line. Subsequent within-±5% calls are silent —
-/// gives the user a way to verify the per-frame clamp is doing what it
-/// claims, without flooding the console during sub-percent oscillation.
-/// Names the screen the view is currently bound to so a stuck-at-1.0 run
-/// tells us *which* display is reporting no headroom.
-pub fn log_headroom_change_if_any(current_headroom: f32, view: *mut c_void) {
+/// **Main thread only**, because naming the screen walks the same
+/// main-thread-only `NSView.window → NSWindow.screen` chain the reading
+/// itself does. Called from [`refresh_headroom_on_main`].
+///
+/// First call (`last == 0`) always logs so the refresh baseline is distinct
+/// from the attach line. Subsequent within-±5% calls are silent, which gives
+/// the user a way to verify the per-frame clamp is doing what it claims
+/// without flooding the console during sub-percent oscillation. Names the
+/// screen the view is currently bound to so a stuck-at-1.0 run tells us
+/// *which* display is reporting no headroom.
+fn log_headroom_change_if_any(current_headroom: f32, view: *mut c_void) {
     let last_bits = LAST_LOGGED_HEADROOM_BITS.load(Ordering::Relaxed);
     let last = f32::from_bits(last_bits);
     let should_log = last_bits == 0 || ((current_headroom - last).abs() / last) > 0.05;
@@ -1040,9 +1145,10 @@ pub fn log_headroom_change_if_any(current_headroom: f32, view: *mut c_void) {
 
 /// Look up `NSScreen.localizedName` for the screen the view's window is currently on.
 ///
-/// Mirrors the screen-lookup walk in `poll_current_headroom` so the logged
-/// screen identity matches the screen whose headroom we just read. Returns
-/// `None` if the view has no window or no screen association yet.
+/// Mirrors the screen-lookup walk in [`refresh_headroom_on_main`] so the
+/// logged screen identity matches the screen whose headroom we just read.
+/// **Main thread only**, for the same reason that one is. Returns `None`
+/// if the view has no window or no screen association yet.
 fn view_screen_name(view: *mut c_void) -> Option<String> {
     use objc2::{MainThreadMarker, rc::Retained};
     use objc2_app_kit::{NSScreen, NSView};
@@ -1050,8 +1156,9 @@ fn view_screen_name(view: *mut c_void) -> Option<String> {
     if view.is_null() {
         return None;
     }
-    // SAFETY: see `view_display_caps` — NSScreen read-only properties
-    // are documented safe off the main thread.
+    // SAFETY: the sole caller is `log_headroom_change_if_any`, itself reached
+    // only from the main-queue refresh, so NSScreen's main-thread-only class
+    // annotation is satisfied for real rather than asserted.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     // SAFETY: `view` is a non-null `*mut NSView` from wine macdrv; `Retained::
     // retain` bumps the refcount via standard Cocoa retain semantics.

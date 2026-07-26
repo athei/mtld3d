@@ -326,9 +326,11 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             let hdr = super::macdrv::hdr_active();
 
             let presented = if hdr {
-                let view_ptr = params.present_view.raw() as *mut c_void;
-                let current = super::macdrv::poll_current_headroom(view_ptr);
-                super::macdrv::log_headroom_change_if_any(current, view_ptr);
+                // Reads what the main thread last published and queues the next
+                // refresh when due. Deriving it here would mean walking
+                // NSView.window on this thread, which is what used to crash
+                // inside AppKit a few seconds after a zone transition.
+                let current = super::macdrv::current_headroom();
                 match route {
                     PresentRoute::Upscale => encode_hdr_present_upscaled(
                         &cmd_buf,
