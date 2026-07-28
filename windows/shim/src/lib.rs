@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 
 use log::{error, info};
+use mtld3d_shared::identity;
 
 const LOG_TARGET: &str = "mtld3d::shim";
 
@@ -49,8 +50,22 @@ fn attach_process(instance: *mut c_void) -> i32 {
         return 0;
     }
 
-    info!(target: LOG_TARGET, "unix call initialized");
+    log_identity(instance);
     1
+}
+
+/// Name this build in the log, alongside the unix-call handshake it completes.
+///
+/// [`identity::BUILD`] says which release the source came from; the image ID is
+/// the PDB GUID the linker assigned, which names this exact binary and picks
+/// the `.pdb` that symbolicates it out of the release's debug archive.
+fn log_identity(instance: *mut c_void) {
+    // SAFETY: `instance` is the HINSTANCE the loader passed to DllMain, so this
+    // image is mapped in full.
+    let id = unsafe { identity::image_id(instance) };
+    let id = id.as_deref().unwrap_or("no-image-id");
+    let build = identity::BUILD;
+    info!(target: LOG_TARGET, "mtld3d.dll {build} {id}, unix call initialized");
 }
 
 /// Forwards to Wine's unix-call dispatcher.

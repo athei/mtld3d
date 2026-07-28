@@ -63,6 +63,18 @@ BUNDLE_NAME  := mtld3d.tar.xz
 BUNDLE_OUT   := $(CURDIR)/windows/target/$(BUNDLE_NAME)
 BUNDLE_STAGE := $(CURDIR)/windows/target/bundle
 
+# Symbols for the same build, packed separately: nobody installing the layer
+# needs them, but a crash report from a tester is unreadable without them. The
+# `BUILD` file inside names the build, matching the identity every DLL logs on
+# load, so an archive can be paired with a log without guessing.
+DEBUG_NAME   := mtld3d-debug.tar.xz
+DEBUG_OUT    := $(CURDIR)/windows/target/$(DEBUG_NAME)
+DEBUG_STAGE  := $(CURDIR)/windows/target/bundle-debug
+# Same expression `unix/shared/build.rs` stamps into the binaries, including the
+# fall back to the manifest version outside a checkout, so the two cannot drift.
+BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
+                        sed -n 's/^version = "\(.*\)"/v\1/p' windows/Cargo.toml)
+
 .PHONY: all windows unix install bundle test conformance conformance-baseline conformance-isolate fmt clippy audit doc check clean setup upgrade upgrade-incompat
 
 all: windows unix
@@ -87,10 +99,22 @@ windows:
 
 unix:
 	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_RELEASE_TARGET)
+	# On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
+	# debug map in the dylib pointing at them by absolute path; `dsymutil` walks
+	# that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of
+	# an MSVC `.pdb`. Run it on a copy already named `mtld3d.so`, because it
+	# stamps the inner DWARF file after the input's basename and lldb looks it up
+	# by that name — renaming the bundle afterwards produces one lldb won't find.
+	cp $(OUT_unix)/libmtld3d_unix.dylib $(OUT_unix)/mtld3d.so
+	rm -rf $(OUT_unix)/mtld3d.so.dSYM
+	dsymutil $(OUT_unix)/mtld3d.so
 
 install: all
 	# The d3d9.dll copies under lib/wine get the builtin signature in place —
-	# the loader ignores unsigned PEs on the builtin search path.
+	# the loader ignores unsigned PEs on the builtin search path. Symbols travel
+	# with each binary: the `.pdb` beside every PE, the `.dSYM` beside the `.so`,
+	# so a local crash symbolicates against the installed files with no extra
+	# flags.
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
@@ -98,7 +122,9 @@ install: all
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
 		winebuild --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
-		cp $(OUT_unix)/libmtld3d_unix.dylib $$dir/lib/wine/x86_64-unix/mtld3d.so ; \
+		cp $(OUT_unix)/mtld3d.so            $$dir/lib/wine/x86_64-unix/ ; \
+		rm -rf $$dir/lib/wine/x86_64-unix/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix)/mtld3d.so.dSYM    $$dir/lib/wine/x86_64-unix/ ; \
 		cp $(OUT_i386)/mtld3d.fake.dll      $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_x64)/mtld3d.fake.dll       $$dir/lib/wine/x86_64-windows/ ; \
 	done
@@ -109,8 +135,11 @@ install: all
 # holds the unmarked d3d9.dll for the DLL-override route (required on
 # CrossOver). The fake placeholders are the prefix markers for the custom
 # mtld3d builtin name.
+#
+# Two archives come out of one run: the bundle users install, and the symbols
+# that make a crash report from one of them readable.
 bundle: all
-	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT)
+	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-unix
@@ -124,13 +153,26 @@ bundle: all
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	winebuild --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	winebuild --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
-	cp $(OUT_unix)/libmtld3d_unix.dylib $(BUNDLE_STAGE)/wine/x86_64-unix/mtld3d.so
+	cp $(OUT_unix)/mtld3d.so            $(BUNDLE_STAGE)/wine/x86_64-unix/
 	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
 	cp $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
 	cp $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
 	cp $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
 	tar -cJf $(BUNDLE_OUT) -C $(BUNDLE_STAGE) wine native mtld3d.conf INSTALL.md LICENSE
+	# The symbols for exactly these binaries, as a second archive. Laid out by
+	# arch alone, with no wine/native split: debug info has no install route, and
+	# the two d3d9.dll flavors are one binary with one `.pdb`.
+	mkdir -p $(DEBUG_STAGE)/i386-windows
+	mkdir -p $(DEBUG_STAGE)/x86_64-windows
+	mkdir -p $(DEBUG_STAGE)/x86_64-unix
+	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
+	cp $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
+	cp $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
+	cp $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
+	cp $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
+	cp -R $(OUT_unix)/mtld3d.so.dSYM    $(DEBUG_STAGE)/x86_64-unix/
+	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows x86_64-unix
 
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
@@ -212,6 +254,12 @@ clippy:
 	cd windows && cargo clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
 	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64)  --all-targets $(DENY_WARNINGS)
 	cd unix && cargo clippy --all-targets $(DENY_WARNINGS)
+	# `unix/shared` ships into both worlds but is a member of only this
+	# workspace, so the windows legs above build it as a plain path dependency
+	# with no lint table — its `cfg(target_family = "windows")` arms (the PE
+	# image-ID reader) would otherwise be linted by nothing. Lint it on the PE
+	# target that reaches them.
+	cd unix && cargo clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known

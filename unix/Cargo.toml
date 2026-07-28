@@ -83,9 +83,14 @@ panic = "abort"
 lto = "thin"
 # Match windows/Cargo.toml — limited debug info for post-mortem
 # symbolication of mtld3d.so crashes (e.g. NSException stack traces).
-# Function names + line tables + inline frame chain. On Mach-O the
-# debug info goes into the binary itself; the size delta is dev-only
-# disk and never loaded into RAM unless a debugger asks.
+# Function names + line tables + inline frame chain. The bytes do NOT
+# land in the dylib: cargo defaults to `split-debuginfo = "unpacked"`
+# on macOS, so the DWARF stays in the compiler's `.o` files and the
+# dylib carries only a debug map (`OSO` stabs) naming them by absolute
+# path. That map resolves on this machine until the next rebuild and
+# nowhere else, which is why the `unix` make target runs `dsymutil` to
+# gather the DWARF into a shippable `mtld3d.so.dSYM` — the Mach-O
+# counterpart of the side-by-side `.pdb` on MSVC.
 debug = 1
 
 # `release` is our dev/debug profile (the `make` build + e2e run against it),

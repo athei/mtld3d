@@ -10,7 +10,7 @@ use mtld3d_shared::{
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetPrimaryDisplayModeParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
     StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams,
+    WaitForGpuRetireParams, identity,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -34,6 +34,7 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         mtld3d_shared::init_logger();
+        log_identity();
         // Latch the unix-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
         // from `RUST_LOG`. Per-cdylib because each cdylib has its own
         // `log` statics; d3d9.dll latches its own copy in `init_logger`.
@@ -49,6 +50,18 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
         metal::declare_latency_critical_activity();
     });
     STATUS_SUCCESS
+}
+
+/// Name this build in the log, as the first line the unix side emits.
+///
+/// [`identity::BUILD`] says which release the source came from; the image ID is
+/// the Mach-O `LC_UUID` the linker assigned, which names this exact binary and
+/// picks the `.dSYM` that symbolicates it out of the release's debug archive.
+fn log_identity() {
+    let id = identity::image_id();
+    let id = id.as_deref().unwrap_or("no-image-id");
+    let build = identity::BUILD;
+    info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized");
 }
 
 pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {

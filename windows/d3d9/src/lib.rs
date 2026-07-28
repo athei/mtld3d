@@ -34,7 +34,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use mtld3d_shared::InitLoggerParams;
+use mtld3d_shared::{InitLoggerParams, identity};
 // HRESULT codes live in `mtld3d_types` (shared with the integration-test
 // harness); re-exported under the crate root so every in-crate
 // `use super::{D3D_OK, …}` path stays valid.
@@ -143,6 +143,7 @@ pub extern "system" fn direct3d_shader_validator_create9() -> *mut c_void {
 // import of `mtld3d_unix_call` from mtld3d.dll.
 fn init_logger(instance: *mut c_void) {
     mtld3d_shared::init_logger();
+    log_identity(instance);
     // Latch the d3d9-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
     // from `RUST_LOG`. Per-cdylib because each cdylib has its own
     // `log` statics; the unix side latches its own copy in
@@ -157,6 +158,20 @@ fn init_logger(instance: *mut c_void) {
     crash::install(instance);
     let mut params = InitLoggerParams { reserved: 0 };
     unix_call(&mut params);
+}
+
+/// Name this build in the log, as the first line the logger emits.
+///
+/// [`identity::BUILD`] says which release the source came from; the image ID is
+/// the PDB GUID the linker assigned, which names this exact binary and picks
+/// the `.pdb` that symbolicates it out of the release's debug archive.
+fn log_identity(instance: *mut c_void) {
+    // SAFETY: `instance` is the HMODULE the loader passed to `DllMain` during
+    // `DLL_PROCESS_ATTACH`, so this image is mapped in full.
+    let id = unsafe { identity::image_id(instance) };
+    let id = id.as_deref().unwrap_or("no-image-id");
+    let build = identity::BUILD;
+    log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded");
 }
 
 /// Null a COM `**out` parameter before returning a failing HRESULT.

@@ -174,7 +174,7 @@ binaries (typically the same path as `WINE_SDK`).
 make setup              # install cross-compilation toolchain (first time only)
 make                    # build all (windows i386+x64 + unix)
 make install            # install to Wine distribution
-make bundle             # pack a distributable tarball (PROD=1 by default)
+make bundle             # pack the distributable tarball + its debug symbols (PROD=1 by default)
 make test               # build, install, run i386 + x64 test binaries
 make check              # the pre-commit gate: fmt + clippy + audit + doc
 make fmt                # format all workspaces (requires nightly)
@@ -203,6 +203,15 @@ unsigned PEs on the builtin search path). The build outputs themselves stay
 unsigned native PEs so they can also be deployed as a native DLL override;
 `make bundle` packs both flavors into `windows/target/mtld3d.tar.xz`, the
 release bundle described in [`INSTALL.md`](INSTALL.md).
+
+Debug symbols travel with each binary: a `.pdb` beside every PE, and a `.dSYM`
+beside the `.so` (on Mach-O the DWARF otherwise stays behind in the compiler's
+object files, so `make` runs `dsymutil` to gather it). `make install` copies
+both, and `make bundle` writes a second archive,
+`windows/target/mtld3d-debug.tar.xz`, holding the symbols for exactly that
+bundle. Every DLL logs its release and its linker-assigned image ID on load, so
+a crash report from a release build names the debug archive that symbolicates
+it.
 
 ## Architecture
 
