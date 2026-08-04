@@ -25,11 +25,11 @@ use mtld3d_shared::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLCullMode, MTLDepthClipMode, MTLDevice, MTLIndexType, MTLLoadAction,
-    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
-    MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture,
-    MTLViewport, MTLVisibilityResultMode,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDepthClipMode, MTLDevice, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize,
+    MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -368,13 +368,29 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 }
             };
             if !presented {
-                encode_present_blit(
-                    &cmd_buf,
-                    &present_texture,
-                    &drawable_texture,
-                    route,
-                    params.present_texture.raw(),
-                );
+                if hdr {
+                    // No blit fallback on the HDR layer: a `copyFromTexture`
+                    // from the BGRA8 backbuffer into an RGBA16Float drawable
+                    // is invalid API use, so Metal kills the command buffer
+                    // and the drawable is presented with nothing written,
+                    // which reads as magenta noise. A defined black frame is
+                    // the only correct fallback here.
+                    mtld3d_shared::log_once_warn!(
+                        target: LOG_TARGET,
+                        "present: HDR present pass failed to encode {}x{} → {}x{}; \
+                         presenting a cleared drawable instead",
+                        geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
+                    );
+                    clear_drawable(&cmd_buf, &drawable_texture);
+                } else {
+                    encode_present_blit(
+                        &cmd_buf,
+                        &present_texture,
+                        &drawable_texture,
+                        route,
+                        params.present_texture.raw(),
+                    );
+                }
             }
 
             mtld3d_shared::crumb!("submit:present", params.drawable_wait_tsc);
@@ -407,7 +423,38 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = params.submit_seq;
         let handler = RcBlock::new(
-            move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                // Tripwire: a command buffer the GPU rejected discards every
+                // encode it carried, but a queued `presentDrawable` still
+                // fires, so the drawable reaches the screen with undefined
+                // contents (magenta on the RGBA16Float HDR layer). There is
+                // no way to un-queue the present at this point; what this
+                // buys is that the otherwise silent one-frame flash leaves a
+                // log line naming the actual GPU error. Keyed per error code
+                // so distinct failure kinds each surface once.
+                //
+                // SAFETY: Metal invokes the block with the completed command
+                // buffer; the pointer is valid for the handler's duration.
+                let cb = unsafe { cb_ptr.as_ref() };
+                if cb.status() == MTLCommandBufferStatus::Error {
+                    mtld3d_shared::crumb!("submit:cberr", seq);
+                    let (code, desc) = cb.error().map_or_else(
+                        || (0, String::new()),
+                        |e| {
+                            (
+                                e.code().unsigned_abs() as u64,
+                                e.localizedDescription().to_string(),
+                            )
+                        },
+                    );
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: code,
+                        "submit_frame: command buffer for frame seq={seq} failed on the GPU \
+                         (code {code}: {desc}); its rendering was discarded, so a queued \
+                         present showed undefined memory",
+                    );
+                }
                 // SAFETY: the PE side allocated an `Arc<AtomicU64>` and
                 // passed its pointer. The Arc is kept alive for the
                 // device's lifetime, and all command buffers that reference
@@ -603,6 +650,11 @@ const fn present_route(
 }
 
 /// The 1:1 present blit, and the last resort when a shader route failed to encode.
+///
+/// SDR only: the drawable and the backbuffer are both `BGRA8Unorm`, so the
+/// copy is well-formed. On the HDR layer the caller clears the drawable
+/// instead, because a cross-format `copyFromTexture` into `RGBA16Float` is
+/// invalid API use that kills the command buffer.
 ///
 /// The copy extent is clamped to the smaller texture in each axis. On the
 /// `Copy` route that changes nothing (the extents are equal); on any other
