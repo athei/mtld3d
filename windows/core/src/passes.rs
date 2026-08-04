@@ -1686,9 +1686,12 @@ impl PassState {
         // `Clear(NULL, white)` then `Clear(rects, red)` yields white
         // everywhere outside the rects. `ensure_pass_open` turns that pending
         // clear into `loadAction = Clear`; keep it so the whole RT clears
-        // first, then the rect quads overwrite the rects. Only when there is NO
-        // pending clear (the RT already holds drawn/loaded content to preserve)
-        // do we rewrite a `Clear` load to `Load`.
+        // first, then the rect quads overwrite the rects. Only when there is
+        // NO pending clear must the freshly opened pass load as `Load`: the
+        // rect quads write only the rects, so every other pixel shows the
+        // load action's result. That covers Rule A's first-use `DontCare` too
+        // — a region clear as the frame's first touch of the attachment
+        // otherwise presents undefined tile memory outside the rects.
         //
         // Crucially, only touch the load action when WE freshly opened the pass.
         // If a pass is already open — e.g. a sequence of region clears in one
@@ -1702,7 +1705,10 @@ impl PassState {
         if was_closed
             && !had_pending_clear
             && let Some(pass) = self.passes.last_mut()
-            && matches!(pass.color_load, ColorLoad::Clear { .. })
+            && matches!(
+                pass.color_load,
+                ColorLoad::Clear { .. } | ColorLoad::DontCare
+            )
         {
             pass.color_load = ColorLoad::Load;
         }
@@ -3414,6 +3420,31 @@ mod tests {
         assert_eq!(s.passes()[1].color_load(), ColorLoad::DontCare);
         // depth() is seen-already (pass A used it), so Load this time.
         assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    }
+
+    #[test]
+    fn region_clear_as_first_touch_loads_instead_of_dontcare() {
+        // A `Clear(pRects)` opening the frame's first backbuffer pass:
+        // the rect quads cover only the rects, so the pass must open with
+        // `Load`, not Rule A's first-use `DontCare` — `DontCare` would
+        // present undefined tile memory outside the rects.
+        let mut s = fresh();
+        s.begin_region_color_clear();
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+    }
+
+    #[test]
+    fn region_clear_after_pending_full_clear_keeps_the_clear() {
+        // `Clear(NULL, white)` then `Clear(rects, red)`: the pending
+        // whole-RT clear must land under the rect quads, per the D3D9
+        // spec (white everywhere outside the rects).
+        let mut s = fresh();
+        s.clear_color(10, 20, 30, 40);
+        s.begin_region_color_clear();
+        assert!(matches!(
+            s.passes()[0].color_load(),
+            ColorLoad::Clear { .. }
+        ));
     }
 
     #[test]
