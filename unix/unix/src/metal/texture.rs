@@ -4,20 +4,32 @@ use mtld3d_shared::{
         BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StorageMode, Swizzle,
         TextureUsage,
     },
-    mtl_handle::{MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
+    mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLBlendFactor, MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLPixelFormat,
-    MTLResource, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle,
-    MTLTextureSwizzleChannels, MTLTextureUsage,
+    MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat,
+    MTLRenderPassDescriptor, MTLResource, MTLStorageMode, MTLStoreAction, MTLTexture,
+    MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureUsage,
 };
 
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
 
 /// Creates a persistent `BGRA8Unorm` render target texture for use as a backbuffer.
+///
+/// The new texture is cleared to opaque black before it is returned. A
+/// fresh `MTLTexture` has undefined contents, and the back buffer is
+/// presentable before the application's first draw or clear reaches it
+/// (a `Present` with no rendering is legal D3D9, and routine right after
+/// a `Reset`). D3D9 leaves post-`Reset` contents formally undefined, but
+/// real drivers hand out zeroed surfaces, and applications visibly rely
+/// on that during scene transitions. The clear is encoded on the frame
+/// queue, so commit order is the fence: every later frame command buffer
+/// observes a black back buffer, with no CPU wait.
 pub fn create_backbuffer(
     device_handle: MetalHandle<MTLDeviceKind>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
     width: u32,
     height: u32,
 ) -> Option<MetalHandle<MTLTextureKind>> {
@@ -47,9 +59,58 @@ pub fn create_backbuffer(
     let texture = device.newTextureWithDescriptor(&desc)?;
     let label = objc2_foundation::NSString::from_str("mtld3d-backbuffer");
     texture.setLabel(Some(&label));
+    clear_texture_black(queue_handle, &texture);
     // SAFETY: `Retained::into_raw` transfers the retain into a raw
     // pointer; `MetalHandle::new` adopts it as the canonical retain.
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
+}
+
+/// Clear a freshly created render target to opaque black.
+///
+/// One empty render pass with `LoadAction::Clear` in its own command
+/// buffer. Runs on the creation paths only (device create, `Reset`,
+/// auto-resize), so cost is irrelevant. Failure to encode leaves the
+/// texture with undefined contents, which is what creation produced
+/// anyway, so it is logged and tolerated rather than failing creation.
+fn clear_texture_black(
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+) {
+    let Some(queue) = queue_handle.into_retained() else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "create_backbuffer: no queue for the creation-time clear; \
+             the new backbuffer starts with undefined contents",
+        );
+        return;
+    };
+    let Some(cmd_buf) = queue.commandBuffer() else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "create_backbuffer: commandBuffer() returned nil for the creation-time \
+             clear; the new backbuffer starts with undefined contents",
+        );
+        return;
+    };
+    let pass_desc = MTLRenderPassDescriptor::new();
+    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+    // subscript 0 is always valid.
+    let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+    color0.setTexture(Some(texture));
+    color0.setLoadAction(MTLLoadAction::Clear);
+    color0.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 1.0,
+    });
+    color0.setStoreAction(MTLStoreAction::Store);
+    if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
+        let label = objc2_foundation::NSString::from_str("mtld3d-backbuffer-init-clear");
+        enc.setLabel(Some(&label));
+        enc.endEncoding();
+    }
+    cmd_buf.commit();
 }
 
 /// Creates a standalone depth/stencil texture for `CreateDepthStencilSurface`.

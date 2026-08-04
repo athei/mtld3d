@@ -300,6 +300,34 @@ fn reset_clears_scene_state() {
 }
 
 #[test]
+fn present_after_resize_reset_without_drawing_reads_black() {
+    let h = Harness::new();
+
+    // Fill the current backbuffer with a loud colour and present it, so the
+    // device heap holds recycled non-zero memory when the Reset below
+    // recreates the backbuffer.
+    h.render_once(0xFFFF_00FF, |_| {});
+
+    // A resized Reset destroys the old backbuffer and creates a fresh
+    // texture; presenting before any draw or clear publishes it as-is (a
+    // scene transition routinely does exactly this). The creation-time
+    // clear must make that frame opaque black, not whatever memory the
+    // allocation recycled. Note the failure is only guaranteed to
+    // reproduce when the heap actually recycles dirty pages, hence the
+    // magenta frame above.
+    assert_eq!(h.reset(512, 384), 0, "resize Reset must succeed");
+    assert_eq!(h.present(), 0, "Present with no draws must succeed");
+
+    for (x, y) in [(0, 0), (511, 0), (0, 383), (511, 383), (256, 192)] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            0xFF00_0000,
+            &format!("undrawn post-Reset backbuffer at ({x},{y})"),
+        );
+    }
+}
+
+#[test]
 fn reset_resize_grows_backbuffer() {
     let h = Harness::new();
     assert_eq!(h.reset(800, 600), 0, "resize Reset must succeed");

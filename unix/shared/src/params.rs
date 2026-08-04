@@ -41,7 +41,7 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 64);
-    assert!(core::mem::size_of::<CreateBackbufferParams>() == 24);
+    assert!(core::mem::size_of::<CreateBackbufferParams>() == 32);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 96);
     assert!(core::mem::size_of::<PassDescriptor>() == 88);
@@ -260,9 +260,16 @@ impl Thunk for DestroyCommandQueueParams {
 
 #[repr(C, align(8))]
 pub struct CreateBackbufferParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>,   // in
-    pub width: u32,                                  // in
-    pub height: u32,                                 // in
+    pub device_handle: MetalHandle<MTLDeviceKind>, // in
+    /// Frame queue the creation-time clear is encoded on.
+    ///
+    /// A new `MTLTexture` has undefined contents, and the back buffer is
+    /// presentable before the application's first draw or clear reaches it.
+    /// Encoding the clear on the frame queue makes commit order the fence:
+    /// every later frame command buffer observes a black back buffer.
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub width: u32,                                // in
+    pub height: u32,                               // in
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 

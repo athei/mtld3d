@@ -1900,6 +1900,7 @@ impl DeviceInner {
 
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
+            queue_handle: self.queue_handle,
             width: self.render_scale.dimension(new_width),
             height: self.render_scale.dimension(new_height),
             texture_handle: MetalHandle::NULL,
@@ -3181,6 +3182,7 @@ fn reset_recreate_resources(
     //    view, and present resolves whatever difference remains.
     let mut bb_params = mtld3d_shared::CreateBackbufferParams {
         device_handle: dev.device_handle,
+        queue_handle: dev.queue_handle,
         width: dev.render_scale.dimension(pp.back_buffer_width),
         height: dev.render_scale.dimension(pp.back_buffer_height),
         texture_handle: MetalHandle::NULL,

@@ -916,6 +916,7 @@ extern "system" fn d3d9_create_device(
     // Create backbuffer texture
     let mut bb_params = CreateBackbufferParams {
         device_handle: cq_params.device_handle,
+        queue_handle: cq_params.queue_handle,
         width: render_width,
         height: render_height,
         texture_handle: MetalHandle::NULL,

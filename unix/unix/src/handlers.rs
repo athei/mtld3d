@@ -237,9 +237,12 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateBackbufferParams = &mut params;
 
-    if let Some(handle) =
-        metal::create_backbuffer(params.device_handle, params.width, params.height)
-    {
+    if let Some(handle) = metal::create_backbuffer(
+        params.device_handle,
+        params.queue_handle,
+        params.width,
+        params.height,
+    ) {
         params.texture_handle = handle;
         // debug, not info — fires per-frame during a Reset-driven
         // window drag. The CreateDevice + AttachMetalLayer info
