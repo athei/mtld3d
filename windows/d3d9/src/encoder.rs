@@ -30,7 +30,7 @@ use mtld3d_core::{
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
-        PairShaderId, PairStatsSample,
+        PairShaderId, PairStatsSample, TaskFaults, perf_enabled,
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
     render_scale::RenderScale,
@@ -47,9 +47,9 @@ use mtld3d_shared::{
     BlitCommand, BufferCreateDesc, Command, CommandType, CompileShaderLibraryParams,
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
     CreateDepthStencilStateParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, MetalHandle, PassDescriptor,
-    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle,
+    PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
         StorageMode, StoreAction, Swizzle, TextureUsage, VisibilityResultMode,
@@ -1701,8 +1701,27 @@ impl FrameEncoder {
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
         let caches = self.cache_sizes(&payload.scratch);
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
-        self.perf
-            .log_frame_summary(&caches, &payload.passes, ctx, status, cmd_vec_realloc_bytes);
+        // One getrusage unix_call per 5 s window, only when the summary is
+        // both enabled and about to emit; every other frame passes None.
+        let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
+            let mut p = GetTaskFaultsParams {
+                minor_faults: 0,
+                major_faults: 0,
+            };
+            let _ = unix_call(&mut p);
+            TaskFaults {
+                minor: p.minor_faults,
+                major: p.major_faults,
+            }
+        });
+        self.perf.log_frame_summary(
+            &caches,
+            &payload.passes,
+            ctx,
+            status,
+            cmd_vec_realloc_bytes,
+            task_faults,
+        );
     }
 
     /// Cache-length snapshot handed to `EncoderPerfState::log_frame_summary`.

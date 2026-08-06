@@ -8,9 +8,9 @@ use mtld3d_shared::{
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
-    GetPrimaryDisplayModeParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams, identity,
+    GetPrimaryDisplayModeParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle,
+    SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, WaitForGpuRetireParams, identity,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -210,6 +210,32 @@ pub extern "C" fn get_primary_display_mode_handler(args: *mut c_void) -> i32 {
     params.width = w;
     params.height = h;
     params.refresh_hz = hz;
+    STATUS_SUCCESS
+}
+
+/// Report the process-wide page-fault counters from `getrusage`.
+///
+/// One cheap libc call; the PE side gates it to once per perf summary
+/// window. `ru_minflt` / `ru_majflt` are cumulative since process start,
+/// so the caller deltas consecutive samples.
+pub extern "C" fn get_task_faults_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut GetTaskFaultsParams.
+    let Some(mut params) = (unsafe { InPtrMut::<GetTaskFaultsParams>::opt(args) }) else {
+        return -1;
+    };
+    // SAFETY: `rusage` is plain old data; all-zero is a valid initial value
+    // for an out-parameter the kernel overwrites.
+    let mut usage: libc::rusage = unsafe { core::mem::zeroed() };
+    // SAFETY: `usage` is a live, writable rusage and RUSAGE_SELF is a valid
+    // `who` selector.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
+    if rc != 0 {
+        return STATUS_UNSUCCESSFUL;
+    }
+    // c_long on macOS is i64; a negative count never occurs, but saturate
+    // to 0 rather than wrap if the kernel ever reports one.
+    params.minor_faults = u64::try_from(usage.ru_minflt).unwrap_or(0);
+    params.major_faults = u64::try_from(usage.ru_majflt).unwrap_or(0);
     STATUS_SUCCESS
 }
 

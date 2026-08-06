@@ -244,6 +244,23 @@ impl Thunk for GetPrimaryDisplayModeParams {
     const CODE: u32 = Thunks::GetPrimaryDisplayMode as u32;
 }
 
+/// Read the process-wide page-fault counters via `getrusage(RUSAGE_SELF)`.
+///
+/// Sampled by the encoder thread once per perf summary window (PERF=1
+/// builds only) so the summary can report a fault-rate delta. Minor
+/// faults are the first-touch zero-fill signal the PageBox churn
+/// investigation watches; major faults ride along for free. Process-wide:
+/// every thread's faults land in the same counters.
+#[repr(C, align(8))]
+pub struct GetTaskFaultsParams {
+    pub minor_faults: u64, // out: cumulative ru_minflt since process start
+    pub major_faults: u64, // out: cumulative ru_majflt since process start
+}
+
+impl Thunk for GetTaskFaultsParams {
+    const CODE: u32 = Thunks::GetTaskFaults as u32;
+}
+
 #[repr(C, align(8))]
 pub struct DestroyCommandQueueParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in

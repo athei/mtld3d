@@ -28,9 +28,9 @@ pub use params::{
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
-    GetPrimaryDisplayModeParams, InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    GetPrimaryDisplayModeParams, GetTaskFaultsParams, InitLoggerParams, PassDescriptor,
+    SetDisplaySyncEnabledParams, StartGpuCaptureParams, StopGpuCaptureParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
 };
 
 #[repr(u32)]
@@ -60,6 +60,7 @@ pub enum Thunks {
     GetPrimaryDisplayMode,
     EnsureClearQuadPipeline,
     EnsureBlitPipeline,
+    GetTaskFaults,
 }
 
 pub trait Thunk {

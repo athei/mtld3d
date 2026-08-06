@@ -1429,6 +1429,17 @@ pub struct CacheSizes {
     pub pending_resource_retention_depth: usize,
 }
 
+/// Absolute process-wide page-fault counts sampled at window close.
+///
+/// The encoder thread fills this from the `GetTaskFaults` unix_call
+/// (`getrusage(RUSAGE_SELF)`, cumulative since process start) when
+/// `window_due()` says the 5 s summary window has expired;
+/// `log_frame_summary` deltas consecutive samples into the `faults` row.
+pub struct TaskFaults {
+    pub minor: u64,
+    pub major: u64,
+}
+
 /// Frame-identity bits needed by `log_frame_summary` for the trace-level per-pass dump.
 ///
 /// The handles are compared against each pass's color/depth attachments to
@@ -1495,6 +1506,10 @@ pub struct EncoderPerfState {
     /// atomics in `page_box.rs` into per-frame values for the window. An
     /// all-zero snapshot means "no baseline yet" and reports a zero frame.
     prev_pagebox_volume: PageBoxVolume,
+    /// Cumulative `ru_minflt` at the previous window close (0 = no baseline).
+    prev_minor_faults: u64,
+    /// Cumulative `ru_majflt` at the previous window close (0 = no baseline).
+    prev_major_faults: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -1517,7 +1532,22 @@ impl EncoderPerfState {
             vbib_retained_bytes: 0,
             tex_staging_retained_bytes: 0,
             prev_pagebox_volume: PageBoxVolume::new(),
+            prev_minor_faults: 0,
+            prev_major_faults: 0,
         }
+    }
+
+    /// True when the 5 s summary window has expired and the next `log_frame_summary` will emit.
+    ///
+    /// Mirrors the expiry check inside `log_frame_summary` so the encoder
+    /// can gather once-per-window data (the `GetTaskFaults` unix_call)
+    /// only when it is about to be consumed. False until the window has
+    /// accumulated its first frame.
+    #[must_use]
+    pub fn window_due(&self) -> bool {
+        self.perf_window.started_tsc != 0
+            && rdtsc().saturating_sub(self.perf_window.started_tsc)
+                >= secs_to_cycles(SUMMARY_INTERVAL_SECS)
     }
 
     /// Seed per-frame encoder counters from the incoming payload.
@@ -1710,6 +1740,7 @@ impl EncoderPerfState {
         ctx: &FrameSummaryContext,
         submit_status: i32,
         cmd_vec_realloc_bytes: u64,
+        task_faults: Option<TaskFaults>,
     ) {
         // `mtld3d::perf=debug` gates both the averaged summary and the
         // per-call ApiTimer / CycleSet / CycleAdd cycle accounting —
@@ -1800,6 +1831,20 @@ impl EncoderPerfState {
         let window_cycles = rdtsc().saturating_sub(self.perf_window.started_tsc);
         if window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
             return;
+        }
+
+        // Fold the once-per-window fault sample into the window before
+        // render. Absolute counts delta against the previous window close;
+        // the first sample has no baseline and reports 0.
+        if let Some(faults) = task_faults {
+            if self.prev_minor_faults != 0 {
+                self.perf_window.minor_faults_window =
+                    faults.minor.saturating_sub(self.prev_minor_faults);
+                self.perf_window.major_faults_window =
+                    faults.major.saturating_sub(self.prev_major_faults);
+            }
+            self.prev_minor_faults = faults.minor;
+            self.prev_major_faults = faults.major;
         }
 
         if want_stats {
@@ -1982,7 +2027,14 @@ impl EncoderPerfState {
         _ctx: &FrameSummaryContext,
         _submit_status: i32,
         _cmd_vec_realloc_bytes: u64,
+        _task_faults: Option<TaskFaults>,
     ) {
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn window_due(&self) -> bool {
+        false
     }
 }
 
@@ -2266,6 +2318,14 @@ struct PerfWindow {
     encode_commit: Stat,
     /// Peak only: `vb_rename + ib_rename` on any single frame.
     vbib_rename: Stat,
+    /// Process-wide minor-fault delta for this window (set at emit, not accumulated).
+    ///
+    /// Written by `log_frame_summary` from the once-per-window
+    /// [`TaskFaults`] sample just before render; stays 0 when no sample
+    /// arrived (perf disabled, first window, or the pre-sample race).
+    minor_faults_window: u64,
+    /// Major-fault twin of `minor_faults_window`.
+    major_faults_window: u64,
     last_submit_status: i32,
 }
 
@@ -4102,6 +4162,21 @@ impl<'a> Summary<'a> {
             Some(&format!("free={fr}  {pb_free_fmt}", fr = w.pagebox_frees.sum)),
             "window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
         );
+        // Process-wide fault delta, sampled once per window via the
+        // GetTaskFaults unix_call. High minflt tracking the rename byte
+        // volume (not the scene) is the cold-first-touch churn signature.
+        let minflt_per_frame = u64_to_f64_exact(w.minor_faults_window) / f;
+        self.res_row(
+            out,
+            "faults",
+            &format!(
+                "minflt={mn}  majflt={mj}",
+                mn = w.minor_faults_window,
+                mj = w.major_faults_window,
+            ),
+            Some(&format!("{minflt_per_frame:.1} min/frame")),
+            "process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
+        );
     }
 }
 
@@ -4447,7 +4522,8 @@ mod tests {
             "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
             "  size      64 KB avg               peak 64 KB                  pool-resident Vec<Command> capacity across frames (recycled, not freed)\n",
             "  realloc   192 KB avg              peak 192 KB                 Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)\n",
-            "pagebox     alloc=16  768 KB        free=14  640 KB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
+            "pagebox     alloc=16  768 KB        free=14  640 KB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)\n",
+            "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
         );
         assert_eq!(got, want, "perf summary drifted — diff above");
     }
@@ -4682,6 +4758,10 @@ mod tests {
             submit_status: 0,
         };
         w.accumulate(&s);
+        // Emit-time fields (not part of accumulate): the once-per-window
+        // fault sample delta, as `log_frame_summary` would set it.
+        w.minor_faults_window = 4200;
+        w.major_faults_window = 3;
         w
     }
 
