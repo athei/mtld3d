@@ -1001,7 +1001,7 @@ impl ApiPerfState {
     ///
     /// Peer of `draw_snapshot_stages_cycles_ptr` under the parent
     /// `snapshot` total. Selected at draw-classification time alongside
-    /// its programmable sibling [`draw_snapshot_c_pr_cycles_ptr`].
+    /// its programmable sibling [`Self::draw_snapshot_c_pr_cycles_ptr`].
     pub const fn draw_snapshot_c_ff_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.counters.draw_snapshot_c_ff_cycles
     }
@@ -1009,7 +1009,7 @@ impl ApiPerfState {
     /// Pointer the `CycleAddTimer` writes into for the const-snapshot block.
     ///
     /// Selected when both VS and PS are programmable. Peer of
-    /// [`draw_snapshot_c_ff_cycles_ptr`].
+    /// [`Self::draw_snapshot_c_ff_cycles_ptr`].
     pub const fn draw_snapshot_c_pr_cycles_ptr(&mut self) -> *mut u64 {
         &raw mut self.counters.draw_snapshot_c_pr_cycles
     }
@@ -1494,7 +1494,7 @@ pub struct FrameSummaryContext {
 /// Under `cfg(not(perf_tracking))` this collapses to a unit struct; all
 /// methods (`begin_frame`, `set_*`, `*_cycles_ptr`, `bump_*`,
 /// `bump_pair_stats`, `log_frame_summary`) become `const fn` no-ops or
-/// return `null_mut()`. Together with the [`PerfWindow`] / [`Summary`]
+/// return `null_mut()`. Together with the `PerfWindow` / `Summary`
 /// items below it (also cfg-gated) the entire 5-second summary pipeline
 /// is compile-time-elided.
 #[cfg(perf_tracking)]
@@ -1578,7 +1578,7 @@ impl EncoderPerfState {
     /// True when the 5 s summary window has expired and the next `log_frame_summary` will emit.
     ///
     /// Mirrors the expiry check inside `log_frame_summary` so the encoder
-    /// can gather once-per-window data (the `GetTaskFaults` unix_call)
+    /// can gather once-per-window data (the `GetTaskFaults` `unix_call`)
     /// only when it is about to be consumed. False until the window has
     /// accumulated its first frame.
     #[must_use]
