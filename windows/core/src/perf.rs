@@ -534,6 +534,14 @@ struct FrameCounters {
     /// actually served. The byte volume is what decides whether rename
     /// churn can drive allocator page-return oscillation.
     vbib_rename_bytes: u64,
+    /// Lock-rename allocs served warm from the `PageBox` recycle pool.
+    ///
+    /// A hit allocates nothing; with `vbib_pool_misses` this renders the
+    /// pool row's hit rate. Both stay 0 while the pool is disabled
+    /// (`memory.pageboxPoolCapMB = 0`).
+    vbib_pool_hits: u32,
+    /// Pool-enabled Lock-rename allocs that fell through to the allocator.
+    vbib_pool_misses: u32,
     /// Subset of `vb_rename` / `ib_rename` that took the no-preserve branch.
     ///
     /// Either explicit `D3DLOCK_DISCARD`, or whole-buffer
@@ -692,6 +700,8 @@ impl FrameCounters {
             vb_rename: 0,
             ib_rename: 0,
             vbib_rename_bytes: 0,
+            vbib_pool_hits: 0,
+            vbib_pool_misses: 0,
             vb_discards: 0,
             ib_discards: 0,
             vbib_preserve_cpu: 0,
@@ -856,6 +866,14 @@ struct EncoderFrameCounters {
     /// submit thread to return a payload. Part of the encoder thread's
     /// wall time but NOT encoder CPU.
     submit_stall_cycles: u64,
+    /// Retired VB/IB `PageBox`es the retention drain parked in the recycle pool.
+    ///
+    /// Counts accepted parks only; rejects (pool off, oversize, cap)
+    /// drop to the allocator and show up in the `pagebox` free cell
+    /// instead.
+    pagebox_pool_recycled: u32,
+    /// Padded bytes behind `pagebox_pool_recycled`.
+    pagebox_pool_recycled_bytes: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -885,6 +903,8 @@ impl EncoderFrameCounters {
             drawable_wait_cycles: 0,
             submit_exec_cycles: 0,
             submit_stall_cycles: 0,
+            pagebox_pool_recycled: 0,
+            pagebox_pool_recycled_bytes: 0,
         }
     }
 }
@@ -1094,6 +1114,14 @@ impl ApiPerfState {
             self.counters.vbib_rename_bytes.saturating_add(bytes as u64);
     }
 
+    pub const fn bump_vbib_pool_hit(&mut self) {
+        self.counters.vbib_pool_hits = self.counters.vbib_pool_hits.saturating_add(1);
+    }
+
+    pub const fn bump_vbib_pool_miss(&mut self) {
+        self.counters.vbib_pool_misses = self.counters.vbib_pool_misses.saturating_add(1);
+    }
+
     /// Whole-buffer non-WRITEONLY contended Lock.
     ///
     /// Fresh `PageBox` + inline `memcpy` from the old box (game might
@@ -1247,6 +1275,10 @@ impl ApiPerfState {
     pub const fn bump_ib_rename(&mut self) {}
     #[inline]
     pub const fn bump_vbib_rename_bytes(&mut self, _bytes: usize) {}
+    #[inline]
+    pub const fn bump_vbib_pool_hit(&mut self) {}
+    #[inline]
+    pub const fn bump_vbib_pool_miss(&mut self) {}
     #[inline]
     pub const fn bump_vbib_preserve_cpu(&mut self) {}
     #[inline]
@@ -1427,11 +1459,17 @@ pub struct CacheSizes {
     pub cmd_vec_capacity_bytes: u64,
     pub pending_blit_retention_depth: usize,
     pub pending_resource_retention_depth: usize,
+    /// Padded bytes parked in the `PageBox` recycle pool at frame end.
+    ///
+    /// Sourced from `PageBoxPool::pooled_bytes()`; 0 whenever the pool is
+    /// disabled. Distinct from `vbib_retained_bytes` (awaiting GPU
+    /// retire): parked boxes are already retired and waiting for reuse.
+    pub pagebox_pool_bytes: u64,
 }
 
 /// Absolute process-wide page-fault counts sampled at window close.
 ///
-/// The encoder thread fills this from the `GetTaskFaults` unix_call
+/// The encoder thread fills this from the `GetTaskFaults` `unix_call`
 /// (`getrusage(RUSAGE_SELF)`, cumulative since process start) when
 /// `window_due()` says the 5 s summary window has expired;
 /// `log_frame_summary` deltas consecutive samples into the `faults` row.
@@ -1674,6 +1712,18 @@ impl EncoderPerfState {
         self.enc.texture_destroys = self.enc.texture_destroys.saturating_add(1);
     }
 
+    /// Count one retired `PageBox` the retention drain parked in the recycle pool.
+    ///
+    /// `bytes` is the padded length; feeds the pool row's `recycled`
+    /// cells.
+    pub const fn bump_pagebox_pool_recycled(&mut self, bytes: usize) {
+        self.enc.pagebox_pool_recycled = self.enc.pagebox_pool_recycled.saturating_add(1);
+        self.enc.pagebox_pool_recycled_bytes = self
+            .enc
+            .pagebox_pool_recycled_bytes
+            .saturating_add(bytes as u64);
+    }
+
     /// Bumped once per successful `run_texture_upload_blit` invocation.
     ///
     /// Successful means it emits a `copy_buffer_to_texture` command.
@@ -1819,6 +1869,7 @@ impl EncoderPerfState {
             pagebox_alloc_bytes: pagebox_frame.alloc_bytes,
             pagebox_frees: pagebox_frame.frees,
             pagebox_free_bytes: pagebox_frame.free_bytes,
+            pagebox_pool_bytes: caches.pagebox_pool_bytes,
             // Derived this frame from the counters above.
             outside_d3d9,
             api_cyc: api_total,
@@ -2012,6 +2063,8 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_texture_destroy(&mut self) {}
     #[inline]
+    pub const fn bump_pagebox_pool_recycled(&mut self, _bytes: usize) {}
+    #[inline]
     pub const fn bump_texture_blit_upload(&mut self) {}
     #[inline]
     pub const fn bump_texture_blit_padded_upload(&mut self) {}
@@ -2101,6 +2154,8 @@ struct FrameSample {
     /// This frame's `PageBox` frees returning to the global allocator.
     pagebox_frees: u64,
     pagebox_free_bytes: u64,
+    /// Padded bytes parked in the recycle pool at frame end (from `CacheSizes`).
+    pagebox_pool_bytes: u64,
 
     // ── Derived this frame from the counters above ──
     /// `frame_total − Σ api_cycles_by_category`.
@@ -2243,6 +2298,9 @@ struct PerfWindow {
     ib_rename: Stat,
     /// Padded fresh-`PageBox` bytes behind the renames (sum + per-frame peak).
     vbib_rename_bytes: Stat,
+    /// Recycle-pool hits / misses on the Lock-rename alloc path (sums only).
+    vbib_pool_hits: Stat,
+    vbib_pool_misses: Stat,
     vb_discards: Stat,
     ib_discards: Stat,
     vbib_preserve_cpu: Stat,
@@ -2301,6 +2359,11 @@ struct PerfWindow {
     /// `PageBox` frees returning to the global allocator (count sum + peak).
     pagebox_frees: Stat,
     pagebox_free_bytes: Stat,
+    /// Retired boxes parked in the recycle pool (count sum + byte sum).
+    pagebox_pool_recycled: Stat,
+    pagebox_pool_recycled_bytes: Stat,
+    /// Parked pool bytes at frame end: averaged over frames, plus peak.
+    pagebox_pool_bytes: Stat,
     /// Peak only: `device_sub_by[Frame] − present_block`, the non-stall Frame sub-bucket.
     ///
     /// Present body, `Clear`, `Begin/EndScene`, `ColorFill`.
@@ -2417,6 +2480,10 @@ impl PerfWindow {
         self.vb_rename.add(u64::from(s.counters.vb_rename));
         self.ib_rename.add(u64::from(s.counters.ib_rename));
         self.vbib_rename_bytes.add(s.counters.vbib_rename_bytes);
+        self.vbib_pool_hits
+            .add(u64::from(s.counters.vbib_pool_hits));
+        self.vbib_pool_misses
+            .add(u64::from(s.counters.vbib_pool_misses));
         self.vb_discards.add(u64::from(s.counters.vb_discards));
         self.ib_discards.add(u64::from(s.counters.ib_discards));
         self.vbib_preserve_cpu
@@ -2461,6 +2528,11 @@ impl PerfWindow {
         self.pagebox_alloc_bytes.add(s.pagebox_alloc_bytes);
         self.pagebox_frees.add(s.pagebox_frees);
         self.pagebox_free_bytes.add(s.pagebox_free_bytes);
+        self.pagebox_pool_recycled
+            .add(u64::from(s.enc.pagebox_pool_recycled));
+        self.pagebox_pool_recycled_bytes
+            .add(s.enc.pagebox_pool_recycled_bytes);
+        self.pagebox_pool_bytes.add(s.pagebox_pool_bytes);
 
         // Derived peaks (no window sum): each is a per-frame quantity, so
         // peak-of-difference ≠ difference-of-peaks — compute per frame.
@@ -3792,6 +3864,38 @@ impl<'a> Summary<'a> {
             )),
             "encoder: shared PageBox queue (VB/IB renames + texture-blit padded staging + visibility pool)",
         );
+        // Recycle-pool effectiveness. All-zero rows mean the pool is off
+        // (memory.pageboxPoolCapMB = 0), the A/B baseline arm.
+        let pool_hits = w.vbib_pool_hits.sum;
+        let pool_misses = w.vbib_pool_misses.sum;
+        let pool_lookups = pool_hits + pool_misses;
+        let pool_hit_pct = if pool_lookups > 0 {
+            u64_to_f64_exact(pool_hits) / u64_to_f64_exact(pool_lookups) * 100.0
+        } else {
+            0.0
+        };
+        let recycled_kb = u64_to_f64_exact(w.pagebox_pool_recycled_bytes.sum) / 1024.0;
+        let (recycled_fmt, _) = format_kb_pair(recycled_kb, recycled_kb);
+        self.res_row(
+            out,
+            "pool",
+            &format!("hit={pool_hits} miss={pool_misses} ({pool_hit_pct:.1}%)"),
+            Some(&format!(
+                "recycled={r}  {recycled_fmt}",
+                r = w.pagebox_pool_recycled.sum,
+            )),
+            "API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)",
+        );
+        let parked_avg_kb = u64_to_f64_exact(w.pagebox_pool_bytes.sum) / f / 1024.0;
+        let parked_peak_kb = u64_to_f64_exact(w.pagebox_pool_bytes.max) / 1024.0;
+        let (parked_avg_fmt, parked_peak_fmt) = format_kb_pair(parked_avg_kb, parked_peak_kb);
+        self.res_row(
+            out,
+            "  parked",
+            &format!("{parked_avg_fmt} avg"),
+            Some(&format!("peak {parked_peak_fmt}")),
+            "bytes held in the pool for reuse (already retired; excluded from retention above)",
+        );
     }
 
     fn write_resources_textures(&self, out: &mut String) {
@@ -4208,6 +4312,7 @@ mod tests {
             pagebox_alloc_bytes: 0,
             pagebox_frees: 0,
             pagebox_free_bytes: 0,
+            pagebox_pool_bytes: 0,
             outside_d3d9: 0,
             api_cyc: 0,
             api_work: 0,
@@ -4482,6 +4587,8 @@ mod tests {
             "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
             "alloc rcv   drain=2 submit=1        peak/frame submit=1         API: VB/IB retention recovery — proactive cap + alloc-fail (drain=cheap, submit=GPU wait)\n",
             "retention   depth= 6.0  3.5 MB avg  peak depth=6   3.5 MB       encoder: shared PageBox queue (VB/IB renames + texture-blit padded staging + visibility pool)\n",
+            "pool        hit=14 miss=1 (93.3%)   recycled=14  672 KB         API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)\n",
+            "  parked    1.0 MB avg              peak 1.0 MB                 bytes held in the pool for reuse (already retired; excluded from retention above)\n",
             "\n",
             "Resources (textures)  — same layout as VB/IB; n/a rows omitted\n",
             "rename      2                                                   API: fresh staging Arc on contended LockRect\n",
@@ -4635,6 +4742,10 @@ mod tests {
                 // 15 renames of a 48 KiB-average buffer: 720 KB of fresh
                 // PageBox pages this frame. Exercises the `  bytes` row.
                 vbib_rename_bytes: 737_280,
+                // Pool fixture: 14 of 15 rename allocs served warm
+                // (93.3%), one fell through to the allocator.
+                vbib_pool_hits: 14,
+                vbib_pool_misses: 1,
                 vb_discards: 10,
                 ib_discards: 3,
                 // Two whole-buffer non-WRITEONLY contended Locks took the
@@ -4695,6 +4806,10 @@ mod tests {
             enc: EncoderFrameCounters {
                 buffer_destroys: 1,
                 texture_destroys: 1,
+                // The drain parked 14 retired boxes (672 KB) in the pool
+                // this frame, matching the 14 hits above.
+                pagebox_pool_recycled: 14,
+                pagebox_pool_recycled_bytes: 688_128,
                 vbib_staging_uploads: 0,
                 vbib_mid_pass_reorders: 0,
                 texture_blit_uploads: 2,
@@ -4749,6 +4864,9 @@ mod tests {
             pagebox_alloc_bytes: 786_432,
             pagebox_frees: 14,
             pagebox_free_bytes: 655_360,
+            // 1 MB parked in the recycle pool at frame end; exercises the
+            // MB branch of the `  parked` row.
+            pagebox_pool_bytes: 1_048_576,
             // Encoder thread = op (Closures) + finalize. The unix
             // command-walk + present moved to the submit thread.
             outside_d3d9: 3_000_000,
@@ -4779,6 +4897,7 @@ mod tests {
             cmd_vec_capacity_bytes: 64 * 1024,
             pending_blit_retention_depth: 0,
             pending_resource_retention_depth: 1,
+            pagebox_pool_bytes: 1_048_576,
         }
     }
 

@@ -84,6 +84,18 @@ pub struct Mtld3dConfig {
     /// `0` disables the cap. Default: 512 MiB. File key:
     /// `memory.vbibRetentionCapMB` (value in MiB).
     pub vbib_retention_cap_bytes: u64,
+    /// Byte cap for the `PageBox` recycle pool. `0` = pool disabled.
+    ///
+    /// When non-zero, VB/IB `PageBox`es retired by the encoder's
+    /// retention drain are parked in a per-size-class pool and handed
+    /// back to the next same-size Lock-rename alloc, instead of cycling
+    /// through the global allocator (whose page-return policy decommits
+    /// them, making the game's first touch of every fresh box fault).
+    /// The cap bounds the committed bytes the pool may park; over-cap
+    /// boxes drop to the allocator as before. Default: `0` (off) until
+    /// the warm-page A/B confirms the win. File key:
+    /// `memory.pageboxPoolCapMB` (value in MiB).
+    pub pagebox_pool_cap_bytes: u64,
     /// Frame-rate ceiling applied via the present-throttle duration.
     ///
     /// Independent of the guest's vsync request. When both this and
@@ -128,6 +140,7 @@ impl Default for Mtld3dConfig {
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
+            pagebox_pool_cap_bytes: 0,
             present_max_fps: 0,
             render_scale_percent: 100,
         }
@@ -229,6 +242,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: memory.pageboxPoolCapMB = {}",
+        cfg.pagebox_pool_cap_bytes / (1024 * 1024)
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: present.maxFps = {}", cfg.present_max_fps
     );
     info!(
@@ -263,7 +281,10 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "memory.vbibRetentionCapMB" => {
-            assign_retention_cap_mb(source, value, &mut cfg.vbib_retention_cap_bytes);
+            assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);
+        }
+        "memory.pageboxPoolCapMB" => {
+            assign_cap_mb(source, key, value, &mut cfg.pagebox_pool_cap_bytes);
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
@@ -301,14 +322,14 @@ fn assign_color_space(source: &str, value: &str, slot: &mut ColorSpacePolicy) {
     }
 }
 
-fn assign_retention_cap_mb(source: &str, value: &str, slot: &mut u64) {
-    // `0` disables the cap; any other value is MiB → bytes.
+fn assign_cap_mb(source: &str, key: &str, value: &str, slot: &mut u64) {
+    // `0` disables the capped feature; any other value is MiB → bytes.
     if let Ok(mb) = value.parse::<u32>() {
         *slot = u64::from(mb) * 1024 * 1024;
     } else {
         log_once_warn!(
             target: crate::LOG_TARGET,
-            "{source}: 'memory.vbibRetentionCapMB = {value}' is not a non-negative integer (MiB) → kept {kept}",
+            "{source}: '{key} = {value}' is not a non-negative integer (MiB) → kept {kept}",
             kept = *slot / (1024 * 1024)
         );
     }
@@ -446,8 +467,31 @@ mod tests {
         assert!(d.bytecode_dump_dir.is_empty());
         assert!(d.skip_shaders.is_empty());
         assert!(d.query_flush_immediate);
+        assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
+        assert_eq!(d.pagebox_pool_cap_bytes, 0);
         assert_eq!(d.present_max_fps, 0);
         assert_eq!(d.render_scale_percent, 100);
+    }
+
+    #[test]
+    fn pagebox_pool_cap_parses_as_mib() {
+        let cfg = parse("memory.pageboxPoolCapMB = 96\n", None);
+        assert_eq!(cfg.pagebox_pool_cap_bytes, 96 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pagebox_pool_cap_zero_disables() {
+        let cfg = parse(
+            "memory.pageboxPoolCapMB = 96\nmemory.pageboxPoolCapMB = 0\n",
+            None,
+        );
+        assert_eq!(cfg.pagebox_pool_cap_bytes, 0);
+    }
+
+    #[test]
+    fn pagebox_pool_cap_garbage_keeps_default() {
+        let cfg = parse("memory.pageboxPoolCapMB = lots\n", None);
+        assert_eq!(cfg.pagebox_pool_cap_bytes, 0);
     }
 
     #[test]
@@ -677,6 +721,8 @@ mod tests {
             ;debug.bytecodeDumpDir=/tmp/x\
             ;debug.skipShaders=0xabc,def\
             ;query.flushImmediate=false\
+            ;memory.vbibRetentionCapMB=256\
+            ;memory.pageboxPoolCapMB=96\
             ;present.maxFps=72\
             ;render.scale=0.5";
         let cfg = parse("", Some(env));
@@ -688,6 +734,8 @@ mod tests {
         assert_eq!(cfg.bytecode_dump_dir, "/tmp/x");
         assert_eq!(cfg.skip_shaders, vec![0xabc, 0xdef]);
         assert!(!cfg.query_flush_immediate);
+        assert_eq!(cfg.vbib_retention_cap_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.pagebox_pool_cap_bytes, 96 * 1024 * 1024);
         assert_eq!(cfg.present_max_fps, 72);
         assert_eq!(cfg.render_scale_percent, 50);
     }

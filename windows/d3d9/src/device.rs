@@ -1351,6 +1351,19 @@ impl DeviceInner {
     /// alloc, we fall through to `new_uninit`'s panic — the address space
     /// is genuinely exhausted and aborting is the right outcome.
     pub fn alloc_pagebox_with_recovery(&mut self, logical_len: usize) -> PageBox {
+        // Recycle-pool fast path: a hit is a warm, still-committed box of
+        // the same padded size, allocates nothing, and therefore skips the
+        // retention-cap check below (which exists to bound allocations).
+        let pool = &*crate::page_box_pool::PAGEBOX_POOL;
+        if let Some(b) = pool.acquire(logical_len) {
+            self.perf.bump_vbib_pool_hit();
+            return b;
+        }
+        if pool.enabled() {
+            // Misses count only while the pool is on, so the A/B baseline
+            // arm reads hit=0 miss=0 rather than all-miss.
+            self.perf.bump_vbib_pool_miss();
+        }
         // Proactive memory cap. The reactive `try_new_uninit`-failure tiers
         // below only trip when the 32-bit address space is *already*
         // exhausted — far too late, since by then the game is thrashing.

@@ -281,15 +281,43 @@ impl PageBox {
         self.logical_len == 0
     }
 
+    /// Padded length a `logical_len` request allocates (next page multiple, min one page).
+    ///
+    /// Public so the recycle pool can classify a request by the padded
+    /// size the constructors would produce, without allocating.
+    ///
+    /// # Panics
+    ///
+    /// Panics when rounding up overflows `usize` — unreachable for any
+    /// length a 32-bit D3D9 buffer can carry.
+    #[must_use]
+    pub fn padded_len(logical_len: usize) -> usize {
+        logical_len
+            .max(1)
+            .div_ceil(PAGE_SIZE)
+            .checked_mul(PAGE_SIZE)
+            .expect("PageBox length overflow")
+    }
+
+    /// Retarget a recycled box to a new request of the same padded size.
+    ///
+    /// Only the logical length changes; pointer, padded length, and layout
+    /// stay. Contents are stale bytes from the previous owner, the same
+    /// caller contract as `new_uninit`.
+    pub fn set_logical_len(&mut self, logical_len: usize) {
+        debug_assert_eq!(
+            Self::padded_len(logical_len),
+            self.len,
+            "recycled PageBox must keep its padded length"
+        );
+        self.logical_len = logical_len;
+    }
+
     fn layout_for(logical_len: usize) -> (usize, Layout) {
         // A zero-length PageBox is still allocated at one page so the
         // returned pointer is non-null and the MTLBuffer wrap doesn't
         // choke on length=0.
-        let padded = logical_len
-            .max(1)
-            .div_ceil(PAGE_SIZE)
-            .checked_mul(PAGE_SIZE)
-            .expect("PageBox length overflow");
+        let padded = Self::padded_len(logical_len);
         let layout = Layout::from_size_align(padded, PAGE_SIZE).expect("valid page-aligned layout");
         (padded, layout)
     }

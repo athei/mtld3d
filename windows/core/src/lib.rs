@@ -23,6 +23,7 @@ pub mod format;
 pub mod gpu_caps;
 pub mod ids;
 pub mod page_box;
+pub mod page_box_pool;
 pub mod passes;
 pub mod perf;
 pub mod pipeline_state;

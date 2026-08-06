@@ -1744,6 +1744,7 @@ impl FrameEncoder {
             cmd_vec_capacity_bytes: self.pass_state.cmd_vec_capacity_bytes(),
             pending_blit_retention_depth: self.pending_blit_retention.len(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
+            pagebox_pool_bytes: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
         }
     }
 
@@ -3906,9 +3907,25 @@ impl FrameEncoder {
         }
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
-        // PageBoxes inside `drained` drop here, after every wrapper
-        // destroy thunk has returned.
-        drop(drained);
+        // PageBoxes inside `drained` are released here, after every
+        // wrapper destroy thunk has returned. VB/IB boxes are offered to
+        // the recycle pool first so the next same-size Lock-rename gets
+        // warm, still-committed pages; texture padded-staging boxes and
+        // pool rejects (disabled, oversize, cap reached) drop to the
+        // allocator exactly as before.
+        let pool = &*crate::page_box_pool::PAGEBOX_POOL;
+        for mut entry in drained {
+            let Some(pb) = entry.page_box.take() else {
+                continue;
+            };
+            if entry.from_texture {
+                continue;
+            }
+            let len = pb.len();
+            if pool.recycle(pb).is_none() {
+                self.perf.bump_pagebox_pool_recycled(len);
+            }
+        }
     }
 
     /// Drain `pending_blit_retention` entries whose `submit_seq` has been retired by the GPU.

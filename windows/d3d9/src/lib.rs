@@ -13,6 +13,7 @@ mod draw;
 mod encoder;
 mod fullscreen;
 mod index_buffer;
+mod page_box_pool;
 mod pixel_shader;
 mod private_data;
 mod query;

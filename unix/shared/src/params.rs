@@ -248,7 +248,7 @@ impl Thunk for GetPrimaryDisplayModeParams {
 ///
 /// Sampled by the encoder thread once per perf summary window (PERF=1
 /// builds only) so the summary can report a fault-rate delta. Minor
-/// faults are the first-touch zero-fill signal the PageBox churn
+/// faults are the first-touch zero-fill signal the `PageBox` churn
 /// investigation watches; major faults ride along for free. Process-wide:
 /// every thread's faults land in the same counters.
 #[repr(C, align(8))]
