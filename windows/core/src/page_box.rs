@@ -10,10 +10,130 @@
 //! past `logical_len` is padding — game writes never reach it, GPU reads
 //! stay within the vertex/index stride × count the draw specifies.
 
+#[cfg(perf_tracking)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     alloc::{self, Layout},
     ptr::NonNull,
 };
+
+/// Cumulative count of `PageBox` allocations served by the global allocator.
+#[cfg(perf_tracking)]
+static PAGEBOX_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative padded bytes behind `PAGEBOX_ALLOCS`.
+#[cfg(perf_tracking)]
+static PAGEBOX_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of `PageBox` frees returned to the global allocator.
+#[cfg(perf_tracking)]
+static PAGEBOX_FREES: AtomicU64 = AtomicU64::new(0);
+/// Cumulative padded bytes behind `PAGEBOX_FREES`.
+#[cfg(perf_tracking)]
+static PAGEBOX_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Count one `PageBox` allocation of `len` padded bytes.
+///
+/// Relaxed bumps on process-wide statics: the constructors run on the API
+/// thread and the encoder thread (padded blit staging), so per-frame
+/// counter homes would need two copies. Cheap enough to stay ungated.
+#[cfg(perf_tracking)]
+fn note_alloc(len: usize) {
+    PAGEBOX_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    PAGEBOX_ALLOC_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+}
+
+/// Twin of `note_alloc`: compiles away without `perf_tracking`.
+#[cfg(not(perf_tracking))]
+const fn note_alloc(_len: usize) {}
+
+/// Count one `PageBox` free of `len` padded bytes.
+///
+/// Same statics discipline as `note_alloc`; called from `Drop`, which can
+/// run on either thread.
+#[cfg(perf_tracking)]
+fn note_free(len: usize) {
+    PAGEBOX_FREES.fetch_add(1, Ordering::Relaxed);
+    PAGEBOX_FREE_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+}
+
+/// Twin of `note_free`: compiles away without `perf_tracking`.
+#[cfg(not(perf_tracking))]
+const fn note_free(_len: usize) {}
+
+/// Snapshot of the cumulative `PageBox` allocator-traffic counters.
+///
+/// All values are process-wide and monotonically increasing since start;
+/// consumers delta two snapshots to get a window. `frees` lags `allocs`
+/// by the number of live boxes.
+pub struct PageBoxVolume {
+    pub allocs: u64,
+    pub alloc_bytes: u64,
+    pub frees: u64,
+    pub free_bytes: u64,
+}
+
+impl Default for PageBoxVolume {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PageBoxVolume {
+    /// All-zero snapshot, doubling as the "no baseline yet" sentinel.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            allocs: 0,
+            alloc_bytes: 0,
+            frees: 0,
+            free_bytes: 0,
+        }
+    }
+
+    /// True when nothing has ever been counted.
+    ///
+    /// A real process is never at zero after the first buffer create, so
+    /// this identifies a fresh baseline (or the `not(perf_tracking)` twin).
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.allocs == 0 && self.frees == 0
+    }
+
+    /// Element-wise `self - prev`, saturating.
+    ///
+    /// Turns two cumulative snapshots into a per-window volume.
+    #[must_use]
+    pub const fn delta(&self, prev: &Self) -> Self {
+        Self {
+            allocs: self.allocs.saturating_sub(prev.allocs),
+            alloc_bytes: self.alloc_bytes.saturating_sub(prev.alloc_bytes),
+            frees: self.frees.saturating_sub(prev.frees),
+            free_bytes: self.free_bytes.saturating_sub(prev.free_bytes),
+        }
+    }
+}
+
+/// Snapshot the cumulative `PageBox` traffic counters (Relaxed loads).
+///
+/// The counters only ever grow, so a delta between two snapshots is the
+/// traffic that reached the global allocator in between: a recycle path
+/// that reuses boxes without dropping them is invisible here by design.
+#[cfg(perf_tracking)]
+#[must_use]
+pub fn pagebox_volume() -> PageBoxVolume {
+    PageBoxVolume {
+        allocs: PAGEBOX_ALLOCS.load(Ordering::Relaxed),
+        alloc_bytes: PAGEBOX_ALLOC_BYTES.load(Ordering::Relaxed),
+        frees: PAGEBOX_FREES.load(Ordering::Relaxed),
+        free_bytes: PAGEBOX_FREE_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+/// Twin of `pagebox_volume`: no counters exist without `perf_tracking`.
+#[cfg(not(perf_tracking))]
+#[must_use]
+pub const fn pagebox_volume() -> PageBoxVolume {
+    PageBoxVolume::new()
+}
 
 /// Apple Silicon page size.
 ///
@@ -58,6 +178,7 @@ impl PageBox {
         // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = unsafe { alloc::alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        note_alloc(len);
         Self {
             ptr,
             len,
@@ -79,11 +200,14 @@ impl PageBox {
         let (len, layout) = Self::layout_for(logical_len);
         // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = unsafe { alloc::alloc(layout) };
-        NonNull::new(ptr).map(|ptr| Self {
-            ptr,
-            len,
-            logical_len,
-            layout,
+        NonNull::new(ptr).map(|ptr| {
+            note_alloc(len);
+            Self {
+                ptr,
+                len,
+                logical_len,
+                layout,
+            }
         })
     }
 
@@ -98,6 +222,7 @@ impl PageBox {
         // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        note_alloc(len);
         Self {
             ptr,
             len,
@@ -172,6 +297,7 @@ impl PageBox {
 
 impl Drop for PageBox {
     fn drop(&mut self) {
+        note_free(self.len);
         // SAFETY: same layout used to alloc; pointer came from that
         // allocator; nothing else owns this allocation.
         unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };

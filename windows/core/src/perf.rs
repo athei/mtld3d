@@ -52,6 +52,8 @@ use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
 #[cfg(perf_tracking)]
 use strum::EnumCount;
 
+#[cfg(perf_tracking)]
+use super::page_box::{PageBoxVolume, pagebox_volume};
 use super::passes::Pass;
 #[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
@@ -525,6 +527,13 @@ struct FrameCounters {
     /// `PageBox` allocations from VB/IB Lock-rename this frame.
     vb_rename: u32,
     ib_rename: u32,
+    /// Padded bytes of the fresh `PageBox`es behind `vb_rename` + `ib_rename`.
+    ///
+    /// Sized via `PageBox::len()` (16 KiB page multiples), not the D3D9
+    /// logical length, so the row reports what the global allocator
+    /// actually served. The byte volume is what decides whether rename
+    /// churn can drive allocator page-return oscillation.
+    vbib_rename_bytes: u64,
     /// Subset of `vb_rename` / `ib_rename` that took the no-preserve branch.
     ///
     /// Either explicit `D3DLOCK_DISCARD`, or whole-buffer
@@ -682,6 +691,7 @@ impl FrameCounters {
             api_call_counts_by_category: [0; ApiCategory::COUNT],
             vb_rename: 0,
             ib_rename: 0,
+            vbib_rename_bytes: 0,
             vb_discards: 0,
             ib_discards: 0,
             vbib_preserve_cpu: 0,
@@ -1074,6 +1084,16 @@ impl ApiPerfState {
         self.counters.ib_rename = self.counters.ib_rename.saturating_add(1);
     }
 
+    /// Add one rename's fresh-`PageBox` padded length to the byte counter.
+    ///
+    /// Callers pass `PageBox::len()` next to the `bump_vb_rename` /
+    /// `bump_ib_rename` bump so the bytes row and the rename row cover the
+    /// same events.
+    pub const fn bump_vbib_rename_bytes(&mut self, bytes: usize) {
+        self.counters.vbib_rename_bytes =
+            self.counters.vbib_rename_bytes.saturating_add(bytes as u64);
+    }
+
     /// Whole-buffer non-WRITEONLY contended Lock.
     ///
     /// Fresh `PageBox` + inline `memcpy` from the old box (game might
@@ -1225,6 +1245,8 @@ impl ApiPerfState {
     pub const fn bump_vb_rename(&mut self) {}
     #[inline]
     pub const fn bump_ib_rename(&mut self) {}
+    #[inline]
+    pub const fn bump_vbib_rename_bytes(&mut self, _bytes: usize) {}
     #[inline]
     pub const fn bump_vbib_preserve_cpu(&mut self) {}
     #[inline]
@@ -1467,6 +1489,12 @@ pub struct EncoderPerfState {
     /// Not reset per frame; sampled at end of frame as a peak-memory
     /// proxy, symmetric to `vbib_retained_bytes`.
     tex_staging_retained_bytes: usize,
+    /// Snapshot of the process-wide `PageBox` traffic counters at the previous frame.
+    ///
+    /// Delta'd on each `log_frame_summary` call to turn the cumulative
+    /// atomics in `page_box.rs` into per-frame values for the window. An
+    /// all-zero snapshot means "no baseline yet" and reports a zero frame.
+    prev_pagebox_volume: PageBoxVolume,
 }
 
 #[cfg(perf_tracking)]
@@ -1488,6 +1516,7 @@ impl EncoderPerfState {
             per_pair_stats: HashMap::new(),
             vbib_retained_bytes: 0,
             tex_staging_retained_bytes: 0,
+            prev_pagebox_volume: PageBoxVolume::new(),
         }
     }
 
@@ -1724,6 +1753,17 @@ impl EncoderPerfState {
         let outside_d3d9 = self.timing.frame_total_cycles.saturating_sub(api_total);
         let api_work_cyc = api_total.saturating_sub(self.timing.present_block_cycles);
 
+        // Per-frame PageBox allocator traffic: delta of the process-wide
+        // cumulative counters against the previous frame's snapshot. The
+        // first sampled frame has no baseline and reports zero.
+        let pagebox = pagebox_volume();
+        let pagebox_frame = if self.prev_pagebox_volume.is_zero() {
+            PageBoxVolume::new()
+        } else {
+            pagebox.delta(&self.prev_pagebox_volume)
+        };
+        self.prev_pagebox_volume = pagebox;
+
         let sample = FrameSample {
             // The three per-frame counter groups flow into the sample as
             // single moves (the API counters, payload timing, and encoder
@@ -1744,6 +1784,10 @@ impl EncoderPerfState {
             pending_blit_retention_depth: caches.pending_blit_retention_depth,
             tex_staging_retained_bytes: self.tex_staging_retained_bytes,
             cmd_vec_realloc_bytes,
+            pagebox_allocs: pagebox_frame.allocs,
+            pagebox_alloc_bytes: pagebox_frame.alloc_bytes,
+            pagebox_frees: pagebox_frame.frees,
+            pagebox_free_bytes: pagebox_frame.free_bytes,
             // Derived this frame from the counters above.
             outside_d3d9,
             api_cyc: api_total,
@@ -1995,6 +2039,16 @@ struct FrameSample {
     /// shows growth churn next to resident footprint; a working pool
     /// drives this near zero in steady state.
     cmd_vec_realloc_bytes: u64,
+    /// This frame's `PageBox` allocations reaching the global allocator.
+    ///
+    /// Delta of the cumulative `page_box.rs` counters between two
+    /// consecutive `log_frame_summary` calls. Includes every producer on
+    /// every thread, not just the Lock-rename path.
+    pagebox_allocs: u64,
+    pagebox_alloc_bytes: u64,
+    /// This frame's `PageBox` frees returning to the global allocator.
+    pagebox_frees: u64,
+    pagebox_free_bytes: u64,
 
     // ── Derived this frame from the counters above ──
     /// `frame_total − Σ api_cycles_by_category`.
@@ -2135,6 +2189,8 @@ struct PerfWindow {
     draw_push_op: Stat,
     vb_rename: Stat,
     ib_rename: Stat,
+    /// Padded fresh-`PageBox` bytes behind the renames (sum + per-frame peak).
+    vbib_rename_bytes: Stat,
     vb_discards: Stat,
     ib_discards: Stat,
     vbib_preserve_cpu: Stat,
@@ -2183,6 +2239,16 @@ struct PerfWindow {
     ///
     /// The `realloc=` half of the `op_vec` row (sum + outlier peak).
     op_vec_realloc_bytes: Stat,
+    /// `PageBox` allocations reaching the global allocator (count sum + peak).
+    ///
+    /// With the byte twins below, the window totals feed the `pagebox`
+    /// footprint row: allocator-visible traffic, every producer, every
+    /// thread.
+    pagebox_allocs: Stat,
+    pagebox_alloc_bytes: Stat,
+    /// `PageBox` frees returning to the global allocator (count sum + peak).
+    pagebox_frees: Stat,
+    pagebox_free_bytes: Stat,
     /// Peak only: `device_sub_by[Frame] − present_block`, the non-stall Frame sub-bucket.
     ///
     /// Present body, `Clear`, `Begin/EndScene`, `ColorFill`.
@@ -2290,6 +2356,7 @@ impl PerfWindow {
         self.draw_push_op.add(s.counters.draw_push_op_cycles);
         self.vb_rename.add(u64::from(s.counters.vb_rename));
         self.ib_rename.add(u64::from(s.counters.ib_rename));
+        self.vbib_rename_bytes.add(s.counters.vbib_rename_bytes);
         self.vb_discards.add(u64::from(s.counters.vb_discards));
         self.ib_discards.add(u64::from(s.counters.ib_discards));
         self.vbib_preserve_cpu
@@ -2330,6 +2397,10 @@ impl PerfWindow {
             .add(s.tex_staging_retained_bytes as u64);
         self.cmd_vec_realloc_bytes.add(s.cmd_vec_realloc_bytes);
         self.op_vec_realloc_bytes.add(s.timing.op_vec_realloc_bytes);
+        self.pagebox_allocs.add(s.pagebox_allocs);
+        self.pagebox_alloc_bytes.add(s.pagebox_alloc_bytes);
+        self.pagebox_frees.add(s.pagebox_frees);
+        self.pagebox_free_bytes.add(s.pagebox_free_bytes);
 
         // Derived peaks (no window sum): each is a per-frame quantity, so
         // peak-of-difference ≠ difference-of-peaks — compute per frame.
@@ -3598,6 +3669,16 @@ impl<'a> Summary<'a> {
             None,
             "API: rename + sync memcpy (whole-buffer non-WRITEONLY contended — game may read back)",
         );
+        let rename_kb = u64_to_f64_exact(w.vbib_rename_bytes.sum) / 1024.0;
+        let rename_peak_kb = u64_to_f64_exact(w.vbib_rename_bytes.max) / 1024.0;
+        let (rename_bytes_fmt, rename_bytes_peak_fmt) = format_kb_pair(rename_kb, rename_peak_kb);
+        self.res_row(
+            out,
+            "  bytes",
+            &rename_bytes_fmt,
+            Some(&format!("peak/frame {rename_bytes_peak_fmt}")),
+            "API: fresh PageBox bytes behind rename (16 KiB-padded; what the allocator serves)",
+        );
         self.res_row(
             out,
             "staging up",
@@ -4008,6 +4089,19 @@ impl<'a> Summary<'a> {
             Some(&format!("peak {realloc_peak_fmt}")),
             "Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)",
         );
+        // PageBox traffic that actually reached the global allocator this
+        // window. Fresh pages fault on first touch under Wine, so a large
+        // steady-state number here is the churn signal this row exists for.
+        let pb_alloc_kb = u64_to_f64_exact(w.pagebox_alloc_bytes.sum) / 1024.0;
+        let pb_free_kb = u64_to_f64_exact(w.pagebox_free_bytes.sum) / 1024.0;
+        let (pb_alloc_fmt, pb_free_fmt) = format_kb_pair(pb_alloc_kb, pb_free_kb);
+        self.res_row(
+            out,
+            "pagebox",
+            &format!("alloc={a}  {pb_alloc_fmt}", a = w.pagebox_allocs.sum),
+            Some(&format!("free={fr}  {pb_free_fmt}", fr = w.pagebox_frees.sum)),
+            "window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
+        );
     }
 }
 
@@ -4035,6 +4129,10 @@ mod tests {
             pending_blit_retention_depth: 0,
             tex_staging_retained_bytes: 0,
             cmd_vec_realloc_bytes: 0,
+            pagebox_allocs: 0,
+            pagebox_alloc_bytes: 0,
+            pagebox_frees: 0,
+            pagebox_free_bytes: 0,
             outside_d3d9: 0,
             api_cyc: 0,
             api_work: 0,
@@ -4303,6 +4401,7 @@ mod tests {
             "rename      VB=12     IB=3          peak/frame VB=12  IB=3      API: PageBox alloc on contended Lock(DISCARD) or whole-buffer Lock\n",
             "  discards  VB=10     IB=3                                      API: rename, no preserve (DISCARD or whole-buffer WRITEONLY)\n",
             "  preserve  2                                                   API: rename + sync memcpy (whole-buffer non-WRITEONLY contended — game may read back)\n",
+            "  bytes     720 KB                  peak/frame 720 KB           API: fresh PageBox bytes behind rename (16 KiB-padded; what the allocator serves)\n",
             "staging up  0                                                   encoder: Staged (non-DYNAMIC) dirty-range upload blits — separate-staging path; high here with rename≈0 is the goal\n",
             "reorder     0                                                   encoder: rename-at-overlap (upload hit a just-drawn region; rare)\n",
             "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
@@ -4347,7 +4446,8 @@ mod tests {
             "  realloc   32 KB avg               peak 32 KB                  Vec<Op> doubling memcpy on push_op (target ≈ 0 with peak_ops_count reserve)\n",
             "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
             "  size      64 KB avg               peak 64 KB                  pool-resident Vec<Command> capacity across frames (recycled, not freed)\n",
-            "  realloc   192 KB avg              peak 192 KB                 Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)",
+            "  realloc   192 KB avg              peak 192 KB                 Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)\n",
+            "pagebox     alloc=16  768 KB        free=14  640 KB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
         );
         assert_eq!(got, want, "perf summary drifted — diff above");
     }
@@ -4456,6 +4556,9 @@ mod tests {
                 api_call_counts_by_category: calls,
                 vb_rename: 12,
                 ib_rename: 3,
+                // 15 renames of a 48 KiB-average buffer: 720 KB of fresh
+                // PageBox pages this frame. Exercises the `  bytes` row.
+                vbib_rename_bytes: 737_280,
                 vb_discards: 10,
                 ib_discards: 3,
                 // Two whole-buffer non-WRITEONLY contended Locks took the
@@ -4563,6 +4666,13 @@ mod tests {
             pending_blit_retention_depth: 0,
             tex_staging_retained_bytes: 0,
             cmd_vec_realloc_bytes: 196_608,
+            // Allocator-visible PageBox traffic: the 15 renames (720 KB)
+            // plus one 64 KB creation on the alloc side; 14 retired boxes
+            // freed. Exercises both cells of the `pagebox` footprint row.
+            pagebox_allocs: 16,
+            pagebox_alloc_bytes: 786_432,
+            pagebox_frees: 14,
+            pagebox_free_bytes: 655_360,
             // Encoder thread = op (Closures) + finalize. The unix
             // command-walk + present moved to the submit thread.
             outside_d3d9: 3_000_000,

@@ -468,6 +468,8 @@ extern "system" fn ib_lock(
                     }
                 }
                 dev.perf_mut().bump_ib_rename();
+                dev.perf_mut()
+                    .bump_vbib_rename_bytes(inner.current_box.len());
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
             }
