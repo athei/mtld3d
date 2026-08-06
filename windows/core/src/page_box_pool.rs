@@ -22,12 +22,16 @@ use std::sync::{
 
 use crate::page_box::{PAGE_SIZE, PageBox};
 
-/// Largest box the pool parks, in 16 KiB pages (64 pages = 1 MiB).
+/// Largest box the pool parks, in 16 KiB pages (256 pages = 4 MiB).
 ///
-/// Renamed Direct-pool buffers are small (tens to a few hundred KiB); a
-/// rare jumbo box would crowd the byte cap out of the hot classes, so
-/// anything larger drops to the allocator instead.
-pub const MAX_POOL_CLASSES: usize = 64;
+/// Sized from measurement, not guesswork: the dominant renamed buffer in
+/// the target game is ~2.75 MB (176 pages), renamed once or twice per
+/// frame, and it is precisely the class that hurts most in the allocator
+/// (>= 2 MiB chunks bypass snmalloc's thread-local cache, so every free
+/// decommits and every alloc re-commits). 4 MiB leaves headroom above it;
+/// anything larger is a rare one-off that would crowd the byte cap out of
+/// the hot classes and drops to the allocator instead.
+pub const MAX_POOL_CLASSES: usize = 256;
 
 /// Mutex-guarded pool state.
 struct PoolInner {

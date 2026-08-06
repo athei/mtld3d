@@ -4038,7 +4038,12 @@ impl<'a> Summary<'a> {
         out.push_str(window);
         cursor += window.chars().count();
         if let Some(pk) = peak {
-            pad_spaces(out, &mut cursor, RES_PEAK_COL);
+            // Same overflow guard as the comment column: a window cell
+            // that reaches/overflows the peak column (e.g. the faults
+            // row's `minflt=NNNNNN  majflt=NN`) must not butt against
+            // the peak cell.
+            let peak_col = RES_PEAK_COL.max(cursor + 2);
+            pad_spaces(out, &mut cursor, peak_col);
             out.push_str(pk);
             cursor += pk.chars().count();
         }
