@@ -86,14 +86,17 @@ pub struct Mtld3dConfig {
     pub vbib_retention_cap_bytes: u64,
     /// Byte cap for the `PageBox` recycle pool. `0` = pool disabled.
     ///
-    /// When non-zero, VB/IB `PageBox`es retired by the encoder's
-    /// retention drain are parked in a per-size-class pool and handed
-    /// back to the next same-size Lock-rename alloc, instead of cycling
-    /// through the global allocator (whose page-return policy decommits
-    /// them, making the game's first touch of every fresh box fault).
-    /// The cap bounds the committed bytes the pool may park; over-cap
-    /// boxes drop to the allocator as before. Default: `0` (off) until
-    /// the warm-page A/B confirms the win. File key:
+    /// VB/IB `PageBox`es retired by the encoder's retention drain are
+    /// parked in a per-size-class pool and handed back to the next
+    /// same-size Lock-rename alloc, instead of cycling through the
+    /// global allocator (whose page-return policy decommits them,
+    /// making the game's first touch of every fresh box fault). The
+    /// A/B measured ~900 MB/s of rename traffic collapsing to a few
+    /// MB/s and a ~50x drop in process fault rate with the pool on;
+    /// parked bytes peaked at 53 MiB in a quiet scene, so the default
+    /// leaves ~2x headroom for busy scenes. The cap bounds the
+    /// committed bytes the pool may park; over-cap boxes drop to the
+    /// allocator as before. Default: 128 MiB. File key:
     /// `memory.pageboxPoolCapMB` (value in MiB).
     pub pagebox_pool_cap_bytes: u64,
     /// Frame-rate ceiling applied via the present-throttle duration.
@@ -140,7 +143,7 @@ impl Default for Mtld3dConfig {
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
-            pagebox_pool_cap_bytes: 0,
+            pagebox_pool_cap_bytes: 128 * 1024 * 1024,
             present_max_fps: 0,
             render_scale_percent: 100,
         }
@@ -468,7 +471,7 @@ mod tests {
         assert!(d.skip_shaders.is_empty());
         assert!(d.query_flush_immediate);
         assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
-        assert_eq!(d.pagebox_pool_cap_bytes, 0);
+        assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
         assert_eq!(d.present_max_fps, 0);
         assert_eq!(d.render_scale_percent, 100);
     }
@@ -491,7 +494,7 @@ mod tests {
     #[test]
     fn pagebox_pool_cap_garbage_keeps_default() {
         let cfg = parse("memory.pageboxPoolCapMB = lots\n", None);
-        assert_eq!(cfg.pagebox_pool_cap_bytes, 0);
+        assert_eq!(cfg.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     }
 
     #[test]

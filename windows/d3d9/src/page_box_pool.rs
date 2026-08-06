@@ -13,9 +13,10 @@ use mtld3d_core::page_box_pool::PageBoxPool;
 
 /// The pool, sized from `memory.pageboxPoolCapMB` on first use.
 ///
-/// A cap of 0 (the default) leaves the pool disabled: `acquire` never
-/// hits and `recycle` hands every box back for a plain drop, so the
-/// baseline arm of the warm-page A/B behaves exactly as before.
+/// A cap of 0 disables the pool: `acquire` never hits and `recycle`
+/// hands every box back for a plain drop, restoring the
+/// everything-through-the-allocator behaviour (the measured baseline
+/// arm of the warm-page A/B).
 pub static PAGEBOX_POOL: LazyLock<PageBoxPool> = LazyLock::new(|| {
     let cap = usize::try_from(crate::config::CONFIG.pagebox_pool_cap_bytes).unwrap_or(usize::MAX);
     PageBoxPool::new(cap)
