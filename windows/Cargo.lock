@@ -117,7 +117,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "d3d9"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.13.0",
  "log",
@@ -278,7 +278,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "mtld3d"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "log",
  "mtld3d-shared",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.13.0",
  "log",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-shared"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.13.0",
  "env_logger",
@@ -314,14 +314,14 @@ dependencies = [
 
 [[package]]
 name = "mtld3d-tests"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "mtld3d-types",
 ]
 
 [[package]]
 name = "mtld3d-types"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "objc2"
