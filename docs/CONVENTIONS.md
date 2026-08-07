@@ -54,7 +54,7 @@ Do not write, in any comment:
 
 `windows/d3d9` is the COM-wrapper layer — `#[repr(C)]` vtables, refcount accounting, `extern "system"` dispatchers, the raw-dylib `unix_call` stub, `DllMain`, and `DeviceInner`. **Everything else belongs in `windows/core`**: format mapping, state packing, bytecode parsing and MSL emission, allocator bookkeeping, geometry math, key hashing, render-pass sequencing, FF state, newtype identifiers.
 
-`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is a pure-Rust rlib that builds on the macOS host target, so `cargo test -p mtld3d-core --target aarch64-apple-darwin` runs natively in ~0 s. `make test` already invokes it, auto-detecting the host triple so tests run on the native arch (no Rosetta) rather than the shipped `x86_64-apple-darwin` target.
+`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --target aarch64-apple-darwin` runs natively in ~0 s. `make test` already invokes it, auto-detecting the host triple so tests run on the native arch (no Rosetta) rather than the shipped `x86_64-apple-darwin` target.
 
 How to apply:
 

@@ -106,7 +106,7 @@ Cost: one `format!` + one `NSString::from_str` + one objc dispatch per create ca
 
 ## Perf infrastructure
 
-The `mtld3d::perf` summary in `windows/core/src/perf.rs` emits a multi-line report every 5 s under `RUST_LOG=mtld3d::perf=debug`. Counters group by which thread owns them (API, encoder, GPU wait); subtimers indent under their parent. Banner shows `bottleneck=…` based on `present_block` share + `gpu_wait` vs `enc_cpu`; the four terminal buckets are echoed on a `buckets:` line for auditability. The same Debug gate also enables the per-call cycle accounting — single switch. Pass / workload shape (per-pass dump, `present_texture=…` audit line, per-RT pair stats) lives on the separate `mtld3d::d3d9::passes=trace` switch — those are diagnostics, not perf metrics.
+The `mtld3d::perf` summary in `windows/core/src/perf.rs` is compiled in only on a `PERF=1` build (`cfg(perf_tracking)`) and emits a multi-line report every 5 s at `info!` under `RUST_LOG=mtld3d::perf=info`. Counters group by which thread owns them (API, encoder, GPU wait); subtimers indent under their parent. Banner shows `bottleneck=…` based on `present_block` share + `gpu_wait` vs `enc_cpu`; the four terminal buckets are echoed on a `buckets:` line for auditability. The same Info gate also enables the per-call cycle accounting — single switch. Pass / workload shape (per-pass dump, `present_texture=…` audit line, per-RT pair stats) lives on the separate `mtld3d::d3d9::passes=trace` switch — those are diagnostics, not perf metrics.
 
 Counter aggregation — mixing these up misreads the log:
 
@@ -126,9 +126,9 @@ Time measurements that flow into the perf summary go through one of:
 - `CycleAddTimer` — sub-scope inside an outer `ApiTimer`, accumulates into a `*mut u64` field (e.g. `query_wait_cycles`).
 - `CycleSetTimer` — once-per-frame measurement that overwrites a `*mut u64` field (e.g. `present_block_cycles`, `op_cycles`, `submit_cycles`, `drawable_wait_tsc`).
 
-All three gate on a static `PERF_TRACKING_ENABLED: AtomicBool` latched once at logger init from `log_enabled!(target: "mtld3d::perf", Level::Debug)`. When perf isn't being reported the helpers cost ~1 ns per call (one `Relaxed` atomic load + branch); when it is, the cached load avoids the per-call env_logger filter walk — the level chosen for the latch (Debug) is paid once at init, not per call.
+All three gate on a static `PERF_TRACKING_ENABLED: AtomicBool` latched once at logger init from `log_enabled!(target: "mtld3d::perf", Level::Info)`. When perf isn't being reported the helpers cost ~1 ns per call (one `Relaxed` atomic load + branch); when it is, the cached load avoids the per-call env_logger filter walk — the level chosen for the latch (Info) is paid once at init, not per call. On a non-`PERF` build the helpers compile to nothing (`cfg(perf_tracking)`).
 
-The summary itself emits at `debug!` on the same target, so the user-facing switch is a single `RUST_LOG=mtld3d::perf=debug` for both the cycle accounting and the rendered grid.
+The summary itself emits at `info!` on the same target, so the user-facing switch on a `PERF=1` build is a single `RUST_LOG=mtld3d::perf=info` for both the cycle accounting and the rendered grid.
 
 A second cached gate, `PAIR_STATS_ENABLED`, latched from `log_enabled!(target: "mtld3d::d3d9::passes", Level::Trace)`, fronts `bump_pair_stats` and the per-pass / `present_texture=…` / per-RT pair lines that `log_frame_summary` appends after the grid. Those are pass-shape and workload-shape diagnostics — they ride the same `mtld3d::d3d9::passes` target as the per-event pass-break / pass-open probes in `windows/core/src/passes.rs`, not the perf target.
 
@@ -142,13 +142,13 @@ Four off-by-default knobs answer "which shader on which RT produced the bad pixe
 
 1. **Pass × shader correlation log** — `RUST_LOG=mtld3d::d3d9=debug`. One `debug!` line per unique `(RT size, VS, PS)` triple; shaders tagged `prog 0x…` (content-hash, stable across runs) or `ff 0x…`. Implementation: `FrameEncoder::maybe_log_pass_shader` from `draw::emit_draw`.
 2. **MSL dumps** — `RUST_LOG=mtld3d::dxso=trace`. Bracketed by `── VS MSL prog 0x… ──` / `── /VS MSL prog 0x… ──` (and PS).
-3. **Raw DXSO bytecode dump** — `MTLD3D_BYTECODE_DUMP=/tmp/mtld3d_shaders`. Writes raw LE `u32` token streams to `{vs|ps}_{id:x}.dxso` on `Create*Shader`. Idempotent per id.
+3. **Raw DXSO bytecode dump** — `debug.bytecodeDumpDir = /tmp/mtld3d_shaders` in `mtld3d.conf`, or one-shot via `MTLD3D_CONFIG="debug.bytecodeDumpDir=/tmp/mtld3d_shaders"`. Writes raw LE `u32` token streams to `{vs|ps}_{id:x}.dxso` on `Create*Shader`. Idempotent per id.
 4. **Offline disassembler** — `cd windows && cargo run --example disasm --target aarch64-apple-darwin -- /tmp/mtld3d_shaders/ps_<id>.dxso`. Prints raw tokens, parsed IR (`{:#?}` on `DxsoProgram`), and emitted MSL. Host-only, no Wine.
 
 Typical workflow:
 
 ```sh
-RUST_LOG=mtld3d=warn,mtld3d::d3d9=debug,mtld3d::dxso=trace MTLD3D_BYTECODE_DUMP=/tmp/mtld3d_shaders ./<game>.exe > /tmp/trace.log 2>&1
+RUST_LOG=mtld3d=warn,mtld3d::d3d9=debug,mtld3d::dxso=trace MTLD3D_CONFIG="debug.bytecodeDumpDir=/tmp/mtld3d_shaders" ./<game>.exe > /tmp/trace.log 2>&1
 ```
 
 Reproduce → grep `pass RT` for suspect ids → grep `── PS MSL <id>` for emitted MSL → `cargo run --example disasm` for deeper analysis → seed a regression test in `core/src/dxso/emit_tests.rs`.

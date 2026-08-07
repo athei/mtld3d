@@ -300,14 +300,14 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*`
 and `env_logger` matches by `::`-separated prefix, so `RUST_LOG=mtld3d=warn`
 is the single switch for the whole project. Examples: `RUST_LOG=mtld3d=warn`,
 `RUST_LOG=mtld3d::d3d9=trace`, `RUST_LOG=mtld3d=warn,mtld3d::unix=trace`,
-`RUST_LOG=mtld3d::perf=debug`.
+`RUST_LOG=mtld3d::perf=info`.
 
 | Target                  | Scope                                                                 |
 |-------------------------|-----------------------------------------------------------------------|
 | `mtld3d::d3d9`          | `windows/d3d9/` + `windows/core/` (everything except `dxso` and `perf`) |
 | `mtld3d::d3d9::cursor`  | hardware cursor (HCURSOR) lifecycle, bitmap cache, wndproc            |
 | `mtld3d::dxso`          | DXSO → MSL emitter                                                    |
-| `mtld3d::perf`          | 5-second averaged performance summary                                 |
+| `mtld3d::perf`          | 5-second averaged performance summary (`PERF=1` builds only)          |
 | `mtld3d::shim`          | Wine unix-call PE shim DLL                                            |
 | `mtld3d::unix`          | Metal-side `.so`                                                      |
 
