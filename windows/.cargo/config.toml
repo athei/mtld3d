@@ -1,12 +1,19 @@
 [build]
 target = "i686-pc-windows-msvc"
 
+# Frame pointers are part of the shipping configuration: the guest-pc sampling
+# profiler recovers call stacks by walking the guest frame-pointer chain, and a
+# build without them stops every walk at the leaf, so profiles captured on
+# end-user machines cannot attribute cost to callers. i686 pins EBP out of
+# 8 GPRs to pay for this, which is a real cost in register-pressure spills;
+# stack-attributed profiles from the field are worth more than the difference.
 [target.i686-pc-windows-msvc]
 linker = "lld-link"
 rustflags = [
     "-C", "target-cpu=nehalem",
     "-C", "target-feature=-crt-static",
     "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
+    "-C", "force-frame-pointers=yes",
     "-Lnative=/opt/xwin/crt/lib/x86",
     "-Lnative=/opt/xwin/sdk/lib/um/x86",
     "-Lnative=/opt/xwin/sdk/lib/ucrt/x86",
@@ -18,6 +25,7 @@ rustflags = [
     "-C", "target-cpu=x86-64-v2",
     "-C", "target-feature=-crt-static",
     "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
+    "-C", "force-frame-pointers=yes",
     "-Lnative=/opt/xwin/crt/lib/x86_64",
     "-Lnative=/opt/xwin/sdk/lib/um/x86_64",
     "-Lnative=/opt/xwin/sdk/lib/ucrt/x86_64",
@@ -39,10 +47,10 @@ rustflags = [
 # (BMI1/BMI2/LZCNT via `-mbmi -mbmi2 -mlzcnt`). cc-rs invokes clang for these
 # targets (the `-idirafter` flags here are clang-style), so these flags
 # propagate without needing an MSVC `/arch:` spelling.
-CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
-CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
-CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
-CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 # `llvm-lib` from the Homebrew llvm keg (keg-only, not on PATH). These paths
 # assume an Apple-Silicon Homebrew prefix; for a different prefix (Intel
 # `/usr/local`, MacPorts, a versioned `llvm@N` keg) override per target via the
