@@ -65,6 +65,21 @@ pub struct StageBindings {
     /// warn for that pair. `SAMPLER_STATE_COUNT == 14`, so `u16` per
     /// sampler covers every legal `type_` index with bits to spare.
     samp_warn_fired: [u16; STAGE_COUNT],
+    /// Bit `stage` set ⇒ `textures[stage]` is non-null.
+    ///
+    /// Maintained by `replace_texture`/`teardown` so the per-draw stage
+    /// walk visits only bound slots instead of all `STAGE_COUNT`.
+    bound_mask: u16,
+    /// Cached [`Self::depth_sampler_mask`] value, maintained incrementally.
+    ///
+    /// Depth-format-ness is fixed at texture creation, so the mask only
+    /// changes when a slot is rebound; caching it turns the per-draw
+    /// variant-key scans into field reads.
+    depth_mask: u16,
+    /// Cached [`Self::volume_sampler_mask`] value; same scheme as `depth_mask`.
+    volume_mask: u16,
+    /// Cached [`Self::depth_fetch_mask`] value; same scheme as `depth_mask`.
+    fetch_mask: u16,
 }
 
 impl StageBindings {
@@ -73,7 +88,19 @@ impl StageBindings {
             textures: [const { CachedComPtr::null() }; STAGE_COUNT],
             sampler_states: *sampler_defaults,
             samp_warn_fired: [0; STAGE_COUNT],
+            bound_mask: 0,
+            depth_mask: 0,
+            volume_mask: 0,
+            fetch_mask: 0,
         }
+    }
+
+    /// Bit `stage` set ⇒ that slot has a texture bound.
+    ///
+    /// The per-draw snapshot walk iterates this instead of probing all
+    /// `STAGE_COUNT` slots.
+    pub const fn bound_mask(&self) -> u16 {
+        self.bound_mask
     }
 
     pub const fn texture(&self, stage: usize) -> *mut Direct3DTexture9 {
@@ -85,13 +112,12 @@ impl StageBindings {
     /// Folded into `VariantKey::depth_sampler_mask` so the PS shader cache
     /// compiles a `depth2d<float>` variant for matching slots.
     pub fn depth_sampler_mask(&self) -> u16 {
-        let mut mask = 0u16;
-        for (stage, slot) in self.textures.iter().enumerate() {
-            if slot.as_ref().is_some_and(Direct3DTexture9::is_depth_format) {
-                mask |= 1u16 << stage;
-            }
-        }
-        mask
+        debug_assert_eq!(
+            self.depth_mask,
+            self.scan_mask(Direct3DTexture9::is_depth_format),
+            "cached depth_mask out of sync with texture slots"
+        );
+        self.depth_mask
     }
 
     /// Bit `i` set ⇒ slot `i` is bound to a volume (3D) texture.
@@ -100,13 +126,12 @@ impl StageBindings {
     /// Folded into `VariantKey::volume_sampler_mask` so the FF PS compiles
     /// a `texture3d<float>` variant for matching slots.
     pub fn volume_sampler_mask(&self) -> u16 {
-        let mut mask = 0u16;
-        for (stage, slot) in self.textures.iter().enumerate() {
-            if slot.as_ref().is_some_and(Direct3DTexture9::is_volume) {
-                mask |= 1u16 << stage;
-            }
-        }
-        mask
+        debug_assert_eq!(
+            self.volume_mask,
+            self.scan_mask(Direct3DTexture9::is_volume),
+            "cached volume_mask out of sync with texture slots"
+        );
+        self.volume_mask
     }
 
     /// Bit `i` set ⇒ slot `i` is bound to a "readable raw depth" FOURCC texture (INTZ/DF24/DF16).
@@ -117,12 +142,22 @@ impl StageBindings {
     /// raw-depth FOURCC formats are read raw rather than as a shadow
     /// comparison. Folded into `VariantKey::depth_fetch_mask`.
     pub fn depth_fetch_mask(&self) -> u16 {
+        debug_assert_eq!(
+            self.fetch_mask,
+            self.scan_mask(|t| mtld3d_core::format::is_raw_depth_fetch_format(t.d3d_format())),
+            "cached fetch_mask out of sync with texture slots"
+        );
+        self.fetch_mask
+    }
+
+    /// Recompute a per-slot predicate mask by walking every texture slot.
+    ///
+    /// Only referenced by the `debug_assert` in-sync guards on the cached
+    /// mask accessors; the per-draw path reads the cached fields.
+    fn scan_mask(&self, pred: impl Fn(&Direct3DTexture9) -> bool) -> u16 {
         let mut mask = 0u16;
         for (stage, slot) in self.textures.iter().enumerate() {
-            if slot
-                .as_ref()
-                .is_some_and(|t| mtld3d_core::format::is_raw_depth_fetch_format(t.d3d_format()))
-            {
+            if slot.as_ref().is_some_and(&pred) {
                 mask |= 1u16 << stage;
             }
         }
@@ -155,19 +190,31 @@ impl StageBindings {
         // calling D3D9 vtable thunk; the game holds a ref across SetTexture,
         // so the stored `is_depth_format` / `is_volume` flags are readable
         // before `adopt`.
-        let (new_depth, new_volume) = if new_nonnull {
+        let (new_depth, new_volume, new_fetch) = if new_nonnull {
             // SAFETY: as above — take a shared reference to the live texture and
-            // read both flags through it (one raw-pointer deref).
+            // read the flags through it (one raw-pointer deref).
             let t = unsafe { &*tex };
-            (t.is_depth_format(), t.is_volume())
+            (
+                t.is_depth_format(),
+                t.is_volume(),
+                mtld3d_core::format::is_raw_depth_fetch_format(t.d3d_format()),
+            )
         } else {
-            (false, false)
+            (false, false, false)
         };
 
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release thunks valid for our
         // lifetime.
         self.textures[stage] = unsafe { CachedComPtr::adopt(tex) };
+
+        // Keep the cached per-slot masks in step with the slot write; the
+        // accessors' debug guards recompute and compare.
+        let bit = 1u16 << stage;
+        self.bound_mask = with_bit(self.bound_mask, bit, new_nonnull);
+        self.depth_mask = with_bit(self.depth_mask, bit, new_depth);
+        self.volume_mask = with_bit(self.volume_mask, bit, new_volume);
+        self.fetch_mask = with_bit(self.fetch_mask, bit, new_fetch);
 
         let mut delta = TextureSwapDelta::empty();
         delta.set(
@@ -249,6 +296,10 @@ impl StageBindings {
         for slot in &mut self.textures {
             *slot = CachedComPtr::null();
         }
+        self.bound_mask = 0;
+        self.depth_mask = 0;
+        self.volume_mask = 0;
+        self.fetch_mask = 0;
     }
 
     /// `IDirect3DDevice9::Reset` analog of `teardown`.
@@ -265,6 +316,13 @@ impl StageBindings {
         self.teardown();
         self.sampler_states = *sampler_defaults;
     }
+}
+
+/// Return `mask` with `bit` set when `on`, cleared otherwise.
+///
+/// Shared by the cached-mask updates in [`StageBindings::replace_texture`].
+const fn with_bit(mask: u16, bit: u16, on: bool) -> u16 {
+    if on { mask | bit } else { mask & !bit }
 }
 
 // ── Silent-write audit: D3DSAMP_* classifier ──

@@ -1,4 +1,4 @@
-use core::{ffi::c_void, ptr::NonNull};
+use core::{ffi::c_void, mem::MaybeUninit, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -66,10 +66,10 @@ use super::{
     cursor::{self, CursorState},
     direct3d9::{depth_format_has_stencil, is_depth_stencil_format},
     draw::{
-        AttrSnapshot, ConstSource, CurrentSnapshot, CurrentSnapshotPtr, DepthScissorFlags,
-        DepthStencilFlags, DrawOp, IndexSource, PsSource, PsSourcePtr, RenderStatePtr,
-        RenderStateSnapshot, ScratchSlice, StageBinding, VertexSource, VsSource, VsSourcePtr,
-        arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
+        AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DepthScissorFlags, DepthStencilFlags,
+        DrawOp, IndexSource, PsSource, PsSourcePtr, RenderStatePtr, RenderStateSnapshot,
+        ScratchSlice, StageBinding, VertexSource, VsSource, VsSourcePtr, arena_alloc_bytes,
+        build_alpha_ref_bytes, bump_packed_stage_bindings,
     },
     encoder::{
         BlitSide, EncoderThread, FrameData, FrameEncoder, FrameInit, Op, StagingWarmupEntry,
@@ -8245,15 +8245,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // PS_CONST source. Same routing as VS_CONST: programmable PS uses
     // the encoder mirror; only FF runs here.
-    let ps_const_src = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
-        let vec = dev.ff_state().build_ps_constants(rs);
-        Some(ConstSource::Owned(vec))
+    let ps_const_buf = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
+        Some(dev.ff_state().build_ps_constants(rs))
     } else {
         None
     };
 
     // ALPHA_REF + FOG_COLOR bytes (variant must be current).
-    let alpha_ref_vec = if dirty.contains(SnapshotDirty::ALPHA_REF) {
+    let alpha_ref_buf = if dirty.contains(SnapshotDirty::ALPHA_REF) {
         let variant = variant_value
             .or(dev.snapshot_cache.variant)
             .unwrap_or_default();
@@ -8261,7 +8260,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
-    let fog_color_vec = if dirty.contains(SnapshotDirty::FOG_COLOR) {
+    let fog_color_buf = if dirty.contains(SnapshotDirty::FOG_COLOR) {
         let variant = variant_value
             .or(dev.snapshot_cache.variant)
             .unwrap_or_default();
@@ -8272,7 +8271,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // Bump-environment matrix bytes (PS slot 12). Built only when a bump TSS
     // state changed (rare); the slot is bound at draw time only for a PS that
     // actually uses texbem/texbeml/bem.
-    let bump_env_vec = if dirty.contains(SnapshotDirty::BUMP_ENV) {
+    let bump_env_buf = if dirty.contains(SnapshotDirty::BUMP_ENV) {
         Some(dev.ff_state().build_bump_env_bytes())
     } else {
         None
@@ -8281,20 +8280,17 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // constant changed (rare) or on the first draw of a frame (all-dirty); the
     // slot is bound at draw time only for a VS that reads a dynamic integer
     // constant. Mirrors the bump-env capture above.
-    let vs_int_const_vec = if dirty.contains(SnapshotDirty::VS_CONST_I) {
+    let vs_int_const_buf = if dirty.contains(SnapshotDirty::VS_CONST_I) {
         Some(dev.shader_bindings().vs_constants_i_bytes())
     } else {
         None
     };
 
-    // Phase 2: take scratch + bump dirty pieces + update cache. SAFETY
-    // (`Borrowed` ConstSource arms): the (ptr, len) pairs alias
-    // `dev.shader_bindings.{vs,ps}_constants[]`, which
-    // emit_snapshot_deltas (synchronous API thread) does not allow
-    // any `Set*ShaderConstantF` to mutate between source read and
-    // copy. Direct field access on `dev.current_frame.scratch` splits
-    // the borrow off `dev.snapshot_cache`, letting both be
-    // mutated/read in turn.
+    // Phase 2: take scratch + bump dirty pieces + update cache. The
+    // const payloads above are fixed stack buffers built in Phase 1, so
+    // nothing here aliases device state. Direct field access on
+    // `dev.current_frame.scratch` splits the borrow off
+    // `dev.snapshot_cache`, letting both be mutated/read in turn.
     let scratch = dev.current_frame.scratch_mut();
 
     // ── consts_timer SCOPE: VS/PS const + alpha/fog bumps. Matches
@@ -8311,19 +8307,19 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         dev.snapshot_cache.vs_constants = None;
     }
     if dirty.contains(SnapshotDirty::PS_CONST) {
-        dev.snapshot_cache.ps_constants = ps_const_src.map(|src| src.alloc_into(scratch));
+        dev.snapshot_cache.ps_constants = ps_const_buf.map(|b| arena_alloc_bytes(scratch, &b));
     }
-    if let Some(v) = alpha_ref_vec {
-        dev.snapshot_cache.alpha_ref_bytes = Some(arena_alloc_bytes(scratch, &v));
+    if let Some((buf, len)) = alpha_ref_buf {
+        dev.snapshot_cache.alpha_ref_bytes = Some(arena_alloc_bytes(scratch, &buf[..len]));
     }
-    if let Some(v) = fog_color_vec {
-        dev.snapshot_cache.fog_color_bytes = Some(arena_alloc_bytes(scratch, &v));
+    if let Some((buf, len)) = fog_color_buf {
+        dev.snapshot_cache.fog_color_bytes = Some(arena_alloc_bytes(scratch, &buf[..len]));
     }
-    if let Some(v) = bump_env_vec {
-        dev.snapshot_cache.bump_env_bytes = Some(arena_alloc_bytes(scratch, &v));
+    if let Some(buf) = bump_env_buf {
+        dev.snapshot_cache.bump_env_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
-    if let Some(v) = vs_int_const_vec {
-        dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &v));
+    if let Some(buf) = vs_int_const_buf {
+        dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     drop(consts_timer);
     // ── END consts_timer SCOPE ──
@@ -8343,14 +8339,23 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             .expect("ScratchArena returned non-null");
         dev.snapshot_cache.render_state = Some(RenderStatePtr(ptr));
     }
-    if let Some((arr, packed_mask)) = stage_bindings_arr_opt {
-        // SAFETY: StageBinding fields are TextureInfo (integer / enum
-        // / bitflag primitives) + sampler_state [u32; N] — trivial
-        // Drop, bytewise scratch copy is sound (same contract as the
-        // prior flat-array bump). The packed form only memcpys the
-        // bound slots, collapsing the per-draw bump from ~2 KB to
-        // ~120-360 B for typical WoW workloads.
-        let ptr = unsafe { bump_packed_stage_bindings(scratch, packed_mask, &arr) };
+    if let Some((packed, packed_mask)) = stage_bindings_arr_opt {
+        // SAFETY: `snapshot_stage_bindings` initialised the first
+        // `popcount(packed_mask)` slots of `packed` (its returned mask
+        // agrees with the entries written), so the prefix reinterpret
+        // is sound.
+        let prefix = unsafe {
+            core::slice::from_raw_parts(
+                packed.as_ptr().cast::<StageBinding>(),
+                packed_mask.count_ones() as usize,
+            )
+        };
+        // SAFETY: StageBinding fields are TextureId + sampler_state
+        // [u32; N] — trivial Drop, bytewise scratch copy is sound (same
+        // contract as the prior flat-array bump). The packed form only
+        // memcpys the bound slots, collapsing the per-draw bump from
+        // ~2 KB to ~120-360 B for typical WoW workloads.
+        let ptr = unsafe { bump_packed_stage_bindings(scratch, packed_mask, prefix) };
         dev.snapshot_cache.stage_bindings = Some(ptr);
     }
     if let Some((attrs_vec, stride, vdecl_hash)) = vdecl_value {
@@ -8401,7 +8406,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     drop(bumps_timer);
 }
 
-/// Capture bound textures as `TextureInfo` snapshots plus the bound-texture bitmask.
+/// Capture bound textures as a packed [`StageBinding`] prefix plus the bound-stage masks.
+///
+/// Walks only the set bits of `StageBindings::bound_mask` and writes the
+/// captured bindings as an initialised prefix of the returned array: the
+/// first `popcount(packed_mask)` slots, in ascending stage order, exactly
+/// the layout `bump_packed_stage_bindings` copies into scratch. Returns
+/// `(packed prefix, FF bound-texture mask (stages 0–7), packed_mask)`.
 ///
 /// Uploads are handled independently of draw-time
 /// binding capture: `texture_unlock_rect` / `texture_add_dirty_rect` push
@@ -8409,23 +8420,34 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 /// longer touches staging bytes.
 fn snapshot_stage_bindings(
     dev: &mut DeviceInner,
-) -> ([Option<StageBinding>; STAGE_COUNT], u8, u16) {
-    let mut stage_bindings: [Option<StageBinding>; STAGE_COUNT] = core::array::from_fn(|_| None);
+) -> ([MaybeUninit<StageBinding>; STAGE_COUNT], u8, u16) {
+    let mut packed: [MaybeUninit<StageBinding>; STAGE_COUNT] =
+        [const { MaybeUninit::uninit() }; STAGE_COUNT];
     let mut bound_texture_mask: u8 = 0;
-    let mut packed_mask: u16 = 0;
-    for (stage, slot) in stage_bindings.iter_mut().enumerate() {
+    let mut out_idx: usize = 0;
+    let mut packed_mask = dev.stage_bindings().bound_mask();
+    let mut remaining = packed_mask;
+    while remaining != 0 {
+        let stage = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
         let tex_ptr = dev.stage_bindings().texture(stage);
         if tex_ptr.is_null() {
+            // `bound_mask` promises a non-null slot; a mismatch means the
+            // incremental mask update drifted. Drop the bit so the packed
+            // count stays in agreement with the entries actually written.
+            debug_assert!(false, "bound_mask bit {stage} set for a null texture slot");
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "stage {stage}: bound_mask set but texture slot is null; skipping"
+            );
+            packed_mask &= !(1u16 << stage);
             continue;
         }
-        packed_mask |= 1u16 << stage;
         // FF combiner only consumes stages 0–7 (MaxTextureBlendStages = 8);
         // stages 8–15 are programmable-PS-only and would shift past the
         // u8 mask width.
-        if let Ok(stage_u8) = u8::try_from(stage)
-            && stage_u8 < 8
-        {
-            bound_texture_mask |= 1u8 << stage_u8;
+        if stage < 8 {
+            bound_texture_mask |= 1u8 << stage;
         }
         let mut sampler_state = dev.stage_bindings().sampler_states(stage);
         // Lazy texture upload: flush any per-mip `dirty` flags before
@@ -8463,10 +8485,11 @@ fn snapshot_stage_bindings(
             let max_mip = sampler_state[D3DSAMP_MAXMIPLEVEL as usize];
             sampler_state[D3DSAMP_MAXMIPLEVEL as usize] = max_mip.max(lod);
         }
-        *slot = Some(StageBinding {
+        packed[out_idx].write(StageBinding {
             texture_id: tex.texture_id(),
             sampler_state,
         });
+        out_idx += 1;
         // Diag probe: when a depth-format texture lands on a sampler
         // slot the emitter treats it as `depth2d<float>` and emits
         // `sample_compare`. Log its id + D3D / Metal format so a wrong
@@ -8488,7 +8511,12 @@ fn snapshot_stage_bindings(
             );
         }
     }
-    (stage_bindings, bound_texture_mask, packed_mask)
+    debug_assert_eq!(
+        out_idx,
+        packed_mask.count_ones() as usize,
+        "packed prefix length must equal the popcount of the returned mask"
+    );
+    (packed, bound_texture_mask, packed_mask)
 }
 
 extern "system" fn device_draw_indexed_primitive_up(

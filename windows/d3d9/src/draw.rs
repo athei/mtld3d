@@ -340,11 +340,13 @@ impl<'a> Iterator for StageBindingsIter<'a> {
     }
 }
 
-/// Bump-allocate the bound stages of `src` into `scratch` as a packed array.
+/// Bump-allocate an already-packed `StageBinding` prefix into `scratch`.
 ///
 /// Returns a `StageBindingsPtr` referencing the
-/// `[StageBinding; popcount(mask)]` payload. `mask` must agree with `src` —
-/// bit `b` set iff `src[b].is_some()`; debug-assert verifies this.
+/// `[StageBinding; popcount(mask)]` payload. `packed` must agree with
+/// `mask`: entry `i` is the binding for the `i`-th set bit, ascending
+/// (the layout `snapshot_stage_bindings` produces); a debug-assert
+/// verifies the length.
 ///
 /// Mask 0 (no bound stages) returns a `dangling()` pointer; readers
 /// see an iter that immediately returns `None`, so the pointer is
@@ -359,21 +361,29 @@ impl<'a> Iterator for StageBindingsIter<'a> {
 pub unsafe fn bump_packed_stage_bindings(
     scratch: &mut ScratchArena,
     mask: u16,
-    src: &[Option<StageBinding>; STAGE_COUNT],
+    packed: &[StageBinding],
 ) -> StageBindingsPtr {
-    // SAFETY: forwarded from caller's contract on `bump_packed_stage_bindings`.
-    let packed =
-        unsafe { scratch.alloc_packed_by_mask::<StageBinding, STAGE_COUNT>(u32::from(mask), src) };
-    packed.map_or_else(
-        || StageBindingsPtr {
+    debug_assert_eq!(
+        packed.len(),
+        mask.count_ones() as usize,
+        "packed prefix length must equal popcount(mask)"
+    );
+    if mask == 0 {
+        return StageBindingsPtr {
             mask: 0,
             bindings: NonNull::dangling(),
-        },
-        |p| StageBindingsPtr {
-            mask,
-            bindings: NonNull::new(p).expect("ScratchArena returned non-null"),
-        },
-    )
+        };
+    }
+    let dst = scratch.alloc_uninit_slice::<StageBinding>(packed.len());
+    // SAFETY: `alloc_uninit_slice` reserved `packed.len()` consecutive
+    // `StageBinding` slots at `dst`; source and destination are disjoint
+    // allocations. The bytewise copy is sound per this function's
+    // trivial-Drop contract.
+    unsafe { core::ptr::copy_nonoverlapping(packed.as_ptr(), dst, packed.len()) };
+    StageBindingsPtr {
+        mask,
+        bindings: NonNull::new(dst).expect("ScratchArena returned non-null"),
+    }
 }
 
 bitflags::bitflags! {
@@ -815,33 +825,6 @@ pub fn arena_alloc_bytes(scratch: &mut ScratchArena, bytes: &[u8]) -> ScratchSli
     ScratchSlice { ptr: nn, len }
 }
 
-/// Two-phase carrier for per-draw FF shader constants.
-///
-/// Phase 1 (state read on API thread) populates one of the variants;
-/// Phase 2 ([`Self::alloc_into`]) consumes it under a `&mut ScratchArena`
-/// borrow. Lets `emit_snapshot_deltas` defer the arena mutable borrow past
-/// the immutable `render_states` borrow without dragging the FF PS path
-/// through a stack-temp.
-///
-/// Programmable VS/PS no longer route through `ConstSource` — the
-/// encoder maintains its own const mirror and snapshots into scratch
-/// at `emit_draw` time. Only the two FF arms reach here.
-pub enum ConstSource {
-    /// FF PS path — `build_ps_constants` allocates a small heap `Vec` (16 B of texture factor).
-    ///
-    /// Copied into the arena in Phase 2.
-    Owned(Vec<u8>),
-}
-
-impl ConstSource {
-    /// Phase 2: bump-copy the bytes into `scratch` and return the resulting [`ScratchSlice`].
-    pub fn alloc_into(self, scratch: &mut ScratchArena) -> ScratchSlice {
-        match self {
-            Self::Owned(v) => arena_alloc_bytes(scratch, &v),
-        }
-    }
-}
-
 bitflags::bitflags! {
     /// Boolean RS bits that DON'T affect pipeline identity (depth test/write, scissor enable).
     ///
@@ -916,12 +899,14 @@ impl RenderStateSnapshot {
 
 /// Serialize the D3D9 alpha-reference float for upload to the PS slot-14 buffer.
 ///
-/// Returns empty when alpha test is off, so `emit_draw` can skip the bind.
-pub fn build_alpha_ref_bytes(variant: VariantKey, alpha_ref: f32) -> Vec<u8> {
+/// Returns `(buffer, len)` with `len == 0` when alpha test is off, so
+/// `emit_draw` can skip the bind. A fixed buffer (not a `Vec`) so the
+/// per-dirty-draw build never touches the allocator.
+pub const fn build_alpha_ref_bytes(variant: VariantKey, alpha_ref: f32) -> ([u8; 4], usize) {
     if variant.alpha_func == 0 || variant.alpha_func == 8 {
-        return Vec::new();
+        return ([0u8; 4], 0);
     }
-    alpha_ref.to_le_bytes().to_vec()
+    (alpha_ref.to_le_bytes(), 4)
 }
 
 /// `debug.skipShaders = hex,hex,…` shader-identity bisection probe.

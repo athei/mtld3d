@@ -116,7 +116,6 @@ windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerKey Clone,Copy,PartialEq,Eq,Hash,Debug
-windows/core/src/scratch.rs Slot Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/shader_cache.rs CacheEntry Clone,Debug,PartialEq,Eq
 windows/core/src/shader_cache.rs CachedKind Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/shader_compile_stats.rs CompileBucket Clone,Copy,Debug,PartialEq,Eq

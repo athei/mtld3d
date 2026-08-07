@@ -100,14 +100,34 @@ impl ScratchArena {
     ///
     /// Underpins both `alloc` (which then memcpys data in) and
     /// `alloc_uninit` (which lets the caller write via raw ptr).
+    ///
+    /// The in-chunk bump is a compare and an add; keeping it inline (and
+    /// the refill/oversized tail outlined `#[cold]`) is what lets the
+    /// per-draw snapshot bumps avoid a call per allocation. Unsplit, the
+    /// body is large enough that LLVM declines to inline it even under
+    /// fat LTO, and every bump then pays a full call.
+    #[inline]
     fn reserve(&mut self, size: usize) -> *mut u8 {
         let aligned = align_up(size, ALIGN);
+        // Fast path: current chunk has room.
+        if aligned <= self.chunk_size
+            && !self.small_chunks.is_empty()
+            && self.cursor + aligned <= self.hot_chunk_len()
+        {
+            return self.bump_in_current_chunk(aligned);
+        }
+        self.reserve_slow(aligned)
+    }
+
+    /// Refill tail of [`Self::reserve`]: oversized requests, cold arena, full chunk.
+    ///
+    /// Outlined and `#[cold]` so the chunk-allocation machinery does not
+    /// count against the inline cost of the fast path above.
+    #[cold]
+    #[inline(never)]
+    fn reserve_slow(&mut self, aligned: usize) -> *mut u8 {
         if aligned > self.chunk_size {
             return self.reserve_oversized(aligned);
-        }
-        // Fast path: current chunk has room.
-        if !self.small_chunks.is_empty() && self.cursor + aligned <= self.hot_chunk_len() {
-            return self.bump_in_current_chunk(aligned);
         }
         // Cursor doesn't fit (or arena is cold). Walk forward to the next
         // retained chunk if there is one; otherwise grow the vec.
@@ -126,6 +146,7 @@ impl ScratchArena {
         self.bump_in_current_chunk(aligned)
     }
 
+    #[inline]
     fn bump_in_current_chunk(&mut self, aligned: usize) -> *mut u8 {
         let chunk = &mut self.small_chunks[self.current_chunk_idx];
         // SAFETY: caller (`reserve`) verified `self.cursor + aligned`
@@ -145,6 +166,7 @@ impl ScratchArena {
     /// Copy `data` into the arena and return a stable pointer cast to `u64`.
     ///
     /// Pointer validity ends at the next `clear()`.
+    #[inline]
     pub fn alloc(&mut self, data: &[u8]) -> u64 {
         let ptr = self.reserve(data.len());
         // SAFETY: `reserve` returned `data.len()`-bytes-aligned-up space;
@@ -223,65 +245,6 @@ impl ScratchArena {
             )
         };
         self.alloc(bytes) as *mut T
-    }
-
-    /// Bump-copy only the `Some` slots of `src` into the arena, in ascending bit-order of `mask`.
-    ///
-    /// Returns a pointer to the packed array of `popcount(mask)` `T`s
-    /// (or `None` when `mask == 0`).
-    ///
-    /// `mask` must agree with `src`: bit `b` set iff `src[b].is_some()`.
-    /// A `debug_assert!` enforces this; in release builds a stale-bit
-    /// mismatch would unwind via the `expect` on the slot.
-    ///
-    /// Designed for per-draw snapshot bumps where only a few of N
-    /// possible slots are populated — collapses a `~N × size_of::<T>()`
-    /// memcpy to `popcount × size_of::<T>()`.
-    ///
-    /// # Safety
-    ///
-    /// The scratch copy is never dropped. Sound only when `T` has no
-    /// `Drop` side effects (same contract as `alloc_from`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `mask` has a bit set whose corresponding `src` slot is
-    /// `None` — caller violated the agreement invariant.
-    pub unsafe fn alloc_packed_by_mask<T, const N: usize>(
-        &mut self,
-        mask: u32,
-        src: &[Option<T>; N],
-    ) -> Option<*mut T> {
-        debug_assert!(
-            N <= 32,
-            "alloc_packed_by_mask: mask is u32, supports at most 32 slots"
-        );
-        let count = mask.count_ones() as usize;
-        if count == 0 {
-            return None;
-        }
-        let dst = self.reserve(count * core::mem::size_of::<T>()).cast::<T>();
-        let mut remaining = mask;
-        let mut out_idx: usize = 0;
-        while remaining != 0 {
-            let bit = remaining.trailing_zeros() as usize;
-            remaining &= remaining - 1;
-            debug_assert!(bit < N, "alloc_packed_by_mask: mask bit beyond slot count");
-            let slot = src[bit]
-                .as_ref()
-                .expect("alloc_packed_by_mask: mask bit set but slot is None");
-            // SAFETY: `dst` has `count` consecutive `T` slots reserved
-            // and `out_idx` is < count, so `dst.add(out_idx)` is
-            // in-bounds.
-            let dst_slot = unsafe { dst.add(out_idx) };
-            // SAFETY: source (stack/heap) and destination (scratch
-            // arena) are disjoint allocations and both cover one `T`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(core::ptr::from_ref(slot), dst_slot, 1);
-            }
-            out_idx += 1;
-        }
-        Some(dst)
     }
 
     /// Bump-copy a slice of `T` into the arena and return a typed pointer + length.
@@ -392,6 +355,7 @@ impl ScratchArena {
         small_full + over
     }
 
+    #[inline]
     fn hot_chunk_len(&self) -> usize {
         self.small_chunks
             .get(self.current_chunk_idx)
@@ -585,91 +549,6 @@ mod tests {
         arena.alloc(&[0u8; 1]);
         let ptr: *mut [f32; 4] = arena.alloc_uninit_slice::<[f32; 4]>(3);
         assert_eq!(ptr.addr() % ALIGN, 0);
-    }
-
-    #[test]
-    fn alloc_packed_by_mask_round_trips_sparse_slots() {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        struct Slot {
-            a: u32,
-            b: u32,
-            c: u32,
-        }
-        let mut src: [Option<Slot>; 16] = [None; 16];
-        src[0] = Some(Slot {
-            a: 10,
-            b: 11,
-            c: 12,
-        });
-        src[3] = Some(Slot {
-            a: 30,
-            b: 31,
-            c: 32,
-        });
-        src[7] = Some(Slot {
-            a: 70,
-            b: 71,
-            c: 72,
-        });
-        let mask: u32 = (1 << 0) | (1 << 3) | (1 << 7);
-
-        let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-        // SAFETY: Slot is Copy with trivial Drop; bytewise scratch copy
-        // is sound per `alloc_packed_by_mask`'s contract.
-        let ptr =
-            unsafe { arena.alloc_packed_by_mask::<Slot, 16>(mask, &src) }.expect("non-empty mask");
-        // SAFETY: `alloc_packed_by_mask` reserved `popcount(mask) = 3`
-        // consecutive `Slot`s starting at `ptr`.
-        let packed: &[Slot] = unsafe { core::slice::from_raw_parts(ptr.cast_const(), 3) };
-        assert_eq!(
-            packed[0],
-            Slot {
-                a: 10,
-                b: 11,
-                c: 12
-            }
-        );
-        assert_eq!(
-            packed[1],
-            Slot {
-                a: 30,
-                b: 31,
-                c: 32
-            }
-        );
-        assert_eq!(
-            packed[2],
-            Slot {
-                a: 70,
-                b: 71,
-                c: 72
-            }
-        );
-    }
-
-    #[test]
-    fn alloc_packed_by_mask_empty_mask_returns_none() {
-        let src: [Option<u32>; 16] = [None; 16];
-        let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-        // SAFETY: u32 is trivially Copy.
-        let result = unsafe { arena.alloc_packed_by_mask::<u32, 16>(0, &src) };
-        assert!(result.is_none());
-        assert_eq!(arena.bytes_used(), 0, "empty mask must not bump");
-    }
-
-    #[test]
-    fn alloc_packed_by_mask_full_mask_copies_every_slot() {
-        let src: [Option<u32>; 8] =
-            core::array::from_fn(|i| Some(u32::try_from(i).expect("i ≤ 7 fits u32") * 100));
-        let mask: u32 = 0xFF;
-        let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-        // SAFETY: u32 is trivially Copy.
-        let ptr = unsafe { arena.alloc_packed_by_mask::<u32, 8>(mask, &src) }.expect("full mask");
-        // SAFETY: reserved 8 consecutive u32s starting at ptr.
-        let packed: &[u32] = unsafe { core::slice::from_raw_parts(ptr.cast_const(), 8) };
-        for (i, &v) in packed.iter().enumerate() {
-            assert_eq!(v, u32::try_from(i).expect("i ≤ 7 fits u32") * 100);
-        }
     }
 
     #[test]

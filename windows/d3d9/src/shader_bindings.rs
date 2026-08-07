@@ -187,12 +187,15 @@ impl ShaderBindings {
     /// The VS integer-constant file as native-endian bytes.
     ///
     /// `INT_CONSTANT_ROWS` × `int4` = 256 B, ready to bind as the shader's
-    /// `vs_i` buffer (slot 14).
-    pub fn vs_constants_i_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(INT_CONSTANT_ROWS * 4 * 4);
+    /// `vs_i` buffer (slot 14). A fixed array (not a `Vec`) so the
+    /// per-dirty-draw build never touches the allocator.
+    pub fn vs_constants_i_bytes(&self) -> [u8; INT_CONSTANT_ROWS * 4 * 4] {
+        let mut out = [0u8; INT_CONSTANT_ROWS * 4 * 4];
+        let mut off = 0;
         for row in &self.vs_constants_i {
             for &v in row {
-                out.extend_from_slice(&v.to_ne_bytes());
+                out[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+                off += 4;
             }
         }
         out

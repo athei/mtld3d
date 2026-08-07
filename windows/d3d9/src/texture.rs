@@ -202,12 +202,14 @@ pub struct TextureInner {
     block_h: u32,
     block_bytes: u32,
 
-    /// Per-mip "needs upload" flag set at non-READONLY `UnlockRect`.
+    /// Per-mip "needs upload" mask, bit `level` set at non-READONLY `UnlockRect`.
     ///
     /// Cleared by `flush_dirty_mips` at bind time. The bind-time flush
     /// schedules a full-mip upload via `schedule_upload`; no sub-rect is
-    /// tracked here, so granularity is per-mip.
-    dirty: Vec<bool>,
+    /// tracked here, so granularity is per-mip. A mask (not a `Vec<bool>`)
+    /// so the every-draw bind-time gate is a single load; level count is
+    /// bounded by log2(max texture dim 16384) + 1 = 15 bits.
+    dirty_mask: u32,
     /// `LockRect(D3DLOCK_READONLY)` stash per mip.
     ///
     /// Suppresses the upload at `UnlockRect` so a game's read-only inspection
@@ -245,8 +247,8 @@ pub struct TextureInner {
     /// since the last copy (the bounding box of every `AddDirtyRect` and
     /// non-`READONLY` `UnlockRect` since then). Created full-dirty;
     /// `UpdateTexture` copies only the dirty region and then clears it, so a
-    /// second copy from a clean source does nothing. Distinct from `dirty` (the
-    /// GPU-upload-needed flag).
+    /// second copy from a clean source does nothing. Distinct from
+    /// `dirty_mask` (the GPU-upload-needed flag).
     update_dirty: Vec<Option<DirtyRect>>,
     /// The `D3DPOOL` this texture was created in.
     ///
@@ -500,9 +502,7 @@ impl TextureInner {
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
             }
         }
-        if let Some(d) = self.dirty.get_mut(dst_level) {
-            *d = true;
-        }
+        self.mark_mip_dirty(dst_level);
         true
     }
 
@@ -587,9 +587,7 @@ impl TextureInner {
                 encode_rgb_pixel(dst_fmt, rgba, out);
             }
         }
-        if let Some(d) = self.dirty.get_mut(dst_level) {
-            *d = true;
-        }
+        self.mark_mip_dirty(dst_level);
         true
     }
 
@@ -666,9 +664,7 @@ impl TextureInner {
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
             }
         }
-        if let Some(d) = self.dirty.get_mut(dst_level) {
-            *d = true;
-        }
+        self.mark_mip_dirty(dst_level);
         true
     }
 
@@ -731,7 +727,7 @@ impl TextureInner {
     ///     `rehydrate_for_device` on a new device knows which mips to
     ///     re-mark dirty.
     ///
-    /// `dirty[level]` is left alone — it's still a "needs upload" hint.
+    /// `dirty_mask` is left alone — it's still a "needs upload" hint.
     pub fn detach_from_device(&mut self) {
         self.device_inner = 0;
         self.device_handle = MetalHandle::NULL;
@@ -1001,6 +997,17 @@ impl TextureInner {
         self.locked.get(level).copied().unwrap_or(false)
     }
 
+    /// Set `level`'s bit in `dirty_mask`; the next bind-time flush re-uploads the mip.
+    ///
+    /// An out-of-range `level` is ignored, mirroring the bounds tolerance
+    /// the format-conversion call sites relied on when this was a
+    /// `Vec<bool>` written through `get_mut`.
+    pub fn mark_mip_dirty(&mut self, level: usize) {
+        if level < (self.levels as usize).min(32) {
+            self.dirty_mask |= 1 << level;
+        }
+    }
+
     /// Union `rect` (the whole mip when `None`) into the source dirty region for `level`.
     ///
     /// Called on every `AddDirtyRect` and non-`READONLY` `UnlockRect`.
@@ -1257,7 +1264,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         block_w: info.block_w,
         block_h: info.block_h,
         block_bytes: info.block_bytes,
-        dirty: vec![false; mip_count],
+        dirty_mask: 0,
         current_lock_readonly: vec![false; mip_count],
         current_lock_no_dirty: vec![false; mip_count],
         last_submit_seq: vec![0; mip_count],
@@ -1939,7 +1946,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     // `flush_dirty_mips` dispatches the actual upload via
     // `schedule_upload` — Unlock is now a single byte write, the
     // Box+Arc+Vec work happens at first bind after this Unlock.
-    ti.dirty[level_u] = true;
+    ti.mark_mip_dirty(level_u);
     let texture_id = ti.texture_id;
     let device_inner_ptr = ti.device_inner;
     mtld3d_shared::log_once_trace_by!(
@@ -2171,7 +2178,7 @@ pub fn evict_mark_dirty(ti: &mut TextureInner) -> Option<TextureId> {
     let mut had_uploads = false;
     for level in 0..ti.levels as usize {
         if ti.was_uploaded[level] {
-            ti.dirty[level] = true;
+            ti.mark_mip_dirty(level);
             had_uploads = true;
         }
     }
@@ -2198,16 +2205,27 @@ pub fn evict_mark_dirty(ti: &mut TextureInner) -> Option<TextureId> {
 ///
 /// Idempotent: returns immediately when `ti.device_inner` already matches
 /// `dev`. Called from every bind site (draw + `StretchRect` + similar).
+#[inline]
 pub fn rehydrate_for_device(ti: &mut TextureInner, dev: &mut DeviceInner) {
     let dev_ptr = std::ptr::from_mut::<DeviceInner>(dev) as u64;
     if ti.device_inner == dev_ptr {
         return;
     }
+    rehydrate_for_device_slow(ti, dev, dev_ptr);
+}
+
+/// Migration tail of [`rehydrate_for_device`], reached only on a device change.
+///
+/// Outlined `#[cold]` so the per-draw bind path inlines just the
+/// same-device pointer compare above.
+#[cold]
+#[inline(never)]
+fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_ptr: u64) {
     let texture_id = ti.texture_id;
     let mut levels_remarked: u32 = 0;
     for level in 0..ti.levels as usize {
         if ti.was_uploaded[level] {
-            ti.dirty[level] = true;
+            ti.mark_mip_dirty(level);
             levels_remarked += 1;
         }
         // Old seq is from the old device's encoder counter — meaningless
@@ -2231,7 +2249,7 @@ pub fn rehydrate_for_device(ti: &mut TextureInner, dev: &mut DeviceInner) {
     );
 }
 
-/// Walk a texture's per-mip `dirty` flags and dispatch a full-mip upload for every dirty level.
+/// Walk a texture's `dirty_mask` and dispatch a full-mip upload for every dirty level.
 ///
 /// Called at bind time from `device.rs::snapshot_stage_bindings` (every Draw)
 /// and `device.rs::device_stretch_rect` (`StretchRect` texture-source).
@@ -2240,24 +2258,37 @@ pub fn rehydrate_for_device(ti: &mut TextureInner, dev: &mut DeviceInner) {
 /// duration of this call. The `dev` parameter avoids lifting a second
 /// `&mut DeviceInner` from `ti.device_inner` (which would alias the
 /// caller's already-held `dev` borrow).
+#[inline]
 pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
+    if ti.dirty_mask == 0 {
+        return;
+    }
+    flush_dirty_mips_slow(ti, dev);
+}
+
+/// Upload tail of [`flush_dirty_mips`], reached only when some mip is dirty.
+///
+/// Outlined `#[cold]` so the per-draw bind path inlines just the
+/// mask-is-zero gate above.
+#[cold]
+#[inline(never)]
+fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
     let mut dirty_count: u32 = 0;
-    for level in 0..ti.levels {
+    let mut mask = ti.dirty_mask;
+    ti.dirty_mask = 0;
+    while mask != 0 {
+        let level = mask.trailing_zeros();
+        mask &= mask - 1;
         let level_u = level as usize;
-        if ti.dirty[level_u] {
-            let rect = DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]);
-            schedule_upload(ti, dev, level, rect);
-            ti.dirty[level_u] = false;
-            dirty_count += 1;
-        }
+        let rect = DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]);
+        schedule_upload(ti, dev, level, rect);
+        dirty_count += 1;
     }
-    if dirty_count > 0 {
-        let texture_id = ti.texture_id;
-        mtld3d_shared::log_once_trace_by!(
-            target: TEX_TRACE_TARGET, key: texture_id.raw(),
-            "tex {texture_id:#x} flush dirty levels={dirty_count}"
-        );
-    }
+    let texture_id = ti.texture_id;
+    mtld3d_shared::log_once_trace_by!(
+        target: TEX_TRACE_TARGET, key: texture_id.raw(),
+        "tex {texture_id:#x} flush dirty levels={dirty_count}"
+    );
 }
 
 // ── IDirect3DVolumeTexture9 (volume / 3D textures) ──
@@ -2509,7 +2540,7 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
     // box through the encoder as a `depth`-slice `CopyBufferToTexture`. The
     // staging retains every byte the game wrote, so a full-box re-upload on
     // each Unlock subsumes any sub-box lock.
-    inner.dirty[lvl] = true;
+    inner.mark_mip_dirty(lvl);
     let device_inner_ptr = inner.device_inner();
     // `inner` is not used past this point, so lifting a `&mut DeviceInner` from
     // the recorded pointer does not alias it (distinct allocations anyway).

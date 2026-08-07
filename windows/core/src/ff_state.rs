@@ -707,12 +707,14 @@ impl FfState {
     /// `bump_env[s*2+1] = (lscale, loffset, 0, 0)` — matching the indexing the
     /// DXSO emitter uses (`bump_matrix_exprs` / `bump_lum_exprs`). Eight stages,
     /// 256 bytes total. The TSS values are stored as `u32` bit patterns of the
-    /// `f32` the game wrote via `SetTextureStageState`.
+    /// `f32` the game wrote via `SetTextureStageState`. A fixed array (not a
+    /// `Vec`) so the per-dirty-draw build never touches the allocator.
     #[must_use]
-    pub fn build_bump_env_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 * 2 * 16);
+    pub fn build_bump_env_bytes(&self) -> [u8; 8 * 2 * 16] {
+        let mut bytes = [0u8; 8 * 2 * 16];
         let f =
             |stage: usize, ty: u32| f32::from_bits(self.texture_stage_states[stage][ty as usize]);
+        let mut off = 0;
         for stage in 0..8 {
             for v in [
                 f(stage, D3DTSS_BUMPENVMAT00),
@@ -724,7 +726,8 @@ impl FfState {
                 0.0,
                 0.0,
             ] {
-                bytes.extend_from_slice(&v.to_le_bytes());
+                bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                off += 4;
             }
         }
         bytes
@@ -1599,13 +1602,14 @@ impl FfState {
     ///
     /// Fog color lives in its own dedicated buffer (slot 13) so the FF and
     /// programmable PS paths share the same binding — see
-    /// `build_fog_color_bytes`.
+    /// `build_fog_color_bytes`. A fixed array (not a `Vec`) so the
+    /// per-dirty-draw build never touches the allocator.
     #[must_use]
-    pub fn build_ps_constants(&self, render_states: &[u32; RENDER_STATE_COUNT]) -> Vec<u8> {
+    pub fn build_ps_constants(&self, render_states: &[u32; RENDER_STATE_COUNT]) -> [u8; 16] {
         let tfactor = d3dcolor_to_rgba(render_states[D3DRS_TEXTUREFACTOR as usize]);
-        let mut bytes = Vec::with_capacity(16);
-        for v in tfactor {
-            bytes.extend_from_slice(&v.to_le_bytes());
+        let mut bytes = [0u8; 16];
+        for (chunk, v) in bytes.chunks_exact_mut(4).zip(tfactor) {
+            chunk.copy_from_slice(&v.to_le_bytes());
         }
         bytes
     }
@@ -1616,31 +1620,33 @@ impl FfState {
 /// Row 0 = fog colour RGBA, row 1 = (start, end, density, depth-bias). Row 1
 /// feeds the per-pixel table-fog factor; the depth-bias lane carries
 /// `D3DRS_DEPTHBIAS` because real hardware fogs the post-bias fragment depth.
-/// Returns empty when fog is off (neither vertex nor table mode set), so
-/// `emit_draw` can skip the bind for variants without fog.
+/// Returns `(buffer, len)` with `len == 0` when fog is off (neither vertex
+/// nor table mode set), so `emit_draw` can skip the bind for variants
+/// without fog. A fixed buffer (not a `Vec`) so the per-dirty-draw build
+/// never touches the allocator.
 #[must_use]
 pub fn build_fog_color_bytes(
     render_states: &[u32; RENDER_STATE_COUNT],
     variant: VariantKey,
-) -> Vec<u8> {
+) -> ([u8; 32], usize) {
+    let mut bytes = [0u8; 32];
     if variant.fog_mode == 0 && variant.fog_table_mode == 0 {
-        return Vec::new();
+        return (bytes, 0);
     }
     let fog_color = d3dcolor_to_rgba(render_states[D3DRS_FOGCOLOR as usize]);
-    let mut bytes = Vec::with_capacity(32);
-    for v in fog_color {
-        bytes.extend_from_slice(&v.to_le_bytes());
+    for (chunk, v) in bytes.chunks_exact_mut(4).zip(fog_color) {
+        chunk.copy_from_slice(&v.to_le_bytes());
     }
-    for rs in [
+    for (chunk, rs) in bytes[16..].chunks_exact_mut(4).zip([
         D3DRS_FOGSTART,
         D3DRS_FOGEND,
         D3DRS_FOGDENSITY,
         D3DRS_DEPTHBIAS,
-    ] {
+    ]) {
         // Float render states store raw f32 bits in the u32 slot.
-        bytes.extend_from_slice(&render_states[rs as usize].to_le_bytes());
+        chunk.copy_from_slice(&render_states[rs as usize].to_le_bytes());
     }
-    bytes
+    (bytes, 32)
 }
 
 /// Assemble the `FfVsFlags` for a `FfVsKey`.
@@ -2052,7 +2058,7 @@ mod tests {
         states[D3DRS_FOGCOLOR as usize] = 0xFFFF_00FF;
         let variant = VariantKey::default();
         assert_eq!(variant.fog_mode, 0);
-        assert!(build_fog_color_bytes(&states, variant).is_empty());
+        assert_eq!(build_fog_color_bytes(&states, variant).1, 0);
     }
 
     #[test]
@@ -2324,8 +2330,8 @@ mod tests {
             fog_mode: 3,
             ..Default::default()
         };
-        let bytes = build_fog_color_bytes(&states, variant);
-        assert_eq!(bytes.len(), 32);
+        let (bytes, len) = build_fog_color_bytes(&states, variant);
+        assert_eq!(len, 32);
         let comp = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
         let (r, g, b, a) = (comp(0), comp(1), comp(2), comp(3));
         assert!((r - 128.0 / 255.0).abs() < 1e-4, "r = {r}");
