@@ -185,11 +185,16 @@ be overwritten by the launcher, so it must be the `[Wine]` key.
 
 Notes:
 
-- **Graphics setting**: leave the bottle's graphics backend on its default.
-  The registry override makes Wine load the native `d3d9.dll` regardless of
-  the selected backend — that switch only redirects Wine's *builtin* DLL
-  search, which the native override bypasses. Other Direct3D versions keep
+- **Graphics setting**: any selection is fine, including *Auto*. The switch
+  (and the per-application database that *Auto* consults) only redirects
+  Wine's *builtin* DLL search, which the `d3d9=native` override bypasses:
+  d3d9 stays with mtld3d in every position. Other Direct3D versions keep
   following the bottle's backend selection.
+- **If d3d9 ever loads wrong anyway**: CrossOver's compatibility database
+  can ship per-game DLL overrides that outrank the bottle's registry
+  override. No game is known to carry one for d3d9; the tell would be
+  wined3d `GLSL` fixme lines in the log and no `mtld3d` lines, and
+  `WINEDEBUG=+cxcompatdb` names any applied rule.
 - **Logging / env**: per-bottle `RUST_LOG` or `MTLD3D_CONFIG` go under
   `[EnvironmentVariables]` in the same `cxbottle.conf`.
 - **CrossOver updates** replace `CrossOver.app` but not bottles, so this
