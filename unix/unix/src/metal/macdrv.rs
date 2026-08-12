@@ -254,8 +254,8 @@ fn install_occlusion_observer_once() {
 /// Whether HDR layer config was applied at attach time.
 ///
 /// `submit_frame` branches on this to choose the HDR shader vs the SDR
-/// blit-present path. Returns `false` when `hdr.enable` is unset in
-/// `mtld3d.conf` or the display has no EDR potential.
+/// blit-present path. Returns `false` when `color.hdr.enable` is turned
+/// off in `mtld3d.conf` or the display has no EDR potential.
 #[must_use]
 pub fn hdr_active() -> bool {
     HDR_ACTIVE.load(Ordering::Relaxed)
@@ -508,7 +508,7 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
 ///
 /// Side effect: latches the unix-side `HDR_ACTIVE` global to `true`
 /// when the display has EDR potential and `hdr_enable` is set (resolved
-/// PE-side from `hdr.enable` in `mtld3d.conf`). `submit_frame` reads
+/// PE-side from `color.hdr.enable` in `mtld3d.conf`). `submit_frame` reads
 /// `HDR_ACTIVE` to decide HDR shader vs SDR blit.
 pub fn attach_metal_layer(
     device_handle: MetalHandle<MTLDeviceKind>,
@@ -559,7 +559,7 @@ pub fn attach_metal_layer(
             None
         } else {
             // Decide HDR vs SDR layer configuration from the panel's
-            // static potential + the user's `hdr.enable` opt-in. Latch
+            // static potential + the user's `color.hdr.enable` setting. Latch
             // the result for `submit_frame` to read each present — the
             // user gate stays unix-side from here on.
             let hdr_active = resolve_hdr_active(
@@ -979,7 +979,7 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
 
 /// Decide whether to configure the layer for EDR at attach time.
 ///
-/// From the panel's static potential + the user's `hdr.enable` opt-in.
+/// From the panel's static potential + the user's `color.hdr.enable` setting.
 /// Returns `true` when both conditions hold; the actual per-frame BT.2446
 /// target is the live dynamic headroom polled in `submit_frame`, not a
 /// function of `potential`. Logs one info line per attach naming the screen
@@ -1001,7 +1001,7 @@ fn resolve_hdr_active(
     if !hdr_enable {
         info!(
             target: LOG_TARGET,
-            "hdr: disabled via mtld3d.conf hdr.enable=false on '{screen}' (potential={potential:.2}× {cs})",
+            "hdr: disabled via mtld3d.conf color.hdr.enable=false on '{screen}' (potential={potential:.2}× {cs})",
         );
         return false;
     }

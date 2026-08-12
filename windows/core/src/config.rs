@@ -32,8 +32,14 @@ pub struct Mtld3dConfig {
     pub caps_all: bool,
     /// Enable HDR present pipeline on EDR-capable displays.
     ///
-    /// Default: `false` — users on HDR displays opt in explicitly. File
-    /// key: `color.hdr.enable`.
+    /// The display gates this, not the value: the present pipeline only
+    /// goes HDR when the attached screen reports EDR headroom, so a
+    /// non-EDR display renders identically either way. On a panel that
+    /// does have headroom the HDR route is the better-looking one (the
+    /// SDR blit throws away every nit above paper white), which is why
+    /// it is the default rather than an opt-in. Set `false` to force
+    /// the SDR blit regardless of display capability. Default: `true`.
+    /// File key: `color.hdr.enable`.
     pub hdr_enable: bool,
     /// Colorspace tagging policy for the `CAMetalLayer` (both SDR and HDR paths).
     ///
@@ -135,7 +141,7 @@ impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
             caps_all: false,
-            hdr_enable: false,
+            hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
             shader_cache_enable: true,
@@ -463,7 +469,7 @@ mod tests {
     fn defaults_match_documented_values() {
         let d = Mtld3dConfig::default();
         assert!(!d.caps_all);
-        assert!(!d.hdr_enable);
+        assert!(d.hdr_enable);
         assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
         assert_eq!(d.cursor_scale, CursorScale::Auto);
         assert!(d.shader_cache_enable);
@@ -691,8 +697,11 @@ mod tests {
 
     #[test]
     fn non_boolean_value_keeps_default() {
-        let cfg = parse("color.hdr.enable = maybe\n", None);
-        assert!(!cfg.hdr_enable, "default must be preserved");
+        // Canary is a key that defaults to `false`, so a parser that
+        // wrongly assigned `true` on garbage would fail here; with a
+        // `true`-defaulting key the two outcomes are indistinguishable.
+        let cfg = parse("debug.capsAll = maybe\n", None);
+        assert!(!cfg.caps_all, "default must be preserved");
     }
 
     #[test]

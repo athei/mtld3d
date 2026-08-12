@@ -176,6 +176,11 @@ bundle: all
 
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
+#   - color.hdr.enable=false    the shipped default is on, and it resolves off
+#     the running machine's panel, so leaving it would make the suite take the
+#     HDR present route on an EDR Mac and the SDR one elsewhere. Pin it so the
+#     results mean the same thing everywhere; the HDR route is exercised by real
+#     runs and by the present-pipeline tests, not by the e2e assertions.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
 # MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
 #
@@ -185,7 +190,7 @@ bundle: all
 # reported space, so a passing scaled run is the evidence that the logical and
 # render spaces stayed separate. `make test SCALE=0.75` — try 0.5 and a
 # non-dividing 0.67 too, since those catch rounding that a clean fraction hides.
-MTLD3D_CONF_TEST := shaderCache.enable=false$(if $(SCALE),;render.scale=$(SCALE))
+MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=

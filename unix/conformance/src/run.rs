@@ -121,9 +121,15 @@ pub fn run_subtest(
         // (`true`) returns a permissive stub immediately for API-thread
         // throughput, but conformance wants the real GPU pixel count, so flip it
         // off here (occlusion-only; EVENT/TIMESTAMP `GetData` are unaffected).
+        //
+        // `color.hdr.enable=false`: the shipped default is on, but it resolves
+        // off the running machine's panel, so an EDR Mac would present through
+        // the tone-mapping shader while another machine blits. The baseline has
+        // to mean the same thing on every machine that runs it, so pin the SDR
+        // path here.
         .env(
             "MTLD3D_CONFIG",
-            "shaderCache.enable=false;query.flushImmediate=false",
+            "shaderCache.enable=false;query.flushImmediate=false;color.hdr.enable=false",
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
