@@ -28,6 +28,12 @@ zstd = { workspace = true }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-metal = { workspace = true }
+# `tests/snmalloc_drift.rs` installs this as its own `#[global_allocator]` so
+# the `page_box` chunk-size model can be checked against the allocator that
+# actually ships, rather than against a comment. Integration tests are separate
+# binaries, so only that one runs on snmalloc; the unit-test binary keeps the
+# system allocator. Same `build_cc` config as `d3d9` uses in production.
+snmalloc-rs = { workspace = true }
 
 [lints]
 workspace = true

@@ -10,5 +10,14 @@ authors.workspace = true
 [dependencies]
 mtld3d-types = { workspace = true }
 
+# `tests/snmalloc_drift.rs` only. It is the one test target that runs on a PE
+# target with snmalloc installed as its own `#[global_allocator]`, which is what
+# the decommit-on-free probe needs: only the Windows PAL returns pages, so the
+# check cannot live in `mtld3d-core`'s host tests. `mtld3d-core` comes along for
+# `SNMALLOC_LOCAL_CACHE_BYTES` so the threshold is not written down twice.
+[dev-dependencies]
+mtld3d-core = { workspace = true }
+snmalloc-rs = { workspace = true }
+
 [lints]
 workspace = true

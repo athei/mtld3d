@@ -1869,6 +1869,7 @@ impl EncoderPerfState {
             pagebox_alloc_bytes: pagebox_frame.alloc_bytes,
             pagebox_frees: pagebox_frame.frees,
             pagebox_free_bytes: pagebox_frame.free_bytes,
+            pagebox_uncached_allocs: pagebox_frame.uncached_allocs,
             pagebox_pool_bytes: caches.pagebox_pool_bytes,
             // Derived this frame from the counters above.
             outside_d3d9,
@@ -2154,6 +2155,11 @@ struct FrameSample {
     /// This frame's `PageBox` frees returning to the global allocator.
     pagebox_frees: u64,
     pagebox_free_bytes: u64,
+    /// Subset of `pagebox_allocs` that missed snmalloc's per-thread cache.
+    ///
+    /// Each one costs a commit on the way in and a decommit on the way
+    /// out; see `page_box::bypasses_local_cache`.
+    pagebox_uncached_allocs: u64,
     /// Padded bytes parked in the recycle pool at frame end (from `CacheSizes`).
     pagebox_pool_bytes: u64,
 
@@ -2359,6 +2365,11 @@ struct PerfWindow {
     /// `PageBox` frees returning to the global allocator (count sum + peak).
     pagebox_frees: Stat,
     pagebox_free_bytes: Stat,
+    /// Allocations that missed snmalloc's per-thread cache (count sum + peak).
+    ///
+    /// Feeds the `uncached` child row: the commit/decommit round trips no
+    /// pool is currently absorbing.
+    pagebox_uncached_allocs: Stat,
     /// Retired boxes parked in the recycle pool (count sum + byte sum).
     pagebox_pool_recycled: Stat,
     pagebox_pool_recycled_bytes: Stat,
@@ -2528,6 +2539,7 @@ impl PerfWindow {
         self.pagebox_alloc_bytes.add(s.pagebox_alloc_bytes);
         self.pagebox_frees.add(s.pagebox_frees);
         self.pagebox_free_bytes.add(s.pagebox_free_bytes);
+        self.pagebox_uncached_allocs.add(s.pagebox_uncached_allocs);
         self.pagebox_pool_recycled
             .add(u64::from(s.enc.pagebox_pool_recycled));
         self.pagebox_pool_recycled_bytes
@@ -4271,6 +4283,25 @@ impl<'a> Summary<'a> {
             Some(&format!("free={fr}  {pb_free_fmt}", fr = w.pagebox_frees.sum)),
             "window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
         );
+        // The subset snmalloc cannot cache: over 1 MiB rounds up to a
+        // chunk at or past its 2 MiB per-thread budget, so each of these
+        // is a VirtualAlloc(MEM_COMMIT) in and a VirtualFree(MEM_DECOMMIT)
+        // out. Pool hits never reach the allocator, so what is left here
+        // comes from the unpooled producers (texture staging, surface
+        // locks, blit padding).
+        let uncached = w.pagebox_uncached_allocs.sum;
+        let uncached_pct = if w.pagebox_allocs.sum > 0 {
+            u64_to_f64_exact(uncached) / u64_to_f64_exact(w.pagebox_allocs.sum) * 100.0
+        } else {
+            0.0
+        };
+        self.res_row(
+            out,
+            "  uncached",
+            &format!("{uncached} ({uncached_pct:.1}%)"),
+            Some(&format!("peak {p}/frame", p = w.pagebox_uncached_allocs.max)),
+            "allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time",
+        );
         // Process-wide fault delta, sampled once per window via the
         // GetTaskFaults unix_call. High minflt tracking the rename byte
         // volume (not the scene) is the cold-first-touch churn signature.
@@ -4317,6 +4348,7 @@ mod tests {
             pagebox_alloc_bytes: 0,
             pagebox_frees: 0,
             pagebox_free_bytes: 0,
+            pagebox_uncached_allocs: 0,
             pagebox_pool_bytes: 0,
             outside_d3d9: 0,
             api_cyc: 0,
@@ -4634,7 +4666,8 @@ mod tests {
             "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
             "  size      64 KB avg               peak 64 KB                  pool-resident Vec<Command> capacity across frames (recycled, not freed)\n",
             "  realloc   192 KB avg              peak 192 KB                 Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)\n",
-            "pagebox     alloc=16  768 KB        free=14  640 KB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)\n",
+            "pagebox     alloc=17  4.8 MB        free=15  4.6 MB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)\n",
+            "  uncached  1 (5.9%)                peak 1/frame                allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time\n",
             "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
         );
         assert_eq!(got, want, "perf summary drifted — diff above");
@@ -4863,12 +4896,18 @@ mod tests {
             tex_staging_retained_bytes: 0,
             cmd_vec_realloc_bytes: 196_608,
             // Allocator-visible PageBox traffic: the 15 renames (720 KB)
-            // plus one 64 KB creation on the alloc side; 14 retired boxes
+            // plus one 48 KB creation on the alloc side; 14 retired boxes
             // freed. Exercises both cells of the `pagebox` footprint row.
-            pagebox_allocs: 16,
-            pagebox_alloc_bytes: 786_432,
-            pagebox_frees: 14,
-            pagebox_free_bytes: 655_360,
+            //
+            // Plus one 4 MiB texture mip-staging box allocated and freed
+            // this frame. Nothing pools that producer, and 4 MiB is past
+            // snmalloc's per-thread budget, so it is the single
+            // `uncached` hit the child row reports.
+            pagebox_allocs: 17,
+            pagebox_alloc_bytes: 4_980_736,
+            pagebox_frees: 15,
+            pagebox_free_bytes: 4_849_664,
+            pagebox_uncached_allocs: 1,
             // 1 MB parked in the recycle pool at frame end; exercises the
             // MB branch of the `  parked` row.
             pagebox_pool_bytes: 1_048_576,

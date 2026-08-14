@@ -296,6 +296,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "rustc-hash",
+ "snmalloc-rs",
  "strum",
  "xxhash-rust",
  "zstd",
@@ -316,7 +317,9 @@ dependencies = [
 name = "mtld3d-tests"
 version = "0.5.0"
 dependencies = [
+ "mtld3d-core",
  "mtld3d-types",
+ "snmalloc-rs",
 ]
 
 [[package]]

@@ -56,11 +56,22 @@ const DLL_PROCESS_DETACH: u32 = 0;
 /// whole project; `RUST_LOG=mtld3d::d3d9=...` scopes to the COM layer.
 const LOG_TARGET: &str = "mtld3d::d3d9";
 
-// Per-thread pools with a lock-free remote-free ring — the fast path for
-// the API→encoder ownership transfer (PageBox + Arc<PageBox> for VB/IB
-// and texture staging, frame closures, FrameData). mimalloc is not usable
-// here: its cross-thread free path faults on 16 KiB-aligned PageBox
-// allocations.
+// The baseline this replaces is not a modern libc malloc. With no global
+// allocator, i686-pc-windows-msvc routes every allocation to HeapAlloc,
+// which under Wine is RtlAllocateHeap: one shared heap lock across the
+// API and encoder threads, and a per-block virtual mapping for large
+// blocks, paid from emulated x86 crossing the PE/unix boundary. snmalloc
+// serves from per-thread slabs and never calls HeapAlloc at any size —
+// it takes address space from VirtualAlloc directly.
+//
+// Its lock-free remote-free ring also batches cross-thread frees, though
+// not for PageBox: the ring's budget is 16 KiB and a PageBox is at least
+// one 16 KiB page, so every box posts on its own. The batching earns its
+// keep on the smaller traffic crossing the same boundary (Arc control
+// blocks, boxed closures, FrameData internals).
+//
+// mimalloc is not usable here: its cross-thread free path faults on
+// 16 KiB-aligned PageBox allocations.
 //
 // Under `cfg(mtld3d_crumb)` the allocator is swapped for
 // `crumb_allocator::CrumbAllocator` — a thin `SnMalloc` wrapper that

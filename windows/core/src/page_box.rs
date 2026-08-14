@@ -29,6 +29,13 @@ static PAGEBOX_FREES: AtomicU64 = AtomicU64::new(0);
 /// Cumulative padded bytes behind `PAGEBOX_FREES`.
 #[cfg(perf_tracking)]
 static PAGEBOX_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Subset of `PAGEBOX_ALLOCS` that snmalloc cannot serve from its cache.
+///
+/// See [`bypasses_local_cache`]: each one costs a commit on the way in
+/// and a decommit on the way out. `PageBoxPool` hits never reach here,
+/// so what this counts is traffic no pool is currently absorbing.
+#[cfg(perf_tracking)]
+static PAGEBOX_UNCACHED_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 /// Count one `PageBox` allocation of `len` padded bytes.
 ///
@@ -39,6 +46,9 @@ static PAGEBOX_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
 fn note_alloc(len: usize) {
     PAGEBOX_ALLOCS.fetch_add(1, Ordering::Relaxed);
     PAGEBOX_ALLOC_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    if bypasses_local_cache(len) {
+        PAGEBOX_UNCACHED_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Twin of `note_alloc`: compiles away without `perf_tracking`.
@@ -69,6 +79,12 @@ pub struct PageBoxVolume {
     pub alloc_bytes: u64,
     pub frees: u64,
     pub free_bytes: u64,
+    /// Subset of `allocs` that missed snmalloc's per-thread cache.
+    ///
+    /// Each one is a commit/decommit syscall round trip rather than a
+    /// buddy operation, so this is the count worth driving to zero. See
+    /// [`bypasses_local_cache`].
+    pub uncached_allocs: u64,
 }
 
 impl Default for PageBoxVolume {
@@ -86,6 +102,7 @@ impl PageBoxVolume {
             alloc_bytes: 0,
             frees: 0,
             free_bytes: 0,
+            uncached_allocs: 0,
         }
     }
 
@@ -108,6 +125,7 @@ impl PageBoxVolume {
             alloc_bytes: self.alloc_bytes.saturating_sub(prev.alloc_bytes),
             frees: self.frees.saturating_sub(prev.frees),
             free_bytes: self.free_bytes.saturating_sub(prev.free_bytes),
+            uncached_allocs: self.uncached_allocs.saturating_sub(prev.uncached_allocs),
         }
     }
 }
@@ -125,6 +143,7 @@ pub fn pagebox_volume() -> PageBoxVolume {
         alloc_bytes: PAGEBOX_ALLOC_BYTES.load(Ordering::Relaxed),
         frees: PAGEBOX_FREES.load(Ordering::Relaxed),
         free_bytes: PAGEBOX_FREE_BYTES.load(Ordering::Relaxed),
+        uncached_allocs: PAGEBOX_UNCACHED_ALLOCS.load(Ordering::Relaxed),
     }
 }
 
@@ -140,6 +159,59 @@ pub const fn pagebox_volume() -> PageBoxVolume {
 /// Metal's `newBufferWithBytesNoCopy` demands the backing be page-aligned +
 /// page-sized; 16 KiB satisfies both `ASi` and x86 macOS.
 pub const PAGE_SIZE: usize = 16 * 1024;
+
+/// snmalloc's per-thread large-object cache budget, in bytes.
+///
+/// `LocalCacheSizeBits = 21` in the vendored `backend/base_constants.h`,
+/// with no target `#ifdef` around it, so the budget is the same on every
+/// target we build. This is the cache *budget*, not an allocation-size
+/// cutoff: a chunk that large cannot fit inside the budget, so
+/// `backend_helpers/largebuddyrange.h` forwards both its alloc and its
+/// free past the thread-local buddy to `CommitRange`, turning every
+/// alloc into a `VirtualAlloc(MEM_COMMIT)` and every free into a
+/// `VirtualFree(MEM_DECOMMIT)`.
+pub const SNMALLOC_LOCAL_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Chunk size snmalloc serves a large request from.
+///
+/// `large_size_to_chunk_size` is `bits::next_pow2` in the vendored
+/// `mem/sizeclasstable.h`, so a large request rounds up to the next
+/// power of two. That rounding is why the uncached band starts well
+/// below [`SNMALLOC_LOCAL_CACHE_BYTES`].
+///
+/// Only meaningful above the small-sizeclass ceiling; below it snmalloc
+/// serves exact classes from a slab and does not round. That ceiling is
+/// 64 KiB on i686 and 512 KiB on the 64-bit targets, so callers that
+/// depend on the exact value must stay above 512 KiB.
+#[must_use]
+pub const fn snmalloc_chunk_size(padded: usize) -> usize {
+    padded.next_power_of_two()
+}
+
+/// Does an allocation of `padded` bytes miss snmalloc's per-thread cache?
+///
+/// True means every alloc/free pair at this size is a commit/decommit
+/// syscall round trip instead of a thread-local buddy operation.
+///
+/// The effective cutoff is *over 1 MiB*, derived rather than written
+/// down so that it tracks both upstream facts automatically:
+///
+/// | `padded` | [`snmalloc_chunk_size`] | result |
+/// |---|---|---|
+/// | 1 MiB | 1 MiB | `false`, cached |
+/// | 1 MiB + 1 | 2 MiB | `true`, uncached |
+/// | 2.75 MB | 4 MiB | `true`, uncached |
+///
+/// Hardcoding 1 MiB instead would go stale the moment either the budget
+/// or the rounding rule changed, with nothing to catch it.
+///
+/// Upstream tests `>= mask_bits(21)`, i.e. `2^21 - 1`, where this tests
+/// `>= 2^21`. The two agree on every input, because the argument is
+/// always a power of two and none lies in between.
+#[must_use]
+pub const fn bypasses_local_cache(padded: usize) -> bool {
+    snmalloc_chunk_size(padded) >= SNMALLOC_LOCAL_CACHE_BYTES
+}
 
 /// RAII wrapper around a `std::alloc::alloc`-ed page-aligned byte region.
 ///
@@ -324,7 +396,38 @@ impl Drop for PageBox {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_SIZE, PageBox};
+    use super::{
+        PAGE_SIZE, PageBox, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache, snmalloc_chunk_size,
+    };
+
+    /// The derived cutoff sits just above 1 MiB, and nothing hardcodes it.
+    #[test]
+    fn local_cache_cutoff_is_one_mib_exclusive() {
+        const MIB: usize = 1024 * 1024;
+        assert!(!bypasses_local_cache(MIB));
+        assert!(bypasses_local_cache(MIB + 1));
+        // The measured dominant renamed VB: 176 pages, rounding to 4 MiB.
+        assert!(bypasses_local_cache(176 * PAGE_SIZE));
+        assert_eq!(snmalloc_chunk_size(176 * PAGE_SIZE), 4 * MIB);
+    }
+
+    /// Our `>= 2^21` test and upstream's `>= 2^21 - 1` agree on every chunk.
+    ///
+    /// Chunk sizes are always powers of two, and none lies between the two
+    /// bounds, so the apparent off-by-one is not one.
+    #[test]
+    fn chunk_bound_agrees_with_upstream_mask_bits() {
+        let upstream_bound = SNMALLOC_LOCAL_CACHE_BYTES - 1;
+        let mut chunk = PAGE_SIZE;
+        while chunk <= 64 * 1024 * 1024 {
+            assert_eq!(
+                chunk >= SNMALLOC_LOCAL_CACHE_BYTES,
+                chunk >= upstream_bound,
+                "disagreement at chunk size {chunk}"
+            );
+            chunk *= 2;
+        }
+    }
 
     #[test]
     fn uninit_alloc_is_page_aligned_and_page_sized() {

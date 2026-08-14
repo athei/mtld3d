@@ -26,11 +26,15 @@ use crate::page_box::{PAGE_SIZE, PageBox};
 ///
 /// Sized from measurement, not guesswork: the dominant renamed buffer in
 /// the target game is ~2.75 MB (176 pages), renamed once or twice per
-/// frame, and it is precisely the class that hurts most in the allocator
-/// (>= 2 MiB chunks bypass snmalloc's thread-local cache, so every free
-/// decommits and every alloc re-commits). 4 MiB leaves headroom above it;
-/// anything larger is a rare one-off that would crowd the byte cap out of
-/// the hot classes and drops to the allocator instead.
+/// frame, and it is precisely the class that hurts most in the allocator.
+/// Any request over 1 MiB rounds up to a chunk of at least
+/// [`crate::page_box::SNMALLOC_LOCAL_CACHE_BYTES`], which no longer fits
+/// snmalloc's per-thread budget, so every free decommits and every alloc
+/// re-commits; 2.75 MB rounds to a 4 MiB chunk and pays that round trip
+/// on both ends. Parking the box here turns the syscall pair into a
+/// vector pop. 4 MiB leaves headroom above the dominant class; anything
+/// larger is a rare one-off that would crowd the byte cap out of the hot
+/// classes and drops to the allocator instead.
 pub const MAX_POOL_CLASSES: usize = 256;
 
 /// Mutex-guarded pool state.
