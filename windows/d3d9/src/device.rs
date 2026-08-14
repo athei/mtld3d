@@ -401,7 +401,7 @@ pub struct DeviceInner {
     ///
     /// Mirrors `coherent_seq`'s sharing. The encoder `fetch_add`s on intake
     /// and `fetch_sub`s on drain; the API thread reads it in
-    /// `alloc_pagebox_with_recovery` to cap retention before a rename burst
+    /// `alloc_pagebox_capped` to cap retention before a rename burst
     /// balloons PE-heap usage into 32-bit OOM territory.
     vbib_retained_bytes: Arc<AtomicU64>,
     /// Running total of bytes occupied by live `D3DPOOL_DEFAULT` textures.
@@ -440,9 +440,9 @@ pub struct DeviceInner {
     /// Proactive retention cap in bytes.
     ///
     /// When `vbib_retained_bytes + pending_retention_bytes` reaches this,
-    /// `alloc_pagebox_with_recovery` drains (and, if still over,
-    /// mid-frame-submits + GPU-waits) before allocating, bounding peak PE-heap
-    /// retention.
+    /// `alloc_pagebox_capped` drains (and, if still over, mid-frame-submits +
+    /// GPU-waits) before allocating, bounding peak PE-heap retention. This is
+    /// the only bound on retained bytes; `0` removes it entirely.
     retention_cap_bytes: u64,
     render_states: [u32; RENDER_STATE_COUNT],
     /// Per-slot "have we warned about this unsupported RS write yet?" latch.
@@ -1315,18 +1315,17 @@ impl DeviceInner {
         }));
     }
 
-    /// Cheap alloc-recovery tier.
+    /// Cheap retention-cap tier.
     ///
     /// Sends a synchronous `DrainRetiredNow` to the encoder so it drains
     /// retention items whose seq has already retired. No submit, no GPU
     /// wait — only useful when the encoder is sitting on drainable
-    /// retention between frames. Returns when drain completes; caller
-    /// retries `try_new_uninit` on success.
+    /// retention between frames. Returns when the drain completes.
     pub fn drain_retention_now(&self) {
         self.encoder.drain_retired_now();
     }
 
-    /// Heavy alloc-recovery tier.
+    /// Heavy retention-cap tier.
     ///
     /// Same submission path as `flush_current_frame_blocking` (no Present,
     /// drawable not consumed), but the encoder additionally waits for GPU
@@ -1334,23 +1333,21 @@ impl DeviceInner {
     /// returning — so on return the global allocator has freed bytes that
     /// include same-frame retentions which `drain_retention_now` couldn't
     /// release.
-    pub fn mid_frame_submit_for_alloc(&mut self) {
+    pub fn mid_frame_submit_for_retention(&mut self) {
         let fresh = self.fresh_frame();
         let frame = self.stamp_and_swap(fresh, true);
-        self.encoder.mid_frame_submit_for_alloc(frame);
+        self.encoder.mid_frame_submit_for_retention(frame);
     }
 
-    /// Two-tier fallible-alloc recovery for VB/IB Lock-rename.
+    /// Allocate a rename backing under the VB/IB retention cap.
     ///
-    /// The common path returns immediately when `try_new_uninit` succeeds.
-    /// The cheap fallback runs `drain_retention_now` and retries — that
-    /// frees retention items whose seq has already retired. The heavy
-    /// fallback runs `mid_frame_submit_for_alloc` (commit + GPU wait +
-    /// drain) which also releases same-frame retentions whose seq matches
-    /// the in-progress frame. If even the heavy tier fails to satisfy the
-    /// alloc, we fall through to `new_uninit`'s panic — the address space
-    /// is genuinely exhausted and aborting is the right outcome.
-    pub fn alloc_pagebox_with_recovery(&mut self, logical_len: usize) -> PageBox {
+    /// Recycle-pool hit, else enforce the cap, else allocate. The cap is
+    /// the only mechanism bounding retained bytes: allocation itself is
+    /// infallible (see `PageBox::new_uninit`), because on the 32-bit game
+    /// process the allocator never fails cleanly — the process thrashes or
+    /// dies long before `alloc` returns null, so reacting to a null was
+    /// always too late to be the fix.
+    pub fn alloc_pagebox_capped(&mut self, logical_len: usize) -> PageBox {
         // Recycle-pool fast path: a hit is a warm, still-committed box of
         // the same padded size, allocates nothing, and therefore skips the
         // retention-cap check below (which exists to bound allocations).
@@ -1364,43 +1361,24 @@ impl DeviceInner {
             // arm reads hit=0 miss=0 rather than all-miss.
             self.perf.bump_vbib_pool_miss();
         }
-        // Proactive memory cap. The reactive `try_new_uninit`-failure tiers
-        // below only trip when the 32-bit address space is *already*
-        // exhausted — far too late, since by then the game is thrashing.
-        // So before allocating, if live VB/IB retention is at the cap,
-        // drain retired backings (cheap) and, if still over, force a
-        // mid-frame submit + GPU-wait so this frame's renames can retire
-        // and free. Bounds peak PE-heap retention well below the OOM cliff.
+        // Before allocating, if live VB/IB retention is at the cap, drain
+        // retired backings (cheap) and, if still over, force a mid-frame
+        // submit + GPU-wait so this frame's renames can retire and free.
+        // Bounds peak PE-heap retention well below the OOM cliff.
         if self.retention_cap_bytes != 0 {
             let retained =
                 self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
             if retained >= self.retention_cap_bytes {
-                // Reuses the alloc-recovery counters/row — same drain +
-                // mid-frame-submit operations, just proactively triggered
-                // by the cap rather than by a hard alloc failure.
-                self.perf.bump_alloc_recovery_drain();
+                self.perf.bump_retention_cap_drain();
                 self.drain_retention_now();
                 let after =
                     self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
                 if after >= self.retention_cap_bytes {
-                    self.perf.bump_alloc_recovery_submit();
-                    self.mid_frame_submit_for_alloc();
+                    self.perf.bump_retention_cap_submit();
+                    self.mid_frame_submit_for_retention();
                 }
             }
         }
-        if let Some(b) = PageBox::try_new_uninit(logical_len) {
-            return b;
-        }
-        self.perf.bump_alloc_recovery_drain();
-        self.drain_retention_now();
-        if let Some(b) = PageBox::try_new_uninit(logical_len) {
-            return b;
-        }
-        self.perf.bump_alloc_recovery_submit();
-        self.mid_frame_submit_for_alloc();
-        // Fall through to the panicking path on second failure —
-        // either we've recovered enough address space and this
-        // succeeds, or we're truly OOM and aborting is correct.
         PageBox::new_uninit(logical_len)
     }
 

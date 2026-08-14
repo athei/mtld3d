@@ -5515,23 +5515,25 @@ impl EncoderThread {
         let _ = done_rx.recv();
     }
 
-    /// Heavy alloc-recovery tier.
+    /// Heavy retention-cap tier.
     ///
     /// Like `mid_frame_submit`, but the encoder also waits for GPU
     /// completion of the submitted seq and drains retention before
     /// signalling — when this returns the global allocator has the freed
-    /// bytes back. Cost: ~1-2 ms of GPU completion + drain. Used only as
-    /// a fallback when `drain_retired_now` already failed to free enough.
-    pub fn mid_frame_submit_for_alloc(&self, frame: FrameData) {
+    /// bytes back. Cost: ~1-2 ms of GPU completion + drain. Used only when
+    /// `drain_retired_now` already failed to get retention under the cap.
+    pub fn mid_frame_submit_for_retention(&self, frame: FrameData) {
         let (done_tx, done_rx) = mpsc::sync_channel(0);
-        let _ = self.sender.send(EncoderMessage::MidFrameSubmitForAlloc {
-            frame: Box::new(frame),
-            done: done_tx,
-        });
+        let _ = self
+            .sender
+            .send(EncoderMessage::MidFrameSubmitForRetention {
+                frame: Box::new(frame),
+                done: done_tx,
+            });
         let _ = done_rx.recv();
     }
 
-    /// Cheap alloc-recovery tier.
+    /// Cheap retention-cap tier.
     ///
     /// Encoder runs only `drain_retired_resource_retention`; no submit,
     /// no GPU wait. Frees retention items whose seq has already retired
@@ -5618,19 +5620,19 @@ enum EncoderMessage {
         frame: Box<FrameData>,
         done: mpsc::SyncSender<()>,
     },
-    /// Heavy alloc-recovery tier.
+    /// Heavy retention-cap tier.
     ///
     /// Run the frame, spin until our seq retires on the GPU (so
     /// `coherent_seq` covers our submission), then drain
     /// `pending_resource_retention` so freed bytes return to the global
     /// allocator before signalling done. Used by VB/IB `Lock`-rename when
-    /// `try_new_uninit` returns null and the cheap-tier `DrainRetiredNow`
-    /// already failed.
-    MidFrameSubmitForAlloc {
+    /// retained bytes are still over the cap after the cheap-tier
+    /// `DrainRetiredNow`.
+    MidFrameSubmitForRetention {
         frame: Box<FrameData>,
         done: mpsc::SyncSender<()>,
     },
-    /// Cheap alloc-recovery tier.
+    /// Cheap retention-cap tier.
     ///
     /// Just drain `pending_resource_retention` against the current
     /// `coherent_seq` — frees only items already retired. Useful when the
@@ -5791,15 +5793,15 @@ fn encoder_thread_main(
                 run_frame(&mut enc, frame, frame_counter, SubmitMode::Sync);
                 let _ = done.send(());
             }
-            Ok(EncoderMessage::MidFrameSubmitForAlloc { frame, done }) => {
+            Ok(EncoderMessage::MidFrameSubmitForRetention { frame, done }) => {
                 frame_counter += 1;
-                mtld3d_shared::crumb!("phase:RecvMidAl");
+                mtld3d_shared::crumb!("phase:RecvMidRet");
                 enc.drain_submit_thread();
                 run_frame(&mut enc, frame, frame_counter, SubmitMode::Sync);
                 // Wait for our just-submitted seq to retire on the GPU
                 // so `coherent_seq` covers it; then drain so the freed
                 // bytes are back in the global allocator before the
-                // API thread retries `try_new_uninit`.
+                // API thread allocates.
                 enc.wait_for_gpu_idle();
                 enc.drain_retired_resource_retention();
                 let _ = done.send(());

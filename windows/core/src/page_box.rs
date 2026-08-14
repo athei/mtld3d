@@ -172,12 +172,22 @@ impl PageBox {
     /// Contents are uninitialized. For any caller that returns the
     /// pointer to the game, the game is expected to write every byte it
     /// later reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the allocator returns null. Both profiles build with
+    /// `panic = "abort"`, so this aborts either way — but panicking runs
+    /// the panic hook first, which dumps the crumb ring
+    /// (`std::alloc::handle_alloc_error` would abort straight away with no
+    /// trace). There is no recovery to attempt: retained VB/IB bytes are
+    /// bounded proactively by the retention cap long before the address
+    /// space runs out.
     #[must_use]
     pub fn new_uninit(logical_len: usize) -> Self {
         let (len, layout) = Self::layout_for(logical_len);
         // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
         note_alloc(len);
         Self {
             ptr,
@@ -187,41 +197,21 @@ impl PageBox {
         }
     }
 
-    /// Fallible counterpart of `new_uninit`.
-    ///
-    /// Returns `None` when the underlying allocator returns null instead of
-    /// panicking via `handle_alloc_error`. Used by VB/IB Lock-rename so the
-    /// caller can attempt mid-frame retention drain + retry before giving
-    /// up. Non-rename call sites (`CreateVertexBuffer` / `IndexBuffer` at
-    /// device-construction time) keep the panicking `new_uninit` because
-    /// there's no recovery available there.
-    #[must_use]
-    pub fn try_new_uninit(logical_len: usize) -> Option<Self> {
-        let (len, layout) = Self::layout_for(logical_len);
-        // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
-        let ptr = unsafe { alloc::alloc(layout) };
-        NonNull::new(ptr).map(|ptr| {
-            note_alloc(len);
-            Self {
-                ptr,
-                len,
-                logical_len,
-                layout,
-            }
-        })
-    }
-
     /// Same as `new_uninit` but zero-initializes the full padded region.
     ///
     /// Used by VB/IB creation so a first-draw-before-Lock sees defined
     /// bytes. Costs one `bzero` per buffer create — negligible compared
     /// to the alternative of every rename paying for the same zero init.
+    ///
+    /// # Panics
+    ///
+    /// Same allocation-failure contract as `new_uninit`.
     #[must_use]
     pub fn new_zeroed(logical_len: usize) -> Self {
         let (len, layout) = Self::layout_for(logical_len);
         // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
         note_alloc(len);
         Self {
             ptr,

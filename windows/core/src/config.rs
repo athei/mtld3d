@@ -87,7 +87,9 @@ pub struct Mtld3dConfig {
     /// drains retired backings and, if still over, forces a mid-frame
     /// GPU-sync before allocating — bounding peak PE-heap retention so
     /// a camera-turn rename burst can't thrash the 32-bit game process.
-    /// `0` disables the cap. Default: 512 MiB. File key:
+    /// This is the only bound: allocation itself is infallible, so `0`
+    /// means unbounded retention and an abort if the address space does
+    /// run out (the A/B baseline arm). Default: 512 MiB. File key:
     /// `memory.vbibRetentionCapMB` (value in MiB).
     pub vbib_retention_cap_bytes: u64,
     /// Byte cap for the `PageBox` recycle pool. `0` = pool disabled.

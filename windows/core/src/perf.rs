@@ -558,18 +558,18 @@ struct FrameCounters {
     /// the memcpy itself, so a non-zero count means the preserve actually
     /// ran — not merely that a rename was planned.
     vbib_preserve_cpu: u32,
-    /// VB/IB Lock-rename hits where `try_new_uninit` returned null.
+    /// VB/IB rename allocs that found retained bytes at the cap.
     ///
-    /// The cheap `DrainRetiredNow` recovery freed enough for the retry to
-    /// succeed.
-    alloc_recovery_drain: u32,
-    /// VB/IB Lock-rename hits where `try_new_uninit` returned null and the cheap drain failed.
+    /// Each one paid a cheap `DrainRetiredNow` round-trip before
+    /// allocating.
+    retention_cap_drain: u32,
+    /// Subset of `retention_cap_drain` still over the cap after the drain.
     ///
     /// The cheap drain didn't free enough, so the heavy
-    /// `MidFrameSubmitForAlloc` recovery (commit + GPU wait + drain)
-    /// was needed. ~1-2 ms per fire — surfaced separately so a
-    /// burst frame's worth of these is visible in the perf summary.
-    alloc_recovery_submit: u32,
+    /// `MidFrameSubmitForRetention` tier (commit + GPU wait + drain) ran.
+    /// ~1-2 ms per fire — surfaced separately so a burst frame's worth of
+    /// these is visible in the perf summary.
+    retention_cap_submit: u32,
     /// Count of texture `LockRect` calls that allocated a fresh uninit staging Box this frame.
     ///
     /// The `FreshBox` branch of `decide_lock_action`.
@@ -705,8 +705,8 @@ impl FrameCounters {
             vb_discards: 0,
             ib_discards: 0,
             vbib_preserve_cpu: 0,
-            alloc_recovery_drain: 0,
-            alloc_recovery_submit: 0,
+            retention_cap_drain: 0,
+            retention_cap_submit: 0,
             texture_renames: 0,
             texture_discards: 0,
             texture_preserve_cpu: 0,
@@ -1131,18 +1131,18 @@ impl ApiPerfState {
         self.counters.vbib_preserve_cpu = self.counters.vbib_preserve_cpu.saturating_add(1);
     }
 
-    /// Bump on a successful `DrainRetiredNow` recovery.
+    /// Bump when the retention cap forced a `DrainRetiredNow`.
     ///
-    /// The cheap tier was enough for the retry to allocate.
-    pub const fn bump_alloc_recovery_drain(&mut self) {
-        self.counters.alloc_recovery_drain = self.counters.alloc_recovery_drain.saturating_add(1);
+    /// The cheap tier: one encoder round-trip, no GPU wait.
+    pub const fn bump_retention_cap_drain(&mut self) {
+        self.counters.retention_cap_drain = self.counters.retention_cap_drain.saturating_add(1);
     }
 
-    /// Bump on a `MidFrameSubmitForAlloc` recovery — heavy tier, includes a GPU completion wait.
+    /// Bump on a `MidFrameSubmitForRetention` — heavy tier, includes a GPU completion wait.
     ///
     /// Each fire costs ~1-2 ms.
-    pub const fn bump_alloc_recovery_submit(&mut self) {
-        self.counters.alloc_recovery_submit = self.counters.alloc_recovery_submit.saturating_add(1);
+    pub const fn bump_retention_cap_submit(&mut self) {
+        self.counters.retention_cap_submit = self.counters.retention_cap_submit.saturating_add(1);
     }
 
     pub const fn bump_vb_discard(&mut self) {
@@ -1282,9 +1282,9 @@ impl ApiPerfState {
     #[inline]
     pub const fn bump_vbib_preserve_cpu(&mut self) {}
     #[inline]
-    pub const fn bump_alloc_recovery_drain(&mut self) {}
+    pub const fn bump_retention_cap_drain(&mut self) {}
     #[inline]
-    pub const fn bump_alloc_recovery_submit(&mut self) {}
+    pub const fn bump_retention_cap_submit(&mut self) {}
     #[inline]
     pub const fn bump_vb_discard(&mut self) {}
     #[inline]
@@ -2313,11 +2313,11 @@ struct PerfWindow {
     ///
     /// The deciding number for a hybrid upload model.
     vbib_mid_pass_reorders: Stat,
-    alloc_recovery_drain: Stat,
-    /// Heavy-tier recoveries (~1-2 ms each).
+    retention_cap_drain: Stat,
+    /// Heavy-tier cap enforcements (~1-2 ms each).
     ///
     /// The peak surfaces a single frame with > 1 as a stutter signal.
-    alloc_recovery_submit: Stat,
+    retention_cap_submit: Stat,
     buffer_destroys: Stat,
     /// Retention depth: window sum (averaged) + entry-count peak.
     ///
@@ -2492,10 +2492,10 @@ impl PerfWindow {
             .add(u64::from(s.enc.vbib_staging_uploads));
         self.vbib_mid_pass_reorders
             .add(u64::from(s.enc.vbib_mid_pass_reorders));
-        self.alloc_recovery_drain
-            .add(u64::from(s.counters.alloc_recovery_drain));
-        self.alloc_recovery_submit
-            .add(u64::from(s.counters.alloc_recovery_submit));
+        self.retention_cap_drain
+            .add(u64::from(s.counters.retention_cap_drain));
+        self.retention_cap_submit
+            .add(u64::from(s.counters.retention_cap_submit));
         self.buffer_destroys.add(u64::from(s.enc.buffer_destroys));
         self.vbib_retention_depth.add(s.vbib_retention_depth as u64);
         self.vbib_retained_bytes.add(s.vbib_retained_bytes as u64);
@@ -3834,17 +3834,17 @@ impl<'a> Summary<'a> {
         );
         self.res_row(
             out,
-            "alloc rcv",
+            "ret cap",
             &format!(
                 "drain={d} submit={s}",
-                d = w.alloc_recovery_drain.sum,
-                s = w.alloc_recovery_submit.sum,
+                d = w.retention_cap_drain.sum,
+                s = w.retention_cap_submit.sum,
             ),
             Some(&format!(
                 "peak/frame submit={pk}",
-                pk = w.alloc_recovery_submit.max,
+                pk = w.retention_cap_submit.max,
             )),
-            "API: VB/IB retention recovery — proactive cap + alloc-fail (drain=cheap, submit=GPU wait)",
+            "API: VB/IB retention cap hit before a rename alloc (drain=cheap, submit=GPU wait)",
         );
         let (avg_fmt, peak_fmt) = format_kb_pair(vbib_ret_kb, vbib_ret_peak_kb);
         self.res_row(
@@ -4590,7 +4590,7 @@ mod tests {
             "staging up  0                                                   encoder: Staged (non-DYNAMIC) dirty-range upload blits — separate-staging path; high here with rename≈0 is the goal\n",
             "reorder     0                                                   encoder: rename-at-overlap (upload hit a just-drawn region; rare)\n",
             "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
-            "alloc rcv   drain=2 submit=1        peak/frame submit=1         API: VB/IB retention recovery — proactive cap + alloc-fail (drain=cheap, submit=GPU wait)\n",
+            "ret cap     drain=2 submit=1        peak/frame submit=1         API: VB/IB retention cap hit before a rename alloc (drain=cheap, submit=GPU wait)\n",
             "retention   depth= 6.0  3.5 MB avg  peak depth=6   3.5 MB       encoder: shared PageBox queue (VB/IB renames + texture-blit padded staging + visibility pool)\n",
             "pool        hit=14 miss=1 (93.3%)   recycled=14  672 KB         API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)\n",
             "  parked    1.0 MB avg              peak 1.0 MB                 bytes held in the pool for reuse (already retired; excluded from retention above)\n",
@@ -4759,8 +4759,8 @@ mod tests {
                 vbib_preserve_cpu: 2,
                 // Two cheap-tier recoveries (drain) and one heavy
                 // (submit) — exercises the row formatting on both halves.
-                alloc_recovery_drain: 2,
-                alloc_recovery_submit: 1,
+                retention_cap_drain: 2,
+                retention_cap_submit: 1,
                 // 2 renames: 1 was DISCARD/WRITEONLY (no preserve),
                 // 1 needed CPU memcpy preserve. Invariant
                 // `rename = discards + preserve_cpu` holds.

@@ -3,7 +3,7 @@
 //! One static rather than per-device state: the pool exists to keep pages
 //! committed across the global allocator, which is process-wide by
 //! nature, and a static lets the API thread (Lock-rename pop in
-//! `DeviceInner::alloc_pagebox_with_recovery`) and the encoder thread
+//! `DeviceInner::alloc_pagebox_capped`) and the encoder thread
 //! (push in `drain_retired_resource_retention`) reach it without pointer
 //! plumbing through `FrameData`.
 

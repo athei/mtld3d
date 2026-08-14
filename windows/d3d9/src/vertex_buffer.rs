@@ -124,7 +124,7 @@ impl VertexBufferInner {
             return;
         };
         let size = (max - min) as usize;
-        let mut transient = dev.alloc_pagebox_with_recovery(size);
+        let mut transient = dev.alloc_pagebox_capped(size);
         // SAFETY: `min <= length` and `current_box` is allocated for `length`
         // bytes, so the offset stays in-bounds.
         let src = unsafe { self.current_box.as_ptr().add(min as usize) };
@@ -502,7 +502,7 @@ extern "system" fn vb_lock(
                 let buffer_id = inner.buffer_id;
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
-                let fresh = dev.alloc_pagebox_with_recovery(logical_len);
+                let fresh = dev.alloc_pagebox_capped(logical_len);
                 let old_box = core::mem::replace(&mut inner.current_box, fresh);
                 match preserve {
                     PreserveKind::None => {
@@ -574,7 +574,7 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
             // a live `DeviceInner` that outlives its children.
             let dev = unsafe { &mut *inner.device_inner };
             let size = (max - min) as usize;
-            let mut transient = dev.alloc_pagebox_with_recovery(size);
+            let mut transient = dev.alloc_pagebox_capped(size);
             // SAFETY: `min <= length` and `current_box` is allocated for
             // `length` bytes, so the offset stays in-bounds.
             let src = unsafe { inner.current_box.as_ptr().add(min as usize) };
