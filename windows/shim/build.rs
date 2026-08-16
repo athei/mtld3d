@@ -4,10 +4,18 @@ fn main() {
         return;
     }
 
-    let wine_arch = if target.contains("x86_64") {
-        "x86_64-windows"
-    } else {
-        "i386-windows"
+    // Wine's builtin directory for this target, which is also the path
+    // `libwinecrt0.a` files its per-arch objects under. Spelled out rather than
+    // defaulted, so a target we have not thought about fails here instead of
+    // silently linking another arch's `unix_lib.o`. arm64ec builds are ARM64
+    // code and take the ARM64 tree, matching Wine's own loader (`get_pe_dir`
+    // maps `IMAGE_FILE_MACHINE_ARM64` to `aarch64-windows`, and a hybrid module
+    // requested as AMD64 is redirected there).
+    let wine_arch = match target.split('-').next().expect("target triple has an arch") {
+        "x86_64" => "x86_64-windows",
+        "i686" => "i386-windows",
+        "aarch64" | "arm64ec" => "aarch64-windows",
+        arch => panic!("no Wine builtin directory known for target arch `{arch}`"),
     };
 
     let wine_sdk = std::env::var("WINE_SDK").expect("WINE_SDK must be set");
@@ -30,7 +38,12 @@ fn main() {
         ])
         .output()
         .expect("ar failed");
-    assert!(output.status.success(), "ar p failed");
+    assert!(
+        output.status.success(),
+        "could not extract libs/winecrt0/{wine_arch}/unix_lib.o from \
+         {lib_dir}/libwinecrt0.a: is WINE_SDK a Wine build tree that carries \
+         this architecture?"
+    );
 
     let unix_lib_path = format!("{out_dir}/unix_lib.o");
     std::fs::write(&unix_lib_path, &output.stdout).expect("failed to write unix_lib.o");

@@ -30,8 +30,8 @@ const LOG_TARGET: &str = "mtld3d::perf";
 /// Read the timestamp / cycle counter.
 ///
 /// Single-instruction primitive on the x86 PE targets (`rdtsc`); `#[inline]`
-/// lets a measurement bracket compile to a pair of reads in release. aarch64
-/// builds read the ARM generic timer `CNTVCT_EL0` instead. Each linkage unit
+/// lets a measurement bracket compile to a pair of reads in release. ARM builds
+/// read the ARM generic timer `CNTVCT_EL0` instead. Each linkage unit
 /// calibrates its own Hz, so a count is only comparable within the unit that
 /// produced it.
 #[inline]
@@ -49,12 +49,13 @@ pub fn rdtsc() -> u64 {
         // (Wine PE process). No preconditions; returns the cycle counter.
         unsafe { core::arch::x86::_rdtsc() }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
     {
-        // Native test/lint builds and the `.so` for an arm64 Wine; the PE side
-        // always takes an x86 path above. CNTVCT_EL0 is the ARM generic-timer
-        // counter, the aarch64 analogue of the TSC; `calibrate()` derives its
-        // Hz at runtime.
+        // Native test/lint builds, the `.so` for an arm64 Wine, and the arm64ec
+        // PE builtin, which is ARM64 code under an x64-shaped ABI (rustc gives
+        // it its own `target_arch`, so it matches neither arm above). CNTVCT_EL0
+        // is the ARM generic-timer counter, the analogue of the TSC;
+        // `calibrate()` derives its Hz at runtime.
         let cnt: u64;
         // SAFETY: CNTVCT_EL0 is readable from EL0 on macOS arm64 (the kernel
         // enables EL0VCTEN); the read has no preconditions and no side effects.
