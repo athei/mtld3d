@@ -3,7 +3,7 @@
 //! Installed once from `init_logger_handler`. Catches SIGSEGV, SIGBUS,
 //! SIGABRT. The handler is async-signal-safe — it only calls
 //! `libc::write` on fd 2 and `mtld3d_shared::crumb::dump_recent` (which is
-//! itself async-signal-safe). On a fatal signal the handler:
+//! itself async-signal-safe). On a fatal signal in OUR code the handler:
 //!
 //! 1. Writes a single-line fatal banner identifying the signal and the
 //!    fault address (for SIGSEGV/SIGBUS).
@@ -18,6 +18,14 @@
 //! until `WoW` eventually crashes downstream. `_exit(1)` produces one
 //! clean diagnostic and one termination event.
 //!
+//! A memory fault raised by anything OTHER than our own code is forwarded to
+//! whoever owned the signal before us instead, because we are not the only
+//! consumer of a fault in this process: Wine translates guest faults into
+//! Windows exceptions, and on an arm64 host the x86 emulator (`xtajit`) takes
+//! memory faults as part of ordinary work. Terminating on those killed the game
+//! at startup on `CrossOver`'s arm64 Wine, and on any host it would have eaten
+//! the guest's own exception handling.
+//!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
 //! to the SIGABRT branch.
@@ -26,7 +34,7 @@ use core::{
     ffi::{c_int, c_void},
     mem, ptr,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use mtld3d_shared::crumb;
 
@@ -35,6 +43,43 @@ use mtld3d_shared::crumb;
 /// With `SA_NODEFER` that would re-enter `handler`; the first re-entry exits
 /// immediately so we never loop.
 static IN_HANDLER: AtomicBool = AtomicBool::new(false);
+
+/// The disposition a signal had before we took it over.
+///
+/// Kept in atomics rather than a `sigaction` copy because the handler reads it
+/// from a signal context, where a lock is not an option.
+struct PrevDisposition {
+    /// `sa_sigaction`, or `SIG_DFL` / `SIG_IGN`.
+    action: AtomicUsize,
+    /// `sa_flags`, which says whether `action` is a three-argument handler.
+    flags: AtomicI32,
+}
+
+impl PrevDisposition {
+    const fn new() -> Self {
+        Self {
+            action: AtomicUsize::new(libc::SIG_DFL),
+            flags: AtomicI32::new(0),
+        }
+    }
+}
+
+/// Previous dispositions of the signals we install, indexed by [`signal_slot`].
+static PREV: [PrevDisposition; 3] = [
+    PrevDisposition::new(),
+    PrevDisposition::new(),
+    PrevDisposition::new(),
+];
+
+/// Index into [`PREV`] for a signal we handle, or `None` for anything else.
+const fn signal_slot(signo: c_int) -> Option<usize> {
+    match signo {
+        libc::SIGSEGV => Some(0),
+        libc::SIGBUS => Some(1),
+        libc::SIGABRT => Some(2),
+        _ => None,
+    }
+}
 
 /// Install the crash handler.
 ///
@@ -71,14 +116,84 @@ fn install_signal_handler(signo: libc::c_int) {
     act.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
     // SAFETY: sigemptyset on a zeroed sigaction.
     unsafe { libc::sigemptyset(&raw mut act.sa_mask) };
-    // SAFETY: sigaction(2) with valid `act`; ignoring the prior handler
-    // because we never chain.
+    // SAFETY: zeroed `sigaction` is a valid out-param for the old disposition.
+    let mut old: libc::sigaction = unsafe { mem::zeroed() };
+    // SAFETY: sigaction(2) with a valid `act` and a valid out-param.
+    unsafe {
+        libc::sigaction(signo, &raw const act, &raw mut old);
+    }
+    // Kept so a fault that is not ours can go back to its owner, which is
+    // Wine's exception translation, or the x86 emulator on an arm64 host.
+    if let Some(slot) = signal_slot(signo) {
+        PREV[slot].action.store(old.sa_sigaction, Ordering::Relaxed);
+        PREV[slot].flags.store(old.sa_flags, Ordering::Relaxed);
+    }
+}
+
+/// True when the faulting instruction is in our own `.so`.
+///
+/// The ownership test for a memory fault, and one `dladdr` is cheap enough for
+/// a signal handler. It fails closed: a PC we cannot decode reads as not-ours,
+/// so the fault goes back to its owner rather than terminating the process. A
+/// fault taken inside a system framework we called (Metal, `AppKit`) is likewise
+/// not ours by this rule; Wine reports that one as a guest exception instead of
+/// our crumb dump, which is the price of staying out of the emulator's way.
+fn fault_is_ours(ctx: *mut c_void) -> bool {
+    let pc = fault_pc(ctx);
+    pc != 0 && dladdr_is_ours(pc)
+}
+
+/// Hand a signal back to whoever owned it before us.
+///
+/// Only the three-argument (`SA_SIGINFO`) form is called through, which is what
+/// Wine and the emulator install. Anything else, including `SIG_DFL`, restores
+/// the previous disposition and returns: the faulting instruction re-executes
+/// and takes that disposition instead, which is how a genuine fault still
+/// reaches the default action.
+fn forward_to_previous(signo: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+    let Some(slot) = signal_slot(signo) else {
+        return;
+    };
+    let action = PREV[slot].action.load(Ordering::Relaxed);
+    let flags = PREV[slot].flags.load(Ordering::Relaxed);
+
+    if action != libc::SIG_DFL && action != libc::SIG_IGN && flags & libc::SA_SIGINFO != 0 {
+        // SAFETY: `action` came from `sigaction`'s out-param for this signal
+        // and its `SA_SIGINFO` flag says it takes these three arguments. The
+        // arguments are the kernel's own, passed through unchanged.
+        let previous: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+            unsafe { mem::transmute::<usize, _>(action) };
+        previous(signo, info, ctx);
+        return;
+    }
+
+    // SAFETY: writing a zero-initialized sigaction that restores the saved
+    // disposition; the handler returns immediately after, so the faulting
+    // instruction re-runs under it.
+    let mut act: libc::sigaction = unsafe { mem::zeroed() };
+    act.sa_sigaction = action;
+    act.sa_flags = flags;
+    // SAFETY: sigemptyset on a zeroed sigaction.
+    unsafe { libc::sigemptyset(&raw mut act.sa_mask) };
+    // SAFETY: sigaction(2) with a valid `act`; no out-param wanted.
     unsafe {
         libc::sigaction(signo, &raw const act, ptr::null_mut());
     }
 }
 
 extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+    // A memory fault outside our own image belongs to somebody else: Wine turns
+    // guest faults into Windows exceptions, and on an arm64 host the x86
+    // emulator faults as part of ordinary work. Hand those straight back,
+    // before the re-entrancy latch below, which would otherwise arm itself on
+    // the first one and turn every later fault into an immediate `_exit`.
+    // SIGABRT is not shared this way: an abort is always terminal, and its PC
+    // is inside libsystem rather than our code, so it stays ours to report.
+    if signo != libc::SIGABRT && !fault_is_ours(ctx) {
+        forward_to_previous(signo, info, ctx);
+        return;
+    }
+
     // Bail on the first re-entry (a faulting register/stack read below would
     // otherwise loop under `SA_NODEFER`).
     if IN_HANDLER.swap(true, Ordering::AcqRel) {
