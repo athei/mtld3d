@@ -30,7 +30,8 @@ endif
 # and FP=1 forces them on for the guest-pc sampling profiler, whose stack walks
 # follow the guest frame-pointer chain, and without them every walk stops at
 # the leaf, so a profile captured on an end-user machine cannot attribute cost
-# to callers.
+# to callers. Applies to the PE and unix builds alike; on aarch64 it changes
+# nothing, the platform ABI mandates a frame pointer there.
 #
 # Written as a `cfg(all())` entry (matches every target) rather than a
 # `RUSTFLAGS` environment variable: cargo joins rustflags arrays across config
@@ -47,16 +48,23 @@ endif
 
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
-# Release/Wine target: the unix `.so` must be x86_64 Mach-O (Wine's unix-call
-# boundary), so shipped artifacts are always built for x86_64.
-UNIX_RELEASE_TARGET := x86_64-apple-darwin
+# Release/Wine targets for the unix half. Wine picks the `.so` out of
+# `lib/wine/<cpu>-unix` by the arch of the Wine build that loads it, so there is
+# one artifact per Wine host ISA: x86_64 for today's Wine on macOS, aarch64 for
+# the arm64 Wine being prepared. The PE side is unaffected (it stays x86 either
+# way), so both artifacts serve the same i386/x86_64 DLLs.
+UNIX_TARGET_x64    := x86_64-apple-darwin
+UNIX_TARGET_arm64  := aarch64-apple-darwin
+UNIX_WINEDIR_x64   := x86_64-unix
+UNIX_WINEDIR_arm64 := aarch64-unix
 # Native host target for unit tests + clippy — whatever this machine is
 # (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta.
 UNIX_NATIVE_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
 
-OUT_i386 := windows/target/$(PE_i386)/$(PROFILE)
-OUT_x64  := windows/target/$(PE_x64)/$(PROFILE)
-OUT_unix := unix/target/$(UNIX_RELEASE_TARGET)/$(PROFILE)
+OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
+OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
+OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
+OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
 XWIN_CACHE := $(HOME)/Library/Caches/xwin
 
@@ -117,23 +125,28 @@ windows:
 	winebuild --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
 unix:
-	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_RELEASE_TARGET) $(FRAME_POINTERS)
+	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
+	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
 	# On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 	# debug map in the dylib pointing at them by absolute path; `dsymutil` walks
 	# that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of
 	# an MSVC `.pdb`. Run it on a copy already named `mtld3d.so`, because it
 	# stamps the inner DWARF file after the input's basename and lldb looks it up
 	# by that name — renaming the bundle afterwards produces one lldb won't find.
-	cp $(OUT_unix)/libmtld3d_unix.dylib $(OUT_unix)/mtld3d.so
-	rm -rf $(OUT_unix)/mtld3d.so.dSYM
-	dsymutil $(OUT_unix)/mtld3d.so
+	for out in $(OUT_unix_x64) $(OUT_unix_arm64); do \
+		cp $$out/libmtld3d_unix.dylib $$out/mtld3d.so ; \
+		rm -rf $$out/mtld3d.so.dSYM ; \
+		dsymutil $$out/mtld3d.so ; \
+	done
 
 install: all
 	# The d3d9.dll copies under lib/wine get the builtin signature in place —
 	# the loader ignores unsigned PEs on the builtin search path. Symbols travel
 	# with each binary: the `.pdb` beside every PE, the `.dSYM` beside the `.so`,
 	# so a local crash symbolicates against the installed files with no extra
-	# flags.
+	# flags. Both unix arches go in, creating the directory the Wine tree lacks:
+	# a Wine only ever loads the one matching its own build, so the other copy
+	# is inert, and a tree that later gains an arm64 loader is already served.
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
@@ -141,9 +154,13 @@ install: all
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
 		winebuild --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
-		cp $(OUT_unix)/mtld3d.so            $$dir/lib/wine/x86_64-unix/ ; \
-		rm -rf $$dir/lib/wine/x86_64-unix/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix)/mtld3d.so.dSYM    $$dir/lib/wine/x86_64-unix/ ; \
+		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_x64) $$dir/lib/wine/$(UNIX_WINEDIR_arm64) ; \
+		cp $(OUT_unix_x64)/mtld3d.so        $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
+		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
+		cp $(OUT_unix_arm64)/mtld3d.so      $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
+		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
 		cp $(OUT_i386)/mtld3d.fake.dll      $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_x64)/mtld3d.fake.dll       $$dir/lib/wine/x86_64-windows/ ; \
 	done
@@ -153,7 +170,9 @@ install: all
 # PE builtin-marked (drop-in for a Wine tree the user owns), while native/
 # holds the unmarked d3d9.dll for the DLL-override route (required on
 # CrossOver). The fake placeholders are the prefix markers for the custom
-# mtld3d builtin name.
+# mtld3d builtin name. wine/ carries both unix arches, so the same tree drops
+# into an x86_64 or an arm64 Wine; each loads only the `.so` matching its own
+# build.
 #
 # Two archives come out of one run: the bundle users install, and the symbols
 # that make a crash report from one of them readable.
@@ -161,7 +180,8 @@ bundle: all
 	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-windows
-	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-unix
+	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)
+	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)
 	mkdir -p $(BUNDLE_STAGE)/native/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/native/x86_64-windows
 	cp $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
@@ -172,7 +192,8 @@ bundle: all
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	winebuild --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	winebuild --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
-	cp $(OUT_unix)/mtld3d.so            $(BUNDLE_STAGE)/wine/x86_64-unix/
+	cp $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
+	cp $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
 	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
 	cp $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
@@ -184,14 +205,17 @@ bundle: all
 	# the two d3d9.dll flavors are one binary with one `.pdb`.
 	mkdir -p $(DEBUG_STAGE)/i386-windows
 	mkdir -p $(DEBUG_STAGE)/x86_64-windows
-	mkdir -p $(DEBUG_STAGE)/x86_64-unix
+	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)
+	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)
 	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
 	cp $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
 	cp $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
 	cp $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
 	cp $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
-	cp -R $(OUT_unix)/mtld3d.so.dSYM    $(DEBUG_STAGE)/x86_64-unix/
-	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows x86_64-unix
+	cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/
+	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/
+	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows \
+		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
 
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
@@ -330,7 +354,7 @@ setup:
 	brew install llvm lld
 	brew upgrade llvm lld
 	@echo "==> rustup: add cross-compile targets"
-	rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc x86_64-apple-darwin
+	rustup target add $(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
 	@echo "==> cargo: install/upgrade xwin and cargo-edit"
 	cargo install xwin cargo-edit
 	@echo "==> /opt/xwin: ensure user-writable"

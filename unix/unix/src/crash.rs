@@ -169,6 +169,9 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // saved registers + top-of-stack name the culprit: `rcx` is the Win64 first
     // argument (a COM call's `this` — the freed object), `rax` the loaded vtable,
     // and the return address the faulting `CALL` pushed at `[rsp]` is the caller.
+    // x86_64 only: an arm64 report carries the fault PC, the crumbs, and the
+    // frame-pointer backtrace, but not this dump or the stack scan below. Both
+    // decode a register file that has no arm64 counterpart written yet.
     #[cfg(target_arch = "x86_64")]
     {
         let rsp = mcontext_u64(ctx, 72);
@@ -367,8 +370,8 @@ const FRAME_CAP: c_int = 64;
 /// `ucontext_t` (same on both macOS arches). The PC offset *within* the
 /// `mcontext` is arch-specific: `x86_64` `__rip` follows the 16-byte exception
 /// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte
-/// exception state + 32 thread-state `u64`s (272). The shipped `.so` is
-/// `x86_64` under Wine.
+/// exception state + 32 thread-state `u64`s (272). Both are shipped: the `.so`
+/// follows the arch of the Wine that loads it.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn fault_pc(ctx: *mut c_void) -> u64 {
     #[cfg(target_arch = "x86_64")]

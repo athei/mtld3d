@@ -16,6 +16,8 @@ wine/                       lib/wine-shaped tree, every PE builtin-marked
   x86_64-windows/           the same three files, 64-bit
   x86_64-unix/
     mtld3d.so               Metal-side unix library
+  aarch64-unix/
+    mtld3d.so               the same library for an arm64 Wine
 native/                     unmarked d3d9.dll for the DLL-override route
   i386-windows/d3d9.dll
   x86_64-windows/d3d9.dll
@@ -34,6 +36,12 @@ The two `d3d9.dll` variants are the same binary in two loader flavors:
 - `native/…/d3d9.dll` is an ordinary native PE, loaded through a
   `d3d9=native` DLL override. The Wine installation stays untouched.
 
+The `.so` ships for two architectures. Wine loads the one under the directory
+matching the arch of the Wine build itself, so today's x86_64 Wine on macOS
+takes `x86_64-unix/` and ignores `aarch64-unix/` entirely; the arm64 copy is
+there for an arm64-native Wine. Nothing to choose: copy both, or the one your
+Wine needs. The PE side is x86 in either case.
+
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
 builtin, so there is no native variant of it. And because Wine resolves
@@ -44,8 +52,8 @@ every prefix needs the `mtld3d.fake.dll` markers copied in once.
 ## Requirements
 
 - **Apple Silicon macOS 15** or newer.
-- **Rosetta 2** (`softwareupdate --install-rosetta`) — the unix library is
-  x86_64 Mach-O, matching Wine's own binaries.
+- **Rosetta 2** (`softwareupdate --install-rosetta`): the game and the whole PE
+  side are x86, and so is Wine itself in every build shipping today.
 - A Wine with the current WoW64 loader: **Wine 8.0 or newer**, or
   **CrossOver 24 or newer**.
 - A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
@@ -104,7 +112,8 @@ tar -xf mtld3d.tar.xz
 # d3d9.dll stays in place.
 cp wine/i386-windows/mtld3d.dll   "$WINE/lib/wine/i386-windows/"
 cp wine/x86_64-windows/mtld3d.dll "$WINE/lib/wine/x86_64-windows/"
-cp wine/x86_64-unix/mtld3d.so     "$WINE/lib/wine/x86_64-unix/"
+cp wine/x86_64-unix/mtld3d.so     "$WINE/lib/wine/x86_64-unix/"    # x86_64 Wine
+#cp wine/aarch64-unix/mtld3d.so   "$WINE/lib/wine/aarch64-unix/"   # arm64 Wine
 
 # One-time prefix markers, as in the builtin route.
 cp wine/i386-windows/mtld3d.fake.dll   "$WINEPREFIX/drive_c/windows/syswow64/mtld3d.dll"

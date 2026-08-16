@@ -149,10 +149,13 @@ the host and the full stack under Wine.
 
 ## Building from source
 
-mtld3d builds and runs on **Apple Silicon macOS**. The shipped `mtld3d.so` is
-an x86_64 Mach-O that runs under **Rosetta 2** inside Wine (install it with
-`softwareupdate --install-rosetta`), and the Metal backend targets **macOS 15**
-or newer (`unix/.cargo/config.toml` pins `MACOSX_DEPLOYMENT_TARGET = 15.0`).
+mtld3d builds and runs on **Apple Silicon macOS**. `mtld3d.so` ships as both an
+x86_64 and an arm64 Mach-O, since Wine loads it from the `lib/wine/<cpu>-unix`
+directory matching its own build; the x86_64 one is what every Wine shipping
+today uses, running under **Rosetta 2** (install it with
+`softwareupdate --install-rosetta`) like the rest of the stack. The Metal
+backend targets **macOS 15** or newer (`unix/.cargo/config.toml` pins
+`MACOSX_DEPLOYMENT_TARGET = 15.0`).
 
 The following must be available on `PATH`:
 
@@ -187,21 +190,21 @@ make upgrade-incompat   # cargo upgrade --incompatible + cargo update; requires 
 ```
 
 `make setup` installs LLVM and lld via Homebrew, adds the
-`i686-pc-windows-msvc`, `x86_64-pc-windows-msvc`, and `x86_64-apple-darwin`
-rustup targets, installs xwin and cargo-edit, and splats the Windows SDK
-(~3 GB) to `/opt/xwin`; creating that root-owned directory takes a one-time
-`sudo` prompt. It does not install Wine or Rosetta. Windows targets
+`i686-pc-windows-msvc`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, and
+`aarch64-apple-darwin` rustup targets, installs xwin and cargo-edit, and splats
+the Windows SDK (~3 GB) to `/opt/xwin`; creating that root-owned directory takes
+a one-time `sudo` prompt. It does not install Wine or Rosetta. Windows targets
 cross-compile from macOS via `lld-link` + xwin (see
-`windows/.cargo/config.toml`); `unix/` targets `x86_64-apple-darwin`
-explicitly because Wine's unix `.so` must be x86_64 Mach-O. The internal
-crates use path dependencies and are not published to crates.io.
+`windows/.cargo/config.toml`); `unix/` builds both Apple targets explicitly,
+one per Wine host ISA, since Wine picks the `.so` matching its own arch. The
+internal crates use path dependencies and are not published to crates.io.
 
 Frame pointers are off by default. `FP=1 make` forces them on for the guest-pc
 sampling profiler, whose stack walks follow the guest frame-pointer chain.
 
 `make install` copies the PE DLLs into `lib/wine/{i386,x86_64}-windows/` and
-the unix `.so` into `lib/wine/x86_64-unix/` under `WINE_INSTALL_DIR`, stamping
-the Wine-builtin signature onto the `d3d9.dll` copies (the loader ignores
+the unix `.so` into `lib/wine/{x86_64,aarch64}-unix/` under `WINE_INSTALL_DIR`,
+stamping the Wine-builtin signature onto the `d3d9.dll` copies (the loader ignores
 unsigned PEs on the builtin search path). The build outputs themselves stay
 unsigned native PEs so they can also be deployed as a native DLL override;
 `make bundle` packs both flavors into `windows/target/mtld3d.tar.xz`, the
@@ -220,10 +223,10 @@ it.
 
 ```
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(i386 PE)  (i386 PE)  (i386 PE)  (x86_64 Mach-O)
+(i386 PE)  (i386 PE)  (i386 PE)  (Mach-O, Wine's own arch)
 
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(x64 PE)   (x64 PE)   (x64 PE)   (x86_64 Mach-O)
+(x64 PE)   (x64 PE)   (x64 PE)   (Mach-O, Wine's own arch)
 ```
 
 - `d3d9.dll`: D3D9 API implementation, COM vtables, caps, state management.
@@ -260,9 +263,10 @@ For the PE/Unix boundary contract, the threading details, perf instrumentation, 
 
 Two Cargo workspaces, one per target platform: `windows/` builds the PE side
 for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, `unix/` builds the
-Mach-O side for `x86_64-apple-darwin`. Open each in a separate editor window
-for rust-analyzer to work correctly. The shipped crates and their outputs
-(the workspaces also hold test, types, and conformance support crates):
+Mach-O side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (one per Wine
+host ISA; the latter is also the native test target). Open each in a separate
+editor window for rust-analyzer to work correctly. The shipped crates and their
+outputs (the workspaces also hold test, types, and conformance support crates):
 
 | Crate         | Workspace  | Output                                                  |
 |---------------|------------|---------------------------------------------------------|

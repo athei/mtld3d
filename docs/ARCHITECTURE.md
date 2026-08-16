@@ -4,11 +4,13 @@ mtld3d is a Wine-side translation layer that ships a D3D9 implementation backed 
 
 ```
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(i386 PE)  (i386 PE)  (i386 PE)  (x86_64 Mach-O)
+(i386 PE)  (i386 PE)  (i386 PE)  (Mach-O, Wine's own arch)
 
 test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(x64 PE)   (x64 PE)   (x64 PE)   (x86_64 Mach-O)
+(x64 PE)   (x64 PE)   (x64 PE)   (Mach-O, Wine's own arch)
 ```
+
+The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), so it is built and shipped for both `x86_64-apple-darwin` and `aarch64-apple-darwin`. x86_64 is what every Wine on macOS uses today; the arm64 artifact is groundwork for an arm64-native one.
 
 - `d3d9.dll` — D3D9 API implementation. COM vtables, caps, state management. Calls Metal-level thunks via its internal `unix_call` caller stub (`windows/d3d9/src/unix_call.rs`).
 - `mtld3d.dll` — PE shim. Links winecrt0, owns Wine unix-call globals, exports `mtld3d_unix_call()`. Forwards every cross-boundary call from `d3d9.dll` into `mtld3d.so`.

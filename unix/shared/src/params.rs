@@ -15,7 +15,8 @@ use super::{
 // ── Wire-layout guards ──
 //
 // Checked at compile time on EVERY target this crate is built for — the two
-// PE arches (i686 + x86_64 `*-pc-windows-msvc`) AND the x86_64 unix `.so`. The
+// PE arches (i686 + x86_64 `*-pc-windows-msvc`) AND both unix `.so` arches
+// (x86_64 and aarch64 Apple, which share these `repr(C)` layouts). The
 // whole PE↔unix thunk protocol assumes a `repr(C)` `u64` is 8-byte aligned on
 // all of them; if a 32-bit target ever aligned `u64` to 4, every struct with a
 // `u64` after an odd run of 4-byte fields would shift and the unix handler
@@ -533,7 +534,14 @@ pub struct SubmitFrameParams {
     /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
     /// VB/IB.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    pub drawable_wait_tsc: u64, // out: TSC cycles spent in nextDrawable()
+    /// Cycles spent in `nextDrawable()`, on the unix side's time base.
+    ///
+    /// The PE side converts these with its OWN calibrated Hz, which holds while
+    /// both sides read the same counter: an `x86_64` `.so` and the PE code both
+    /// go through Rosetta's `rdtsc`. An arm64 `.so` reads `CNTVCT_EL0` directly,
+    /// which does not tick at the emulated `rdtsc` rate, so this one `PERF=1`
+    /// number needs converting at the source before it means anything there.
+    pub drawable_wait_tsc: u64, // out
     /// `NSView*` the layer was attached to.
     ///
     /// `submit_frame` walks `view → window → screen` each present to read

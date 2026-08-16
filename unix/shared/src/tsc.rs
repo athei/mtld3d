@@ -3,9 +3,9 @@
 //! Compiles to a single `rdtsc` instruction on both PE targets (i386 and
 //! `x86_64`), bypassing any Wine-side `QueryPerformanceCounter` translation.
 //! Under Rosetta 2 on Apple Silicon the instruction is trapped to the ARM
-//! generic timer; cost stays near-native (~10–30 cycles). Native host
-//! (aarch64) test/lint builds — which never ship — read `CNTVCT_EL0`
-//! directly instead of going through Rosetta.
+//! generic timer; cost stays near-native (~10–30 cycles). On aarch64 (the
+//! native test/lint builds, and the `.so` built for an arm64 Wine) the counter
+//! is read as `CNTVCT_EL0` directly instead of through Rosetta.
 //!
 //! Returns raw TSC cycles, not nanoseconds. TSC is invariant on Nehalem+
 //! so a single runtime calibration against `Instant` yields a
@@ -30,9 +30,10 @@ const LOG_TARGET: &str = "mtld3d::perf";
 /// Read the timestamp / cycle counter.
 ///
 /// Single-instruction primitive on the x86 PE targets (`rdtsc`); `#[inline]`
-/// lets a measurement bracket compile to a pair of reads in release. Native
-/// host (aarch64) test/lint builds read the ARM generic timer `CNTVCT_EL0`
-/// instead — shipped Wine code always runs an x86 path.
+/// lets a measurement bracket compile to a pair of reads in release. aarch64
+/// builds read the ARM generic timer `CNTVCT_EL0` instead. Each linkage unit
+/// calibrates its own Hz, so a count is only comparable within the unit that
+/// produced it.
 #[inline]
 #[must_use]
 pub fn rdtsc() -> u64 {
@@ -50,9 +51,10 @@ pub fn rdtsc() -> u64 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Native host (test/lint) builds only — shipped Wine code always runs
-        // an x86 path above. CNTVCT_EL0 is the ARM generic-timer counter, the
-        // aarch64 analogue of the TSC; `calibrate()` derives its Hz at runtime.
+        // Native test/lint builds and the `.so` for an arm64 Wine; the PE side
+        // always takes an x86 path above. CNTVCT_EL0 is the ARM generic-timer
+        // counter, the aarch64 analogue of the TSC; `calibrate()` derives its
+        // Hz at runtime.
         let cnt: u64;
         // SAFETY: CNTVCT_EL0 is readable from EL0 on macOS arm64 (the kernel
         // enables EL0VCTEN); the read has no preconditions and no side effects.
