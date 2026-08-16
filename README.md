@@ -196,6 +196,9 @@ cross-compile from macOS via `lld-link` + xwin (see
 explicitly because Wine's unix `.so` must be x86_64 Mach-O. The internal
 crates use path dependencies and are not published to crates.io.
 
+Frame pointers are off by default. `FP=1 make` forces them on for the guest-pc
+sampling profiler, whose stack walks follow the guest frame-pointer chain.
+
 `make install` copies the PE DLLs into `lib/wine/{i386,x86_64}-windows/` and
 the unix `.so` into `lib/wine/x86_64-unix/` under `WINE_INSTALL_DIR`, stamping
 the Wine-builtin signature onto the `d3d9.dll` copies (the loader ignores

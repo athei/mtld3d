@@ -26,6 +26,25 @@ export MTLD3D_PERF := 1
 $(info ==> PERF=1: cfg(perf_tracking) compile-time perf telemetry enabled)
 endif
 
+# Frame pointers are opt-in: the toolchain default decides for a normal build,
+# and FP=1 forces them on for the guest-pc sampling profiler, whose stack walks
+# follow the guest frame-pointer chain, and without them every walk stops at
+# the leaf, so a profile captured on an end-user machine cannot attribute cost
+# to callers.
+#
+# Written as a `cfg(all())` entry (matches every target) rather than a
+# `RUSTFLAGS` environment variable: cargo joins rustflags arrays across config
+# sources, and joins the cfg table with the triple table, so this ADDS to the
+# flags each `.cargo/config.toml` pins per target (target-cpu, target features,
+# linker search paths) where `RUSTFLAGS` would replace them wholesale.
+#
+# Build-script C/C++ is not covered; see the note on `-fno-omit-frame-pointer`
+# in `windows/.cargo/config.toml`.
+ifeq ($(FP),1)
+$(info ==> FP=1: frame pointers forced (guest stack walks for the sampling profiler))
+FRAME_POINTERS := --config 'target."cfg(all())".rustflags=["-C","force-frame-pointers=yes"]'
+endif
+
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
 # Release/Wine target: the unix `.so` must be x86_64 Mach-O (Wine's unix-call
@@ -80,8 +99,8 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 all: windows unix
 
 windows:
-	cd windows && cargo build --profile $(PROFILE) --target $(PE_i386)
-	cd windows && cargo build --profile $(PROFILE) --target $(PE_x64)
+	cd windows && cargo build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
+	cd windows && cargo build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
 	# mtld3d.dll is only ever a Wine builtin (it owns the unix-call globals), so
 	# it gets the builtin signature at build time. d3d9.dll stays an ordinary
 	# native PE here — `install` and `bundle` mark their staged copies instead,
@@ -98,7 +117,7 @@ windows:
 	winebuild --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
 unix:
-	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_RELEASE_TARGET)
+	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_RELEASE_TARGET) $(FRAME_POINTERS)
 	# On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 	# debug map in the dylib pointing at them by absolute path; `dsymutil` walks
 	# that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of

@@ -3,17 +3,16 @@
 # tests and clippy want. Shipped artifacts are built for x86_64-apple-darwin
 # by passing `--target` explicitly (see the Makefile `unix:` recipe) — Wine's
 # unix-call boundary requires the `.so` to be x86_64 Mach-O.
-# `force-frame-pointers` and `-fno-omit-frame-pointer` (below) pin what is
-# already the toolchain default on Apple targets: the guest-pc sampling
-# profiler recovers call stacks by walking the frame-pointer chain, and this
-# `.so` runs under x86-on-ARM translation where it is guest code like the PE
-# side, so the requirement is load-bearing rather than a default we happen to
-# inherit.
+#
+# Frame pointers are not pinned below: a normal build takes the toolchain
+# default. The guest-pc sampling profiler needs them (it walks the frame-pointer
+# chain, and this `.so` is guest code under x86-on-ARM translation like the PE
+# side), so a profiling build asks for them with `FP=1 make`, which appends
+# `-C force-frame-pointers=yes` to these flags.
 [target.x86_64-apple-darwin]
 rustflags = [
     "-C", "target-cpu=x86-64-v2",
     "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
-    "-C", "force-frame-pointers=yes",
 ]
 
 [env]
@@ -23,6 +22,7 @@ MACOSX_DEPLOYMENT_TARGET = "15.0"
 # runs under x86-on-ARM translation, whose vector unit is 128-bit: 256-bit
 # AVX/AVX2 ops are split across two halves and underperform plain SSE, so the
 # baseline caps at SSE4.2 (128-bit, 1:1 with the host vector unit) plus the
-# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT).
-CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer"
-CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer"
+# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT). Pre-emptive:
+# this workspace has no C dependency today, so nothing reads these yet.
+CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"
+CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"

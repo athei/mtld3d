@@ -1,19 +1,17 @@
 [build]
 target = "i686-pc-windows-msvc"
 
-# Frame pointers are part of the shipping configuration: the guest-pc sampling
-# profiler recovers call stacks by walking the guest frame-pointer chain, and a
-# build without them stops every walk at the leaf, so profiles captured on
-# end-user machines cannot attribute cost to callers. i686 pins EBP out of
-# 8 GPRs to pay for this, which is a real cost in register-pressure spills;
-# stack-attributed profiles from the field are worth more than the difference.
+# Frame pointers are not pinned here: a normal build takes the toolchain
+# default. The guest-pc sampling profiler needs them (it recovers call stacks by
+# walking the guest frame-pointer chain, and a build without them stops every
+# walk at the leaf), so `FP=1 make` appends `-C force-frame-pointers=yes` to
+# these rustflags for a build meant to be profiled.
 [target.i686-pc-windows-msvc]
 linker = "lld-link"
 rustflags = [
     "-C", "target-cpu=nehalem",
     "-C", "target-feature=-crt-static",
     "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
-    "-C", "force-frame-pointers=yes",
     "-Lnative=/opt/xwin/crt/lib/x86",
     "-Lnative=/opt/xwin/sdk/lib/um/x86",
     "-Lnative=/opt/xwin/sdk/lib/ucrt/x86",
@@ -25,7 +23,6 @@ rustflags = [
     "-C", "target-cpu=x86-64-v2",
     "-C", "target-feature=-crt-static",
     "-C", "target-feature=+bmi1,+bmi2,+lzcnt",
-    "-C", "force-frame-pointers=yes",
     "-Lnative=/opt/xwin/crt/lib/x86_64",
     "-Lnative=/opt/xwin/sdk/lib/um/x86_64",
     "-Lnative=/opt/xwin/sdk/lib/ucrt/x86_64",
@@ -47,6 +44,12 @@ rustflags = [
 # (BMI1/BMI2/LZCNT via `-mbmi -mbmi2 -mlzcnt`). cc-rs invokes clang for these
 # targets (the `-idirafter` flags here are clang-style), so these flags
 # propagate without needing an MSVC `/arch:` spelling.
+#
+# `-fno-omit-frame-pointer` stays unconditional here, unlike the Rust side's
+# `FP=1` knob: cc and cmake take the whole flag string from the first matching
+# environment variable with no composition, so the knob could only reach them by
+# restating everything above in the Makefile. This is a fixed, small amount of
+# code (snmalloc-sys and zstd-sys) whose frames are worth keeping walkable.
 CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"

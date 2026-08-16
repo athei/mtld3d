@@ -163,7 +163,7 @@ MTLD3D_CRUMB=1 make install   # cfg routed through build.rs
 xxd /tmp/mtld3d-crumb.bin     # read last-recorded state
 ```
 
-`MTLD3D_CRUMB=1` is used instead of `RUSTFLAGS="--cfg mtld3d_crumb"` because cargo prefers env `RUSTFLAGS` over `[target.*.rustflags]` (does not merge), so the env approach silently drops xwin `-Lnative=…` paths. `windows/d3d9/build.rs` reads `MTLD3D_CRUMB` and emits the cfg through `cargo:rustc-cfg`, which composes correctly.
+`MTLD3D_CRUMB=1` is used instead of `RUSTFLAGS="--cfg mtld3d_crumb"` because cargo prefers env `RUSTFLAGS` over `[target.*.rustflags]` (does not merge), so the env approach silently drops xwin `-Lnative=…` paths. `windows/d3d9/build.rs` reads `MTLD3D_CRUMB` and emits the cfg through `cargo:rustc-cfg`, which composes correctly. The other way to add a flag without losing the config-file ones is a `--config` layer, which cargo *does* join into the existing array; that is how the Makefile's `FP=1` appends `-C force-frame-pointers=yes`.
 
 Slot layout (8 bytes each, 128-byte map):
 
