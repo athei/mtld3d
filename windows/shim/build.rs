@@ -4,22 +4,28 @@ fn main() {
         return;
     }
 
-    // Wine's builtin directory for this target, which is also the path
-    // `libwinecrt0.a` files its per-arch objects under. Spelled out rather than
-    // defaulted, so a target we have not thought about fails here instead of
-    // silently linking another arch's `unix_lib.o`. arm64ec builds are ARM64
-    // code and take the ARM64 tree, matching Wine's own loader (`get_pe_dir`
-    // maps `IMAGE_FILE_MACHINE_ARM64` to `aarch64-windows`, and a hybrid module
-    // requested as AMD64 is redirected there).
-    let wine_arch = match target.split('-').next().expect("target triple has an arch") {
-        "x86_64" => "x86_64-windows",
-        "i686" => "i386-windows",
-        "aarch64" | "arm64ec" => "aarch64-windows",
+    // Where Wine keeps this target's libraries, and the path its per-arch
+    // objects carry inside `libwinecrt0.a`. The two differ for arm64ec: an
+    // ARM64X build (`--enable-archs=arm64ec,aarch64`) installs one archive
+    // under the native arch and packs BOTH arches' objects into it
+    // (`output_static_lib` in Wine's makedep adds `object_files[hybrid_arch]`),
+    // so the EC build takes the EC object out of the aarch64 archive. That also
+    // matches the loader, whose `get_pe_dir` knows no arm64ec directory and
+    // redirects a hybrid module requested as AMD64 to `aarch64-windows`.
+    //
+    // Spelled out rather than defaulted, so a target we have not thought about
+    // fails here instead of silently linking another arch's `unix_lib.o`.
+    let (lib_arch, object_arch) = match target.split('-').next().expect("target triple has an arch")
+    {
+        "x86_64" => ("x86_64-windows", "x86_64-windows"),
+        "i686" => ("i386-windows", "i386-windows"),
+        "aarch64" => ("aarch64-windows", "aarch64-windows"),
+        "arm64ec" => ("aarch64-windows", "arm64ec-windows"),
         arch => panic!("no Wine builtin directory known for target arch `{arch}`"),
     };
 
     let wine_sdk = std::env::var("WINE_SDK").expect("WINE_SDK must be set");
-    let lib_dir = format!("{wine_sdk}/lib/wine/{wine_arch}");
+    let lib_dir = format!("{wine_sdk}/lib/wine/{lib_arch}");
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     // Homebrew installs llvm keg-only (not on PATH), so resolve `llvm-ar`
@@ -34,13 +40,13 @@ fn main() {
         .args([
             "p",
             &format!("{lib_dir}/libwinecrt0.a"),
-            &format!("libs/winecrt0/{wine_arch}/unix_lib.o"),
+            &format!("libs/winecrt0/{object_arch}/unix_lib.o"),
         ])
         .output()
         .expect("ar failed");
     assert!(
         output.status.success(),
-        "could not extract libs/winecrt0/{wine_arch}/unix_lib.o from \
+        "could not extract libs/winecrt0/{object_arch}/unix_lib.o from \
          {lib_dir}/libwinecrt0.a: is WINE_SDK a Wine build tree that carries \
          this architecture?"
     );
