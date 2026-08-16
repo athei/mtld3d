@@ -8,8 +8,9 @@ mtld3d replaces Wine's built-in `d3d9.dll` with an implementation that translate
 
 Download the release bundle (`mtld3d.tar.xz`) from
 [GitHub Releases](https://github.com/athei/mtld3d/releases). It runs on Apple
-Silicon macOS 15 or newer with Rosetta 2, inside Wine 8.0+ or CrossOver 24+
-(64-bit prefix). The bundle supports two install routes:
+Silicon macOS 15 or newer, inside Wine 8.0+ or CrossOver 24+ (64-bit prefix);
+an x86_64 Wine additionally needs Rosetta 2. The bundle supports two install
+routes:
 
 - **Builtin**: the bundle's `wine/` tree mirrors `lib/wine/` with every PE
   builtin-marked. Dropped into a Wine installation you own, it replaces the
@@ -27,7 +28,7 @@ inside the bundle.
 ### x87 performance
 
 D3D9-era games do their floating-point math in x87 instructions, which
-Rosetta 2 translates slowly. For full performance, run the game together with
+Rosetta 2 translates slowly. Under an x86_64 Wine, run the game together with
 [x87sidecar](https://github.com/athei/x87sidecar), a JIT that replaces
 Rosetta's x87 handling. Its cooperative attach mode requires a Wine that
 performs the sidecar handshake at startup: the Wine builds from
@@ -151,10 +152,10 @@ the host and the full stack under Wine.
 
 mtld3d builds and runs on **Apple Silicon macOS**. `mtld3d.so` ships as both an
 x86_64 and an arm64 Mach-O, since Wine loads it from the `lib/wine/<cpu>-unix`
-directory matching its own build; the x86_64 one is what every Wine shipping
-today uses, running under **Rosetta 2** (install it with
-`softwareupdate --install-rosetta`) like the rest of the stack. The Metal
-backend targets **macOS 15** or newer (`unix/.cargo/config.toml` pins
+directory matching its own build. The PE side is x86 either way, translated by
+**Rosetta 2** (install it with `softwareupdate --install-rosetta`) under an
+x86_64 Wine and by FEX under an arm64 one. The Metal backend targets
+**macOS 15** or newer (`unix/.cargo/config.toml` pins
 `MACOSX_DEPLOYMENT_TARGET = 15.0`).
 
 The following must be available on `PATH`:

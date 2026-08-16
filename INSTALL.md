@@ -37,10 +37,10 @@ The two `d3d9.dll` variants are the same binary in two loader flavors:
   `d3d9=native` DLL override. The Wine installation stays untouched.
 
 The `.so` ships for two architectures. Wine loads the one under the directory
-matching the arch of the Wine build itself, so today's x86_64 Wine on macOS
-takes `x86_64-unix/` and ignores `aarch64-unix/` entirely; the arm64 copy is
-there for an arm64-native Wine. Nothing to choose: copy both, or the one your
-Wine needs. The PE side is x86 in either case.
+matching the arch of the Wine build itself: an x86_64 Wine takes
+`x86_64-unix/` and ignores `aarch64-unix/`, an arm64 Wine the other way
+round. Nothing to choose: copy both, or the one your Wine needs. The PE side
+is x86 in either case.
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
@@ -52,8 +52,9 @@ every prefix needs the `mtld3d.fake.dll` markers copied in once.
 ## Requirements
 
 - **Apple Silicon macOS 15** or newer.
-- **Rosetta 2** (`softwareupdate --install-rosetta`): the game and the whole PE
-  side are x86, and so is Wine itself in every build shipping today.
+- **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, which
+  is what most builds are: the game and the whole PE side are x86. An arm64
+  Wine brings its own x86 translation (FEX) and does not need it.
 - A Wine with the current WoW64 loader: **Wine 8.0 or newer**, or
   **CrossOver 24 or newer**.
 - A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
@@ -61,7 +62,7 @@ every prefix needs the `mtld3d.fake.dll` markers copied in once.
 ## x87 performance
 
 D3D9-era games do their floating-point math in x87 instructions, which
-Rosetta 2 translates slowly. For full performance, run the game together with
+Rosetta 2 translates slowly. Under an x86_64 Wine, run the game together with
 [x87sidecar](https://github.com/athei/x87sidecar), a JIT that replaces
 Rosetta's x87 handling. Its cooperative attach mode requires a Wine that
 performs the sidecar handshake at startup: the Wine builds from
