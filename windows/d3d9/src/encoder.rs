@@ -59,7 +59,7 @@ use mtld3d_shared::{
         MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLSamplerStateKind,
         MTLTextureKind, NSViewKind,
     },
-    tsc::{rdtsc, secs_to_cycles},
+    tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
 use mtld3d_types::{D3DCMP_ALWAYS, D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 // Fast non-cryptographic hasher for the per-draw resource caches below
@@ -470,15 +470,19 @@ struct SubmitPacket {
 /// A finished frame coming back from the submit thread.
 ///
 /// The payload (for recycling) plus the unix-side status and the
-/// drawable-wait cycles the `SubmitFrame` thunk measured.
+/// drawable-wait time the `SubmitFrame` thunk measured.
 struct ReturnedPayload {
     payload: FramePayload,
     status: i32,
-    drawable_wait_tsc: u64,
+    /// `nextDrawable` wait in nanoseconds, as the unix side measured it.
+    ///
+    /// Nanoseconds because the two sides do not share a cycle counter; it
+    /// becomes our cycles via `ns_to_cycles` when folded into perf.
+    drawable_wait_ns: u64,
     /// Total submit-thread CPU for `execute_submit`.
     ///
     /// Covers the unix command-walk, present, and commit — including the
-    /// `drawable_wait_tsc` portion. Folded into perf so the summary can
+    /// `drawable_wait_ns` portion. Folded into perf so the summary can
     /// show the submit thread's own cost; `submit_exec - drawable_wait` is
     /// the encode+commit CPU.
     submit_exec_tsc: u64,
@@ -504,7 +508,7 @@ fn submit_thread_main(
             frame,
         } = packet;
         let mut submit_exec_tsc: u64 = 0;
-        let (payload, status, drawable_wait_tsc) = {
+        let (payload, status, drawable_wait_ns) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
             execute_submit(params, payload)
         };
@@ -515,7 +519,7 @@ fn submit_thread_main(
             .send(ReturnedPayload {
                 payload,
                 status,
-                drawable_wait_tsc,
+                drawable_wait_ns,
                 submit_exec_tsc,
             })
             .is_err()
@@ -1802,8 +1806,11 @@ impl FrameEncoder {
     fn reclaim_returned(&mut self, returned: ReturnedPayload) {
         self.submit_in_flight = self.submit_in_flight.saturating_sub(1);
         self.last_submit_status = returned.status;
+        // The unix side measures this one in nanoseconds (its counter is not
+        // ours), so it converts to our cycles here, where every other perf
+        // bucket is denominated.
         self.perf
-            .set_drawable_wait_cycles(returned.drawable_wait_tsc);
+            .set_drawable_wait_cycles(ns_to_cycles(returned.drawable_wait_ns));
         self.perf.set_submit_exec_cycles(returned.submit_exec_tsc);
         if returned.status != 0 {
             error!(
@@ -6036,8 +6043,9 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
     let (payload, status) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         let (params, payload) = finalize_submit(enc, &frame);
-        let (payload, status, drawable_wait_tsc) = execute_submit(params, payload);
-        enc.perf.set_drawable_wait_cycles(drawable_wait_tsc);
+        let (payload, status, drawable_wait_ns) = execute_submit(params, payload);
+        enc.perf
+            .set_drawable_wait_cycles(ns_to_cycles(drawable_wait_ns));
         (payload, status)
     };
     enc.last_submit_status = status;
@@ -6140,7 +6148,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         submit_seq: frame.submit_seq,
         coherent_seq_ptr: frame.coherent_seq_ptr,
         upload_coherent_seq_ptr: frame.upload_coherent_seq_ptr,
-        drawable_wait_tsc: 0,
+        drawable_wait_ns: 0,
         present_view: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
@@ -6164,14 +6172,14 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
 /// `params` carries raw pointers aliasing into `payload`; both are taken
 /// by value so the payload stays alive for the whole thunk, then handed
 /// back for recycling along with the unix status and the drawable-wait
-/// cycles the thunk writes into `params`. This is the only part of submit
+/// nanoseconds the thunk writes into `params`. This is the only part of submit
 /// that runs on the dedicated submit thread in `Async` mode.
 fn execute_submit(
     mut params: SubmitFrameParams,
     payload: FramePayload,
 ) -> (FramePayload, i32, u64) {
     let status = unix_call(&mut params);
-    (payload, status, params.drawable_wait_tsc)
+    (payload, status, params.drawable_wait_ns)
 }
 
 /// Recycle a finished payload.

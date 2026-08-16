@@ -88,6 +88,27 @@ pub fn cycles_to_ms(cycles: u64) -> f64 {
     u64_to_f64_exact(cycles) * 1e3 / u64_to_f64_exact(tsc_hz())
 }
 
+/// Convert whole nanoseconds into this linkage unit's TSC cycles.
+///
+/// For a duration measured on the other side of the PE/unix boundary (see
+/// `mtld3d_shared::perf::NanosSetTimer`) and folded into cycle-denominated perf
+/// buckets here: cycles never travel between linkage units, because each
+/// calibrates its own counter and an arm64 `.so` reads a different one than the
+/// PE side's emulated `rdtsc`.
+///
+/// Zero passes through untouched, so a build that never measures anything
+/// cannot trip the [`tsc_hz`] calibration sleep. Saturates instead of
+/// overflowing; the product only exceeds `u64` beyond ~584 years of wait.
+#[inline]
+#[must_use]
+pub fn ns_to_cycles(ns: u64) -> u64 {
+    if ns == 0 {
+        return 0;
+    }
+    let cycles = u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000;
+    u64::try_from(cycles).unwrap_or(u64::MAX)
+}
+
 /// Lossless u64 → f64 reconstruction via a hi/lo u32 split, scale, and add.
 ///
 /// Each `f64::from(u32)` is exact (u32 ⊂ f64 mantissa); `2^32` is exactly
@@ -160,4 +181,36 @@ fn calibrate() -> u64 {
         elapsed.as_secs_f64() * 1e3,
     );
     hz
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ns_to_cycles, tsc_hz};
+
+    /// A duration handed across the boundary lands on this side's own rate.
+    ///
+    /// The conversion is the whole reason `drawable_wait_ns` travels in
+    /// nanoseconds; if it stopped scaling by the local `tsc_hz`, the perf
+    /// summary would report the unix side's wait in the wrong unit and nothing
+    /// would fail loudly.
+    #[test]
+    fn ns_convert_to_locally_calibrated_cycles() {
+        // Zero short-circuits, which is what keeps a non-measuring build from
+        // paying the calibration sleep.
+        assert_eq!(ns_to_cycles(0), 0);
+
+        // One second of nanoseconds is, by definition, `tsc_hz` cycles. The
+        // integer division makes the result exact only to the tick, so allow
+        // the one-cycle truncation.
+        let hz = tsc_hz();
+        let one_second = ns_to_cycles(1_000_000_000);
+        assert!(
+            one_second.abs_diff(hz) <= 1,
+            "1 s converted to {one_second} cycles, calibrated rate is {hz}"
+        );
+
+        // A frame-sized wait stays well inside the range and keeps its order.
+        assert!(ns_to_cycles(16_000_000) < one_second);
+        assert!(ns_to_cycles(16_000_000) > ns_to_cycles(8_000_000));
+    }
 }

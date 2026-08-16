@@ -534,14 +534,15 @@ pub struct SubmitFrameParams {
     /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
     /// VB/IB.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    /// Cycles spent in `nextDrawable()`, on the unix side's time base.
+    /// Nanoseconds spent in `nextDrawable()`, 0 outside a `PERF=1` build.
     ///
-    /// The PE side converts these with its OWN calibrated Hz, which holds while
-    /// both sides read the same counter: an `x86_64` `.so` and the PE code both
-    /// go through Rosetta's `rdtsc`. An arm64 `.so` reads `CNTVCT_EL0` directly,
-    /// which does not tick at the emulated `rdtsc` rate, so this one `PERF=1`
-    /// number needs converting at the source before it means anything there.
-    pub drawable_wait_tsc: u64, // out
+    /// Nanoseconds, not cycles, because this is the one duration that crosses
+    /// the boundary: each side calibrates its own counter, and an arm64 `.so`
+    /// reads `CNTVCT_EL0` while the PE side reads an emulated `rdtsc` at a
+    /// different rate, so a raw cycle count would be scaled by the wrong Hz on
+    /// arrival. Measured by `perf::NanosSetTimer`; the PE side converts it into
+    /// its own cycles with `tsc::ns_to_cycles` before folding it into perf.
+    pub drawable_wait_ns: u64, // out
     /// `NSView*` the layer was attached to.
     ///
     /// `submit_frame` walks `view → window → screen` each present to read
@@ -875,7 +876,7 @@ mod tests {
         //   + 8 passes_ptr + 4 pass_count + 4 _pad1
         //   + 8 present_layer + 8 present_texture
         //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
-        //   + 8 drawable_wait_tsc + 8 present_view
+        //   + 8 drawable_wait_ns + 8 present_view
         //   = 96
         assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 96);
 

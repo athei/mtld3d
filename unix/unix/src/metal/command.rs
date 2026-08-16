@@ -20,7 +20,7 @@ use mtld3d_shared::{
         MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
         MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
     },
-    perf::CycleSetTimer,
+    perf::NanosSetTimer,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
@@ -144,7 +144,7 @@ impl core::fmt::Display for BlitSite {
 /// with its own attachments and load actions, optionally blits the
 /// backbuffer to the drawable, and commits.
 pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
-    params.drawable_wait_tsc = 0;
+    params.drawable_wait_ns = 0;
     mtld3d_shared::crumb!("submit:enter", params.queue_handle.raw(), params.pass_count);
     mtld3d_shared::crumb!("submit:queueret", params.queue_handle.raw());
     let Some(queue) = params.queue_handle.into_retained() else {
@@ -253,7 +253,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             super::macdrv::sync_drawable_size(&layer);
             mtld3d_shared::crumb!("submit:nextdraw", params.present_layer.raw());
             let drawable = {
-                let _wait = CycleSetTimer::start(&raw mut params.drawable_wait_tsc);
+                let _wait = NanosSetTimer::start(&raw mut params.drawable_wait_ns);
                 layer.nextDrawable()
             };
             if drawable.is_none() {
@@ -264,7 +264,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 mtld3d_shared::crumb!(
                     "submit:nodrawable",
                     params.present_layer.raw(),
-                    params.drawable_wait_tsc,
+                    params.drawable_wait_ns,
                 );
             }
             // A nil drawable means `nextDrawable` exhausted its timeout;
@@ -393,7 +393,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 }
             }
 
-            mtld3d_shared::crumb!("submit:present", params.drawable_wait_tsc);
+            mtld3d_shared::crumb!("submit:present", params.drawable_wait_ns);
             // Throttle presents to `1/panel_max_hz` when the guest asked
             // for vsync (PE-side `D3DPRESENT_INTERVAL_*` mapping). On a
             // ProMotion panel the system adapts the panel rate to whatever

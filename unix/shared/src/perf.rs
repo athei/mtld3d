@@ -1,8 +1,9 @@
 //! Cross-linkage-unit perf-tracking primitives.
 //!
 //! Houses the runtime gate (`PERF_TRACKING_ENABLED` cached from
-//! `RUST_LOG=mtld3d::perf=info`) and the two state-agnostic RAII timers
-//! (`CycleSetTimer`, `CycleAddTimer`) — both used by `d3d9.dll` PE-side
+//! `RUST_LOG=mtld3d::perf=info`) and the state-agnostic RAII timers
+//! (`CycleSetTimer`, `CycleAddTimer`, and `NanosSetTimer` for a duration
+//! that crosses the boundary), all used by `d3d9.dll` PE-side
 //! AND `mtld3d.so` unix-side. Each cdylib that links `mtld3d-shared`
 //! statically gets its own static instance, which matches each cdylib's
 //! own `env_logger` filter cache.
@@ -229,5 +230,70 @@ impl Drop for CycleAddTimer {
 // LLVM DCEs the empty drop body after inlining.
 #[cfg(not(perf_tracking))]
 impl Drop for CycleAddTimer {
+    fn drop(&mut self) {}
+}
+
+/// RAII guard that **overwrites** a `*mut u64` field with elapsed nanoseconds.
+///
+/// The cycle timers measure with the counter of whichever linkage unit runs
+/// them, so their output only means something inside that unit: each
+/// calibrates its own Hz, and an arm64 `.so` reads `CNTVCT_EL0` while the PE
+/// side reads an emulated `rdtsc` at a different rate. A duration that crosses
+/// the PE/unix boundary therefore travels as nanoseconds, measured here off the
+/// monotonic clock (no calibration, so no first-call sleep on the measuring
+/// thread) and converted back into the reader's own cycles by
+/// [`crate::tsc::ns_to_cycles`].
+///
+/// Same null-check plus perf-enabled gate as [`CycleSetTimer`]; the clock reads
+/// cost more than `rdtsc`, which is why this is for once-per-frame brackets
+/// (today: the `nextDrawable` wait) rather than hot-path measurements.
+#[cfg(perf_tracking)]
+pub struct NanosSetTimer {
+    /// `None` when the gate is off, so a disabled timer reads no clock at all.
+    start: Option<std::time::Instant>,
+    target: *mut u64,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct NanosSetTimer;
+
+impl NanosSetTimer {
+    #[cfg(perf_tracking)]
+    pub fn start(target: *mut u64) -> Self {
+        Self {
+            start: (!target.is_null() && perf_enabled()).then(std::time::Instant::now),
+            target,
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start(_target: *mut u64) -> Self {
+        Self
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Drop for NanosSetTimer {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        // Saturating rather than `expect`: a `u64` of nanoseconds covers 584
+        // years, so the clamp is unreachable, and a perf timer must never be
+        // the thing that panics a frame.
+        let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: `target` was bound to a `&mut u64` field for this timer's
+        // lifetime via the `start` constructor; the borrow outlives this Drop.
+        unsafe {
+            *self.target = elapsed;
+        }
+    }
+}
+
+// Empty Drop under `not(perf_tracking)`, as above.
+#[cfg(not(perf_tracking))]
+impl Drop for NanosSetTimer {
     fn drop(&mut self) {}
 }
