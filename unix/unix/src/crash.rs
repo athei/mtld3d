@@ -166,38 +166,39 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     }
 
     // For a jump-through-garbage fault (`fault_pc` is a tiny/invalid value), the
-    // saved registers + top-of-stack name the culprit: `rcx` is the Win64 first
-    // argument (a COM call's `this` — the freed object), `rax` the loaded vtable,
-    // and the return address the faulting `CALL` pushed at `[rsp]` is the caller.
-    // x86_64 only: an arm64 report carries the fault PC, the crumbs, and the
-    // frame-pointer backtrace, but not this dump or the stack scan below. Both
-    // decode a register file that has no arm64 counterpart written yet.
-    #[cfg(target_arch = "x86_64")]
+    // saved registers name the culprit: the first-argument register holds a COM
+    // call's `this` (the freed object), and the caller is one register or one
+    // stack slot away. The register names differ per arch, the roles do not.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        let rsp = mcontext_u64(ctx, 72);
-        let rcx = mcontext_u64(ctx, 32);
-        let rax = mcontext_u64(ctx, 16);
+        let sp = mcontext_u64(ctx, SP_OFFSET);
         let mut b = [0u8; 192];
         let mut p = 0;
-        push(&mut b, &mut p, b"[mtld3d::unix] rcx(this)=");
-        push_hex(&mut b, &mut p, rcx);
-        push(&mut b, &mut p, b" rax(vtbl)=");
-        push_hex(&mut b, &mut p, rax);
-        push(&mut b, &mut p, b" rsp=");
-        push_hex(&mut b, &mut p, rsp);
+        push(&mut b, &mut p, b"[mtld3d::unix] ");
+        push(&mut b, &mut p, ARG0_LABEL);
+        push_hex(&mut b, &mut p, mcontext_u64(ctx, ARG0_OFFSET));
+        #[cfg(target_arch = "x86_64")]
+        {
+            // The vtable pointer the faulting `CALL` loaded. No arm64
+            // counterpart: an indirect branch there goes through whichever
+            // register the compiler picked, and `fault_pc` above already
+            // carries the value it jumped to.
+            push(&mut b, &mut p, b" rax(vtbl)=");
+            push_hex(&mut b, &mut p, mcontext_u64(ctx, RAX_OFFSET));
+        }
+        push(&mut b, &mut p, b" sp=");
+        push_hex(&mut b, &mut p, sp);
         push(&mut b, &mut p, b"\n");
         // SAFETY: write(2) on fd 2 is async-signal-safe.
         unsafe {
             let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
         }
-        if rsp != 0 {
-            // SAFETY: `rsp` is the faulting stack pointer; the `CALL` that jumped
-            // to garbage pushed its return address there. A bad `rsp` re-faults
-            // into the re-entrancy guard rather than looping.
-            let ret = unsafe { (rsp as *const u64).read() };
+        let ret = caller_pc(ctx, sp);
+        if ret != 0 {
             let mut rb = [0u8; 192];
             let mut rp = 0;
-            push(&mut rb, &mut rp, b"[mtld3d::unix] caller(ret@rsp)=");
+            push(&mut rb, &mut rp, b"[mtld3d::unix] ");
+            push(&mut rb, &mut rp, CALLER_LABEL);
             push_hex(&mut rb, &mut rp, ret);
             push(&mut rb, &mut rp, b"\n");
             // SAFETY: write(2) on fd 2 is async-signal-safe.
@@ -237,20 +238,20 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // Last resort for a jump-to-NULL whose frame chain is broken: scan the raw
     // stack for words that `dladdr` resolves into *our* dylib and symbolise
     // them. This reconstructs the call chain the frame-pointer walk can't —
-    // the return addresses pushed by the calls leading to the bad jump are
-    // still on the stack even when `rbp` is garbage. Done last because an
-    // unmapped read re-faults into the re-entrancy guard (`_exit`), which would
-    // otherwise drop the crumb dump + native backtrace above.
-    #[cfg(target_arch = "x86_64")]
+    // the return addresses spilled by the calls leading to the bad jump are
+    // still on the stack even when the frame pointer is garbage. Done last
+    // because an unmapped read re-faults into the re-entrancy guard (`_exit`),
+    // which would otherwise drop the crumb dump + native backtrace above.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        let rsp = mcontext_u64(ctx, 72);
-        if rsp != 0 {
+        let sp = mcontext_u64(ctx, SP_OFFSET);
+        if sp != 0 {
             const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
             // SAFETY: write(2) on fd 2 is async-signal-safe.
             unsafe {
                 let _ = libc::write(2, HDR.as_ptr().cast::<c_void>(), HDR.len());
             }
-            scan_stack_for_our_frames(rsp);
+            scan_stack_for_our_frames(sp);
         }
     }
 
@@ -261,30 +262,39 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 
 /// Scan the raw stack for return addresses into our own dylib and print them.
 ///
-/// Walks up to 4096 words from `rsp` and `backtrace_symbols_fd`-prints each
+/// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
 /// value that `dladdr` resolves into a module whose path contains `mtld3d`.
 /// Caps the printed count so a deep stack can't flood. Async-signal-safe: only
 /// `dladdr` (no malloc on the resolve path here) + `backtrace_symbols_fd` + raw
-/// stack reads.
-#[cfg(target_arch = "x86_64")]
-fn scan_stack_for_our_frames(rsp: u64) {
-    let base = rsp as *const u64;
+/// stack reads. Arch-neutral: a spilled return address is a stack word on both
+/// arches, and the 4-byte step below already tolerates either alignment.
+fn scan_stack_for_our_frames(sp: u64) {
+    /// Header for the guest-stack pass below.
+    const GUEST_HDR: &[u8] = b"[mtld3d::unix] guest (PE) stack words:\n";
+    /// Stack words to inspect, and the print caps for each pass.
+    const WORDS: usize = 4096;
+    const OURS_CAP: u32 = 48;
+    const GUEST_CAP: u32 = 64;
+
+    let base = sp as *const u8;
     let mut printed = 0u32;
-    let mut i = 0usize;
-    while i < 4096 && printed < 48 {
-        // SAFETY: reads stack memory at increasing offsets from `rsp`; an
-        // unmapped read re-faults into the re-entrancy guard (terminating),
-        // which bounds the walk. `read_unaligned` tolerates a 4-byte-aligned
-        // 32-bit stack.
-        let v = unsafe { base.cast::<u8>().add(i * 4).cast::<u64>().read_unaligned() };
-        if v >= 0x1000 && dladdr_is_ours(v) {
-            let mut frame = [v as *mut c_void; 1];
+    let mut slot = 0usize;
+    while slot < WORDS && printed < OURS_CAP {
+        // SAFETY: an offset into stack memory near `sp`; an unmapped read below
+        // re-faults into the re-entrancy guard (terminating), which bounds the
+        // walk.
+        let word = unsafe { base.add(slot * 4) };
+        // SAFETY: as above; `read_unaligned` tolerates a 4-byte-aligned 32-bit
+        // stack.
+        let addr = unsafe { word.cast::<u64>().read_unaligned() };
+        if addr >= 0x1000 && dladdr_is_ours(addr) {
+            let mut frame = [addr as *mut c_void; 1];
             // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd`
             // resolves via `dladdr` and writes to fd 2.
             unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, 2) };
             printed += 1;
         }
-        i += 1;
+        slot += 1;
     }
     // Second pass: the 32-bit guest stack. `dladdr` can't see Wine's PE
     // builtins (not dyld images), so collect raw 4-byte words that land in the
@@ -293,32 +303,34 @@ fn scan_stack_for_our_frames(rsp: u64) {
     // guest client's `.text` (up to ~0x7ff000), not just the first page, so the
     // real guest call chain (its 0x4xxxxx–0x7xxxxx return addresses) is shown,
     // mapped to modules by their logged load bases.
-    const GHDR: &[u8] = b"[mtld3d::unix] guest (PE) stack words:\n";
+    //
     // SAFETY: write(2) on fd 2 is async-signal-safe.
     unsafe {
-        let _ = libc::write(2, GHDR.as_ptr().cast::<c_void>(), GHDR.len());
+        let _ = libc::write(2, GUEST_HDR.as_ptr().cast::<c_void>(), GUEST_HDR.len());
     }
-    let mut gprinted = 0u32;
-    let mut j = 0usize;
-    while j < 4096 && gprinted < 64 {
-        // SAFETY: as the loop above — reads near `rsp`; an unmapped read
-        // re-faults into the re-entrancy guard, bounding the walk.
-        let w = unsafe { base.cast::<u8>().add(j * 4).cast::<u32>().read_unaligned() };
-        let in_builtin = (0x7A00_0000..0x7C00_0000).contains(&w);
-        let in_exe = (0x0040_0000..0x0080_0000).contains(&w);
+    let mut guest_printed = 0u32;
+    let mut slot = 0usize;
+    while slot < WORDS && guest_printed < GUEST_CAP {
+        // SAFETY: as the loop above, an offset into stack memory near `sp`.
+        let word = unsafe { base.add(slot * 4) };
+        // SAFETY: as above; an unmapped read re-faults into the re-entrancy
+        // guard, bounding the walk.
+        let guest_addr = unsafe { word.cast::<u32>().read_unaligned() };
+        let in_builtin = (0x7A00_0000..0x7C00_0000).contains(&guest_addr);
+        let in_exe = (0x0040_0000..0x0080_0000).contains(&guest_addr);
         if in_builtin || in_exe {
             let mut b = [0u8; 192];
             let mut p = 0;
             push(&mut b, &mut p, b"  g=");
-            push_hex(&mut b, &mut p, u64::from(w));
+            push_hex(&mut b, &mut p, u64::from(guest_addr));
             push(&mut b, &mut p, b"\n");
             // SAFETY: write(2) on fd 2 is async-signal-safe.
             unsafe {
                 let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
             }
-            gprinted += 1;
+            guest_printed += 1;
         }
-        j += 1;
+        slot += 1;
     }
 }
 
@@ -327,8 +339,12 @@ fn scan_stack_for_our_frames(rsp: u64) {
 /// The match is on a loaded image whose filename contains the bytes `mtld3d`.
 /// Filters stack garbage and libsystem/Wine/Metal frames down to our own call
 /// chain.
-#[cfg(target_arch = "x86_64")]
 fn dladdr_is_ours(addr: u64) -> bool {
+    /// Scanned for in the image path, without allocating.
+    const NEEDLE: &[u8] = b"mtld3d";
+    /// Bound on the path scan, so a corrupt `dli_fname` can't spin.
+    const PATH_MAX_SCAN: usize = 4096;
+
     // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
     let mut info: libc::Dl_info = unsafe { mem::zeroed() };
     // SAFETY: `dladdr` reads `addr` only as an opaque value and fills `info`.
@@ -336,21 +352,22 @@ fn dladdr_is_ours(addr: u64) -> bool {
     if ok == 0 || info.dli_fname.is_null() {
         return false;
     }
-    // Scan the NUL-terminated path for the substring "mtld3d" without alloc.
-    const NEEDLE: &[u8] = b"mtld3d";
-    let p = info.dli_fname.cast::<u8>();
+    let path = info.dli_fname.cast::<u8>();
     let mut idx = 0usize;
     let mut matched = 0usize;
-    while idx < 4096 {
-        // SAFETY: `dli_fname` is a NUL-terminated C string owned by dyld.
-        let c = unsafe { p.add(idx).read() };
-        if c == 0 {
+    while idx < PATH_MAX_SCAN {
+        // SAFETY: an offset within a NUL-terminated C string owned by dyld,
+        // bounded by the NUL check below.
+        let at = unsafe { path.add(idx) };
+        // SAFETY: as above; reads one byte of that string.
+        let byte = unsafe { at.read() };
+        if byte == 0 {
             break;
         }
-        matched = if c == NEEDLE[matched] {
+        matched = if byte == NEEDLE[matched] {
             matched + 1
         } else {
-            usize::from(c == NEEDLE[0])
+            usize::from(byte == NEEDLE[0])
         };
         if matched == NEEDLE.len() {
             return true;
@@ -362,6 +379,69 @@ fn dladdr_is_ours(addr: u64) -> bool {
 
 /// Capacity of the frame buffer handed to `backtrace`.
 const FRAME_CAP: c_int = 64;
+
+/// Byte offset of the saved stack pointer within `__darwin_mcontext64`.
+///
+/// `x86_64` `__rsp`; `arm64` `__sp`, which follows `__x[29]`, `__fp`, `__lr`.
+#[cfg(target_arch = "x86_64")]
+const SP_OFFSET: usize = 72;
+#[cfg(target_arch = "aarch64")]
+const SP_OFFSET: usize = 264;
+
+/// Byte offset of the register carrying a called method's first argument.
+///
+/// `x86_64` `__rcx` is the Win64 first argument, i.e. a COM call's `this`;
+/// `arm64` `__x0` is the AAPCS64 first argument, the same role.
+#[cfg(target_arch = "x86_64")]
+const ARG0_OFFSET: usize = 32;
+#[cfg(target_arch = "aarch64")]
+const ARG0_OFFSET: usize = 16;
+
+/// Byte offset of `__rax`, which holds the vtable pointer a `CALL` loaded.
+#[cfg(target_arch = "x86_64")]
+const RAX_OFFSET: usize = 16;
+
+/// Byte offset of `__lr`, where `BLR` leaves the return address.
+#[cfg(target_arch = "aarch64")]
+const LR_OFFSET: usize = 256;
+
+/// Label for the first-argument register in the fault report.
+#[cfg(target_arch = "x86_64")]
+const ARG0_LABEL: &[u8] = b"rcx(this)=";
+#[cfg(target_arch = "aarch64")]
+const ARG0_LABEL: &[u8] = b"x0(this)=";
+
+/// Label for the caller address in the fault report, naming where it came from.
+#[cfg(target_arch = "x86_64")]
+const CALLER_LABEL: &[u8] = b"caller(ret@rsp)=";
+#[cfg(target_arch = "aarch64")]
+const CALLER_LABEL: &[u8] = b"caller(lr)=";
+
+/// The return address of the frame that faulted, or 0 if it can't be read.
+///
+/// `x86_64` `CALL` pushes it, so for a jump-through-garbage fault (which faults
+/// at the callee's first instruction, before any prologue) it is the word at
+/// `[rsp]`; a bad `rsp` re-faults into the re-entrancy guard rather than
+/// looping.
+#[cfg(target_arch = "x86_64")]
+fn caller_pc(_ctx: *mut c_void, sp: u64) -> u64 {
+    if sp == 0 {
+        return 0;
+    }
+    // SAFETY: `sp` is the faulting stack pointer, whose top word is the return
+    // address the faulting `CALL` pushed. An unmapped read terminates through
+    // the re-entrancy guard.
+    unsafe { (sp as *const u64).read() }
+}
+
+/// The return address of the frame that faulted, or 0 if it can't be read.
+///
+/// `arm64` `BLR` leaves it in `__lr` rather than on the stack, so this needs no
+/// memory read at all and stays valid even when the stack pointer is garbage.
+#[cfg(target_arch = "aarch64")]
+const fn caller_pc(ctx: *mut c_void, _sp: u64) -> u64 {
+    mcontext_u64(ctx, LR_OFFSET)
+}
 
 /// The faulting program counter from a signal `ucontext`, or 0 if it can't be read.
 ///
@@ -407,12 +487,13 @@ const fn fault_pc(_ctx: *mut c_void) -> u64 {
 
 /// Read a `u64` at byte `offset` within the signal `ucontext`'s `mcontext`.
 ///
-/// That `mcontext` is the `x86_64` register file. Offsets follow
-/// `__darwin_mcontext64`: the 16-byte exception state then the thread-state
-/// registers — `rax` at 16, `rcx` at 32, `rsp` at 72, `rip` at 144. Returns 0
-/// if the context can't be read.
-#[cfg(target_arch = "x86_64")]
-fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
+/// Offsets follow `__darwin_mcontext64` for the arch this built for: a 16-byte
+/// exception state, then the thread-state registers. `x86_64` has `rax` at 16,
+/// `rcx` at 32, `rsp` at 72, `rip` at 144; `arm64` has `x0` at 16 (the rest of
+/// `__x[29]` following), then `fp` at 248, `lr` at 256, `sp` at 264, `pc` at
+/// 272. Returns 0 if the context can't be read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
     if ctx.is_null() {
         return 0;
     }
@@ -472,5 +553,105 @@ fn push_hex(buf: &mut [u8; 192], pos: &mut usize, v: u64) {
         let nib = usize::try_from((v >> (i * 4)) & 0xf).expect("4-bit nibble fits usize");
         buf[*pos] = HEX[nib];
         *pos += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Set in the re-executed child so it faults instead of asserting.
+    ///
+    /// A signal handler can only be exercised by actually taking the signal,
+    /// which terminates the process, so the test spawns itself.
+    const SELFTEST_ENV: &str = "MTLD3D_CRASH_SELFTEST";
+
+    /// The bad pointer the child dereferences.
+    ///
+    /// Below every mapping and page-aligned nowhere useful, so the fault is a
+    /// read of exactly this address and the report's `fault=` line pins it.
+    const BAD_ADDR: usize = 0xdead_beef;
+
+    /// Fault through a garbage object pointer, the shape the dump decodes.
+    ///
+    /// `extern "C"` and never inlined so the argument really travels in the
+    /// first-argument register and the return address really is a caller frame.
+    #[inline(never)]
+    extern "C" fn deref_this(this: *const u64) -> u64 {
+        // SAFETY: deliberately unsound; this is the fault under test, taken in
+        // a child process that never returns from the handler.
+        unsafe { this.read() }
+    }
+
+    /// The saved-register decode names the faulting frame on the running arch.
+    ///
+    /// Guards the `mcontext` offsets, which are hand-derived per arch and have
+    /// no compiler check: a wrong one silently reports zeros in the crash
+    /// report, exactly when nobody can re-run the crash.
+    #[test]
+    fn fault_report_decodes_registers() {
+        if std::env::var_os(SELFTEST_ENV).is_some() {
+            super::install();
+            let _ = deref_this(BAD_ADDR as *const u64);
+            unreachable!("the read above must fault");
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "crash::tests::fault_report_decodes_registers",
+                "--nocapture",
+            ])
+            .env(SELFTEST_ENV, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let report = String::from_utf8_lossy(&out.stderr);
+
+        // The handler ran to its own `_exit(1)` rather than dying on the
+        // signal's default action (or looping in the re-entrancy guard).
+        assert_eq!(out.status.code(), Some(1), "{report}");
+        assert!(report.contains("FATAL: SIGSEGV"), "{report}");
+        assert!(
+            report.contains(&format!("fault=0x{BAD_ADDR:016x}")),
+            "{report}"
+        );
+
+        // Reads the hex word printed right after `label`.
+        let value_after = |label: &str| -> String {
+            report
+                .split_once(label)
+                .unwrap_or_else(|| panic!("{label} missing from report:\n{report}"))
+                .1
+                .chars()
+                .take(18)
+                .collect()
+        };
+        let zero = format!("0x{:016x}", 0);
+
+        // `fault_pc` is why this handler beats the one Wine would print: it must
+        // name the faulting instruction, and the stack pointer must be real.
+        assert_ne!(value_after("fault_pc="), zero, "{report}");
+        assert_ne!(value_after(" sp="), zero, "{report}");
+
+        // The two per-arch offsets. On arm64 both decode exactly: AAPCS64 passes
+        // the argument in `x0` and `BLR` leaves the return address in `lr`, so
+        // the sentinel pins `ARG0_OFFSET` to the byte and a non-zero `lr` pins
+        // `LR_OFFSET`. The x86_64 pair can only be checked for presence, because
+        // neither is reproducible from a native call: `rcx` is the *Win64* first
+        // argument (what Wine's COM calls use, not System V's `rdi`), and
+        // `[rsp]` holds a return address only for a fault at a callee's first
+        // instruction, which is the jump-through-garbage shape it exists for.
+        let arg0_label = std::str::from_utf8(super::ARG0_LABEL).expect("ascii label");
+        let caller_label = std::str::from_utf8(super::CALLER_LABEL).expect("ascii label");
+        assert!(report.contains(arg0_label), "{report}");
+        assert!(report.contains(caller_label), "{report}");
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(
+                value_after(arg0_label),
+                format!("0x{BAD_ADDR:016x}"),
+                "{report}"
+            );
+            assert_ne!(value_after(caller_label), zero, "{report}");
+        }
     }
 }
