@@ -224,6 +224,50 @@ switch for the whole project. On stock Wine, export both in the environment
 that launches the game; on CrossOver, set them under
 `[EnvironmentVariables]` in the bottle's `cxbottle.conf`.
 
+## Troubleshooting
+
+**The two lines that say mtld3d is live.** Every run prints these before the
+game draws anything, and no `RUST_LOG` setting is needed to see them:
+
+```
+[mtld3d::shim] mtld3d.dll <version> <id>, unix call initialized
+[mtld3d::d3d9] d3d9.dll <version> <id> loaded
+```
+
+If they are absent, `d3d9.dll` never mapped, and every other symptom follows
+from that. Check the prefix markers first, then the override.
+
+**World of Warcraft 1.12 dies at startup with `ERROR #132`.** The report reads
+`0xC0000005 (ACCESS_VIOLATION) at 0107:0063A915`, "referenced memory at
+`0x00000054`", with `EAX=00000000`. This is a load failure, not a rendering
+bug, and the game never reached its first frame.
+
+The client loads `d3d9.dll` through `LoadLibrary` during its hardware survey,
+long before it creates a device, and calls `Direct3DCreate9` and
+`GetDeviceCaps` to classify the GPU. When that probe fails it finds no row in
+its video-hardware table and dereferences the null result. So the crash means
+Wine could not load `d3d9.dll` at all. Verified against both failure shapes:
+missing prefix marker and missing `d3d9.dll` produce this identical report.
+
+Check, in order:
+
+- `mtld3d.dll` exists in the prefix's `syswow64` (32-bit game) or `system32`
+  (64-bit game). This is the marker step in the route sections above, and it is
+  the usual cause: `d3d9.dll` imports `mtld3d.dll`, so a missing marker makes
+  `d3d9.dll` itself unloadable.
+- For the native-override route, `d3d9` is set to `native` under
+  `HKCU\Software\Wine\DllOverrides`, and the `d3d9.dll` next to the game came
+  from `native/`, not from `wine/`. A builtin-marked PE never executes its own
+  bytes.
+- The unix side is installed for the arch of the Wine build, not of the game.
+- On an ARM64 Wine, or on macOS older than 15.4, use 0.6.0 or newer. Earlier
+  releases carry BMI instructions that neither `xtajit` nor pre-15.4 Rosetta
+  can execute, so module init aborts and the load fails the same way.
+
+The game's own `Logs/gx.log` is not useful here: the crash happens before that
+file is opened, so it is empty either way. An empty `Loaded Modules` section in
+the report only means the game directory has no usable `dbghelp.dll`.
+
 ## Fullscreen
 
 Nothing to configure. A fullscreen game gets a borderless window covering the
