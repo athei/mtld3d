@@ -5,11 +5,11 @@
 
 use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DDEVCAPS_HWRASTERIZATION, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
-    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
-    D3DFMT_X8R8G8B8, D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE,
-    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3D_OK, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
+    D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_X8R8G8B8,
+    D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
 #[test]
@@ -207,24 +207,24 @@ fn device_caps_are_sane() {
         "PS version < 2.0"
     );
     assert_ne!(
-        caps.dev_caps & D3DDEVCAPS_HWRASTERIZATION,
+        caps.dev_caps & DevCaps::HWRASTERIZATION.bits(),
         0,
         "hardware rasterization not advertised"
     );
     assert_ne!(
-        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_CUBEMAP,
+        caps.texture_caps & TextureCaps::CUBEMAP.bits(),
         0,
         "cube maps not advertised"
     );
     assert_ne!(
-        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_MIPCUBEMAP,
+        caps.texture_caps & TextureCaps::MIPCUBEMAP.bits(),
         0,
         "mipmapped cube maps not advertised"
     );
     assert_eq!(
-        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_CUBEMAP_POW2,
+        caps.texture_caps & TextureCaps::RESTRICTIONS.bits(),
         0,
-        "non-power-of-two cube maps are supported"
+        "no texture-creation restriction is advertised"
     );
     assert!(caps.max_streams >= 1, "no vertex streams");
 }

@@ -9435,7 +9435,7 @@ extern "system" fn device_set_stream_source(
     stride: u32,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Buffer);
-    if stream as usize >= crate::bound_buffers::MAX_STREAMS {
+    if stream >= mtld3d_types::MAX_STREAMS {
         warn!(
             target: LOG_TARGET,
             "reject SetStreamSource(stream={stream}) → INVALIDCALL (exceeds max_streams)"
@@ -9488,7 +9488,7 @@ extern "system" fn device_get_stream_source(
     // caller that binds a higher stream and reads it back — relying on the
     // binding outliving its own Release — sees the buffer. An out-of-range
     // stream is unbound → NULL/0 per the "nothing bound" contract (S_OK).
-    let (vb_ptr, offset, vb_stride) = if (stream as usize) < crate::bound_buffers::MAX_STREAMS {
+    let (vb_ptr, offset, vb_stride) = if stream < mtld3d_types::MAX_STREAMS {
         let b = dev.bound_buffers();
         (
             b.stream_vertex_buffer(stream as usize),

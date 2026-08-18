@@ -158,24 +158,6 @@ pub const D3DVBF_3WEIGHTS: u32 = 3;
 pub const D3DVBF_TWEENING: u32 = 255;
 pub const D3DVBF_0WEIGHTS: u32 = 256;
 
-// ── D3D9 device caps bits (`D3DCAPS9::DevCaps`) ──
-
-/// The device rasterizes through hardware acceleration.
-pub const D3DDEVCAPS_HWRASTERIZATION: u32 = 0x0008_0000;
-
-// ── D3D9 texture caps bits (`D3DCAPS9::TextureCaps`) ──
-
-pub const D3DPTEXTURECAPS_CUBEMAP: u32 = 0x0000_0800;
-pub const D3DPTEXTURECAPS_MIPCUBEMAP: u32 = 0x0001_0000;
-pub const D3DPTEXTURECAPS_CUBEMAP_POW2: u32 = 0x0002_0000;
-
-// ── D3D9 device caps2 bits (`D3DCAPS9::DevCaps2`) ──
-
-/// The device can `StretchRect` from a texture-level surface into a render target.
-///
-/// Advertised by default because the blit path supports it.
-pub const D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES: u32 = 0x0000_0010;
-
 // ── D3D9 clear flags ──
 
 pub const D3DCLEAR_TARGET: u32 = 0x0000_0001;

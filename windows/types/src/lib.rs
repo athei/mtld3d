@@ -1,3 +1,4 @@
+mod caps;
 mod cursor;
 mod device;
 mod direct3d9;
@@ -8,6 +9,7 @@ mod primitive;
 mod vertex_buffer;
 mod vertex_decl;
 
+pub use caps::*;
 pub use cursor::{ICONINFO, POINT};
 pub use device::*;
 pub use direct3d9::*;

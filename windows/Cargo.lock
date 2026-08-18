@@ -325,6 +325,9 @@ dependencies = [
 [[package]]
 name = "mtld3d-types"
 version = "0.6.0"
+dependencies = [
+ "bitflags 2.13.0",
+]
 
 [[package]]
 name = "objc2"

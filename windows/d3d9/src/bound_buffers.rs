@@ -3,21 +3,13 @@
 //! COM `AddRef`/`Release` pairing for `SetStreamSource` / `SetIndices` lives
 //! here so the ref-count invariant can't leak elsewhere in the crate.
 
+use mtld3d_types::MAX_STREAMS;
+
 use crate::{
     com_ref::{Bound, CachedComPtr},
     index_buffer::Direct3DIndexBuffer9,
     vertex_buffer::Direct3DVertexBuffer9,
 };
-
-/// Maximum vertex streams we accept (matches `caps.max_streams`).
-///
-/// Stream 0 is the only stream we render; streams 1..MAX exist solely so
-/// `SetStreamSource` / `GetStreamSource` round-trip (the single-stream
-/// architecture never fetches the higher streams). A caller that binds a
-/// higher stream, releases its own reference, then reads the stream back
-/// relies on the binding keeping the buffer alive — the `Bound` marker
-/// provides exactly that.
-pub const MAX_STREAMS: usize = 16;
 
 /// One higher-stream (1..MAX) binding: a `Bound` buffer slot plus its offset/stride.
 struct StreamSlot {
@@ -46,10 +38,13 @@ pub struct BoundBuffers {
     vb_stride: u32,
     /// Indexed-draw source slot. Same `Bound` semantics.
     index_buffer: CachedComPtr<Direct3DIndexBuffer9, Bound>,
-    /// Higher streams (1..MAX), indexed by `stream - 1`.
+    /// Higher streams (1..[`MAX_STREAMS`]), indexed by `stream - 1`.
     ///
-    /// Stored for get/set round-trip only; never rendered.
-    extra_streams: [StreamSlot; MAX_STREAMS - 1],
+    /// Stored for get/set round-trip only; never rendered. A caller that binds
+    /// a higher stream, releases its own reference, then reads the stream back
+    /// relies on the binding keeping the buffer alive — the `Bound` marker
+    /// provides exactly that.
+    extra_streams: [StreamSlot; MAX_STREAMS as usize - 1],
 }
 
 impl BoundBuffers {
@@ -59,7 +54,7 @@ impl BoundBuffers {
             vb_offset: 0,
             vb_stride: 0,
             index_buffer: CachedComPtr::null(),
-            extra_streams: [const { StreamSlot::new() }; MAX_STREAMS - 1],
+            extra_streams: [const { StreamSlot::new() }; MAX_STREAMS as usize - 1],
         }
     }
 

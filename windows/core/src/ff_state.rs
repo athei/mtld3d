@@ -38,6 +38,15 @@ use crate::{
     scratch::ScratchArena,
 };
 
+/// `MaxActiveLights` per the D3D9 caps we advertise.
+///
+/// At most this many lights contribute to a single draw, regardless of the
+/// addressable index range. Matches the fast-path slot count and the per-light
+/// row budget in the FF VS const layout (rows 15..62 = 6 rows × 8 lights).
+/// `caps::fill` reports this value as `D3DCAPS9::MaxActiveLights`, so the
+/// advertised cap cannot drift from the number of slots the FF VS has.
+pub const MAX_ACTIVE_LIGHTS: u32 = 8;
+
 bitflags! {
     /// Per-section dirty bits for the FF VS const buffer.
     ///
@@ -85,13 +94,6 @@ bitflags! {
     }
 }
 
-/// `MaxActiveLights` per the D3D9 caps we advertise.
-///
-/// At most this many lights contribute to a single draw, regardless of the
-/// addressable index range. Matches the 8 fast-path slots and the per-light
-/// row budget in the FF VS const layout (rows 15..62 = 6 rows × 8 lights).
-const MAX_ACTIVE_LIGHTS: usize = 8;
-
 /// A light addressed beyond the 8 fast-path slots.
 ///
 /// `defined` is implicit by the slot's presence in [`FfState::overflow_lights`];
@@ -123,7 +125,7 @@ struct ActiveLight {
 /// key derivation and the constant packing so the two agree on slot order by
 /// construction.
 struct ActiveLights {
-    lights: [ActiveLight; MAX_ACTIVE_LIGHTS],
+    lights: [ActiveLight; MAX_ACTIVE_LIGHTS as usize],
     len: usize,
 }
 
@@ -501,8 +503,8 @@ impl FfState {
             len: 0,
         };
         let active = self.light_active_mask();
-        for i in 0..8usize {
-            if out.len == MAX_ACTIVE_LIGHTS {
+        for i in 0..MAX_ACTIVE_LIGHTS as usize {
+            if out.len == MAX_ACTIVE_LIGHTS as usize {
                 return out;
             }
             if (active & (1u8 << i)) != 0 {
@@ -515,7 +517,7 @@ impl FfState {
             }
         }
         for slot in self.overflow_lights.values() {
-            if out.len == MAX_ACTIVE_LIGHTS {
+            if out.len == MAX_ACTIVE_LIGHTS as usize {
                 return out;
             }
             if slot.enabled && slot.light.type_ != 0 {
