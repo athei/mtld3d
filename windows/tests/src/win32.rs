@@ -42,6 +42,15 @@ unsafe extern "system" {
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
+    fn SetWindowPos(
+        hwnd: usize,
+        insert_after: usize,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -257,6 +266,24 @@ pub fn screen_size() -> (u32, u32) {
         u32::try_from(width).expect("screen width is positive"),
         u32::try_from(height).expect("screen height is positive"),
     )
+}
+
+/// `SetWindowPos` without z-order or activation changes.
+///
+/// This is the app-side move a game makes when it manages its own window;
+/// tests use it to simulate an external resize of a device window.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+pub fn set_window_pos(hwnd: usize, x: i32, y: i32, width: i32, height: i32) {
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // geometry is plain scalars.
+    let ok = unsafe { SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) };
+    assert!(ok != 0, "SetWindowPos failed");
 }
 
 /// Destroy a window created by [`create_window`].

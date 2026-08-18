@@ -303,6 +303,8 @@ pub struct SavedWindow {
     style: u32,
     exstyle: u32,
     rect: Rect,
+    /// Ping-pong guard for [`reassert_cover`], one per fullscreen session.
+    guard: mtld3d_core::fullscreen_resize::ExternalResizeGuard,
 }
 
 impl SavedWindow {
@@ -323,6 +325,7 @@ pub fn enter(hwnd: *mut c_void) -> SavedWindow {
         style: window_long(hwnd, GWL_STYLE),
         exstyle: window_long(hwnd, GWL_EXSTYLE),
         rect: window_rect(hwnd).unwrap_or(Rect::EMPTY),
+        guard: mtld3d_core::fullscreen_resize::ExternalResizeGuard::new(),
     };
     apply_fullscreen_window(hwnd, &saved);
     saved
@@ -332,9 +335,52 @@ pub fn enter(hwnd: *mut c_void) -> SavedWindow {
 ///
 /// The saved window state is the one captured on the way in and is left alone
 /// — a Reset between two fullscreen present params must still restore the
-/// *pre-fullscreen* window when the device finally leaves.
-pub fn update(saved: &SavedWindow) {
+/// *pre-fullscreen* window when the device finally leaves. The re-assert
+/// guard refills: a game-driven Reset is a fresh session.
+pub fn update(saved: &mut SavedWindow) {
+    saved.guard.reset();
     apply_fullscreen_window(saved.hwnd, saved);
+}
+
+/// Answer an external resize of a fullscreen device's window.
+///
+/// The window is supposed to cover the monitor; games that manage their own
+/// window shrink it to their mode's outer rect after a Reset (under a real
+/// mode-set that would still cover the screen). Re-apply the monitor rect,
+/// bounded by the [`ExternalResizeGuard`] so a window manager that keeps
+/// clamping the window back gets a one-shot warning instead of a fight.
+///
+/// [`ExternalResizeGuard`]: mtld3d_core::fullscreen_resize::ExternalResizeGuard
+pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
+    use mtld3d_core::fullscreen_resize::ExternalResizeAction;
+
+    let Some(rect) = primary_monitor_rect() else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetMonitorInfo failed; fullscreen window not re-asserted after an external resize",
+        );
+        return;
+    };
+    let monitor = (rect.width().cast_unsigned(), rect.height().cast_unsigned());
+    match saved.guard.decide(incoming, monitor) {
+        ExternalResizeAction::Covered => {}
+        ExternalResizeAction::Reassert => {
+            debug!(
+                target: LOG_TARGET,
+                "external resize to {}x{} on a fullscreen window; re-asserting the monitor rect",
+                incoming.0, incoming.1,
+            );
+            apply_fullscreen_window(saved.hwnd, saved);
+        }
+        ExternalResizeAction::Suppressed => {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "the window manager keeps re-sizing the fullscreen window ({}x{}); leaving it, \
+                 the back buffer keeps its size and present scales the frame",
+                incoming.0, incoming.1,
+            );
+        }
+    }
 }
 
 /// A windowed style made fullscreen: no decoration, but still managed.

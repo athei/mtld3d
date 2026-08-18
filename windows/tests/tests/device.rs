@@ -570,6 +570,44 @@ fn create_fullscreen_honors_the_requested_resolution() {
 }
 
 #[test]
+fn fullscreen_window_reasserts_monitor_rect_after_external_resize() {
+    let h = Harness::fullscreen(512, 384);
+    let (screen_w, screen_h) = Harness::screen_size();
+
+    // The move a self-managing game makes after a mode change: apply the
+    // mode's outer rect to its own window (GMmark2 does exactly this after
+    // every fullscreen Reset). Native D3D9 leaves the app-set rect in
+    // place until window events are processed and only then restores the
+    // monitor rect, so the re-cover must not fire synchronously inside
+    // the SetWindowPos call.
+    mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 520, 418);
+    let rect = h.window_rect();
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (520, 418),
+        "the app-set rect survives its own SetWindowPos call",
+    );
+
+    assert!(h.pump(), "no WM_QUIT expected");
+    let rect = h.window_rect();
+    assert_eq!(
+        (
+            u32::try_from(rect.right - rect.left).expect("width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("height is positive")
+        ),
+        (screen_w, screen_h),
+        "processing window events re-covers the monitor",
+    );
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc after the external resize");
+    assert_eq!(
+        (bb.width, bb.height),
+        (512, 384),
+        "the back buffer never follows an external resize",
+    );
+}
+
+#[test]
 fn reset_balances_device_refcount() {
     // Reset must not leak a device reference. A leak would mean the device's
     // refcount never returns to zero after a resolution change, so it could

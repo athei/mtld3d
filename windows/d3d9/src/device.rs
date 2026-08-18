@@ -1848,9 +1848,21 @@ impl DeviceInner {
     ///
     /// No-op for a device that is not fullscreen — the caller decides the
     /// transition, this only carries it out.
-    pub fn update_fullscreen(&self) {
-        if let Some(saved) = self.fullscreen.as_ref() {
+    pub fn update_fullscreen(&mut self) {
+        if let Some(saved) = self.fullscreen.as_mut() {
             crate::fullscreen::update(saved);
+        }
+    }
+
+    /// Re-cover the monitor after an external resize of the fullscreen window.
+    ///
+    /// The deferred half of the cursor subclass's `WM_SIZE` handling: runs
+    /// when the posted re-assert message is processed, which is native
+    /// D3D9's cadence. Bounded by the guard in `fullscreen::reassert_cover`;
+    /// a no-op when the device is no longer fullscreen.
+    pub fn reassert_fullscreen_cover(&mut self, new_width: u32, new_height: u32) {
+        if let Some(saved) = self.fullscreen.as_mut() {
+            crate::fullscreen::reassert_cover(saved, (new_width, new_height));
         }
     }
 

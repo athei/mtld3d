@@ -55,6 +55,7 @@ unsafe extern "system" {
         lp: isize,
     ) -> isize;
     fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
+    fn PostMessageW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -116,6 +117,14 @@ fn def_window_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
+fn post_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) {
+    // SAFETY: PostMessageW accepts any HWND and message tuple; posting to a
+    // window that is destroyed before delivery just drops the message.
+    unsafe {
+        PostMessageW(hwnd, msg, wp, lp);
+    }
+}
+
 fn call_window_proc(
     prev_proc: *mut c_void,
     hwnd: *mut c_void,
@@ -175,6 +184,16 @@ const WM_ACTIVATE: u32 = 0x0006;
 const WM_SIZE: u32 = 0x0005;
 const WA_INACTIVE: u32 = 0;
 const HTCLIENT: usize = 1;
+
+/// Private message: re-cover the monitor after an external fullscreen resize.
+///
+/// Posted (never sent) from the `WM_SIZE` handler, so the restore runs when
+/// the game next pumps messages. That is native D3D9's cadence: the rect an
+/// app sets on its own fullscreen device window survives the `MoveWindow`
+/// call itself and is put back when window events are processed.
+/// `lParam` carries the client size like `WM_SIZE`.
+/// `WM_APP` range, consumed by the subclass and never forwarded.
+const WM_APP_REASSERT_FULLSCREEN: u32 = 0x8000 + 0x03D9;
 
 // ── Per-window subclass back-pointers ──
 
@@ -669,9 +688,11 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // path already resolved the back-buffer size. The latch is
         // process-global because the bounce is delivered to whichever
         // device is subclassed on the window, which need not be the
-        // device doing the move. A fullscreen device also never follows:
-        // its logical size is the requested mode, and `apply_auto_resize`
-        // returns early for it.
+        // device doing the move. A fullscreen device never follows the
+        // window: its logical size is the requested mode, and an external
+        // shrink is answered by re-covering the monitor — deferred through
+        // a posted message, because native leaves the app-set rect in
+        // place until window events are processed (test_window_position).
         let lp_bits = lp.cast_unsigned();
         let new_width = u32::try_from(lp_bits & 0xFFFF).expect("16-bit value fits u32");
         let new_height = u32::try_from((lp_bits >> 16) & 0xFFFF).expect("16-bit value fits u32");
@@ -679,7 +700,11 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // the lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
         if new_width != 0 && new_height != 0 && !crate::fullscreen::driving_window() {
-            dev.apply_auto_resize(new_width, new_height);
+            if dev.fullscreen_window().is_some() {
+                post_message(hwnd, WM_APP_REASSERT_FULLSCREEN, 0, lp);
+            } else {
+                dev.apply_auto_resize(new_width, new_height);
+            }
         }
         // WoW's own `WM_SIZE` handler (about to run via the
         // `CallWindowProcW` tail below) will call `ShowCursor(FALSE)`
@@ -710,6 +735,20 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             "wndproc WM_SIZE: {new_width}x{new_height} → pinned visible, dirty armed, handle={:p} tid={}",
             cur.handle, current_thread_id(),
         );
+    } else if msg == WM_APP_REASSERT_FULLSCREEN {
+        // Deferred half of the WM_SIZE branch above. Our own message, so it
+        // is consumed here rather than forwarded to the game. lParam is the
+        // client size the WM_SIZE carried; the guard re-checks it against
+        // the monitor, so a stale post after the window recovered (or after
+        // the device left fullscreen) is a no-op.
+        let lp_bits = lp.cast_unsigned();
+        let new_width = u32::try_from(lp_bits & 0xFFFF).expect("16-bit value fits u32");
+        let new_height = u32::try_from((lp_bits >> 16) & 0xFFFF).expect("16-bit value fits u32");
+        // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
+        // lifetime of the subclass.
+        let dev = unsafe { &mut *dev_ptr };
+        dev.reassert_fullscreen_cover(new_width, new_height);
+        return 0;
     }
 
     // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
