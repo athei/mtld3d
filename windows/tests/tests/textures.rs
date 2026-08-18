@@ -426,10 +426,24 @@ fn state_block_restores_cube_binding() {
     let h = Harness::new();
     let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
     assert_eq!(h.set_cube_texture(0, &cube), 0);
-    let block = h.create_state_block(mtld3d_types::D3DSBT_PIXELSTATE);
+
+    // Texture bindings are D3DSBT_ALL state. A filtered PIXELSTATE block
+    // captures texture *stage* states and sampler states, never the
+    // SetTexture bindings themselves, so applying one must leave the stage
+    // as it is.
+    let pixel = h.create_state_block(mtld3d_types::D3DSBT_PIXELSTATE);
+    let all = h.create_state_block(mtld3d_types::D3DSBT_ALL);
     assert_eq!(h.clear_texture(0), 0);
-    assert_eq!(block.apply(), 0);
-    assert!(h.texture_matches_raw(0, cube.as_ptr()));
+    assert_eq!(pixel.apply(), 0);
+    assert!(
+        h.texture_matches_raw(0, core::ptr::null_mut()),
+        "a PIXELSTATE apply must not restore texture bindings",
+    );
+    assert_eq!(all.apply(), 0);
+    assert!(
+        h.texture_matches_raw(0, cube.as_ptr()),
+        "a D3DSBT_ALL apply restores the cube binding",
+    );
     assert_eq!(h.clear_texture(0), 0);
 }
 
