@@ -75,9 +75,10 @@ instead of breaking.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
   enumeration, hardware color cursors. A fullscreen device takes its window
   borderless over the monitor without ever changing the display mode; the back
-  buffer keeps the resolution the game picked and MetalFX upscales it to the
+  buffer keeps the display mode the game picked and MetalFX upscales it to the
   screen, with `render.scale` as a further multiplier on the render
-  resolution.
+  resolution. A fullscreen request that is no display mode at all follows the
+  window instead.
 
 ### Not implemented yet
 
@@ -109,9 +110,12 @@ back:
   `CGDisplaySetDisplayMode`, which reconfigures the user's screen and
   rearranges every other window, and avoiding that would depend on a Wine
   registry setting. Instead the window goes borderless over the monitor while
-  the back buffer keeps the resolution the game picked, exactly as it would
+  the back buffer keeps the display mode the game picked, exactly as it would
   under a real mode-set, and present scales the frame to the display (MetalFX
-  when enlarging).
+  when enlarging). A request that matches no enumerable mode, which a real
+  mode-set would reject, follows the window instead: games that ask for such
+  sizes derived them from their window and keep sizing their rendering and
+  input from it.
 - **The fullscreen focus lifecycle**: the focus dance around a fullscreen
   device is not emulated — no device loss on deactivation, no focus-window
   subclassing, no synthesized activation messages. Presentation is a composited

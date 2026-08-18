@@ -12,13 +12,14 @@
 //! would depend on a registry key the user has to know about.
 //!
 //! A monitor-covering borderless window buys the property the mode-set was
-//! there for: the game's frame fills the display. The back buffer keeps the
-//! resolution the game asked for, exactly as it would under a real mode-set,
-//! so game-sized viewports and scissors cover the frame, and present scales
-//! the back buffer to the drawable (`MetalFX` when enlarging). A maximized
-//! window is the one case that differs: the window manager sizes it, not the
-//! game, so there the back buffer follows the client rect and `render.scale`
-//! decides how many pixels are rasterized.
+//! there for: the game's frame fills the display. When the game asks for an
+//! enumerable display mode, the back buffer keeps it, exactly as it would
+//! under a real mode-set, so game-sized viewports and scissors cover the
+//! frame, and present scales the back buffer to the drawable (`MetalFX` when
+//! enlarging). A request that is no display mode at all (native would reject
+//! it) follows the client rect instead, and so does a maximized window, where
+//! the window manager sizes the window; `render.scale` decides how many
+//! pixels are rasterized in those cases.
 //!
 //! The z-order is left to the window manager. Raising the window to the
 //! topmost level deadlocks Wine's mac driver: it re-derives the Cocoa window's

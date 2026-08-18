@@ -160,14 +160,19 @@ registry setting the user has to know about. It also leaves the z-order alone:
 raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
-The back buffer keeps the size the app requested, exactly as it would under a
-real mode-set, and present scales it to the drawable (MetalFX when enlarging,
-the same resample `render.scale` rides). That keeps the D3D9 half of the
-contract at the requested mode: the default viewport and scissor, the
-reported present parameters, and the device's and swap chain's
-`GetDisplayMode` all agree with the size the app rendered for. (Until
-2026-08 the back buffer instead followed the monitor-covering window; apps
-that sized their viewport from their own request rendered into a corner.)
+When the app requests an enumerable display mode, the back buffer keeps it,
+exactly as it would under a real mode-set, and present scales it to the
+drawable (MetalFX when enlarging, the same resample `render.scale` rides).
+That keeps the D3D9 half of the contract at the requested mode: the default
+viewport and scissor, the reported present parameters, and the device's and
+swap chain's `GetDisplayMode` all agree with the size the app rendered for.
+(Until 2026-08 the back buffer instead followed the monitor-covering window;
+apps that sized their viewport from their own request rendered into a
+corner.) A request that matches no enumerable mode still follows the window:
+native would reject it, so nothing can depend on it being honored, and the
+apps that make such requests (WoW's windowed-to-fullscreen toggle carries its
+window size) size their rendering and mouse handling from the window — the
+window-sized back buffer is the assignment that keeps them consistent.
 
 What the emulation cannot deliver is the Win32 half of a real mode-set:
 the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, and window rects

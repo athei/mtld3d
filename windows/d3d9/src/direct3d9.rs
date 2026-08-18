@@ -793,16 +793,32 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
     (w != 0 && h != 0).then_some((w, h))
 }
 
+/// `true` when `width`x`height` is a mode `EnumAdapterModes` serves.
+///
+/// The membership test behind the fullscreen honor-or-follow split in
+/// [`resolve_backbuffer_dims`]. Format-agnostic: the mode table repeats every
+/// size once per adapter format.
+pub fn is_enumerable_mode(width: u32, height: u32) -> bool {
+    ADAPTER_MODES
+        .iter()
+        .any(|m| m.width == width && m.height == height)
+}
+
 /// Resolve the back buffer's *logical* size.
 ///
 /// Logical size is what D3D9 reports and the space every game-supplied
 /// coordinate lives in. Three rules, keyed on who decides the resolution:
 ///
-/// - **Fullscreen**: the game's requested mode stands, exactly as it would
-///   under a native mode-set, so viewports and scissors the game sizes from
-///   its own request cover the frame. The window still covers the monitor and
-///   present resolves the size difference at the drawable (`MetalFX` when
-///   enlarging), the same resample `render.scale` rides.
+/// - **Fullscreen, requesting an enumerable mode**: the request stands,
+///   exactly as it would under a native mode-set, so viewports and scissors
+///   the game sizes from its own request cover the frame. The window still
+///   covers the monitor and present resolves the size difference at the
+///   drawable (`MetalFX` when enlarging), the same resample `render.scale`
+///   rides. A request that is *not* an enumerable mode is one native would
+///   reject outright, so no game can depend on it being honored; such games
+///   carry their window size into the request and size their rendering and
+///   input from the window, so the client rect wins there — the lenient
+///   answer that keeps the window, back buffer and mouse in one space.
 /// - **Maximized window**: the window manager sizes the window, not the game,
 ///   so the client area wins and the requested resolution is ignored;
 ///   `render.scale` is the resolution control in that mode.
@@ -816,19 +832,37 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
     if pp.windowed == 0 {
         // Callers reject a zero-dimension fullscreen request before the window
-        // moves, so the request is always concrete here. The log line is the
-        // breadcrumb tying an upscaled frame back to the size the game asked
-        // for; a client rect that cannot be read only costs that line.
-        if let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void)
-            && (pp.back_buffer_width != client_w || pp.back_buffer_height != client_h)
-        {
+        // moves, so the request is always concrete here.
+        let client = client_rect_dims(hwnd as *mut c_void);
+        if is_enumerable_mode(pp.back_buffer_width, pp.back_buffer_height) {
+            // The log line is the breadcrumb tying an upscaled frame back to
+            // the size the game asked for; a client rect that cannot be read
+            // only costs that line.
+            if let Some((client_w, client_h)) = client
+                && (pp.back_buffer_width != client_w || pp.back_buffer_height != client_h)
+            {
+                mtld3d_shared::log_once_info!(
+                    target: LOG_TARGET,
+                    "fullscreen device: honoring the requested {}x{} back buffer; the window \
+                     covers the monitor ({}x{}) and present scales the frame",
+                    pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
+                );
+            }
+            return;
+        }
+        let Some((client_w, client_h)) = client else {
+            return;
+        };
+        if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "fullscreen device: honoring the requested {}x{} back buffer; the window covers \
-                 the monitor ({}x{}) and present scales the frame",
+                "fullscreen device: requested {}x{} is not an enumerable display mode, so the \
+                 back buffer follows the window ({}x{}) instead",
                 pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
             );
         }
+        pp.back_buffer_width = client_w;
+        pp.back_buffer_height = client_h;
         return;
     }
     let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void) else {
