@@ -1,4 +1,6 @@
-use mtld3d_types::{D3DCAPS9, D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES};
+use mtld3d_types::{
+    D3DCAPS9, D3DDEVCAPS_HWRASTERIZATION, D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES,
+};
 
 const fn fill_default(caps: &mut D3DCAPS9) {
     // SAFETY: `caps` is a valid `&mut D3DCAPS9`; zeroing all bytes is sound
@@ -12,8 +14,9 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.caps2 = 0x7002_0000; // CANMANAGERESOURCE | DYNAMICTEXTURES | FULLSCREENGAMMA | CANAUTOGENMIPMAP
     caps.caps3 = 0x0000_0020; // ALPHA_FULLSCREEN_FLIP_OR_DISCARD
     caps.cursor_caps = 0x0000_0001; // D3DCURSORCAPS_COLOR — Win32 HCURSOR path is live
-    caps.dev_caps = 0x0001_05F0; // EXECUTESYSTEMMEMORY | EXECUTEVIDEOMEMORY | TLVERTEXSYSTEMMEMORY
-    // | TLVERTEXVIDEOMEMORY | PUREDEVICE | DRAWPRIMTLVERTEX | HWTRANSFORMANDLIGHT
+    caps.dev_caps = 0x0001_05F0 | D3DDEVCAPS_HWRASTERIZATION; // EXECUTESYSTEMMEMORY
+    // | EXECUTEVIDEOMEMORY | TLVERTEXSYSTEMMEMORY | TLVERTEXVIDEOMEMORY
+    // | TEXTURESYSTEMMEMORY | DRAWPRIMTLVERTEX | HWTRANSFORMANDLIGHT | HWRASTERIZATION
     caps.primitive_misc_caps = 0x0022_0AF2; // MASKZ (0x02) | CULLNONE (0x10) | CULLCW (0x20)
     // | CULLCCW (0x40) | COLORWRITEENABLE (0x80) | CLIPTLVERTS (0x200) | BLENDOP (0x800)
     // | SEPARATEALPHABLEND (0x2_0000) | POSTBLENDSRGBCONVERT (0x20_0000)
@@ -245,7 +248,7 @@ const ALL_STENCIL_CAPS: u32 = 0x0000_01FF; // KEEP | ZERO | REPLACE | INCRSAT
 
 #[cfg(test)]
 mod tests {
-    use mtld3d_types::D3DCAPS9;
+    use mtld3d_types::{D3DCAPS9, D3DDEVCAPS_HWRASTERIZATION};
 
     use super::{apply_advertise_all, fill_default};
 
@@ -301,6 +304,15 @@ mod tests {
         let mut caps: D3DCAPS9 = unsafe { core::mem::zeroed() };
         fill_default(&mut caps);
         caps
+    }
+
+    #[test]
+    fn default_caps_advertise_hardware_rasterization() {
+        assert_ne!(
+            filled().dev_caps & D3DDEVCAPS_HWRASTERIZATION,
+            0,
+            "Metal-backed HAL must advertise hardware rasterization"
+        );
     }
 
     // Each bit below is backed by a Consumed classifier arm — the test

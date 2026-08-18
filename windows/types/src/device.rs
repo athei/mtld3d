@@ -158,6 +158,11 @@ pub const D3DVBF_3WEIGHTS: u32 = 3;
 pub const D3DVBF_TWEENING: u32 = 255;
 pub const D3DVBF_0WEIGHTS: u32 = 256;
 
+// ── D3D9 device caps bits (`D3DCAPS9::DevCaps`) ──
+
+/// The device rasterizes through hardware acceleration.
+pub const D3DDEVCAPS_HWRASTERIZATION: u32 = 0x0008_0000;
+
 // ── D3D9 device caps2 bits (`D3DCAPS9::DevCaps2`) ──
 
 /// The device can `StretchRect` from a texture-level surface into a render target.
