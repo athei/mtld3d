@@ -371,6 +371,20 @@ pub enum BufferKind {
 }
 
 bitflags! {
+    /// Shape and view attributes for `TextureCreateDesc`.
+    ///
+    /// Kept in the descriptor slot formerly occupied by `has_swizzle`, so the
+    /// PE to Unix wire layout remains 56 bytes while texture dimensionality is
+    /// explicit instead of inferred from depth.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct TextureCreateFlags: u32 {
+        const HAS_SWIZZLE = 1 << 0;
+        const TYPE_3D = 1 << 1;
+        const TYPE_CUBE = 1 << 2;
+    }
+}
+
+bitflags! {
     /// `TextureCreateDesc::usage_flags` bits.
     ///
     /// `RENDER_TARGET` requests `MTLTextureUsage::RenderTarget` so the

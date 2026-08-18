@@ -29,6 +29,7 @@ use crate::{
 /// Overridable via `MTLD3D_CONFORMANCE_TIMEOUT_SECS`; the normal subtests
 /// finish in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
+const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
 
 fn subtest_timeout() -> Duration {
     let secs = std::env::var("MTLD3D_CONFORMANCE_TIMEOUT_SECS")
@@ -108,6 +109,7 @@ pub fn run_subtest(
         .env("MTL_DEBUG_LAYER_WARNING_MODE", "nslog")
         .env("MTL_HUD_ENABLED", "0")
         .env("WINEDEBUG", "-all")
+        .env("WINEDLLOVERRIDES", HEADLESS_DLL_OVERRIDES)
         .env("WINEMSYNC", "1")
         .env("RUST_LOG", "off")
         // `shaderCache.enable=false`: disable the persistent on-disk shader

@@ -214,7 +214,11 @@ use crate::shader_compile_stats::CompileBucket;
 /// MSL of every fogged PS; and the shared `Varyings` struct gains the
 /// `fog_z [[center_no_perspective]]` NDC-depth field (the table-fog Z
 /// source), changing the MSL of EVERY shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 54;
+///
+/// `55` adds `VariantKey::cube_sampler_mask`, which changes fixed-function
+/// pixel-shader keys and emits `texturecube<float>` bindings with `.xyz`
+/// coordinates.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 55;
 
 /// File magic.
 ///

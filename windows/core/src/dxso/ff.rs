@@ -1248,6 +1248,8 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 // `MTLTextureType3D`; binding it via `texture2d<float>` fails
                 // Metal's type-check and samples black.
                 "texture3d<float>"
+            } else if (variant.cube_sampler_mask & (1u16 << i)) != 0 {
+                "texturecube<float>"
             } else {
                 "texture2d<float>"
             };
@@ -1300,8 +1302,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 // samples at the origin, matching native (D3D9 returns the
                 // (0,0) texel there). A volume-bound slot samples with the
                 // full `.xyz` coordinate (texture3d takes a float3).
-                let volume = (variant.volume_sampler_mask & (1u16 << i)) != 0;
-                let (sw, zero) = if volume {
+                let three_dimensional = (variant.volume_sampler_mask & (1u16 << i)) != 0
+                    || (variant.cube_sampler_mask & (1u16 << i)) != 0;
+                let (sw, zero) = if three_dimensional {
                     ("xyz", "float3(0.0)")
                 } else {
                     ("xy", "float2(0.0)")

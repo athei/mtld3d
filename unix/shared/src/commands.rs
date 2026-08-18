@@ -489,6 +489,11 @@ pub struct CopyBufferToTextureInfo {
     pub buffer_offset: u64,
     pub bytes_per_row: u32,
     pub texture_handle: u64,
+    /// Destination texture slice.
+    ///
+    /// Zero for 2D and volume textures; cube faces use their
+    /// `D3DCUBEMAP_FACES` index.
+    pub destination_slice: u32,
     pub mip_level: u32,
     pub origin_x: u32,
     pub origin_y: u32,
@@ -523,7 +528,7 @@ impl BlitCommand {
             origin_y: info.origin_y,
             region_w: info.region_w,
             region_h: info.region_h,
-            dst_offset: 0,
+            dst_offset: info.destination_slice as u64,
             byte_size: 0,
             depth: info.depth,
             bytes_per_image: info.bytes_per_image,
@@ -803,6 +808,7 @@ mod tests {
             buffer_offset: 256,
             bytes_per_row: 1024,
             texture_handle: 0x1111_2222_3333_4444,
+            destination_slice: 0,
             mip_level: 2,
             origin_x: 10,
             origin_y: 20,
@@ -814,6 +820,7 @@ mod tests {
         assert_eq!(cmd.cmd, BlitCommandType::CopyBufferToTexture as u32);
         assert_eq!(cmd.src_handle, 0xAAAA_BBBB_CCCC_DDDD);
         assert_eq!(cmd.dst_handle, 0x1111_2222_3333_4444);
+        assert_eq!(cmd.dst_offset, 0);
         assert_eq!(cmd.src_offset, 256);
         assert_eq!(cmd.bytes_per_row, 1024);
         assert_eq!(cmd.mip_level, 2);
@@ -823,6 +830,26 @@ mod tests {
         assert_eq!(cmd.region_h, 64);
         assert_eq!(cmd.depth, 1);
         assert_eq!(cmd.bytes_per_image, 1024 * 64);
+    }
+
+    #[test]
+    fn cube_upload_packs_face_into_existing_destination_offset() {
+        let cmd = BlitCommand::copy_buffer_to_texture(&CopyBufferToTextureInfo {
+            buffer_handle: 1,
+            buffer_offset: 0,
+            bytes_per_row: 16,
+            texture_handle: 2,
+            destination_slice: 5,
+            mip_level: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: 4,
+            region_h: 4,
+            depth: 1,
+            bytes_per_image: 64,
+        });
+        assert_eq!(cmd.dst_offset, 5);
+        assert_eq!(core::mem::size_of_val(&cmd), 80);
     }
 
     #[test]

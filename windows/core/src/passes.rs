@@ -231,6 +231,7 @@ pub enum ColorClearOutcome {
 /// mid-frame Clear, depth change) end the current pass and open a new one.
 pub struct Pass {
     color_texture: MetalHandle<MTLTextureKind>,
+    color_subresource: u32,
     color_size: (u32, u32),
     color_format: PixelFormat,
     color_load: ColorLoad,
@@ -313,6 +314,14 @@ impl Pass {
     #[must_use]
     pub const fn color_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.color_texture
+    }
+    #[must_use]
+    pub const fn color_slice(&self) -> u32 {
+        self.color_subresource & 0xff
+    }
+    #[must_use]
+    pub const fn color_level(&self) -> u32 {
+        self.color_subresource >> 8
     }
     #[must_use]
     pub const fn color_size(&self) -> (u32, u32) {
@@ -487,6 +496,7 @@ pub struct PassState {
     current_pass_closed: bool,
 
     current_color_texture: MetalHandle<MTLTextureKind>,
+    current_color_subresource: u32,
     current_color_size: (u32, u32),
     current_color_format: PixelFormat,
     current_depth_texture: MetalHandle<MTLTextureKind>,
@@ -539,7 +549,7 @@ pub struct PassState {
     /// so accumulated draws survive across pass breaks. Reset each frame
     /// in `reset_frame`. Capacity hint matches a typical frame shape
     /// (backbuffer + a few CSM ping-pong RTs).
-    seen_color_rts: HashSet<MetalHandle<MTLTextureKind>>,
+    seen_color_rts: HashSet<(MetalHandle<MTLTextureKind>, u32)>,
     /// Depth-attachment textures that have already been used as a depth rt in this frame.
     ///
     /// Same semantics as `seen_color_rts`.
@@ -677,6 +687,7 @@ impl PassState {
             passes: Vec::with_capacity(4),
             current_pass_closed: true,
             current_color_texture: MetalHandle::NULL,
+            current_color_subresource: 0,
             current_color_size: (0, 0),
             // Placeholder; `reset_frame` always overwrites this before any
             // pass opens. Chose the dominant backbuffer format rather than
@@ -768,6 +779,7 @@ impl PassState {
         self.current_color_logical_size = backbuffer_size;
         self.backbuffer_logical_size = backbuffer_size;
         self.current_color_texture = backbuffer;
+        self.current_color_subresource = 0;
         self.current_color_size = (
             render_scale.dimension(backbuffer_size.0),
             render_scale.dimension(backbuffer_size.1),
@@ -977,6 +989,11 @@ impl PassState {
     /// Treated exactly like a sampled texture, which already exempts the
     /// colour store (Rules C/D).
     pub fn note_color_read_back(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        self.note_texture_read(handle);
+    }
+
+    /// Record an attachment read that the render-command stream cannot see.
+    pub fn note_texture_read(&mut self, handle: MetalHandle<MTLTextureKind>) {
         if !handle.is_null() {
             self.seen_sampled_textures.insert(handle);
         }
@@ -1305,7 +1322,9 @@ impl PassState {
             None if ENABLE_FIRST_USE_DONTCARE
                 && viewport_covers_attachment
                 && !self.current_color_texture.is_null()
-                && !self.seen_color_rts.contains(&self.current_color_texture)
+                && !self
+                    .seen_color_rts
+                    .contains(&(self.current_color_texture, self.current_color_subresource))
                 && !self
                     .seen_sampled_textures
                     .contains(&self.current_color_texture)
@@ -1334,7 +1353,8 @@ impl PassState {
             None => DepthLoad::Load,
         };
         if !self.current_color_texture.is_null() {
-            self.seen_color_rts.insert(self.current_color_texture);
+            self.seen_color_rts
+                .insert((self.current_color_texture, self.current_color_subresource));
         }
         if !self.current_depth_texture.is_null() {
             self.seen_depth_rts.insert(self.current_depth_texture);
@@ -1350,6 +1370,7 @@ impl PassState {
             .unwrap_or_else(|| Vec::with_capacity(64));
         let mut pass = Pass {
             color_texture: self.current_color_texture,
+            color_subresource: self.current_color_subresource,
             color_size: self.current_color_size,
             color_format: self.current_color_format,
             color_load,
@@ -1496,6 +1517,19 @@ impl PassState {
         format: PixelFormat,
         scale: RenderScale,
     ) {
+        self.set_color_render_target_subresource(texture, width, height, format, scale, (0, 0));
+    }
+
+    /// Rebind a color attachment slice and mip level for the next pass.
+    pub fn set_color_render_target_subresource(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        scale: RenderScale,
+        subresource: (u32, u32),
+    ) {
         // `width`/`height` arrive logical, the size D3D9 reports for this
         // target; `scale` says what it is actually rasterized at.
         // `current_color_size` is the real texture extent.
@@ -1503,7 +1537,11 @@ impl PassState {
         self.current_color_logical_size = (width, height);
         self.warn_if_scale_wasted(width, height, scale);
         let (width, height) = (scale.dimension(width), scale.dimension(height));
-        if self.current_color_texture == texture {
+        let (slice, level) = subresource;
+        let packed_subresource = slice | (level << 8);
+        if self.current_color_texture == texture
+            && self.current_color_subresource == packed_subresource
+        {
             self.current_color_size = (width, height);
             self.current_color_format = format;
             return;
@@ -1511,7 +1549,7 @@ impl PassState {
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
-                "pass-break trigger=set_color_rt prev={:#x} new={:#x} new_size={width}x{height}",
+                "pass-break trigger=set_color_rt prev={:#x} new={:#x} slice={slice} level={level} new_size={width}x{height}",
                 self.current_color_texture,
                 texture,
             );
@@ -1521,6 +1559,7 @@ impl PassState {
         }
         self.end_current_pass("set_color_rt");
         self.current_color_texture = texture;
+        self.current_color_subresource = packed_subresource;
         self.current_color_size = (width, height);
         self.current_color_format = format;
     }
@@ -1614,7 +1653,9 @@ impl PassState {
         // applies when the new viewport is meaningful (non-zero size)
         // and a color texture is bound.
         if !color_texture.is_null()
-            && self.seen_color_rts.contains(&color_texture)
+            && self
+                .seen_color_rts
+                .contains(&(color_texture, self.current_color_subresource))
             && self.viewport_width > 0
             && self.viewport_height > 0
         {
@@ -2060,6 +2101,7 @@ impl PassState {
             {
                 let stripped = pass.color_texture;
                 pass.color_texture = MetalHandle::NULL;
+                pass.color_subresource = 0;
                 // Once the color attachment is gone, the load/store
                 // actions are moot for the unix side; reset them to
                 // their unused defaults so a stale `Clear` doesn't
@@ -2177,6 +2219,7 @@ impl PassState {
             pass.color_clear_quad_ranges.clear();
             let stripped = pass.color_texture;
             pass.color_texture = MetalHandle::NULL;
+            pass.color_subresource = 0;
             pass.color_load = ColorLoad::DontCare;
             pass.color_store = StoreAction::DontCare;
             if log_enabled!(target: TRACE_TARGET, Level::Trace) {
@@ -2265,6 +2308,7 @@ impl PassState {
                 continue;
             }
             let target_color = p.color_texture;
+            let target_color_subresource = p.color_subresource;
             let target_depth = p.depth_texture;
             let color_load = p.color_load;
             let depth_load = p.depth_load;
@@ -2276,6 +2320,7 @@ impl PassState {
             let target_idx = self.find_clear_merge_target(
                 i,
                 target_color,
+                target_color_subresource,
                 target_depth,
                 needs_color,
                 needs_depth,
@@ -2312,6 +2357,7 @@ impl PassState {
         &self,
         start: usize,
         target_color: MetalHandle<MTLTextureKind>,
+        target_color_subresource: u32,
         target_depth: MetalHandle<MTLTextureKind>,
         needs_color: bool,
         needs_depth: bool,
@@ -2328,6 +2374,7 @@ impl PassState {
             // Intervening Clear on the same attachment supersedes ours.
             if needs_color
                 && cand.color_texture == target_color
+                && cand.color_subresource == target_color_subresource
                 && matches!(cand.color_load, ColorLoad::Clear { .. })
             {
                 return None;
@@ -2341,6 +2388,7 @@ impl PassState {
             // Match: same attachments, currently loading.
             let color_ok = !needs_color
                 || (cand.color_texture == target_color
+                    && cand.color_subresource == target_color_subresource
                     && matches!(cand.color_load, ColorLoad::Load));
             let depth_ok = !needs_depth
                 || (cand.depth_texture == target_depth
@@ -2360,6 +2408,7 @@ impl PassState {
             // Load pass matches BOTH sides and returns above.
             let consumes_color = needs_color
                 && cand.color_texture == target_color
+                && cand.color_subresource == target_color_subresource
                 && matches!(cand.color_load, ColorLoad::Load);
             let consumes_depth = needs_depth
                 && cand.depth_texture == target_depth
@@ -2482,12 +2531,13 @@ impl PassState {
             }
         }
         if ENABLE_NEXT_CLEAR_COLOR_DONTCARE {
-            let mut next_color_use: HashMap<MetalHandle<MTLTextureKind>, usize> =
+            let mut next_color_use: HashMap<(MetalHandle<MTLTextureKind>, u32), usize> =
                 HashMap::with_capacity(self.seen_color_rts.len());
             for i in (0..self.passes.len()).rev() {
                 let rt = self.passes[i].color_texture;
+                let key = (rt, self.passes[i].color_subresource);
                 if !rt.is_null()
-                    && let Some(&next) = next_color_use.get(&rt)
+                    && let Some(&next) = next_color_use.get(&key)
                     && matches!(self.passes[next].color_load, ColorLoad::Clear { .. })
                     && !self.seen_sampled_textures.contains(&rt)
                 {
@@ -2499,18 +2549,20 @@ impl PassState {
                         );
                     }
                 }
-                next_color_use.insert(rt, i);
+                next_color_use.insert(key, i);
             }
         }
         if ENABLE_LAST_USE_COLOR_DONTCARE {
-            let mut handled: HashSet<MetalHandle<MTLTextureKind>> =
+            let mut handled: HashSet<(MetalHandle<MTLTextureKind>, u32)> =
                 HashSet::with_capacity(self.seen_color_rts.len());
             for pass in self.passes.iter_mut().rev() {
                 let rt = pass.color_texture;
                 if rt.is_null() || rt == self.backbuffer_texture {
                     continue;
                 }
-                if handled.insert(rt) && !matches!(pass.color_store, StoreAction::DontCare) {
+                if handled.insert((rt, pass.color_subresource))
+                    && !matches!(pass.color_store, StoreAction::DontCare)
+                {
                     if self.seen_sampled_textures.contains(&rt) {
                         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                             trace!(
@@ -2562,13 +2614,13 @@ fn pass_reads_texture(pass: &Pass, target_handle: MetalHandle<MTLTextureKind>) -
     if sampler_reads {
         return true;
     }
-    pass.leading_blits.iter().any(|b| {
-        let reads_src = matches!(
-            BlitCommandType::from_repr(b.cmd),
-            Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::GenerateMipmaps)
-        );
-        reads_src && b.src_handle == target_raw
-    })
+    pass.leading_blits
+        .iter()
+        .any(|b| match BlitCommandType::from_repr(b.cmd) {
+            Some(BlitCommandType::CopyTextureToTexture) => b.src_handle == target_raw,
+            Some(BlitCommandType::GenerateMipmaps) => b.dst_handle == target_raw,
+            _ => false,
+        })
 }
 
 /// True if any blit in `blits` writes to texture `target_handle`.
@@ -3314,6 +3366,65 @@ mod tests {
         );
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
+    }
+
+    #[test]
+    fn set_render_target_subresource_breaks_on_slice_or_level_change() {
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.set_color_render_target_subresource(
+            rt,
+            256,
+            256,
+            RT_FORMAT,
+            RenderScale::IDENTITY,
+            (0, 0),
+        );
+        s.emit_command(dummy_draw());
+        s.set_color_render_target_subresource(
+            rt,
+            256,
+            256,
+            RT_FORMAT,
+            RenderScale::IDENTITY,
+            (1, 0),
+        );
+        s.emit_command(dummy_draw());
+        s.set_color_render_target_subresource(
+            rt,
+            128,
+            128,
+            RT_FORMAT,
+            RenderScale::IDENTITY,
+            (1, 1),
+        );
+        s.emit_command(dummy_draw());
+
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(
+            (s.passes()[0].color_slice(), s.passes()[0].color_level()),
+            (0, 0)
+        );
+        assert_eq!(
+            (s.passes()[1].color_slice(), s.passes()[1].color_level()),
+            (1, 0)
+        );
+        assert_eq!(
+            (s.passes()[2].color_slice(), s.passes()[2].color_level()),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn ordinary_render_target_binding_uses_base_subresource() {
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+
+        assert_eq!(s.passes().len(), 1);
+        assert_eq!(s.passes()[0].color_slice(), 0);
+        assert_eq!(s.passes()[0].color_level(), 0);
     }
 
     #[test]

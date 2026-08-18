@@ -113,6 +113,10 @@ pub struct VariantKey {
     /// The programmable path ignores this — SM2/SM3 carry the sampler
     /// dimensionality in their `dcl` tokens. Part of the PS cache key.
     pub volume_sampler_mask: u16,
+    /// Bit `i` set when fixed-function sampling slot `i` is a cube texture.
+    ///
+    /// Programmable shaders keep using declaration-driven sampler types.
+    pub cube_sampler_mask: u16,
     /// Bit `i` set ⇒ texture stage `i` has `D3DTTFF_PROJECTED`.
     ///
     /// The fixed-function and `ps_1_0`..`ps_1_3` pixel pipelines apply an

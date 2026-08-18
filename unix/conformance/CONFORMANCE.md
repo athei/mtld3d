@@ -169,15 +169,14 @@ render the game's UI at the requested size only to upscale it, which is worse
 output than rendering at the monitor's. `render.scale` is the resolution
 control that replaces the mode.
 
-Every site asserting the old contract — the desktop mode following a create,
-`GetSystemMetrics` reporting it, a non-enumerable mode being rejected, or the
-back buffer / viewport / `GetPresentParameters` / `GetDisplayMode` reporting
-the request — is `expected` under this decision. The same decision is what
-makes the window-management sites (rect adoption, monitor coverage, and the
-`GetMonitorInfo` cascade that depended on it) pass. Net 15 sites gone, 14
-gained, and the mode-set backlog row retired.
+Every site asserting the old contract, including the desktop mode following a
+create, `GetSystemMetrics` reporting it, a non-enumerable mode being rejected,
+or the back buffer, viewport, `GetPresentParameters`, or `GetDisplayMode`
+reporting the request, is `expected` under this decision. The harness pins
+emulated mode switching and Retina mode so window-management assertions use a
+stable physical-pixel coordinate space.
 
-### The `real` backlog (12 distinct defects behind the 45 sites)
+### The `real` backlog (12 distinct defects behind the 43 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
@@ -191,7 +190,6 @@ gained, and the mode-set backlog row retired.
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
 | Depth→depth StretchRect is an S_OK no-op | depth_blit_test | 1 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
-| Cube-cap-off rejection shape too permissive (MANAGED/SYSTEMMEM accepted) | test_cube_textures | 2 |
 | CreateTexture(depth) succeeds while our own CheckDeviceFormat denies it | test_resource_access | 1 |
 | Occlusion query undercounts a >2^32-sample span (cause unproven) | test_occlusion_query | 1 |
 
@@ -210,10 +208,10 @@ Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
 Sites: 4572=expected 4161=expected 4231=expected 4551=real 4475=flaky
 Sites: 4480=flaky
 
-4161/4231 are the test's *own* `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
-failing, before any D3D9 object is involved — Wine's mac driver does not
-deliver the requested desktop mode. No mtld3d code participates, so there is
-nothing here for us to implement. The rest of the fullscreen focus lifecycle we
+4161/4231 are the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
+failing before any D3D9 object is involved. With `EmulateModeset=Y`, Wine does
+not deliver the requested desktop mode. No mtld3d code participates. The rest
+of the fullscreen focus lifecycle we
 deliberately do not drive: no focus/foreground mutation (4212/4214), no focus-
 window subclass (4223/4572), no WM_* activation/mode message generation
 (4207/4248/4293/4319/4340/4410/4432/4525/4545), no focus-window minimize
@@ -223,11 +221,10 @@ device window's proc — a deliberate, load-bearing hook we keep (cursor
 realization), not a missing feature. 4551 is `real`: a windowed Reset must
 emit exactly one `WM_WINDOWPOSCHANGING` on the device window carrying
 `SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE` and a zeroed rect; the
-`SetWindowPos` our fullscreen restore issues carries different flags. (4568,
-the WS_VISIBLE re-show on the same path, now passes — leaving fullscreen
-re-shows the window.) 4475/4480 are
-the only flaky pins: macdrv WM timing, no SetWindowPos/MoveWindow anywhere
-in our code.
+`SetWindowPos` our fullscreen restore issues carries different flags. The
+WS_VISIBLE re-show on the same path now passes because leaving fullscreen
+re-shows the window. 4475/4480 are flaky macdrv window-message timing sites;
+mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths.
 
 ### device.c/test_reset
 Sites: 2126=expected 2127=expected 2179=expected 2180=expected
@@ -325,8 +322,9 @@ Sites: 5662=expected 5671=expected 5674=expected
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize),
 plus 5552/5554: the back buffer must keep the size a fullscreen create asked
-for across an external mode change. All `expected` under the same decision —
-we never change the desktop mode, and the back buffer follows the window.
+for across an external mode change. All are `expected` under the same
+decision: physical mode switching is disabled and the back buffer follows the
+window.
 
 ### device.c/test_device_window_reset
 Sites: 5968=expected
@@ -346,16 +344,6 @@ the undercount is unexplained. No capability branch is involved, so the old
 `caps` tag was wrong. Tagged `real` pending investigation of the visibility
 span/slot summation; if the undercount is proven intrinsic to Metal
 visibility counting, retag `expected` with that evidence.
-
-### device.c/test_cube_textures
-Sites: 7866=real 7868=real
-
-We do not advertise D3DPTEXTURECAPS_CUBEMAP, and the test's cap-off branch
-asserts a cube-less device rejects ALL cube creates with INVALIDCALL. We
-correctly reject DEFAULT (7864 passes) but accept MANAGED/SYSTEMMEM as
-CPU-only shells — a too-permissive rejection shape vs a native cube-less
-device. Faithful fix: reject non-SCRATCH pools while the cap is off
-(SCRATCH is asserted creatable, 7871, and passes).
 
 ### device.c/test_lockrect_invalid
 Sites: 8664=expected 8682=expected 8701=expected
@@ -379,16 +367,6 @@ branch. Our rename-on-DISCARD model returns fresh backing by design, and
 DISCARD contents are spec-undefined, so our behavior is legal. Intent-to-
 keep (the rename model is core); previously mis-tagged `caps`.
 
-### device.c/test_npot_textures
-Sites: 10178=caps
-
-The no-POW2 branch asserts CreateCubeTexture(EdgeLength=3) succeeds without
-checking D3DPTEXTURECAPS_CUBEMAP — cap-blind. Our INVALIDCALL for the
-DEFAULT pool is the correct cube-less answer (the cap-off branch of
-test_cube_textures asserts exactly that at 7864). Note: fixing the
-test_cube_textures rejection shape will make the MANAGED/SYSTEMMEM
-iterations here fail too (count 1→3, still `caps`) — re-baseline together.
-
 ### device.c/test_lost_device
 Sites: 12144=expected 12146=expected 12153=expected 12155=expected
 Sites: 12199=expected
@@ -408,26 +386,26 @@ advertise MORE than native here, deliberately; not an omitted-cap (`caps`)
 case, and our answer is truthful for our backend.
 
 ### device.c/test_miptree_layout
-Sites: 12784=expected
+Sites: 12784=expected 12823=expected
 
 The test asserts each mip's lock pointer sits at a contiguous offset from
 level 0 (single-allocation mip chain). Our staging is one PageBox per mip,
 which is load-bearing for the rename-at-overlap versioning model (each
 mip's Arc swaps independently); a contiguous chain is structurally
-incompatible with that design, which we keep. Per-mip pixel data is
-correct.
+incompatible with that design, which we keep. Site 12823 is the same pointer
+layout assertion across six cube faces and their mip levels. Cube staging is
+also one PageBox per subresource so a face or mip can rename independently.
+Per-subresource pixel data is correct.
 
 ### device.c/test_resource_access
-Sites: 13838=real 13853=caps
+Sites: 13838=real
 
 13838 ("Test 2D 6": DEFAULT pool, depth format, USAGE_DEPTHSTENCIL
 texture): the test derives its expectation from OUR OWN CheckDeviceFormat,
 which denies depth textures — yet the create succeeds. Internal
 inconsistency between the capability report and the create path = defect
-(either advertise or reject; decide with the usual never-advertise-what-we-
-fail rule in mind). 13853 (CUBE 0/3/7, valid DEFAULT colour cubes): the
-formula is cap-blind on CUBEMAP; our INVALIDCALL is the correct cube-less
-response — `caps`.
+(either advertise or reject, following the usual never-advertise-what-we-fail
+rule).
 
 ### device.c/test_get_display_mode
 Sites: 14378=expected 14379=expected 14383=expected 14384=expected
@@ -447,10 +425,10 @@ test_window_style — a net gain, and the only self-consistent choice without a
 mode-set.
 
 14480/14482/14491/14493 are the separate GetAdapterMonitor/GetMonitorInfoW
-environment cascade: the call is display-config dependent and poisons the
+environment cascade. The call is display-config dependent and poisons the
 width/height comparisons downstream when it fails. GetAdapterMonitor itself is
-implemented (MonitorFromPoint → primary). Their sibling sites 14451/14454 and
-14472/14474 now pass, since the device window really does cover the monitor.
+implemented as MonitorFromPoint on the primary monitor. Their sibling sites
+14451/14454 and 14472/14474 pass with the harness's pinned Retina mode.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=expected

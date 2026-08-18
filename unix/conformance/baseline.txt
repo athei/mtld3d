@@ -1,5 +1,5 @@
 # mtld3d d3d9 conformance baseline — per-site failure counts.
-# Wine: wine-11.0-6-gf073261758b
+# Wine: wine-11.0-7-gea8264de552
 # Regenerate with 'make conformance-baseline'. Classifications + triage prose
 # live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test
 # keeps the two files covering the same sites.
@@ -87,14 +87,11 @@
   device.c:5674 count=1
   device.c:5968 count=1
   device.c:6780 count=1
-  device.c:7866 count=1
-  device.c:7868 count=1
-  device.c:8664 count=30
+  device.c:8664 count=60
   device.c:8682 count=30
-  device.c:8701 count=39
+  device.c:8701 count=30
   device.c:10074 count=1
   device.c:10079 count=1
-  device.c:10178 count=1
   device.c:12144 count=1
   device.c:12146 count=1
   device.c:12153 count=1
@@ -103,8 +100,8 @@
   device.c:12689 count=1
   device.c:12694 count=1
   device.c:12784 count=72
+  device.c:12823 count=477
   device.c:13838 count=1
-  device.c:13853 count=3
   device.c:14378 count=1
   device.c:14379 count=1
   device.c:14383 count=1
@@ -168,7 +165,7 @@
   visual.c:12470 count=9
   visual.c:14835 count=12
   visual.c:15617 count=144
-  visual.c:15668 count=15
+  visual.c:15668 count=17
   visual.c:15824 count=8
   visual.c:15829 count=12
   visual.c:16129 count=4
@@ -278,14 +275,11 @@
   device.c:5674 count=1
   device.c:5968 count=1
   device.c:6780 count=1
-  device.c:7866 count=1
-  device.c:7868 count=1
-  device.c:8664 count=30
+  device.c:8664 count=60
   device.c:8682 count=30
-  device.c:8701 count=39
+  device.c:8701 count=30
   device.c:10074 count=1
   device.c:10079 count=1
-  device.c:10178 count=1
   device.c:12144 count=1
   device.c:12146 count=1
   device.c:12153 count=1
@@ -294,8 +288,8 @@
   device.c:12689 count=1
   device.c:12694 count=1
   device.c:12784 count=72
+  device.c:12823 count=477
   device.c:13838 count=1
-  device.c:13853 count=3
   device.c:14378 count=1
   device.c:14379 count=1
   device.c:14383 count=1

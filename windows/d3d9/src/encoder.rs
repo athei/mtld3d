@@ -52,7 +52,7 @@ use mtld3d_shared::{
     VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
-        StorageMode, StoreAction, Swizzle, TextureUsage, VisibilityResultMode,
+        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -223,6 +223,15 @@ pub struct TextureUploadJob {
     pub info: TextureInfo,
     pub arc: Arc<PageBox>,
     pub level: u32,
+    /// Destination array slice.
+    ///
+    /// Zero for ordinary textures; cube uploads use the face index.
+    pub destination_slice: u32,
+    /// Index in the texture's staging-buffer cache.
+    ///
+    /// Equal to `level` for ordinary textures and `face * levels + level` for
+    /// cubes.
+    pub staging_index: usize,
     pub origin_x: u32,
     pub origin_y: u32,
     pub region_w: u32,
@@ -370,7 +379,7 @@ pub struct TextureInfo {
     pub depth: u32,
     pub levels: u32,
     pub pixel_format: PixelFormat,
-    pub has_swizzle: u32,
+    pub create_flags: TextureCreateFlags,
     pub swizzle: [Swizzle; 4],
     /// `TextureUsage` bits passed through to the unix side.
     ///
@@ -1179,13 +1188,22 @@ impl FrameEncoder {
             levels: info.levels,
             pixel_format: info.pixel_format,
             storage_mode,
-            has_swizzle: info.has_swizzle,
+            flags: info.create_flags,
             swizzle_r: info.swizzle[0],
             swizzle_g: info.swizzle[1],
             swizzle_b: info.swizzle[2],
             swizzle_a: info.swizzle[3],
             usage_flags: info.usage_flags,
         }
+    }
+
+    const fn texture_staging_slot_count(info: &TextureInfo) -> usize {
+        let faces = if info.create_flags.contains(TextureCreateFlags::TYPE_CUBE) {
+            6
+        } else {
+            1
+        };
+        info.levels as usize * faces
     }
 
     /// Drain the API-thread-queued texture warmups into one batched `CreateTexturesBatch` thunk.
@@ -1224,7 +1242,7 @@ impl FrameEncoder {
                         mtl_texture: handle,
                         mip_staging_buffers: vec![
                             MipStagingBuffer::default();
-                            info.levels as usize
+                            Self::texture_staging_slot_count(&info)
                         ],
                     });
                 }
@@ -2085,8 +2103,35 @@ impl FrameEncoder {
         has_alpha: bool,
         scale: RenderScale,
     ) {
-        self.pass_state
-            .set_color_render_target(texture, width, height, format, scale);
+        self.set_color_render_target_subresource(
+            texture,
+            (width, height),
+            format,
+            has_alpha,
+            scale,
+            (0, 0),
+        );
+    }
+
+    /// Bind a color render-target slice and mip level.
+    pub fn set_color_render_target_subresource(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        size: (u32, u32),
+        format: PixelFormat,
+        has_alpha: bool,
+        scale: RenderScale,
+        subresource: (u32, u32),
+    ) {
+        let (width, height) = size;
+        self.pass_state.set_color_render_target_subresource(
+            texture,
+            width,
+            height,
+            format,
+            scale,
+            subresource,
+        );
         // Kept in lockstep with the format: the Metal pixel format alone can't
         // distinguish X8R8G8B8 (no alpha) from A8R8G8B8 (both `Bgra8Unorm`).
         self.pass_state.set_color_rt_has_alpha(has_alpha);
@@ -3611,7 +3656,7 @@ impl FrameEncoder {
     /// `CreateTexture` time.
     pub fn get_or_create_texture(&mut self, info: &TextureInfo) -> u64 {
         let texture_id = info.texture_id;
-        let levels = info.levels;
+        let staging_slots = Self::texture_staging_slot_count(info);
         if let Some(state) = self.texture_cache.get(&texture_id) {
             return state.mtl_texture.raw();
         }
@@ -3630,7 +3675,7 @@ impl FrameEncoder {
             texture_id,
             TextureGpuState {
                 mtl_texture: handle,
-                mip_staging_buffers: vec![MipStagingBuffer::default(); levels as usize],
+                mip_staging_buffers: vec![MipStagingBuffer::default(); staging_slots],
             },
         );
         handle.raw()
@@ -4106,7 +4151,18 @@ impl FrameEncoder {
             .pass_state
             .texture_sampled_this_frame(unsafe { MetalHandle::new(handle) });
         if sampled {
-            if job.depth > 1 {
+            if job
+                .info
+                .create_flags
+                .contains(TextureCreateFlags::TYPE_CUBE)
+            {
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: job.info.texture_id.raw(),
+                    "run_texture_upload: cube texture {:#x} uploaded after being sampled this frame; per-draw cube versioning is not implemented",
+                    job.info.texture_id.raw(),
+                );
+            } else if job.depth > 1 {
                 mtld3d_shared::log_once_warn_by!(
                     target: LOG_TARGET,
                     key: job.info.texture_id.raw(),
@@ -4253,6 +4309,7 @@ impl FrameEncoder {
         // clear stashed as a pending load-action; materialize it onto the (still
         // current) attachment first so the regen reads the cleared level 0.
         self.pass_state.flush_pending_clears();
+        self.pass_state.note_texture_read(state.mtl_texture);
         self.end_current_pass("autogen_rt_regen");
         self.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
     }
@@ -4276,7 +4333,7 @@ impl FrameEncoder {
         // so the alignment-pad branch below knows how many source rows
         // to repack.
         let staging_buffer_handle =
-            self.get_or_create_staging_buffer(job.info.texture_id, job.level as usize, &job.arc);
+            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
         if staging_buffer_handle == 0 {
             return;
         }
@@ -4307,6 +4364,7 @@ impl FrameEncoder {
                     buffer_offset,
                     bytes_per_row: job.src_pitch,
                     texture_handle,
+                    destination_slice: job.destination_slice,
                     mip_level: job.level,
                     origin_x: job.origin_x,
                     origin_y: job.origin_y,
@@ -4331,6 +4389,7 @@ impl FrameEncoder {
                     buffer_offset: 0,
                     bytes_per_row: job.src_pitch,
                     texture_handle,
+                    destination_slice: job.destination_slice,
                     mip_level: job.level,
                     origin_x: 0,
                     origin_y: 0,
@@ -4351,6 +4410,7 @@ impl FrameEncoder {
                 buffer_offset,
                 bytes_per_row: job.src_pitch,
                 texture_handle,
+                destination_slice: job.destination_slice,
                 mip_level: job.level,
                 origin_x: job.origin_x,
                 origin_y: job.origin_y,
@@ -4441,7 +4501,7 @@ impl FrameEncoder {
         let mip_h = (job.info.height.max(1) >> job.level).max(1);
 
         let staging_buffer_handle =
-            self.get_or_create_staging_buffer(job.info.texture_id, job.level as usize, &job.arc);
+            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
         if staging_buffer_handle == 0 {
             return;
         }
@@ -4451,6 +4511,7 @@ impl FrameEncoder {
             buffer_offset: 0,
             bytes_per_row: src_pitch,
             texture_handle,
+            destination_slice: 0,
             mip_level: job.level,
             origin_x: 0,
             origin_y: 0,
@@ -4687,6 +4748,7 @@ impl FrameEncoder {
             buffer_offset: 0,
             bytes_per_row,
             texture_handle: color_handle,
+            destination_slice: 0,
             mip_level: 0,
             origin_x: 0,
             origin_y: 0,
@@ -6262,7 +6324,11 @@ fn pass_to_descriptor(
         // non-empty leading list needs the encoder. If a future caller
         // threads notifies through here, switch to a tracked flag on
         // `Pass`.
-        leading_blits_need_encoder: u32::from(!leading.is_empty()),
+        pass_flags: PassDescriptor::pack_flags(
+            !leading.is_empty(),
+            p.color_slice(),
+            p.color_level(),
+        ),
     }
 }
 
@@ -6317,7 +6383,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        leading_blits_need_encoder: 1,
+        pass_flags: PassDescriptor::pack_flags(true, 0, 0),
     }
 }
 

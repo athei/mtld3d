@@ -80,7 +80,7 @@ INSTALL_DIRS := $(WINE_SDK) $(WINE_INSTALL_DIR)
 
 export MTL_HUD_ENABLED = 1
 export MTL_DEBUG_LAYER = 1
-export WINEDBG_DISABLE_CRASH_DIALOG = 1
+export WINEDLLOVERRIDES = mscoree,mshtml=
 export WINEDEBUG=+msync
 export WINEMSYNC=1
 
@@ -102,7 +102,7 @@ DEBUG_STAGE  := $(CURDIR)/windows/target/bundle-debug
 BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
                         sed -n 's/^version = "\(.*\)"/v\1/p' windows/Cargo.toml)
 
-.PHONY: all windows unix install bundle test conformance conformance-baseline conformance-isolate fmt clippy audit doc check clean setup upgrade upgrade-incompat
+.PHONY: all windows unix install bundle configure-test-prefix test conformance conformance-baseline conformance-isolate fmt clippy audit doc check clean setup upgrade upgrade-incompat
 
 all: windows unix
 
@@ -238,7 +238,17 @@ MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE)
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
 
+configure-test-prefix:
+	# Keep automated tests non-interactive and independent of mutable prefix
+	# display settings. EmulateModeset prevents physical host mode changes;
+	# RetinaMode keeps Win32 monitor geometry in the same physical-pixel space
+	# as mtld3d's adapter modes.
+	wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
+	wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
+	wine reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
+
 test: install
+	$(MAKE) configure-test-prefix
 	# Host-native unit tests, built for this machine's native arch (no Rosetta).
 	# The windows workspace singles out mtld3d-core (its other members are
 	# PE-only and can't build for the host target) and must override its i686
@@ -267,10 +277,12 @@ test: install
 # runner finds the wine loader via the global WINE_SDK and its baseline.txt in
 # the crate dir.
 conformance: install
+	$(MAKE) configure-test-prefix
 	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
 	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --wine-build $(WINE_BUILD)
 
 conformance-baseline: install
+	$(MAKE) configure-test-prefix
 	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
 	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --update-baseline --wine-build $(WINE_BUILD)
 
@@ -282,6 +294,7 @@ ONLY ?= device
 ARCH ?= i686
 REPEAT ?= 20
 conformance-isolate: install
+	$(MAKE) configure-test-prefix
 	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
 	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --wine-build $(WINE_BUILD) --only $(ONLY) --arch $(ARCH) --repeat $(REPEAT)
 

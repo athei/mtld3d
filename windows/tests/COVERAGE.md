@@ -16,7 +16,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle-fan + `DrawIndexedPrimitiveUP` + `ProcessVertices` stubs. |
 | `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices`/`SetStreamSourceFreq` + non-zero stream stubs. |
 | `render_states.rs` | Alpha + additive blend; COLORWRITEENABLE mask; scissor; cull-mode winding; defaults vs `render_state_defaults()`; set/get round-trip; stencil round-trip + wireframe no-op (pinned). |
-| `textures.rs` | Lock/sample A8R8G8B8/X8R8G8B8/R5G6B5/A1R5G5B5/A4R4G4B4/L8; DXT1 block decode; mip chain levels/dims; AUTOGENMIPMAP; SetLOD no-op; SCRATCH-pool cube creates (other pools reject); volume creates. |
+| `textures.rs` | Lock/sample A8R8G8B8/X8R8G8B8/R5G6B5/A1R5G5B5/A4R4G4B4/L8; DXT1 block decode; mip chain levels/dims; AUTOGENMIPMAP; SetLOD no-op; cube creation in all pools; CPU-only extension-format cubes; managed DXT face isolation; cube face upload, sampling, state blocks, render targets, and AUTOGENMIPMAP; volume creates. |
 | `samplers.rs` | State round-trip; CLAMP≠WRAP past the unit square; POINT≠LINEAR; BORDER → Metal black preset (pinned). |
 | `texture_stages.rs` | COLOROP round-trip; MODULATE/ADD/SELECTARG2; TFACTOR arg source. |
 | `shaders.rs` | hand-assembled VS/PS; PS-constant colour; VS-constant translation; float-constant setters (in-range accept + out-of-range/`-1` → `INVALIDCALL`); integer/bool + Get*Constant* stubs. |
@@ -39,10 +39,9 @@ contract so a future implementation flips a known assertion.
   `SetStreamSource` on stream ≠ 0.
 - **Render states:** stencil func/ops not plumbed to Metal (states round-trip
   but do not gate rendering); `D3DFILL_WIREFRAME` renders solid.
-- **Textures:** `CreateCubeTexture` creates `D3DPOOL_SCRATCH` cubes only (a
-  CPU-only, creatable/releasable shell — no `MTLTexture`, per-face lock/upload
-  and sampling unwired); other pools reject (no `D3DPTEXTURECAPS_CUBEMAP`).
-  `SetLOD` is a managed-pool-only no-op.
+- **Textures:** ATI1 and YUV cubes are CPU-only `D3DPOOL_SCRATCH` resources;
+  GPU-backed cubes support mapped color and DXT formats. `SetLOD` is a
+  managed-pool-only no-op.
 - **Samplers:** arbitrary `D3DSAMP_BORDERCOLOR` (Metal has 3 preset borders).
 - **Shaders:** integer/bool constant setters; `Get{Vertex,Pixel}ShaderConstantF`.
 - **Surfaces:** `CreateRenderTarget` (use `CreateTexture(D3DUSAGE_RENDERTARGET)`)

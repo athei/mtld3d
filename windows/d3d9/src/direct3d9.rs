@@ -11,12 +11,13 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A1R5G5B5,
-    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8,
-    D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
-    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16,
+    D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
+    D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
+    D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN,
+    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -248,6 +249,17 @@ const fn is_texture_format(fmt: u32) -> bool {
     )
 }
 
+/// Sampleable cube colour formats backed by `MTLTextureTypeCube`.
+///
+/// ATI1 requires extension-specific cube lock semantics that are not
+/// implemented. Packed YUV has no shader sampling path, and depth cube maps
+/// are not implemented.
+fn is_cube_texture_format(fmt: u32) -> bool {
+    mtld3d_core::format::map_d3d_format(fmt).is_some()
+        && !matches!(fmt, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY)
+        && !is_depth_stencil_format(fmt)
+}
+
 // Formats the Metal backend can render into.
 //
 // `R5G6B5` and `A1R5G5B5` map bit-for-bit to the native `B5G6R5Unorm` /
@@ -258,7 +270,7 @@ const fn is_texture_format(fmt: u32) -> bool {
 // in the wrong bits — so `A4R4G4B4` is a sampling-only format. Backbuffer /
 // CAMetalLayer is hardcoded BGRA8, so a request for one of these as a backbuffer
 // format hits the existing substitute-warn at `d3d9_create_device`.
-const fn is_render_target_format(fmt: u32) -> bool {
+pub const fn is_render_target_format(fmt: u32) -> bool {
     matches!(
         fmt,
         D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5
@@ -579,7 +591,18 @@ extern "system" fn d3d9_check_device_format(
     {
         return D3DERR_NOTAVAILABLE;
     }
-    let supported = if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
+    let supported = if rtype == D3DRTYPE_CUBETEXTURE {
+        if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
+            false
+        } else if usage & D3DUSAGE_RENDERTARGET != 0 {
+            is_render_target_format(check_format)
+                && (usage & D3DUSAGE_QUERY_SRGBWRITE == 0 || has_srgb_twin(check_format))
+        } else if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
+            false
+        } else {
+            is_cube_texture_format(check_format)
+        }
+    } else if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
         is_depth_stencil_format(check_format)
     } else if usage & D3DUSAGE_RENDERTARGET != 0 {
         // SRGBWRITE is only meaningful for render-targetable colour
@@ -611,10 +634,9 @@ extern "system" fn d3d9_check_device_format(
         );
         return D3DERR_NOTAVAILABLE;
     }
-    // D3DUSAGE_AUTOGENMIPMAP needs render-target capability — the runtime
-    // renders each down-sampled level. A supported but non-renderable format
-    // returns the *success* code D3DOK_NOAUTOGEN ("valid, but you won't get
-    // auto-generated mips") rather than D3D_OK.
+    // D3DUSAGE_AUTOGENMIPMAP needs render-target capability even when the
+    // query does not include D3DUSAGE_RENDERTARGET. Metal mip generation is
+    // available for renderable 2D and cube color formats.
     if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && !is_render_target_format(check_format) {
         return D3DOK_NOAUTOGEN;
     }

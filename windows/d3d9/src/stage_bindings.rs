@@ -44,6 +44,8 @@ bitflags::bitflags! {
         const DEPTH_CHANGED = 1 << 1;
         /// The slot's volume (3D) texture-ness flipped (drives `volume_sampler_mask`).
         const VOLUME_CHANGED = 1 << 2;
+        /// The slot's cube texture-ness flipped (drives `cube_sampler_mask`).
+        const CUBE_CHANGED = 1 << 3;
     }
 }
 
@@ -78,6 +80,8 @@ pub struct StageBindings {
     depth_mask: u16,
     /// Cached [`Self::volume_sampler_mask`] value; same scheme as `depth_mask`.
     volume_mask: u16,
+    /// Cached cube binding mask; updated only by `replace_texture`.
+    cube_mask: u16,
     /// Cached [`Self::depth_fetch_mask`] value; same scheme as `depth_mask`.
     fetch_mask: u16,
 }
@@ -91,6 +95,7 @@ impl StageBindings {
             bound_mask: 0,
             depth_mask: 0,
             volume_mask: 0,
+            cube_mask: 0,
             fetch_mask: 0,
         }
     }
@@ -132,6 +137,15 @@ impl StageBindings {
             "cached volume_mask out of sync with texture slots"
         );
         self.volume_mask
+    }
+
+    pub fn cube_sampler_mask(&self) -> u16 {
+        debug_assert_eq!(
+            self.cube_mask,
+            self.scan_mask(Direct3DTexture9::is_cube),
+            "cached cube_mask out of sync with texture slots"
+        );
+        self.cube_mask
     }
 
     /// Bit `i` set ⇒ slot `i` is bound to a "readable raw depth" FOURCC texture (INTZ/DF24/DF16).
@@ -184,23 +198,25 @@ impl StageBindings {
         let old_nonnull = !old.raw().is_null();
         let old_depth = old.as_ref().is_some_and(Direct3DTexture9::is_depth_format);
         let old_volume = old.as_ref().is_some_and(Direct3DTexture9::is_volume);
+        let old_cube = old.as_ref().is_some_and(Direct3DTexture9::is_cube);
 
         let new_nonnull = !tex.is_null();
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; the game holds a ref across SetTexture,
         // so the stored `is_depth_format` / `is_volume` flags are readable
         // before `adopt`.
-        let (new_depth, new_volume, new_fetch) = if new_nonnull {
+        let (new_depth, new_volume, new_cube, new_fetch) = if new_nonnull {
             // SAFETY: as above — take a shared reference to the live texture and
             // read the flags through it (one raw-pointer deref).
             let t = unsafe { &*tex };
             (
                 t.is_depth_format(),
                 t.is_volume(),
+                t.is_cube(),
                 mtld3d_core::format::is_raw_depth_fetch_format(t.d3d_format()),
             )
         } else {
-            (false, false, false)
+            (false, false, false, false)
         };
 
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
@@ -214,6 +230,7 @@ impl StageBindings {
         self.bound_mask = with_bit(self.bound_mask, bit, new_nonnull);
         self.depth_mask = with_bit(self.depth_mask, bit, new_depth);
         self.volume_mask = with_bit(self.volume_mask, bit, new_volume);
+        self.cube_mask = with_bit(self.cube_mask, bit, new_cube);
         self.fetch_mask = with_bit(self.fetch_mask, bit, new_fetch);
 
         let mut delta = TextureSwapDelta::empty();
@@ -223,6 +240,7 @@ impl StageBindings {
         );
         delta.set(TextureSwapDelta::DEPTH_CHANGED, old_depth != new_depth);
         delta.set(TextureSwapDelta::VOLUME_CHANGED, old_volume != new_volume);
+        delta.set(TextureSwapDelta::CUBE_CHANGED, old_cube != new_cube);
         delta
     }
 

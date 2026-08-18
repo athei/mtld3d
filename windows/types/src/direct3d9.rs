@@ -52,6 +52,14 @@ pub const IID_IDIRECT3DTEXTURE9: Guid = Guid {
     data4: [0x9B, 0x3A, 0xF1, 0x1A, 0xC3, 0x8C, 0x18, 0xB5],
 };
 
+/// `IID_IDirect3DCubeTexture9`: `{FFF32F81-D953-473A-9223-93D652ABA93F}`.
+pub const IID_IDIRECT3DCUBETEXTURE9: Guid = Guid {
+    data1: 0xFFF3_2F81,
+    data2: 0xD953,
+    data3: 0x473A,
+    data4: [0x92, 0x23, 0x93, 0xD6, 0x52, 0xAB, 0xA9, 0x3F],
+};
+
 /// `SetPrivateData` flag: the data pointer is an `IUnknown*`.
 ///
 /// The runtime `AddRef`s on store and `Release`s on overwrite/free/destroy.

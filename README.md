@@ -63,7 +63,7 @@ instead of breaking.
 - **Queries**: occlusion queries backed by real Metal visibility results;
   event queries.
 - **Resources**: DXT1–5 and ATI1 compressed textures, the common
-  uncompressed integer and float formats, volume textures, mipmap
+  uncompressed integer and float formats, cube and volume textures, mipmap
   auto-generation, managed-pool dirty-region uploads, StretchRect (including
   cross-format blits via a conversion pass), GetDC read-back.
 - **Depth**: sampleable depth textures (INTZ, DF16, DF24) with hardware
@@ -90,11 +90,6 @@ back:
   only accepts D3DMULTISAMPLE_NONE.
 - **Multiple render targets**: a single simultaneous render target is
   advertised.
-- **Cube-map sampling**: the cap is off and cube textures are never
-  GPU-backed. CreateCubeTexture in the CPU pools still returns a real,
-  lockable cube texture (faces work via GetCubeMapSurface/LockRect), so
-  applications that probe cube support degrade gracefully; DEFAULT-pool
-  creates are rejected.
 - **Point sprites** and non-solid fill modes (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports
   NOTAVAILABLE, as the spec allows.

@@ -29,9 +29,9 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS,
-    D3DDISPLAYMODE, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
     D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
     D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
     D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC,
@@ -83,8 +83,8 @@ use super::{
     state_block::{RecordingStateBlock, StateOp},
     surface::Direct3DSurface9,
     texture::{
-        Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags, TextureInner,
-        new_uninit_page_box,
+        CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags,
+        TextureInner, new_uninit_page_box,
     },
     unix_call::unix_call,
     vertex_buffer::{Direct3DVertexBuffer9, VertexBufferCreateInfo},
@@ -1270,7 +1270,7 @@ impl DeviceInner {
         };
         let scale = self.scale_for_created_target(logical_w, logical_h, true);
         self.push_op(Box::new(move |enc| {
-            let (handle, w, h, fmt, has_alpha) = match info {
+            let (handle, w, h, fmt, has_alpha, slice, level) = match info {
                 RtBinding::Backbuffer {
                     handle,
                     width,
@@ -1284,6 +1284,8 @@ impl DeviceInner {
                     // (see `PassState::reset_frame`), so its destination-alpha
                     // blend factors resolve unclamped.
                     true,
+                    0,
+                    0,
                 ),
                 RtBinding::StandaloneColor {
                     handle,
@@ -1291,12 +1293,14 @@ impl DeviceInner {
                     has_alpha,
                     width,
                     height,
-                } => (handle, width, height, format, has_alpha),
+                } => (handle, width, height, format, has_alpha, 0, 0),
                 RtBinding::Texture {
                     info,
                     has_alpha,
                     width,
                     height,
+                    slice,
+                    level,
                 } => {
                     let fmt = info.pixel_format;
                     let h = enc.get_or_create_texture(&info);
@@ -1308,10 +1312,23 @@ impl DeviceInner {
                         height,
                         fmt,
                         has_alpha,
+                        slice,
+                        level,
                     )
                 }
             };
-            enc.set_color_render_target(handle, w, h, fmt, has_alpha, scale);
+            if slice == 0 && level == 0 {
+                enc.set_color_render_target(handle, w, h, fmt, has_alpha, scale);
+            } else {
+                enc.set_color_render_target_subresource(
+                    handle,
+                    (w, h),
+                    fmt,
+                    has_alpha,
+                    scale,
+                    (slice, level),
+                );
+            }
         }));
     }
 
@@ -2353,6 +2370,8 @@ enum RtBinding {
         has_alpha: bool,
         width: u32,
         height: u32,
+        slice: u32,
+        level: u32,
     },
 }
 
@@ -3982,15 +4001,15 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // Usage/pool rules: RT/DS require D3DPOOL_DEFAULT
-    // (which the CPU-only cube shell rejects below anyway), the two usages are
-    // exclusive, and DYNAMIC cannot combine with either.
+    let mut usage_flags = mtld3d_shared::mtl::TextureUsage::empty();
+    if usage & D3DUSAGE_RENDERTARGET != 0 {
+        usage_flags.insert(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET);
+    }
+    // Cube render targets must be DEFAULT-pool color resources. Depth cubes
+    // remain unsupported, and DYNAMIC cannot combine with either target usage.
     let usage_rt = usage & D3DUSAGE_RENDERTARGET != 0;
     let usage_ds = usage & D3DUSAGE_DEPTHSTENCIL != 0;
-    if (usage_rt && usage_ds)
-        || ((usage_rt || usage_ds) && pool != D3DPOOL_DEFAULT)
-        || (usage & D3DUSAGE_DYNAMIC != 0 && (usage_rt || usage_ds))
-    {
+    if usage_ds || (usage_rt && (pool != D3DPOOL_DEFAULT || usage & D3DUSAGE_DYNAMIC != 0)) {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -4000,25 +4019,6 @@ extern "system" fn device_create_cube_texture(
     // formats, so this never fires in-game.
     let is_depth_fmt = mtld3d_core::format::is_depth_format(format);
     if (usage_ds && !is_depth_fmt) || (usage_rt && is_depth_fmt) {
-        null_out(texture);
-        return D3DERR_INVALIDCALL;
-    }
-    // GPU-backed (sampleable) cube maps are not exposed — the
-    // `D3DPTEXTURECAPS_CUBEMAP` cap is off, so a cube is never bound or
-    // sampled. `D3DPOOL_DEFAULT` would require a GPU `MTLTextureTypeCube`, so
-    // it is rejected. The CPU pools (`MANAGED`/`SYSTEMMEM`/`SCRATCH`) get a
-    // creatable, lockable CPU-only shell: a real `IDirect3DCubeTexture9` whose
-    // six faces share one per-level store (invisible without sampling), so
-    // `GetCubeMapSurface`/`LockRect` work and return a real surface rather
-    // than a NULL cube that would fault the caller. The shell does not
-    // forward a device ref
-    // (`is_cube_shell`) so an un-released one cannot pin the device.
-    if pool == D3DPOOL_DEFAULT {
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: (u64::from(format) << 32) | (u64::from(usage) << 16) | u64::from(pool),
-            "IDirect3DDevice9::CreateCubeTexture(edge={edge_length}, levels={levels}, usage={usage:#x}, fmt={format}, D3DPOOL_DEFAULT) → INVALIDCALL (no GPU cube-map cap)"
-        );
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -4034,38 +4034,50 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // We cannot GPU-back a block-compressed or packed-YUV cube map, and the cube
-    // cap is off, so `CheckDeviceFormat(CUBETEXTURE, fmt)` reports them
-    // unsupported — the driver-support pools (SYSTEMMEM/MANAGED) must therefore
-    // reject them, matching that report. SCRATCH (a runtime-only pool) and
-    // uncompressed shells (e.g. A8R8G8B8) are unaffected.
-    if matches!(pool, D3DPOOL_SYSTEMMEM | D3DPOOL_MANAGED)
-        && is_block_or_yuv_format(format, fmt.block_width(), fmt.block_height())
+    // ATI1 and packed YUV retain only their CPU SCRATCH resource form. Depth
+    // formats remain unsupported, and render-target cubes require a Metal
+    // renderable color format.
+    if (matches!(format, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY) && pool != D3DPOOL_SCRATCH)
+        || is_depth_fmt
+        || (usage_rt && !crate::direct3d9::is_render_target_format(format))
     {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && levels > 1 {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
+    if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && !matches!(pool, D3DPOOL_DEFAULT | D3DPOOL_MANAGED) {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     let bpp = fmt.bytes_per_pixel().max(1);
-    // The cap-off shell materialises a real per-level CPU mip chain (square
-    // faces, `edge_length`), but ONE store shared by all six faces — without
-    // sampling the faces are indistinguishable, and `LockRect`/`GetCubeMapSurface`
-    // only need correct per-level dimensions/offsets. `levels == 0` means the
-    // full chain (matches `CreateTexture`).
-    let actual_levels = if levels == 0 {
+    // `levels == 0` means the full chain. Staging is face-major so the cube
+    // sidecar can address `face * levels + level` without another allocation.
+    let autogen_mipmap = usage & D3DUSAGE_AUTOGENMIPMAP != 0;
+    let autogen_full_chain = autogen_mipmap && !fmt.is_compressed();
+    let actual_levels = if autogen_full_chain || levels == 0 {
         compute_mip_count(edge_length, edge_length)
     } else {
         levels
     };
-    let mut staging: Vec<PageBox> = Vec::with_capacity(actual_levels as usize);
+    let mut staging: Vec<PageBox> =
+        Vec::with_capacity(actual_levels as usize * CUBE_FACE_COUNT as usize);
     let mut mip_widths = Vec::with_capacity(actual_levels as usize);
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
     for level in 0..actual_levels {
-        let (mw, mh, size, bpr) = compute_mip_size(edge_length, edge_length, level, &fmt);
-        staging.push(new_uninit_page_box(size as usize));
+        let (mw, mh, _size, bpr) = compute_mip_size(edge_length, edge_length, level, &fmt);
         mip_widths.push(mw);
         mip_heights.push(mh);
         mip_bytes_per_row.push(bpr);
+    }
+    for _face in 0..CUBE_FACE_COUNT {
+        for level in 0..actual_levels {
+            let (_, _, size, _) = compute_mip_size(edge_length, edge_length, level, &fmt);
+            staging.push(new_uninit_page_box(size as usize));
+        }
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -4073,6 +4085,8 @@ extern "system" fn device_create_cube_texture(
     };
     // A cube face is never the main view's colour or depth target, so it keeps
     // whatever edge length the game asked for.
+    let mut flags = TextureFlags::CUBE;
+    flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
     let tex = crate::texture::Direct3DCubeTexture9::new(TextureCreateInfo {
         texture_id: mtld3d_core::ids::TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
@@ -4084,9 +4098,9 @@ extern "system" fn device_create_cube_texture(
         levels: actual_levels,
         d3d_format: format,
         metal_pixel_format: fmt.metal_pixel_format(),
-        flags: TextureFlags::CUBE_SHELL,
+        flags,
         swizzle: fmt.swizzle(),
-        usage_flags: mtld3d_shared::mtl::TextureUsage::empty(),
+        usage_flags,
         d3d_usage: usage,
         d3d_pool: pool,
         bytes_per_pixel: bpp,
@@ -4098,6 +4112,9 @@ extern "system" fn device_create_cube_texture(
         mip_heights,
         mip_bytes_per_row,
     });
+    if matches!(pool, D3DPOOL_DEFAULT | D3DPOOL_MANAGED) {
+        obj.inner().push_texture_warmup(tex.inner().texture_info());
+    }
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live cube texture at refcount 1;
     // it shares `Direct3DTexture9`'s layout and refcount engine.
@@ -4576,21 +4593,23 @@ extern "system" fn device_update_surface(
         // SAFETY: `dst_parent` is a live `Direct3DTexture9` whose refcount keeps
         // it alive while the destination surface is alive.
         let tex = unsafe { &mut *dst_parent };
-        return if tex.inner_mut().copy_bytes_to_staging_region(
-            dst_level,
-            &SourceImage {
-                bytes: src_bytes,
-                pitch: src_pitch,
-                width: src_w,
-                height: src_h,
-            },
-            rect,
-            point,
-        ) {
-            D3D_OK
-        } else {
-            D3DERR_INVALIDCALL
+        let image = SourceImage {
+            bytes: src_bytes,
+            pitch: src_pitch,
+            width: src_w,
+            height: src_h,
         };
+        let copied = if let Some(face) = dst_surf.cube_face() {
+            if tex.d3d_pool() != D3DPOOL_DEFAULT || tex.d3d_format() != src_fmt {
+                return D3DERR_INVALIDCALL;
+            }
+            tex.inner_mut()
+                .copy_bytes_to_cube_staging_region(face, dst_level, &image, rect, point)
+        } else {
+            tex.inner_mut()
+                .copy_bytes_to_staging_region(dst_level, &image, rect, point)
+        };
+        return if copied { D3D_OK } else { D3DERR_INVALIDCALL };
     }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
         return D3DERR_INVALIDCALL;
@@ -4607,7 +4626,22 @@ extern "system" fn device_update_surface(
         if !dst.update_region_valid(dst_level, src, src_level, rect, point) {
             return D3DERR_INVALIDCALL;
         }
-        let _ = dst.copy_sub_region_from(dst_level, src, src_level, rect, point);
+        match (dst_surf.cube_face(), src_surf.cube_face()) {
+            (Some(dst_face), Some(src_face)) => {
+                let _ = dst.copy_cube_sub_region_from(
+                    (dst_face, dst_level),
+                    src,
+                    src_face,
+                    src_level,
+                    rect,
+                    point,
+                );
+            }
+            (None, None) => {
+                let _ = dst.copy_sub_region_from(dst_level, src, src_level, rect, point);
+            }
+            _ => return D3DERR_INVALIDCALL,
+        }
         D3D_OK
     })
 }
@@ -4621,12 +4655,76 @@ extern "system" fn device_update_texture(
     if src.is_null() || dst.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // The IDirect3DBaseTexture9 the game passes shares the 2D-texture layout for
-    // our 2D textures (the conformance path); cube/volume update is unsupported.
+    // All texture interfaces share this wrapper layout. The type flag below
+    // selects the cube path; volume updates remain unsupported.
     let src_parent = src.cast::<crate::texture::Direct3DTexture9>();
     let dst_parent = dst.cast::<crate::texture::Direct3DTexture9>();
     if std::ptr::eq(src_parent.cast_const(), dst_parent.cast_const()) {
         return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: both pointers are non-null live base-texture wrappers. All three
+    // texture interfaces share the same wrapper layout.
+    let src_is_cube = unsafe { (*src_parent).is_cube() };
+    // SAFETY: same invariant as the source pointer above.
+    let dst_is_cube = unsafe { (*dst_parent).is_cube() };
+    if src_is_cube != dst_is_cube {
+        return D3DERR_INVALIDCALL;
+    }
+    if src_is_cube {
+        let hr = copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
+            let mut s = src.mip_width(0);
+            let d = dst.mip_width(0);
+            let mut src_skip = 0usize;
+            while s > d {
+                s >>= 1;
+                src_skip += 1;
+            }
+            let levels = (src.app_level_count() as usize)
+                .saturating_sub(src_skip)
+                .min(dst.app_level_count() as usize);
+            for face in 0..6 {
+                for level in 0..levels {
+                    let src_level = level + src_skip;
+                    let Some(dr) = src.cube_update_dirty_rect(face, src_level) else {
+                        continue;
+                    };
+                    let sw = src.mip_width(src_level);
+                    let sh = src.mip_height(src_level);
+                    let Some(c) = dr.clamp(sw, sh) else { continue };
+                    if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
+                        let _ = dst.copy_cube_sub_region_from(
+                            (face, level),
+                            src,
+                            face,
+                            src_level,
+                            None,
+                            (0, 0),
+                        );
+                    } else {
+                        let rect = (
+                            c.x.cast_signed(),
+                            c.y.cast_signed(),
+                            (c.x + c.w).cast_signed(),
+                            (c.y + c.h).cast_signed(),
+                        );
+                        let _ = dst.copy_cube_sub_region_from(
+                            (face, level),
+                            src,
+                            face,
+                            src_level,
+                            Some(rect),
+                            (c.x.cast_signed(), c.y.cast_signed()),
+                        );
+                    }
+                }
+            }
+            D3D_OK
+        });
+        if hr == D3D_OK {
+            // SAFETY: `src_parent` remains live and distinct from `dst_parent`.
+            unsafe { (*src_parent).inner_mut() }.clear_all_cube_update_dirty();
+        }
+        return hr;
     }
     let hr = copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
         // D3D9 matches src/dst mips by aligning the SMALLEST levels: when the
@@ -5859,6 +5957,8 @@ extern "system" fn device_color_fill(
         info,
         arc: Arc::new(page),
         level,
+        destination_slice: 0,
+        staging_index: level as usize,
         origin_x,
         origin_y,
         region_w,
@@ -6079,9 +6179,9 @@ extern "system" fn device_set_render_target(
     // `GetBackBuffer` / `GetRenderTarget` on the default RT) fall
     // back to the backbuffer handle.
     // SAFETY: `surf` is the live surface validated above.
-    let parent = unsafe { (*surf).parent_texture() };
-    // SAFETY: `surf` is the live surface validated above.
-    let standalone_color = unsafe { (*surf).metal_color_handle() };
+    let surface_ref = unsafe { &*surf };
+    let parent = surface_ref.parent_texture();
+    let standalone_color = surface_ref.metal_color_handle();
     let info = if parent.is_null() {
         if !standalone_color.is_null() && standalone_color != dev.backbuffer_handle {
             // A standalone `CreateRenderTarget` colour surface: parent-null but
@@ -6118,19 +6218,12 @@ extern "system" fn device_set_render_target(
         // live `Direct3DTexture9` whose refcount keeps it alive while
         // the surface is bound.
         let parent_tex = unsafe { &*parent };
+        let mut texture_info = parent_tex.inner().texture_info();
+        texture_info
+            .usage_flags
+            .insert(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET);
         RtBinding::Texture {
-            info: TextureInfo {
-                texture_id: parent_tex.texture_id(),
-                width: parent_tex.width(),
-                height: parent_tex.height(),
-                depth: 1,
-                levels: parent_tex.levels(),
-                pixel_format: parent_tex.metal_pixel_format(),
-                has_swizzle: parent_tex.has_swizzle(),
-                swizzle: parent_tex.swizzle(),
-                usage_flags: parent_tex.usage_flags()
-                    | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET,
-            },
+            info: texture_info,
             // Unknown formats default to alpha-bearing (the pre-clamp
             // behaviour); a real X8R8G8B8 RT texture reports `false`.
             has_alpha: map_d3d_format(desc.format)
@@ -6138,6 +6231,10 @@ extern "system" fn device_set_render_target(
                 .is_none_or(FormatMapping::has_alpha),
             width: desc.width,
             height: desc.height,
+            // A 2D texture uses slice zero. Cube-face surfaces carry their
+            // face as the Metal array slice while sharing the parent texture.
+            slice: surface_ref.cube_face().unwrap_or(0),
+            level: surface_ref.mip_level(),
         }
     };
 
@@ -7072,7 +7169,11 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
     // deltas. `ff_aware_mask` still strips VS/PS bits for programmable
     // shaders.
     let mut bits = SnapshotDirty::STAGES;
-    if delta.intersects(TextureSwapDelta::DEPTH_CHANGED | TextureSwapDelta::VOLUME_CHANGED) {
+    if delta.intersects(
+        TextureSwapDelta::DEPTH_CHANGED
+            | TextureSwapDelta::VOLUME_CHANGED
+            | TextureSwapDelta::CUBE_CHANGED,
+    ) {
         bits |= SnapshotDirty::VARIANT;
     }
     let ffkey_rebuilt = (stage as usize) < 8 && delta.contains(TextureSwapDelta::OCCUPANCY_CHANGED);
@@ -8001,6 +8102,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         variant.depth_sampler_mask = dev.stage_bindings().depth_sampler_mask();
         variant.depth_fetch_mask = dev.stage_bindings().depth_fetch_mask();
         variant.volume_sampler_mask = dev.stage_bindings().volume_sampler_mask();
+        variant.cube_sampler_mask = dev.stage_bindings().cube_sampler_mask();
         // D3DTTFF_PROJECTED stages drive an implicit per-pixel projective divide
         // for the ps_1_0..1_3 programmable PS (the SM1 emitter consumes this; FF
         // uses its own FfPsKey mask, ps_1_4 uses DZ/DW, ps_2_0+ ignore TTFF).

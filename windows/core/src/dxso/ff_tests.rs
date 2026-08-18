@@ -457,6 +457,7 @@ fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
         &ps,
         VariantKey {
             volume_sampler_mask: 0b1,
+            cube_sampler_mask: 0,
             ..VariantKey::default()
         },
     );
@@ -481,6 +482,7 @@ fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
         &ps_proj,
         VariantKey {
             volume_sampler_mask: 0b1,
+            cube_sampler_mask: 0,
             ..VariantKey::default()
         },
     );
@@ -490,6 +492,41 @@ fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
         ),
         "{projected}"
     );
+}
+
+#[test]
+fn cube_sampler_mask_emits_texturecube_and_xyz_sample() {
+    let mut vs = default_vs_key();
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: 2,
+        color_arg1: 2,
+        color_arg2: 1,
+        alpha_op: 2,
+        alpha_arg1: 2,
+        alpha_arg2: 1,
+        has_texture: true,
+    };
+
+    let cube = emit_pair_for_tests(
+        &vs,
+        &ps,
+        VariantKey {
+            cube_sampler_mask: 1,
+            ..VariantKey::default()
+        },
+    );
+    assert!(
+        cube.contains("texturecube<float> s0 [[texture(0)]]"),
+        "{cube}"
+    );
+    assert!(
+        cube.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xyz);"),
+        "{cube}"
+    );
+    assert!(!cube.contains("texture2d<float> s0"), "{cube}");
 }
 
 #[test]
@@ -503,6 +540,7 @@ fn emits_alpha_test_discard() {
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
         volume_sampler_mask: 0,
+        cube_sampler_mask: 0,
         tt_projected_mask: 0,
         flags: VariantFlags::empty(),
     };
@@ -529,6 +567,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
         volume_sampler_mask: 0,
+        cube_sampler_mask: 0,
         tt_projected_mask: 0,
         flags: VariantFlags::empty(),
     };
@@ -637,6 +676,7 @@ fn omits_alpha_test_when_always() {
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
         volume_sampler_mask: 0,
+        cube_sampler_mask: 0,
         tt_projected_mask: 0,
         flags: VariantFlags::empty(),
     };

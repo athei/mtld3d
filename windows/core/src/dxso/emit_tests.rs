@@ -820,6 +820,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
         volume_sampler_mask: 0,
+        cube_sampler_mask: 0,
         tt_projected_mask: 0,
         flags: VariantFlags::empty(),
     };

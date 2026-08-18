@@ -1,5 +1,6 @@
 use mtld3d_types::{
     D3DCAPS9, D3DDEVCAPS_HWRASTERIZATION, D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES,
+    D3DPTEXTURECAPS_CUBEMAP, D3DPTEXTURECAPS_MIPCUBEMAP,
 };
 
 const fn fill_default(caps: &mut D3DCAPS9) {
@@ -38,8 +39,9 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.dest_blend_caps = 0x27FF;
     caps.shade_caps = 0x0000_4208; // COLORGOURAUDRGB (0x08) | SPECULARGOURAUDRGB (0x200)
     // | ALPHAGOURAUDBLEND (0x4000) — FF VS emits out.color0 + out.color1
-    caps.texture_caps = 0x0000_4405; // ALPHA (0x04) | PERSPECTIVE (0x01)
-    // | PROJECTED (0x400) | MIPMAP (0x4000). POW2 (0x2) and NONPOW2CONDITIONAL
+    caps.texture_caps = 0x0000_4405 | D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_MIPCUBEMAP;
+    // ALPHA (0x04) | PERSPECTIVE (0x01) | PROJECTED (0x400) | MIPMAP (0x4000)
+    // | CUBEMAP (0x800) | MIPCUBEMAP (0x10000). POW2 (0x2) and NONPOW2CONDITIONAL
     // (0x100) are BOTH clear: Metal supports non-power-of-2 textures
     // unconditionally (mipmaps + wrap addressing), which D3D9 signals by leaving
     // both flags off. NONPOW2CONDITIONAL is only valid alongside POW2. Texture
@@ -205,7 +207,7 @@ const ALL_RASTER_CAPS: u32 = 0x0F77_A191; // DITHER, ZTEST, FOGVERTEX, FOGTABLE,
 // have. NONPOW2CONDITIONAL is only valid alongside POW2 (it means "non-pow2
 // conditionally, with restrictions"); since we support non-pow2 unconditionally,
 // both stay clear so games see full NPOT support even in capsAll mode.
-const ALL_TEXTURE_CAPS_EXCEPT_POW2: u32 = 0x0027_EEE2;
+const ALL_TEXTURE_CAPS_EXCEPT_POW2: u32 = 0x0025_EEE2;
 
 const ALL_FILTER_CAPS: u32 = 0x1F03_1F00; // MIN/MAG/MIP × POINT/LINEAR/ANISOTROPIC
 // + PYRAMIDALQUAD / GAUSSIANQUAD variants
@@ -248,7 +250,10 @@ const ALL_STENCIL_CAPS: u32 = 0x0000_01FF; // KEEP | ZERO | REPLACE | INCRSAT
 
 #[cfg(test)]
 mod tests {
-    use mtld3d_types::{D3DCAPS9, D3DDEVCAPS_HWRASTERIZATION};
+    use mtld3d_types::{
+        D3DCAPS9, D3DDEVCAPS_HWRASTERIZATION, D3DPTEXTURECAPS_CUBEMAP,
+        D3DPTEXTURECAPS_CUBEMAP_POW2, D3DPTEXTURECAPS_MIPCUBEMAP,
+    };
 
     use super::{apply_advertise_all, fill_default};
 
@@ -355,15 +360,21 @@ mod tests {
         let expected = D3DPTEXTURECAPS_ALPHA
             | D3DPTEXTURECAPS_PERSPECTIVE
             | D3DPTEXTURECAPS_PROJECTED
-            | D3DPTEXTURECAPS_MIPMAP;
+            | D3DPTEXTURECAPS_MIPMAP
+            | D3DPTEXTURECAPS_CUBEMAP
+            | D3DPTEXTURECAPS_MIPCUBEMAP;
         assert_eq!(filled().texture_caps, expected);
         // POW2 ("textures must be pow2") and NONPOW2CONDITIONAL (valid only with
         // POW2) are both clear — we support non-pow2 unconditionally.
         assert_eq!(filled().texture_caps & D3DPTEXTURECAPS_POW2, 0);
+        assert_eq!(filled().texture_caps & D3DPTEXTURECAPS_CUBEMAP_POW2, 0);
         assert_eq!(
             filled().texture_caps & D3DPTEXTURECAPS_NONPOW2CONDITIONAL,
             0
         );
+        let mut all = filled();
+        apply_advertise_all(&mut all);
+        assert_eq!(all.texture_caps & D3DPTEXTURECAPS_CUBEMAP_POW2, 0);
     }
 
     #[test]

@@ -477,13 +477,45 @@ pub struct PassDescriptor {
     pub depth_clear_value: u32,                     // in: f32 bits (default 1.0)
     pub command_count: u32,                         // in
     pub leading_blits_count: u32,                   // in
-    /// 0 / non-zero: whether the leading-blit list contains any encoder-bound command.
+    /// Leading-blit and color-subresource flags.
     ///
-    /// Encoder-bound = the CopyBuffer/Texture variants. The unix
-    /// dispatcher uses this to skip `MTLBlitCommandEncoder` creation on
-    /// pure-`NotifyBufferDidModifyRange` lists; saves a per-pass scan of
-    /// the blit slice on the encoder thread.
-    pub leading_blits_need_encoder: u32, // in
+    /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..3
+    /// carry the color attachment slice, and bits 4..7 carry its mip level.
+    /// Ordinary 2D level-zero passes therefore retain their previous 0/1
+    /// value and the descriptor remains 88 bytes.
+    pub pass_flags: u32, // in
+}
+
+impl PassDescriptor {
+    const LEADING_BLITS_NEED_ENCODER: u32 = 1;
+    const COLOR_SLICE_SHIFT: u32 = 1;
+    const COLOR_LEVEL_SHIFT: u32 = 4;
+
+    /// Pack leading-blit and color-subresource state.
+    #[must_use]
+    pub const fn pack_flags(needs_encoder: bool, color_slice: u32, color_level: u32) -> u32 {
+        (if needs_encoder { 1 } else { 0 })
+            | ((color_slice & 0x7) << Self::COLOR_SLICE_SHIFT)
+            | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
+    }
+
+    /// Whether the leading-blit list contains an encoder-bound command.
+    #[must_use]
+    pub const fn leading_blits_need_encoder(&self) -> bool {
+        self.pass_flags & Self::LEADING_BLITS_NEED_ENCODER != 0
+    }
+
+    /// Color attachment array slice.
+    #[must_use]
+    pub const fn color_slice(&self) -> u32 {
+        (self.pass_flags >> Self::COLOR_SLICE_SHIFT) & 0x7
+    }
+
+    /// Color attachment mip level.
+    #[must_use]
+    pub const fn color_level(&self) -> u32 {
+        (self.pass_flags >> Self::COLOR_LEVEL_SHIFT) & 0xf
+    }
 }
 
 /// Self-contained frame submission.
@@ -617,7 +649,7 @@ pub struct TextureCreateDesc {
     pub levels: u32,               // in: mip level count
     pub pixel_format: PixelFormat, // in
     pub storage_mode: StorageMode, // in
-    pub has_swizzle: u32,          // in: non-zero = use swizzle fields
+    pub flags: crate::mtl::TextureCreateFlags, // in: swizzle and texture shape
     pub swizzle_r: Swizzle,        // in: R channel
     pub swizzle_g: Swizzle,        // in: G channel
     pub swizzle_b: Swizzle,        // in: B channel
@@ -887,9 +919,20 @@ mod tests {
         // TextureCreateDesc:
         //   8 tex_id
         //   + 4 width + 4 height + 4 depth + 4 levels (16)
-        //   + 4 pixel_format + 4 storage_mode + 4 has_swizzle + 4 swizzle_r (16)
+        //   + 4 pixel_format + 4 storage_mode + 4 flags + 4 swizzle_r (16)
         //   + 4 swizzle_g + 4 swizzle_b + 4 swizzle_a + 4 usage_flags (16)
         //   = 56
         assert_eq!(core::mem::size_of::<TextureCreateDesc>(), 56);
+    }
+
+    #[test]
+    fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
+        assert_eq!(PassDescriptor::pack_flags(false, 0, 0), 0);
+        assert_eq!(PassDescriptor::pack_flags(true, 0, 0), 1);
+        assert_eq!(
+            PassDescriptor::pack_flags(true, 5, 9),
+            1 | (5 << 1) | (9 << 4)
+        );
+        assert_eq!(core::mem::size_of::<PassDescriptor>(), 88);
     }
 }

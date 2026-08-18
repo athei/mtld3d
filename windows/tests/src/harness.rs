@@ -17,7 +17,7 @@ use crate::{
     check::expect_ok,
     ffi::Direct3DCreate9,
     resource::{
-        IndexBuffer, PixelShader, Query, StateBlock, Surface, Texture, VertexBuffer,
+        CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, Texture, VertexBuffer,
         VertexDeclaration, VertexShader,
     },
     vtbl::deref_vtbl,
@@ -557,6 +557,13 @@ impl Harness {
         unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
     }
 
+    /// `SetTexture(stage, cube_texture)`.
+    pub fn set_cube_texture(&self, stage: u32, texture: &CubeTexture<'_>) -> i32 {
+        // SAFETY: cube textures implement `IDirect3DBaseTexture9` and remain
+        // live for the call.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
+    }
+
     /// `SetTexture(stage, null)` — unbind whatever is on `stage`.
     pub fn clear_texture(&self, stage: u32) -> i32 {
         // SAFETY: vtable thunk; null unbinds the stage.
@@ -571,6 +578,25 @@ impl Harness {
         let hr = unsafe { (self.dev_vtbl().get_texture)(self.device, stage, &raw mut out) };
         expect_ok(hr, "GetTexture");
         out
+    }
+
+    /// Compare a bound texture pointer and release the `GetTexture` reference.
+    #[must_use]
+    pub fn texture_matches_raw(&self, stage: u32, expected: *mut c_void) -> bool {
+        let out = self.texture_raw(stage);
+        let matches = out == expected;
+        if !out.is_null() {
+            type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+            // SAFETY: a live COM object's first field is its vtable pointer.
+            let vtbl = unsafe { *out.cast::<*const ReleaseFn>() };
+            // SAFETY: `IUnknown::Release` is slot 2 of every D3D9 vtable.
+            let slot = unsafe { vtbl.add(2) };
+            // SAFETY: `slot` points at the live `Release` function pointer.
+            let release = unsafe { *slot };
+            // SAFETY: balances the reference returned by `GetTexture`.
+            unsafe { release(out) };
+        }
+        matches
     }
 
     /// `SetTransform`.
@@ -914,6 +940,41 @@ impl Harness {
         format: u32,
         pool: u32,
     ) -> i32 {
+        let (hr, out) = self.try_create_cube_texture(edge, levels, usage, format, pool);
+        if hr == 0 && !out.is_null() {
+            drop(CubeTexture::from_raw(out));
+        }
+        hr
+    }
+
+    /// Create an owned cube texture, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails or returns a null pointer.
+    #[must_use]
+    pub fn create_cube_texture_owned(
+        &self,
+        edge: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> CubeTexture<'_> {
+        let (hr, out) = self.try_create_cube_texture(edge, levels, usage, format, pool);
+        assert_eq!(hr, 0, "CreateCubeTexture failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateCubeTexture returned null");
+        CubeTexture::from_raw(out)
+    }
+
+    #[must_use]
+    pub fn try_create_cube_texture(
+        &self,
+        edge: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
         let hr = unsafe {
@@ -928,18 +989,7 @@ impl Harness {
                 core::ptr::null_mut(),
             )
         };
-        if hr == 0 && !out.is_null() {
-            type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
-            // SAFETY: a live COM object's first field is its vtable pointer.
-            let vtbl = unsafe { *out.cast::<*const ReleaseFn>() };
-            // SAFETY: `IUnknown::Release` is slot 2 of every D3D9 vtable.
-            let slot = unsafe { vtbl.add(2) };
-            // SAFETY: `slot` points at the live `Release` fn pointer.
-            let release = unsafe { *slot };
-            // SAFETY: releasing the cube texture created just above at refcount 1.
-            unsafe { release(out) };
-        }
-        hr
+        (hr, out)
     }
 
     /// `CreateVolumeTexture`, returning the raw hr.
@@ -1584,6 +1634,27 @@ impl Harness {
     pub fn get_render_target_data_hr(&self, rt: &Surface<'_>, dst: &Surface<'_>) -> i32 {
         // SAFETY: vtable thunk; both surfaces are live.
         unsafe { (self.dev_vtbl().get_render_target_data)(self.device, rt.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateSurface` for the complete source and destination surfaces.
+    pub fn update_surface_hr(&self, src: &Surface<'_>, dst: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live and null selects the
+        // complete source rectangle and destination origin.
+        unsafe {
+            (self.dev_vtbl().update_surface)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::null(),
+                dst.as_ptr(),
+                core::ptr::null(),
+            )
+        }
+    }
+
+    /// `UpdateTexture` between two cube textures.
+    pub fn update_cube_texture_hr(&self, src: &CubeTexture<'_>, dst: &CubeTexture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both cube textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
     }
 
     /// `GetFrontBufferData` (a documented stub today). Returns the hr.

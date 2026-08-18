@@ -6,9 +6,10 @@
 use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
 use mtld3d_types::{
     D3D_OK, D3DDEVCAPS_HWRASTERIZATION, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
-    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_X8R8G8B8,
-    D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING,
-    D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DVIEWPORT9,
+    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
+    D3DFMT_X8R8G8B8, D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE,
+    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 #[test]
@@ -128,6 +129,36 @@ fn check_device_format_accept_and_reject() {
         D3DOK_NOAUTOGEN,
         "AUTOGENMIPMAP on a non-renderable format is D3DOK_NOAUTOGEN",
     );
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, D3DFMT_DXT1),
+        D3D_OK,
+        "DXT1 cube sampling must agree with CreateCubeTexture",
+    );
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, D3DFMT_ATI1),
+        D3DERR_NOTAVAILABLE,
+        "ATI1 cube sampling remains unavailable",
+    );
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DRTYPE_CUBETEXTURE,
+            D3DFMT_A8R8G8B8,
+        ),
+        D3D_OK,
+        "cube autogen is advertised for renderable color formats",
+    );
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+            D3DRTYPE_CUBETEXTURE,
+            D3DFMT_A8R8G8B8,
+        ),
+        D3D_OK,
+        "cube render-target autogen query agrees with creation",
+    );
 }
 
 #[test]
@@ -179,6 +210,21 @@ fn device_caps_are_sane() {
         caps.dev_caps & D3DDEVCAPS_HWRASTERIZATION,
         0,
         "hardware rasterization not advertised"
+    );
+    assert_ne!(
+        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_CUBEMAP,
+        0,
+        "cube maps not advertised"
+    );
+    assert_ne!(
+        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_MIPCUBEMAP,
+        0,
+        "mipmapped cube maps not advertised"
+    );
+    assert_eq!(
+        caps.texture_caps & mtld3d_types::D3DPTEXTURECAPS_CUBEMAP_POW2,
+        0,
+        "non-power-of-two cube maps are supported"
     );
     assert!(caps.max_streams >= 1, "no vertex streams");
 }

@@ -9,8 +9,8 @@ use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
     D3DINDEXBUFFER_DESC, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
-    IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
-    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl,
+    IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
     IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
 };
 
@@ -204,6 +204,96 @@ impl<'h> Texture<'h> {
 impl Drop for Texture<'_> {
     fn drop(&mut self) {
         // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Cube texture ──
+
+/// An `IDirect3DCubeTexture9`.
+pub struct CubeTexture<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl CubeTexture<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The raw COM pointer used for base-texture binding.
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DCubeTexture9Vtbl {
+        // SAFETY: `self.ptr` is a live cube texture for the wrapper lifetime.
+        unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(self.ptr) }
+    }
+
+    /// Lock one cube face and mip level.
+    ///
+    /// # Panics
+    /// Panics if `LockRect` fails.
+    #[must_use]
+    pub fn lock_rect(&self, face: u32, level: u32, flags: u32) -> LockedRect<'_> {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: live cube texture and writable lock out-param.
+        let hr = unsafe {
+            (self.vtbl().lock_rect)(
+                self.ptr,
+                face,
+                level,
+                &raw mut locked,
+                core::ptr::null(),
+                flags,
+            )
+        };
+        expect_ok(hr, "CubeTexture LockRect");
+        LockedRect {
+            owner: LockOwner::Cube {
+                this: self.ptr,
+                face,
+                level,
+            },
+            pitch: locked.pitch,
+            bits: locked.bits,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Get a parent-backed face surface.
+    ///
+    /// # Panics
+    /// Panics if `GetCubeMapSurface` fails.
+    #[must_use]
+    pub fn surface(&self, face: u32, level: u32) -> Surface<'_> {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live cube texture and writable surface out-param.
+        let hr =
+            unsafe { (self.vtbl().get_cube_map_surface)(self.ptr, face, level, &raw mut surface) };
+        expect_created(hr, surface, "GetCubeMapSurface");
+        Surface::from_raw(surface)
+    }
+
+    /// Mip-chain length.
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        // SAFETY: live cube texture.
+        unsafe { (self.vtbl().get_level_count)(self.ptr) }
+    }
+}
+
+impl Drop for CubeTexture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: live cube texture and this wrapper owns one reference.
         unsafe { (self.vtbl().release)(self.ptr) };
     }
 }
@@ -635,8 +725,18 @@ impl Drop for VertexDeclaration<'_> {
 // ── Lock guards ──
 
 enum LockOwner {
-    Texture { this: *mut c_void, level: u32 },
-    Surface { this: *mut c_void },
+    Texture {
+        this: *mut c_void,
+        level: u32,
+    },
+    Cube {
+        this: *mut c_void,
+        face: u32,
+        level: u32,
+    },
+    Surface {
+        this: *mut c_void,
+    },
 }
 
 /// A held texture/surface lock. Exposes the mapped span and unlocks on drop.
@@ -706,6 +806,12 @@ impl Drop for LockedRect<'_> {
                 let vtbl = unsafe { deref_vtbl::<IDirect3DTexture9Vtbl>(this) };
                 // SAFETY: vtable thunk; `this` is the matching live texture.
                 unsafe { (vtbl.unlock_rect)(this, level) };
+            }
+            LockOwner::Cube { this, face, level } => {
+                // SAFETY: `this` is the live cube texture this guard locked.
+                let vtbl = unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(this) };
+                // SAFETY: vtable thunk; face and level match the lock.
+                unsafe { (vtbl.unlock_rect)(this, face, level) };
             }
             LockOwner::Surface { this } => {
                 // SAFETY: `this` is the live surface this guard locked.

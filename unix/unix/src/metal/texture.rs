@@ -2,7 +2,7 @@ use mtld3d_shared::{
     MetalHandle, TextureCreateDesc,
     mtl::{
         BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StorageMode, Swizzle,
-        TextureUsage,
+        TextureCreateFlags, TextureUsage,
     },
     mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
 };
@@ -307,11 +307,22 @@ pub fn create_texture(
     let mtl_format = mtl_pixel_format(desc.pixel_format);
     let is_depth = is_depth_pixel_format(desc.pixel_format);
 
-    // `depth > 1` is a volume (3D) texture (`D3DFMT_*` `CreateVolumeTexture`);
+    // Texture shape is carried explicitly. This keeps cube and single-slice
+    // volume descriptors distinct without changing the wire layout.
     // there is no `texture3DDescriptor…` convenience constructor, so build the
     // descriptor by hand. Everything else (usage, storage, swizzle, label) is
     // shared with the 2D path below.
-    let tex_desc = if desc.depth > 1 {
+    let tex_desc = if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+        let d = MTLTextureDescriptor::new();
+        d.setTextureType(objc2_metal::MTLTextureType::TypeCube);
+        d.setPixelFormat(mtl_format);
+        // SAFETY: objc2 typed property setters on a fresh descriptor.
+        unsafe { d.setWidth(desc.width as usize) };
+        // SAFETY: cube faces are square; height is still set for an explicit,
+        // self-contained descriptor.
+        unsafe { d.setHeight(desc.height as usize) };
+        d
+    } else if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
         let d = MTLTextureDescriptor::new();
         d.setTextureType(objc2_metal::MTLTextureType::Type3D);
         d.setPixelFormat(mtl_format);
@@ -389,7 +400,7 @@ pub fn create_texture(
     // base texture is bound directly; the sample-time alpha fixup is sacrificed
     // (X8 render targets sampling their own alpha is an undefined-value corner
     // of D3D9), which is the right trade against a hard validation/UB crash.
-    if !is_depth && !is_render_target && desc.has_swizzle != 0 {
+    if !is_depth && !is_render_target && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE) {
         let swizzle_channels = MTLTextureSwizzleChannels {
             red: mtl_texture_swizzle(desc.swizzle_r),
             green: mtl_texture_swizzle(desc.swizzle_g),
@@ -403,7 +414,14 @@ pub fn create_texture(
                 mtl_format,
                 texture.textureType(),
                 objc2_foundation::NSRange::new(0, desc.levels as usize),
-                objc2_foundation::NSRange::new(0, 1),
+                objc2_foundation::NSRange::new(
+                    0,
+                    if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+                        6
+                    } else {
+                        1
+                    },
+                ),
                 swizzle_channels,
             )
         };

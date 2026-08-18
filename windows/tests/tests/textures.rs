@@ -1,15 +1,16 @@
 //! Texture create → lock/write → bind → sample across formats and mip levels.
 //!
-//! Plus the cube/volume stub contracts.
+//! Plus cube and volume texture contracts.
 
-use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex};
+use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_L8,
-    D3DFMT_R5G6B5, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRTYPE_SURFACE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
+    D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -294,18 +295,10 @@ fn autogen_mipmap_texture_creates() {
 }
 
 #[test]
-fn cube_texture_cpu_pools_create_default_rejects() {
+fn cube_textures_create_in_all_pools() {
     let h = Harness::new();
-    // A sampleable (GPU) cube needs D3DPTEXTURECAPS_CUBEMAP, which is off, so a
-    // DEFAULT-pool cube — which would require an MTLTextureTypeCube — is rejected.
-    assert_eq!(
-        h.create_cube_texture(64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT),
-        D3DERR_INVALIDCALL,
-        "DEFAULT-pool cube texture is rejected without GPU cube-map support",
-    );
-    // The CPU pools get a creatable, lockable shell (six faces share one CPU
-    // store; never sampled). Each must succeed and release cleanly.
     for (pool, name) in [
+        (D3DPOOL_DEFAULT, "DEFAULT"),
         (D3DPOOL_SCRATCH, "SCRATCH"),
         (D3DPOOL_MANAGED, "MANAGED"),
         (D3DPOOL_SYSTEMMEM, "SYSTEMMEM"),
@@ -313,7 +306,7 @@ fn cube_texture_cpu_pools_create_default_rejects() {
         assert_eq!(
             h.create_cube_texture(64, 1, 0, D3DFMT_A8R8G8B8, pool),
             0,
-            "{name}-pool cube texture is a creatable CPU shell",
+            "{name}-pool cube texture creates",
         );
     }
     // Volume (3D) textures are created as `MTLTextureType3D`; the call
@@ -322,6 +315,219 @@ fn cube_texture_cpu_pools_create_default_rejects() {
         h.create_volume_texture([32, 32, 32], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT),
         0,
         "CreateVolumeTexture succeeds",
+    );
+}
+
+#[test]
+fn scratch_extension_cubes_are_cpu_only_resources() {
+    let h = Harness::new();
+    for format in [D3DFMT_ATI1, D3DFMT_YUY2, D3DFMT_UYVY] {
+        assert_eq!(
+            h.create_cube_texture(4, 1, 0, format, D3DPOOL_SCRATCH),
+            0,
+            "SCRATCH extension cube creates",
+        );
+        assert_eq!(
+            h.create_cube_texture(4, 1, 0, format, D3DPOOL_DEFAULT),
+            D3DERR_INVALIDCALL,
+            "GPU extension cube remains unsupported",
+        );
+    }
+}
+
+#[test]
+fn managed_cube_autogen_creates() {
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        64,
+        0,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(cube.level_count(), 1, "autogen exposes only level zero");
+}
+
+#[test]
+fn cube_render_target_faces_generate_mips_independently() {
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let cube = h.create_cube_texture_owned(
+        64,
+        0,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(cube.level_count(), 1, "autogen exposes only level zero");
+
+    let positive_x = cube.surface(0, 0);
+    assert_eq!(h.set_render_target(0, &positive_x), 0);
+    assert_eq!(h.clear_target(0xFFFF_0000), 0);
+
+    let negative_x = cube.surface(1, 0);
+    assert_eq!(h.set_render_target(0, &negative_x), 0);
+    assert_eq!(h.clear_target(0xFF00_FF00), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 2), 0);
+    assert_pixel_eq(
+        sample_cube_x(&h, &cube, 1.0),
+        0xFFFF_0000,
+        "generated positive-X mip",
+    );
+    assert_pixel_eq(
+        sample_cube_x(&h, &cube, -1.0),
+        0xFF00_FF00,
+        "generated negative-X mip",
+    );
+}
+
+#[test]
+fn managed_dxt_cube_keeps_faces_independent() {
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_DXT1, D3DPOOL_MANAGED);
+    assert_eq!(cube.level_count(), 1);
+
+    let face0 = [0x11u8; 8];
+    let face1 = [0x77u8; 8];
+    {
+        let mut lock = cube.lock_rect(0, 0, 0);
+        lock.write(&face0);
+    }
+    {
+        let mut lock = cube.lock_rect(1, 0, 0);
+        lock.write(&face1);
+    }
+    {
+        let lock = cube.lock_rect(0, 0, mtld3d_types::D3DLOCK_READONLY);
+        // SAFETY-free byte view through the existing typed lock helper.
+        assert_eq!(lock.as_u32(2), &[0x1111_1111; 2]);
+    }
+    {
+        let lock = cube.lock_rect(1, 0, mtld3d_types::D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(2), &[0x7777_7777; 2]);
+    }
+
+    let face2 = cube.surface(2, 0);
+    {
+        let mut lock = face2.lock_rect(0);
+        lock.write(&[0xA5u8; 8]);
+    }
+    {
+        let lock = cube.lock_rect(2, 0, mtld3d_types::D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(2), &[0xA5A5_A5A5; 2]);
+    }
+}
+
+#[test]
+fn state_block_restores_cube_binding() {
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(h.set_cube_texture(0, &cube), 0);
+    let block = h.create_state_block(mtld3d_types::D3DSBT_PIXELSTATE);
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(block.apply(), 0);
+    assert!(h.texture_matches_raw(0, cube.as_ptr()));
+    assert_eq!(h.clear_texture(0), 0);
+}
+
+#[repr(C)]
+struct CubeVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+    u: f32,
+    v: f32,
+    w: f32,
+}
+
+const fn cube_vertex(x: f32, y: f32, direction_x: f32) -> CubeVertex {
+    CubeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: direction_x,
+        v: 0.0,
+        w: 0.0,
+    }
+}
+
+fn sample_cube_x(h: &Harness, cube: &mtld3d_tests::CubeTexture<'_>, direction_x: f32) -> u32 {
+    assert_eq!(h.set_cube_texture(0, cube), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+        0
+    );
+    let quad = [
+        cube_vertex(-1.0, 1.0, direction_x),
+        cube_vertex(1.0, 1.0, direction_x),
+        cube_vertex(-1.0, -1.0, direction_x),
+        cube_vertex(1.0, 1.0, direction_x),
+        cube_vertex(1.0, -1.0, direction_x),
+        cube_vertex(-1.0, -1.0, direction_x),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let pixel = h.read_pixel(320, 240);
+    assert_eq!(h.clear_texture(0), 0);
+    pixel
+}
+
+#[test]
+fn fixed_function_cube_sampling_uses_direction_coordinates() {
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut face = cube.lock_rect(0, 0, 0);
+        face.write_u32(&[0xFFFF_0000; 16]);
+    }
+    assert_pixel_eq(
+        sample_cube_x(&h, &cube, 1.0),
+        0xFFFF_0000,
+        "fixed-function cube sample",
+    );
+}
+
+#[test]
+fn update_surface_uploads_the_selected_cube_face() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[0xFF00_FF00; 16]);
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let negative_x = cube.surface(1, 0);
+    assert_eq!(h.update_surface_hr(&src, &negative_x), 0);
+    assert_pixel_eq(
+        sample_cube_x(&h, &cube, -1.0),
+        0xFF00_FF00,
+        "UpdateSurface destination cube face",
+    );
+}
+
+#[test]
+fn update_texture_keeps_cube_faces_independent() {
+    let h = Harness::new();
+    let src = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0, 0).write_u32(&[0xFFFF_0000; 16]);
+    src.lock_rect(1, 0, 0).write_u32(&[0xFF00_FF00; 16]);
+    let dst = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_cube_texture_hr(&src, &dst), 0);
+    assert_pixel_eq(
+        sample_cube_x(&h, &dst, 1.0),
+        0xFFFF_0000,
+        "UpdateTexture positive-X face",
+    );
+    assert_pixel_eq(
+        sample_cube_x(&h, &dst, -1.0),
+        0xFF00_FF00,
+        "UpdateTexture negative-X face",
     );
 }
 

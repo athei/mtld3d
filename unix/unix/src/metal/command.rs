@@ -1085,7 +1085,7 @@ fn encode_leading_blits(
                             depth: cmd.depth as usize,
                         },
                         &texture,
-                        0,
+                        to_usize(cmd.dst_offset),
                         cmd.mip_level as usize,
                         MTLOrigin {
                             x: cmd.origin_x as usize,
@@ -1259,7 +1259,7 @@ fn encode_pass(
         if !encode_leading_blits(
             cmd_buf,
             blits,
-            pass.leading_blits_need_encoder != 0,
+            pass.leading_blits_need_encoder(),
             BlitSite::Pass(pass_idx),
         ) {
             return false;
@@ -1302,6 +1302,10 @@ fn encode_pass(
         // subscript 0 is always valid.
         let color0 = unsafe { rp_desc.colorAttachments().objectAtIndexedSubscript(0) };
         color0.setTexture(Some(&texture));
+        color0.setSlice(pass.color_slice() as usize);
+        color0.setLevel(pass.color_level() as usize);
+        rt_width = rt_width.min((texture.width() >> pass.color_level()).max(1));
+        rt_height = rt_height.min((texture.height() >> pass.color_level()).max(1));
         color0.setStoreAction(map_store_action(pass.color_store_action));
         match pass.color_load_action {
             LoadAction::Clear => {

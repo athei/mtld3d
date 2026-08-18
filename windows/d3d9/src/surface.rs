@@ -148,6 +148,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
+            cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
             standalone_format: format,
@@ -190,6 +191,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
+            cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
             standalone_format: format,
@@ -229,6 +231,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
+            cube_face: u32::MAX,
             // Extent + Metal handle resolve live; only the pinned D3D format is a
             // snapshot (`live_format` returns it for a `Backbuffer` surface).
             standalone_width: 0,
@@ -267,6 +270,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
+            cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
             standalone_format: 0,
@@ -302,6 +306,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture,
             mip_level,
+            cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
             standalone_format: 0,
@@ -316,6 +321,43 @@ impl Direct3DSurface9 {
             dc_lock: DcLockState::default(),
             lock_flags: 0,
             state_owner_texture: core::ptr::null_mut(),
+            implicit_kind: ImplicitKind::None,
+            container: 0,
+        }));
+        Self {
+            vtbl: &raw const DIRECT3D_SURFACE9_VTBL,
+            refcount: 1,
+            private_refcount: 0,
+            inner,
+        }
+    }
+
+    /// Cube face surface backed by its parent cube subresource.
+    pub fn new_cube_texture_backed(
+        device_inner: *mut DeviceInner,
+        parent_texture: *mut Direct3DTexture9,
+        face: u32,
+        mip_level: u32,
+    ) -> Self {
+        let inner = Box::into_raw(Box::new(SurfaceInner {
+            device_inner,
+            parent_texture,
+            mip_level,
+            cube_face: face,
+            standalone_width: 0,
+            standalone_height: 0,
+            standalone_format: 0,
+            standalone_usage: 0,
+            standalone_pool: D3DPOOL_DEFAULT,
+            metal_depth_handle: MetalHandle::NULL,
+            metal_color_handle: MetalHandle::NULL,
+            readback: None,
+            system_memory: None,
+            flags: SurfaceFlags::empty(),
+            private_data: PrivateDataStore::default(),
+            dc_lock: DcLockState::default(),
+            lock_flags: 0,
+            state_owner_texture: parent_texture,
             implicit_kind: ImplicitKind::None,
             container: 0,
         }));
@@ -343,6 +385,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture,
             mip_level: 0,
+            cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
             standalone_format: 0,
@@ -386,6 +429,7 @@ impl Direct3DSurface9 {
             device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
+            cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
             standalone_format: format,
@@ -426,18 +470,6 @@ impl Direct3DSurface9 {
         unsafe { &mut *self.inner }.system_memory = Some(backing);
     }
 
-    /// Point this surface's `LockRect`/`GetDC` mutual-exclusion state at the owning cube.
-    ///
-    /// The cube is a `Direct3DTexture9`, and all six of its faces share one
-    /// per-resource state. The caller (`GetCubeMapSurface`) must have taken a
-    /// reference on `cube` so it outlives the face; the face's finalize
-    /// releases that reference. Only valid on a freshly created face surface
-    /// (refcount 1).
-    pub fn set_cube_state_owner(&mut self, cube: *mut Direct3DTexture9) {
-        // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper.
-        unsafe { &mut *self.inner }.state_owner_texture = cube;
-    }
-
     fn inner(&self) -> &SurfaceInner {
         // SAFETY: `self.inner` was installed by `Self::new` as a
         // `Box::into_raw` and is dropped only in `surface_release` at
@@ -475,7 +507,14 @@ impl Direct3DSurface9 {
         } else {
             // SAFETY: `parent` is non-null (checked) and a live `Direct3DTexture9`
             // whose refcount keeps it alive while this surface is alive.
-            unsafe { (*parent).inner() }.is_level_locked(self.mip_level() as usize)
+            if self.inner().cube_face == u32::MAX {
+                // SAFETY: `parent` is the live parent texture held by this surface.
+                unsafe { (*parent).inner() }.is_level_locked(self.mip_level() as usize)
+            } else {
+                // SAFETY: same live-parent invariant as the 2D branch.
+                unsafe { (*parent).inner() }
+                    .cube_is_locked(self.inner().cube_face, self.mip_level() as usize)
+            }
         }
     }
 
@@ -556,6 +595,11 @@ impl Direct3DSurface9 {
     /// Only meaningful when `parent_texture()` is non-null.
     pub fn mip_level(&self) -> u32 {
         self.inner().mip_level
+    }
+
+    /// Cube face index for a cube-backed surface, or `None` for other surfaces.
+    pub fn cube_face(&self) -> Option<u32> {
+        (self.inner().cube_face != u32::MAX).then_some(self.inner().cube_face)
     }
 
     /// Persistent `MTLTexture*` for standalone color surfaces.
@@ -652,6 +696,8 @@ struct SurfaceInner {
     /// See [`SurfaceFlags`].
     flags: SurfaceFlags,
     mip_level: u32,
+    /// Cube face index for a parent-backed cube surface, or `u32::MAX`.
+    cube_face: u32,
     /// Standalone-surface description; only used when `parent_texture` is null.
     standalone_width: u32,
     standalone_height: u32,
@@ -785,7 +831,10 @@ impl SurfaceInner {
             // SAFETY: `state_owner_texture` is the live owning cube texture set
             // by `set_cube_state_owner`; single-threaded access is sound.
             let cube = unsafe { &*self.state_owner_texture };
-            if cube.inner().is_level_locked(self.mip_level as usize) {
+            if cube
+                .inner()
+                .cube_is_locked(self.cube_face, self.mip_level as usize)
+            {
                 return Err(D3DERR_INVALIDCALL);
             }
         }
@@ -1038,7 +1087,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         // down when the cube texture itself finalizes — the cube outlives every
         // face that references it, so no face frees the shared DC here.)
         teardown_gdi_dc(inner.dc_lock.held_dc);
-    } else {
+    } else if inner.parent_texture.is_null() {
         // SAFETY: `owner_tex` is the cube `Direct3DTexture9` whose reference
         // this face took at `GetCubeMapSurface`; drop it to balance that AddRef.
         let release = unsafe { (*owner_tex).vtbl().release };
@@ -1340,7 +1389,11 @@ extern "system" fn surface_get_container(
             g == IID_IUNKNOWN
                 || g == IID_IDIRECT3DRESOURCE9
                 || g == IID_IDIRECT3DBASETEXTURE9
-                || g == IID_IDIRECT3DTEXTURE9
+                || if inner.cube_face == u32::MAX {
+                    g == IID_IDIRECT3DTEXTURE9
+                } else {
+                    g == mtld3d_types::IID_IDIRECT3DCUBETEXTURE9
+                }
         });
         if !matches_texture {
             null_out(container);
@@ -1486,6 +1539,26 @@ extern "system" fn surface_lock_rect(
         // SAFETY: `parent_tex` is non-null (checked above) and points to
         // a live `Direct3DTexture9` whose refcount keeps it alive while
         // this surface is live.
+        if obj.inner().cube_face != u32::MAX {
+            // SAFETY: `obj.inner` is this live face surface's inner allocation.
+            let inner = unsafe { &mut *obj.inner };
+            if let Err(hr) = inner.try_begin_lock() {
+                return hr;
+            }
+            let hr = crate::texture::cube_lock_rect(
+                parent_tex.cast::<c_void>(),
+                inner.cube_face,
+                inner.mip_level,
+                locked_rect,
+                rect,
+                flags,
+            );
+            if hr != D3D_OK {
+                let _ = inner.try_end_lock();
+            }
+            return hr;
+        }
+        // SAFETY: `parent_tex` is non-null and held live by the surface.
         let tex_vtbl = unsafe { (*parent_tex).vtbl() };
         // SAFETY: calling the just-loaded `lock_rect` thunk through
         // `tex_vtbl` with the parent texture as `this`; `locked_rect`,
@@ -1529,6 +1602,19 @@ extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
     };
     let parent_tex = obj.inner().parent_texture;
     if !parent_tex.is_null() {
+        if obj.inner().cube_face != u32::MAX {
+            // SAFETY: `obj.inner` is this live face surface's inner allocation.
+            let inner = unsafe { &mut *obj.inner };
+            let surface_hr = inner.try_end_lock();
+            if surface_hr != D3D_OK {
+                return surface_hr;
+            }
+            return crate::texture::cube_unlock_rect(
+                parent_tex.cast::<c_void>(),
+                inner.cube_face,
+                inner.mip_level,
+            );
+        }
         // An offscreen-plain D3DPOOL_DEFAULT surface (it owns its backing texture)
         // rejects an unlock-without-lock / double-unlock with INVALIDCALL, unlike
         // a regular GetSurfaceLevel texture surface which returns S_OK. Check
@@ -2204,7 +2290,11 @@ impl SurfaceInner {
         let tex = unsafe { &*self.parent_texture };
         let level = self.mip_level as usize;
         let ti = tex.inner();
-        let (bits, row_pitch, _slice_pitch) = ti.lock_box(level)?;
+        let (bits, row_pitch, _slice_pitch) = if self.cube_face == u32::MAX {
+            ti.lock_box(level)?
+        } else {
+            ti.cube_lock_box(self.cube_face, level)?
+        };
         Some(SurfacePixels {
             bits,
             width: ti.mip_width(level),
@@ -2234,6 +2324,13 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // `GetDC` is INVALIDCALL while any lock OR a DC is outstanding on the
     // resource (`map_count != 0`). For a cube-map face this is the shared cube
     // map count, so a lock on any sibling face blocks it too.
+    if !inner.state_owner_texture.is_null() {
+        // SAFETY: the face surface holds a reference on its live parent cube.
+        let cube = unsafe { &*inner.state_owner_texture };
+        if cube.inner().cube_any_locked() {
+            return D3DERR_INVALIDCALL;
+        }
+    }
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state; read-only here.
     if (unsafe { &*inner.dc_lock_ptr() }).map_count != 0 {
         return D3DERR_INVALIDCALL;
@@ -2351,7 +2448,12 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     if !parent_tex.is_null() {
         // SAFETY: `parent_tex` is a live `Direct3DTexture9` (its refcount keeps
         // it alive while this surface is live); distinct from the surface inner.
-        unsafe { (*parent_tex).inner_mut() }.mark_update_dirty(level, None);
+        let texture = unsafe { (*parent_tex).inner_mut() };
+        if inner.cube_face == u32::MAX {
+            texture.mark_update_dirty(level, None);
+        } else {
+            texture.mark_cube_surface_dirty(inner.cube_face, level);
+        }
     }
     teardown_gdi_dc(held);
     // A backbuffer GetDC stashed a full read-back snapshot in `readback`; drop it
