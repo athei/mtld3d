@@ -29,9 +29,9 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS,
-    D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_YUY2,
+    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
     D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
     D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
     D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC,
@@ -1835,11 +1835,11 @@ impl DeviceInner {
             .map(crate::fullscreen::SavedWindow::window)
     }
 
-    /// Take `hwnd` fullscreen: borderless, topmost, covering the monitor.
+    /// Take `hwnd` fullscreen: borderless, covering the monitor.
     ///
-    /// No display mode is set. The window covering the monitor is what makes
-    /// the image fill the screen, and the back buffer follows the resulting
-    /// client rect rather than the resolution the game asked for.
+    /// No display mode is set and the z-order is left alone. The window
+    /// covering the monitor is what makes the image fill the screen; the back
+    /// buffer keeps the resolution the game asked for and present scales it.
     pub fn enter_fullscreen(&mut self, hwnd: *mut c_void) {
         self.fullscreen = Some(crate::fullscreen::enter(hwnd));
     }
@@ -1868,12 +1868,23 @@ impl DeviceInner {
     /// textures → reseed `current_frame` → re-push default viewport) but
     /// **skips** `reset_to_defaults` — the game didn't request a Reset,
     /// so its render states / textures / vertex bindings must survive.
-    /// No-op when dims already match. Caller drives this from the
-    /// cursor subclass wndproc on the API thread; encoder is paused
+    /// No-op when dims already match, and for a fullscreen device: its
+    /// logical size is the mode the game requested, decoupled from the
+    /// window, and only a `Reset` may change it. Caller drives this from
+    /// the cursor subclass wndproc on the API thread; encoder is paused
     /// inside `flush_current_frame_blocking` for the destroy/create
     /// span so no in-flight cmdbuf references the freed handles.
     pub fn apply_auto_resize(&mut self, new_width: u32, new_height: u32) {
         if new_width == 0 || new_height == 0 {
+            return;
+        }
+        if self.fullscreen.is_some() {
+            debug!(
+                target: LOG_TARGET,
+                "WM_SIZE ({new_width}x{new_height}) on a fullscreen device ignored; the back \
+                 buffer keeps the requested {}x{}",
+                self.backbuffer_width, self.backbuffer_height,
+            );
             return;
         }
         if new_width == self.backbuffer_width && new_height == self.backbuffer_height {
@@ -2831,12 +2842,8 @@ extern "system" fn device_get_display_mode(
     // SAFETY: `mode` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `D3DDISPLAYMODE` slot owned by the caller.
     unsafe {
-        *mode.cast::<D3DDISPLAYMODE>() = D3DDISPLAYMODE {
-            width: obj.inner().backbuffer_width,
-            height: obj.inner().backbuffer_height,
-            refresh_rate: 60,
-            format: D3DFMT_X8R8G8B8,
-        };
+        *mode.cast::<D3DDISPLAYMODE>() =
+            crate::direct3d9::reported_display_mode(obj.inner().present_params());
     }
     D3D_OK
 }

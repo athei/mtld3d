@@ -105,6 +105,30 @@ pub fn adapter_display_format() -> u32 {
     ADAPTER_MODES[0].format
 }
 
+/// The display mode a device or its implicit swap chain reports.
+///
+/// A fullscreen device owns the (emulated) mode, so the honored back-buffer
+/// size is the current mode; the refresh rate is the requested one, or the
+/// host's when the request left it zero. A windowed device never owns the
+/// mode and reports the desktop's, exactly like native D3D9.
+pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
+    if pp.windowed == 0 {
+        let refresh_rate = if pp.full_screen_refresh_rate_in_hz != 0 {
+            pp.full_screen_refresh_rate_in_hz
+        } else {
+            ADAPTER_MODES[0].refresh_rate
+        };
+        D3DDISPLAYMODE {
+            width: pp.back_buffer_width,
+            height: pp.back_buffer_height,
+            refresh_rate,
+            format: D3DFMT_X8R8G8B8,
+        }
+    } else {
+        ADAPTER_MODES[0]
+    }
+}
+
 fn build_adapter_modes() -> Vec<D3DDISPLAYMODE> {
     let mut p = GetPrimaryDisplayModeParams {
         width: 0,
@@ -772,15 +796,16 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
 /// Resolve the back buffer's *logical* size.
 ///
 /// Logical size is what D3D9 reports and the space every game-supplied
-/// coordinate lives in. Two rules, keyed on who decides the window's geometry:
+/// coordinate lives in. Three rules, keyed on who decides the resolution:
 ///
-/// - **Fullscreen or maximized**: the window covers the monitor and the game
-///   does not size it, so the client area wins and the requested resolution is
-///   ignored. Honouring it would mean rendering at one size, letting the
-///   compositor stretch to another, and resampling twice for nothing;
-///   `render.scale` is the resolution control in that mode. This is also what
-///   keeps `GetClientRect`, mouse input and our geometry in agreement without
-///   changing the display mode.
+/// - **Fullscreen**: the game's requested mode stands, exactly as it would
+///   under a native mode-set, so viewports and scissors the game sizes from
+///   its own request cover the frame. The window still covers the monitor and
+///   present resolves the size difference at the drawable (`MetalFX` when
+///   enlarging), the same resample `render.scale` rides.
+/// - **Maximized window**: the window manager sizes the window, not the game,
+///   so the client area wins and the requested resolution is ignored;
+///   `render.scale` is the resolution control in that mode.
 /// - **Ordinary window**: the game's explicit request stands. Only the D3D9
 ///   "a zero dimension means the client area" rule is applied, so a zeroed
 ///   present-params struct (the conformance `stateblock` device, additional
@@ -789,16 +814,32 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
 /// A window whose client rect cannot be read leaves the request untouched; a
 /// dimension still zero afterwards is rejected by the caller.
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
+    if pp.windowed == 0 {
+        // Callers reject a zero-dimension fullscreen request before the window
+        // moves, so the request is always concrete here. The log line is the
+        // breadcrumb tying an upscaled frame back to the size the game asked
+        // for; a client rect that cannot be read only costs that line.
+        if let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void)
+            && (pp.back_buffer_width != client_w || pp.back_buffer_height != client_h)
+        {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "fullscreen device: honoring the requested {}x{} back buffer; the window covers \
+                 the monitor ({}x{}) and present scales the frame",
+                pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
+            );
+        }
+        return;
+    }
     let Some((client_w, client_h)) = client_rect_dims(hwnd as *mut c_void) else {
         return;
     };
-    if pp.windowed == 0 || crate::fullscreen::is_maximized(hwnd as *mut c_void) {
+    if crate::fullscreen::is_maximized(hwnd as *mut c_void) {
         if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "{} device: back buffer follows the window ({}x{}), requested {}x{} ignored — \
-                 use render.scale to pick the render resolution",
-                if pp.windowed == 0 { "fullscreen" } else { "maximized" },
+                "maximized device: back buffer follows the window ({}x{}), requested {}x{} \
+                 ignored; use render.scale to pick the render resolution",
                 client_w, client_h, pp.back_buffer_width, pp.back_buffer_height,
             );
         }

@@ -661,16 +661,17 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // shrunk the visible rect after we attached the layer because
         // chrome / dock take some pixels). lParam's low / high words
         // are the new client width / height in pixels — trigger an
-        // auto-resize so game-side `GetClientRect` and our
-        // `GetDisplayMode` agree.
+        // auto-resize so a windowed back buffer keeps matching the
+        // client area the game sees.
         //
-        // Skipped only while mtld3d is the one moving a window: a
-        // fullscreen transition's own `SetWindowPos` bounces back here,
-        // and that path already sized the back buffer from the resulting
-        // client rect. The latch is process-global because the bounce is
-        // delivered to whichever device is subclassed on the window, which
-        // need not be the device doing the move. A fullscreen device's back
-        // buffer otherwise follows its window like any other's.
+        // Skipped while mtld3d is the one moving a window: a fullscreen
+        // transition's own `SetWindowPos` bounces back here, and that
+        // path already resolved the back-buffer size. The latch is
+        // process-global because the bounce is delivered to whichever
+        // device is subclassed on the window, which need not be the
+        // device doing the move. A fullscreen device also never follows:
+        // its logical size is the requested mode, and `apply_auto_resize`
+        // returns early for it.
         let lp_bits = lp.cast_unsigned();
         let new_width = u32::try_from(lp_bits & 0xFFFF).expect("16-bit value fits u32");
         let new_height = u32::try_from((lp_bits >> 16) & 0xFFFF).expect("16-bit value fits u32");

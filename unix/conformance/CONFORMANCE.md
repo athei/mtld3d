@@ -145,12 +145,12 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **45 `real` · 136 `expected` ·
+re-checked before retagging. Headline: **45 `real` · 124 `expected` ·
 6 `caps` · 2 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
 `crash=0`. Tags do not affect the gate (which rejects count/site/crash
 regressions), so tag corrections are documentation, not gate changes.
 
-#### Desktop mode switching, and why fullscreen ignores the requested size
+#### Desktop mode switching, and how fullscreen honors the requested size
 
 A fullscreen device takes a borderless window over the monitor and never
 changes the display mode. Wine's mac driver would hand a mode change to
@@ -160,19 +160,23 @@ registry setting the user has to know about. It also leaves the z-order alone:
 raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
-Without a mode change, `GetClientRect` necessarily reports the monitor. So the
-back buffer follows the client rect and the resolution the app requested is
-ignored — that is the only assignment under which D3D9's coordinate space,
-`GetClientRect` and mouse input agree. Reporting the request instead would
-reintroduce exactly the disagreement the mode-set existed to hide, and would
-render the game's UI at the requested size only to upscale it, which is worse
-output than rendering at the monitor's. `render.scale` is the resolution
-control that replaces the mode.
+The back buffer keeps the size the app requested, exactly as it would under a
+real mode-set, and present scales it to the drawable (MetalFX when enlarging,
+the same resample `render.scale` rides). That keeps the D3D9 half of the
+contract at the requested mode: the default viewport and scissor, the
+reported present parameters, and the device's and swap chain's
+`GetDisplayMode` all agree with the size the app rendered for. (Until
+2026-08 the back buffer instead followed the monitor-covering window; apps
+that sized their viewport from their own request rendered into a corner.)
 
-Every site asserting the old contract, including the desktop mode following a
-create, `GetSystemMetrics` reporting it, a non-enumerable mode being rejected,
-or the back buffer, viewport, `GetPresentParameters`, or `GetDisplayMode`
-reporting the request, is `expected` under this decision. The harness pins
+What the emulation cannot deliver is the Win32 half of a real mode-set:
+the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, and window rects
+derived from them keep the monitor's native resolution, and mouse input
+arrives in window coordinates rather than mode coordinates. Every site
+asserting that half — the desktop mode following a create, `GetSystemMetrics`
+reporting it, the device window adopting the mode's rect — is `expected`
+under this decision, as is rejecting a non-enumerable mode (we do not
+validate against a mode list because no mode is set). The harness pins
 emulated mode switching and Retina mode so window-management assertions use a
 stable physical-pixel coordinate space.
 
@@ -230,13 +234,14 @@ mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths.
 Sites: 2126=expected 2127=expected 2179=expected 2180=expected
 Sites: 2234=expected 2237=expected 2238=expected 2250=expected
 Sites: 2251=expected 2519=expected 2521=expected 2529=expected
-Sites: 2531=expected 2133=expected 2134=expected 2172=expected
-Sites: 2173=expected 2187=expected 2189=expected
+Sites: 2531=expected
 Sites: 2370=real 2372=real 2496=real 2498=real 2541=real
 
 Everything fullscreen in this cluster follows from one decision: we never
-change the desktop mode, and a fullscreen device's back buffer follows its
-monitor-covering window instead of the resolution it was asked for.
+change the desktop mode. The back buffer honors the resolution it was asked
+for, so the request-side assertions (the default viewport matching the
+request at 2133/2134 and 2172/2173, `GetPresentParameters` reporting it at
+2187/2189) pass; what remains `expected` is the Win32 half:
 
 - 2126/2127, 2179/2180, 2250/2251 read `GetSystemMetrics(SM_CXSCREEN)` and
   expect the requested mode. The desktop keeps its own resolution.
@@ -244,16 +249,11 @@ monitor-covering window instead of the resolution it was asked for.
   before any D3D9 object is involved. Not ours to implement.
 - 2519/2521, 2529/2531 expect a fullscreen Reset to a non-enumerable mode
   (32x32, 801x600) to return INVALIDCALL. We do not validate the requested
-  resolution because we do not use it: the only mode list worth validating
-  against is Wine's own, which is what the mode-set used to consult, and
+  resolution against a mode list: no mode is set, the only list worth
+  validating against is Wine's own (what the mode-set used to consult), and
   rejecting against our narrower synthetic `ADAPTER_MODES` table would fail
   resolutions Wine really does enumerate. Zero dimensions are still rejected,
   since the D3D9 "zero means the client area" rule is windowed-only.
-- 2133/2134, 2172/2173 want the default viewport to match the request;
-  2187/2189 want the swap chain's `GetPresentParameters` to report it.
-  Reporting the request while rendering at the window's size would put D3D9's
-  coordinate space out of step with `GetClientRect` and mouse input, which is
-  the disagreement the mode-set used to paper over.
 
 The rest is windowed API contract, not environment:
 Reset must return INVALIDCALL with an outstanding DEFAULT-pool surface
@@ -315,16 +315,15 @@ the z-order buys nothing. (5200, the window-rect adoption, now passes.)
 
 ### device.c/test_mode_change
 Sites: 5509=expected 5533=expected 5537=expected 5542=expected 5584=expected
-Sites: 5552=expected 5554=expected
 Sites: 5602=expected 5622=expected 5636=expected 5639=expected 5646=expected
 Sites: 5662=expected 5671=expected 5674=expected
 
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
-`EnumDisplaySettings` reflecting changes/restores, fullscreen window resize),
-plus 5552/5554: the back buffer must keep the size a fullscreen create asked
-for across an external mode change. All are `expected` under the same
-decision: physical mode switching is disabled and the back buffer follows the
-window.
+`EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
+All are `expected` under the same decision: physical mode switching is
+disabled. 5552/5554 (the back buffer must keep the size a fullscreen create
+asked for across an external mode change) pass now that the back buffer
+honors the request and never follows the window.
 
 ### device.c/test_device_window_reset
 Sites: 5968=expected
@@ -408,27 +407,24 @@ inconsistency between the capability report and the create path = defect
 rule).
 
 ### device.c/test_get_display_mode
-Sites: 14378=expected 14379=expected 14383=expected 14384=expected
-Sites: 14390=expected 14391=expected 14480=expected 14482=expected
+Sites: 14383=expected 14384=expected 14480=expected 14482=expected
 Sites: 14491=expected 14493=expected
 
-All one decision. After a fullscreen 640x480 create, `GetAdapterDisplayMode`
-must report the switched desktop mode (14383/14384) and the device's and swap
-chain's `GetDisplayMode` must report 640x480 (14378/14379, 14390/14391). We
-change no mode, and the back buffer follows the monitor-covering window, so
-every one of these reports the monitor's size instead.
+All one decision. A fullscreen device's and swap chain's `GetDisplayMode`
+report the honored mode (14378/14379, 14390/14391 pass) and a windowed
+device's reports the desktop mode, so the windowed halves of
+14480/14482 and 14491/14493 pass too. What remains: `GetAdapterDisplayMode`
+must report the *switched* desktop mode after a fullscreen create
+(14383/14384), and the fullscreen halves of 14480-14493 expect
+`GetDisplayMode` to equal the monitor rect because a real mode-set would
+have shrunk the monitor to the mode. We change no mode, so the monitor keeps
+its native size while the device reports the mode it honored.
 
-14378/14379 and 14390/14391 used to pass, when a fullscreen device still
-rendered at the size it was asked for. Giving that up is what buys the
-window-management sites in test_window_position, test_device_window_reset and
-test_window_style — a net gain, and the only self-consistent choice without a
-mode-set.
-
-14480/14482/14491/14493 are the separate GetAdapterMonitor/GetMonitorInfoW
-environment cascade. The call is display-config dependent and poisons the
-width/height comparisons downstream when it fails. GetAdapterMonitor itself is
-implemented as MonitorFromPoint on the primary monitor. Their sibling sites
-14451/14454 and 14472/14474 pass with the harness's pinned Retina mode.
+Raw output confirms the remaining halves: 14480-14493 fail only as
+"Adapter 0 test 1" (the CREATE_DEVICE_FULLSCREEN iteration), "Expect width
+3456, got 640" — deterministic, not the GetMonitorInfoW environment cascade
+an earlier audit blamed. Their sibling sites 14451/14454 and 14472/14474
+pass with the harness's pinned Retina mode.
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=expected

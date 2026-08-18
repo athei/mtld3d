@@ -33,6 +33,8 @@ pub struct HarnessConfig {
     pub depth_format: Option<u32>,
     /// `WS_VISIBLE`. Hidden (default) keeps parallel runs off-screen.
     pub visible: bool,
+    /// `D3DPRESENT_PARAMETERS.Windowed`, in its wire encoding (1 = windowed).
+    pub windowed: u32,
 }
 
 impl Default for HarnessConfig {
@@ -43,6 +45,7 @@ impl Default for HarnessConfig {
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
             visible: false,
+            windowed: 1,
         }
     }
 }
@@ -85,6 +88,20 @@ impl Harness {
     pub fn with_depth() -> Self {
         Self::create(&HarnessConfig {
             depth_format: Some(mtld3d_types::D3DFMT_D24S8),
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// A fullscreen `width`×`height` X8R8G8B8 device with no depth buffer.
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn fullscreen(width: u32, height: u32) -> Self {
+        Self::create(&HarnessConfig {
+            width,
+            height,
+            windowed: 0,
             ..HarnessConfig::default()
         })
     }
@@ -1798,6 +1815,18 @@ impl Harness {
         win32::screen_size()
     }
 
+    /// `IDirect3DDevice9::GetDisplayMode(0)` into a `D3DDISPLAYMODE`. Returns the hr.
+    pub fn display_mode(&self, mode: &mut mtld3d_types::D3DDISPLAYMODE) -> i32 {
+        // SAFETY: vtable thunk; `mode` is writable for the call.
+        unsafe {
+            (self.dev_vtbl().get_display_mode)(
+                self.device,
+                0,
+                core::ptr::from_mut(mode).cast::<c_void>(),
+            )
+        }
+    }
+
     /// `GetBackBuffer(0, index, MONO)`, asserting success.
     ///
     /// # Panics
@@ -1823,6 +1852,7 @@ impl Harness {
             back_buffer_format: self.back_buffer_format,
             depth_format: self.depth_format,
             visible: false,
+            windowed: 1,
         };
         let mut pp = present_params(&cfg, self.hwnd);
         // SAFETY: vtable thunk; `&mut pp` is writable.
@@ -2001,7 +2031,7 @@ fn present_params(cfg: &HarnessConfig, hwnd: usize) -> D3DPRESENT_PARAMETERS {
         multi_sample_quality: 0,
         swap_effect: D3DSWAPEFFECT_DISCARD,
         device_window: hwnd,
-        windowed: 1,
+        windowed: cfg.windowed,
         enable_auto_depth_stencil: u32::from(cfg.depth_format.is_some()),
         auto_depth_stencil_format: cfg.depth_format.unwrap_or(0),
         flags: 0,

@@ -11,9 +11,7 @@
 use core::ffi::c_void;
 
 use mtld3d_shared::{InPtr, OutPtr};
-use mtld3d_types::{
-    D3DDISPLAYMODE, D3DFMT_X8R8G8B8, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl,
-};
+use mtld3d_types::{D3DDISPLAYMODE, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl};
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, device::DeviceInner};
 use crate::{device::Direct3DDevice9, null_out, surface::Direct3DSurface9};
@@ -320,20 +318,15 @@ extern "system" fn swapchain_get_display_mode(this: *mut c_void, mode: *mut c_vo
     let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // Mirror `device_get_display_mode`: report the (resolved) backbuffer extent
-    // as an X8R8G8B8 60 Hz display mode. `present_params` is normalised at
+    // Mirror `device_get_display_mode`: fullscreen reports the honored mode,
+    // windowed reports the desktop's. `present_params` is normalised at
     // creation and refreshed on Reset (`DeviceInner::set_present_params`), so the
     // implicit swapchain stays in sync with the device.
     let pp = obj.inner().present_params;
     // SAFETY: `mode` is non-null (checked) and per the D3D9 ABI points to a
     // writable `D3DDISPLAYMODE` slot owned by the caller.
     unsafe {
-        *mode.cast::<D3DDISPLAYMODE>() = D3DDISPLAYMODE {
-            width: pp.back_buffer_width,
-            height: pp.back_buffer_height,
-            refresh_rate: 60,
-            format: D3DFMT_X8R8G8B8,
-        };
+        *mode.cast::<D3DDISPLAYMODE>() = crate::direct3d9::reported_display_mode(&pp);
     }
     D3D_OK
 }

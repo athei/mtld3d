@@ -11,13 +11,14 @@
 //! costs a second mode change on the way out — and making the image correct
 //! would depend on a registry key the user has to know about.
 //!
-//! A monitor-covering borderless window buys the same property the mode-set
-//! was there for. The guest's coordinate space matches the window's client
-//! rect, so `GetClientRect`, mouse input and our back-buffer geometry stay in
-//! agreement, and the resolution the game asked for is simply ignored: the
-//! back buffer follows the client rect and `render.scale` decides how many
-//! pixels are actually rasterized. That makes fullscreen and a maximized
-//! window the same path.
+//! A monitor-covering borderless window buys the property the mode-set was
+//! there for: the game's frame fills the display. The back buffer keeps the
+//! resolution the game asked for, exactly as it would under a real mode-set,
+//! so game-sized viewports and scissors cover the frame, and present scales
+//! the back buffer to the drawable (`MetalFX` when enlarging). A maximized
+//! window is the one case that differs: the window manager sizes it, not the
+//! game, so there the back buffer follows the client rect and `render.scale`
+//! decides how many pixels are rasterized.
 //!
 //! The z-order is left to the window manager. Raising the window to the
 //! topmost level deadlocks Wine's mac driver: it re-derives the Cocoa window's
@@ -215,9 +216,9 @@ fn is_window(hwnd: *mut c_void) -> bool {
 
 /// `true` when `hwnd` is maximized (`WS_MAXIMIZE`).
 ///
-/// A maximized window is sized by the window manager, not the game, so it gets
-/// the same treatment as a fullscreen one: the back buffer follows the client
-/// rect and the requested resolution is ignored.
+/// A maximized window is sized by the window manager, not the game, so it is
+/// the one windowed case where the back buffer follows the client rect and
+/// the requested resolution is ignored.
 pub fn is_maximized(hwnd: *mut c_void) -> bool {
     // SAFETY: IsZoomed accepts any HWND and returns zero for one that is not
     // a window.

@@ -422,7 +422,9 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     let windowed_style = h.window_style();
 
     let (screen_w, screen_h) = Harness::screen_size();
-    let mut pp = fullscreen_params(hwnd, screen_w, screen_h);
+    // A non-monitor size keeps the backbuffer assertion below sharp: the
+    // window must adopt the monitor rect while the back buffer must not.
+    let mut pp = fullscreen_params(hwnd, 512, 384);
     assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
 
     let rect = h.window_rect();
@@ -454,8 +456,8 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
     assert_eq!(
         (bb.width, bb.height),
-        (screen_w, screen_h),
-        "backbuffer follows the monitor-covering window",
+        (512, 384),
+        "backbuffer keeps the requested size; the window covers the monitor",
     );
 
     // Back to windowed: the window we took over is handed back as it was.
@@ -473,14 +475,14 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
 }
 
 #[test]
-fn reset_fullscreen_ignores_the_requested_resolution() {
+fn reset_fullscreen_honors_the_requested_resolution() {
     let h = Harness::new();
     let (screen_w, screen_h) = Harness::screen_size();
     // 137x101 is in no display-mode list, and it does not matter: a fullscreen
-    // device takes a monitor-covering window instead of setting a mode, so the
-    // back buffer follows the window and the request is ignored rather than
-    // rejected. The resolved size is reported back through the present params,
-    // which is how a game that re-reads them learns its real resolution.
+    // device takes a monitor-covering window instead of setting a mode, and
+    // the back buffer keeps the requested size, so a game that sizes its
+    // viewport from its own request covers the frame. Present scales the back
+    // buffer to the drawable.
     let mut pp = fullscreen_params(h.hwnd(), 137, 101);
     assert_eq!(
         h.reset_params(&mut pp),
@@ -489,15 +491,81 @@ fn reset_fullscreen_ignores_the_requested_resolution() {
     );
     assert_eq!(
         (pp.back_buffer_width, pp.back_buffer_height),
-        (screen_w, screen_h),
-        "Reset must report the size it actually used",
+        (137, 101),
+        "Reset must report the requested size back unchanged",
     );
     let (bb_hr, bb) = h.back_buffer(0).desc();
     assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
     assert_eq!(
         (bb.width, bb.height),
+        (137, 101),
+        "back buffer keeps the requested size, not the window's",
+    );
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.width, vp.height),
+        (137, 101),
+        "default viewport covers the requested back buffer",
+    );
+    let rect = h.window_rect();
+    assert_eq!(
+        (
+            u32::try_from(rect.right - rect.left).expect("width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("height is positive")
+        ),
         (screen_w, screen_h),
-        "back buffer follows the monitor-covering window, not the request",
+        "the window still covers the monitor",
+    );
+
+    // A second fullscreen Reset at another size takes the recreate path: the
+    // resized gate compares against the honored (not window) size.
+    let mut pp = fullscreen_params(h.hwnd(), 320, 240);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset to a second size must succeed",
+    );
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc after the second fullscreen Reset");
+    assert_eq!(
+        (bb.width, bb.height),
+        (320, 240),
+        "an in-game mode change recreates the back buffer at the new request",
+    );
+}
+
+#[test]
+fn create_fullscreen_honors_the_requested_resolution() {
+    let (screen_w, screen_h) = Harness::screen_size();
+    let h = Harness::fullscreen(320, 240);
+
+    let rect = h.window_rect();
+    assert_eq!(
+        (
+            u32::try_from(rect.right - rect.left).expect("width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("height is positive")
+        ),
+        (screen_w, screen_h),
+        "a fullscreen create covers the monitor",
+    );
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
+    assert_eq!(
+        (bb.width, bb.height),
+        (320, 240),
+        "back buffer keeps the requested size",
+    );
+    let mut mode = D3DDISPLAYMODE {
+        width: 0,
+        height: 0,
+        refresh_rate: 0,
+        format: 0,
+    };
+    assert_eq!(h.display_mode(&mut mode), D3D_OK, "GetDisplayMode");
+    assert_eq!(
+        (mode.width, mode.height),
+        (320, 240),
+        "GetDisplayMode reports the requested mode",
     );
 }
 

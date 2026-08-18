@@ -75,8 +75,9 @@ instead of breaking.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
   enumeration, hardware color cursors. A fullscreen device takes its window
   borderless over the monitor without ever changing the display mode; the back
-  buffer follows the window, and `render.scale` decides how many pixels are
-  actually rendered before MetalFX upscales the result to the screen.
+  buffer keeps the resolution the game picked and MetalFX upscales it to the
+  screen, with `render.scale` as a further multiplier on the render
+  resolution.
 
 ### Not implemented yet
 
@@ -107,10 +108,10 @@ back:
   the desktop mode. Wine's mac driver would hand the request to
   `CGDisplaySetDisplayMode`, which reconfigures the user's screen and
   rearranges every other window, and avoiding that would depend on a Wine
-  registry setting. A monitor-covering borderless window keeps `GetClientRect`,
-  mouse input and the back buffer in agreement without any of it, so the
-  resolution a game picks in fullscreen is ignored and `render.scale` controls
-  the render resolution instead.
+  registry setting. Instead the window goes borderless over the monitor while
+  the back buffer keeps the resolution the game picked, exactly as it would
+  under a real mode-set, and present scales the frame to the display (MetalFX
+  when enlarging).
 - **The fullscreen focus lifecycle**: the focus dance around a fullscreen
   device is not emulated — no device loss on deactivation, no focus-window
   subclassing, no synthesized activation messages. Presentation is a composited
