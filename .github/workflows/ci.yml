@@ -1,0 +1,151 @@
+# Formatting on Linux, then `make check` and a build on macOS.
+#
+# `make test` needs cargo-nextest, a writable Wine tree to install into, and a
+# Metal device. Conformance additionally needs WINE_BUILD: a Wine build tree
+# with dlls/d3d9/tests compiled.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a gate does not redden with no change here. The SDK xwin splats
+  # still floats with Microsoft's manifest; only the tool is pinned.
+  WINE_TAG: cx-26.2.0-0
+  XWIN_VERSION: 0.10.0
+
+jobs:
+  # Restates the first two legs of `make check` so a formatting slip fails in
+  # seconds rather than after the macOS job restores two toolchains.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly rustfmt
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: |
+          cd windows && cargo +nightly fmt --check
+          cd ../unix && cargo +nightly fmt --check
+
+  check:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains and targets
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc \
+                            x86_64-apple-darwin aarch64-apple-darwin
+
+      # lld carries lld-link, the linker both PE targets name. The llvm keg is
+      # keg-only and stays off PATH: windows/.cargo/config.toml names llvm-lib
+      # absolutely and windows/shim/build.rs resolves llvm-ar through
+      # `brew --prefix`, so putting it first would only shadow the system clang.
+      - name: Install LLVM and lld
+        run: brew install llvm lld
+
+      - name: Verify the toolchain
+        run: |
+          fail=0
+          command -v lld-link >/dev/null && echo "  ok      lld-link" || { echo "  MISSING lld-link"; fail=1; }
+          for f in "$(brew --prefix llvm)/bin/llvm-lib" "$(brew --prefix llvm)/bin/llvm-ar"; do
+            [ -x "$f" ] && echo "  ok      $f" || { echo "  MISSING $f"; fail=1; }
+          done
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Cache Wine
+        id: cache-wine
+        uses: actions/cache@v4
+        with:
+          key: wine-${{ env.WINE_TAG }}-${{ runner.os }}
+          path: ~/wine-sdk
+
+      - name: Fetch Wine
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ~/wine-sdk
+          gh release download "$WINE_TAG" --repo athei/wine-build \
+            --pattern '*macos-x86_64.tar.xz' --output /tmp/wine.tar.xz
+          tar -xJf /tmp/wine.tar.xz -C ~/wine-sdk --strip-components=1
+          rm /tmp/wine.tar.xz
+
+      # windows/shim/build.rs reads libwinecrt0.a during clippy; the windows
+      # target runs winebuild.
+      - name: Verify the Wine tree
+        run: |
+          fail=0
+          for f in bin/winebuild \
+                   lib/wine/i386-windows/libwinecrt0.a \
+                   lib/wine/x86_64-windows/libwinecrt0.a; do
+            [ -f "$HOME/wine-sdk/$f" ] && echo "  ok      $f" || { echo "  MISSING $f"; fail=1; }
+          done
+          if [ "$fail" != 0 ]; then
+            echo "unexpected layout under ~/wine-sdk:"; ls "$HOME/wine-sdk"; exit 1
+          fi
+          echo "WINE_SDK=$HOME/wine-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/wine-sdk/bin" >> "$GITHUB_PATH"
+
+      # /opt is root-owned, so the cache restore below needs this to exist and
+      # be writable first.
+      - name: Create the SDK directory
+        run: |
+          sudo mkdir -p /opt/xwin
+          sudo chown "$USER" /opt/xwin
+
+      - name: Cache the Windows SDK
+        id: cache-xwin
+        uses: actions/cache@v4
+        with:
+          key: xwin-${{ env.XWIN_VERSION }}-${{ runner.os }}
+          path: /opt/xwin
+
+      - name: Splat the Windows SDK
+        if: steps.cache-xwin.outputs.cache-hit != 'true'
+        run: |
+          cargo install xwin --version "$XWIN_VERSION" --locked
+          xwin --accept-license --arch x86,x86_64 \
+            --cache-dir "$HOME/Library/Caches/xwin" splat --output /opt/xwin
+
+      # <atomic> probes the CRT tree because that is the C++ header snmalloc-sys
+      # needs from it; the C headers live under the SDK's ucrt. Both targets set
+      # -crt-static, so the CRT they link is msvcrt, not libcmt.
+      - name: Verify the Windows SDK
+        run: |
+          fail=0
+          for f in crt/include/atomic \
+                   sdk/include/ucrt/stdio.h \
+                   sdk/include/um/windows.h \
+                   sdk/include/shared/windef.h \
+                   crt/lib/x86/msvcrt.lib        crt/lib/x86_64/msvcrt.lib \
+                   sdk/lib/ucrt/x86/ucrt.lib     sdk/lib/ucrt/x86_64/ucrt.lib \
+                   sdk/lib/um/x86/kernel32.lib   sdk/lib/um/x86_64/kernel32.lib; do
+            [ -f "/opt/xwin/$f" ] && echo "  ok      $f" || { echo "  MISSING $f"; fail=1; }
+          done
+          [ "$fail" = 0 ] || { echo "the splatted SDK is incomplete"; exit 1; }
+
+      - name: make check
+        run: make check
+
+      # clippy and rustdoc never link.
+      - name: make
+        run: make
