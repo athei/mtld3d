@@ -34,7 +34,7 @@ env:
   # driver, has so far only produced a bare abort inside translated code with no
   # statement of what it objected to. Both are on by default for a developer.
   MTL_HUD_ENABLED: "0"
-  MTL_DEBUG_LAYER: "0"
+  MTL_DEBUG_LAYER: "1"
 
 jobs:
   # The linear part: one job downloads and builds the shared state (toolchains,
