@@ -37,11 +37,20 @@ runs:
       shell: bash
       run: echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
 
+    # The tools key is built from the pinned versions themselves rather than from
+    # a hash of the file that carries them: editing a comment in ci.yml must not
+    # throw away half a gigabyte of cache and recompile the tools from source.
+    - name: Compute the tools cache key
+      id: keys
+      shell: bash
+      run: |
+        pins=$(printf '%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" | shasum | cut -c1-16)
+        echo "tools=tools-${{ runner.os }}-${{ runner.arch }}-$pins" >> "$GITHUB_OUTPUT"
+
     # Two caches, because the two halves of a cargo home change for different
     # reasons and one of them must never be restored partially.
     #
-    # The toolchains and the three cargo-installed tools are keyed on ci.yml,
-    # which is where their versions are pinned, and take NO restore-keys. The
+    # The toolchains and the cargo-installed tools take NO restore-keys. The
     # ledger files (.crates.toml, .crates2.json) are cargo's record of which
     # crate owns which installed binary, so they have to arrive with `bin` or the
     # next `cargo install` refuses to touch what it sees as strays ("binary
@@ -57,7 +66,7 @@ runs:
           ~/.cargo/bin
           ~/.cargo/.crates.toml
           ~/.cargo/.crates2.json
-        key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
+        key: ${{ steps.keys.outputs.tools }}
 
     # The crate registry is keyed on the lockfiles and a prefix fallback is right
     # here: a partial registry costs a fetch of what is missing, nothing more.
@@ -147,7 +156,7 @@ runs:
           ~/.cargo/bin
           ~/.cargo/.crates.toml
           ~/.cargo/.crates2.json
-        key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
+        key: ${{ steps.keys.outputs.tools }}
 
     - name: Save the crate registry
       uses: actions/cache/save@v4
