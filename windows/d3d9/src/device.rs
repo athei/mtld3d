@@ -2247,6 +2247,23 @@ impl DeviceInner {
         !self.bound_rt.depth_stencil().is_null() || !self.depth_stencil_handle.is_null()
     }
 
+    /// Whether the bound depth-stencil surface carries a stencil plane.
+    ///
+    /// D3D9 silently ignores `D3DCLEAR_STENCIL` against a depth-only format
+    /// (D16 / D24X8 / D32) rather than failing the call, so `Clear` masks the
+    /// flag off instead of rejecting it.
+    pub fn depth_stencil_has_stencil(&self) -> bool {
+        if !self.depth_stencil_bound() {
+            return false;
+        }
+        let bound = self.bound_rt.depth_stencil();
+        if bound.is_null() {
+            return depth_format_has_stencil(self.depth_stencil_format);
+        }
+        // SAFETY: non-null check passed; the bound-RT refcount holds it live.
+        depth_format_has_stencil(unsafe { (*bound).standalone_format() })
+    }
+
     /// The device's default depth-stencil format (`D3DFMT_*`), or `0` when none.
     pub const fn depth_stencil_format(&self) -> u32 {
         self.depth_stencil_format
@@ -6619,7 +6636,7 @@ extern "system" fn device_clear(
     flags: u32,
     color: u32,
     z: f32,
-    _stencil: u32,
+    stencil: u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Frame);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -6707,8 +6724,12 @@ extern "system" fn device_clear(
         }));
     }
 
-    if flags & D3DCLEAR_STENCIL != 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Clear: D3DCLEAR_STENCIL flag set but stencil clear not implemented");
+    if flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil() {
+        // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
+        let value = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
+        dev.push_op(Box::new(move |enc| {
+            enc.clear_stencil(value);
+        }));
     }
 
     0 // S_OK

@@ -18,6 +18,16 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{dirty_range::DirtyRange, render_scale::RenderScale};
 
+/// What a clear-only pass carries, and the attachments it must land on.
+struct ClearMerge {
+    color: MetalHandle<MTLTextureKind>,
+    color_subresource: u32,
+    depth: MetalHandle<MTLTextureKind>,
+    needs_color: bool,
+    needs_depth: bool,
+    needs_stencil: bool,
+}
+
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
 /// Flip to `false` for a single-line hotfix if a temporal-blending game
@@ -172,6 +182,21 @@ pub enum DepthLoad {
     DontCare,
 }
 
+/// How the next render-pass should load its stencil attachment.
+///
+/// Separate from `DepthLoad` because the two planes of a combined
+/// `Depth32Float_Stencil8` attachment take independent load actions:
+/// `Clear(D3DCLEAR_STENCIL)` without `D3DCLEAR_ZBUFFER` resets stencil while
+/// carrying depth forward. A stencil clear value is also an integer rather
+/// than an f32 bit pattern, and there is no `DontCare`: unlike depth, games
+/// carry stencil across passes within a frame, so a first-use discard would
+/// drop live content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StencilLoad {
+    Load,
+    Clear { value: u32 },
+}
+
 /// How the render-pass should store its attachment at pass end.
 ///
 /// `Store` writes tile memory back to device memory; `DontCare`
@@ -214,6 +239,22 @@ pub enum DepthClearOutcome {
     },
 }
 
+/// What `clear_stencil` decided.
+///
+/// `Folded` means the clear became the next pass's `loadAction`; `EmitQuad`
+/// means the caller paints a scissored quad instead, because folding would
+/// clear the whole attachment and wipe tiles the frame already drew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StencilClearOutcome {
+    Folded,
+    EmitQuad {
+        value: u32,
+        viewport: (u32, u32, u32, u32),
+        has_color: bool,
+        color_format: PixelFormat,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorClearOutcome {
     Folded,
@@ -246,6 +287,7 @@ pub struct Pass {
     color_store: StoreAction,
     depth_texture: MetalHandle<MTLTextureKind>,
     depth_load: DepthLoad,
+    stencil_load: StencilLoad,
     /// Defaults to `Store`.
     ///
     /// Flipped to `DontCare` by `finalize_store_actions` on the *last*
@@ -353,6 +395,10 @@ impl Pass {
         self.depth_load
     }
 
+    #[must_use]
+    pub const fn stencil_load(&self) -> StencilLoad {
+        self.stencil_load
+    }
     #[must_use]
     pub const fn depth_store(&self) -> StoreAction {
         self.depth_store
@@ -509,6 +555,7 @@ pub struct PassState {
 
     pending_color_clear: Option<(u32, u32, u32, u32)>,
     pending_depth_clear: Option<u32>,
+    pending_stencil_clear: Option<u32>,
 
     /// Sticky across frames — games call `SetViewport` once and expect it to persist.
     ///
@@ -703,6 +750,7 @@ impl PassState {
             current_attachments: CurrentAttachmentFlags::COLOR_HAS_ALPHA,
             pending_color_clear: None,
             pending_depth_clear: None,
+            pending_stencil_clear: None,
             viewport_x: 0,
             viewport_y: 0,
             viewport_width: 0,
@@ -804,6 +852,7 @@ impl PassState {
         self.backbuffer_texture = backbuffer;
         self.pending_color_clear = None;
         self.pending_depth_clear = None;
+        self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
         self.seen_color_rts.clear();
         self.seen_depth_rts.clear();
@@ -1353,6 +1402,10 @@ impl PassState {
             }
             None => DepthLoad::Load,
         };
+        let stencil_load = self
+            .pending_stencil_clear
+            .take()
+            .map_or(StencilLoad::Load, |value| StencilLoad::Clear { value });
         if !self.current_color_texture.is_null() {
             self.seen_color_rts
                 .insert((self.current_color_texture, self.current_color_subresource));
@@ -1378,6 +1431,7 @@ impl PassState {
             color_store: StoreAction::Store,
             depth_texture: self.current_depth_texture,
             depth_load,
+            stencil_load,
             depth_store: StoreAction::Store,
             viewport: (vpx, vpy, vpw, vph),
             commands,
@@ -1485,7 +1539,10 @@ impl PassState {
     /// the original target must still be cleared. This is a no-op when there
     /// are no pending clears.
     pub fn flush_pending_clears(&mut self) {
-        if self.pending_color_clear.is_some() || self.pending_depth_clear.is_some() {
+        if self.pending_color_clear.is_some()
+            || self.pending_depth_clear.is_some()
+            || self.pending_stencil_clear.is_some()
+        {
             self.ensure_pass_open();
             self.end_current_pass("flush_pending_clears");
         }
@@ -1603,7 +1660,7 @@ impl PassState {
                 texture,
             );
         }
-        if self.pending_depth_clear.is_some() {
+        if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
             self.flush_pending_clears();
         }
         self.end_current_pass("set_depth_attach");
@@ -1829,6 +1886,116 @@ impl PassState {
             has_color: !self.current_color_texture.is_null(),
             color_format: self.current_color_format,
         })
+    }
+
+    /// Apply a stencil clear.
+    ///
+    /// Mirrors `clear_depth`: fold into the next pass's `loadAction` where
+    /// that is observationally identical, and paint a scissored quad where it
+    /// is not. Metal's `loadAction = Clear` covers the whole attachment
+    /// regardless of viewport, so a mid-frame re-clear of a plane the frame
+    /// already drew into has to be a quad or it wipes those tiles. Depth keeps
+    /// its own load action throughout, so a stencil-only clear never disturbs
+    /// the depth plane the two share.
+    pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
+        let depth_texture = self.current_depth_texture;
+        if self.current_pass_has_work()
+            && let Some(outcome) = self.clear_stencil_in_active_pass(value, depth_texture)
+        {
+            return outcome;
+        }
+        if let Some(outcome) = self.clear_stencil_cross_pass(value, depth_texture) {
+            return outcome;
+        }
+        if let Some(outcome) = self.clear_stencil_amend_open(value) {
+            return outcome;
+        }
+        self.clear_stencil_stash_pending(value)
+    }
+
+    /// Active-pass branch: paint into the live encoder.
+    ///
+    /// Returns `None` when a visibility-counting query is armed, since the
+    /// quad's own fragments would inflate the occlusion counter, or when the
+    /// viewport is degenerate; the caller falls through to the folding chain.
+    fn clear_stencil_in_active_pass(
+        &mut self,
+        value: u32,
+        depth_texture: MetalHandle<MTLTextureKind>,
+    ) -> Option<StencilClearOutcome> {
+        if depth_texture.is_null() {
+            return None;
+        }
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("clear_stencil_vis_fallback");
+            return None;
+        }
+        let vp = self.effective_viewport();
+        if vp.2 == 0 || vp.3 == 0 {
+            return None;
+        }
+        Some(StencilClearOutcome::EmitQuad {
+            value,
+            viewport: vp,
+            has_color: !self.current_color_texture.is_null(),
+            color_format: self.current_color_format,
+        })
+    }
+
+    /// Cross-pass branch: the plane already carries content from this frame.
+    ///
+    /// Open the pass with `Load` so the earlier tiles survive, and let the
+    /// caller paint only the cleared region.
+    fn clear_stencil_cross_pass(
+        &mut self,
+        value: u32,
+        depth_texture: MetalHandle<MTLTextureKind>,
+    ) -> Option<StencilClearOutcome> {
+        if depth_texture.is_null()
+            || !self.seen_depth_rts.contains(&depth_texture)
+            || self.viewport_width == 0
+            || self.viewport_height == 0
+        {
+            return None;
+        }
+        let vp = self.effective_viewport();
+        self.ensure_pass_open();
+        if let Some(pass) = self.passes.last_mut()
+            && matches!(pass.stencil_load, StencilLoad::Clear { .. })
+        {
+            pass.stencil_load = StencilLoad::Load;
+        }
+        Some(StencilClearOutcome::EmitQuad {
+            value,
+            viewport: vp,
+            has_color: !self.current_color_texture.is_null(),
+            color_format: self.current_color_format,
+        })
+    }
+
+    /// Amend branch: a pass is open with no draws, so its load action is free.
+    fn clear_stencil_amend_open(&mut self, value: u32) -> Option<StencilClearOutcome> {
+        if self.current_pass_closed {
+            return None;
+        }
+        let pass = self.passes.last_mut()?;
+        pass.stencil_load = StencilLoad::Clear { value };
+        self.pending_stencil_clear = None;
+        Some(StencilClearOutcome::Folded)
+    }
+
+    /// Stash branch: no pass to amend, so the next `ensure_pass_open` takes it.
+    const fn clear_stencil_stash_pending(&mut self, value: u32) -> StencilClearOutcome {
+        self.pending_stencil_clear = Some(value);
+        StencilClearOutcome::Folded
+    }
+
+    /// Fallback for when the clear-quad pipeline cannot be built.
+    ///
+    /// Ends the pass so the next one carries the clear in its load action.
+    pub fn clear_stencil_legacy_break(&mut self, value: u32) {
+        self.end_current_pass("clear_stencil_legacy_fallback");
+        self.pending_stencil_clear = Some(value);
     }
 
     /// Cross-pass branch.
@@ -2304,7 +2471,10 @@ impl PassState {
             });
             let needs_color = !has_draw && matches!(p.color_load, ColorLoad::Clear { .. });
             let needs_depth = !has_draw && matches!(p.depth_load, DepthLoad::Clear { .. });
-            if !needs_color && !needs_depth {
+            let needs_stencil = !has_draw
+                && !p.depth_texture.is_null()
+                && matches!(p.stencil_load, StencilLoad::Clear { .. });
+            if !needs_color && !needs_depth && !needs_stencil {
                 i += 1;
                 continue;
             }
@@ -2313,6 +2483,7 @@ impl PassState {
             let target_depth = p.depth_texture;
             let color_load = p.color_load;
             let depth_load = p.depth_load;
+            let stencil_load = p.stencil_load;
             // Pass has only Clear load actions; no real draws / state.
             // Look ahead for a merge target. Both attachments (if Clear)
             // must match the target pass's attachments AND that pass
@@ -2320,11 +2491,14 @@ impl PassState {
             // and lossless). Bail on any intervening read of either.
             let target_idx = self.find_clear_merge_target(
                 i,
-                target_color,
-                target_color_subresource,
-                target_depth,
-                needs_color,
-                needs_depth,
+                &ClearMerge {
+                    color: target_color,
+                    color_subresource: target_color_subresource,
+                    depth: target_depth,
+                    needs_color,
+                    needs_depth,
+                    needs_stencil,
+                },
             );
             if let Some(t) = target_idx {
                 if needs_color {
@@ -2332,6 +2506,9 @@ impl PassState {
                 }
                 if needs_depth {
                     self.passes[t].depth_load = depth_load;
+                }
+                if needs_stencil {
+                    self.passes[t].stencil_load = stencil_load;
                 }
                 if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                     trace!(
@@ -2354,22 +2531,22 @@ impl PassState {
     /// the target as a fragment sampler input, as a blit source, or
     /// attaches it with `Clear` itself (that pass already overwrites
     /// whatever we'd move).
-    fn find_clear_merge_target(
-        &self,
-        start: usize,
-        target_color: MetalHandle<MTLTextureKind>,
-        target_color_subresource: u32,
-        target_depth: MetalHandle<MTLTextureKind>,
-        needs_color: bool,
-        needs_depth: bool,
-    ) -> Option<usize> {
+    fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
+        let ClearMerge {
+            color: target_color,
+            color_subresource: target_color_subresource,
+            depth: target_depth,
+            needs_color,
+            needs_depth,
+            needs_stencil,
+        } = *want;
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
             if needs_color && pass_reads_texture(cand, target_color) {
                 return None;
             }
-            if needs_depth && pass_reads_texture(cand, target_depth) {
+            if (needs_depth || needs_stencil) && pass_reads_texture(cand, target_depth) {
                 return None;
             }
             // Intervening Clear on the same attachment supersedes ours.
@@ -2386,6 +2563,12 @@ impl PassState {
             {
                 return None;
             }
+            if needs_stencil
+                && cand.depth_texture == target_depth
+                && matches!(cand.stencil_load, StencilLoad::Clear { .. })
+            {
+                return None;
+            }
             // Match: same attachments, currently loading.
             let color_ok = !needs_color
                 || (cand.color_texture == target_color
@@ -2394,7 +2577,10 @@ impl PassState {
             let depth_ok = !needs_depth
                 || (cand.depth_texture == target_depth
                     && matches!(cand.depth_load, DepthLoad::Load));
-            if color_ok && depth_ok {
+            let stencil_ok = !needs_stencil
+                || (cand.depth_texture == target_depth
+                    && matches!(cand.stencil_load, StencilLoad::Load));
+            if color_ok && depth_ok && stencil_ok {
                 return Some(j);
             }
             // This pass consumes (Loads) one of the to-be-cleared attachments
@@ -2414,7 +2600,10 @@ impl PassState {
             let consumes_depth = needs_depth
                 && cand.depth_texture == target_depth
                 && matches!(cand.depth_load, DepthLoad::Load);
-            if consumes_color || consumes_depth {
+            let consumes_stencil = needs_stencil
+                && cand.depth_texture == target_depth
+                && matches!(cand.stencil_load, StencilLoad::Load);
+            if consumes_color || consumes_depth || consumes_stencil {
                 return None;
             }
         }
@@ -4708,6 +4897,70 @@ mod tests {
                 a: 7
             }
         ));
+    }
+
+    #[test]
+    fn a_stencil_clear_paints_once_the_plane_is_in_use() {
+        // Metal's loadAction covers the whole attachment. Once the frame has
+        // drawn into the depth-stencil texture, folding a later clear into a
+        // load action would wipe those tiles, so the decision has to be a
+        // scissored quad instead. This is the shadow-volume shape: clear,
+        // draw, then clear again under a narrowed viewport.
+        let ds = tex(0x3300);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+
+        // Nothing drawn yet: folding is observationally identical.
+        assert_eq!(s.clear_stencil(5), StencilClearOutcome::Folded);
+
+        s.ensure_pass_open();
+        s.emit_command(dummy_draw());
+
+        // The plane now carries this frame's content, so it must be painted.
+        assert!(
+            matches!(
+                s.clear_stencil(7),
+                StencilClearOutcome::EmitQuad { value: 7, .. }
+            ),
+            "a clear over an in-use plane must be a quad, not a load action"
+        );
+    }
+
+    #[test]
+    fn rule_e_carries_the_stencil_clear_into_the_merge_target() {
+        // Same shape as the colour case, but the clear-only pass carries a
+        // stencil clear. Folding only colour and depth would delete the pass
+        // and the stencil clear with it, leaving the plane holding the
+        // previous frame's values.
+        let other_rt = tex(0x3100);
+        let ds = tex(0x3200);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.clear_color(1, 2, 3, 4);
+        s.clear_stencil(0x2A);
+        s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.coalesce_clear_only_passes();
+
+        // Either outcome is correct as long as the clear is still there: the
+        // fold moves it into the target, and a refused fold leaves the
+        // clear-only pass standing.
+        let survivors = s.passes();
+        assert!(
+            survivors
+                .iter()
+                .any(|p| matches!(p.stencil_load(), StencilLoad::Clear { value: 0x2A })),
+            "the stencil clear must survive coalescing"
+        );
     }
 
     #[test]

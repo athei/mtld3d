@@ -99,6 +99,8 @@ windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs CurrentAttachmentFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/passes.rs DepthClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs DepthLoad Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/passes.rs StencilClearOutcome Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/passes.rs StencilLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs StoreAction Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/perf.rs ApiCategory Clone,Copy,Debug,strum::EnumCount
 windows/core/src/perf.rs BindSubCategory Clone,Copy,Debug,strum::EnumCount

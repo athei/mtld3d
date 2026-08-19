@@ -4,13 +4,13 @@
 
 use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8};
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCMP_EQUAL,
-    D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE,
-    D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP,
-    D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING,
-    D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC,
-    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DSTENCILOP_REPLACE,
-    render_state_defaults,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
+    D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE,
+    D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRECT,
+    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_STENCILENABLE,
+    D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DSTENCILOP_KEEP,
+    D3DSTENCILOP_REPLACE, render_state_defaults,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -40,6 +40,15 @@ fn fill_quad(color: u32) -> [PosColorVertex; 6] {
         v(1.0, -1.0),
         v(-1.0, -1.0),
     ]
+}
+
+/// A full clip-space quad at a chosen depth.
+fn quad_at_depth(color: u32, z: f32) -> [PosColorVertex; 6] {
+    let mut q = fill_quad(color);
+    for v in &mut q {
+        v.z = z;
+    }
+    q
 }
 
 const fn centered_triangle(color: u32) -> [PosColorVertex; 3] {
@@ -314,6 +323,106 @@ fn wireframe_fill_mode_is_a_noop() {
 }
 
 #[test]
+fn stencil_test_gates_rendering() {
+    // Stamp the reference under a centred triangle, then draw a fullscreen quad
+    // that only passes where the stamp landed. The quad covers the corner too,
+    // so a corner still holding the clear colour is the proof that the stencil
+    // test rejected those fragments rather than the quad missing them.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_STENCIL, 0, 1.0, 0), 0, "stencil clear");
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle(BLUE)),
+            0,
+            "stamp draw"
+        );
+
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0,
+            "gated draw"
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "inside the stamp");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
+}
+
+#[test]
+fn stencil_clear_leaves_depth_intact() {
+    // D3DCLEAR_STENCIL alone must not disturb the depth plane it shares on
+    // D24S8. Prime depth with a near quad, clear only stencil, then draw a
+    // farther quad: it stays rejected, so the near colour survives.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        let near = quad_at_depth(GREEN, 0.25);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &near),
+            0,
+            "near draw"
+        );
+        assert_eq!(d.clear(D3DCLEAR_STENCIL, 0, 1.0, 0), 0, "stencil clear");
+        let far = quad_at_depth(BLUE, 0.75);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &far),
+            0,
+            "far draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "depth survived the stencil clear"
+    );
+}
+
+#[test]
+fn stencil_reference_is_compared_through_the_mask() {
+    // D3D9 compares (ref & mask) against (stencil & mask), and apps do set a
+    // reference wider than the 8-bit attachment, sweeping it across a pass to
+    // read stencil values back one at a time. Only the quad whose low byte
+    // matches the stored value may paint.
+    const STORED: u32 = 0x3;
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.clear(D3DCLEAR_STENCIL, 0, 1.0, STORED),
+            0,
+            "stencil clear"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILMASK, 0xFF), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        for i in 0..16u32 {
+            assert_eq!(d.set_render_state(D3DRS_STENCILREF, 0x0000_FF00 | i), 0);
+            let shade = 0xFF00_0000 | (i * 16);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(shade)),
+                0,
+                "painter draw {i}"
+            );
+        }
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0xFF00_0000 | (STORED * 16),
+        "only the reference matching the stored value may paint"
+    );
+}
+
+#[test]
 fn stencil_enable_without_a_stencil_attachment_is_dropped() {
     // A depth-only surface with D3DRS_STENCILENABLE left set from an earlier
     // pass must not build a stencil-enabled state: Metal rejects one against a
@@ -337,5 +446,22 @@ fn stencil_enable_without_a_stencil_attachment_is_dropped() {
         h.read_pixel(320, 240),
         GREEN,
         "the draw was not stencil-gated"
+    );
+}
+
+#[test]
+fn stencil_clear_on_a_depth_only_surface_succeeds() {
+    // D3D9 masks D3DCLEAR_STENCIL against a format with no stencil plane
+    // rather than failing the call, so a game that always passes the flag
+    // keeps working after binding a depth-only surface.
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(mtld3d_types::D3DFMT_D16),
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear(D3DCLEAR_STENCIL, 0, 1.0, 0x7F), 0, "stencil clear");
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0x7F),
+        0,
+        "combined depth+stencil clear"
     );
 }

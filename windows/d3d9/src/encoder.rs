@@ -26,7 +26,7 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, LastBoundCache, Pass,
-        PassState, StoreAction as PassStoreAction,
+        PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -2296,6 +2296,82 @@ impl FrameEncoder {
                 self.emit_clear_quad_depth_inner(value, viewport, has_color, color_format);
             }
         }
+    }
+
+    pub fn clear_stencil(&mut self, value: u32) {
+        let was_closed = self.pass_state.current_pass_closed();
+        match self.pass_state.clear_stencil(value) {
+            StencilClearOutcome::Folded => {}
+            StencilClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => {
+                self.reset_last_bound_on_fresh_pass(was_closed);
+                self.emit_clear_quad_stencil_inner(value, viewport, has_color, color_format);
+            }
+        }
+    }
+
+    /// Stencil mirror of `emit_clear_quad_depth_inner`.
+    ///
+    /// Reuses the depth clear-quad pipeline: its fragment stage exports depth,
+    /// so the pipeline needs a depth attachment either way, and the
+    /// depth-stencil state is what decides which plane is actually written.
+    /// The clear value rides the encoder as the stencil reference, which the
+    /// `Replace` op then writes to every covered fragment.
+    fn emit_clear_quad_stencil_inner(
+        &mut self,
+        value: u32,
+        viewport: (u32, u32, u32, u32),
+        has_color: bool,
+        color_format: PixelFormat,
+    ) {
+        let mut flags = ClearQuadFlags::HAS_DEPTH;
+        flags.set(ClearQuadFlags::HAS_STENCIL, true);
+        flags.set(ClearQuadFlags::COLOR_FORMAT_NO_WRITE, has_color);
+        let key = ClearQuadKey {
+            depth_format: PixelFormat::Depth32Float,
+            color_format: if has_color {
+                color_format
+            } else {
+                PixelFormat::Bgra8Unorm
+            },
+            flags,
+        };
+        let pipeline = self.get_or_create_clear_quad_pipeline(key);
+        if pipeline == 0 {
+            self.pass_state.clear_stencil_legacy_break(value);
+            return;
+        }
+        let depth_state =
+            self.get_or_create_depth_stencil(&DepthStencilSnapshot::stencil_overwrite());
+        // Depth is not written, but the vertex stage still consumes a constant
+        // z at slot 0; any value inside the clip range will do.
+        let z_bytes = 0.0f32.to_le_bytes();
+        let z_ptr = self.scratch.alloc(&z_bytes);
+        let (vx, vy, vw, vh) = viewport;
+        if self.last_bound.pipeline_changed(pipeline) {
+            self.pass_state
+                .emit_command(Command::set_render_pipeline_state(pipeline));
+        }
+        if self.last_bound.depth_stencil_changed(depth_state) {
+            self.pass_state
+                .emit_command(Command::set_depth_stencil_state(depth_state));
+        }
+        if self.last_bound.stencil_reference_changed(value) {
+            self.pass_state
+                .emit_command(Command::set_stencil_reference(value));
+        }
+        self.emit_scissor_rect_resolved((vx, vy, vw, vh));
+        self.pass_state
+            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
+        self.last_bound.invalidate_vertex_buffer();
+        #[cfg(debug_assertions)]
+        self.debug_assert_cache_in_sync();
+        self.pass_state
+            .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
     }
 
     /// Flush `last_bound` when a cross-pass clear-quad opened a fresh Metal encoder.
@@ -6267,6 +6343,10 @@ fn pass_to_descriptor(
         DepthLoad::Clear { value } => (LoadAction::Clear, value),
         DepthLoad::DontCare => (LoadAction::DontCare, f32::to_bits(1.0)),
     };
+    let (stencil_load_action, stencil_clear_value) = match p.stencil_load() {
+        StencilLoad::Load => (LoadAction::Load, 0),
+        StencilLoad::Clear { value } => (LoadAction::Clear, value),
+    };
     let color_store_action = match p.color_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
@@ -6302,6 +6382,8 @@ fn pass_to_descriptor(
         depth_load_action,
         depth_store_action,
         depth_clear_value,
+        stencil_load_action,
+        stencil_clear_value,
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
@@ -6366,6 +6448,8 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         depth_load_action: LoadAction::DontCare,
         depth_store_action: StoreAction::DontCare,
         depth_clear_value: 0,
+        stencil_load_action: LoadAction::DontCare,
+        stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),

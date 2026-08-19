@@ -17,7 +17,7 @@ use mtld3d_types::{
     D3DRS_CCW_STENCILZFAIL, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
     D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL,
     D3DRS_TWOSIDEDSTENCILMODE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSTENCILOP_KEEP,
-    RENDER_STATE_COUNT,
+    D3DSTENCILOP_REPLACE, RENDER_STATE_COUNT,
 };
 
 use crate::convert::{d3d_to_metal_cmp, d3d_to_metal_stencil_op};
@@ -70,8 +70,10 @@ pub const STENCIL_MASK_BITS: u32 = 0xFF;
 /// truncating `as`; the asserts pin them to the ABI constants.
 const CMP_ALWAYS: u8 = 8;
 const OP_KEEP: u8 = 1;
+const OP_REPLACE: u8 = 3;
 const _: () = assert!(CMP_ALWAYS as u32 == D3DCMP_ALWAYS);
 const _: () = assert!(OP_KEEP as u32 == D3DSTENCILOP_KEEP);
+const _: () = assert!(OP_REPLACE as u32 == D3DSTENCILOP_REPLACE);
 
 /// The D3D9 default face: always compare, never modify.
 ///
@@ -81,6 +83,14 @@ const KEEP_FACE: StencilFaceState = StencilFaceState {
     fail_op: OP_KEEP,
     depth_fail_op: OP_KEEP,
     pass_op: OP_KEEP,
+};
+
+/// Writes the reference to every fragment, whatever the depth test did.
+const REPLACE_FACE: StencilFaceState = StencilFaceState {
+    func: CMP_ALWAYS,
+    fail_op: OP_REPLACE,
+    depth_fail_op: OP_REPLACE,
+    pass_op: OP_REPLACE,
 };
 
 /// Input view of the render states that select an `MTLDepthStencilState`.
@@ -139,6 +149,26 @@ impl DepthStencilSnapshot {
         Self {
             depth_enable: 1,
             depth_write: 1,
+            ..Self::inert()
+        }
+    }
+
+    /// Stencil overwritten with the reference, depth untouched.
+    ///
+    /// The state for the stencil clear quad.
+    ///
+    /// MSL cannot export a stencil value, so the clear writes through the
+    /// stencil operation instead: compare `Always` and `Replace` on every
+    /// outcome, with the clear value supplied as the encoder's stencil
+    /// reference. `read_mask` is irrelevant under an always-true compare.
+    #[must_use]
+    pub const fn stencil_overwrite() -> Self {
+        Self {
+            stencil_enable: 1,
+            front: REPLACE_FACE,
+            back: REPLACE_FACE,
+            read_mask: 0,
+            write_mask: STENCIL_MASK_BITS,
             ..Self::inert()
         }
     }
