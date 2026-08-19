@@ -3,13 +3,17 @@ $(error WINE_SDK is not set)
 endif
 export WINE_SDK
 
-# Every wine tool this Makefile shells out to (`wine`, `wineserver`,
-# `winebuild`) and the `wine` runner cargo spawns for the PE test binaries comes
-# from the same install we build against and install into, so put its `bin` in
-# front rather than relying on the caller's PATH. Without this a machine that
-# has no wine on PATH at all (a CI runner) fails deep inside a recipe, and a
-# machine with a second wine could silently mix loaders across a run.
-export PATH := $(WINE_SDK)/bin:$(PATH)
+# The Wine tools this Makefile runs, named by absolute path out of the same
+# install we build against and install into. Not found on PATH, and NOT by
+# exporting one either: make execs a simple recipe line itself rather than
+# through a shell, and that lookup reads make's own environment, so a PATH
+# exported here is never consulted. It appears to work on a machine whose shell
+# already has the SDK on PATH and fails everywhere else, which is precisely what
+# a CI runner is. The loader needs no PATH of its own; it finds wineserver and
+# its libraries relative to its own location.
+WINE       := $(WINE_SDK)/bin/wine
+WINEBUILD  := $(WINE_SDK)/bin/winebuild
+WINESERVER := $(WINE_SDK)/bin/wineserver
 
 # Distribution bundles default to the production profile; PROD=0 overrides
 # for a quick release-profile bundle.
@@ -225,13 +229,13 @@ unix: unix-x64 unix-arm64
 # names don't), which the prefix-marker targets below do.
 windows-i686:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
-	winebuild --builtin $(OUT_i386)/mtld3d.dll
-	winebuild --fake-module -o $(OUT_i386)/mtld3d.fake.dll -m32 --dll $(OUT_i386)/mtld3d.dll
+	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
+	$(WINEBUILD) --fake-module -o $(OUT_i386)/mtld3d.fake.dll -m32 --dll $(OUT_i386)/mtld3d.dll
 
 windows-x86_64:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
-	winebuild --builtin $(OUT_x64)/mtld3d.dll
-	winebuild --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
+	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
+	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
 # On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 # debug map in the dylib pointing at them by absolute path; `dsymutil` walks
@@ -266,7 +270,7 @@ install-windows-i686: windows-i686
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/mtld3d.fake.dll                     $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
-		winebuild --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
+		$(WINEBUILD) --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
 	done
 
 install-windows-x86_64: windows-x86_64
@@ -274,7 +278,7 @@ install-windows-x86_64: windows-x86_64
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/mtld3d.fake.dll                      $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
-		winebuild --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
+		$(WINEBUILD) --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
 	done
 
 # Both unix arches create the directory the Wine tree lacks: a Wine only ever
@@ -321,8 +325,8 @@ bundle: all
 	cp $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
 	cp $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/wine/x86_64-windows/
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
-	winebuild --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
-	winebuild --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
+	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
+	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
 	cp $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
 	cp $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
 	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
@@ -375,17 +379,17 @@ configure-test-prefix:
 	# RetinaMode keeps Win32 monitor geometry in the same physical-pixel space
 	# as mtld3d's adapter modes. The first `reg add` also creates the prefix if
 	# it does not exist yet, which is the case on a fresh machine.
-	wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
-	wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
-	wine reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
+	$(WINE) reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
+	$(WINE) reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
+	$(WINE) reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
 	# Pre-boot a persistent wineserver so individual test processes attach to it
 	# instead of each paying boot cost (and briefly holding its stdio). Both
 	# lines detach stdio: the persistent server (and the winedevice.exe residents
 	# wineboot leaves behind) would otherwise inherit make's stdout/stderr and
 	# hold a consumer pipe open forever, so `make test | ...` never sees EOF even
 	# though make itself exited.
-	-wineserver -p >/dev/null 2>&1
-	-wine wineboot >/dev/null 2>&1
+	-$(WINESERVER) -p >/dev/null 2>&1
+	-$(WINE) wineboot >/dev/null 2>&1
 
 # Install the prefix marker for the custom `mtld3d` builtin name, one per arch.
 # Wine resolves a builtin by finding a fake-DLL marker for that NAME in the
@@ -415,12 +419,12 @@ test-unit:
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-i686
-	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=wine \
+	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
 		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386)
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-x86_64
-	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine \
+	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
 		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64)
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
