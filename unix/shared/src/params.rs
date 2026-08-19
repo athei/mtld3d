@@ -3,7 +3,7 @@ use super::{
     mtl::{
         AddressMode, BlendFactor, BlendOperation, BufferKind, ClearQuadFlags, ColorSpacePolicy,
         ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        StageTag, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
+        StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -34,8 +34,10 @@ const _: () = {
     assert!(core::mem::offset_of!(U64After4, b) == 8);
     // A real wire struct whose `u64 id` sits after device_handle(8) + three
     // 4-byte fields: offset 24 ⇒ u64 8-aligned; would be 20 if 4-aligned.
-    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, id) == 24);
-    assert!(core::mem::size_of::<CreateDepthStencilStateParams>() == 40);
+    assert!(core::mem::size_of::<StencilFaceParams>() == 16);
+    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, front) == 24);
+    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, id) == 64);
+    assert!(core::mem::size_of::<CreateDepthStencilStateParams>() == 80);
 
     // Device create / render / destroy structs: align must be 8 and size
     // identical on all targets.
@@ -605,8 +607,28 @@ pub struct CreateDepthStencilStateParams {
     pub depth_test_enable: u32,                    // in: non-zero = enabled
     pub depth_write_enable: u32,                   // in: non-zero = enabled
     pub depth_compare_func: CompareFunc,           // in
+    pub stencil_test_enable: u32,                  // in: non-zero = enabled
+    pub front: StencilFaceParams,                  // in
+    pub back: StencilFaceParams,                   // in
+    pub stencil_read_mask: u32,                    // in
+    pub stencil_write_mask: u32,                   // in
     pub id: u64,                                   // in: caller-defined label tag
     pub state_handle: MetalHandle<MTLDepthStencilStateKind>, // out
+}
+
+/// One face of the stencil test, mirroring `MTLStencilDescriptor`.
+///
+/// Embedded twice in `CreateDepthStencilStateParams`. D3D9 addresses the back
+/// face through the separate `D3DRS_CCW_STENCIL*` states, which apply only
+/// while `D3DRS_TWOSIDEDSTENCILMODE` is set; the PE side resolves that and
+/// sends both faces populated either way.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilFaceParams {
+    pub compare_func: CompareFunc,
+    pub stencil_fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
 }
 
 impl Thunk for CreateDepthStencilStateParams {

@@ -15,7 +15,7 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
     buffer_rename::BufferMapMode,
-    convert::d3d_to_metal_cmp,
+    depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey,
         emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
@@ -46,10 +46,10 @@ use mtld3d_core::{
 use mtld3d_shared::{
     BlitCommand, BufferCreateDesc, Command, CommandType, CompileShaderLibraryParams,
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
-    CreateDepthStencilStateParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle,
-    PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    CreateTexturesBatchParams, DestroyResourcesBulkParams, EnsureBlitPipelineParams,
+    EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle, PassDescriptor,
+    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
         StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
@@ -61,7 +61,7 @@ use mtld3d_shared::{
     },
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
-use mtld3d_types::{D3DCMP_ALWAYS, D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
+use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 // Fast non-cryptographic hasher for the per-draw resource caches below
 // (texture/lib/pipeline/sampler/buffer/...). Keys are small trusted integers
 // or fixed structs; SipHash's DoS resistance buys nothing here and its
@@ -2572,7 +2572,7 @@ impl FrameEncoder {
         // below is actually emitted (the clear-quad cross-pass rule).
         self.reset_last_bound_on_fresh_pass(true);
 
-        let depth_state = self.get_or_create_depth_stencil(0, 0, D3DCMP_ALWAYS);
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
         if self.last_bound.pipeline_changed(pipeline) {
             self.pass_state
                 .emit_command(Command::set_render_pipeline_state(pipeline));
@@ -2693,7 +2693,8 @@ impl FrameEncoder {
             self.pass_state.clear_depth_legacy_break(value);
             return;
         }
-        let depth_state = self.get_or_create_depth_stencil(1, 1, D3DCMP_ALWAYS);
+        let depth_state =
+            self.get_or_create_depth_stencil(&DepthStencilSnapshot::depth_overwrite());
         let z_bytes = f32::from_bits(value).to_le_bytes();
         let z_ptr = self.scratch.alloc(&z_bytes);
         let (vx, vy, vw, vh) = viewport;
@@ -2772,7 +2773,7 @@ impl FrameEncoder {
         // Color clear doesn't write depth: bind a no-write depth-stencil
         // state so a transient color clear over an in-use depth
         // attachment doesn't perturb depth values.
-        let depth_state = self.get_or_create_depth_stencil(0, 0, D3DCMP_ALWAYS);
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
         // Color: write rgba as float4 via setFragmentBytes. The caller
         // (`device_clear` → `clear_color`/`clear_color_rects`) passes each
         // channel as f32 BITS, exactly like the folded load-action clear
@@ -3050,29 +3051,14 @@ impl FrameEncoder {
 
     // ── D3D9→Metal translation + caching (runs on encoder thread) ──
 
-    /// Look up or create an `MTLDepthStencilState` for the given D3D9 params.
-    ///
-    /// `depth_func` is a D3DCMP_* value, translated to `MTLCompareFunction` here.
-    pub fn get_or_create_depth_stencil(
-        &mut self,
-        depth_enable: u32,
-        depth_write: u32,
-        depth_func: u32,
-    ) -> u64 {
-        let key = DepthStencilKey::from_state(depth_enable, depth_write, depth_func);
+    /// Look up or create an `MTLDepthStencilState` for the given D3D9 state.
+    pub fn get_or_create_depth_stencil(&mut self, snapshot: &DepthStencilSnapshot) -> u64 {
+        let key = key_from_snapshot(snapshot);
         if let Some(&handle) = self.depth_stencil_cache.get(&key) {
             return handle.raw();
         }
 
-        let metal_cmp = d3d_to_metal_cmp(depth_func);
-        let mut params = CreateDepthStencilStateParams {
-            device_handle: self.device_handle,
-            depth_test_enable: depth_enable,
-            depth_write_enable: depth_write,
-            depth_compare_func: metal_cmp,
-            id: key.raw(),
-            state_handle: MetalHandle::NULL,
-        };
+        let mut params = params_from_snapshot(snapshot, key, self.device_handle);
         let status = unix_call(&mut params);
         let state = params.state_handle;
         if status != 0 || state.is_null() {

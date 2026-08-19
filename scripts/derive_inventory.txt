@@ -26,6 +26,7 @@ unix/shared/src/mtl.rs MipFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StageTag Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs StencilOp Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StorageMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StoreAction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs Swizzle Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -33,6 +34,7 @@ unix/shared/src/mtl.rs TextureCreateFlags Clone,Copy,Debug,Default,PartialEq,Eq,
 unix/shared/src/mtl.rs TextureUsage Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs VertexFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/params.rs StencilFaceParams Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy
 unix/unix/src/metal/clear_quad.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 unix/unix/src/metal/command.rs BlitSite Clone,Copy
@@ -53,6 +55,9 @@ windows/core/src/convert.rs DecalHeuristicInputs Clone,Copy,Debug
 windows/core/src/convert.rs FfVsLayout Clone,Copy,Default
 windows/core/src/convert.rs FfVsLayoutFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/convert.rs InputSemantic Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/depth_stencil_state.rs DepthStencilKey Clone,Copy,PartialEq,Eq,Hash,Debug
+windows/core/src/depth_stencil_state.rs DepthStencilSnapshot Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/depth_stencil_state.rs StencilFaceState Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
 windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/emit.rs EmitContextFlags Clone,Copy,Debug,PartialEq,Eq
@@ -87,7 +92,6 @@ windows/core/src/ff_state.rs FogConfig Clone,Copy
 windows/core/src/fullscreen_resize.rs ExternalResizeAction Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug
-windows/core/src/ids.rs DepthStencilKey Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs ProgramId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs TextureId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/passes.rs ColorClearOutcome Clone,Copy,Debug,PartialEq,Eq

@@ -8056,14 +8056,15 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             color_write_mask: to_u8(rs[D3DRS_COLORWRITEENABLE as usize]),
         };
 
+        let depth_stencil_state = mtld3d_core::depth_stencil_state::snapshot_from_state(rs);
         let mut depth_scissor = DepthScissorFlags::empty();
         depth_scissor.set(
             DepthScissorFlags::DEPTH_ENABLE,
-            rs[D3DRS_ZENABLE as usize] != 0,
+            depth_stencil_state.depth_enable != 0,
         );
         depth_scissor.set(
             DepthScissorFlags::DEPTH_WRITE,
-            rs[D3DRS_ZWRITEENABLE as usize] != 0,
+            depth_stencil_state.depth_write != 0,
         );
         depth_scissor.set(
             DepthScissorFlags::SCISSOR_TEST,
@@ -8082,12 +8083,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         Some(RenderStateSnapshot {
             pipeline_rs,
             depth_scissor,
-            depth_func: to_u8(rs[D3DRS_ZFUNC as usize]),
+            depth_stencil_state,
             cull_mode: to_u8(rs[D3DRS_CULLMODE as usize]),
             scissor_rect,
             blend_factor: rs[D3DRS_BLENDFACTOR as usize],
             depth_bias: rs[D3DRS_DEPTHBIAS as usize],
             slope_scale_depth_bias: rs[D3DRS_SLOPESCALEDEPTHBIAS as usize],
+            stencil_ref: rs[D3DRS_STENCILREF as usize],
         })
     } else {
         None

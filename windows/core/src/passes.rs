@@ -352,6 +352,7 @@ impl Pass {
     pub const fn depth_load(&self) -> DepthLoad {
         self.depth_load
     }
+
     #[must_use]
     pub const fn depth_store(&self) -> StoreAction {
         self.depth_store
@@ -2690,6 +2691,7 @@ pub struct LastBoundCache {
     fragment_textures: [u64; LAST_BOUND_MAX_STAGES],
     pipeline: u64,
     depth_stencil: u64,
+    stencil_reference: u32,
     cull_mode: Option<CullMode>,
     /// VS slot 15 — programmable / FF vertex constant buffer.
     vs_constants: Vec<u8>,
@@ -2744,6 +2746,7 @@ impl LastBoundCache {
             fragment_textures: [0; LAST_BOUND_MAX_STAGES],
             pipeline: 0,
             depth_stencil: 0,
+            stencil_reference: 0,
             cull_mode: None,
             vs_constants: Vec::new(),
             vs_pos_fixup: Vec::new(),
@@ -2769,6 +2772,7 @@ impl LastBoundCache {
         self.fragment_textures = [0; LAST_BOUND_MAX_STAGES];
         self.pipeline = 0;
         self.depth_stencil = 0;
+        self.stencil_reference = 0;
         self.cull_mode = None;
         self.vs_constants.clear();
         self.vs_pos_fixup.clear();
@@ -2875,6 +2879,16 @@ impl LastBoundCache {
         }
         self.scissor_rect = Some(rect);
         true
+    }
+
+    #[inline]
+    pub const fn stencil_reference_changed(&mut self, value: u32) -> bool {
+        if self.stencil_reference == value {
+            false
+        } else {
+            self.stencil_reference = value;
+            true
+        }
     }
 
     #[inline]

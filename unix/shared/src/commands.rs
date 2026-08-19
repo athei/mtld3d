@@ -71,6 +71,13 @@ pub enum CommandType {
     // 18 was SetDepthClipMode; the D3D9 depth-clamp rule is realized in the
     // FF vertex shader now (`pos_fixup.z`), because encoder-level clamp is
     // not honoured by every Metal device.
+    /// `encoder.setStencilReferenceValue:`
+    ///
+    /// The reference value the stencil test compares against, and the source
+    /// for `D3DSTENCILOP_REPLACE`. Metal carries it on the encoder rather
+    /// than the depth/stencil state object, so `D3DRS_STENCILREF` changes
+    /// cost a command instead of a new `MTLDepthStencilState`.
+    SetStencilReference = 19,
 }
 
 /// Fixed-size command struct written by the API thread and read by the encoding thread.
@@ -322,6 +329,17 @@ impl Command {
             cmd: CommandType::SetVisibilityResultMode as u32,
             param_a: mode as u32,
             param_b: offset_bytes as u64,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn set_stencil_reference(value: u32) -> Self {
+        Self {
+            cmd: CommandType::SetStencilReference as u32,
+            param_a: value,
+            param_b: 0,
             param_c: 0,
             param_d: 0,
         }
@@ -866,6 +884,13 @@ mod tests {
         assert_eq!(cmd.region_w, 512);
         assert_eq!(cmd.region_h, 256);
         assert_eq!(cmd.dst_offset, 0);
+    }
+
+    #[test]
+    fn set_stencil_reference_roundtrip() {
+        let cmd = Command::set_stencil_reference(0x7F);
+        assert_eq!(cmd.cmd, CommandType::SetStencilReference as u32);
+        assert_eq!(cmd.param_a, 0x7F);
     }
 
     #[test]

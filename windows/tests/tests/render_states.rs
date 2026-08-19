@@ -2,7 +2,7 @@
 //!
 //! Plus get/set round-trips and spec-default verification.
 
-use mtld3d_tests::{Harness, PosColorVertex, Rgba8};
+use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8};
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCMP_EQUAL,
     D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE,
@@ -310,5 +310,32 @@ fn wireframe_fill_mode_is_a_noop() {
         h.read_pixel(320, 280),
         GREEN,
         "wireframe is a no-op — interior still filled"
+    );
+}
+
+#[test]
+fn stencil_enable_without_a_stencil_attachment_is_dropped() {
+    // A depth-only surface with D3DRS_STENCILENABLE left set from an earlier
+    // pass must not build a stencil-enabled state: Metal rejects one against a
+    // pass with no stencil attachment.
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(mtld3d_types::D3DFMT_D16),
+        ..HarnessConfig::default()
+    });
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 0x7F), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0,
+            "draw with a stale stencil enable"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the draw was not stencil-gated"
     );
 }

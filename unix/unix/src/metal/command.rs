@@ -1773,6 +1773,9 @@ fn encode_pass(
                     let alpha = f32::from_bits(to_u32(cmd.param_d));
                     encoder.setBlendColorRed_green_blue_alpha(red, green, blue, alpha);
                 }
+                Some(CommandType::SetStencilReference) => {
+                    encoder.setStencilReferenceValue(cmd.param_a);
+                }
                 None => {
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "unknown command type {t}", t = cmd.cmd);
                 }

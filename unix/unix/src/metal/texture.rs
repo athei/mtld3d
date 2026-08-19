@@ -1,7 +1,7 @@
 use mtld3d_shared::{
-    MetalHandle, TextureCreateDesc,
+    CreateDepthStencilStateParams, MetalHandle, StencilFaceParams, TextureCreateDesc,
     mtl::{
-        BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StorageMode, Swizzle,
+        BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StencilOp, StorageMode, Swizzle,
         TextureCreateFlags, TextureUsage,
     },
     mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
@@ -10,8 +10,9 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat,
-    MTLRenderPassDescriptor, MTLResource, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureUsage,
+    MTLRenderPassDescriptor, MTLResource, MTLStencilDescriptor, MTLStencilOperation,
+    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle,
+    MTLTextureSwizzleChannels, MTLTextureUsage,
 };
 
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
@@ -238,33 +239,74 @@ fn create_color_texture(
 }
 
 /// Creates an `MTLDepthStencilState` object.
-///
-/// `compare_func` is an `MTLCompareFunction` raw value.
 pub fn create_depth_stencil_state(
-    device_handle: MetalHandle<MTLDeviceKind>,
-    depth_test_enable: u32,
-    depth_write_enable: u32,
-    compare_func: CompareFunc,
-    id: u64,
+    params: &CreateDepthStencilStateParams,
 ) -> Option<MetalHandle<MTLDepthStencilStateKind>> {
-    let device = device_handle.into_retained()?;
+    let device = params.device_handle.into_retained()?;
 
     let desc = MTLDepthStencilDescriptor::new();
 
-    if depth_test_enable != 0 {
-        desc.setDepthCompareFunction(mtl_compare_function(compare_func));
-        desc.setDepthWriteEnabled(depth_write_enable != 0);
+    if params.depth_test_enable != 0 {
+        desc.setDepthCompareFunction(mtl_compare_function(params.depth_compare_func));
+        desc.setDepthWriteEnabled(params.depth_write_enable != 0);
     } else {
         desc.setDepthCompareFunction(MTLCompareFunction::Always);
         desc.setDepthWriteEnabled(false);
     }
 
+    if params.stencil_test_enable != 0 {
+        desc.setFrontFaceStencil(Some(&stencil_face_descriptor(
+            params.front,
+            params.stencil_read_mask,
+            params.stencil_write_mask,
+        )));
+        desc.setBackFaceStencil(Some(&stencil_face_descriptor(
+            params.back,
+            params.stencil_read_mask,
+            params.stencil_write_mask,
+        )));
+    }
+
+    let id = params.id;
     let label = objc2_foundation::NSString::from_str(&format!("mtld3d-dss-{id:#x}"));
     desc.setLabel(Some(&label));
 
     let state = device.newDepthStencilStateWithDescriptor(&desc)?;
     // SAFETY: Retained::into_raw transfers the retain into the typed handle.
     Some(unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(Retained::into_raw(state) as u64) })
+}
+
+/// Builds one `MTLStencilDescriptor` face.
+///
+/// Metal carries the read/write masks per face; D3D9 has one pair of masks
+/// (`D3DRS_STENCILMASK` / `D3DRS_STENCILWRITEMASK`) covering both, so the
+/// same pair is written to each face.
+fn stencil_face_descriptor(
+    face: StencilFaceParams,
+    read_mask: u32,
+    write_mask: u32,
+) -> Retained<MTLStencilDescriptor> {
+    let desc = MTLStencilDescriptor::new();
+    desc.setStencilCompareFunction(mtl_compare_function(face.compare_func));
+    desc.setStencilFailureOperation(mtl_stencil_operation(face.stencil_fail_op));
+    desc.setDepthFailureOperation(mtl_stencil_operation(face.depth_fail_op));
+    desc.setDepthStencilPassOperation(mtl_stencil_operation(face.pass_op));
+    desc.setReadMask(read_mask);
+    desc.setWriteMask(write_mask);
+    desc
+}
+
+pub const fn mtl_stencil_operation(wire: StencilOp) -> MTLStencilOperation {
+    match wire {
+        StencilOp::Keep => MTLStencilOperation::Keep,
+        StencilOp::Zero => MTLStencilOperation::Zero,
+        StencilOp::Replace => MTLStencilOperation::Replace,
+        StencilOp::IncrementClamp => MTLStencilOperation::IncrementClamp,
+        StencilOp::DecrementClamp => MTLStencilOperation::DecrementClamp,
+        StencilOp::Invert => MTLStencilOperation::Invert,
+        StencilOp::IncrementWrap => MTLStencilOperation::IncrementWrap,
+        StencilOp::DecrementWrap => MTLStencilOperation::DecrementWrap,
+    }
 }
 
 pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
