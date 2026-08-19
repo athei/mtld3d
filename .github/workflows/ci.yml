@@ -28,13 +28,13 @@ env:
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
-  # No Metal HUD and no validation layer on a runner: the GPU there is
-  # paravirtual ('Apple Virtual') and does not implement the counters the HUD
-  # samples, and validation, whose whole value is catching misuse against a real
-  # driver, has so far only produced a bare abort inside translated code with no
-  # statement of what it objected to. Both are on by default for a developer.
+  # The Metal HUD only: the GPU on a runner is paravirtual ('Apple Virtual') and
+  # does not implement the counters the HUD samples, which it announces on every
+  # single launch. The validation layer is deliberately NOT turned off and keeps
+  # the Makefile's default: it was the suspect for the e2e aborts and was cleared
+  # by re-enabling it on its own once the suite ran serially, so CI keeps the
+  # misuse checking those legs exist to provide.
   MTL_HUD_ENABLED: "0"
-  MTL_DEBUG_LAYER: "1"
 
 jobs:
   # The linear part: one job downloads and builds the shared state (toolchains,

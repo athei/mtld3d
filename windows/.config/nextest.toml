@@ -16,14 +16,20 @@ test-group = "gpu"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # CI profile, for a runner where the GPU is paravirtual ('Apple Virtual') and
-# every guest instruction is translated. Three differences from the default, all
-# about seeing what is happening rather than changing what is tested:
+# every guest instruction is translated:
 #
-#   fail-fast = false   one broken test otherwise cancels the other 164 and the
-#                       log shows four results out of a suite of 165.
-#   test-threads = 1    no two Metal devices at once, which takes GPU and
-#                       wineserver contention out of the picture; a prefix under
-#                       CrossOver needed the same treatment.
+#   test-threads = 1    THE fix for that environment, not a precaution. Run four
+#                       at a time there and tests that create a device abort or
+#                       hang, the same test differing between arches and between
+#                       runs; serially all 165 pass on both arches. A prefix
+#                       under CrossOver needs the same treatment, for what is
+#                       presumably the same reason: concurrent CreateDevice
+#                       wedges something below us. Metal's validation layer was
+#                       the other suspect and was cleared by re-enabling it
+#                       alone on a serial run.
+#   fail-fast = false   one broken test otherwise cancels the other 164, and a
+#                       log showing four results out of 165 is what made the
+#                       above take three runs to see.
 #   slow-timeout        a test that is merely slow on a virtual GPU must not be
 #                       killed and counted as a hang.
 [profile.ci]
