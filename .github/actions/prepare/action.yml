@@ -33,20 +33,39 @@ runs:
       shell: bash
       run: echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
 
-    # Keyed on the lockfiles for the crates and on the two files that carry the
-    # pins (ci.yml pins the toolchains, the Makefile pins the MSVC CRT and SDK),
-    # so bumping a pin rotates the cache instead of quietly reusing the old one.
-    - name: Restore the cargo home
+    # Two caches, because the two halves of a cargo home change for different
+    # reasons and one of them must never be restored partially.
+    #
+    # The toolchains and the three cargo-installed tools are keyed on ci.yml,
+    # which is where their versions are pinned, and take NO restore-keys. The
+    # ledger files (.crates.toml, .crates2.json) are cargo's record of which
+    # crate owns which installed binary, so they have to arrive with `bin` or the
+    # next `cargo install` refuses to touch what it sees as strays ("binary
+    # `xwin` already exists in destination") instead of skipping them. A prefix
+    # fallback could hand back an entry with one and not the other, which is
+    # exactly the failure it looks like it is avoiding, and only the setup job
+    # pays for a miss anyway.
+    - name: Restore the toolchains and cargo tools
       uses: actions/cache/restore@v4
       with:
         path: |
+          ~/.rustup
           ~/.cargo/bin
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+        key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
+
+    # The crate registry is keyed on the lockfiles and a prefix fallback is right
+    # here: a partial registry costs a fetch of what is missing, nothing more.
+    - name: Restore the crate registry
+      uses: actions/cache/restore@v4
+      with:
+        path: |
           ~/.cargo/registry
           ~/.cargo/git
-          ~/.rustup
-        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml', 'Makefile', '**/Cargo.lock') }}
+        key: registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          rust-${{ runner.os }}-${{ runner.arch }}-
+          registry-${{ runner.os }}-${{ runner.arch }}-
 
     # Skipped on a PE leg: `setup-xwin` below has it as a prerequisite, and it is
     # the one step that has to run after the splat cache lands, so running it here
@@ -115,16 +134,25 @@ runs:
       shell: bash
       run: make fetch
 
-    - name: Save the cargo home
+    - name: Save the toolchains and cargo tools
       uses: actions/cache/save@v4
       if: inputs.prime == 'true'
       with:
         path: |
+          ~/.rustup
           ~/.cargo/bin
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+        key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
+
+    - name: Save the crate registry
+      uses: actions/cache/save@v4
+      if: inputs.prime == 'true'
+      with:
+        path: |
           ~/.cargo/registry
           ~/.cargo/git
-          ~/.rustup
-        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml', 'Makefile', '**/Cargo.lock') }}
+        key: registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Save the MSVC SDK splat
       uses: actions/cache/save@v4
