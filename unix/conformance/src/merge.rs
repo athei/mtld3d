@@ -6,6 +6,11 @@
 //! sites are new (they need a CONFORMANCE.md entry before `make test` goes
 //! green again) and which were dropped (their prose entries are now stale and
 //! must be removed).
+//!
+//! One run covers one architecture, so the merge is *arch-scoped*: the fresh
+//! results replace that arch's entries and every other arch is carried over
+//! untouched. Re-recording the whole file therefore means running each arch's
+//! baseline leg once, in either order.
 
 use std::collections::BTreeMap;
 
@@ -25,16 +30,34 @@ pub struct MergeSummary {
     pub dropped_sites: Vec<Site>,
 }
 
-/// Build a new baseline from `fresh` results.
+/// Build a new baseline from `fresh` results for `arch`.
+///
+/// Entries the prior baseline holds for any *other* arch survive verbatim: a
+/// run only ever measured its own arch, so dropping the rest would record a
+/// regression-free score for tests that never ran.
 #[must_use]
 pub fn merge(
     prior: &Baseline,
+    arch: Arch,
     fresh: &BTreeMap<(Arch, Subtest), SubtestResult>,
     wine_version: String,
 ) -> (Baseline, MergeSummary) {
     let mut next = Baseline {
         wine_version,
-        entries: BTreeMap::new(),
+        entries: prior
+            .entries
+            .iter()
+            .filter(|((a, _), _)| *a != arch)
+            .map(|(&key, sub)| {
+                (
+                    key,
+                    SubtestBaseline {
+                        crash: sub.crash,
+                        sites: sub.sites.clone(),
+                    },
+                )
+            })
+            .collect(),
     };
     let mut summary = MergeSummary::default();
     for (&key, result) in fresh {
@@ -111,7 +134,7 @@ mod tests {
             },
         );
 
-        let (next, summary) = merge(&prior, &fresh, "new".to_owned());
+        let (next, summary) = merge(&prior, Arch::I686, &fresh, "new".to_owned());
         let sub = &next.entries[&key];
         assert!(sub.crash);
         assert_eq!(sub.sites[&site(1)], 7); // refreshed
@@ -121,5 +144,38 @@ mod tests {
         assert_eq!(summary.new_sites, vec![site(3)]);
         assert_eq!(summary.dropped_sites, vec![site(2)]);
         assert_eq!(next.wine_version, "new");
+    }
+
+    #[test]
+    fn a_single_arch_update_keeps_the_other_arch() {
+        let mine = (Arch::I686, Subtest::Device);
+        let theirs = (Arch::X64, Subtest::Visual);
+
+        let mut other_sites = BTreeMap::new();
+        other_sites.insert(site(9), 4u32);
+        let mut prior = Baseline {
+            wine_version: "old".to_owned(),
+            entries: BTreeMap::new(),
+        };
+        prior.entries.insert(
+            theirs,
+            SubtestBaseline {
+                crash: true,
+                sites: other_sites,
+            },
+        );
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert(mine, SubtestResult::default());
+
+        let (next, summary) = merge(&prior, Arch::I686, &fresh, "new".to_owned());
+        let kept = &next.entries[&theirs];
+        assert!(kept.crash);
+        assert_eq!(kept.sites[&site(9)], 4);
+        assert!(next.entries.contains_key(&mine));
+        // The untouched arch is carried, not re-measured: it reports nothing.
+        assert_eq!(summary.carried, 0);
+        assert!(summary.new_sites.is_empty());
+        assert!(summary.dropped_sites.is_empty());
     }
 }

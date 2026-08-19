@@ -1,10 +1,13 @@
 //! Wine d3d9 conformance runner for mtld3d.
 //!
-//! Runs Wine's upstream `d3d9_test.exe` (built in a local Wine build tree,
-//! located via `--wine-build`) against our installed builtin `d3d9.dll`, one
-//! subtest at a time per arch, and either diffs the result against the
-//! checked-in `baseline.txt` or re-records it. See the `CONFORMANCE.md`
-//! alongside this crate for the triage prose.
+//! Runs Wine's upstream `d3d9_test.exe` (handed in as `--exe`, alongside the
+//! loader as `--wine`) against our installed builtin `d3d9.dll`, one subtest at
+//! a time, and either diffs the result against the checked-in `baseline.txt` or
+//! re-records it. See the `CONFORMANCE.md` alongside this crate for the triage
+//! prose.
+//!
+//! One invocation covers one architecture's test binary, so the caller decides
+//! what to run and where it lives; nothing here resolves a Wine path.
 //!
 //! This is intentionally NOT a pass/fail gate of zero failures — many subtests
 //! fail by design given our documented stub/limitation list. It is a
@@ -41,30 +44,32 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode, String> {
-    let config = cli::parse_args(std::env::args().skip(1), std::env::var("WINE_BUILD").ok())?;
-    let wine = run::wine_binary()?;
-    let wine_version = run::wine_version(&wine);
-    println!("Wine: {wine_version}");
+    let config = cli::parse_args(std::env::args().skip(1))?;
+    let wine_version = run::wine_version(&config.wine);
+    println!("Wine: {wine_version} ({})", config.arch);
 
-    // `--only`/`--arch` narrow the Cartesian product; absent = the full set.
-    let arches: Vec<Arch> = config.arch.map_or_else(|| Arch::ALL.to_vec(), |a| vec![a]);
+    // `--only` narrows the subtest set; absent = all four.
     let subtests: Vec<Subtest> = config
         .only
         .map_or_else(|| Subtest::ALL.to_vec(), |s| vec![s]);
 
-    // `--repeat N>1` is characterization, not a gate: run each selected combo N
+    // `--repeat N>1` is characterization, not a gate: run each selected subtest N
     // times and print a flap report, then exit 0 regardless of what fluttered.
     if config.repeat > 1 {
-        isolate::run_flap(&wine, &config.wine_build, &arches, &subtests, config.repeat)?;
+        isolate::run_flap(
+            &config.wine,
+            &config.exe,
+            config.arch,
+            &subtests,
+            config.repeat,
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let mut current: BTreeMap<(Arch, Subtest), SubtestResult> = BTreeMap::new();
-    for &arch in &arches {
-        for &subtest in &subtests {
-            let result = run::run_subtest(&wine, &config.wine_build, arch, subtest)?;
-            current.insert((arch, subtest), result);
-        }
+    for &subtest in &subtests {
+        let result = run::run_subtest(&config.wine, &config.exe, config.arch, subtest)?;
+        current.insert((config.arch, subtest), result);
     }
 
     // Assets (baseline.txt) live in the crate directory by default; --assets
@@ -82,7 +87,7 @@ fn real_main() -> Result<ExitCode, String> {
             eprintln!("warning: ignoring unparseable prior baseline ({e}); new/dropped reporting incomplete");
             Baseline::default()
         });
-        let (next, summary) = merge::merge(&prior, &current, wine_version);
+        let (next, summary) = merge::merge(&prior, config.arch, &current, wine_version);
         std::fs::write(&baseline_path, next.to_text())
             .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
         println!(

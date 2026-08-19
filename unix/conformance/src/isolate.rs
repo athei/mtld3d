@@ -5,7 +5,7 @@
 //! and runs the whole subtest. To characterize a *non-deterministic* site (one
 //! the gate flips on a clean binary) the only stock lever is to run the whole
 //! subtest repeatedly and watch which sites move. This module runs each selected
-//! `(arch, subtest)` N times and prints a per-site flap report: a site that
+//! subtest N times and prints a per-site flap report: a site that
 //! fired in every run at the same count is deterministic; one that fired in only
 //! some runs, or at a varying count, is flaky. The output is the evidence for
 //! tagging a site `flaky` in `CONFORMANCE.md` (see [`crate::triage`]). This is
@@ -63,16 +63,16 @@ struct Aggregate {
     flaky_marked: BTreeMap<Site, u32>,
 }
 
-/// Run every selected `(arch, subtest)` `repeat` times and print a flap report.
+/// Run every selected subtest of one test binary `repeat` times and print a flap report.
 ///
 /// # Errors
 ///
-/// Propagates a spawn/wait error from [`run::run_subtest`] (a missing per-arch
+/// Propagates a spawn/wait error from [`run::run_subtest`] (a missing
 /// `d3d9_test.exe`, or `wine` failing to launch).
 pub fn run_flap(
     wine: &Path,
-    wine_build: &Path,
-    arches: &[Arch],
+    exe: &Path,
+    arch: Arch,
     subtests: &[Subtest],
     repeat: u32,
 ) -> Result<(), String> {
@@ -80,19 +80,17 @@ pub fn run_flap(
         "flap characterization: {repeat} run(s) per combo (counts shown as value×runs; \
          a site is FLAPS unless it fired in every run at one constant count)\n"
     );
-    for &arch in arches {
-        for &subtest in subtests {
-            let agg = characterize(wine, wine_build, arch, subtest, repeat)?;
-            print!("{}", render(arch, subtest, &agg));
-        }
+    for &subtest in subtests {
+        let agg = characterize(wine, exe, arch, subtest, repeat)?;
+        print!("{}", render(arch, subtest, &agg));
     }
     Ok(())
 }
 
-/// Run one `(arch, subtest)` `repeat` times, folding each run into an [`Aggregate`].
+/// Run one subtest `repeat` times, folding each run into an [`Aggregate`].
 fn characterize(
     wine: &Path,
-    wine_build: &Path,
+    exe: &Path,
     arch: Arch,
     subtest: Subtest,
     repeat: u32,
@@ -101,7 +99,7 @@ fn characterize(
     for i in 1..=repeat {
         // Liveness to stderr — a full subtest can take many seconds.
         eprintln!("  [{arch}/{subtest}] run {i}/{repeat}…");
-        let result = run::run_subtest(wine, wine_build, arch, subtest)?;
+        let result = run::run_subtest(wine, exe, arch, subtest)?;
         agg.runs += 1;
         if result.crash {
             agg.crash_runs += 1;

@@ -14,3 +14,21 @@ gpu = { max-threads = 4 }
 filter = "package(mtld3d-tests)"
 test-group = "gpu"
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+# CI profile, for a runner whose GPU is paravirtual ('Apple Virtual') and whose
+# guest code is translated:
+#
+#   test-threads = 1    Required there. Concurrent device creation aborts or
+#                       hangs tests, non-deterministically; serially the suite
+#                       passes. A prefix under CrossOver needs the same.
+#   fail-fast = false   Report the whole suite rather than the first failure.
+#   slow-timeout        A test that is only slow on a virtual GPU must not be
+#                       killed and counted as a hang.
+[profile.ci]
+fail-fast = false
+test-threads = 1
+
+[[profile.ci.overrides]]
+filter = "package(mtld3d-tests)"
+test-group = "gpu"
+slow-timeout = { period = "120s", terminate-after = 2 }

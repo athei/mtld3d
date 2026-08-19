@@ -28,10 +28,11 @@ fn main() {
     let lib_dir = format!("{wine_sdk}/lib/wine/{lib_arch}");
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    // Homebrew installs llvm keg-only (not on PATH), so resolve `llvm-ar`
-    // explicitly: honour an `LLVM_AR` override, else ask Homebrew for its llvm
-    // prefix (covers Apple-Silicon `/opt/homebrew` and Intel `/usr/local`),
-    // else fall back to the default Apple-Silicon keg path.
+    // `llvm-ar` is never on PATH under either of the names it can arrive as, so
+    // resolve it explicitly: an `LLVM_AR` override first, then the toolchain's
+    // own `llvm-tools` copy, then Homebrew's keg for a toolchain without that
+    // component. It has to be `llvm-ar` and not the `llvm-lib` symlink beside it,
+    // because the extraction below speaks ar syntax, not lib.exe syntax.
     let llvm_ar = std::env::var("LLVM_AR").unwrap_or_else(|_| resolve_llvm_ar());
 
     // Take just unix_lib.o out of winecrt0.a, which avoids the TLS symbol
@@ -107,6 +108,37 @@ fn extract_unix_lib(llvm_ar: &str, archive: &str, object_arch: &str, out_dir: &s
 /// llvm` and fall back to the default Apple-Silicon keg location if Homebrew
 /// is unavailable.
 fn resolve_llvm_ar() -> String {
+    toolchain_llvm_ar().unwrap_or_else(homebrew_llvm_ar)
+}
+
+/// `llvm-ar` from the active toolchain's `llvm-tools` component.
+///
+/// The first choice, because it needs nothing installed beyond the toolchain
+/// this build is already running under, and `make setup-rust` installs that
+/// component for exactly this (and for the `lld-link`/`llvm-lib` symlinks it
+/// creates from the same directory). `None` when the component is absent, which
+/// is what a toolchain installed without it looks like.
+fn toolchain_llvm_ar() -> Option<String> {
+    let rustc = std::env::var("RUSTC").ok()?;
+    let host = std::env::var("HOST").ok()?;
+    let out = std::process::Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let path = format!("{sysroot}/lib/rustlib/{host}/bin/llvm-ar");
+    std::path::Path::new(&path).is_file().then_some(path)
+}
+
+/// `llvm-ar` from the Homebrew llvm keg, which is keg-only and off PATH.
+///
+/// The fallback for a toolchain with no `llvm-tools`. Asking `brew` covers both
+/// prefixes (Apple-Silicon `/opt/homebrew`, Intel `/usr/local`); the literal
+/// path is the last resort when `brew` itself is not on PATH.
+fn homebrew_llvm_ar() -> String {
     std::process::Command::new("brew")
         .args(["--prefix", "llvm"])
         .output()
