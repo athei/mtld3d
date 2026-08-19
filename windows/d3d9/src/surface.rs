@@ -578,6 +578,28 @@ impl Direct3DSurface9 {
         self.inner().live_format()
     }
 
+    /// D3D9 format of this surface when bound as a depth attachment (D3DFMT_*).
+    ///
+    /// Texture-backed depth surfaces report the parent texture's format;
+    /// standalone and implicit surfaces resolve their own (live) format.
+    /// The snapshot and `SetDepthStencilSurface` both derive `has_stencil`
+    /// from this, so the pipeline's declared depth/stencil formats always
+    /// match the texture the pass actually binds — a texture-backed D24S8
+    /// depth surface creates a `Depth32Float_Stencil8` Metal texture, and a
+    /// pipeline declaring plain `Depth32Float` against it is a Metal
+    /// validation error.
+    pub fn depth_attachment_format(&self) -> u32 {
+        let parent = self.inner().parent_texture;
+        if parent.is_null() {
+            return self.inner().live_format();
+        }
+        // SAFETY: `parent` is non-null (checked above); texture-backed
+        // surfaces are created by `GetSurfaceLevel` with a live
+        // `Direct3DTexture9*`, and the parent texture's refcount keeps
+        // it alive for as long as this surface is live.
+        unsafe { (*parent).d3d_format() }
+    }
+
     /// Width of a standalone surface (backbuffer / depth-stencil).
     ///
     /// Zero for texture-backed surfaces — query the parent texture mip instead

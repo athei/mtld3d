@@ -1200,6 +1200,21 @@ impl DeviceInner {
         // thread to re-emit every Op::Set* on the first draw of the
         // new frame.
         self.snapshot_dirty = SnapshotDirty::all();
+        // The fresh frame's pass state defaults to the implicit backbuffer +
+        // auto depth-stencil, but a D3D9 render-target or depth binding —
+        // including an explicit `SetDepthStencilSurface(NULL)` unbind —
+        // outlives Present and internal flushes alike. Re-assert it into the
+        // fresh frame, or the pass would carry an attachment the pipeline
+        // (built from the D3D9 snapshot) does not declare.
+        // Clone (not Copy) out of the persistent binding: `TextureInfo` and
+        // the binding enums are wide aggregates, and frame swaps are rare
+        // relative to draws.
+        if let Some(info) = self.last_color_rt_binding.clone() {
+            self.push_color_rt_binding_op(info);
+        }
+        if let Some((binding, is_sampleable, has_stencil)) = self.last_depth_binding.clone() {
+            self.push_depth_binding_op(binding, is_sampleable, has_stencil);
+        }
         frame
     }
 
@@ -1214,19 +1229,6 @@ impl DeviceInner {
         let fresh = self.fresh_frame();
         let frame = self.stamp_and_swap(fresh, true);
         self.encoder.mid_frame_submit(frame);
-        // The fresh frame's pass state defaults to the backbuffer. A D3D9
-        // render-target binding survives an internal flush (this is not a
-        // Present), so re-assert it; otherwise a draw issued after a
-        // `GetRenderTargetData` readback would silently render to the
-        // backbuffer's format instead of the bound RT's.
-        // Clone (not Copy) out of the persistent binding: `TextureInfo` and the
-        // binding enums are wide aggregates, and this flush path is rare.
-        if let Some(info) = self.last_color_rt_binding.clone() {
-            self.push_color_rt_binding_op(info);
-        }
-        if let Some((binding, is_sampleable, has_stencil)) = self.last_depth_binding.clone() {
-            self.push_depth_binding_op(binding, is_sampleable, has_stencil);
-        }
     }
 
     /// Push the encoder op that binds `binding` as the depth/stencil attachment.
@@ -6470,15 +6472,17 @@ extern "system" fn device_set_depth_stencil_surface(
     let is_sampleable = matches!(binding, DepthBinding::Lazy(_));
     // Whether the bound depth attachment is a combined depth+stencil format
     // (D24S8 etc. → the combined Metal texture), so the clear-quad / draw
-    // pipelines declare matching depth/stencil attachment formats. Mirrors the
-    // snapshot's `depth_format_has_stencil(standalone_format())`. Sampleable
-    // (Lazy) depths are the depth-only shadow-map path; `None` has no depth.
-    let depth_has_stencil = if matches!(binding, DepthBinding::Eager(_)) && !surf.is_null() {
-        // SAFETY: the Eager arm implies `surf` is the live, non-null bound
-        // surface (already deref'd above to build the binding).
-        depth_format_has_stencil(unsafe { (*surf).standalone_format() })
-    } else {
+    // pipelines declare matching depth/stencil attachment formats. Mirrors
+    // the snapshot's `depth_format_has_stencil(depth_attachment_format())`,
+    // which resolves texture-backed (sampleable) depth surfaces to the parent
+    // texture's format — a D24S8 shadow map binds a combined-stencil Metal
+    // texture just like a standalone D24S8 surface does.
+    let depth_has_stencil = if surf.is_null() {
         false
+    } else {
+        // SAFETY: `surf` is non-null (checked) and a live `Direct3DSurface9`
+        // (already deref'd above to build the binding).
+        depth_format_has_stencil(unsafe { (*surf).depth_attachment_format() })
     };
     // Remember the binding so a mid-frame readback flush can re-assert it (the
     // encoder's pass state re-attaches the implicit auto-depth each frame; a
@@ -8094,7 +8098,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let bound_ds = dev.bound_rt().depth_stencil();
         let (has_depth, has_stencil) = if !bound_ds.is_null() {
             // SAFETY: non-null check passed; refcount holds it live.
-            let fmt = unsafe { (*bound_ds).standalone_format() };
+            let fmt = unsafe { (*bound_ds).depth_attachment_format() };
             (true, depth_format_has_stencil(fmt))
         } else if dev.flags.contains(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND) {
             // App called `SetDepthStencilSurface(NULL)`: no depth attachment,
