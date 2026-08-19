@@ -193,6 +193,29 @@ validate against a mode list because no mode is set). The harness pins
 emulated mode switching and Retina mode so window-management assertions use a
 stable physical-pixel coordinate space.
 
+Two refinements landed 2026-08 after the CI runner exposed them (its virtual
+display accepts the mode changes this machine's macdrv rejects, so the tests
+walk further):
+
+- **One source of display truth.** `EnumAdapterModes` / `GetAdapterDisplayMode`
+  seed from `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` — the same view
+  win32u validates `ChangeDisplaySettingsW` against and derives
+  `GetMonitorInfoW` from — instead of `NSScreen`. On this machine the two
+  agree under the pinned Retina mode; on the runner's virtual display they
+  disagreed by exactly 2x (Win32 2048x1536, `NSScreen` 1024x768), which split
+  `GetDisplayMode` from the monitor rect (test_get_display_mode 14472/14474)
+  and fed the tests modes that user32 then refused.
+- **Registry-mode restore.** The one direction of the mode contract compatible
+  with never modesetting: when a fullscreen device loses focus
+  (`WM_ACTIVATEAPP FALSE`) or leaves fullscreen (windowed `Reset`, final
+  release) and the current mode differs from the registry mode — the app
+  changed it through user32, we never did — the device puts the registry mode
+  back (`ChangeDisplaySettingsW(NULL, 0)`), as native does. Locally this is
+  dormant (the tests' own mode changes fail first, so current always equals
+  registry); on the runner it covers test_wndproc 4261/4302/4328/4329 and
+  test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
+  the sites asserting the mode follows a Reset stay `expected`.
+
 ### The `real` backlog (12 distinct defects behind the 43 sites)
 
 | defect | cluster(s) | sites |
