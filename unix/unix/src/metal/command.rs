@@ -26,10 +26,10 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDepthClipMode, MTLDevice, MTLIndexType,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize,
-    MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
+    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLIndexType, MTLLoadAction,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture,
+    MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -1514,14 +1514,6 @@ fn encode_pass(
                     let depth_bias = f32::from_bits(cmd.param_a);
                     let slope_scale = f32::from_bits(to_u32(cmd.param_b));
                     encoder.setDepthBias_slopeScale_clamp(depth_bias, slope_scale, 0.0);
-                }
-                Some(CommandType::SetDepthClipMode) => {
-                    let mode = if cmd.param_a != 0 {
-                        MTLDepthClipMode::Clip
-                    } else {
-                        MTLDepthClipMode::Clamp
-                    };
-                    encoder.setDepthClipMode(mode);
                 }
                 Some(CommandType::SetFragmentTexture) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLTexture address.

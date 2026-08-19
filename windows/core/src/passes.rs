@@ -2734,11 +2734,6 @@ pub struct LastBoundCache {
     /// definite "not yet bound" sentinel — `(0, 0)` matches Metal's
     /// fresh-encoder default.
     depth_bias_bits: (u32, u32),
-    /// Depth-clip mode: `true` = Clip (Metal's fresh-encoder default), `false` = Clamp.
-    ///
-    /// Driven per-draw by "depth test active" (ZENABLE + a depth
-    /// attachment) — see `Command::set_depth_clip_mode`.
-    depth_clip: bool,
 }
 
 impl LastBoundCache {
@@ -2760,7 +2755,6 @@ impl LastBoundCache {
             scissor_rect: None,
             blend_color: 0xFFFF_FFFF,
             depth_bias_bits: (0, 0),
-            depth_clip: true,
         }
     }
 
@@ -2786,7 +2780,6 @@ impl LastBoundCache {
         self.scissor_rect = None;
         self.blend_color = 0xFFFF_FFFF;
         self.depth_bias_bits = (0, 0);
-        self.depth_clip = true;
     }
 
     #[inline]
@@ -2901,16 +2894,6 @@ impl LastBoundCache {
             false
         } else {
             self.depth_bias_bits = bits;
-            true
-        }
-    }
-
-    #[inline]
-    pub const fn depth_clip_changed(&mut self, clip: bool) -> bool {
-        if self.depth_clip == clip {
-            false
-        } else {
-            self.depth_clip = clip;
             true
         }
     }

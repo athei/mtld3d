@@ -1288,11 +1288,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    RHW draw unconditionally would wrongly bypass clipping here).
     // The RHW-with-bound-VS bypass resolves pre-transformed draws to a
     // FixedFunction source, so the FF key's has_rhw covers every RHW draw.
+    // Realized as a VS-side clamp selected per-draw through `pos_fixup.z`
+    // (emitted below with the half-pixel fixup) rather than
+    // `MTLDepthClipMode::Clamp`: encoder-level clamp is not honoured by
+    // every Metal device (a GitHub runner's paravirtual GPU clips
+    // regardless), while the clamp in the FF vertex shader behaves
+    // identically on all of them.
     let position_transformed = matches!(vs, VsSource::FixedFunction { key, .. } if key.has_rhw());
-    let depth_clip = (has_depth && render_state.depth_enable()) || !position_transformed;
-    if enc.last_bound().depth_clip_changed(depth_clip) {
-        enc.emit_command(Command::set_depth_clip_mode(depth_clip));
-    }
+    let depth_clamp_z = position_transformed && !(has_depth && render_state.depth_enable());
     drop(t_state);
 
     // Diagnostic probe: per-(VS, PS, state) decal + caster trace rows. Zero
@@ -1457,13 +1460,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // declares `constant float4 &pos_fixup [[buffer(13)]]` and shifts
     // clip-space position half a pixel right/down so on-boundary geometry
     // lands on the D3D9 window→NDC reference.
-    // `(1/vp_w, -1/vp_h, 0, 0)` from the live viewport; deduped so it only
-    // re-emits when the viewport dims change (rare).
+    // `(1/vp_w, -1/vp_h, depth_clamp_z, 0)` from the live viewport; the `.z`
+    // lane selects the FF RHW epilogue's depth clamp (the D3D9 depth-clamp
+    // rule, see `depth_clamp_z` above). Deduped so it only re-emits when the
+    // viewport dims or the clamp predicate change (rare).
     let (_, _, vp_w, vp_h) = enc.effective_viewport();
     // Viewport dims fit u16 in practice; convert without an `as`-cast
     // precision-loss lint (same idiom as `encoder.rs`).
     let to_f = |v: u32| f32::from(u16::try_from(v).unwrap_or(u16::MAX));
-    let pos_fixup: [f32; 4] = [1.0 / to_f(vp_w.max(1)), -1.0 / to_f(vp_h.max(1)), 0.0, 0.0];
+    let pos_fixup: [f32; 4] = [
+        1.0 / to_f(vp_w.max(1)),
+        -1.0 / to_f(vp_h.max(1)),
+        f32::from(u8::from(depth_clamp_z)),
+        0.0,
+    ];
     // SAFETY: `[f32; 4]` is POD with no padding; reinterpreting the array as
     // 16 contiguous bytes is sound and the borrow is local to this scope.
     let pos_fixup_bytes =

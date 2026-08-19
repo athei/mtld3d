@@ -68,14 +68,9 @@ pub enum CommandType {
     /// (`newBufferWithBytes`) for the draw, since Metal has no inline-index
     /// form.
     DrawIndexedPrimitivesUp = 17,
-    /// `encoder.setDepthClipMode:` — Clip (Metal's default) or Clamp.
-    ///
-    /// D3D9 z-clips primitives only while the depth test is live
-    /// (`D3DRS_ZENABLE` on AND a depth attachment bound); with the test
-    /// inactive, out-of-range-z fragments are depth-clamped and drawn —
-    /// an XYZRHW quad with z in [-0.5, 1.5] and no depth surface /
-    /// ZENABLE off rasterizes in full.
-    SetDepthClipMode = 18,
+    // 18 was SetDepthClipMode; the D3D9 depth-clamp rule is realized in the
+    // FF vertex shader now (`pos_fixup.z`), because encoder-level clamp is
+    // not honoured by every Metal device.
 }
 
 /// Fixed-size command struct written by the API thread and read by the encoding thread.
@@ -361,18 +356,6 @@ impl Command {
             cmd: CommandType::SetDepthBias as u32,
             param_a: depth_bias.to_bits(),
             param_b: slope_scale.to_bits() as u64,
-            param_c: 0,
-            param_d: 0,
-        }
-    }
-
-    /// `encoder.setDepthClipMode(clip ? Clip : Clamp)` — see [`CommandType::SetDepthClipMode`].
-    #[must_use]
-    pub const fn set_depth_clip_mode(clip: bool) -> Self {
-        Self {
-            cmd: CommandType::SetDepthClipMode as u32,
-            param_a: clip as u32,
-            param_b: 0,
             param_c: 0,
             param_d: 0,
         }

@@ -741,6 +741,24 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         // rasterizer's own depth uses.
         out.push_str("    out.fog_z = out.position.z / out.position.w;\n");
 
+        // Depth-clamp for pre-transformed geometry with the depth test
+        // inactive: D3D9 does not z-clip an
+        // XYZRHW draw when no depth test can reject it, so out-of-[0,1] z
+        // must survive to the raster stage. Clamped here in clip space
+        // instead of via `MTLDepthClipMode::Clamp` because encoder-level
+        // clamp is not honoured by every Metal device (a GitHub runner's
+        // paravirtual GPU clips regardless, failing zenable_test), while a
+        // VS-side clamp behaves identically everywhere: z is unused
+        // downstream in this variant (depth test inactive means no depth
+        // write either), and the table-fog Z source above reads the
+        // unclamped value. `pos_fixup.z != 0` selects it per-draw — the
+        // predicate lives in `draw.rs` (depth test active keeps clipping;
+        // both conjuncts are load-bearing, see zenable_test's second half
+        // and depth_clamp_test).
+        out.push_str(
+            "    if (pos_fixup.z != 0.0) { out.position.z = clamp(out.position.z, 0.0, out.position.w); }\n",
+        );
+
         out.push_str("    return out;\n");
         out.push_str("}\n");
         return;

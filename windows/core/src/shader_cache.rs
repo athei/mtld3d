@@ -218,7 +218,11 @@ use crate::shader_compile_stats::CompileBucket;
 /// `55` adds `VariantKey::cube_sampler_mask`, which changes fixed-function
 /// pixel-shader keys and emits `texturecube<float>` bindings with `.xyz`
 /// coordinates.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 55;
+///
+/// `56` adds the `pos_fixup.z`-selected depth clamp to the FF XYZRHW vertex
+/// epilogue (the D3D9 depth-clamp rule, previously `MTLDepthClipMode::Clamp`
+/// on the encoder), changing the MSL of every FF RHW vertex shader.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 56;
 
 /// File magic.
 ///
