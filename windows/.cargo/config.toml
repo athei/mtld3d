@@ -25,6 +25,11 @@ target = "i686-pc-windows-msvc"
 # walking the guest frame-pointer chain, and a build without them stops every
 # walk at the leaf), so `FP=1 make` appends `-C force-frame-pointers=yes` to
 # these rustflags for a build meant to be profiled.
+
+# The PE linker is a symlink `make setup-rust` creates onto the `rust-lld` that
+# the toolchain's own `llvm-tools` component ships, because LLD selects its COFF
+# driver from the name it is invoked under. Same trick as the archiver at the
+# bottom of this file, and between them nothing here needs a Homebrew LLVM.
 [target.i686-pc-windows-msvc]
 linker = "lld-link"
 rustflags = [
@@ -71,9 +76,11 @@ CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -fno-omit-frame-pointer -idira
 CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
-# `llvm-lib` from the Homebrew llvm keg (keg-only, not on PATH). These paths
-# assume an Apple-Silicon Homebrew prefix; for a different prefix (Intel
-# `/usr/local`, MacPorts, a versioned `llvm@N` keg) override per target via the
-# `AR_<target>` environment variable.
-AR_i686-pc-windows-msvc         = "/opt/homebrew/opt/llvm/bin/llvm-lib"
-AR_x86_64-pc-windows-msvc       = "/opt/homebrew/opt/llvm/bin/llvm-lib"
+# The MSVC librarian, as a bare name resolved from PATH: `make setup-rust` puts an
+# `llvm-lib` symlink in the cargo bin directory onto `llvm-ar`, which switches to
+# lib.exe-compatible mode based on the name it is invoked under. That mode is what
+# matters, because cc-rs drives the archiver with MSVC syntax (`-out:`) for these
+# targets. Apple's `ar` cannot stand in: it is Mach-O only, and handed a COFF
+# object it writes an archive with no members at all and exits 0.
+AR_i686-pc-windows-msvc         = "llvm-lib"
+AR_x86_64-pc-windows-msvc       = "llvm-lib"

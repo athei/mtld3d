@@ -9,9 +9,9 @@ description: Restore the shared caches and bring up exactly the toolchain one CI
 inputs:
   pe:
     description: >
-      Leg builds for a PE target: needs the MSVC SDK splat, the Homebrew LLVM,
-      and the Wine SDK, since windows/shim links against Wine's import libraries
-      and `winebuild` marks the built DLLs.
+      Leg builds for a PE target: needs the MSVC SDK splat, and the Wine SDK,
+      since windows/shim links against Wine's import libraries and `winebuild`
+      marks the built DLLs.
     default: 'false'
   wine:
     description: >
@@ -87,11 +87,6 @@ runs:
       if: inputs.pe != 'true'
       shell: bash
       run: make setup-rust
-
-    - name: Homebrew llvm and lld
-      if: inputs.pe == 'true'
-      shell: bash
-      run: make setup-brew
 
     # /opt is root-owned, so the cache cannot restore into /opt/xwin until this
     # has created it and handed it to the runner user.

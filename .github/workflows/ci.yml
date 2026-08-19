@@ -28,8 +28,12 @@ env:
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  # Metal API validation stays on, but reports instead of trapping, the way the
+  # conformance runner already does it. A validation failure inside translated
+  # x86 code otherwise surfaces as a bare SIGTRAP with a Rosetta message and no
+  # statement of what was invalid.
+  MTL_DEBUG_LAYER_ERROR_MODE: nslog
+  MTL_DEBUG_LAYER_WARNING_MODE: nslog
 
 jobs:
   # The linear part: one job downloads and builds the shared state (toolchains,
@@ -66,10 +70,10 @@ jobs:
       - uses: ./.github/actions/prepare
       - run: make audit
 
-  # clippy for the two PE targets. `pe` gates the MSVC SDK, the Homebrew LLVM and
-  # the Wine SDK: clippy runs build scripts, so snmalloc-sys and zstd-sys need the
-  # xwin headers and the keg's llvm-lib, and windows/shim's build script reads
-  # Wine's libwinecrt0.a, all before anything is linked.
+  # clippy for the two PE targets. `pe` gates the MSVC SDK and the Wine SDK:
+  # clippy runs build scripts, so snmalloc-sys and zstd-sys need the xwin headers
+  # and the archiver, and windows/shim's build script reads Wine's libwinecrt0.a,
+  # all before anything is linked.
   clippy-pe:
     needs: setup
     runs-on: macos-26

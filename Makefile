@@ -203,7 +203,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
 	clippy-native audit doc doc-windows doc-unix check clean upgrade \
-	upgrade-incompat setup setup-brew setup-rust setup-dev setup-xwin \
+	upgrade-incompat setup setup-rust setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
 
@@ -564,23 +564,16 @@ upgrade-incompat:
 # for the same reason the test and lint targets are: a host-only leg needs
 # neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
 # stands alone and this is the everything-at-once aggregate.
-setup: setup-brew setup-rust setup-dev setup-xwin setup-rosetta
-
-# `lld-link` (the PE linker) and the llvm keg's `llvm-lib` (the PE archiver,
-# named by absolute path in windows/.cargo/config.toml) both come from here, so
-# every PE build, lint and doc leg needs this one.
-setup-brew:
-	@echo "==> brew: install/upgrade llvm and lld"
-	brew install llvm lld
-	brew upgrade llvm lld
+setup: setup-rust setup-dev setup-xwin setup-rosetta
 
 setup-rust:
 	@echo "==> rustup: install $(RUST_STABLE) and $(RUST_NIGHTLY) with the cross-compile targets"
 	# `--profile minimal` plus the one component each toolchain is here for:
 	# clippy for the lint legs (rustdoc travels with rustc, so `doc` is covered),
-	# rustfmt for the fmt legs. Nightly is only ever used for rustfmt; every
-	# build, lint and test leg runs on stable.
-	rustup toolchain install $(RUST_STABLE) --profile minimal --component clippy
+	# llvm-tools for the PE linker and archiver below, rustfmt for the fmt legs.
+	# Nightly is only ever used for rustfmt; every build, lint and test leg runs
+	# on stable.
+	rustup toolchain install $(RUST_STABLE) --profile minimal --component clippy --component llvm-tools
 	rustup target add --toolchain $(RUST_STABLE) \
 		$(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
 	rustup toolchain install $(RUST_NIGHTLY) --profile minimal --component rustfmt
@@ -593,6 +586,18 @@ setup-rust:
 	# installed package asks for, which is what we want and worth saying out loud.
 	@echo "==> cargo: install/upgrade $(CARGO_TOOLS)"
 	cargo +$(RUST_STABLE) install --locked $(CARGO_TOOLS)
+	# The PE linker and archiver, out of the toolchain's own llvm-tools rather
+	# than a Homebrew LLVM: both LLD and llvm-ar choose their behaviour from the
+	# name they are invoked under, so `lld-link` gets LLD's COFF driver and
+	# `llvm-lib` gets llvm-ar's lib.exe-compatible mode, which is the syntax
+	# cc-rs uses for an MSVC target. windows/.cargo/config.toml names both
+	# without a path, so they go in the cargo bin directory, which is already on
+	# PATH anywhere cargo works and is cached as one unit with the toolchain.
+	@bin=$$(rustc +$(RUST_STABLE) --print sysroot)/lib/rustlib/$(UNIX_NATIVE_TARGET)/bin ; \
+	dest=$${CARGO_HOME:-$$HOME/.cargo}/bin ; \
+	echo "==> tools: $$dest/{lld-link,llvm-lib} -> $$bin/{rust-lld,llvm-ar}" ; \
+	ln -sf $$bin/rust-lld $$dest/lld-link ; \
+	ln -sf $$bin/llvm-ar $$dest/llvm-lib
 
 # Tooling only a person uses: cargo-edit backs `upgrade` and `upgrade-incompat`,
 # which no CI leg runs, so it stays out of `setup-rust` rather than being rebuilt
