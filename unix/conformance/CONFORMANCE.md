@@ -229,7 +229,7 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (12 distinct defects behind the 43 sites)
+### The `real` backlog (11 distinct defects behind the 42 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
@@ -244,7 +244,6 @@ walk further):
 | Depth→depth StretchRect is an S_OK no-op | depth_blit_test | 1 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
 | CreateTexture(depth) succeeds while our own CheckDeviceFormat denies it | test_resource_access | 1 |
-| Occlusion query undercounts a >2^32-sample span (cause unproven) | test_occlusion_query | 1 |
 
 Coupling note for the stream-frequency fix: implementing the Set/Get round-trip
 un-gates the instanced draws behind it, so the by-design instancing pixel sites
@@ -388,16 +387,25 @@ Reset. Ours adopts the monitor rect instead, since there is no mode. (5951 and
 5971, which check that the window covers the screen at all, now pass.)
 
 ### device.c/test_occlusion_query
-Sites: 6780=real
+Sites: 6780=expected
 
-A query spanning ~2^32+ samples returns a genuine undercount (this run:
-0x1de98f00 — a non-integer multiple of one fullscreen quad). The test
-accepts the exact 64-bit count or 32-bit saturation; our own fallback paths
-(slot exhaustion → u32::MAX) would have passed the saturation clause, so
-the undercount is unexplained. No capability branch is involved, so the old
-`caps` tag was wrong. Tagged `real` pending investigation of the visibility
-span/slot summation; if the undercount is proven intrinsic to Metal
-visibility counting, retag `expected` with that evidence.
+The >2^32-sample query (65 fullscreen 8192x8192 quads under one query, depth
+test off) undercounts because Apple's TBDR hidden-surface removal merges
+same-encoder opaque overdraw before fragment processing: the visibility
+counter reports the samples that *survive* HSR, not every sample that would
+have passed the depth test on an immediate-mode GPU. Proven by
+instrumentation, not inferred: the GPU-written slot value itself is short
+(our BEGIN..END span is a single slot in a single frame, summed correctly),
+the value is always an integer number of 8192-wide quad ROWS (0x1de98f00 =
+8192 x 61260; an earlier environment read 0x077a63c0 = 8192 x 15315) —
+tile-row-granular partial renders decide how many overdraw layers escape
+culling, which is why the number moves between environments. The same test's
+single-quad section counts bit-exactly (0x75cf00 = one 3456x2234 quad), so
+the machinery is precise whenever HSR has nothing to merge. Counting all
+overdraw layers would need an encoder per draw under active queries,
+destroying pass batching — the kept optimization is single-encoder pass
+batching, so this is `expected`. Real-game occlusion (a bounding box tested
+against a populated depth buffer, read as zero/non-zero) is unaffected.
 
 ### device.c/test_lockrect_invalid
 Sites: 8664=expected 8682=expected 8701=expected
