@@ -24,7 +24,7 @@ concurrency:
 # syntax. The MSVC CRT and Windows SDK versions are pinned in the Makefile
 # instead, beside the xwin call that consumes them.
 env:
-  WINE_RELEASE: cx-26.3.0-0
+  WINE_RELEASE: cx-26.3.0-1
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
@@ -152,7 +152,48 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
 
-  # d3d9 conformance is deliberately absent: it runs Wine's own d3d9_test.exe out
-  # of the SDK bundle, and no wine-build release carries those binaries yet.
-  # Adding conformance-i686 / conformance-x86_64 is a follow-up, together with the
-  # WINE_RELEASE bump that brings them.
+  # Wine's own d3d9_test.exe against our builtin, per-site counts diffed against
+  # unix/conformance/baseline.txt. One arch per runner process, and not part of
+  # `make test`: many subtests fail by design, so this gates on a regression
+  # rather than on zero failures. The per-subtest budget is raised from its 180 s
+  # default because the GPU here is paravirtual, and a subtest killed for taking
+  # too long is reported as a crash.
+  conformance:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [i686, x86_64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
+      - run: make conformance-${{ matrix.arch }}
+        env:
+          MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
+
+  # The distribution bundle, which no other leg covers: it stages both install
+  # routes, marks the builtins, and packs the symbols archive alongside, all from
+  # artifacts for four targets. PROD=0 takes the release profile instead of
+  # production, so this exercises that staging without paying for fat LTO on four
+  # targets; a release build is still made by hand.
+  bundle:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # BUILD_ID, which names the build inside the symbols archive, comes
+          # from `git describe --tags`.
+          fetch-tags: true
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
+      - run: make bundle PROD=0
