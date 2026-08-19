@@ -7,10 +7,9 @@ export WINE_SDK
 # install we build against and install into. Not found on PATH, and NOT by
 # exporting one either: make execs a simple recipe line itself rather than
 # through a shell, and that lookup reads make's own environment, so a PATH
-# exported here is never consulted. It appears to work on a machine whose shell
-# already has the SDK on PATH and fails everywhere else, which is precisely what
-# a CI runner is. The loader needs no PATH of its own; it finds wineserver and
-# its libraries relative to its own location.
+# exported here is never consulted, so a bare name only resolves on a machine
+# whose shell already has the SDK on PATH. The loader needs no PATH of its own;
+# it finds wineserver and its libraries relative to its own location.
 WINE       := $(WINE_SDK)/bin/wine
 WINEBUILD  := $(WINE_SDK)/bin/winebuild
 WINESERVER := $(WINE_SDK)/bin/wineserver

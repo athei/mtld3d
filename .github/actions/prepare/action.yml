@@ -50,14 +50,12 @@ runs:
     # Two caches, because the two halves of a cargo home change for different
     # reasons and one of them must never be restored partially.
     #
-    # The toolchains and the cargo-installed tools take NO restore-keys. The
-    # ledger files (.crates.toml, .crates2.json) are cargo's record of which
-    # crate owns which installed binary, so they have to arrive with `bin` or the
-    # next `cargo install` refuses to touch what it sees as strays ("binary
-    # `xwin` already exists in destination") instead of skipping them. A prefix
-    # fallback could hand back an entry with one and not the other, which is
-    # exactly the failure it looks like it is avoiding, and only the setup job
-    # pays for a miss anyway.
+    # The ledger files (.crates.toml, .crates2.json) are cargo's record of which
+    # crate owns which installed binary, and have to arrive with `bin`: without
+    # them `cargo install` treats the restored binaries as strays and refuses to
+    # proceed rather than skipping them. Hence no restore-keys here, since a
+    # prefix fallback can hand back one without the other; a miss costs the setup
+    # job one cold install and the other legs nothing.
     - name: Restore the toolchains and cargo tools
       uses: actions/cache/restore@v4
       with:

@@ -15,22 +15,14 @@ filter = "package(mtld3d-tests)"
 test-group = "gpu"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
-# CI profile, for a runner where the GPU is paravirtual ('Apple Virtual') and
-# every guest instruction is translated:
+# CI profile, for a runner whose GPU is paravirtual ('Apple Virtual') and whose
+# guest code is translated:
 #
-#   test-threads = 1    THE fix for that environment, not a precaution. Run four
-#                       at a time there and tests that create a device abort or
-#                       hang, the same test differing between arches and between
-#                       runs; serially all 165 pass on both arches. A prefix
-#                       under CrossOver needs the same treatment, for what is
-#                       presumably the same reason: concurrent CreateDevice
-#                       wedges something below us. Metal's validation layer was
-#                       the other suspect and was cleared by re-enabling it
-#                       alone on a serial run.
-#   fail-fast = false   one broken test otherwise cancels the other 164, and a
-#                       log showing four results out of 165 is what made the
-#                       above take three runs to see.
-#   slow-timeout        a test that is merely slow on a virtual GPU must not be
+#   test-threads = 1    Required there. Concurrent device creation aborts or
+#                       hangs tests, non-deterministically; serially the suite
+#                       passes. A prefix under CrossOver needs the same.
+#   fail-fast = false   Report the whole suite rather than the first failure.
+#   slow-timeout        A test that is only slow on a virtual GPU must not be
 #                       killed and counted as a hang.
 [profile.ci]
 fail-fast = false

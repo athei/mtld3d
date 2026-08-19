@@ -28,12 +28,9 @@ env:
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
-  # The Metal HUD only: the GPU on a runner is paravirtual ('Apple Virtual') and
-  # does not implement the counters the HUD samples, which it announces on every
-  # single launch. The validation layer is deliberately NOT turned off and keeps
-  # the Makefile's default: it was the suspect for the e2e aborts and was cleared
-  # by re-enabling it on its own once the suite ran serially, so CI keeps the
-  # misuse checking those legs exist to provide.
+  # The paravirtual GPU on a runner does not implement the counters the Metal HUD
+  # samples, and says so on every launch. The validation layer keeps the
+  # Makefile's default of on: it catches the misuse these legs exist to find.
   MTL_HUD_ENABLED: "0"
 
 jobs:
