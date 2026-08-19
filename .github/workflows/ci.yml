@@ -191,8 +191,8 @@ jobs:
   # routes, marks the builtins, and packs the symbols archive alongside, all from
   # artifacts for four targets. Built the way a release is, at the default PROD=1,
   # so the production profile's fat LTO is exercised here rather than first
-  # failing when a release is cut. It is the longest job by some way, and runs
-  # alongside the others.
+  # failing when a release is cut. Costs about 5 minutes, which is less than the
+  # e2e legs take.
   bundle:
     needs: setup
     runs-on: macos-26
