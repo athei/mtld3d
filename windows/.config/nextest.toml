@@ -14,3 +14,23 @@ gpu = { max-threads = 4 }
 filter = "package(mtld3d-tests)"
 test-group = "gpu"
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+# CI profile, for a runner where the GPU is paravirtual ('Apple Virtual') and
+# every guest instruction is translated. Three differences from the default, all
+# about seeing what is happening rather than changing what is tested:
+#
+#   fail-fast = false   one broken test otherwise cancels the other 164 and the
+#                       log shows four results out of a suite of 165.
+#   test-threads = 1    no two Metal devices at once, which takes GPU and
+#                       wineserver contention out of the picture; a prefix under
+#                       CrossOver needed the same treatment.
+#   slow-timeout        a test that is merely slow on a virtual GPU must not be
+#                       killed and counted as a hang.
+[profile.ci]
+fail-fast = false
+test-threads = 1
+
+[[profile.ci.overrides]]
+filter = "package(mtld3d-tests)"
+test-group = "gpu"
+slow-timeout = { period = "120s", terminate-after = 2 }

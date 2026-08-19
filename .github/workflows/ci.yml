@@ -28,12 +28,13 @@ env:
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
-  # Metal API validation stays on, but reports instead of trapping, the way the
-  # conformance runner already does it. A validation failure inside translated
-  # x86 code otherwise surfaces as a bare SIGTRAP with a Rosetta message and no
-  # statement of what was invalid.
-  MTL_DEBUG_LAYER_ERROR_MODE: nslog
-  MTL_DEBUG_LAYER_WARNING_MODE: nslog
+  # No Metal HUD and no validation layer on a runner: the GPU there is
+  # paravirtual ('Apple Virtual') and does not implement the counters the HUD
+  # samples, and validation, whose whole value is catching misuse against a real
+  # driver, has so far only produced a bare abort inside translated code with no
+  # statement of what it objected to. Both are on by default for a developer.
+  MTL_HUD_ENABLED: "0"
+  MTL_DEBUG_LAYER: "0"
 
 jobs:
   # The linear part: one job downloads and builds the shared state (toolchains,
@@ -147,7 +148,12 @@ jobs:
           pe: 'true'
           wine: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
+      # The ci profile runs the suite serially and to completion; see
+      # windows/.config/nextest.toml. Scoped to this job because the unix
+      # workspace has no nextest config to carry the same profile.
       - run: make test-e2e-${{ matrix.arch }}
+        env:
+          NEXTEST_PROFILE: ci
 
   # d3d9 conformance is deliberately absent: it runs Wine's own d3d9_test.exe out
   # of the SDK bundle, and no wine-build release carries those binaries yet.

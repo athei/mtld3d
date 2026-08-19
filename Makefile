@@ -143,8 +143,13 @@ DENY_WARNINGS := --config 'build.warnings="deny"'
 
 INSTALL_DIRS := $(WINE_SDK) $(WINE_INSTALL_DIR)
 
-export MTL_HUD_ENABLED = 1
-export MTL_DEBUG_LAYER = 1
+# Both overridable, unlike the rest of these: the HUD and the validation layer
+# are here to catch Metal misuse on a real GPU, and a caller running against a
+# paravirtual one (a CI runner) has reason to turn them off, since neither has
+# anything useful to say about a device that does not implement the counters they
+# read.
+export MTL_HUD_ENABLED ?= 1
+export MTL_DEBUG_LAYER ?= 1
 export WINEDLLOVERRIDES = mscoree,mshtml=
 export WINEDEBUG=+msync
 export WINEMSYNC=1
