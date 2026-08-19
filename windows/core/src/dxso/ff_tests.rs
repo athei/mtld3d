@@ -1135,6 +1135,37 @@ fn xyzrhw_emits_half_pixel_offset_window_to_ndc() {
 }
 
 #[test]
+fn rhw_emits_pos_fixup_selected_depth_clamp() {
+    // The XYZRHW epilogue realizes the D3D9 depth-clamp rule in the shader:
+    // `pos_fixup.z != 0` (set per-draw when the depth test is inactive)
+    // clamps clip-space z to [0, w]. Shader-side because encoder-level
+    // `MTLDepthClipMode::Clamp` is not honoured by every Metal device, and
+    // AFTER the `fog_z` write so table fog keeps reading unclamped depth.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_RHW, true);
+    let msl = emit_vs_ff(&vs);
+    let clamp =
+        "if (pos_fixup.z != 0.0) { out.position.z = clamp(out.position.z, 0.0, out.position.w); }";
+    assert!(
+        msl.contains(clamp),
+        "RHW epilogue must carry the pos_fixup.z-selected depth clamp:\n{msl}"
+    );
+    let fog_z = msl.find("out.fog_z =").expect("RHW epilogue writes fog_z");
+    let clamp_at = msl.find(clamp).expect("checked above");
+    assert!(
+        fog_z < clamp_at,
+        "fog_z must be written from the unclamped position:\n{msl}"
+    );
+    // The regular (non-RHW) transform path clips like every other draw and
+    // must not grow the clamp.
+    let msl_plain = emit_vs_ff(&default_vs_key());
+    assert!(
+        !msl_plain.contains("pos_fixup.z != 0.0"),
+        "non-RHW FF VS must not emit the depth clamp:\n{msl_plain}"
+    );
+}
+
+#[test]
 fn ff_transform_emits_half_pixel_pos_fixup() {
     // The FF transformed-position path (non-XYZRHW) declares the buffer-13
     // `pos_fixup` uniform and shifts clip-space position half a pixel
