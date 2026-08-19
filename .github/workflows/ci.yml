@@ -186,6 +186,21 @@ jobs:
       - run: make conformance-${{ matrix.arch }}
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
+          # Every subtest's full output, which is what carries the
+          # `Got <actual>, expected <expected>` values behind each site. The
+          # job's own log reduces to per-site counts, and counts alone cannot
+          # say why this environment diverges.
+          MTLD3D_CONFORMANCE_RAW_DIR: ${{ runner.temp }}/conformance-raw
+
+      # `always()`, because a diverging run is exactly the one whose output is
+      # worth reading, and the job reports failure whenever it diverges.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-raw-${{ matrix.arch }}
+          path: ${{ runner.temp }}/conformance-raw
+          retention-days: 14
+          if-no-files-found: error
 
   # The distribution bundle, which no other leg covers: it stages both install
   # routes, marks the builtins, and packs the symbols archive alongside, all from
