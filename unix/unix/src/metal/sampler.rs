@@ -81,9 +81,47 @@ pub fn create_sampler_state(
         objc2_foundation::NSString::from_str(&format!("mtld3d-{label_kind}-{:#x}", params.id));
     desc.setLabel(Some(&label));
 
-    let sampler = device.newSamplerStateWithDescriptor(&desc)?;
+    let mut sampler = device.newSamplerStateWithDescriptor(&desc);
+    if sampler.is_none() && uses_mirror_clamp(params) {
+        // `MirrorClampToEdge` (D3DTADDRESS_MIRRORONCE) is unimplemented on
+        // some Metal devices — a GitHub runner's paravirtual GPU rejects the
+        // descriptor outright. Retry with `MirrorRepeat`, which matches
+        // MIRRORONCE inside |coord| <= 1 (where content actually samples)
+        // and only diverges beyond it.
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "sampler: MirrorClampToEdge unsupported on this device — falling back to MirrorRepeat"
+        );
+        let fix = |mode: AddressMode| {
+            if mode == AddressMode::MirrorClampToEdge {
+                MTLSamplerAddressMode::MirrorRepeat
+            } else {
+                mtl_address_mode(mode)
+            }
+        };
+        desc.setSAddressMode(fix(params.address_u));
+        desc.setTAddressMode(fix(params.address_v));
+        desc.setRAddressMode(fix(params.address_w));
+        sampler = device.newSamplerStateWithDescriptor(&desc);
+    }
+    let Some(sampler) = sampler else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "sampler: newSamplerStateWithDescriptor failed (id={:#x}) — draws with this sampler bind nothing",
+            params.id
+        );
+        return None;
+    };
     // SAFETY: Retained::into_raw transfers the retain into the typed handle.
     Some(unsafe { MetalHandle::<MTLSamplerStateKind>::new(Retained::into_raw(sampler) as u64) })
+}
+
+/// Whether any of the three address modes is `MirrorClampToEdge`.
+#[inline]
+fn uses_mirror_clamp(params: &CreateSamplerStateParams) -> bool {
+    params.address_u == AddressMode::MirrorClampToEdge
+        || params.address_v == AddressMode::MirrorClampToEdge
+        || params.address_w == AddressMode::MirrorClampToEdge
 }
 
 /// Release a Metal sampler-state handle.
