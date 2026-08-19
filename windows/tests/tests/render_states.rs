@@ -267,10 +267,6 @@ fn cull_mode_discriminates_winding() {
 
 #[test]
 fn stencil_render_states_round_trip() {
-    // The stencil render states store and read back, but mtld3d does not yet
-    // translate them into a Metal stencil descriptor (create_depth_stencil_state
-    // sets only depth compare + write), so stencil testing does not gate
-    // rendering — a documented limitation, not exercised by the target workload.
     let h = Harness::with_depth();
     for (state, value) in [
         (D3DRS_STENCILENABLE, 1),

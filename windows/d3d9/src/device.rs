@@ -10071,22 +10071,27 @@ const fn rs_classify(index: u32) -> RsClass {
         // decals (shadows, projectors, alpha overlays) z-fight with
         // the surface they sit on.
         | D3DRS_DEPTHBIAS
-        | D3DRS_SLOPESCALEDEPTHBIAS => RsClass::Consumed,
-
-        // Bucket B — not yet implemented → port-target candidates.
-        D3DRS_STENCILENABLE => RsClass::PortCandidate("stencil test"),
-        D3DRS_STENCILFAIL
+        | D3DRS_SLOPESCALEDEPTHBIAS
+        // The stencil states reach Metal through
+        // depth_stencil_state::snapshot_from_state, whose per-field tests
+        // assert that mutating any of them produces a different
+        // DepthStencilKey. STENCILREF is the exception by design: it rides
+        // the encoder as SetStencilReference, not the state object.
+        | D3DRS_STENCILENABLE
+        | D3DRS_STENCILFAIL
         | D3DRS_STENCILZFAIL
         | D3DRS_STENCILPASS
         | D3DRS_STENCILFUNC
         | D3DRS_STENCILMASK
         | D3DRS_STENCILWRITEMASK
-        | D3DRS_STENCILREF => RsClass::PortCandidate("stencil"),
-        D3DRS_TWOSIDEDSTENCILMODE => RsClass::PortCandidate("two-sided stencil"),
-        D3DRS_CCW_STENCILFAIL
+        | D3DRS_STENCILREF
+        | D3DRS_TWOSIDEDSTENCILMODE
+        | D3DRS_CCW_STENCILFAIL
         | D3DRS_CCW_STENCILZFAIL
         | D3DRS_CCW_STENCILPASS
-        | D3DRS_CCW_STENCILFUNC => RsClass::PortCandidate("CCW stencil"),
+        | D3DRS_CCW_STENCILFUNC => RsClass::Consumed,
+
+        // Bucket B — not yet implemented → port-target candidates.
         D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
         D3DRS_RANGEFOGENABLE => RsClass::PortCandidate("range fog"),
         D3DRS_FILLMODE => {
