@@ -1,0 +1,141 @@
+name: prepare
+description: Restore the shared caches and bring up exactly the toolchain one CI leg needs.
+
+# Every leg is one `make` target, so this holds no build logic: it restores the
+# caches the setup job primed and then calls the `setup-*` leaves the Makefile
+# already exposes. The inputs are what a leg needs, not what it is: a host-only
+# lint leg wants neither the MSVC SDK nor Rosetta, and only the e2e legs run
+# Wine at all.
+inputs:
+  pe:
+    description: Leg builds for a PE target, so it needs the MSVC SDK splat and the Homebrew LLVM.
+    default: 'false'
+  wine:
+    description: Leg runs Wine, so it needs the pinned SDK bundle and Rosetta.
+    default: 'false'
+  wine-release:
+    description: wine-build release tag to download on a cache miss. Only read when `wine` is true.
+    default: ''
+  prime:
+    description: >
+      This is the linear setup job: warm the cargo registry and save every cache
+      it touched. The legs that fan out afterwards only ever restore.
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Mandatory for every `make` call (the Makefile hard-errors without it and
+    # prepends $WINE_SDK/bin to PATH so wine, wineserver and winebuild resolve).
+    # Under $HOME rather than the workspace: checkout's `git clean` would take
+    # anything inside the workspace with it.
+    - name: Point WINE_SDK at the extracted bundle
+      shell: bash
+      run: echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+
+    # Keyed on the lockfiles for the crates and on the two files that carry the
+    # pins (ci.yml pins the toolchains, the Makefile pins the MSVC CRT and SDK),
+    # so bumping a pin rotates the cache instead of quietly reusing the old one.
+    - name: Restore the cargo home
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.rustup
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml', 'Makefile', '**/Cargo.lock') }}
+        restore-keys: |
+          rust-${{ runner.os }}-${{ runner.arch }}-
+
+    # Skipped on a PE leg: `setup-xwin` below has it as a prerequisite, and it is
+    # the one step that has to run after the splat cache lands, so running it here
+    # too would just repeat the rustup and cargo-install checks.
+    - name: Toolchains
+      if: inputs.pe != 'true'
+      shell: bash
+      run: make setup-rust
+
+    - name: Homebrew llvm and lld
+      if: inputs.pe == 'true'
+      shell: bash
+      run: make setup-brew
+
+    # /opt is root-owned, so the cache cannot restore into /opt/xwin until this
+    # has created it and handed it to the runner user.
+    - name: Claim /opt/xwin
+      if: inputs.pe == 'true'
+      shell: bash
+      run: make xwin-dir
+
+    - name: Restore the MSVC SDK splat
+      uses: actions/cache/restore@v4
+      if: inputs.pe == 'true'
+      with:
+        path: /opt/xwin
+        key: xwin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+        restore-keys: |
+          xwin-${{ runner.os }}-${{ runner.arch }}-
+
+    # A no-op on a hit: the splat carries a stamp of what it holds, and the
+    # Makefile pins the versions this compares against.
+    - name: MSVC SDK
+      if: inputs.pe == 'true'
+      shell: bash
+      run: make setup-xwin
+
+    - name: Restore the Wine SDK
+      id: wine-cache
+      uses: actions/cache/restore@v4
+      if: inputs.wine == 'true'
+      with:
+        path: ~/wine-sdk
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
+
+    # The tarball unpacks to `wine/`, so this lands at $HOME/wine-sdk/wine, which
+    # is what WINE_SDK points at above. `make install` writes our builtin into
+    # this tree, which is why the legs restore it but never save it back.
+    - name: Download the pinned Wine SDK
+      if: inputs.wine == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/wine-sdk"
+        curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
+          "https://github.com/athei/wine-build/releases/download/${{ inputs.wine-release }}/wine-${{ inputs.wine-release }}-macos-x86_64.tar.xz"
+        tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
+
+    # The SDK is an x86_64 build and every PE it loads is x86 code.
+    - name: Rosetta
+      if: inputs.wine == 'true'
+      shell: bash
+      run: make setup-rosetta
+
+    - name: Warm the cargo registry
+      if: inputs.prime == 'true'
+      shell: bash
+      run: make fetch
+
+    - name: Save the cargo home
+      uses: actions/cache/save@v4
+      if: inputs.prime == 'true'
+      with:
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.rustup
+        key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml', 'Makefile', '**/Cargo.lock') }}
+
+    - name: Save the MSVC SDK splat
+      uses: actions/cache/save@v4
+      if: inputs.prime == 'true' && inputs.pe == 'true'
+      with:
+        path: /opt/xwin
+        key: xwin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+
+    - name: Save the Wine SDK
+      uses: actions/cache/save@v4
+      if: inputs.prime == 'true' && inputs.wine == 'true'
+      with:
+        path: ~/wine-sdk
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}

@@ -69,12 +69,43 @@ UNIX_WINEDIR_arm64 := aarch64-unix
 # (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta.
 UNIX_NATIVE_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
 
+# Which toolchains to use. Both float for a developer, who tracks stable and
+# nightly and whose `rustc -V` is allowed to differ from anyone else's, and CI
+# pins both to exact versions (see .github/workflows/ci.yml), because clippy runs
+# nursery + pedantic with warnings denied, so a new release landing on a runner
+# image would otherwise redden a run nobody here touched.
+RUST_STABLE  ?= stable
+RUST_NIGHTLY ?= nightly
+
+# rustup reads this for every cargo and rustc below, so not one recipe has to
+# name a toolchain and a cargo line added later cannot escape the pin by
+# forgetting to. A `+toolchain` on the command line outranks it, which is exactly
+# how the two fmt recipes reach nightly while everything else stays on stable.
+export RUSTUP_TOOLCHAIN := $(RUST_STABLE)
+
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
 OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
 OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
 OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
 XWIN_CACHE := $(HOME)/Library/Caches/xwin
+# What the splat in /opt/xwin actually holds, written there by `setup-xwin` and
+# read back by it to decide whether upstream has moved on. Stamped inside the
+# splat rather than inferred from the download cache so the decision survives a
+# cleared cache, and so CI can cache the splat alone instead of a second copy of
+# the downloads next to it.
+XWIN_STAMP := /opt/xwin/.xwin-packages
+# The MSVC CRT and the Windows SDK are PINNED. Without these two flags `xwin`
+# takes whatever is newest in Microsoft's channel manifest at the moment it
+# runs, so an upstream release nobody here asked for would change the headers
+# and import libs under a build, on one machine before another. Bump them
+# deliberately; `setup-xwin` notices on its own, because the package names it
+# stamps carry the versions.
+XWIN_CRT_VERSION := 14.44.17.14
+XWIN_SDK_VERSION := 10.0.26100
+XWIN := xwin --accept-license --arch x86,x86_64 \
+	--crt-version $(XWIN_CRT_VERSION) --sdk-version $(XWIN_SDK_VERSION) \
+	--cache-dir $(XWIN_CACHE)
 
 # Wine's own d3d9 test binaries, as published inside the SDK bundle by
 # wine-build's bundle step (`make install` puts our builtin `d3d9.dll` into the
@@ -144,8 +175,9 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
-	clippy-native audit doc doc-windows doc-unix check clean setup upgrade \
-	upgrade-incompat
+	clippy-native audit doc doc-windows doc-unix check clean upgrade \
+	upgrade-incompat setup setup-brew setup-rust setup-xwin setup-rosetta \
+	xwin-dir fetch
 
 all: windows unix
 
@@ -420,12 +452,12 @@ conformance-isolate: install-pe-$(ARCH) install-so-$(SDK_SO_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT))
 
 fmt:
-	cd windows && cargo +nightly fmt
-	cd unix && cargo +nightly fmt
+	cd windows && cargo +$(RUST_NIGHTLY) fmt
+	cd unix && cargo +$(RUST_NIGHTLY) fmt
 
 fmt-check:
-	cd windows && cargo +nightly fmt --check
-	cd unix && cargo +nightly fmt --check
+	cd windows && cargo +$(RUST_NIGHTLY) fmt --check
+	cd unix && cargo +$(RUST_NIGHTLY) fmt --check
 
 clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native
 
@@ -500,20 +532,52 @@ upgrade-incompat:
 	cd windows && cargo upgrade --incompatible && cargo update
 	cd unix && cargo upgrade --incompatible && cargo update
 
-setup:
+# One-time bootstrap for a development machine or a CI runner. Split into leaves
+# for the same reason the test and lint targets are: a host-only leg needs
+# neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
+# stands alone and this is the everything-at-once aggregate.
+setup: setup-brew setup-rust setup-xwin setup-rosetta
+
+# `lld-link` (the PE linker) and the llvm keg's `llvm-lib` (the PE archiver,
+# named by absolute path in windows/.cargo/config.toml) both come from here, so
+# every PE build, lint and doc leg needs this one.
+setup-brew:
 	@echo "==> brew: install/upgrade llvm and lld"
 	brew install llvm lld
 	brew upgrade llvm lld
-	@echo "==> rustup: add cross-compile targets and the nightly toolchain"
-	rustup target add $(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
-	# Nightly is only ever used for rustfmt (`fmt`/`fmt-check`); every build,
-	# lint and test leg runs on stable.
-	rustup toolchain install nightly --profile minimal --component rustfmt
+
+setup-rust:
+	@echo "==> rustup: install $(RUST_STABLE) and $(RUST_NIGHTLY) with the cross-compile targets"
+	# `--profile minimal` plus the one component each toolchain is here for:
+	# clippy for the lint legs (rustdoc travels with rustc, so `doc` is covered),
+	# rustfmt for the fmt legs. Nightly is only ever used for rustfmt; every
+	# build, lint and test leg runs on stable.
+	rustup toolchain install $(RUST_STABLE) --profile minimal --component clippy
+	rustup target add --toolchain $(RUST_STABLE) \
+		$(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
+	rustup toolchain install $(RUST_NIGHTLY) --profile minimal --component rustfmt
+	# `--locked`: cargo-nextest refuses to build any other way (it ships a
+	# tripwire crate that fails the compile), and taking every tool's own
+	# lockfile is what makes a CI runner and a laptop install the same thing.
 	@echo "==> cargo: install/upgrade xwin, cargo-edit and cargo-nextest"
-	cargo install xwin cargo-edit cargo-nextest
-	@echo "==> /opt/xwin: ensure user-writable"
+	cargo install --locked xwin cargo-edit cargo-nextest
+
+# Populate the cargo registry for both workspaces without building anything. A
+# CI setup job runs this once so the legs that fan out afterwards start from a
+# warm cargo home instead of each re-downloading the same crates.
+fetch:
+	@echo "==> cargo: fetch dependencies for both workspaces"
+	cd windows && cargo fetch
+	cd unix && cargo fetch
+
+# The MSVC SDK splat lives at /opt/xwin and cannot move: that path is compiled
+# into windows/.cargo/config.toml, as `-Lnative` for rustc and `-idirafter` for
+# the build-script C/C++. /opt is root-owned on macOS, so creating the directory
+# needs sudo. It is its own target because restoring a cached splat into that
+# path needs the directory to exist and be writable first.
+xwin-dir:
 	@if mkdir -p /opt/xwin 2>/dev/null && [ -w /opt/xwin ]; then \
-		echo "    /opt/xwin already user-writable"; \
+		echo "==> /opt/xwin: already user-writable"; \
 	else \
 		echo ""; \
 		echo "    /opt/xwin will hold the splatted Windows SDK (~3 GB)."; \
@@ -522,22 +586,49 @@ setup:
 		echo ""; \
 		sudo mkdir -p /opt/xwin && sudo chown $$USER /opt/xwin; \
 	fi
-	@echo "==> xwin: compare upstream manifest to local cache ($(XWIN_CACHE))"
-	@upstream=$$(xwin --accept-license --arch x86,x86_64 --cache-dir $(XWIN_CACHE) list 2>/dev/null | grep -oE 'Microsoft\.VC\.[0-9.]+\.CRT|Win11SDK_[0-9.]+' | sort -u); \
-	cached=$$(ls $(XWIN_CACHE)/dl/ 2>/dev/null | grep -oE 'Microsoft\.VC\.[0-9.]+\.CRT|Win11SDK_[0-9.]+' | sort -u); \
-	if [ -n "$$cached" ] && [ "$$upstream" = "$$cached" ] && [ -d /opt/xwin/crt ] && [ -d /opt/xwin/sdk ]; then \
-		echo "    up to date — skipping splat"; \
-		echo "$$cached" | sed 's/^/      /'; \
-	else \
-		if [ -n "$$cached" ] && [ "$$upstream" != "$$cached" ]; then \
-			echo "    upgrade available — wiping cache and /opt/xwin"; \
-			echo "      cached:   $$(echo $$cached | tr '\n' ' ')"; \
-			echo "      upstream: $$(echo $$upstream | tr '\n' ' ')"; \
-			rm -rf $(XWIN_CACHE) /opt/xwin/crt /opt/xwin/sdk; \
-		elif [ -z "$$cached" ]; then \
-			echo "    no local cache — first-time download"; \
-		else \
-			echo "    /opt/xwin missing or stale — re-splat from cache"; \
+
+# Splat the Windows SDK, skipping the work when what is already installed matches
+# upstream. A splat made before $(XWIN_STAMP) existed is adopted through the old
+# download-cache listing, so an install that was already correct is never
+# re-downloaded just to learn its own contents.
+setup-xwin: setup-rust xwin-dir
+	@echo "==> xwin: compare the pinned manifest to the splat in /opt/xwin"
+	@set -e; \
+	pkgs='Microsoft\.VC\.[0-9.]+\.CRT|Win11SDK_[0-9.]+'; \
+	upstream=$$($(XWIN) list 2>/dev/null | grep -oE "$$pkgs" | sort -u); \
+	installed=$$(cat $(XWIN_STAMP) 2>/dev/null || true); \
+	if [ -z "$$installed" ]; then \
+		installed=$$(ls $(XWIN_CACHE)/dl/ 2>/dev/null | grep -oE "$$pkgs" | sort -u); \
+		if [ -n "$$installed" ]; then \
+			echo "    no stamp yet, adopting the existing splat from the download cache"; \
 		fi; \
-		xwin --accept-license --arch x86,x86_64 --cache-dir $(XWIN_CACHE) splat --output /opt/xwin; \
+	fi; \
+	if [ -n "$$installed" ] && [ "$$upstream" = "$$installed" ] && [ -d /opt/xwin/crt ] && [ -d /opt/xwin/sdk ]; then \
+		echo "    up to date, skipping splat"; \
+		echo "$$installed" | sed 's/^/      /'; \
+		echo "$$installed" > $(XWIN_STAMP); \
+		exit 0; \
+	fi; \
+	if [ -z "$$installed" ]; then \
+		echo "    nothing installed, first-time download"; \
+	elif [ "$$upstream" != "$$installed" ]; then \
+		echo "    upgrade available, wiping the download cache and the splat"; \
+		echo "      installed: $$(echo $$installed | tr '\n' ' ')"; \
+		echo "      upstream:  $$(echo $$upstream | tr '\n' ' ')"; \
+		rm -rf $(XWIN_CACHE) /opt/xwin/crt /opt/xwin/sdk $(XWIN_STAMP); \
+	else \
+		echo "    splat incomplete, re-splatting from the download cache"; \
+	fi; \
+	$(XWIN) splat --output /opt/xwin; \
+	echo "$$upstream" > $(XWIN_STAMP)
+
+# The Wine we run is an x86_64 build and every PE it loads is x86 code, so the
+# whole test path goes through Rosetta. A no-op where it is already installed,
+# and on an Intel Mac, where the probe just runs natively.
+setup-rosetta:
+	@if arch -x86_64 /usr/bin/true 2>/dev/null; then \
+		echo "==> rosetta: already present"; \
+	else \
+		echo "==> rosetta: installing (needed to run the x86_64 Wine)"; \
+		sudo softwareupdate --install-rosetta --agree-to-license; \
 	fi

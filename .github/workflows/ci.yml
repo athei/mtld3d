@@ -1,0 +1,147 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a branch can be run through the whole matrix before it has a PR.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One bucket per ref, so a second push to a PR cancels the fan-out already
+  # grinding on the commit it superseded. Not on main: every commit there gets a
+  # complete, attributable result rather than a cancelled one.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Everything a run depends on that is not in the tree is pinned here, so a green
+# main cannot turn red without a commit. Both toolchains are plain Makefile
+# variables: it exports the stable one to rustup for every cargo it runs, and
+# names the nightly one on the fmt command lines. The MSVC CRT and Windows SDK
+# versions are pinned in the Makefile instead, beside the xwin call that consumes
+# them.
+env:
+  WINE_RELEASE: cx-26.3.0-0
+  RUST_STABLE: 1.97.1
+  RUST_NIGHTLY: nightly-2026-08-18
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  # The linear part: one job downloads and builds the shared state (toolchains,
+  # the ~3 GB MSVC SDK splat, the Wine bundle, the cargo registry) and saves it
+  # to the cache, so the legs below start warm instead of a dozen runners racing
+  # to splat the same SDK.
+  setup:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
+          prime: 'true'
+
+  fmt-check:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+      - run: make fmt-check
+
+  audit:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+      - run: make audit
+
+  # clippy for the two PE targets. `pe` is what gates the MSVC SDK and the
+  # Homebrew LLVM: clippy runs build scripts, so snmalloc-sys and zstd-sys need
+  # the xwin headers and the keg's llvm-lib even though nothing is linked here.
+  clippy-pe:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [i686, x86_64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+      - run: make clippy-pe-${{ matrix.arch }}
+
+  clippy-native:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+      - run: make clippy-native
+
+  doc-windows:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+      - run: make doc-windows
+
+  doc-unix:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+      - run: make doc-unix
+
+  test-unit:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+      - run: make test-unit
+
+  # The end-to-end suite: real PE binaries, run by the pinned Wine against a
+  # Metal device, one leg per PE arch. Needs everything, `wine` included, since
+  # the leg installs our builtin into the SDK tree and boots a prefix.
+  test-e2e:
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [i686, x86_64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
+      - run: make test-e2e-${{ matrix.arch }}
+
+  # d3d9 conformance is deliberately absent: it runs Wine's own d3d9_test.exe out
+  # of the SDK bundle, and no wine-build release carries those binaries yet.
+  # Adding conformance-i686 / conformance-x86_64 is a follow-up, together with the
+  # WINE_RELEASE bump that brings them.
