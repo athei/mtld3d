@@ -104,15 +104,6 @@ pub struct SubtestResult {
 impl Arch {
     /// Every architecture, in baseline-output order.
     pub const ALL: [Self; 2] = [Self::I686, Self::X64];
-
-    /// The Wine build-tree subdirectory holding this arch's `d3d9_test.exe`.
-    #[must_use]
-    pub const fn wine_target_dir(self) -> &'static str {
-        match self {
-            Self::I686 => "i386-windows",
-            Self::X64 => "x86_64-windows",
-        }
-    }
 }
 
 impl Subtest {

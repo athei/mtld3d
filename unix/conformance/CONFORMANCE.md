@@ -12,8 +12,10 @@ Because our `d3d9.dll` is installed as a Wine *builtin* (`make install`), runnin
 ## Running
 
 ```
-make conformance           WINE_BUILD=<wine-build-tree>   # diff vs baseline.txt
-make conformance-baseline  WINE_BUILD=<wine-build-tree>   # (re)record baseline.txt
+make conformance                # diff both arches vs baseline.txt
+make conformance-i686           # one arch, one runner process (what CI runs)
+make conformance-x86_64
+make conformance-baseline       # (re)record baseline.txt, both arches in sequence
 ```
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
@@ -24,19 +26,25 @@ the Metal-validation lines), which is what the per-cluster audit below was built
 from — the *actual-vs-expected* values distinguish a real defect from an
 acceptable `caps` difference. Off unless the variable is set.
 
-`WINE_BUILD` is the only conformance-specific input: it is the Wine *build tree*
-that has compiled `dlls/d3d9/tests/{i386,x86_64}-windows/d3d9_test.exe`. The
-binaries are **not** vendored — they are large and drift with the Wine version,
-so `baseline.txt` records the Wine version it was taken against instead. (The
-runner finds the wine loader itself via the global `WINE_SDK` install that holds
-our builtin; that variable is already mandatory for the whole Makefile, so it is
-not a conformance-specific knob.)
+There is no conformance-specific input to set. The test binaries ship inside the
+Wine SDK bundle (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
+published by the [wine-build](https://github.com/athei/wine-build) bundle step),
+which is the same install `make install` puts our builtin `d3d9.dll` into, so a
+CI job needs nothing but that tarball and no Wine build tree at all. The
+binaries are **not** vendored here: they are large and drift with the Wine
+version, so `baseline.txt` records the Wine version it was taken against
+instead.
 
-The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It runs
-each subtest as its own process — so a crash in one cannot poison another's
-counts — with the Metal debug layer disabled (`MTL_DEBUG_LAYER=0`) so a
-validation abort cannot mask the failure counts, and with our logs and Wine's
-debug channels silenced.
+The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It takes
+the loader and one test binary as explicit paths (`--wine`, `--exe`, plus
+`--arch` as the label to record under) and resolves nothing itself: every Wine
+location lives in the Makefile. One invocation therefore covers one
+architecture, which is what lets the 32-bit and 64-bit gates be separate CI
+jobs, and `--update-baseline` rewrites only its own arch's entries. It runs each
+subtest as its own process, so a crash in one cannot poison another's counts,
+with Metal API validation left on in `nslog` mode (it logs rather than aborting,
+so it cannot mask the failure counts) and with our logs and Wine's debug
+channels silenced.
 
 This is **not** part of `make test`: many checks fail by design (see below), so
 it is a tracked-score tool, not a pass/fail gate. The runner exits non-zero only

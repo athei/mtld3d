@@ -1,10 +1,9 @@
 //! Spawn Wine's `d3d9_test.exe` for one `(arch, subtest)` and interpret it.
 //!
-//! The wine loader is located via the ambient `WINE_SDK` environment variable
-//! (the global Wine install that `make install` populated with our builtin
-//! `d3d9.dll`). `WINE_SDK` is mandatory for the whole Makefile, so the runner
-//! reads it from the environment rather than taking it as a conformance flag —
-//! the only conformance-specific input is the Wine build tree (`--wine-build`).
+//! Both paths, the loader and the test binary, come from the caller
+//! (`--wine`/`--exe`). This module resolves nothing itself: it knows no Wine
+//! directory layout and reads no environment for one, so whoever invokes the
+//! runner owns where a Wine install keeps its loader and its test binaries.
 
 use std::{
     fs,
@@ -40,22 +39,6 @@ fn subtest_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Resolve the wine loader from `WINE_SDK`.
-///
-/// # Errors
-///
-/// Returns a message when `WINE_SDK` is unset or its `bin/wine` is absent.
-pub fn wine_binary() -> Result<PathBuf, String> {
-    let sdk = std::env::var("WINE_SDK").map_err(|_| {
-        "WINE_SDK is not set (the global Wine install holding our builtin d3d9.dll)".to_owned()
-    })?;
-    let wine = PathBuf::from(sdk).join("bin/wine");
-    if !wine.is_file() {
-        return Err(format!("wine loader not found at {}", wine.display()));
-    }
-    Ok(wine)
-}
-
 /// `wine --version`, or `"unknown"` if it can't be determined.
 #[must_use]
 pub fn wine_version(wine: &Path) -> String {
@@ -76,23 +59,22 @@ pub fn wine_version(wine: &Path) -> String {
 /// (not inherited) so a validation abort can't mask the failure counts — the
 /// same overrides the shell runner used.
 ///
+/// `arch` does not select anything (the caller already picked the binary); it is
+/// the label the results, raw logs and validation lines are recorded under.
+///
 /// # Errors
 ///
-/// Returns a message when the per-arch `d3d9_test.exe` is missing or `wine`
-/// fails to spawn.
+/// Returns a message when `exe` is not a file or `wine` fails to spawn.
 pub fn run_subtest(
     wine: &Path,
-    wine_build: &Path,
+    exe: &Path,
     arch: Arch,
     subtest: Subtest,
 ) -> Result<SubtestResult, String> {
-    let exe = wine_build
-        .join("dlls/d3d9/tests")
-        .join(arch.wine_target_dir())
-        .join("d3d9_test.exe");
     if !exe.is_file() {
         return Err(format!(
-            "test exe not found: {} — build the Wine d3d9 tests first",
+            "test exe not found: {}; a Wine SDK bundle carries these under \
+             lib/wine/tests, so re-bundle if yours predates them",
             exe.display()
         ));
     }
@@ -102,7 +84,7 @@ pub fn run_subtest(
     // aborting, so it cannot mask the per-site counts the way `error`/`abort`
     // mode would — the historical reason the layer was disabled here.
     let mut child = Command::new(wine)
-        .arg(&exe)
+        .arg(exe)
         .arg(subtest.arg())
         .env("MTL_DEBUG_LAYER", "1")
         .env("MTL_DEBUG_LAYER_ERROR_MODE", "nslog")

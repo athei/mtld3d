@@ -3,6 +3,14 @@ $(error WINE_SDK is not set)
 endif
 export WINE_SDK
 
+# Every wine tool this Makefile shells out to (`wine`, `wineserver`,
+# `winebuild`) and the `wine` runner cargo spawns for the PE test binaries comes
+# from the same install we build against and install into, so put its `bin` in
+# front rather than relying on the caller's PATH. Without this a machine that
+# has no wine on PATH at all (a CI runner) fails deep inside a recipe, and a
+# machine with a second wine could silently mix loaders across a run.
+export PATH := $(WINE_SDK)/bin:$(PATH)
+
 # Distribution bundles default to the production profile; PROD=0 overrides
 # for a quick release-profile bundle.
 ifneq ($(filter bundle,$(MAKECMDGOALS)),)
@@ -68,6 +76,20 @@ OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
 XWIN_CACHE := $(HOME)/Library/Caches/xwin
 
+# Wine's own d3d9 test binaries, as published inside the SDK bundle by
+# wine-build's bundle step (`make install` puts our builtin `d3d9.dll` into the
+# same tree, which is what the tests then exercise). The conformance runner
+# takes explicit paths and knows no Wine layout, so this is the only place the
+# layout is written down. One binary per arch, one runner process per binary.
+D3D9_TEST_i686   := $(WINE_SDK)/lib/wine/tests/i386-windows/d3d9_test.exe
+D3D9_TEST_x86_64 := $(WINE_SDK)/lib/wine/tests/x86_64-windows/d3d9_test.exe
+
+# Which unix `.so` arch the ambient WINE_SDK actually loads: Wine resolves unix
+# libs by the arch of the Wine build itself, so a test or conformance leg needs
+# that one installed and the other is inert. Probed from the loader (lazily, so
+# only legs that use it pay for it) and overridable.
+SDK_SO_ARCH ?= $(if $(findstring arm64,$(shell file -b $(WINE_SDK)/bin/wine)),arm64,x64)
+
 # Hard-fail on any warning (cargo counts emitted warnings, including ones
 # replayed from cache, and errors at the end of the run) — applied only to the
 # `check` legs so normal builds and a plain `cargo clippy` stay
@@ -84,7 +106,18 @@ export WINEDLLOVERRIDES = mscoree,mshtml=
 export WINEDEBUG=+msync
 export WINEMSYNC=1
 
+# The prefix the test and conformance legs run in, which is also where the
+# `mtld3d` builtin's placeholder has to be installed. Not `?=`: an exported but
+# empty WINEPREFIX (a common shell profile shape) counts as defined and would
+# leave the path rooted at `/`.
+WINEPREFIX_DIR := $(if $(WINEPREFIX),$(WINEPREFIX),$(HOME)/.wine)
+
+# Quiet locally, echoing under CI: a CI log is read after the fact by someone
+# who cannot re-run the command, so the command line is the most useful thing
+# in it. GitHub Actions (and every other runner) sets CI.
+ifndef CI
 MAKEFLAGS += --silent
+endif
 
 BUNDLE_NAME  := mtld3d.tar.xz
 BUNDLE_OUT   := $(CURDIR)/windows/target/$(BUNDLE_NAME)
@@ -102,67 +135,109 @@ DEBUG_STAGE  := $(CURDIR)/windows/target/bundle-debug
 BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
                         sed -n 's/^version = "\(.*\)"/v\1/p' windows/Cargo.toml)
 
-.PHONY: all windows unix install bundle configure-test-prefix test conformance conformance-baseline conformance-isolate fmt clippy audit doc check clean setup upgrade upgrade-incompat
+# Every target here is phony: the recipes write into cargo's target dirs and the
+# Wine install, never into a file named after the target.
+.PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
+	install install-pe-i686 install-pe-x86_64 install-so-x64 install-so-arm64 \
+	bundle configure-test-prefix prefix-marker-i686 prefix-marker-x86_64 \
+	test test-unit test-e2e-i686 test-e2e-x86_64 \
+	conformance conformance-i686 conformance-x86_64 \
+	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
+	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
+	clippy-native audit doc doc-windows doc-unix check clean setup upgrade \
+	upgrade-incompat
 
 all: windows unix
 
-windows:
+windows: windows-i686 windows-x86_64
+unix: unix-x64 unix-arm64
+
+# Per-arch build leaves. Each PE arch and each unix arch is independent, so a
+# job (or a developer) that only needs one does not pay for the others; the
+# aggregates above keep the everything-at-once habit.
+#
+# mtld3d.dll is only ever a Wine builtin (it owns the unix-call globals), so it
+# gets the builtin signature at build time. d3d9.dll stays an ordinary native PE
+# here: `install` and `bundle` mark their staged copies instead, so the build
+# output can also be loaded as a native override in Wine distributions we don't
+# control (CrossOver).
+#
+# The "fake DLL" placeholder is the prefix marker for the custom mtld3d builtin
+# name. It ships into lib/wine, and a prefix-setup step must copy it into the
+# target prefix's syswow64/system32, since Wine finds builtins by name in the
+# prefix, not lib/wine (`d3d9` gets its placeholder from wineboot, but custom
+# names don't), which the prefix-marker targets below do.
+windows-i686:
 	cd windows && cargo build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
-	cd windows && cargo build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
-	# mtld3d.dll is only ever a Wine builtin (it owns the unix-call globals), so
-	# it gets the builtin signature at build time. d3d9.dll stays an ordinary
-	# native PE here — `install` and `bundle` mark their staged copies instead,
-	# so the build output can also be loaded as a native override in Wine
-	# distributions we don't control (CrossOver).
 	winebuild --builtin $(OUT_i386)/mtld3d.dll
-	winebuild --builtin $(OUT_x64)/mtld3d.dll
-	# Tiny "fake DLL" placeholders for the mtld3d builtin name, one per arch.
-	# Shipped into lib/wine; a prefix-setup step must copy them into the target
-	# prefix's syswow64/system32, since Wine finds builtins by name in the
-	# prefix, not lib/wine (`d3d9` gets its placeholder from wineboot, but
-	# custom names don't).
 	winebuild --fake-module -o $(OUT_i386)/mtld3d.fake.dll -m32 --dll $(OUT_i386)/mtld3d.dll
+
+windows-x86_64:
+	cd windows && cargo build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
+	winebuild --builtin $(OUT_x64)/mtld3d.dll
 	winebuild --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
-unix:
+# On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
+# debug map in the dylib pointing at them by absolute path; `dsymutil` walks
+# that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of
+# an MSVC `.pdb`. Run it on a copy already named `mtld3d.so`, because it
+# stamps the inner DWARF file after the input's basename and lldb looks it up
+# by that name — renaming the bundle afterwards produces one lldb won't find.
+unix-x64:
 	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
-	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
-	# On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
-	# debug map in the dylib pointing at them by absolute path; `dsymutil` walks
-	# that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of
-	# an MSVC `.pdb`. Run it on a copy already named `mtld3d.so`, because it
-	# stamps the inner DWARF file after the input's basename and lldb looks it up
-	# by that name — renaming the bundle afterwards produces one lldb won't find.
-	for out in $(OUT_unix_x64) $(OUT_unix_arm64); do \
-		cp $$out/libmtld3d_unix.dylib $$out/mtld3d.so ; \
-		rm -rf $$out/mtld3d.so.dSYM ; \
-		dsymutil $$out/mtld3d.so ; \
-	done
+	cp $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
+	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
+	dsymutil $(OUT_unix_x64)/mtld3d.so
 
-install: all
-	# The d3d9.dll copies under lib/wine get the builtin signature in place —
-	# the loader ignores unsigned PEs on the builtin search path. Symbols travel
-	# with each binary: the `.pdb` beside every PE, the `.dSYM` beside the `.so`,
-	# so a local crash symbolicates against the installed files with no extra
-	# flags. Both unix arches go in, creating the directory the Wine tree lacks:
-	# a Wine only ever loads the one matching its own build, so the other copy
-	# is inert, and a tree that later gains an arm64 loader is already served.
+unix-arm64:
+	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
+	cp $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
+	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
+	dsymutil $(OUT_unix_arm64)/mtld3d.so
+
+install: install-pe-i686 install-pe-x86_64 install-so-x64 install-so-arm64
+
+# Per-arch install leaves, matching the build leaves: a test leg installs the one
+# PE arch it exercises plus the one unix `.so` its Wine loads, and only `install`
+# (and `bundle`) covers everything.
+#
+# The d3d9.dll copies under lib/wine get the builtin signature in place: the
+# loader ignores unsigned PEs on the builtin search path. Symbols travel with
+# each binary, the `.pdb` beside every PE and the `.dSYM` beside the `.so`, so a
+# local crash symbolicates against the installed files with no extra flags.
+install-pe-i686: windows-i686
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
+		cp $(OUT_i386)/mtld3d.fake.dll                     $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
 		winebuild --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
+	done
+
+install-pe-x86_64: windows-x86_64
+	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
+		cp $(OUT_x64)/mtld3d.fake.dll                      $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
 		winebuild --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
-		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_x64) $$dir/lib/wine/$(UNIX_WINEDIR_arm64) ; \
+	done
+
+# Both unix arches create the directory the Wine tree lacks: a Wine only ever
+# loads the one matching its own build, so the other copy is inert, and a tree
+# that later gains an arm64 loader is already served.
+install-so-x64: unix-x64
+	for dir in $(INSTALL_DIRS); do \
+		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_x64) ; \
 		cp $(OUT_unix_x64)/mtld3d.so        $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
 		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
 		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
+	done
+
+install-so-arm64: unix-arm64
+	for dir in $(INSTALL_DIRS); do \
+		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_arm64) ; \
 		cp $(OUT_unix_arm64)/mtld3d.so      $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
 		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
 		cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
-		cp $(OUT_i386)/mtld3d.fake.dll      $$dir/lib/wine/i386-windows/ ; \
-		cp $(OUT_x64)/mtld3d.fake.dll       $$dir/lib/wine/x86_64-windows/ ; \
 	done
 
 # Distribution bundle, serving both install routes (see INSTALL.md, which is
@@ -242,85 +317,144 @@ configure-test-prefix:
 	# Keep automated tests non-interactive and independent of mutable prefix
 	# display settings. EmulateModeset prevents physical host mode changes;
 	# RetinaMode keeps Win32 monitor geometry in the same physical-pixel space
-	# as mtld3d's adapter modes.
+	# as mtld3d's adapter modes. The first `reg add` also creates the prefix if
+	# it does not exist yet, which is the case on a fresh machine.
 	wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
 	wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
 	wine reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
-
-test: install
-	$(MAKE) configure-test-prefix
-	# Host-native unit tests, built for this machine's native arch (no Rosetta).
-	# The windows workspace singles out mtld3d-core (its other members are
-	# PE-only and can't build for the host target) and must override its i686
-	# default; the unix workspace already defaults to the host, so just run all
-	# of it.
-	cd windows && cargo nextest run -p mtld3d-core -p mtld3d-types --target $(UNIX_NATIVE_TARGET)
-	cd unix && cargo nextest run
-	# Pre-boot a persistent wineserver so individual e2e test processes attach
-	# to it instead of each paying boot cost (and briefly holding its stdio).
-	# Both lines detach stdio: the persistent server (and the winedevice.exe
-	# residents wineboot leaves behind) would otherwise inherit make's
-	# stdout/stderr and hold a consumer pipe open forever — `make test | ...`
-	# then never sees EOF even though make itself exited.
+	# Pre-boot a persistent wineserver so individual test processes attach to it
+	# instead of each paying boot cost (and briefly holding its stdio). Both
+	# lines detach stdio: the persistent server (and the winedevice.exe residents
+	# wineboot leaves behind) would otherwise inherit make's stdout/stderr and
+	# hold a consumer pipe open forever, so `make test | ...` never sees EOF even
+	# though make itself exited.
 	-wineserver -p >/dev/null 2>&1
 	-wine wineboot >/dev/null 2>&1
+
+# Install the prefix marker for the custom `mtld3d` builtin name, one per arch.
+# Wine resolves a builtin by finding a fake-DLL marker for that NAME in the
+# prefix's system directories and only then loads the real module out of
+# lib/wine; wineboot writes markers only for names it knows from wine.inf, so
+# without this our d3d9.dll cannot reach its own unix half and every test fails
+# to create a device. Idempotent, so it also self-heals a prefix that wineboot
+# has since wiped. Same copy INSTALL.md documents for end users.
+prefix-marker-i686: install-pe-i686
+	cp $(OUT_i386)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/syswow64/mtld3d.dll
+
+prefix-marker-x86_64: install-pe-x86_64
+	cp $(OUT_x64)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/system32/mtld3d.dll
+
+test: test-unit test-e2e-i686 test-e2e-x86_64
+
+# Host-native unit tests, built for this machine's native arch (no Rosetta).
+# Needs no install and no wine at all, which is why it is its own leg: the
+# windows workspace singles out mtld3d-core (its other members are PE-only and
+# can't build for the host target) and must override its i686 default; the unix
+# workspace already defaults to the host, so just run all of it.
+test-unit:
+	cd windows && cargo nextest run -p mtld3d-core -p mtld3d-types --target $(UNIX_NATIVE_TARGET)
+	cd unix && cargo nextest run
+
+# The e2e suite, one leg per PE arch: each installs the arch it exercises plus
+# the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
+test-e2e-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+	$(MAKE) configure-test-prefix prefix-marker-i686
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=wine \
 		cargo nextest run -p mtld3d-tests --target $(PE_i386)
+
+test-e2e-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+	$(MAKE) configure-test-prefix prefix-marker-x86_64
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine \
 		cargo nextest run -p mtld3d-tests --target $(PE_x64)
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
-# from WINE_BUILD against our installed builtin d3d9.dll, then diff per-site
-# failure counts against the checked-in baseline. Many subtests fail by design
-# — see unix/conformance/CONFORMANCE.md. WINE_BUILD must point at a Wine build
-# tree that has built dlls/d3d9/tests (it ships d3d9_test.exe per arch); the
-# runner finds the wine loader via the global WINE_SDK and its baseline.txt in
-# the crate dir.
-conformance: install
-	$(MAKE) configure-test-prefix
-	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
-	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --wine-build $(WINE_BUILD)
+# against our installed builtin d3d9.dll, then diff per-site failure counts
+# against the checked-in baseline. Many subtests fail by design, see
+# unix/conformance/CONFORMANCE.md. The test exes ship inside the Wine SDK
+# ($(D3D9_TEST_*) above); the runner takes them as paths and finds its
+# baseline.txt in the crate dir.
+#
+# One arch per runner process, so the two gates are independent jobs. Every leg
+# runs the same four subtests for its arch.
+CONFORMANCE_RUN = cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- \
+	--wine $(WINE_SDK)/bin/wine
 
-conformance-baseline: install
-	$(MAKE) configure-test-prefix
-	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
-	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --update-baseline --wine-build $(WINE_BUILD)
+# $(1) = arch (i686|x86_64), $(2) = extra runner args. Checks the exe up front
+# so a bundle that predates the published test binaries says so, rather than
+# failing four times inside the runner.
+define conformance_leg
+	$(MAKE) configure-test-prefix prefix-marker-$(1)
+	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
+	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2)
+endef
 
-# Flap characterization: run ONE subtest/arch REPEAT times and print a per-site
-# flap report (which sites fire deterministically vs flutter run-to-run) — the
-# evidence for tagging a site `flaky` in baseline.txt. Tune with ONLY (device|
+conformance: conformance-i686 conformance-x86_64
+
+conformance-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+	$(call conformance_leg,i686)
+
+conformance-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+	$(call conformance_leg,x86_64)
+
+# Re-record the baseline. Both legs write the same baseline.txt (each replacing
+# only its own arch's entries), so they must run in sequence: hence recursive
+# make in the recipe rather than prerequisites, which `-j` could interleave.
+conformance-baseline:
+	$(MAKE) conformance-baseline-i686
+	$(MAKE) conformance-baseline-x86_64
+
+conformance-baseline-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+	$(call conformance_leg,i686,--update-baseline)
+
+conformance-baseline-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+	$(call conformance_leg,x86_64,--update-baseline)
+
+# Flap characterization: run ONE subtest REPEAT times and print a per-site flap
+# report (which sites fire deterministically vs flutter run-to-run), the
+# evidence for tagging a site `flaky` in CONFORMANCE.md. Tune with ONLY (device|
 # visual|stateblock|d3d9ex), ARCH (i686|x86_64), REPEAT (default 20).
 ONLY ?= device
 ARCH ?= i686
 REPEAT ?= 20
-conformance-isolate: install
-	$(MAKE) configure-test-prefix
-	test -n "$(WINE_BUILD)" || { echo "WINE_BUILD is not set — point it at a Wine build tree with dlls/d3d9/tests built" >&2; exit 2; }
-	cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- --wine-build $(WINE_BUILD) --only $(ONLY) --arch $(ARCH) --repeat $(REPEAT)
+conformance-isolate: install-pe-$(ARCH) install-so-$(SDK_SO_ARCH)
+	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT))
 
 fmt:
 	cd windows && cargo +nightly fmt
 	cd unix && cargo +nightly fmt
 
-clippy:
-	# No --all-targets on the whole-workspace PE runs: that would build every
-	# member's test targets for PE, including mtld3d-core's apple-only objc2
-	# dev-deps (the SM3 corpus test), which hard `compile_error!` off Apple.
-	# Lib/bin only here; test targets are linted per-crate below.
+fmt-check:
+	cd windows && cargo +nightly fmt --check
+	cd unix && cargo +nightly fmt --check
+
+clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native
+
+# Three independent clippy legs, split by the target they lint for so each is one
+# job. No --all-targets on the whole-workspace PE runs: that would build every
+# member's test targets for PE, including mtld3d-core's apple-only objc2 dev-deps
+# (the SM3 corpus test), which hard `compile_error!` off Apple. Lib/bin only
+# there; mtld3d-tests' integration tests aren't covered by those runs, so its own
+# per-crate pass lints all its targets (it has no apple dev-deps).
+clippy-pe-i686:
 	cd windows && cargo clippy --target $(PE_i386) $(DENY_WARNINGS)
-	cd windows && cargo clippy --target $(PE_x64)  $(DENY_WARNINGS)
-	cd windows && cargo clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
-	# mtld3d-tests' integration tests aren't covered by the whole-workspace
-	# lib/bin runs; lint all its targets on both PE archs (no apple dev-deps).
 	cd windows && cargo clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
-	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64)  --all-targets $(DENY_WARNINGS)
-	cd unix && cargo clippy --all-targets $(DENY_WARNINGS)
-	# `unix/shared` ships into both worlds but is a member of only this
-	# workspace, so the windows legs above build it as a plain path dependency
-	# with no lint table — its `cfg(target_family = "windows")` arms (the PE
-	# image-ID reader) would otherwise be linted by nothing. Lint it on the PE
-	# target that reaches them.
+	# `unix/shared` ships into both worlds but is a member of only the unix
+	# workspace, so the windows legs build it as a plain path dependency with no
+	# lint table: its `cfg(target_family = "windows")` arms (the PE image-ID
+	# reader) would otherwise be linted by nothing. Lint it on the PE target that
+	# reaches them.
 	cd unix && cargo clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
+
+clippy-pe-x86_64:
+	cd windows && cargo clippy --target $(PE_x64) $(DENY_WARNINGS)
+	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
+
+# Everything that lints for this machine's own arch: mtld3d-core's test targets
+# (the only place `#[cfg(test)]` blocks in the windows workspace are linted) and
+# the whole unix workspace.
+clippy-native:
+	cd windows && cargo clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
+	cd unix && cargo clippy --all-targets $(DENY_WARNINGS)
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
@@ -332,20 +466,24 @@ audit:
 # links, malformed HTML in doc comments. `audit` gates the *shape* of a doc block
 # and clippy gates its prose; only rustdoc knows whether its links resolve.
 # `build.warnings` covers rustdoc warnings too, so no RUSTDOCFLAGS needed.
-#
+doc: doc-windows doc-unix
+
 # The windows workspace is documented for a PE target, not the host: d3d9 and the
 # shim are `cdylib`s with raw-dylib imports and only build for *-pc-windows-msvc,
 # so a host run would silently skip them. i686 covers every member.
-doc:
+doc-windows:
 	cd windows && cargo doc --no-deps --target $(PE_i386) $(DENY_WARNINGS)
+
+doc-unix:
 	cd unix && cargo doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
 # conventions audit, and the doc build. fmt-check first (fast, fails early on
-# drift); clippy reuses the target above; audit is pure grep; doc last.
+# drift); clippy reuses the target above; audit is pure grep; doc last. Each leg
+# is also its own target, so CI runs them as parallel jobs instead of this
+# sequence.
 check:
-	cd windows && cargo +nightly fmt --check
-	cd unix && cargo +nightly fmt --check
+	$(MAKE) fmt-check
 	$(MAKE) clippy
 	$(MAKE) audit
 	$(MAKE) doc
@@ -366,10 +504,13 @@ setup:
 	@echo "==> brew: install/upgrade llvm and lld"
 	brew install llvm lld
 	brew upgrade llvm lld
-	@echo "==> rustup: add cross-compile targets"
+	@echo "==> rustup: add cross-compile targets and the nightly toolchain"
 	rustup target add $(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
-	@echo "==> cargo: install/upgrade xwin and cargo-edit"
-	cargo install xwin cargo-edit
+	# Nightly is only ever used for rustfmt (`fmt`/`fmt-check`); every build,
+	# lint and test leg runs on stable.
+	rustup toolchain install nightly --profile minimal --component rustfmt
+	@echo "==> cargo: install/upgrade xwin, cargo-edit and cargo-nextest"
+	cargo install xwin cargo-edit cargo-nextest
 	@echo "==> /opt/xwin: ensure user-writable"
 	@if mkdir -p /opt/xwin 2>/dev/null && [ -w /opt/xwin ]; then \
 		echo "    /opt/xwin already user-writable"; \
