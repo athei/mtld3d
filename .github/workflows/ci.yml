@@ -189,13 +189,14 @@ jobs:
 
   # The distribution bundle, which no other leg covers: it stages both install
   # routes, marks the builtins, and packs the symbols archive alongside, all from
-  # artifacts for four targets. PROD=0 takes the release profile instead of
-  # production, so this exercises that staging without paying for fat LTO on four
-  # targets; a release build is still made by hand.
+  # artifacts for four targets. Built the way a release is, at the default PROD=1,
+  # so the production profile's fat LTO is exercised here rather than first
+  # failing when a release is cut. It is the longest job by some way, and runs
+  # alongside the others.
   bundle:
     needs: setup
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
@@ -206,4 +207,4 @@ jobs:
         with:
           pe: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
-      - run: make bundle PROD=0
+      - run: make bundle
