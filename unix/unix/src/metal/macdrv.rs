@@ -625,9 +625,12 @@ pub fn set_display_sync_enabled(
 ) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
-    // SAFETY: NSScreen read-only properties (`maximumFramesPerSecond`)
-    // are accessible from any thread per Apple's documented carve-out;
-    // same posture as `get_primary_display_mode`.
+    // SAFETY: NSScreen is MainThreadOnly per objc2-app-kit's class
+    // annotation, but mtld3d reads only display-metadata properties
+    // (`maximumFramesPerSecond`, `frame`, `convertRectToBacking`), which
+    // Apple documents as retrievable from any thread ("NSScreen objects
+    // can be retrieved from any thread"). This is the canonical statement
+    // of that posture; the other NSScreen readers in this file cite it.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let panel_max_hz = NSScreen::mainScreen(mtm).map_or(0.0_f64, |s| {
         let clamped = s.maximumFramesPerSecond().clamp(0, 1000);
@@ -635,49 +638,6 @@ pub fn set_display_sync_enabled(
         f64::from(as_u32)
     });
     store_min_present_duration(panel_max_hz, pacing);
-}
-
-/// Query the primary display's pixel size and refresh rate.
-///
-/// Returns `(width, height, refresh_hz)`. `refresh_hz` is 0 if `NSScreen`
-/// can't tell (older macOS or virtualised display). Used at
-/// `Direct3DCreate9` time to build a realistic `EnumAdapterModes` table
-/// around the host's actual desktop size — macOS doesn't do D3D9-style
-/// mode-setting, so the values are advisory for the game's UI dropdown
-/// only.
-pub fn get_primary_display_mode() -> (u32, u32, u32) {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSScreen;
-
-    // SAFETY: NSScreen is MainThreadOnly per objc2-app-kit's class
-    // annotation. mtld3d calls this from the API thread (game's thread),
-    // not AppKit's main thread; we read display-metadata properties
-    // (frame / convertRectToBacking / maximumFramesPerSecond) which
-    // are effectively read-only display state. This matches the
-    // pre-objc2-app-kit raw msg_send! posture and Apple's documented
-    // "NSScreen objects can be retrieved from any thread" carve-out.
-    // The typed bindings make the contract visible without changing it.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    let Some(screen) = NSScreen::mainScreen(mtm) else {
-        return (0, 0, 0);
-    };
-    // NSScreen.frame returns NSRect (origin + size) in *points*.
-    // To get the panel's pixel dimensions (the units CAMetalLayer
-    // drawableSize speaks, and what every other "resolution" UI
-    // means by resolution) multiply by backingScaleFactor — typically
-    // 2 on retina, 1 on external non-retina. `convertRectToBacking:`
-    // returns the same shape as a single call, no manual multiply.
-    let frame_points = screen.frame();
-    let frame_pixels = screen.convertRectToBacking(frame_points);
-    // maximumFramesPerSecond returns NSInteger; on macOS 12+ this is
-    // the panel's native refresh (60 on most external displays, 120 on
-    // ProMotion MBPs). Pre-12, the selector exists but may return 0.
-    let refresh_ns = screen.maximumFramesPerSecond();
-
-    let width = bounded_cast::f64_to_u32_saturating(frame_pixels.size.width.round());
-    let height = bounded_cast::f64_to_u32_saturating(frame_pixels.size.height.round());
-    let refresh_hz = u32::try_from(refresh_ns.clamp(0, 1000)).expect("clamped above to [0, 1000]");
-    (width, height, refresh_hz)
 }
 
 /// Numeric casts where the cast lints fire but the bounds are established by the caller.
@@ -874,7 +834,7 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSScreen, NSView};
 
-    // SAFETY: see `get_primary_display_mode` for the off-main-thread
+    // SAFETY: see `set_display_sync_enabled` for the off-main-thread
     // NSScreen rationale — we read static display capabilities only.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
@@ -955,7 +915,7 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     // `maximumFramesPerSecond` is the panel ceiling (e.g. 60 on most
     // external displays, 120 on `ProMotion`). Drives the present-throttle
     // cap computed at attach. Returns `NSInteger`; clamp + widening cast
-    // mirrors `get_primary_display_mode`'s posture. Sub-zero / huge
+    // mirrors `set_display_sync_enabled`'s posture. Sub-zero / huge
     // pathological values fall through to `0.0`, which
     // `compute_min_present_duration` then treats as "no throttle".
     let panel_max_hz = screen.as_deref().map_or(0.0_f64, |s| {

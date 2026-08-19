@@ -224,27 +224,6 @@ impl Thunk for StopGpuCaptureParams {
     const CODE: u32 = Thunks::StopGpuCapture as u32;
 }
 
-/// Query the primary display's pixel size and refresh rate via `NSScreen`.
-///
-/// Used at `Direct3DCreate9` time to build a realistic `EnumAdapterModes`
-/// table around the host's actual desktop size. macOS doesn't do D3D9-style
-/// mode-setting (`CAMetalLayer` renders at whatever size we ask, the
-/// `WindowServer` composites it onto the actual desktop), so the values are
-/// purely advisory — they shape the game's UI dropdown, not the actual
-/// rendering surface.
-#[repr(C, align(8))]
-pub struct GetPrimaryDisplayModeParams {
-    pub width: u32,      // out: pixels (NSScreen.frame.size.width, rounded)
-    pub height: u32,     // out: pixels
-    pub refresh_hz: u32, // out: NSScreen.maximumFramesPerSecond, or 0 if unknown
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
-}
-
-impl Thunk for GetPrimaryDisplayModeParams {
-    const CODE: u32 = Thunks::GetPrimaryDisplayMode as u32;
-}
-
 /// Read the process-wide page-fault counters via `getrusage(RUSAGE_SELF)`.
 ///
 /// Sampled by the encoder thread once per perf summary window (PERF=1

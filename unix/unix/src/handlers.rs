@@ -8,9 +8,9 @@ use mtld3d_shared::{
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
-    GetPrimaryDisplayModeParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle,
-    SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams, identity,
+    GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
+    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams, identity,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -198,18 +198,6 @@ pub extern "C" fn start_gpu_capture_handler(args: *mut c_void) -> i32 {
 
 pub extern "C" fn stop_gpu_capture_handler(_args: *mut c_void) -> i32 {
     metal::stop_capture();
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn get_primary_display_mode_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut GetPrimaryDisplayModeParams.
-    let Some(mut params) = (unsafe { InPtrMut::<GetPrimaryDisplayModeParams>::opt(args) }) else {
-        return -1;
-    };
-    let (w, h, hz) = metal::get_primary_display_mode();
-    params.width = w;
-    params.height = h;
-    params.refresh_hz = hz;
     STATUS_SUCCESS
 }
 

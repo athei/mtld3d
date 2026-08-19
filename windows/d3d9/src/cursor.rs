@@ -181,6 +181,7 @@ unsafe extern "system" {
 const GWLP_WNDPROC: i32 = -4;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_ACTIVATE: u32 = 0x0006;
+const WM_ACTIVATEAPP: u32 = 0x001C;
 const WM_SIZE: u32 = 0x0005;
 const WA_INACTIVE: u32 = 0;
 const HTCLIENT: usize = 1;
@@ -675,6 +676,20 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={} tid={}",
             cur.dirty(), current_thread_id(),
         );
+    } else if msg == WM_ACTIVATEAPP && wp == 0 {
+        // Focus-loss half of the D3D9 fullscreen mode contract: when the app
+        // deactivates while a fullscreen device is live, native D3D9 puts
+        // the registry display mode back.
+        // `WM_ACTIVATEAPP FALSE` reaches every top-level window of the
+        // deactivated thread, so the subclassed device window sees it even
+        // when the focus window was the active one. No-op when nothing
+        // changed the mode — the common case, since mtld3d never modesets.
+        // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
+        // lifetime of the subclass.
+        let is_fullscreen = unsafe { (*dev_ptr).fullscreen_window().is_some() };
+        if is_fullscreen {
+            crate::fullscreen::restore_registry_mode();
+        }
     } else if msg == WM_SIZE {
         // Implicit client-area resize from Wine's macdrv (e.g. macOS
         // shrunk the visible rect after we attached the layer because

@@ -21,6 +21,13 @@
 //! the window manager sizes the window; `render.scale` decides how many
 //! pixels are rasterized in those cases.
 //!
+//! One direction of the mode contract is honoured even so: when a fullscreen
+//! device loses focus or leaves fullscreen and the current mode differs from
+//! the registry mode (the app changed it through user32 — we never did),
+//! [`restore_registry_mode`] puts the user's desktop back, exactly as native
+//! D3D9 does. Restoring is compatible with the no-modeset decision because
+//! it only ever returns the display to the state the user chose.
+//!
 //! The z-order is left to the window manager. Raising the window to the
 //! topmost level deadlocks Wine's mac driver: it re-derives the Cocoa window's
 //! level and parent while holding winemac's per-window lock and hops to the
@@ -71,8 +78,136 @@ struct MonitorInfo {
 const MONITOR_INFO_SIZE: u32 = 40;
 const _: () = assert!(size_of::<MonitorInfo>() == MONITOR_INFO_SIZE as usize);
 
+/// Win32 `DEVMODEW`, display-device shape (printer fields collapsed).
+///
+/// Every member is 2- or 4-byte, so the layout is identical on the i686 and
+/// `x86_64` Win32 ABIs (no 8-byte members to shift alignment; see the
+/// wire-invariant rule on out-param structs). The union in the C header
+/// (`dmPosition` + orientation/fixed-output vs. the printer fields) is
+/// declared as its display arm, which is what `EnumDisplaySettingsW` fills.
+#[repr(C)]
+struct DevModeW {
+    device_name: [u16; 32],
+    spec_version: u16,
+    driver_version: u16,
+    size: u16,
+    driver_extra: u16,
+    fields: u32,
+    position_x: i32,
+    position_y: i32,
+    display_orientation: u32,
+    display_fixed_output: u32,
+    color: i16,
+    duplex: i16,
+    y_resolution: i16,
+    tt_option: i16,
+    collate: i16,
+    form_name: [u16; 32],
+    log_pixels: u16,
+    bits_per_pel: u32,
+    pels_width: u32,
+    pels_height: u32,
+    display_flags: u32,
+    display_frequency: u32,
+    icm_method: u32,
+    icm_intent: u32,
+    media_type: u32,
+    dither_type: u32,
+    reserved1: u32,
+    reserved2: u32,
+    panning_width: u32,
+    panning_height: u32,
+}
+
+/// `DEVMODEW`'s ABI size, which the API reads back out of `size`.
+const DEV_MODE_SIZE: u16 = 220;
+const _: () = assert!(size_of::<DevModeW>() == DEV_MODE_SIZE as usize);
+
+/// `EnumDisplaySettingsW` mode selector for the current display mode.
+const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+/// `EnumDisplaySettingsW` mode selector for the registry display mode.
+const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
+
+/// One `EnumDisplaySettingsW` query on the primary display.
+///
+/// `mode_num` is `ENUM_CURRENT_SETTINGS` / `ENUM_REGISTRY_SETTINGS`;
+/// returns `(width, height, refresh_hz)`, where `refresh_hz` may be 0 when
+/// the driver doesn't report one.
+fn query_display_mode(mode_num: u32) -> Option<(u32, u32, u32)> {
+    // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is
+    // a valid value.
+    let mut dm: DevModeW = unsafe { core::mem::zeroed() };
+    dm.size = DEV_MODE_SIZE;
+    // SAFETY: null device name selects the primary display; `dm` is a
+    // writable `DEVMODEW` with `size` set per the API contract.
+    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+    if ok == 0 || dm.pels_width == 0 || dm.pels_height == 0 {
+        warn!(
+            target: LOG_TARGET,
+            "EnumDisplaySettingsW({mode_num:#x}) failed (ok={ok}, {}x{})",
+            dm.pels_width,
+            dm.pels_height
+        );
+        return None;
+    }
+    Some((dm.pels_width, dm.pels_height, dm.display_frequency))
+}
+
+/// The primary display's current mode in the Win32 coordinate space.
+///
+/// This is the same view win32u validates `ChangeDisplaySettingsW` against
+/// and derives `GetMonitorInfoW` from, so callers deriving D3D9 display
+/// geometry from it agree with the window-management side by construction —
+/// reading `NSScreen` instead gave a second source of truth that disagreed
+/// on displays where the two scale differently (a CI runner's virtual
+/// display reports 2048x1536 through Win32 but 1024x768 through `NSScreen`).
+pub fn current_display_mode() -> Option<(u32, u32, u32)> {
+    query_display_mode(ENUM_CURRENT_SETTINGS)
+}
+
+/// Put the desktop back to the registry display mode when it differs.
+///
+/// The D3D9 contract restores the registry mode when a fullscreen device
+/// loses focus (app deactivation) and when it leaves fullscreen (windowed
+/// `Reset`, final release) — even when the mode was changed by the app
+/// through user32 rather than by the device. mtld3d never initiates a
+/// modeset (see the module doc); putting the user's desktop back is the one
+/// direction that decision allows, and a windowed device never triggers
+/// this. The compare-first guard keeps the common nothing-changed case free
+/// of a spurious `WM_DISPLAYCHANGE` broadcast; the refresh rate is ignored
+/// in the comparison because the registry view may report 0 where the
+/// current view reports the real rate.
+pub fn restore_registry_mode() {
+    let Some((cur_w, cur_h, _)) = query_display_mode(ENUM_CURRENT_SETTINGS) else {
+        return;
+    };
+    let Some((reg_w, reg_h, _)) = query_display_mode(ENUM_REGISTRY_SETTINGS) else {
+        return;
+    };
+    if (cur_w, cur_h) == (reg_w, reg_h) {
+        return;
+    }
+    // SAFETY: a null devmode with flags 0 applies the registry mode, per the
+    // `ChangeDisplaySettingsW` contract.
+    let ret = unsafe { ChangeDisplaySettingsW(core::ptr::null_mut(), 0) };
+    if ret == 0 {
+        debug!(
+            target: LOG_TARGET,
+            "restored registry display mode {reg_w}x{reg_h} (was {cur_w}x{cur_h})"
+        );
+    } else {
+        warn!(
+            target: LOG_TARGET,
+            "ChangeDisplaySettingsW(NULL) failed restoring {reg_w}x{reg_h} from {cur_w}x{cur_h}: ret={ret}"
+        );
+    }
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn ChangeDisplaySettingsW(dev_mode: *mut DevModeW, flags: u32) -> i32;
+    fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
+    -> i32;
     fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
     fn GetWindowLongW(hwnd: *mut c_void, index: i32) -> i32;
     fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
@@ -437,6 +572,10 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
 
 /// Restore the window state captured by [`enter`].
 pub fn leave(saved: &SavedWindow) {
+    // Leaving fullscreen (windowed `Reset` or device destruction) puts the
+    // registry display mode back first, matching native D3D9's order (mode
+    // restore, then window restore). No-op when nothing changed the mode.
+    restore_registry_mode();
     let _driving = DrivingGuard::new();
     let hwnd = saved.hwnd;
     if !is_window(hwnd) {

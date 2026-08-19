@@ -5,8 +5,8 @@ use log::{error, info, trace, warn};
 use mtld3d_core::caps;
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
-    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams,
-    GetPrimaryDisplayModeParams, InPtr, InPtrMut, MetalHandle, OutPtr, VtableThis,
+    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
+    MetalHandle, OutPtr, VtableThis,
     mtl_handle::{MTLTextureKind, NSViewKind},
 };
 use mtld3d_types::{
@@ -32,12 +32,12 @@ use super::{
 
 // Dynamic display-mode list served by GetAdapterModeCount / EnumAdapterModes /
 // GetAdapterDisplayMode. Built once on first enumeration call from the host
-// display's actual pixel size + refresh rate (queried via the
-// `GetPrimaryDisplayMode` unix thunk), combined with a bank of common gaming
-// resolutions <= host. macOS doesn't do D3D9-style mode-setting — CAMetalLayer
-// renders at whatever size we ask, the WindowServer composites onto the actual
-// desktop — so the list shapes the game's UI dropdown, not actual rendering
-// behaviour. The first entry doubles as the current adapter display mode.
+// display's current mode in the Win32 view (`EnumDisplaySettingsW`, see
+// `build_adapter_modes`), combined with a bank of common gaming resolutions
+// <= host. macOS doesn't do D3D9-style mode-setting — CAMetalLayer renders at
+// whatever size we ask, the WindowServer composites onto the actual desktop —
+// so the list shapes the game's UI dropdown, not actual rendering behaviour.
+// The first entry doubles as the current adapter display mode.
 static ADAPTER_MODES: LazyLock<Vec<D3DDISPLAYMODE>> = LazyLock::new(build_adapter_modes);
 
 // Common gaming resolutions filtered down to those <= host display. Host
@@ -130,16 +130,19 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
 }
 
 fn build_adapter_modes() -> Vec<D3DDISPLAYMODE> {
-    let mut p = GetPrimaryDisplayModeParams {
-        width: 0,
-        height: 0,
-        refresh_hz: 0,
-        pad0: 0,
-    };
-    let _ = unix_call(&mut p);
-    let host_w = if p.width > 0 { p.width } else { 1920 };
-    let host_h = if p.height > 0 { p.height } else { 1080 };
-    let host_hz = if p.refresh_hz > 0 { p.refresh_hz } else { 60 };
+    // The host mode comes from the Win32 view (`EnumDisplaySettingsW` →
+    // macdrv), NOT from `NSScreen`: win32u validates the tests' and games'
+    // `ChangeDisplaySettingsW` calls against this view and derives
+    // `GetMonitorInfoW` from it, so a mode enumerated here is consistent
+    // with the window-management side on every display. An `NSScreen` read
+    // disagreed by the Retina factor on displays where the two scale
+    // differently (a CI runner's virtual display), splitting
+    // `GetAdapterDisplayMode` from the monitor rect.
+    let host = crate::fullscreen::current_display_mode();
+    let (w, h, hz) = host.unwrap_or((1920, 1080, 60));
+    let host_w = if w > 0 { w } else { 1920 };
+    let host_h = if h > 0 { h } else { 1080 };
+    let host_hz = if hz > 0 { hz } else { 60 };
     let host_aspect = f64::from(host_w) / f64::from(host_h);
 
     let mut sizes: Vec<(u32, u32)> = Vec::with_capacity(RES_BANK.len() + 1);

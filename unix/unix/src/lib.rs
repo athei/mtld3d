@@ -68,7 +68,6 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::WaitForGpuRetire => arp!(handlers::wait_for_gpu_retire_handler),
         Thunks::StartGpuCapture => arp!(handlers::start_gpu_capture_handler),
         Thunks::StopGpuCapture => arp!(handlers::stop_gpu_capture_handler),
-        Thunks::GetPrimaryDisplayMode => arp!(handlers::get_primary_display_mode_handler),
         Thunks::EnsureClearQuadPipeline => arp!(handlers::ensure_clear_quad_pipeline_handler),
         Thunks::EnsureBlitPipeline => arp!(handlers::ensure_blit_pipeline_handler),
         Thunks::GetTaskFaults => arp!(handlers::get_task_faults_handler),
