@@ -594,6 +594,13 @@ struct PresentGeometry {
 /// `Reset`, or device creation, which are about to change again anyway.
 const SETTLED_PRESENTS: u32 = 30;
 
+/// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
+///
+/// A larger payload (a `DrawPrimitiveUP` vertex stream past ~200 vertices)
+/// must ride a transient `MTLBuffer` instead; the validation layer rejects
+/// the `setBytes` call outright ("length must be <= 4096").
+const SET_BYTES_MAX: usize = 4096;
+
 /// Advance the settle counter for `geometry`, and say whether it has settled.
 ///
 /// A change of geometry restarts the count, so "settled" means
@@ -1456,13 +1463,48 @@ fn encode_pass(
                 Some(CommandType::SetVertexBytes) => {
                     let ptr = core::ptr::NonNull::new(cmd.param_b as *mut c_void);
                     if let Some(ptr) = ptr {
+                        let length = to_usize(cmd.param_c);
+                        if length > SET_BYTES_MAX {
+                            // `setVertexBytes` caps at 4 KiB; a UP draw with a
+                            // larger inline vertex payload rides a transient
+                            // buffer instead. Metal retains buffers a draw
+                            // references until the command buffer completes,
+                            // so releasing our handle after encoding is safe.
+                            let device = cmd_buf.device();
+                            // SAFETY: `ptr` is non-null (checked) and the PE
+                            // scratch arena holds `length` readable bytes for
+                            // the frame; Metal copies them into the new buffer.
+                            let vertex_buffer = unsafe {
+                                device.newBufferWithBytes_length_options(
+                                    ptr,
+                                    length,
+                                    MTLResourceOptions::StorageModeShared,
+                                )
+                            };
+                            let Some(vertex_buffer) = vertex_buffer else {
+                                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                    "SetVertexBytes: transient vertex buffer alloc failed ({length} B) — bind skipped"
+                                );
+                                continue;
+                            };
+                            // SAFETY: objc2 typed binding; `vertex_buffer` is
+                            // retained for the call.
+                            unsafe {
+                                encoder.setVertexBuffer_offset_atIndex(
+                                    Some(&vertex_buffer),
+                                    0,
+                                    cmd.param_a as usize,
+                                );
+                            }
+                            continue;
+                        }
                         // SAFETY: objc2 typed binding; `ptr` is non-null per
                         // the `Some` branch and `length` matches the PE-side
                         // buffer; encoder copies bytes synchronously.
                         unsafe {
                             encoder.setVertexBytes_length_atIndex(
                                 ptr,
-                                to_usize(cmd.param_c),
+                                length,
                                 cmd.param_a as usize,
                             );
                         }
