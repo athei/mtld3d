@@ -319,15 +319,14 @@ thunk from its init path.
 
 ## Contributing
 
-The development conventions live in
+[`CONTRIBUTING.md`](CONTRIBUTING.md) is the operating manual: what to read
+before changing anything, the gates and how to read their output, how
+conformance work is organised, and what a pull request is expected to contain.
+The development conventions themselves live in
 [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
 
-Run **`make check`** before every commit: `cargo fmt --check`, clippy with
-`nursery` and `pedantic` enabled, `make audit` (the rules clippy cannot
-express), and `make doc` (rustdoc, so doc links have to resolve). The check
-legs deny every warning via cargo's `build.warnings = "deny"`; normal builds
-and a plain `cargo clippy` only warn. Each audit finding names the section of
-`docs/CONVENTIONS.md` it comes from.
+The short version: **`make check`** and **`make test`** are green before every
+commit, and one pull request is one clearly defined change.
 
 ## License
 

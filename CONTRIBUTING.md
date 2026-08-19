@@ -1,0 +1,213 @@
+# Contributing
+
+Contributions are welcome, written by hand or with an agent. This file is the
+operating manual: what to read before changing anything, which gates have to be
+green, how to read their output, and what makes a pull request land on the first
+review instead of the third.
+
+It states no rule twice. Every rule has exactly one home, and this file points
+at it.
+
+## Read these first
+
+| File | What it owns |
+| --- | --- |
+| [`README.md`](README.md) | The goal, what is and is not implemented, and how to build, install, configure and log. |
+| [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The boundary contract: thunk versus command, stable backing for pointers the unix side dereferences, typed wire values, labelling Metal objects, the threading model, the perf counters and how to read them. |
+| [`unix/conformance/CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) | The conformance suite: how the runner and the baseline work, what each classification means, and the current per-site audit with its rationales. |
+| [`windows/tests/COVERAGE.md`](windows/tests/COVERAGE.md) | What the end-to-end suite covers, and the stubs whose contract a test pins on purpose. |
+| [`mtld3d.conf`](mtld3d.conf) | Every runtime option, its default, and a short why. |
+
+Read the conformance document before changing anything in the render, state or
+shader-emission path. It is where the reasoning behind the current behaviour
+lives, and a change that looks like a fix is often a divergence that was
+measured and kept.
+
+## The gates
+
+Two commands, both green before you commit:
+
+- **`make check`** is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
+  `make audit`, and `make doc`. Only the check legs deny warnings, so a plain
+  `cargo clippy` in an editor reports without failing. Each audit finding names
+  the section of `docs/CONVENTIONS.md` behind it; read that section rather than
+  pattern-matching your way past the grep.
+- **`make test`** is the host-native unit tests plus the end-to-end suite under
+  Wine, one leg per PE architecture. Conformance is not part of it, on purpose:
+  many of its checks fail by design, so it gates on a regression against a
+  baseline instead of on zero failures.
+
+`make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
+touched, that churn is its own pull request, not a hand-revert and not a passenger
+in yours.
+
+Both agent runners configured in this tree already print the conventions digest
+at session start and run `scripts/audit.sh --file` after every edit, so a
+violation surfaces while you write rather than at commit time. The digest at
+`.claude/conventions-digest.md` is generated: regenerate it in the same change
+that touches `docs/CONVENTIONS.md`.
+
+## Reading a test run
+
+The suite is honest, the summary is not. Two ways a run reads green while it
+failed:
+
+- The test runner is fail-fast. On a failure it prints a summary like
+  `42/88 tests run`, which undercounts and reads as mostly passing.
+- A pipeline reports the last stage's status, so `make test | tee log` returns
+  the exit code of `tee`.
+
+So capture with a plain redirect, in this order, `make test > out.log 2>&1`, and
+judge the run by grepping per-test results on both architectures rather than by
+the summary or by `$?`. Every test name appears once per architecture, and the
+occasional `LEAK` line is benign.
+
+## Which suite is right when they disagree
+
+Wine's d3d9 test suite is the spec oracle. The end-to-end suite is our own
+regression harness, so its assertions can encode our past bugs rather than D3D9's
+behaviour.
+
+When a conformance-improving change breaks an end-to-end test, the first question
+is whether the assertion is wrong, not whether the change should be reverted. If
+the new behaviour is what D3D9 does, update or delete the assertion and keep the
+fix. Revert only when the change itself is wrong, for example when it rejects an
+operation that is valid.
+
+## Speed, conformance, and divergences
+
+Speed is the goal and conformance serves it, so a divergence that buys frame time
+and breaks no game is allowed to stay. What is not allowed is a silent one.
+
+A kept divergence is a decision with three obligations: it goes in the README
+list of divergences kept on purpose, its conformance sites carry the rationale in
+`CONFORMANCE.md`, and where a knob makes sense it is revertible from
+`mtld3d.conf`. "It matches what we ship today" is not a justification for a
+change, because what we ship today may itself be the divergence. Prove a claim
+about observable behaviour with a test that fails before the change and passes
+after, and say in the pull request which way it went.
+
+## Reference implementations
+
+Before inventing a render-state heuristic, a per-shader allowlist, or any
+game-shaped special case, read what an established implementation does. DXVK's
+`src/d3d9/` (including its shader translator under `dxso/`) is the correctness
+reference and has been hardened against thousands of D3D9 titles; dxmt is the
+D3D9-on-Metal reference for the workloads it has been validated against; Wine's
+own wined3d is the baseline that runs on the same machine, so a behaviour we get
+wrong and it gets right is a regression by definition.
+
+If one of them ships clean where we do not, the gap is usually a structural
+feature we have not ported, not a quirk of one game. Port the structure. When
+our architecture forces a deviation, say so explicitly in the pull request
+instead of quietly simplifying.
+
+## Working on conformance
+
+```sh
+make conformance                       # both architectures, diffed against the baseline
+make conformance-i686                  # one architecture, one runner process
+make conformance-isolate ONLY=visual ARCH=x86_64 REPEAT=1
+make conformance-baseline-i686         # re-record this architecture's entries
+```
+
+The rules that are easy to get wrong:
+
+- Classifications live only in `CONFORMANCE.md`, on its `Sites:` lines.
+  `baseline.txt` is machine-owned counts and crash state; the parser rejects
+  class tokens there.
+- A classification records the nature of a divergence, never its difficulty or
+  how much a game cares. A hard-to-fix real defect is still real.
+- Re-record the baseline in the same change as the fix that moves the counts, and
+  check the diff: a re-record drops flaky-pinned sites that happened to read zero
+  in that run.
+- Derive the reason for a failing site from the upstream test source and from the
+  raw actual-versus-expected values, which `MTLD3D_CONFORMANCE_RAW_DIR=<dir>`
+  keeps. A site name is not a description of what the test exercises.
+- Run gating runs with clean shader caches, and never re-record prefix drift: the
+  Makefile pins the prefix display state before every run for a reason.
+
+A shader-emission or shared-crate change has wide, subtle fallout. Run the whole
+suite before committing, not just the subtest you were working on.
+
+## Companion edits that belong in the same change
+
+Each of these rots silently when it is left for later:
+
+- A new render-state, texture-stage-state or sampler-state consumer moves its
+  slot to consumed in the matching classifier, and flips the matching caps bit.
+  The classifier warnings are only useful while every warning is a real gap.
+- A change to shader emission bumps the shader-cache schema version. An unchanged
+  cache key serves stale MSL, and the result looks like a rendering bug.
+- A new config key ships with its dispatch arm, its unit test, and its entry in
+  the `mtld3d.conf` sample with the default and a short why.
+- A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
+  (`scripts/audit.sh --update-derives`).
+
+## Standing rules worth knowing before you write code
+
+The full set is in `docs/CONVENTIONS.md`. These are the ones a newcomer trips:
+
+- No new `MTLD3D_*` environment variable. A runtime knob is a `mtld3d.conf` key;
+  a diagnostic is a narrowed `mtld3d::*` log target consumed through `RUST_LOG`.
+- No fourth `#[allow]`. The tree carries exactly three, and complexity lints are
+  never suppressed: introduce a parameter struct instead.
+- No silent failures. Every stub, fallback and catch-all arm logs once.
+- No `pub(crate)`, no `mod.rs`, no type aliases, no glob imports, no raw
+  Objective-C selectors.
+- Hash maps use `FxHashMap`; content hashing uses xxh3.
+- Pure logic belongs in `mtld3d-core`; `windows/d3d9` is COM wiring. A COM
+  wrapper carries a vtable pointer, a refcount and an opaque inner pointer, and
+  every other field lives on the inner struct.
+- Every integer with symbolic meaning that crosses the boundary is a typed value
+  in `unix/shared`, never a bare `u32` and never a locally restated constant.
+- Comments state the invariant, not the history that produced it: no incident
+  provenance, no upstream test-file citations outside `unix/conformance/`, no
+  absolute paths from someone's machine. The audit greps for these.
+- No em dashes in prose, comments, commit messages or documentation.
+
+## Pull requests
+
+`main` is protected, so everything lands through a pull request, maintainers
+included, and pull requests are squash-merged.
+
+That makes the pull request, not the commit, the unit of review and the unit of
+history. One pull request is one clearly defined change, and the squashed commit
+is what has to stay bisectable on `main`. No drive-bys: an unrelated cleanup, a
+rename or a reformat picked up along the way goes in its own pull request. It
+keeps the review small and keeps `main` at one change per commit.
+
+Commits inside the branch are discarded by the squash, so they need no polish.
+The description is what survives, and for anything non-trivial it carries:
+
+1. The user-visible symptom, quoting the exact log line or error where there is
+   one.
+2. The root cause, the mechanism, and say so when it is conjecture.
+3. The fix, in its minimum conceptual steps.
+4. At least one considered alternative, including the dead ends.
+5. Verification: the commands you ran and what a reviewer should look for.
+
+Every check leg runs per pull request, plus both end-to-end architectures, the
+bundle, and both conformance architectures. The conformance legs are advisory:
+the runner's GPU is paravirtual and diverges from the baseline in both
+directions, so read their artifact rather than their status, and run
+`make conformance` locally when your change touches the render or
+shader-emission path.
+
+The end-to-end legs run serially in CI on purpose, because parallel device
+creation aborts on a runner. A flake there is not fixed by re-enabling
+parallelism.
+
+## What sends a pull request back
+
+- `make check` or `make test` is red, or the run was judged by the summary.
+- A new lint suppression, or a new environment variable.
+- A conformance regression with no re-recorded baseline and no rationale.
+- An end-to-end assertion deleted without saying which behaviour it contradicted.
+- A behaviour change that diverges from D3D9 without being written down as a
+  decision.
+- A missing companion edit: classifier arm, caps bit, cache-schema bump, config
+  sample entry, derive inventory.
+- Incident provenance or a private path in a comment.
+- Two unrelated changes in one branch.
