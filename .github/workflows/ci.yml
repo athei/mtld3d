@@ -66,9 +66,10 @@ jobs:
       - uses: ./.github/actions/prepare
       - run: make audit
 
-  # clippy for the two PE targets. `pe` is what gates the MSVC SDK and the
-  # Homebrew LLVM: clippy runs build scripts, so snmalloc-sys and zstd-sys need
-  # the xwin headers and the keg's llvm-lib even though nothing is linked here.
+  # clippy for the two PE targets. `pe` gates the MSVC SDK, the Homebrew LLVM and
+  # the Wine SDK: clippy runs build scripts, so snmalloc-sys and zstd-sys need the
+  # xwin headers and the keg's llvm-lib, and windows/shim's build script reads
+  # Wine's libwinecrt0.a, all before anything is linked.
   clippy-pe:
     needs: setup
     runs-on: macos-26
@@ -82,6 +83,7 @@ jobs:
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
       - run: make clippy-pe-${{ matrix.arch }}
 
   clippy-native:
@@ -102,6 +104,7 @@ jobs:
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
       - run: make doc-windows
 
   doc-unix:

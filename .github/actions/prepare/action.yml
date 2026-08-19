@@ -8,13 +8,17 @@ description: Restore the shared caches and bring up exactly the toolchain one CI
 # Wine at all.
 inputs:
   pe:
-    description: Leg builds for a PE target, so it needs the MSVC SDK splat and the Homebrew LLVM.
+    description: >
+      Leg builds for a PE target: needs the MSVC SDK splat, the Homebrew LLVM,
+      and the Wine SDK, since windows/shim links against Wine's import libraries
+      and `winebuild` marks the built DLLs.
     default: 'false'
   wine:
-    description: Leg runs Wine, so it needs the pinned SDK bundle and Rosetta.
+    description: >
+      Leg runs the PE binaries it built, so it needs Rosetta. Implies `pe`.
     default: 'false'
   wine-release:
-    description: wine-build release tag to download on a cache miss. Only read when `wine` is true.
+    description: wine-build release tag to download on a cache miss. Read when `pe` is true.
     default: ''
   prime:
     description: >
@@ -106,7 +110,7 @@ runs:
     - name: Restore the Wine SDK
       id: wine-cache
       uses: actions/cache/restore@v4
-      if: inputs.wine == 'true'
+      if: inputs.pe == 'true'
       with:
         path: ~/wine-sdk
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
@@ -115,7 +119,7 @@ runs:
     # is what WINE_SDK points at above. `make install` writes our builtin into
     # this tree, which is why the legs restore it but never save it back.
     - name: Download the pinned Wine SDK
-      if: inputs.wine == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
+      if: inputs.pe == 'true' && steps.wine-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         mkdir -p "$HOME/wine-sdk"
@@ -163,7 +167,7 @@ runs:
 
     - name: Save the Wine SDK
       uses: actions/cache/save@v4
-      if: inputs.prime == 'true' && inputs.wine == 'true'
+      if: inputs.prime == 'true' && inputs.pe == 'true'
       with:
         path: ~/wine-sdk
         key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
