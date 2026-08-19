@@ -77,10 +77,18 @@ UNIX_NATIVE_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
 RUST_STABLE  ?= stable
 RUST_NIGHTLY ?= nightly
 
+# The cargo-installed tools a CI leg actually needs: `xwin` splats the MSVC SDK,
+# `cargo-nextest` runs every test leg. Floating here and pinned by ci.yml, same
+# split as the toolchains, because until this was a variable they were the one
+# input a run took from whatever the registry happened to hold that day.
+# Developer-only tooling is deliberately not in here, see `setup-dev`.
+CARGO_TOOLS ?= xwin cargo-nextest
+
 # rustup reads this for every cargo and rustc below, so not one recipe has to
 # name a toolchain and a cargo line added later cannot escape the pin by
 # forgetting to. A `+toolchain` on the command line outranks it, which is exactly
 # how the two fmt recipes reach nightly while everything else stays on stable.
+# Note this replaces any ambient RUSTUP_TOOLCHAIN: `RUST_STABLE` is the knob.
 export RUSTUP_TOOLCHAIN := $(RUST_STABLE)
 
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
@@ -191,7 +199,8 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
 	clippy-native audit doc doc-windows doc-unix check clean upgrade \
-	upgrade-incompat setup setup-brew setup-rust setup-xwin setup-rosetta \
+	upgrade-incompat setup setup-brew setup-rust setup-dev setup-xwin \
+	setup-rosetta \
 	xwin-dir fetch
 
 all: windows unix
@@ -551,7 +560,7 @@ upgrade-incompat:
 # for the same reason the test and lint targets are: a host-only leg needs
 # neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
 # stands alone and this is the everything-at-once aggregate.
-setup: setup-brew setup-rust setup-xwin setup-rosetta
+setup: setup-brew setup-rust setup-dev setup-xwin setup-rosetta
 
 # `lld-link` (the PE linker) and the llvm keg's `llvm-lib` (the PE archiver,
 # named by absolute path in windows/.cargo/config.toml) both come from here, so
@@ -574,8 +583,19 @@ setup-rust:
 	# `--locked`: cargo-nextest refuses to build any other way (it ships a
 	# tripwire crate that fails the compile), and taking every tool's own
 	# lockfile is what makes a CI runner and a laptop install the same thing.
-	@echo "==> cargo: install/upgrade xwin, cargo-edit and cargo-nextest"
-	cargo install --locked xwin cargo-edit cargo-nextest
+	# The toolchain is named rather than left to the exported RUSTUP_TOOLCHAIN
+	# because cargo warns about the implicit override here, once per package it
+	# builds: the toolchain comes from this environment and not from anything the
+	# installed package asks for, which is what we want and worth saying out loud.
+	@echo "==> cargo: install/upgrade $(CARGO_TOOLS)"
+	cargo +$(RUST_STABLE) install --locked $(CARGO_TOOLS)
+
+# Tooling only a person uses: cargo-edit backs `upgrade` and `upgrade-incompat`,
+# which no CI leg runs, so it stays out of `setup-rust` rather than being rebuilt
+# from source on every cold cache for nothing.
+setup-dev:
+	@echo "==> cargo: install/upgrade cargo-edit"
+	cargo +$(RUST_STABLE) install --locked cargo-edit
 
 # Populate the cargo registry for both workspaces without building anything. A
 # CI setup job runs this once so the legs that fan out afterwards start from a
