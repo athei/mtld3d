@@ -18,11 +18,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Everything a run depends on that is not in the tree is pinned here, so a green
-# main cannot turn red without a commit. Both toolchains are plain Makefile
-# variables: it exports the stable one to rustup for every cargo it runs, and
-# names the nightly one on the fmt command lines. The MSVC CRT and Windows SDK
-# versions are pinned in the Makefile instead, beside the xwin call that consumes
-# them.
+# main cannot turn red without a commit: both toolchains, and the two cargo tools
+# a leg needs. All three are plain Makefile variables that float for a developer,
+# and every cargo line in the Makefile names its toolchain with rustup's `+`
+# syntax. The MSVC CRT and Windows SDK versions are pinned in the Makefile
+# instead, beside the xwin call that consumes them.
 env:
   WINE_RELEASE: cx-26.3.0-0
   RUST_STABLE: 1.97.1

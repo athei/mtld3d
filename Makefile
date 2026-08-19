@@ -54,6 +54,27 @@ $(info ==> FP=1: frame pointers forced (guest stack walks for the sampling profi
 FRAME_POINTERS := --config 'target."cfg(all())".rustflags=["-C","force-frame-pointers=yes"]'
 endif
 
+# Which toolchains to use. Both float for a developer, who tracks stable and
+# nightly and whose `rustc -V` is allowed to differ from anyone else's, and CI
+# pins both to exact versions (see .github/workflows/ci.yml), because clippy runs
+# nursery + pedantic with warnings denied, so a new release landing on a runner
+# image would otherwise redden a run nobody here touched.
+#
+# Every cargo and rustc line below names its toolchain with rustup's `+` syntax,
+# so the choice is visible where it is used and lives in no environment variable.
+# It is also the only form that outranks an ambient RUSTUP_TOOLCHAIN, so a shell
+# that pins one cannot silently redirect a build here. The cost is that a cargo
+# line added later has to carry the prefix too.
+RUST_STABLE  ?= stable
+RUST_NIGHTLY ?= nightly
+
+# The cargo-installed tools a CI leg actually needs: `xwin` splats the MSVC SDK,
+# `cargo-nextest` runs every test leg. Floating here and pinned by ci.yml, same
+# split as the toolchains, because until this was a variable they were the one
+# input a run took from whatever the registry happened to hold that day.
+# Developer-only tooling is deliberately not in here, see `setup-dev`.
+CARGO_TOOLS ?= xwin cargo-nextest
+
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
 # Release/Wine targets for the unix half. Wine picks the `.so` out of
@@ -67,29 +88,8 @@ UNIX_WINEDIR_x64   := x86_64-unix
 UNIX_WINEDIR_arm64 := aarch64-unix
 # Native host target for unit tests + clippy — whatever this machine is
 # (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta.
-UNIX_NATIVE_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
+UNIX_NATIVE_TARGET  := $(shell rustc +$(RUST_STABLE) -vV | sed -n 's/^host: //p')
 
-# Which toolchains to use. Both float for a developer, who tracks stable and
-# nightly and whose `rustc -V` is allowed to differ from anyone else's, and CI
-# pins both to exact versions (see .github/workflows/ci.yml), because clippy runs
-# nursery + pedantic with warnings denied, so a new release landing on a runner
-# image would otherwise redden a run nobody here touched.
-RUST_STABLE  ?= stable
-RUST_NIGHTLY ?= nightly
-
-# The cargo-installed tools a CI leg actually needs: `xwin` splats the MSVC SDK,
-# `cargo-nextest` runs every test leg. Floating here and pinned by ci.yml, same
-# split as the toolchains, because until this was a variable they were the one
-# input a run took from whatever the registry happened to hold that day.
-# Developer-only tooling is deliberately not in here, see `setup-dev`.
-CARGO_TOOLS ?= xwin cargo-nextest
-
-# rustup reads this for every cargo and rustc below, so not one recipe has to
-# name a toolchain and a cargo line added later cannot escape the pin by
-# forgetting to. A `+toolchain` on the command line outranks it, which is exactly
-# how the two fmt recipes reach nightly while everything else stays on stable.
-# Note this replaces any ambient RUSTUP_TOOLCHAIN: `RUST_STABLE` is the knob.
-export RUSTUP_TOOLCHAIN := $(RUST_STABLE)
 
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
 OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
@@ -131,7 +131,7 @@ SDK_UNIX_ARCH ?= $(if $(findstring arm64,$(shell file -b $(WINE_SDK)/bin/wine)),
 
 # Hard-fail on any warning (cargo counts emitted warnings, including ones
 # replayed from cache, and errors at the end of the run) — applied only to the
-# `check` legs so normal builds and a plain `cargo clippy` stay
+# `check` legs so normal builds and a plain `cargo +$(RUST_STABLE) clippy` stay
 # warning-tolerant. Unlike `-D warnings` (via clippy args or RUSTDOCFLAGS)
 # this changes no compiler flags, so check runs share the build cache with
 # plain invocations.
@@ -224,12 +224,12 @@ unix: unix-x64 unix-arm64
 # prefix, not lib/wine (`d3d9` gets its placeholder from wineboot, but custom
 # names don't), which the prefix-marker targets below do.
 windows-i686:
-	cd windows && cargo build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
+	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
 	winebuild --builtin $(OUT_i386)/mtld3d.dll
 	winebuild --fake-module -o $(OUT_i386)/mtld3d.fake.dll -m32 --dll $(OUT_i386)/mtld3d.dll
 
 windows-x86_64:
-	cd windows && cargo build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
+	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
 	winebuild --builtin $(OUT_x64)/mtld3d.dll
 	winebuild --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
@@ -240,13 +240,13 @@ windows-x86_64:
 # stamps the inner DWARF file after the input's basename and lldb looks it up
 # by that name — renaming the bundle afterwards produces one lldb won't find.
 unix-x64:
-	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
 	cp $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
 	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_x64)/mtld3d.so
 
 unix-arm64:
-	cd unix && cargo build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
 	cp $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
@@ -408,20 +408,20 @@ test: test-unit test-e2e-i686 test-e2e-x86_64
 # can't build for the host target) and must override its i686 default; the unix
 # workspace already defaults to the host, so just run all of it.
 test-unit:
-	cd windows && cargo nextest run -p mtld3d-core -p mtld3d-types --target $(UNIX_NATIVE_TARGET)
-	cd unix && cargo nextest run
+	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --target $(UNIX_NATIVE_TARGET)
+	cd unix && cargo +$(RUST_STABLE) nextest run
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-i686
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=wine \
-		cargo nextest run -p mtld3d-tests --target $(PE_i386)
+		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386)
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-x86_64
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine \
-		cargo nextest run -p mtld3d-tests --target $(PE_x64)
+		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64)
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts
@@ -432,7 +432,7 @@ test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 #
 # One arch per runner process, so the two gates are independent jobs. Every leg
 # runs the same four subtests for its arch.
-CONFORMANCE_RUN = cd unix && cargo run --profile $(PROFILE) -p mtld3d-conformance -- \
+CONFORMANCE_RUN = cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance -- \
 	--wine $(WINE_SDK)/bin/wine
 
 # $(1) = arch (i686|x86_64), $(2) = extra runner args. Checks the exe up front
@@ -492,25 +492,25 @@ clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native
 # there; mtld3d-tests' integration tests aren't covered by those runs, so its own
 # per-crate pass lints all its targets (it has no apple dev-deps).
 clippy-pe-i686:
-	cd windows && cargo clippy --target $(PE_i386) $(DENY_WARNINGS)
-	cd windows && cargo clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_i386) $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
 	# `unix/shared` ships into both worlds but is a member of only the unix
 	# workspace, so the windows legs build it as a plain path dependency with no
 	# lint table: its `cfg(target_family = "windows")` arms (the PE image-ID
 	# reader) would otherwise be linted by nothing. Lint it on the PE target that
 	# reaches them.
-	cd unix && cargo clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
+	cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $(PE_i386) $(DENY_WARNINGS)
 
 clippy-pe-x86_64:
-	cd windows && cargo clippy --target $(PE_x64) $(DENY_WARNINGS)
-	cd windows && cargo clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_x64) $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
 
 # Everything that lints for this machine's own arch: mtld3d-core's test targets
 # (the only place `#[cfg(test)]` blocks in the windows workspace are linted) and
 # the whole unix workspace.
 clippy-native:
-	cd windows && cargo clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
-	cd unix && cargo clippy --all-targets $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
+	cd unix && cargo +$(RUST_STABLE) clippy --all-targets $(DENY_WARNINGS)
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
@@ -528,10 +528,10 @@ doc: doc-windows doc-unix
 # shim are `cdylib`s with raw-dylib imports and only build for *-pc-windows-msvc,
 # so a host run would silently skip them. i686 covers every member.
 doc-windows:
-	cd windows && cargo doc --no-deps --target $(PE_i386) $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) doc --no-deps --target $(PE_i386) $(DENY_WARNINGS)
 
 doc-unix:
-	cd unix && cargo doc --no-deps $(DENY_WARNINGS)
+	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
 # conventions audit, and the doc build. fmt-check first (fast, fails early on
@@ -545,16 +545,16 @@ check:
 	$(MAKE) doc
 
 clean:
-	cd windows && cargo clean
-	cd unix && cargo clean
+	cd windows && cargo +$(RUST_STABLE) clean
+	cd unix && cargo +$(RUST_STABLE) clean
 
 upgrade:
-	cd windows && cargo update
-	cd unix && cargo update
+	cd windows && cargo +$(RUST_STABLE) update
+	cd unix && cargo +$(RUST_STABLE) update
 
 upgrade-incompat:
-	cd windows && cargo upgrade --incompatible && cargo update
-	cd unix && cargo upgrade --incompatible && cargo update
+	cd windows && cargo +$(RUST_STABLE) upgrade --incompatible && cargo +$(RUST_STABLE) update
+	cd unix && cargo +$(RUST_STABLE) upgrade --incompatible && cargo +$(RUST_STABLE) update
 
 # One-time bootstrap for a development machine or a CI runner. Split into leaves
 # for the same reason the test and lint targets are: a host-only leg needs
@@ -602,8 +602,8 @@ setup-dev:
 # warm cargo home instead of each re-downloading the same crates.
 fetch:
 	@echo "==> cargo: fetch dependencies for both workspaces"
-	cd windows && cargo fetch
-	cd unix && cargo fetch
+	cd windows && cargo +$(RUST_STABLE) fetch
+	cd unix && cargo +$(RUST_STABLE) fetch
 
 # The MSVC SDK splat lives at /opt/xwin and cannot move: that path is compiled
 # into windows/.cargo/config.toml, as `-Lnative` for rustc and `-idirafter` for
