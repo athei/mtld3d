@@ -119,7 +119,7 @@ D3D9_TEST_x86_64 := $(WINE_SDK)/lib/wine/tests/x86_64-windows/d3d9_test.exe
 # libs by the arch of the Wine build itself, so a test or conformance leg needs
 # that one installed and the other is inert. Probed from the loader (lazily, so
 # only legs that use it pay for it) and overridable.
-SDK_SO_ARCH ?= $(if $(findstring arm64,$(shell file -b $(WINE_SDK)/bin/wine)),arm64,x64)
+SDK_UNIX_ARCH ?= $(if $(findstring arm64,$(shell file -b $(WINE_SDK)/bin/wine)),arm64,x64)
 
 # Hard-fail on any warning (cargo counts emitted warnings, including ones
 # replayed from cache, and errors at the end of the run) — applied only to the
@@ -166,10 +166,25 @@ DEBUG_STAGE  := $(CURDIR)/windows/target/bundle-debug
 BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
                         sed -n 's/^version = "\(.*\)"/v\1/p' windows/Cargo.toml)
 
+# Target naming, two vocabularies with one rule each:
+#
+#   windows / unix   the two cargo workspaces, which are also the two
+#                    directories. A leg split by workspace says which one it
+#                    covers: `doc-unix`, `install-windows-i686`.
+#   pe / native      the target family: a PE cross-compile versus this machine's
+#                    own arch. A leg split by target says which one it takes:
+#                    `clippy-pe-i686`, `clippy-native`. The clippy legs are named
+#                    this way because the target is what actually splits them
+#                    (see the comment there), and the native leg spans a crate
+#                    from each workspace, so no workspace name would fit it.
+#
+# The arch suffix is the target's own spelling, i686 / x86_64 for PE and
+# x64 / arm64 for the unix `.so`, matching the OUT_* variables above.
+#
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
-	install install-pe-i686 install-pe-x86_64 install-so-x64 install-so-arm64 \
+	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle configure-test-prefix prefix-marker-i686 prefix-marker-x86_64 \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
@@ -227,17 +242,17 @@ unix-arm64:
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
 
-install: install-pe-i686 install-pe-x86_64 install-so-x64 install-so-arm64
+install: install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64
 
-# Per-arch install leaves, matching the build leaves: a test leg installs the one
-# PE arch it exercises plus the one unix `.so` its Wine loads, and only `install`
-# (and `bundle`) covers everything.
+# Per-arch install leaves, named after the build leaf each one installs: a test
+# leg installs the one PE arch it exercises plus the one unix `.so` its Wine
+# loads, and only `install` (and `bundle`) covers everything.
 #
 # The d3d9.dll copies under lib/wine get the builtin signature in place: the
 # loader ignores unsigned PEs on the builtin search path. Symbols travel with
 # each binary, the `.pdb` beside every PE and the `.dSYM` beside the `.so`, so a
 # local crash symbolicates against the installed files with no extra flags.
-install-pe-i686: windows-i686
+install-windows-i686: windows-i686
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/mtld3d.fake.dll                     $$dir/lib/wine/i386-windows/ ; \
@@ -245,7 +260,7 @@ install-pe-i686: windows-i686
 		winebuild --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
 	done
 
-install-pe-x86_64: windows-x86_64
+install-windows-x86_64: windows-x86_64
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/mtld3d.fake.dll                      $$dir/lib/wine/x86_64-windows/ ; \
@@ -256,7 +271,7 @@ install-pe-x86_64: windows-x86_64
 # Both unix arches create the directory the Wine tree lacks: a Wine only ever
 # loads the one matching its own build, so the other copy is inert, and a tree
 # that later gains an arm64 loader is already served.
-install-so-x64: unix-x64
+install-unix-x64: unix-x64
 	for dir in $(INSTALL_DIRS); do \
 		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_x64) ; \
 		cp $(OUT_unix_x64)/mtld3d.so        $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
@@ -264,7 +279,7 @@ install-so-x64: unix-x64
 		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
 	done
 
-install-so-arm64: unix-arm64
+install-unix-arm64: unix-arm64
 	for dir in $(INSTALL_DIRS); do \
 		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_arm64) ; \
 		cp $(OUT_unix_arm64)/mtld3d.so      $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
@@ -370,10 +385,10 @@ configure-test-prefix:
 # without this our d3d9.dll cannot reach its own unix half and every test fails
 # to create a device. Idempotent, so it also self-heals a prefix that wineboot
 # has since wiped. Same copy INSTALL.md documents for end users.
-prefix-marker-i686: install-pe-i686
+prefix-marker-i686: install-windows-i686
 	cp $(OUT_i386)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/syswow64/mtld3d.dll
 
-prefix-marker-x86_64: install-pe-x86_64
+prefix-marker-x86_64: install-windows-x86_64
 	cp $(OUT_x64)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/system32/mtld3d.dll
 
 test: test-unit test-e2e-i686 test-e2e-x86_64
@@ -389,12 +404,12 @@ test-unit:
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
-test-e2e-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-i686
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=wine \
 		cargo nextest run -p mtld3d-tests --target $(PE_i386)
 
-test-e2e-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix prefix-marker-x86_64
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine \
 		cargo nextest run -p mtld3d-tests --target $(PE_x64)
@@ -422,10 +437,10 @@ endef
 
 conformance: conformance-i686 conformance-x86_64
 
-conformance-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+conformance-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,i686)
 
-conformance-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+conformance-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64)
 
 # Re-record the baseline. Both legs write the same baseline.txt (each replacing
@@ -435,10 +450,10 @@ conformance-baseline:
 	$(MAKE) conformance-baseline-i686
 	$(MAKE) conformance-baseline-x86_64
 
-conformance-baseline-i686: install-pe-i686 install-so-$(SDK_SO_ARCH)
+conformance-baseline-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,i686,--update-baseline)
 
-conformance-baseline-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
+conformance-baseline-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64,--update-baseline)
 
 # Flap characterization: run ONE subtest REPEAT times and print a per-site flap
@@ -448,7 +463,7 @@ conformance-baseline-x86_64: install-pe-x86_64 install-so-$(SDK_SO_ARCH)
 ONLY ?= device
 ARCH ?= i686
 REPEAT ?= 20
-conformance-isolate: install-pe-$(ARCH) install-so-$(SDK_SO_ARCH)
+conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT))
 
 fmt:
