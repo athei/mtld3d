@@ -166,10 +166,12 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **45 `real` · 123 `expected` ·
-6 `caps` · 3 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
-`crash=0`. Tags do not affect the gate (which rejects count/site/crash
-regressions), so tag corrections are documentation, not gate changes.
+re-checked before retagging. Headline: **42 `real` · 107 `expected` ·
+1 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
+subtest-arches `crash=0`. Only two tags change what the gate tolerates:
+`flaky` (count changes in either direction) and `ceiling` (reads below the
+pin). Every other tag is documentation, so a correction between `real`,
+`expected` and `caps` is never a gate change.
 
 #### Desktop mode switching, and how fullscreen honors the requested size
 
