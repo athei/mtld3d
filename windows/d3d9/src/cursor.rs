@@ -354,6 +354,14 @@ impl CursorState {
             return;
         };
         let interval_us = elapsed_us(last);
+        // Per-frame timeline at trace: with `mtld3d::d3d9::cursor=trace`
+        // every Present gets a row, so a blip too small for the hitch rule
+        // below (one late refresh under VRR pacing) is still on record next
+        // to the transition line it follows.
+        trace!(
+            target: LOG_TARGET,
+            "present: interval_us={interval_us} cursor_calls_us={calls_us} wm_setcursor={msgs}",
+        );
         if interval_us > HITCH_MAX_INTERVAL_US {
             return;
         }

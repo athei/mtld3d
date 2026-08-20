@@ -8,7 +8,7 @@ use std::{
 };
 
 use block2::RcBlock;
-use log::{debug, error};
+use log::{debug, error, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle, PassDescriptor,
     SubmitFrameParams,
@@ -72,6 +72,12 @@ unsafe impl Sync for PendingCmdBuf {}
 /// so the map size is bounded by in-flight frames.
 static PENDING_CMDBUFS: Mutex<BTreeMap<u64, PendingCmdBuf>> = Mutex::new(BTreeMap::new());
 
+/// Log sub-target of the presented-cadence probe.
+///
+/// Inherits `mtld3d::unix` filters by prefix; `mtld3d::unix::present=trace`
+/// turns on the per-frame rows without touching anything else.
+const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
+
 /// Host time (ns) at which the previous drawable reached the screen.
 ///
 /// Half of the presented-cadence probe, see [`register_presented_probe`].
@@ -119,6 +125,16 @@ fn register_presented_probe(
                 return;
             }
             let interval_ns = now_ns - last_ns;
+            // Per-frame timeline at trace, the presented-side twin of the
+            // PE `present:` row; `t_us` is the absolute host time so rows
+            // can be aligned across threads.
+            trace!(
+                target: PRESENT_LOG_TARGET,
+                "presented: seq={seq} interval_us={} wait_us={} t_us={}",
+                interval_ns / 1000,
+                drawable_wait_ns / 1000,
+                now_ns / 1000,
+            );
             if interval_ns > PRESENTED_MAX_INTERVAL_NS {
                 TYPICAL_PRESENTED_NS.store(0, Ordering::Relaxed);
                 return;
@@ -135,7 +151,7 @@ fn register_presented_probe(
                 && interval_ns > typical_ns + PRESENTED_MIN_EXCESS_NS;
             if hitch {
                 debug!(
-                    target: LOG_TARGET,
+                    target: PRESENT_LOG_TARGET,
                     "presented hitch: presented interval {} us (typical {} us) seq={seq} next_drawable_wait_us={}",
                     interval_ns / 1000,
                     typical_ns / 1000,
