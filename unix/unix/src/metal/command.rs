@@ -8,7 +8,7 @@ use std::{
 };
 
 use block2::RcBlock;
-use log::error;
+use log::{debug, error, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle, PassDescriptor,
     SubmitFrameParams,
@@ -26,10 +26,10 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLIndexType, MTLLoadAction,
-    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
-    MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture,
-    MTLViewport, MTLVisibilityResultMode,
+    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLDrawable, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize,
+    MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -71,6 +71,100 @@ unsafe impl Sync for PendingCmdBuf {}
 /// `waitUntilCompleted` on. The completion handler always removes,
 /// so the map size is bounded by in-flight frames.
 static PENDING_CMDBUFS: Mutex<BTreeMap<u64, PendingCmdBuf>> = Mutex::new(BTreeMap::new());
+
+/// Log sub-target of the presented-cadence probe.
+///
+/// Inherits `mtld3d::unix` filters by prefix; `mtld3d::unix::present=trace`
+/// turns on the per-frame rows without touching anything else.
+const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
+
+/// Host time (ns) at which the previous drawable reached the screen.
+///
+/// Half of the presented-cadence probe, see [`register_presented_probe`].
+/// Atomics because Metal runs the presented handler on its own thread.
+static LAST_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
+/// Exponential running average of the presented interval, ns; 0 = unseeded.
+static TYPICAL_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
+/// A presented interval above this is a pause, not a hitch; it reseeds.
+const PRESENTED_MAX_INTERVAL_NS: u64 = 500_000_000;
+/// Minimum excess over the typical presented interval for a hitch, ns.
+///
+/// Applied on top of the 1.5x ratio, so jitter on a fast panel stays quiet
+/// while one dropped refresh at 120 Hz (8.3 ms to 16.6 ms) registers.
+const PRESENTED_MIN_EXCESS_NS: u64 = 3_000_000;
+
+/// Presented-cadence probe: when each frame actually reached the screen.
+///
+/// Registers a presented handler on the drawable. The handler reads
+/// `presentedTime`, the compositor's host time for the frame hitting the
+/// panel, keeps an exponential running typical interval, and logs one
+/// debug line when an interval exceeds 1.5x the typical one by at least
+/// `PRESENTED_MIN_EXCESS_NS`: the interval, the typical interval, the
+/// frame's sequence number and its `nextDrawable` wait. Together with the
+/// PE-side `frame hitch` line (Present-call cadence on the API thread) it
+/// separates a stalled game thread from a frame that was produced on time
+/// and displayed late. One block allocation per frame while the target is
+/// at debug or below; the caller skips the registration otherwise, and the
+/// line only forms on a hitch.
+fn register_presented_probe(
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    seq: u64,
+    drawable_wait_ns: u64,
+) {
+    let handler = RcBlock::new(
+        move |d_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // SAFETY: Metal invokes the block with the presented drawable;
+            // the pointer is valid for the handler's duration.
+            let d = unsafe { d_ptr.as_ref() };
+            let now_ns = super::macdrv::host_seconds_to_ns(d.presentedTime());
+            if now_ns == 0 {
+                // Never presented (drawable dropped): leave the chain alone.
+                return;
+            }
+            let last_ns = LAST_PRESENTED_NS.swap(now_ns, Ordering::AcqRel);
+            if last_ns == 0 || now_ns <= last_ns {
+                return;
+            }
+            let interval_ns = now_ns - last_ns;
+            // Per-frame timeline at trace, the presented-side twin of the
+            // PE `present:` row; `t_us` is the absolute host time so rows
+            // can be aligned across threads.
+            trace!(
+                target: PRESENT_LOG_TARGET,
+                "presented: seq={seq} interval_us={} wait_us={} t_us={}",
+                interval_ns / 1000,
+                drawable_wait_ns / 1000,
+                now_ns / 1000,
+            );
+            if interval_ns > PRESENTED_MAX_INTERVAL_NS {
+                TYPICAL_PRESENTED_NS.store(0, Ordering::Relaxed);
+                return;
+            }
+            let typical_ns = TYPICAL_PRESENTED_NS.load(Ordering::Relaxed);
+            let next_typical = if typical_ns == 0 {
+                interval_ns
+            } else {
+                typical_ns - typical_ns / 16 + interval_ns / 16
+            };
+            TYPICAL_PRESENTED_NS.store(next_typical, Ordering::Relaxed);
+            let hitch = typical_ns != 0
+                && interval_ns * 2 > typical_ns * 3
+                && interval_ns > typical_ns + PRESENTED_MIN_EXCESS_NS;
+            if hitch {
+                debug!(
+                    target: PRESENT_LOG_TARGET,
+                    "presented hitch: presented interval {} us (typical {} us) seq={seq} next_drawable_wait_us={}",
+                    interval_ns / 1000,
+                    typical_ns / 1000,
+                    drawable_wait_ns / 1000,
+                );
+            }
+        },
+    );
+    // SAFETY: objc2 typed binding; Metal copies (retains) the block on
+    // registration, so the stack `handler` may drop when this returns.
+    unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
+}
 
 /// Block until `coherent_seq >= target_seq` by calling `waitUntilCompleted`.
 ///
@@ -406,6 +500,11 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
             } else {
                 cmd_buf.presentDrawable(drawable_obj);
+            }
+            // Debug and trace output only, so the per-frame block allocation
+            // and handler registration are skipped when the target is off.
+            if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
+                register_presented_probe(&drawable, params.submit_seq, params.drawable_wait_ns);
             }
         }
     }
