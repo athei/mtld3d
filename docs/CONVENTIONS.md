@@ -18,6 +18,8 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `pub(crate)` = 0 | §No `pub(crate)` |
 | `extern "stdcall"` = 0 | §`extern "system"` everywhere |
 | `msg_send!` / `class!` / `sel!` = 0 | §No raw `msg_send!` |
+| `HashMap` / `HashSet` = 0 (maps are `FxHashMap` / `FxHashSet`) | §FxHash for maps, xxh3 for content |
+| `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
 | Release hygiene (see below) | §Release hygiene |
 
@@ -392,6 +394,14 @@ The title is what rustdoc puts in the summary column of every index, and what a 
 /// own persistent `metal_color_handle` distinct from the backbuffer, plus its
 /// own format and dimensions.
 ```
+
+## FxHash for maps, xxh3 for content
+
+Every hash map and set in both workspaces is `rustc_hash::FxHashMap` / `FxHashSet`, never std's default `HashMap` / `HashSet`. The keys here are `u64`s, handles, ids and small derived-`Hash` structs; SipHash's DoS resistance buys nothing in a renderer and costs a dozen rounds per lookup where FxHash is one multiply. Build with `FxHashMap::default()` or `with_capacity_and_hasher(n, FxBuildHasher)`. `std::collections::hash_map::Entry` is hasher-agnostic and stays.
+
+Content hashing is a different job: folding a byte buffer or a composite key into a `u64` that then *is* the identity (shader bytecode, vertex declarations, cursor pixels, the on-disk shader-cache keys). That uses `xxhash_rust::xxh3::Xxh3`: fast over buffers, real avalanche, stable across toolchains. Never `DefaultHasher` (SipHash, and std documents its algorithm as unspecified between releases) and never `FxHasher`, which spreads keys across buckets but is not an identity: a map absorbs a collision with the `Eq` compare that follows, a content hash has nothing behind it.
+
+The audit bans `HashMap`, `HashSet`, `DefaultHasher` and `RandomState` outside comments.
 
 ## Dependencies
 

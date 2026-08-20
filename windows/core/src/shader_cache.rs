@@ -42,11 +42,9 @@
 //! testable. Encoder-side write hooks and pre-warm-thread plumbing live in
 //! `windows/d3d9`.
 
-use std::{
-    collections::HashSet,
-    hash::{Hash, Hasher},
-};
+use std::hash::{Hash, Hasher};
 
+use rustc_hash::FxHashSet;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::shader_compile_stats::CompileBucket;
@@ -426,7 +424,7 @@ pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
     let mut single_count: usize = 0;
     let mut bundle_count: usize = 0;
     let mut other_chunk = false;
-    let mut seen_keys: HashSet<u64> = HashSet::new();
+    let mut seen_keys: FxHashSet<u64> = FxHashSet::default();
     let mut duplicates = false;
 
     while off + CHUNK_HEADER_LEN <= bytes.len() {

@@ -127,6 +127,7 @@ dependencies = [
  "rustc-hash",
  "snmalloc-rs",
  "xbr",
+ "xxhash-rust",
 ]
 
 [[package]]

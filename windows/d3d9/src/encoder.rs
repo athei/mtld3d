@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque, hash_map::Entry},
+    collections::{VecDeque, hash_map::Entry},
     fs::{File, OpenOptions},
     io::Write as _,
     path::PathBuf,
@@ -66,7 +66,7 @@ use mtld3d_types::{D3DCMP_ALWAYS, D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 // (texture/lib/pipeline/sampler/buffer/...). Keys are small trusted integers
 // or fixed structs; SipHash's DoS resistance buys nothing here and its
 // per-probe cost shows up in the encoder `resolve`/`binds`/`samplers` phases.
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     LOG_TARGET,
@@ -671,7 +671,7 @@ pub struct FrameEncoder {
     /// happen to share dimensions stay distinguishable. Lives on
     /// `FrameEncoder` rather than the perf struct because the log itself
     /// is a shader-debug aid (target `mtld3d::d3d9`), not perf telemetry.
-    pass_shader_log_fired: HashSet<(MetalHandle<MTLTextureKind>, PairShaderId, PairShaderId)>,
+    pass_shader_log_fired: FxHashSet<(MetalHandle<MTLTextureKind>, PairShaderId, PairShaderId)>,
 
     /// Captured at encoder spawn from `MTLDevice` queries.
     ///
@@ -1069,7 +1069,7 @@ impl FrameEncoder {
             backbuffer_width: 0,
             backbuffer_height: 0,
             perf: EncoderPerfState::new(),
-            pass_shader_log_fired: HashSet::new(),
+            pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
             device_handle: MetalHandle::NULL,
             depth_stencil_cache: FxHashMap::default(),

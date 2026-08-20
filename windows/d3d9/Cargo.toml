@@ -19,6 +19,7 @@ log = { workspace = true }
 rustc-hash = { workspace = true }
 snmalloc-rs = { workspace = true }
 xbr = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [lints]
 workspace = true

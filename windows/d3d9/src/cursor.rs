@@ -12,7 +12,6 @@
 
 use core::{ffi::c_void, ptr::null_mut};
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
     hash::Hasher,
     sync::{LazyLock, Mutex},
     time::Instant,
@@ -24,6 +23,8 @@ use mtld3d_shared::InPtr;
 use mtld3d_types::{
     D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO, IDirect3DSurface9Vtbl, POINT,
 };
+use rustc_hash::FxHashMap;
+use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL,
@@ -230,8 +231,8 @@ const WM_APP_REASSERT_FULLSCREEN: u32 = 0x8000 + 0x03D9;
 /// when more than one device exists at once (the second `CreateDevice` would
 /// orphan the first window's cursor and, once either device tears down, leave a
 /// still-subclassed window pointing at a stale/cleared device).
-static DEVICE_INSTANCES: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DEVICE_INSTANCES: LazyLock<Mutex<FxHashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 // ── CursorState ──
 
@@ -314,7 +315,7 @@ pub struct CursorState {
     handle: *mut c_void,
     flags: CursorFlags,
     hash: u64,
-    cache: HashMap<u64, *mut c_void>,
+    cache: FxHashMap<u64, *mut c_void>,
     probe: HitchProbe,
     /// Nearest-neighbor upscale factor applied to the cursor bitmap.
     ///
@@ -335,7 +336,7 @@ impl CursorState {
             // cursor image is set and shown).
             flags: CursorFlags::DIRTY,
             hash: 0,
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             probe: HitchProbe::new(),
             scale: scale.clamp(1, 8),
         }
@@ -936,9 +937,10 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
 
 /// Content-hash over hotspot + dimensions + pixel bytes.
 ///
-/// Used as the cursor cache key inside `SetCursorProperties`. Cold-path (a
-/// handful of calls per session), so `DefaultHasher` is used here for
-/// consistency with `ProgramId::from_tokens`.
+/// Used as the cursor cache key inside `SetCursorProperties`. xxh3 is the
+/// content hash for byte buffers throughout the tree (see `ProgramId`); the
+/// value is the whole identity of the cursor, so it needs real avalanche, not
+/// a map hasher.
 fn hash_cursor(
     x_hotspot: u32,
     y_hotspot: u32,
@@ -947,7 +949,7 @@ fn hash_cursor(
     src: *const u8,
     pitch: usize,
 ) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = Xxh3::new();
     h.write_u32(x_hotspot);
     h.write_u32(y_hotspot);
     h.write_u32(width);

@@ -9,7 +9,6 @@
 //! about to land in `lib_cache`.
 
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -26,6 +25,7 @@ use mtld3d_core::{
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
 };
 use mtld3d_shared::{MetalHandle, mtl::StageTag, mtl_handle::MTLDeviceKind};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
     LOG_TARGET,
@@ -162,7 +162,7 @@ fn run(device_handle: MetalHandle<MTLDeviceKind>, sender: PrewarmSender, stop: &
     // we'd pay `newLibraryWithSource:` cost N times for a key that
     // appeared in both the bundle and a later append.
     let mut deduped: Vec<CacheEntry> = Vec::with_capacity(entries.len());
-    let mut seen = HashSet::with_capacity(entries.len());
+    let mut seen = FxHashSet::with_capacity_and_hasher(entries.len(), FxBuildHasher);
     for entry in entries {
         if seen.insert(entry.key) {
             deduped.push(entry);

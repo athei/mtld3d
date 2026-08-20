@@ -29,7 +29,7 @@
 //! from their device pointer at construction time.
 
 #[cfg(perf_tracking)]
-use std::{collections::HashMap, fmt::Write as _, sync::LazyLock};
+use std::{fmt::Write as _, sync::LazyLock};
 
 #[cfg(perf_tracking)]
 use log::{info, trace};
@@ -46,6 +46,8 @@ use mtld3d_shared::{
     tsc::{cycles_to_ms, rdtsc, secs_to_cycles},
 };
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
+#[cfg(perf_tracking)]
+use rustc_hash::FxHashMap;
 // Brings `OpSub::COUNT` (the `strum::EnumCount` associated const) into scope
 // for the `[_; OpSub::COUNT]` arrays below. Only referenced from
 // perf-tracking code, so the import is elided under `not(perf_tracking)`.
@@ -1392,9 +1394,9 @@ impl FramePerfPayload {
 /// Used as a map key for the per-pair stats and as the formatted tag in
 /// trace dumps.
 ///
-/// The module in d3d9 that constructs these fills `hash` from
-/// `ProgramId.raw()` when `is_programmable`, or from a `DefaultHasher` over
-/// the fixed-function key otherwise.
+/// The module in d3d9 that constructs these fills `hash` with the shader's
+/// on-disk cache key (xxh3 over the program id or the fixed-function key),
+/// so the tag matches the entry-point name seen in Metal captures.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PairShaderId {
     pub is_programmable: bool,
@@ -1518,7 +1520,7 @@ pub struct EncoderPerfState {
     /// frame with nothing returned yet reports 0 rather than stale data).
     enc: EncoderFrameCounters,
 
-    per_pair_stats: HashMap<(u32, u32, PairShaderId, PairShaderId), PerPairStats>,
+    per_pair_stats: FxHashMap<(u32, u32, PairShaderId, PairShaderId), PerPairStats>,
 
     // ── Running totals (live across frames) ──
     /// Byte total of live `PageBoxes` in the encoder's retention queue.
@@ -1566,7 +1568,7 @@ impl EncoderPerfState {
             counters: FrameCounters::new(),
             timing: FrameTiming::new(),
             enc: EncoderFrameCounters::new(),
-            per_pair_stats: HashMap::new(),
+            per_pair_stats: FxHashMap::default(),
             vbib_retained_bytes: 0,
             tex_staging_retained_bytes: 0,
             prev_pagebox_volume: PageBoxVolume::new(),

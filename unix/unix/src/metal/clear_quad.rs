@@ -28,10 +28,7 @@
 //! entries. Pipelines + library are process-lifetime (leaked via
 //! `Retained::into_raw`) — same posture as `present`.
 
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-};
+use std::sync::{Mutex, OnceLock};
 
 use mtld3d_shared::{
     EnsureClearQuadPipelineParams, MetalHandle,
@@ -44,6 +41,7 @@ use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLPixelFormat,
     MTLRenderPipelineDescriptor,
 };
+use rustc_hash::FxHashMap;
 
 use super::texture::mtl_pixel_format;
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -114,7 +112,7 @@ struct ClearQuadKey {
 struct ClearQuadCache {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_color_fn: MetalHandle<MTLFunctionKind>,
-    pipelines: Mutex<HashMap<ClearQuadKey, MetalHandle<MTLRenderPipelineStateKind>>>,
+    pipelines: Mutex<FxHashMap<ClearQuadKey, MetalHandle<MTLRenderPipelineStateKind>>>,
 }
 
 static CACHE: OnceLock<Option<ClearQuadCache>> = OnceLock::new();
@@ -190,7 +188,7 @@ fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option
     Some(ClearQuadCache {
         vs_fn: vs_handle,
         ps_color_fn: ps_color_handle,
-        pipelines: Mutex::new(HashMap::new()),
+        pipelines: Mutex::new(FxHashMap::default()),
     })
 }
 

@@ -74,6 +74,7 @@ objc2-metal = { version = "0.3", features = [
 ] }
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
+rustc-hash = "2"
 strum = { version = "0.28", default-features = false }
 
 [profile.dev]

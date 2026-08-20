@@ -30,6 +30,7 @@ use mtld3d_types::{
     D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC,
     D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9,
 };
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::dxso::{DeclUsage, ff_attr_index_for_semantic};
 
@@ -857,7 +858,7 @@ pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> (Vec<VertexAttrDe
 /// same elements produce the same hash.
 #[must_use]
 pub fn hash_elements(elements: &[D3DVERTEXELEMENT9]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = Xxh3::new();
     for e in elements {
         e.hash(&mut h);
     }

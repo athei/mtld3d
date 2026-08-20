@@ -8,11 +8,11 @@
 //! it) falls out of the store's own `Drop`.
 
 use core::ffi::c_void;
-use std::collections::HashMap;
 
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DSPD_IUNKNOWN, Guid,
 };
+use rustc_hash::FxHashMap;
 
 /// `IUnknown` vtable head, enough to call `AddRef`/`Release` on an external COM pointer.
 ///
@@ -78,7 +78,7 @@ impl Entry {
 /// Per-resource GUID-keyed private-data table.
 #[derive(Default)]
 pub struct PrivateDataStore {
-    entries: HashMap<Guid, Entry>,
+    entries: FxHashMap<Guid, Entry>,
 }
 
 impl PrivateDataStore {
