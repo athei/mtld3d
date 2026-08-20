@@ -37,3 +37,15 @@ pub struct IDirect3DVertexBuffer9Vtbl {
     pub unlock: unsafe extern "system" fn(*mut c_void) -> i32,
     pub get_desc: unsafe extern "system" fn(*mut c_void, *mut D3DVERTEXBUFFER_DESC) -> i32,
 }
+
+/// `D3DSTREAMSOURCE_INDEXEDDATA`: the per-vertex stream flag of `SetStreamSourceFreq`.
+///
+/// On stream 0 the low bits carry the instance count; on any other stream the
+/// count is informational. Exclusive with [`D3DSTREAMSOURCE_INSTANCEDATA`].
+pub const D3DSTREAMSOURCE_INDEXEDDATA: u32 = 1 << 30;
+
+/// `D3DSTREAMSOURCE_INSTANCEDATA`: `SetStreamSourceFreq` flag of a per-instance stream.
+///
+/// The low bits carry how many instances share one element. Never valid on
+/// stream 0.
+pub const D3DSTREAMSOURCE_INSTANCEDATA: u32 = 2 << 30;

@@ -14,13 +14,14 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity (SM2 sub-structs at the ps_2_0 floor, cube/volume filter and address caps, no VTF and `QUERY_VERTEXTEXTURE` rejected to match); `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize, fullscreen monitor-rect + style adoption and restore, fullscreen ignores the requested resolution, undrawn post-resize `Present` reads back black). |
 | `clear_present.rs` | (folded into smoke/device — clear flags exercised via `clear`). |
 | `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle-fan + `DrawIndexedPrimitiveUP` + `ProcessVertices` stubs. |
-| `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices`/`SetStreamSourceFreq` + non-zero stream stubs. |
+| `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices` round-trips including higher streams and the NULL-bind offset/stride retention. |
+| `streams.rs` | A two-stream declaration through a programmable VS; the `SetStreamSourceFreq` contract (defaults, rejections leaving state untouched, flag round-trip); instanced indexed draws (count from stream 0, per-instance step rate, non-indexed draws never instance, no per-instance stream means one instance); recorded and `D3DSBT_ALL` state blocks restoring stream bindings and frequencies. |
 | `render_states.rs` | Alpha + additive blend; COLORWRITEENABLE mask; scissor; cull-mode winding; defaults vs `render_state_defaults()`; set/get round-trip; stencil round-trip; stencil test gating a draw; stencil clear preserving depth; combined depth+stencil mid-frame clear resetting both planes; stencil reference compared through the mask; stencil clear and test against a depth-only surface; wireframe no-op (pinned). |
 | `textures.rs` | Lock/sample A8R8G8B8/X8R8G8B8/R5G6B5/A1R5G5B5/A4R4G4B4/L8; DXT1 block decode; mip chain levels/dims; AUTOGENMIPMAP; SetLOD no-op; cube creation in all pools; CPU-only extension-format cubes; managed DXT face isolation; cube face upload, sampling, state blocks, render targets, and AUTOGENMIPMAP; volume creates. |
 | `samplers.rs` | State round-trip; CLAMP≠WRAP past the unit square; POINT≠LINEAR; BORDER → Metal black preset (pinned). |
 | `texture_stages.rs` | COLOROP round-trip; MODULATE/ADD/SELECTARG2; TFACTOR arg source. |
 | `shaders.rs` | hand-assembled VS/PS; PS-constant colour; VS-constant translation; float-constant setters (in-range accept + out-of-range/`-1` → `INVALIDCALL`); integer/bool + Get*Constant* stubs. |
-| `vertex_decl.rs` | `CreateVertexDeclaration` drives an FF draw; `GetVertexDeclaration` round-trip. |
+| `vertex_decl.rs` | `CreateVertexDeclaration` drives an FF draw; `GetVertexDeclaration` round-trip; a two-stream declaration through the FF pipeline; a declared stream with nothing bound reads zeros (bound and UP draws). |
 | `transforms_ff.rs` | Set/Get/MultiplyTransform; FF diffuse passthrough; alpha test; Set/Get material + light + LightEnable. |
 | `render_target.rs` | Render-to-texture + sample; depth occlusion; auto depth-stencil Get/Set; CreateDepthStencilSurface; backbuffer desc; StretchRect 1:1 accept; INTZ sampleable-depth dual-use (render-as-depth → sample) via both the FF and a programmable PS; `GetRenderTargetData` read-back into a SYSTEMMEM offscreen surface (`Surface::GetDevice` + `CreateOffscreenPlainSurface` + `LockRect`, pixels matched against the private export); surface-op contracts (ColorFill/CreateRenderTarget stubs, DEFAULT-pool rejection). |
 | `mrt.rs` | Multiple render targets: `ps_3_0` writing `oC0`/`oC1` into two bound targets; `Clear` reaching every bound target and an unwritten target keeping its contents; `D3DRS_COLORWRITEENABLE1` masking slot 1 alone; the slot contract (four slots, slot 0 never null, `NOTFOUND` on an unbound slot, `SetRenderTarget(1, NULL)`); `Reset` unbinding slots 1..3; a target sized unlike slot 0 cleared but left out of draws; a mid-pass `Clear` and a rect `Clear` reaching both targets through the in-pass quad; the MRT caps bits. |
@@ -37,8 +38,6 @@ contract so a future implementation flips a known assertion.
 
 - **Draw:** `DrawIndexedPrimitiveUP`, `ProcessVertices`; `D3DPT_TRIANGLEFAN`
   (no Metal fan primitive).
-- **Buffers:** `GetStreamSource`, `GetIndices`, `SetStreamSourceFreq`;
-  `SetStreamSource` on stream ≠ 0.
 - **Textures:** ATI1 and YUV cubes are CPU-only `D3DPOOL_SCRATCH` resources;
   GPU-backed cubes support mapped color and DXT formats. `SetLOD` is a
   managed-pool-only no-op.

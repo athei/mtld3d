@@ -267,11 +267,13 @@ impl Command {
     /// `indexBuffer`, `indexBufferOffset`, `instanceCount`, `baseVertex`,
     /// `baseInstance`.
     ///
-    /// `index_count` is packed into the high 56 bits of `param_d`; `index_type`
-    /// takes the low 8 bits. `param_c` packs `offset` into the high 32 bits
-    /// and `base_vertex` (signed, via bitcast) into the low 32 so both fit in
-    /// one u64. The unix side decodes with `offset = (param_c >> 32) as usize`
-    /// and `base_vertex = (param_c as u32) as i32 as isize`.
+    /// `param_d` packs `index_type` into bits 0..8, `index_count` into bits
+    /// 8..40 and `instance_count` into bits 40..64 (see
+    /// [`Self::pack_indexed_draw_counts`]). `param_c` packs `offset` into the
+    /// high 32 bits and `base_vertex` (signed, via bitcast) into the low 32 so
+    /// both fit in one u64. The unix side decodes with
+    /// `offset = (param_c >> 32) as usize` and
+    /// `base_vertex = (param_c as u32) as i32 as isize`.
     #[must_use]
     pub const fn draw_indexed_primitives(
         primitive_type: PrimitiveType,
@@ -280,6 +282,7 @@ impl Command {
         index_buffer: u64,
         index_buffer_offset: u32,
         base_vertex: i32,
+        instance_count: u32,
     ) -> Self {
         // Bitcast i32 → u32 so the sign pattern round-trips; `as i32 as isize`
         // on the unix side re-sign-extends.
@@ -290,7 +293,7 @@ impl Command {
             param_a: primitive_type as u32,
             param_b: index_buffer,
             param_c: offset_bits | base_vertex_bits,
-            param_d: ((index_count as u64) << 8) | ((index_type as u64) & 0xFF),
+            param_d: Self::pack_indexed_draw_counts(index_count, index_type, instance_count),
         }
     }
 
@@ -299,9 +302,9 @@ impl Command {
     /// `index_ptr` points into the per-frame scratch arena and
     /// `index_bytes` is its length; the unix side copies it into a transient
     /// `MTLBuffer` (`newBufferWithBytes`) for the draw, since Metal has no
-    /// inline-index form. `index_count` packs into the high 56 bits of
-    /// `param_d`, `index_type` into the low 8. Base vertex is always 0 (UP
-    /// indices are absolute), single instance.
+    /// inline-index form. `param_d` carries the counts packed by
+    /// [`Self::pack_indexed_draw_counts`]. Base vertex is always 0 (UP indices
+    /// are absolute).
     #[must_use]
     pub const fn draw_indexed_primitives_up(
         primitive_type: PrimitiveType,
@@ -309,14 +312,43 @@ impl Command {
         index_type: IndexType,
         index_ptr: u64,
         index_bytes: u32,
+        instance_count: u32,
     ) -> Self {
         Self {
             cmd: CommandType::DrawIndexedPrimitivesUp as u32,
             param_a: primitive_type as u32,
             param_b: index_ptr,
             param_c: index_bytes as u64,
-            param_d: ((index_count as u64) << 8) | ((index_type as u64) & 0xFF),
+            param_d: Self::pack_indexed_draw_counts(index_count, index_type, instance_count),
         }
+    }
+
+    /// Pack the counts of an indexed draw into one `param_d`.
+    ///
+    /// Bits 0..8 hold the `IndexType` discriminant, bits 8..40 the full
+    /// 32-bit index count and bits 40..64 the instance count, which D3D9 caps
+    /// at 23 bits (`D3DSTREAMSOURCE_INDEXEDDATA | n` masks `n` with
+    /// `0x7FFFFF`), so the three never overlap. Decode with
+    /// [`Self::unpack_indexed_draw_counts`].
+    #[must_use]
+    pub const fn pack_indexed_draw_counts(
+        index_count: u32,
+        index_type: IndexType,
+        instance_count: u32,
+    ) -> u64 {
+        ((instance_count as u64) << 40) | ((index_count as u64) << 8) | ((index_type as u64) & 0xFF)
+    }
+
+    /// Decode a `param_d` packed by [`Self::pack_indexed_draw_counts`].
+    ///
+    /// Returns `(index_count, raw index type, instance_count)`; the raw index
+    /// type goes through `IndexType::from_repr` at the decode site.
+    #[must_use]
+    pub const fn unpack_indexed_draw_counts(param_d: u64) -> (u32, u32, u32) {
+        let index_count = ((param_d >> 8) & 0xFFFF_FFFF) as u32;
+        let index_type_raw = (param_d & 0xFF) as u32;
+        let instance_count = (param_d >> 40) as u32;
+        (index_count, index_type_raw, instance_count)
     }
 
     /// `encoder.setVisibilityResultMode(mode, offset)`.
@@ -712,8 +744,7 @@ mod tests {
         let base_vertex = u32::try_from(cmd.param_c & 0xFFFF_FFFF)
             .expect("low 32 bits fit u32")
             .cast_signed();
-        let index_count = u32::try_from(cmd.param_d >> 8).expect("u64 >> 8 fits u32 by wire shape");
-        let index_type = u32::try_from(cmd.param_d & 0xFF).expect("8-bit mask fits u32");
+        let (index_count, index_type, _) = Command::unpack_indexed_draw_counts(cmd.param_d);
         (
             primitive_type,
             index_count,
@@ -733,6 +764,7 @@ mod tests {
             0xDEAD_BEEF_0000_0000,
             128,
             0,
+            1,
         );
         let (prim, cnt, ty, buf, off, base) = decode_draw_indexed(&cmd);
         assert_eq!(prim, PrimitiveType::Triangle as u32);
@@ -752,6 +784,7 @@ mod tests {
             1,
             42,
             100_000,
+            1,
         );
         let (_, _, _, _, off, base) = decode_draw_indexed(&cmd);
         assert_eq!(off, 42);
@@ -769,10 +802,35 @@ mod tests {
             1,
             0,
             -100_000,
+            1,
         );
         let (_, _, _, _, off, base) = decode_draw_indexed(&cmd);
         assert_eq!(off, 0);
         assert_eq!(base, -100_000);
+    }
+
+    #[test]
+    fn indexed_draw_counts_pack_without_overlap() {
+        // A full 32-bit index count next to the 23-bit D3D9 instance ceiling
+        // and a non-zero index type: each field decodes to what went in.
+        let packed = Command::pack_indexed_draw_counts(u32::MAX, IndexType::UInt32, 0x7F_FFFF);
+        assert_eq!(
+            Command::unpack_indexed_draw_counts(packed),
+            (u32::MAX, IndexType::UInt32 as u32, 0x7F_FFFF)
+        );
+        // Both indexed draw forms carry the same packing.
+        let up = Command::draw_indexed_primitives_up(
+            PrimitiveType::Triangle,
+            6,
+            IndexType::UInt16,
+            0xA000,
+            12,
+            4,
+        );
+        assert_eq!(
+            Command::unpack_indexed_draw_counts(up.param_d),
+            (6, IndexType::UInt16 as u32, 4)
+        );
     }
 
     #[test]
@@ -952,6 +1010,7 @@ mod tests {
             0,
             0,
             0,
+            1,
         );
         let (_, cnt, ty, _, _, _) = decode_draw_indexed(&cmd);
         assert_eq!(cnt, u32::MAX);

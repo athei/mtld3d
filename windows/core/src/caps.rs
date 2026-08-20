@@ -293,11 +293,16 @@ const DECL_TYPES_DEFAULT: DeclTypeCaps = DeclTypeCaps::UBYTE4
     .union(DeclTypeCaps::FLOAT16_2)
     .union(DeclTypeCaps::FLOAT16_4);
 
-/// `StretchRect` from a texture-level surface into a render target is supported by the blit path.
+/// The `DEVCAPS2` bits that are truthful on the default path.
 ///
-/// The only `DEVCAPS2` bit that is truthful on the default path;
-/// `apply_advertise_all` widens the field to every spec bit.
-const DEV_CAPS2_DEFAULT: DevCaps2 = DevCaps2::CAN_STRETCHRECT_FROM_TEXTURES;
+/// `StretchRect` from a texture-level surface into a render target is
+/// supported by the blit path; a `SetStreamSource` byte offset is honoured on
+/// every stream, and two declaration elements may share one offset (Metal
+/// places attributes independently). `apply_advertise_all` widens the field
+/// to every spec bit.
+const DEV_CAPS2_DEFAULT: DevCaps2 = DevCaps2::CAN_STRETCHRECT_FROM_TEXTURES
+    .union(DevCaps2::STREAMOFFSET)
+    .union(DevCaps2::VERTEXELEMENTSCANSHARESTREAMOFFSET);
 
 /// Texture caps the diagnostic ORs in.
 ///
@@ -710,10 +715,13 @@ mod tests {
     }
 
     #[test]
-    fn dev_caps2_advertises_only_stretchrect_from_textures() {
+    fn dev_caps2_advertises_stretchrect_and_stream_offsets() {
         assert_eq!(
             filled().dev_caps2,
-            DevCaps2::CAN_STRETCHRECT_FROM_TEXTURES.bits()
+            (DevCaps2::CAN_STRETCHRECT_FROM_TEXTURES
+                | DevCaps2::STREAMOFFSET
+                | DevCaps2::VERTEXELEMENTSCANSHARESTREAMOFFSET)
+                .bits()
         );
     }
 

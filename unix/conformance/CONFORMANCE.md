@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **42 `real` · 107 `expected` ·
+re-checked before retagging. Headline: **15 `real` · 93 `expected` ·
 1 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -231,14 +231,12 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (11 distinct defects behind the 42 sites)
+### The `real` backlog (9 distinct defects behind the 15 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
-| SetStreamSourceFreq/GetStreamSourceFreq are INVALIDCALL stubs (state round-trip, independent of instancing) | stream_test | 24 |
 | Reset: no outstanding-DEFAULT-pool / implicit-surface-ref rejection | test_reset | 4 |
 | TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
-| StateSnapshot (D3DSBT_ALL) never captures the stream-0 vertex buffer | resource_check_data | 3 |
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
 | Clears ignore D3DRS_SRGBWRITEENABLE (draw path honors it) | clear_test | 2 |
 | FF lighting renders black for default-light/world-matrix cases | lighting_test | 1 |
@@ -247,10 +245,11 @@ walk further):
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
 | CreateTexture(depth) succeeds while our own CheckDeviceFormat denies it | test_resource_access | 1 |
 
-Coupling note for the stream-frequency fix: implementing the Set/Get round-trip
-un-gates the instanced draws behind it, so the by-design instancing pixel sites
-(12423/12464/12466/12468/12470) will rise in count — re-baseline in the same
-commit.
+Vertex streams 1..15 and `SetStreamSourceFreq` instancing are implemented, so
+the clusters that used to sit on "single-stream rendering" (stream_test,
+fixed_function_decl_test, the stream-1 half of test_sysmem_draw, and the
+state-block stream capture in resource_check_data) no longer appear in the
+baseline.
 
 ### device.c clusters
 
@@ -544,33 +543,6 @@ The ps_1_4 depth-gradient math is correct (the same-frame cycle passes and
 is absent here). The failing cycles read the gradient across Presents —
 the same Rule B depth-store elision as z_range_test.
 
-### visual.c/fixed_function_decl_test
-Sites: 9632=expected 9638=expected 9641=expected 9645=expected
-Sites: 9651=expected 9654=expected
-
-The failing draws source the color attribute from STREAM 1 (position from
-stream 0) via the D3DCOLOR/UBYTE4N declarations; we render stream 0 only
-(single-stream architecture, kept). The previous "two-sided-stencil /
-color-ubyte switching" rationale was wrong about the mechanism.
-
-### visual.c/stream_test
-Sites: 12258=real 12261=real 12265=real 12275=real 12276=real 12278=real
-Sites: 12280=real 12281=real 12283=real 12285=real 12286=real 12288=real
-Sites: 12290=real 12291=real 12295=real 12296=real 12300=real 12393=real
-Sites: 12398=real 12404=real 12410=real 12448=real 12452=real 12456=real
-Sites: 12423=expected 12464=expected 12466=expected 12468=expected
-Sites: 12470=expected
-
-The real block is the Set/GetStreamSourceFreq STATE ROUND-TRIP: both entry
-points are INVALIDCALL stubs, so every set/get/value assertion fails (the
-sibling INVALIDCALL-expecting checks pass by accident of the stub). Storing
-the frequency state is plain D3D9 API surface, independent of rendering
-instancing — previously mis-filed under "single-stream architecture". The
-expected block is actual instanced RENDERING output (INSTANCEDATA freq
-dividers), which single-stream rendering deliberately does not implement.
-See the coupling note in the backlog table: fixing the round-trip un-gates
-the instanced draws and their counts will rise.
-
 ### visual.c/depth_blit_test
 Sites: 14835=real
 
@@ -656,14 +628,11 @@ the CI runner and tripped the stale-baseline gate (PR #12), hence the flaky
 tolerance. The kept divergence itself is unchanged.
 
 ### visual.c/test_sysmem_draw
-Sites: 25431=real 25436=real 25505=expected 25518=expected 25565=expected
+Sites: 25431=real 25436=real
 
-25431/25436: ProcessVertices is an INVALIDCALL stub — unimplemented SW
-vertex processing, no design rationale (real). 25505/25518/25565: the
-colour attribute comes from stream 1 of a two-stream SYSTEMMEM declaration;
-single-stream rendering by design. Note single-stream SYSTEMMEM draws
-themselves work (those checks pass) — the old "SYSTEMMEM draw" rationale
-was wrong.
+ProcessVertices is an INVALIDCALL stub — unimplemented SW vertex
+processing, no design rationale (real). The SYSTEMMEM draws themselves,
+single- and two-stream, pass.
 
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected
@@ -697,22 +666,6 @@ agrees, and the YUV blit tests gate on this predicate — change all three
 consistently.
 
 ### stateblock.c clusters
-
-### stateblock.c/resource_check_data
-Sites: 1810=real 1812=real 1813=real
-
-The 16-stream verification loop (VB pointer / offset / stride). Two causes
-share these lines: (a) ~210 of 215 assertions are streams 1–15, which state
-blocks deliberately don't capture (single-stream architecture — the
-recorder path stores stream 0 only); (b) the intend-to-fix core: the
-snapshot path (`StateSnapshot`, D3DSBT_ALL) captures the index buffer but
-has NO stream-0 vertex-buffer/offset/stride field at all, so the two
-CreateStateBlock(ALL)→Apply chains lose the stream-0 binding (5 assertions:
-2 on 1810, 1 on 1812, 2 on 1813 — stream-0 failures confirmed in raw logs).
-Mixed-site rule ⇒ real. Fix: capture/apply stream 0 in StateSnapshot like
-the recorder already does. (The 77/61/77 counts: the offset quirk
-SB_QUIRK_STREAM_OFFSET_NOT_UPDATED lets 16 offset asserts pass in one
-chain.)
 
 ### d3d9ex.c clusters
 

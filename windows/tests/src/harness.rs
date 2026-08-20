@@ -887,10 +887,20 @@ impl Harness {
         (hr, wrapped)
     }
 
-    /// `SetStreamSourceFreq` (a documented stub today). Returns the hr.
+    /// `SetStreamSourceFreq(stream, setting)`. Returns the hr.
     pub fn set_stream_source_freq(&self, stream: u32, freq: u32) -> i32 {
         // SAFETY: vtable thunk; `self.device` is live.
         unsafe { (self.dev_vtbl().set_stream_source_freq)(self.device, stream, freq) }
+    }
+
+    /// `GetStreamSourceFreq(stream)`. Returns `(hr, setting)`.
+    pub fn get_stream_source_freq(&self, stream: u32) -> (i32, u32) {
+        let mut setting = 0u32;
+        // SAFETY: vtable thunk; `&mut setting` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_stream_source_freq)(self.device, stream, &raw mut setting)
+        };
+        (hr, setting)
     }
 
     // ── Resource creation ──

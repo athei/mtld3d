@@ -24,6 +24,8 @@ use std::{
     fmt::Write,
 };
 
+use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+
 use super::{
     ir::{
         DeclUsage, Declaration, DstMods, DstOperand, DxsoProgram, InstrFlags, Instruction, RegKind,
@@ -383,18 +385,27 @@ fn emit_vs_function(
 ) -> Result<(), EmitError> {
     let _ = writeln!(out, "vertex Varyings {entry}(");
     w(out, "    VertexIn in [[stage_in]],\n");
-    w(out, "    constant float4 *vs_c [[buffer(15)]]");
-    // Half-pixel rasterization fixup uniform (VS buffer 13): `(1/vp_w,
-    // -1/vp_h, 0, 0)`, supplied per-draw by the encoder from the live
-    // viewport. Read by the position epilogue below. Buffer 13 is free on the
-    // VS side (app float constants live in vs_c/buffer 15, int constants in
-    // vs_i/buffer 14, the vertex stream in buffer 0), so it never collides
-    // with an app-uploaded constant — D3D9 float consts are 0..255 in vs_c.
-    w(out, ",\n    constant float4 &pos_fixup [[buffer(13)]]");
+    let _ = write!(
+        out,
+        "    constant float4 *vs_c [[buffer({VS_FLOAT_CONST_SLOT})]]"
+    );
+    // Half-pixel rasterization fixup uniform: `(1/vp_w, -1/vp_h, 0, 0)`,
+    // supplied per-draw by the encoder from the live viewport. Read by the
+    // position epilogue below. The three uniform slots sit above the sixteen
+    // vertex-stream slots (stream `n` binds at buffer `n`), so neither an app
+    // stream nor an app-uploaded constant can collide with them: D3D9 float
+    // consts are 0..255 inside vs_c.
+    let _ = write!(
+        out,
+        ",\n    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+    );
     // A dynamic integer constant (typically a `loop aL, iN` / `rep iN` counter
-    // fed by SetVertexShaderConstantI) reads the runtime int4 buffer at slot 14.
+    // fed by SetVertexShaderConstantI) reads the runtime int4 buffer.
     if vs.uses_dynamic_int_constants() {
-        w(out, ",\n    constant int4 *vs_i [[buffer(14)]]");
+        let _ = write!(
+            out,
+            ",\n    constant int4 *vs_i [[buffer({VS_INT_CONST_SLOT})]]"
+        );
     }
     w(out, "\n) {\n");
     w(out, "    float4 r[32];\n");

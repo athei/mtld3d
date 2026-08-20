@@ -3,13 +3,9 @@
 //! Stores the raw element array the game passed to
 //! `CreateVertexDeclaration`; the per-VS attribute resolution happens at
 //! draw time in `snapshot_shared` via `convert::resolve_attrs_for_vs` /
-//! `resolve_attrs_for_ff`.
-//!
-//! Multi-stream declarations are accepted (D3D9 creation validates structure
-//! only), but only stream 0 is rendered — `resolve_attrs_for_vs` /
-//! `resolve_attrs_for_ff` drop elements on other streams. `WoW` is
-//! single-stream; full multi-stream VB wiring in the pipeline descriptor is a
-//! bigger change deferred until a target workload needs it.
+//! `resolve_attrs_for_ff`. The precomputed stream mask tells the draw path
+//! which `SetStreamSource` slots to snapshot without walking the elements
+//! per draw.
 
 use core::ffi::c_void;
 
@@ -52,6 +48,8 @@ pub struct VertexDeclInner {
     /// back.
     elements_with_end: Vec<D3DVERTEXELEMENT9>,
     hash: u64,
+    /// Bit `s` set: some element lives on stream `s`.
+    stream_mask: u16,
 }
 
 impl VertexDeclInner {
@@ -68,6 +66,11 @@ impl VertexDeclInner {
     pub const fn hash(&self) -> u64 {
         self.hash
     }
+
+    /// Bit `s` set: some element lives on stream `s`.
+    pub const fn stream_mask(&self) -> u16 {
+        self.stream_mask
+    }
 }
 
 pub struct VertexDeclCreateInfo<'a> {
@@ -78,14 +81,14 @@ pub struct VertexDeclCreateInfo<'a> {
 impl Direct3DVertexDeclaration9 {
     /// Build a wrapper from a slice that already includes the `D3DDECL_END` terminator.
     ///
-    /// Returns `None` only if the slice has no terminator. Multi-stream
-    /// layouts are accepted (only stream 0 renders).
+    /// Returns `None` only if the slice has no terminator.
     pub fn new(info: &VertexDeclCreateInfo<'_>) -> Option<Self> {
-        let (elements_with_end, hash) = pack_vertex_decl(info.elements)?;
+        let packed = pack_vertex_decl(info.elements)?;
         let inner = Box::into_raw(Box::new(VertexDeclInner {
             device_inner: info.device_inner,
-            elements_with_end,
-            hash,
+            elements_with_end: packed.elements_with_end,
+            hash: packed.hash,
+            stream_mask: packed.stream_mask,
         }));
         Some(Self {
             vtbl: &raw const DIRECT3D_VERTEX_DECLARATION9_VTBL,

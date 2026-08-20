@@ -30,7 +30,8 @@ pub use params::{
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorAttachmentParams,
     ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, PassDescriptor,
     SetDisplaySyncEnabledParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
-    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
+    WaitForGpuRetireParams,
 };
 
 #[repr(u32)]

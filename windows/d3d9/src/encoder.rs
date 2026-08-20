@@ -3731,9 +3731,12 @@ impl FrameEncoder {
         };
         let vb = match vertex_source {
             VertexSource::Up { size, .. } => format!("vb=UP({size})"),
-            VertexSource::Bound {
-                buffer_id, offset, ..
-            } => format!("vb={buffer_id:#x}+{offset}"),
+            VertexSource::Bound { first, extra, .. } => format!(
+                "vb={:#x}+{} streams={}",
+                first.buffer_id,
+                first.offset,
+                extra.len() + 1
+            ),
         };
         let idx = match index_source {
             IndexSource::None {
@@ -3858,9 +3861,13 @@ impl FrameEncoder {
         if let Some(&handle) = self.pipeline_cache.get(&key) {
             return handle;
         }
+        // One wire layout per used stream; lives on this frame until the
+        // synchronous thunk below has read it.
+        let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
         let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
             snapshot,
             vertex_attrs,
+            vertex_layouts: &vertex_layouts,
             device_handle: self.device_handle,
         });
         let status = unix_call(&mut params);

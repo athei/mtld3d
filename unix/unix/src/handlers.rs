@@ -10,7 +10,7 @@ use mtld3d_shared::{
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
     StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams, identity,
+    VertexBufferLayoutDesc, WaitForGpuRetireParams, identity,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -292,8 +292,21 @@ pub extern "C" fn create_render_pipeline_handler(args: *mut c_void) -> i32 {
             )
         }
     };
+    let layouts = if params.vertex_layout_count == 0 || params.vertex_layouts_ptr == 0 {
+        &[][..]
+    } else {
+        // SAFETY: PE supplied `vertex_layouts_ptr` as the address of a
+        // `[VertexBufferLayoutDesc; vertex_layout_count]` valid for the call
+        // duration.
+        unsafe {
+            core::slice::from_raw_parts(
+                params.vertex_layouts_ptr as *const VertexBufferLayoutDesc,
+                params.vertex_layout_count as usize,
+            )
+        }
+    };
 
-    if let Some(handle) = metal::create_render_pipeline(params, attrs) {
+    if let Some(handle) = metal::create_render_pipeline(params, attrs, layouts) {
         params.pipeline_handle = handle;
         STATUS_SUCCESS
     } else {

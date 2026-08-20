@@ -30,7 +30,7 @@ use mtld3d_types::{
     D3DSTENCILOP_INCR, D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT, D3DSTENCILOP_KEEP,
     D3DSTENCILOP_REPLACE, D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP,
     D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC,
-    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9, MAX_STREAMS,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -586,51 +586,93 @@ pub fn fvf_to_elements(fvf: u32) -> (Vec<D3DVERTEXELEMENT9>, u32) {
     (elements, u32::from(offset))
 }
 
+/// The Metal vertex attributes a declaration resolves to, plus what each stream it names needs.
+///
+/// Produced by [`resolve_attrs_for_vs`] / [`resolve_attrs_for_ff`] and
+/// consumed by the draw path, which lays out one vertex buffer per used
+/// stream and binds that stream's buffer at the Metal slot of the same index.
+pub struct ResolvedAttrs {
+    /// One entry per consumed element; `buffer_index` is the element's stream.
+    pub attrs: Vec<VertexAttrDesc>,
+    /// Per stream, `max(offset + size)` over every element on it.
+    ///
+    /// Unconsumed elements count too: the stream's vertex buffer layout must
+    /// cover this extent, since Metal rejects a pipeline whose attribute
+    /// reaches past its layout's stride. Zero for a stream the declaration
+    /// never names.
+    pub extents: [u32; MAX_STREAMS as usize],
+    /// Bit `s` set: stream `s` feeds at least one consumed attribute.
+    ///
+    /// Only these streams get a layout and a binding; a used stream with no
+    /// vertex buffer bound reads zeros through a constant layout.
+    pub used_streams: u16,
+}
+
 /// Resolve a vertex declaration's elements against a programmable VS's input semantics.
 ///
 /// The returned `attr_index` for each kept element is the VS `vN` register
 /// bound to the matching `(usage, usage_index)`. Elements whose semantic the
 /// VS does not consume are skipped silently — Metal accepts a descriptor that
 /// declares more data than the shader reads.
-///
-/// `stride` is the maximum `offset + element_size` across *all* elements
-/// on stream 0, including skipped ones: the stride is a property of the
-/// vertex buffer layout, not the VS.
+#[must_use]
 pub fn resolve_attrs_for_vs(
     elements: &[D3DVERTEXELEMENT9],
     semantics: &[InputSemantic],
-) -> (Vec<VertexAttrDesc>, u32) {
-    let mut attrs = Vec::with_capacity(semantics.len());
-    let mut stride: u32 = 0;
+) -> ResolvedAttrs {
+    // VS semantic not declared by the shader: Metal accepts extra data, so
+    // there is intentionally no warning for an unmatched element.
+    resolve_attrs(elements, "programmable", |e| {
+        lookup_semantic(semantics, e.usage, e.usage_index)
+    })
+}
+
+/// Walk a declaration once, mapping each element to a Metal attribute through `attr_for`.
+///
+/// `attr_for` returns the `[[attribute(N)]]` slot for an element or `None`
+/// to leave it out of the descriptor. Elements on a stream past the slot
+/// table are dropped with a once-per-path warning; a declaration validator
+/// only checks structure, so such a stream can reach a draw.
+fn resolve_attrs(
+    elements: &[D3DVERTEXELEMENT9],
+    path: &'static str,
+    mut attr_for: impl FnMut(&D3DVERTEXELEMENT9) -> Option<u16>,
+) -> ResolvedAttrs {
+    let mut attrs = Vec::with_capacity(elements.len());
+    let mut extents = [0u32; MAX_STREAMS as usize];
+    let mut used_streams: u16 = 0;
     for e in elements {
-        if e.stream != 0 {
+        let stream = u32::from(e.stream);
+        if stream >= MAX_STREAMS {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "programmable vertex decl: element on stream={} dropped (multi-stream unsupported)",
-                e.stream
+                "{path} vertex decl: element on stream={stream} past MaxStreams dropped"
             );
             continue;
         }
         let (format, size) = decl_type_to_metal_format(e.type_);
-        stride = stride.max(u32::from(e.offset) + size);
+        let extent = &mut extents[stream as usize];
+        *extent = (*extent).max(u32::from(e.offset) + size);
         if format == VertexFormat::Invalid {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "programmable vertex decl: type={} has no Metal format → element dropped",
+                "{path} vertex decl: type={} has no Metal format → element dropped",
                 e.type_
             );
             continue;
         }
-        if let Some(reg) = lookup_semantic(semantics, e.usage, e.usage_index) {
+        if let Some(reg) = attr_for(e) {
             attrs.push(VertexAttrDesc {
                 attr_index: u32::from(reg),
-                buffer_index: 0,
+                buffer_index: stream,
                 offset: u32::from(e.offset),
                 format,
             });
+            used_streams |= 1 << stream;
         }
-        // VS semantic not declared by the shader: Metal accepts extra data,
-        // so we intentionally do NOT warn — this is expected.
     }
-    (attrs, stride)
+    ResolvedAttrs {
+        attrs,
+        extents,
+        used_streams,
+    }
 }
 
 /// Vertex-layout flags derived from a declaration element list, suitable for building an `FfVsKey`.
@@ -684,17 +726,11 @@ bitflags::bitflags! {
         /// Drives whether the FF VS emit needs the indexed-palette input
         /// attribute (slot 13).
         const DECLARED_INDICES = 1 << 4;
-        /// A COLOR0 (diffuse) element is declared on a non-zero, unbound stream.
-        ///
-        /// The element is dropped from the descriptor, and no stream-0 COLOR0
-        /// exists — so the unlit FF VS must output black, not the white
-        /// default.
-        const DIFFUSE_DECLARED_UNBOUND = 1 << 5;
         /// The vertex format came from `SetVertexDeclaration`, not `SetFVF`.
         ///
         /// A COLORVERTEX material source pointing at a vertex colour the
         /// declaration omits reads 0 (FVF instead falls back to the material).
-        const USES_VERTEX_DECL = 1 << 6;
+        const USES_VERTEX_DECL = 1 << 5;
     }
 }
 
@@ -703,12 +739,6 @@ impl FfVsLayout {
     #[must_use]
     pub const fn has_normal(&self) -> bool {
         self.flags.contains(FfVsLayoutFlags::HAS_NORMAL)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn has_diffuse_declared_unbound(&self) -> bool {
-        self.flags
-            .contains(FfVsLayoutFlags::DIFFUSE_DECLARED_UNBOUND)
     }
     #[inline]
     #[must_use]
@@ -750,22 +780,14 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
     let mut tex_coord_dims = [0u8; 8];
     let mut declared_weights_count = 0u8;
     for e in elements {
-        // Only stream 0 is rendered (single-stream architecture), and
-        // `resolve_attrs_for_ff` drops non-zero streams from the vertex
-        // descriptor. The layout flags must agree with the attributes the
-        // descriptor actually carries — otherwise the FF VS declares an
-        // `[[attribute(N)]]` (e.g. a stream-1 COLOR) that the descriptor lacks
-        // and Metal drops the draw. A material colour source bound to a dropped
-        // stream then correctly falls back to the material constant.
-        if e.stream != 0 {
-            // A diffuse (COLOR0) declared on an unbound stream is dropped from
-            // the descriptor, but the vertex reads 0 from it — so the unlit FF
-            // VS must output black, not the white "absent diffuse" default.
-            // A stream-0 COLOR0 (`HAS_COLOR0`) still takes precedence in the
-            // emit.
-            if e.usage == D3DDECLUSAGE_COLOR && e.usage_index == 0 {
-                flags.insert(FfVsLayoutFlags::DIFFUSE_DECLARED_UNBOUND);
-            }
+        // Every stream the declaration names reaches the descriptor, so the
+        // layout flags follow the elements regardless of stream: an element
+        // on a stream nothing feeds reads zeros through that stream's
+        // constant layout, which is what a D3D9 vertex reads there too. The
+        // one exception is a stream past the slot table, which
+        // `resolve_attrs_*` drops; its flags must drop with it or the FF VS
+        // would declare an attribute the descriptor lacks.
+        if u32::from(e.stream) >= MAX_STREAMS {
             continue;
         }
         match e.usage {
@@ -832,34 +854,11 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
 /// declarations — its input layout is fixed.
-pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> (Vec<VertexAttrDesc>, u32) {
-    let mut attrs = Vec::with_capacity(elements.len());
-    let mut stride: u32 = 0;
-    for e in elements {
-        if e.stream != 0 {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "FF vertex decl: element on stream={} dropped (multi-stream unsupported)",
-                e.stream
-            );
-            continue;
-        }
-        let (format, size) = decl_type_to_metal_format(e.type_);
-        stride = stride.max(u32::from(e.offset) + size);
-        if format == VertexFormat::Invalid {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "FF vertex decl: type={} has no Metal format → element dropped",
-                e.type_
-            );
-            continue;
-        }
-        if let Some(reg) = ff_attr_index_for_semantic(e.usage, e.usage_index) {
-            attrs.push(VertexAttrDesc {
-                attr_index: u32::from(reg),
-                buffer_index: 0,
-                offset: u32::from(e.offset),
-                format,
-            });
-        } else {
+#[must_use]
+pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
+    resolve_attrs(elements, "FF", |e| {
+        let reg = ff_attr_index_for_semantic(e.usage, e.usage_index);
+        if reg.is_none() {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: (u64::from(e.usage) << 8) | u64::from(e.usage_index),
@@ -868,8 +867,8 @@ pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> (Vec<VertexAttrDe
                 e.usage_index
             );
         }
-    }
-    (attrs, stride)
+        reg
+    })
 }
 
 /// Convenience: hash a contiguous `&[D3DVERTEXELEMENT9]` for use as a pipeline-cache key.
@@ -891,26 +890,40 @@ pub const fn is_decl_end(e: &D3DVERTEXELEMENT9) -> bool {
     e.stream == D3DDECL_END_STREAM
 }
 
+/// A vertex declaration as stored by `CreateVertexDeclaration`.
+pub struct PackedVertexDecl {
+    /// The elements the game passed, `D3DDECL_END` terminator included.
+    pub elements_with_end: Vec<D3DVERTEXELEMENT9>,
+    /// `hash_elements` over the real elements; the pipeline-cache identity.
+    pub hash: u64,
+    /// Bit `s` set: some element lives on stream `s`.
+    ///
+    /// Lets the draw path pick the streams to snapshot without walking the
+    /// elements per draw. Streams past the slot table contribute no bit.
+    pub stream_mask: u16,
+}
+
 /// Validate + pack the raw element slice a game passes to `CreateVertexDeclaration`.
 ///
-/// Returns the full element array *including* the `D3DDECL_END` terminator
-/// plus the precomputed hash (see `hash_elements`) on success. Returns `None`
-/// if the slice has no terminator or if any real element uses a non-zero
-/// stream (multi-stream is not supported).
-pub fn pack_vertex_decl(elements: &[D3DVERTEXELEMENT9]) -> Option<(Vec<D3DVERTEXELEMENT9>, u64)> {
+/// Returns `None` only if the slice has no terminator: D3D9 validates
+/// structure, not which streams the layout spans, and callers rely on a
+/// valid object back so their own `Release(decl)` doesn't fault. The `stream`
+/// field is part of each element's hash, so layouts that differ only by
+/// stream stay distinct in the pipeline cache.
+pub fn pack_vertex_decl(elements: &[D3DVERTEXELEMENT9]) -> Option<PackedVertexDecl> {
     let end_pos = elements.iter().position(is_decl_end)?;
-    // Multi-stream declarations are *accepted*: D3D9 `CreateVertexDeclaration`
-    // validates only structure, not how many streams the layout spans, and
-    // callers rely on a valid object back so their own `Release(decl)`
-    // doesn't fault. We still only render stream 0 —
-    // `resolve_attrs_for_vs` / the FF path drop elements on other streams — so
-    // multi-stream draws are wrong, not crashes. The `stream` field is part of
-    // each element's hash, so layouts that differ only by stream stay distinct
-    // in the attrs cache.
     let mut packed = Vec::with_capacity(end_pos + 1);
     packed.extend_from_slice(&elements[..=end_pos]);
     let hash = hash_elements(&packed[..end_pos]);
-    Some((packed, hash))
+    let stream_mask = packed[..end_pos]
+        .iter()
+        .filter(|e| u32::from(e.stream) < MAX_STREAMS)
+        .fold(0u16, |m, e| m | (1 << e.stream));
+    Some(PackedVertexDecl {
+        elements_with_end: packed,
+        hash,
+        stream_mask,
+    })
 }
 
 /// Map a `D3DDECLTYPE` byte to the float component count of a fixed-function texcoord set.
@@ -1358,11 +1371,12 @@ mod tests {
             },
         ];
         let elems = [pos3(), tex0(12)];
-        let (attrs, stride) = resolve_attrs_for_vs(&elems, &semantics);
-        assert_eq!(attrs.len(), 2);
-        assert_eq!(attrs[0].attr_index, 2);
-        assert_eq!(attrs[1].attr_index, 7);
-        assert_eq!(stride, 20);
+        let resolved = resolve_attrs_for_vs(&elems, &semantics);
+        assert_eq!(resolved.attrs.len(), 2);
+        assert_eq!(resolved.attrs[0].attr_index, 2);
+        assert_eq!(resolved.attrs[1].attr_index, 7);
+        assert_eq!(resolved.extents[0], 20);
+        assert_eq!(resolved.used_streams, 0b1);
     }
 
     #[test]
@@ -1384,12 +1398,12 @@ mod tests {
                 usage_index: 0,
             },
         ];
-        let (attrs, stride) = resolve_attrs_for_vs(&elems, &semantics);
-        assert_eq!(attrs.len(), 1);
-        assert_eq!(attrs[0].attr_index, 0);
-        // Stride still covers the normal element so the vertex buffer
+        let resolved = resolve_attrs_for_vs(&elems, &semantics);
+        assert_eq!(resolved.attrs.len(), 1);
+        assert_eq!(resolved.attrs[0].attr_index, 0);
+        // The extent still covers the normal element so the vertex buffer
         // layout is correct even with an unused attribute.
-        assert_eq!(stride, 24);
+        assert_eq!(resolved.extents[0], 24);
     }
 
     #[test]
@@ -1397,11 +1411,92 @@ mod tests {
         // POSITION → attr(0), TEXCOORD0 → attr(4). Must agree with
         // `crate::dxso::ff_attr_index_for_semantic`.
         let elems = [pos3(), tex0(12)];
-        let (attrs, stride) = resolve_attrs_for_ff(&elems);
-        assert_eq!(attrs.len(), 2);
-        assert_eq!(attrs[0].attr_index, 0);
-        assert_eq!(attrs[1].attr_index, 4);
-        assert_eq!(stride, 20);
+        let resolved = resolve_attrs_for_ff(&elems);
+        assert_eq!(resolved.attrs.len(), 2);
+        assert_eq!(resolved.attrs[0].attr_index, 0);
+        assert_eq!(resolved.attrs[1].attr_index, 4);
+        assert_eq!(resolved.extents[0], 20);
+    }
+
+    #[test]
+    fn resolve_attrs_keeps_each_stream_separate() {
+        // POSITION on stream 0, COLOR0 on stream 1 at offset 0, an unconsumed
+        // NORMAL on stream 1 past it: stream 1's extent covers the normal,
+        // the colour attribute points at buffer 1, and both streams are used.
+        let elems = [
+            pos3(),
+            D3DVERTEXELEMENT9 {
+                stream: 1,
+                offset: 0,
+                type_: D3DDECLTYPE_D3DCOLOR,
+                method: 0,
+                usage: D3DDECLUSAGE_COLOR,
+                usage_index: 0,
+            },
+            D3DVERTEXELEMENT9 {
+                stream: 1,
+                offset: 4,
+                type_: D3DDECLTYPE_FLOAT3,
+                method: 0,
+                usage: D3DDECLUSAGE_NORMAL,
+                usage_index: 0,
+            },
+        ];
+        let semantics = vec![
+            InputSemantic {
+                usage: DeclUsage::Position,
+                usage_index: 0,
+                register_index: 0,
+            },
+            InputSemantic {
+                usage: DeclUsage::Color,
+                usage_index: 0,
+                register_index: 1,
+            },
+        ];
+        let resolved = resolve_attrs_for_vs(&elems, &semantics);
+        assert_eq!(resolved.attrs.len(), 2);
+        assert_eq!(resolved.attrs[0].buffer_index, 0);
+        assert_eq!(resolved.attrs[1].buffer_index, 1);
+        assert_eq!(resolved.attrs[1].attr_index, 1);
+        assert_eq!(resolved.extents[0], 12);
+        assert_eq!(resolved.extents[1], 16);
+        assert_eq!(resolved.used_streams, 0b11);
+
+        // A stream that only carries unconsumed elements is not used, but its
+        // extent is still reported.
+        let resolved = resolve_attrs_for_vs(&elems, &semantics[..1]);
+        assert_eq!(resolved.used_streams, 0b1);
+        assert_eq!(resolved.extents[1], 16);
+
+        // The FF path maps streams the same way.
+        let resolved = resolve_attrs_for_ff(&elems);
+        assert_eq!(resolved.attrs.len(), 3);
+        assert_eq!(resolved.attrs[1].buffer_index, 1);
+        assert_eq!(resolved.used_streams, 0b11);
+    }
+
+    #[test]
+    fn resolve_attrs_drops_streams_past_the_slot_table() {
+        let elems = [
+            pos3(),
+            D3DVERTEXELEMENT9 {
+                stream: 16,
+                offset: 0,
+                type_: D3DDECLTYPE_D3DCOLOR,
+                method: 0,
+                usage: D3DDECLUSAGE_COLOR,
+                usage_index: 0,
+            },
+        ];
+        let resolved = resolve_attrs_for_ff(&elems);
+        assert_eq!(resolved.attrs.len(), 1);
+        assert_eq!(resolved.used_streams, 0b1);
+        let layout = ff_vs_layout_from_elements(&elems, true);
+        assert!(
+            !layout.has_color0(),
+            "dropped element leaves no flag behind"
+        );
     }
 
     fn end() -> D3DVERTEXELEMENT9 {
@@ -1418,19 +1513,19 @@ mod tests {
     #[test]
     fn pack_vertex_decl_hash_stable_across_calls() {
         let elems = [pos3(), tex0(12), end()];
-        let (_, h_a) = pack_vertex_decl(&elems).expect("pack a");
-        let (_, h_b) = pack_vertex_decl(&elems).expect("pack b");
+        let h_a = pack_vertex_decl(&elems).expect("pack a").hash;
+        let h_b = pack_vertex_decl(&elems).expect("pack b").hash;
         assert_eq!(h_a, h_b);
         let swapped = [pos3(), tex0(16), end()];
-        let (_, h_c) = pack_vertex_decl(&swapped).expect("pack c");
+        let h_c = pack_vertex_decl(&swapped).expect("pack c").hash;
         assert_ne!(h_a, h_c);
     }
 
     #[test]
-    fn pack_vertex_decl_accepts_multi_stream_distinct_hash() {
-        // A non-zero stream is accepted (D3D9 creation succeeds; we render
-        // only stream 0). Two layouts that differ *only* by stream must hash
-        // differently so the attrs cache keeps them apart.
+    fn pack_vertex_decl_multi_stream_distinct_hash_and_mask() {
+        // Two layouts that differ *only* by stream must hash differently so
+        // the pipeline cache keeps them apart, and the stream mask names the
+        // streams the draw path has to snapshot.
         let on_stream = |stream| D3DVERTEXELEMENT9 {
             stream,
             offset: 0,
@@ -1441,7 +1536,15 @@ mod tests {
         };
         let a = pack_vertex_decl(&[on_stream(0), end()]).expect("stream 0 accepted");
         let b = pack_vertex_decl(&[on_stream(1), end()]).expect("stream 1 accepted");
-        assert_ne!(a.1, b.1, "stream must participate in the decl hash");
+        assert_ne!(a.hash, b.hash, "stream must participate in the decl hash");
+        assert_eq!(a.stream_mask, 0b01);
+        assert_eq!(b.stream_mask, 0b10);
+        let both = pack_vertex_decl(&[on_stream(0), tex0(0), on_stream(3), end()]).expect("pack");
+        assert_eq!(both.stream_mask, 0b1001);
+        // A stream past the slot table is accepted (D3D9 validates structure
+        // only) but contributes no bit.
+        let wide = pack_vertex_decl(&[on_stream(0), on_stream(16), end()]).expect("pack");
+        assert_eq!(wide.stream_mask, 0b1);
     }
 
     #[test]
@@ -1452,7 +1555,7 @@ mod tests {
     #[test]
     fn pack_vertex_decl_preserves_terminator_in_output() {
         let elems = [pos3(), tex0(12), end()];
-        let (packed, _) = pack_vertex_decl(&elems).expect("pack");
+        let packed = pack_vertex_decl(&elems).expect("pack").elements_with_end;
         assert_eq!(packed.len(), 3);
         assert_eq!(packed.last().unwrap().stream, D3DDECL_END_STREAM);
     }

@@ -3,6 +3,8 @@
 //! These assert the presence of key fragments in the generated source —
 //! they do NOT invoke a Metal compiler.
 
+use mtld3d_shared::mtl::VS_POS_FIXUP_SLOT;
+
 use super::{
     emit::{VariantFlags, VariantKey},
     ff::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff},
@@ -1177,8 +1179,10 @@ fn ff_transform_emits_half_pixel_pos_fixup() {
     let vs = default_vs_key();
     let msl = emit_vs_ff(&vs);
     assert!(
-        msl.contains("constant float4 &pos_fixup [[buffer(13)]]"),
-        "FF VS must declare the pos_fixup uniform at slot 13:\n{msl}"
+        msl.contains(&format!(
+            "constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+        )),
+        "FF VS must declare the pos_fixup uniform at its slot:\n{msl}"
     );
     assert!(
         msl.contains("out.position.x += pos_fixup.x * out.position.w;")

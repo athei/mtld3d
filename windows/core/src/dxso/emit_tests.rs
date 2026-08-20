@@ -7,6 +7,8 @@
 //! Each test emits VS and PS independently (matching the per-stage API) and
 //! concatenates the two strings into one check target.
 
+use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+
 use super::{
     emit::{VariantFlags, VariantKey, emit_ps_programmable, emit_vs_programmable},
     parser::parse,
@@ -180,7 +182,9 @@ fn minimal_vs_plus_ps_emits_valid_msl_skeleton() {
         "no position field:\n{msl}"
     );
     assert!(
-        msl.contains("constant float4 *vs_c [[buffer(15)]]"),
+        msl.contains(&format!(
+            "constant float4 *vs_c [[buffer({VS_FLOAT_CONST_SLOT})]]"
+        )),
         "no VS constants slot:\n{msl}"
     );
     assert!(
@@ -2111,7 +2115,9 @@ fn dynamic_int_constant_reads_the_runtime_vs_i_buffer() {
     );
     let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
     assert!(
-        vs_msl.contains("constant int4 *vs_i [[buffer(14)]]"),
+        vs_msl.contains(&format!(
+            "constant int4 *vs_i [[buffer({VS_INT_CONST_SLOT})]]"
+        )),
         "a dynamic-int-const shader must declare the vs_i buffer at slot 14:\n{vs_msl}"
     );
     assert!(
@@ -3069,7 +3075,9 @@ fn programmable_vs_emits_half_pixel_pos_fixup() {
     let vs = parse(&bc).expect("vs_1_1 parse");
     let msl = emit_vs_programmable(&vs).expect("emit vs_1_1");
     assert!(
-        msl.contains("constant float4 &pos_fixup [[buffer(13)]]"),
+        msl.contains(&format!(
+            "constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+        )),
         "VS must declare the pos_fixup uniform at slot 13:\n{msl}"
     );
     assert!(

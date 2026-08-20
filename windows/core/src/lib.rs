@@ -37,6 +37,7 @@ pub mod shader_cache;
 pub mod shader_compile_stats;
 pub mod state_trace;
 pub mod storage_policy;
+pub mod streams;
 pub mod stretch_rect;
 pub mod texture_staging;
 pub mod visibility;

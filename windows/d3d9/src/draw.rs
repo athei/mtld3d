@@ -18,15 +18,19 @@ use mtld3d_core::{
     dxso::{FfPsKey, FfVsKey, VariantKey},
     ids::{BufferId, ProgramId},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
-    pipeline_state::PipelineSnapshot,
+    pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
     shader_cache,
+    streams::{instance_count, instanced_stream_read_bytes, is_instance_data, stream_step},
 };
 use mtld3d_shared::{
     Command, VertexAttrDesc,
-    mtl::{IndexType, PrimitiveType},
+    mtl::{
+        IndexType, PrimitiveType, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+        VertexStepFunction,
+    },
 };
-use mtld3d_types::SAMPLER_STATE_COUNT;
+use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT};
 
 use super::{encoder::FrameEncoder, stage_bindings::STAGE_COUNT};
 
@@ -65,21 +69,148 @@ pub enum VertexSource {
         size: u32,
         stride: u32,
     },
-    /// `DrawPrimitive` / `DrawIndexedPrimitive`: bound `IDirect3DVertexBuffer9`.
+    /// `DrawPrimitive` / `DrawIndexedPrimitive`: the bound `IDirect3DVertexBuffer9` streams.
     ///
-    /// `buffer_id` keys the encoder's `MTLBuffer` wrap cache; `backing_ptr`
-    /// / `backing_len` describe the `PageBox` to wrap if we need a fresh
-    /// `MTLBuffer`; `offset` is the game's `SetStreamSource` byte offset.
-    /// `stride` is the game's `SetStreamSource` stride — the true per-vertex
-    /// span, which can exceed the vertex declaration's min-extent when the
-    /// application's vertex struct carries fields past the declared elements.
+    /// One [`StreamBinding`] per stream the declaration reads that has a
+    /// buffer bound; a read stream with nothing bound is absent and feeds
+    /// zeros at draw time. `first` is the lowest such stream and `extra` the
+    /// rest, so the single-stream case carries no heap allocation (an empty
+    /// boxed slice does not allocate).
     Bound {
-        buffer_id: BufferId,
-        backing_ptr: u64,
-        backing_len: u64,
-        offset: u32,
-        stride: u32,
+        first: StreamBinding,
+        extra: Box<[StreamBinding]>,
+        /// Raw `SetStreamSourceFreq` word of stream 0.
+        ///
+        /// The instance count of an indexed draw comes from here even when
+        /// stream 0 is not among the bound streams.
+        stream0_freq: u32,
     },
+}
+
+/// One bound vertex stream of a draw.
+///
+/// `buffer_id` keys the encoder's `MTLBuffer` wrap cache; `backing_ptr` /
+/// `backing_len` describe the `PageBox` to wrap if we need a fresh
+/// `MTLBuffer`; `offset` is the game's `SetStreamSource` byte offset.
+/// `stride` is the game's `SetStreamSource` stride — the true per-vertex
+/// span, which can exceed the vertex declaration's extent when the
+/// application's vertex struct carries fields past the declared elements.
+pub struct StreamBinding {
+    /// D3D9 stream index, which is also the Metal vertex buffer slot.
+    pub stream: u8,
+    pub buffer_id: BufferId,
+    pub backing_ptr: u64,
+    pub backing_len: u64,
+    pub offset: u32,
+    pub stride: u32,
+    /// Raw `SetStreamSourceFreq` word of this stream (flags + count).
+    pub freq: u32,
+}
+
+/// How one stream is fed for a draw.
+enum StreamFeed<'a> {
+    /// Stream 0 of a UP draw: inline bytes at the call's stride.
+    Inline { stride: u32 },
+    /// A bound vertex buffer.
+    Buffer(&'a StreamBinding),
+    /// Read by the declaration, nothing bound: zeros.
+    Null,
+}
+
+impl VertexSource {
+    /// How `stream` is fed, for a stream the declaration reads.
+    fn feed(&self, stream: u32) -> StreamFeed<'_> {
+        match self {
+            Self::Up { stride, .. } => {
+                if stream == 0 {
+                    StreamFeed::Inline { stride: *stride }
+                } else {
+                    StreamFeed::Null
+                }
+            }
+            Self::Bound { first, extra, .. } => core::iter::once(first)
+                .chain(extra.iter())
+                .find(|b| u32::from(b.stream) == stream)
+                .map_or(StreamFeed::Null, StreamFeed::Buffer),
+        }
+    }
+
+    /// Every bound stream of the draw, lowest first.
+    fn bindings(&self) -> impl Iterator<Item = &StreamBinding> {
+        let (first, extra) = match self {
+            Self::Up { .. } => (None, &[][..]),
+            Self::Bound { first, extra, .. } => (Some(first), &extra[..]),
+        };
+        first.into_iter().chain(extra.iter())
+    }
+}
+
+/// The stride a stream's vertex buffer layout steps by.
+///
+/// The application's `SetStreamSource` stride wins when it covers the
+/// declaration's extent on that stream (it can exceed it when the vertex
+/// struct carries fields past the declared elements). A zero stride means
+/// the application left it to the declaration. A non-zero stride smaller
+/// than the extent would make Metal reject the pipeline (an attribute past
+/// its layout's stride), so it is widened to the extent with a warning.
+fn layout_stride(app_stride: u32, extent: u32) -> u32 {
+    if app_stride == 0 {
+        return extent;
+    }
+    if app_stride < extent {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "stream stride {app_stride} below the declaration extent {extent}; layout widened to the extent"
+        );
+        return extent;
+    }
+    app_stride
+}
+
+/// Zero bytes fed to a stream the declaration reads but nothing is bound to.
+///
+/// Bound inline at the stream's slot under a `Constant` layout, so every
+/// vertex and instance reads offset 0 and sees zeros, the value a D3D9 vertex
+/// reads from an unbound stream. Sized to the `setVertexBytes` limit; a
+/// declaration whose extent on one stream exceeds it is not something a
+/// 16-element declaration can produce.
+static NULL_STREAM_ZEROS: [u8; 4096] = [0; 4096];
+
+/// The vertex buffer layouts of a draw, one per stream the declaration reads.
+///
+/// Unread streams stay [`StreamLayout::UNUSED`] so the pipeline key is
+/// canonical.
+fn stream_layouts(
+    source: &VertexSource,
+    attrs: &AttrSnapshot,
+) -> [StreamLayout; MAX_STREAMS as usize] {
+    let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+    let mut used = attrs.used_streams;
+    while used != 0 {
+        let stream = used.trailing_zeros();
+        used &= used - 1;
+        let extent = attrs.extents[stream as usize];
+        layouts[stream as usize] = match source.feed(stream) {
+            StreamFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamFeed::Buffer(b) => {
+                let (step, step_rate) = stream_step(b.freq);
+                StreamLayout {
+                    stride: layout_stride(b.stride, extent),
+                    step,
+                    step_rate,
+                }
+            }
+            StreamFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
+        };
+    }
+    layouts
 }
 
 /// Where the index data comes from (or whether the draw is non-indexed).
@@ -160,16 +291,19 @@ pub struct DrawOp {
 /// to pipeline-key against. Updated via `Op::SetVertexAttrs` when the
 /// vertex declaration or FVF changes; reused across draws otherwise.
 ///
-/// `Copy` (24 B of pointer + scalars) is structurally needed: the
-/// `Option<AttrSnapshot>` field on `CurrentSnapshot` is read by-value
-/// through a borrowed snapshot (`snap.attrs.expect(...)`). Rust
+/// `Copy` (pointer + scalars + the per-stream extents) is structurally
+/// needed: the `Option<AttrSnapshot>` field on `CurrentSnapshot` is read
+/// by-value through a borrowed snapshot (`snap.attrs.expect(...)`). Rust
 /// requires `Clone` whenever `Copy` is derived, so `Clone` rides
 /// along despite no explicit `.clone()` callers.
 #[derive(Clone, Copy)]
 pub struct AttrSnapshot {
     pub ptr: NonNull<VertexAttrDesc>,
     pub len: u32,
-    pub stride: u32,
+    /// Per stream, the declaration's `max(offset + size)`; see `ResolvedAttrs`.
+    pub extents: [u32; MAX_STREAMS as usize],
+    /// Bit `s` set: stream `s` feeds a consumed attribute.
+    pub used_streams: u16,
     pub vdecl_hash: u64,
 }
 
@@ -1132,35 +1266,32 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     drop(t_lookup);
     let shaders = ShaderRef { vs, ps, variant };
     enc.maybe_log_pass_shader(shaders, stage_bindings);
+    // One vertex buffer layout per stream the declaration reads: stride from
+    // the binding (or the declaration extent), step function from the
+    // stream's `SetStreamSourceFreq`, a constant zero feed where nothing is
+    // bound. Part of the pipeline identity.
+    let layouts = stream_layouts(&vertex_source, &attrs);
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
         &vertex_source,
         &index_source,
-        attrs.stride,
+        layouts[0].stride,
     );
     drop(t_resolve);
 
     let t_pipeline = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Pipeline));
     let attrs_ref = attrs.as_slice();
-    // The pipeline's vertex layout must step by the application-provided
-    // per-vertex stride. For `DrawPrimitiveUP` that is the call's
-    // `VertexStreamZeroStride` (which can exceed the declaration's min-extent
-    // when the vertex struct has trailing padding); only fall back to the
-    // declaration extent when the source doesn't carry an explicit stride.
-    let stride = match &vertex_source {
-        VertexSource::Up { stride, .. } => *stride,
-        // The bound stream's stride is the application's `SetStreamSource`
-        // stride, which (like the UP case) can exceed the declaration's
-        // min-extent when the vertex struct carries fields past the declared
-        // elements. Fall back to the declaration extent only when no stream
-        // stride was recorded (0).
-        VertexSource::Bound { stride, .. } => {
-            if *stride != 0 {
-                *stride
-            } else {
-                attrs.stride
-            }
+    // Instances of an indexed draw: stream 0's frequency count, but only when
+    // a stream this draw reads is per-instance; non-indexed draws never
+    // instance (D3D9 ignores the frequency state for them).
+    let instances = match (&vertex_source, &index_source) {
+        (_, IndexSource::None { .. }) | (VertexSource::Up { .. }, _) => 1,
+        (VertexSource::Bound { stream0_freq, .. }, _) => {
+            let any_instanced = vertex_source
+                .bindings()
+                .any(|b| attrs.used_streams & (1 << b.stream) != 0 && is_instance_data(b.freq));
+            instance_count(*stream0_freq, any_instanced)
         }
     };
     let vdecl_hash = attrs.vdecl_hash;
@@ -1192,7 +1323,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         vs_fn: vs_handles.func,
         ps_fn: ps_handles.func,
         vdecl_hash,
-        vertex_stride: stride,
+        stream_layouts: layouts,
         color_format,
         attach,
         rs: render_state.pipeline_rs,
@@ -1489,20 +1620,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
 
     let t_binds = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Binds));
     let t_cbind = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BCbind));
-    // 5. Shader constants (slot 15), alpha-ref float (slot 14), fog color
-    //    (slot 13). Dedup via inline-bytes cache: when the same constants
-    //    re-bind draw-after-draw (FF pass with one CB update at the head,
-    //    or shadow-cast pass with shared light constants) we skip the
-    //    `setBytes` command. The bytes already live in the owning
+    // 5. Shader constants (VS float slot / PS slot 15), alpha-ref float (PS
+    //    slot 14), fog color (PS slot 13). Dedup via inline-bytes cache: when
+    //    the same constants re-bind draw-after-draw (FF pass with one CB
+    //    update at the head, or shadow-cast pass with shared light constants)
+    //    we skip the `setBytes` command. The bytes already live in the owning
     //    `FrameData::scratch` arena (bump-allocated on the API thread)
     //    so we pass their `(ptr, len)` straight to the Metal command
     //    without re-copying through the encoder's scratch.
     if !vs_const_bytes.is_empty() && enc.last_bound().vs_constants_changed(vs_const_bytes) {
         let (p, n) = vs_constants.as_raw();
-        enc.emit_command(Command::set_vertex_bytes_at(p, n, 15));
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_FLOAT_CONST_SLOT));
     }
-    // Half-pixel rasterization fixup (VS slot 13). Every DXSO/FF vertex shader
-    // declares `constant float4 &pos_fixup [[buffer(13)]]` and shifts
+    // Half-pixel rasterization fixup (VS pos-fixup slot). Every DXSO/FF vertex
+    // shader declares `constant float4 &pos_fixup` there and shifts
     // clip-space position half a pixel right/down so on-boundary geometry
     // lands on the D3D9 window→NDC reference.
     // `(1/vp_w, -1/vp_h, depth_clamp_z, 0)` from the live viewport; the `.z`
@@ -1525,7 +1656,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         unsafe { core::slice::from_raw_parts(pos_fixup.as_ptr().cast::<u8>(), 16) };
     if enc.last_bound().vs_pos_fixup_changed(pos_fixup_bytes) {
         let ptr = enc.alloc_scratch(pos_fixup_bytes);
-        enc.emit_command(Command::set_vertex_bytes_at(ptr, 16, 13));
+        enc.emit_command(Command::set_vertex_bytes_at(ptr, 16, VS_POS_FIXUP_SLOT));
     }
     if !ps_const_bytes.is_empty() && enc.last_bound().ps_constants_changed(ps_const_bytes) {
         let (p, n) = ps_constants.as_raw();
@@ -1543,82 +1674,136 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let (p, n) = bump_env_slice.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 12));
     }
-    // VS integer constants (vertex slot 14) — bound only for the rare shader
-    // that reads a dynamic integer constant. Re-bound unconditionally (no
-    // dedup): such draws are infrequent and the payload is a fixed 256 B.
+    // VS integer constants — bound only for the rare shader that reads a
+    // dynamic integer constant. Re-bound unconditionally (no dedup): such
+    // draws are infrequent and the payload is a fixed 256 B.
     if !vs_int_const_slice.as_slice().is_empty() {
         let (p, n) = vs_int_const_slice.as_raw();
-        enc.emit_command(Command::set_vertex_bytes_at(p, n, 14));
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_INT_CONST_SLOT));
     }
     drop(t_cbind);
 
-    // 6. Bind the vertex source. Wraps the bound VB's `PageBox` in an
+    // 6. Bind the vertex streams. Wraps each bound VB's `PageBox` in an
     //    MTLBuffer lazily — the cache hits after the first draw post-rename
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
-    match vertex_source {
+    match &vertex_source {
         VertexSource::Up { bytes, size, .. } => {
-            let scratch_ptr = enc.alloc_scratch(&bytes);
-            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
+            let scratch_ptr = enc.alloc_scratch(bytes);
+            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, *size, 0));
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
             // re-emits its `setVertexBuffer` instead of reading these bytes.
             enc.last_bound().invalidate_vertex_buffer();
         }
-        VertexSource::Bound {
-            buffer_id,
-            backing_ptr,
-            backing_len,
-            offset,
-            ..
-        } => {
-            let buffer_handle = enc.ensure_vbib_mtl_buffer(buffer_id, backing_ptr, backing_len);
-            if buffer_handle == 0 {
-                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for VB");
-                mtld3d_shared::log_once_trace_by!(
-                    target: crate::LOG_TARGET,
-                    key: buffer_id.raw(),
-                    "drop: VB buffer {:#x} wrap failed",
-                    buffer_id.raw(),
-                );
-                return;
-            }
-            if enc
-                .last_bound()
-                .vertex_buffer_changed(buffer_handle, offset)
-            {
-                enc.emit_command(Command::set_vertex_buffer(buffer_handle, offset, 0));
-            }
-            // Record this draw's VB read range so a later overlapping
-            // staging upload renames instead of corrupting this draw.
-            // Tighten it past the whole-buffer fallback so a disjoint
-            // later upload to the same buffer doesn't force a needless
-            // rename: non-indexed draws give the exact vertex span;
-            // indexed draws tighten only the lower bound by `base_vertex`
-            // (the upper bound needs the max index value, which we don't
-            // scan, so it stays at end-of-buffer). Both may over-cover but
-            // never under-cover; overflow falls back to the whole tail.
-            // `None` = the draw reads nothing → record nothing.
-            let logical_len = u32::try_from(backing_len).unwrap_or(u32::MAX);
-            let read_range = match &index_source {
-                IndexSource::None {
-                    start_vertex,
-                    vertex_count,
-                } => nonindexed_vb_range(offset, stride, *start_vertex, *vertex_count),
-                IndexSource::Bound {
-                    base_vertex,
-                    index_count,
-                    ..
-                } => indexed_vb_range_lower_bound(offset, stride, *base_vertex, *index_count),
-                // `Up` indices only ever pair with `VertexSource::Up`, never a
-                // bound VB, so this arm is unreachable in practice; record no
-                // read range (there is no bound buffer to guard).
-                IndexSource::Up { .. } => None,
-            };
-            if let Some((range_off, range_size)) = read_range {
-                enc.note_buffer_draw_range(buffer_id.raw(), range_off, range_size, logical_len);
+        VertexSource::Bound { .. } => {
+            for b in vertex_source.bindings() {
+                let slot = u32::from(b.stream);
+                let layout = layouts[b.stream as usize];
+                if !layout.is_used() {
+                    // Bound but not read by the declaration's consumed
+                    // attributes: nothing to bind.
+                    continue;
+                }
+                let buffer_handle =
+                    enc.ensure_vbib_mtl_buffer(b.buffer_id, b.backing_ptr, b.backing_len);
+                if buffer_handle == 0 {
+                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for VB");
+                    mtld3d_shared::log_once_trace_by!(
+                        target: crate::LOG_TARGET,
+                        key: b.buffer_id.raw(),
+                        "drop: VB buffer {:#x} (stream {slot}) wrap failed",
+                        b.buffer_id.raw(),
+                    );
+                    return;
+                }
+                if enc
+                    .last_bound()
+                    .vertex_buffer_changed(slot, buffer_handle, b.offset)
+                {
+                    enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
+                }
+                // Record this draw's VB read range so a later overlapping
+                // staging upload renames instead of corrupting this draw.
+                // Tighten it past the whole-buffer fallback so a disjoint
+                // later upload to the same buffer doesn't force a needless
+                // rename: non-indexed draws give the exact vertex span;
+                // indexed draws tighten only the lower bound by `base_vertex`
+                // (the upper bound needs the max index value, which we don't
+                // scan, so it stays at end-of-buffer); a per-instance stream
+                // reads one element per `step_rate` instances. All may
+                // over-cover but never under-cover; overflow falls back to the
+                // whole tail. `None` = the draw reads nothing → record nothing.
+                let logical_len = u32::try_from(b.backing_len).unwrap_or(u32::MAX);
+                let read_range = match (layout.step, &index_source) {
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::None {
+                            start_vertex,
+                            vertex_count,
+                        },
+                    ) => nonindexed_vb_range(b.offset, layout.stride, *start_vertex, *vertex_count),
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::Bound {
+                            base_vertex,
+                            index_count,
+                            ..
+                        },
+                    ) => indexed_vb_range_lower_bound(
+                        b.offset,
+                        layout.stride,
+                        *base_vertex,
+                        *index_count,
+                    ),
+                    // `Up` indices only ever pair with `VertexSource::Up`,
+                    // never a bound VB, so this arm is unreachable in
+                    // practice; record no read range.
+                    (VertexStepFunction::PerVertex, IndexSource::Up { .. }) => None,
+                    (VertexStepFunction::PerInstance | VertexStepFunction::Constant, _) => Some((
+                        b.offset,
+                        instanced_stream_read_bytes(
+                            instances,
+                            layout.step,
+                            layout.step_rate,
+                            layout.stride,
+                        ),
+                    )),
+                };
+                if let Some((range_off, range_size)) = read_range {
+                    enc.note_buffer_draw_range(
+                        b.buffer_id.raw(),
+                        range_off,
+                        range_size,
+                        logical_len,
+                    );
+                }
             }
         }
+    }
+    // Streams the declaration reads with nothing bound: feed zeros inline
+    // under the constant layout built above. The inline bind clobbers that
+    // slot's real Metal binding, so forget it in the cache too.
+    let mut null_streams = attrs.used_streams;
+    while null_streams != 0 {
+        let stream = null_streams.trailing_zeros();
+        null_streams &= null_streams - 1;
+        if !matches!(vertex_source.feed(stream), StreamFeed::Null) {
+            continue;
+        }
+        let extent = layouts[stream as usize].stride;
+        let len = u32::try_from(NULL_STREAM_ZEROS.len()).expect("4 KiB fits u32");
+        if extent > len {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "stream {stream} is unbound and its declaration extent {extent} exceeds the zero feed; clamped"
+            );
+        }
+        enc.emit_command(Command::set_vertex_bytes_at(
+            NULL_STREAM_ZEROS.as_ptr() as u64,
+            extent.min(len),
+            stream,
+        ));
+        enc.last_bound().invalidate_vertex_buffer_slot(stream);
     }
     drop(t_vbib);
 
@@ -1678,6 +1863,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 buffer_handle,
                 offset,
                 base_vertex,
+                instances,
             ));
             index_count
         }
@@ -1698,6 +1884,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 index_type,
                 scratch_ptr,
                 byte_len,
+                instances,
             ));
             index_count
         }

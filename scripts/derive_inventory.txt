@@ -33,6 +33,7 @@ unix/shared/src/mtl.rs Swizzle Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs TextureCreateFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs TextureUsage Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs VertexFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs VertexStepFunction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/params.rs StencilFaceParams Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy
@@ -121,6 +122,7 @@ windows/core/src/pipeline_state.rs PipelineAttachFlags Clone,Copy,Debug,Default,
 windows/core/src/pipeline_state.rs PipelineRsBits Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineRsFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineSnapshot Clone,PartialEq,Eq
+windows/core/src/pipeline_state.rs StreamLayout Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq

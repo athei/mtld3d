@@ -359,6 +359,50 @@ pub enum VertexFormat {
     Float4 = 31,
 }
 
+/// `MTLVertexStepFunction` wire encoding for one vertex buffer layout.
+///
+/// Discriminants match the native Metal enum. `Constant` is the layout of a
+/// stream the declaration references but nothing feeds: every vertex and
+/// instance reads offset 0 of whatever is bound, with `step_rate` 0. Metal
+/// has no zero-stride layout, so it is also how a `D3DSTREAMSOURCE_INSTANCEDATA`
+/// stream with frequency 0 is expressed.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum VertexStepFunction {
+    Constant = 0,
+    PerVertex = 1,
+    PerInstance = 2,
+}
+
+/// Vertex-stage buffer slots the D3D9 vertex streams occupy.
+///
+/// Stream `n` of `SetStreamSource` binds at Metal vertex buffer index `n`,
+/// so the slot count equals `D3DCAPS9::MaxStreams`. mtld3d's own vertex
+/// uniforms sit above this range (see [`VS_POS_FIXUP_SLOT`]).
+pub const VERTEX_STREAM_SLOTS: u32 = 16;
+
+/// Vertex-stage buffer slot of the half-pixel rasterization fixup uniform.
+///
+/// The three uniform slots sit at the top of Metal's 31-entry vertex buffer
+/// table so no D3D9 stream index can collide with them. Shared by the MSL
+/// emitters (`[[buffer(N)]]`) and the encoder's `setVertexBytes` binds.
+pub const VS_POS_FIXUP_SLOT: u32 = 28;
+
+/// Vertex-stage buffer slot of the runtime integer constant table (`vs_i`).
+pub const VS_INT_CONST_SLOT: u32 = 29;
+
+/// Vertex-stage buffer slot of the float constant table (`vs_c`).
+pub const VS_FLOAT_CONST_SLOT: u32 = 30;
+
+// The uniform slots must clear every stream slot and stay inside Metal's
+// 31-entry vertex buffer table.
+const _: () = {
+    assert!(VS_POS_FIXUP_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_FLOAT_CONST_SLOT <= 30);
+};
+
 /// `BufferCreateDesc::kind` — what role the buffer plays on the PE side.
 ///
 /// Mostly used to compose a human-readable `setLabel` for Xcode captures so
@@ -569,6 +613,14 @@ mod tests {
         assert_eq!(Swizzle::Alpha as u32, 5);
         assert_eq!(VertexFormat::Float4 as u32, 31);
         assert_eq!(VertexFormat::from_repr(0), Some(VertexFormat::Invalid));
+        assert_eq!(VertexStepFunction::Constant as u32, 0);
+        assert_eq!(VertexStepFunction::PerVertex as u32, 1);
+        assert_eq!(VertexStepFunction::PerInstance as u32, 2);
+        assert_eq!(
+            VertexStepFunction::from_repr(2),
+            Some(VertexStepFunction::PerInstance)
+        );
+        assert_eq!(VertexStepFunction::from_repr(3), None);
 
         assert_eq!(DestroyKind::Buffer as u32, 0);
         assert_eq!(DestroyKind::DepthStencilState as u32, 6);
@@ -624,6 +676,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<StageTag>(), 4);
         assert_eq!(core::mem::size_of::<Swizzle>(), 4);
         assert_eq!(core::mem::size_of::<VertexFormat>(), 4);
+        assert_eq!(core::mem::size_of::<VertexStepFunction>(), 4);
         assert_eq!(core::mem::size_of::<TextureUsage>(), 4);
         assert_eq!(core::mem::align_of::<TextureUsage>(), 4);
         assert_eq!(core::mem::size_of::<ColorWriteMask>(), 4);
