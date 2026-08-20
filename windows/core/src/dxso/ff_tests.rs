@@ -542,6 +542,7 @@ fn emits_alpha_test_discard() {
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
+        color_out_mask: 0,
         flags: VariantFlags::empty(),
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
@@ -569,6 +570,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
+        color_out_mask: 0,
         flags: VariantFlags::empty(),
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);
@@ -678,6 +680,7 @@ fn omits_alpha_test_when_always() {
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
+        color_out_mask: 0,
         flags: VariantFlags::empty(),
     };
     let msl = emit_pair_for_tests(&vs, &ps, variant);

@@ -220,7 +220,12 @@ use crate::shader_compile_stats::CompileBucket;
 /// `56` adds the `pos_fixup.z`-selected depth clamp to the FF XYZRHW vertex
 /// epilogue (the D3D9 depth-clamp rule, previously `MTLDepthClipMode::Clamp`
 /// on the encoder), changing the MSL of every FF RHW vertex shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 56;
+///
+/// `57` adds `VariantKey::color_out_mask` (multiple render targets): the
+/// programmable PS declares `oC0..oC3` locals and returns a `PsOut` struct
+/// with one `[[color(i)]]` member per exported target, changing the key hash
+/// of every pixel shader and the MSL of any that writes `oC1` or above.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 57;
 
 /// File magic.
 ///

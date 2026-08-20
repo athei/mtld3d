@@ -126,6 +126,17 @@ pub struct VariantKey {
     /// Folded in at draw time (the FF PS uses its own `FfPsKey` mask). Part of
     /// the PS cache key.
     pub tt_projected_mask: u8,
+    /// Bit `i` set ⇒ colour attachment `i` is present in the render pass.
+    ///
+    /// The programmable PS exports `[[color(i)]]` only for attachments that
+    /// are both present here and written by the shader (see
+    /// `DxsoProgram::color_out_mask`); a write to any other `oCi` sinks into
+    /// a plain local. Metal rejects a pipeline whose fragment function writes
+    /// a colour slot the pass leaves unbound, so the mask must match the
+    /// pass exactly. Bit 0 is implied: the emitter ORs it in, so the derived
+    /// `Default` (0) still means "render target 0 only" and the FF PS, which
+    /// writes one output, keys on the default. Part of the PS cache key.
+    pub color_out_mask: u8,
     /// Packed boolean features — pixel-fog source, flat shade, sRGB write.
     ///
     /// See [`VariantFlags`].
@@ -693,10 +704,26 @@ fn emit_ps_function(
                 .as_ref()
                 .is_some_and(|d| d.reg.kind == RegKind::DepthOut)
     });
-    if has_depth_out {
+    // Colour outputs. `written` is what the bytecode stores to; `exported` is
+    // the subset the render pass can receive (bit 0 always). A bare `float4`
+    // return covers the common single-output case; anything else returns a
+    // `PsOut` struct with one `[[color(i)]]` member per exported slot. Locals
+    // exist for every written register so a non-exported write still has a
+    // target.
+    let written_colors = ps.color_out_mask();
+    let exported_colors = (written_colors & variant.color_out_mask) | 1;
+    let color_local_count = 8 - written_colors.leading_zeros().min(7);
+    let returns_struct = has_depth_out || exported_colors != 1;
+    if returns_struct {
         w(out, "struct PsOut {\n");
-        w(out, "    float4 oC0 [[color(0)]];\n");
-        w(out, "    float oDepth [[depth(any)]];\n");
+        for i in 0..4u32 {
+            if exported_colors & (1 << i) != 0 {
+                let _ = writeln!(out, "    float4 oC{i} [[color({i})]];");
+            }
+        }
+        if has_depth_out {
+            w(out, "    float oDepth [[depth(any)]];\n");
+        }
         w(out, "};\n\n");
     }
 
@@ -709,7 +736,7 @@ fn emit_ps_function(
         .iter()
         .any(|i| matches!(i.opcode, Opcode::TexBem | Opcode::TexBemL | Opcode::Bem));
 
-    if has_depth_out {
+    if returns_struct {
         let _ = writeln!(out, "fragment PsOut {entry}(");
     } else {
         let _ = writeln!(out, "fragment float4 {entry}(");
@@ -800,7 +827,9 @@ fn emit_ps_function(
     // See `emit_vs_function` for the rationale — same SM3 predicate
     // register, same default.
     w(out, "    bool4 p0 = bool4(false);\n");
-    w(out, "    float4 oC0 = float4(0.0);\n");
+    for i in 0..color_local_count {
+        let _ = writeln!(out, "    float4 oC{i} = float4(0.0);");
+    }
     if has_depth_out {
         // DepthOut writes go through `store_dst`, which expects a
         // float4 target so the write_mask path is uniform. Stash the
@@ -875,13 +904,25 @@ fn emit_ps_function(
     write_fog_blend(out, variant, "oC0");
     // D3DRS_SRGBWRITEENABLE: in-shader linear→sRGB encode on the final colour,
     // after fog/specular/alpha-test, alpha left linear. See the helper doc.
+    // Every exported target is an sRGB-capable write under the same render
+    // state, so the encode applies to each of them.
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
-        w(out, "    oC0.rgb = mtld3d_linear_to_srgb(oC0.rgb);\n");
+        for i in 0..4u32 {
+            if exported_colors & (1 << i) != 0 {
+                let _ = writeln!(out, "    oC{i}.rgb = mtld3d_linear_to_srgb(oC{i}.rgb);");
+            }
+        }
     }
-    if has_depth_out {
+    if returns_struct {
         w(out, "    PsOut _ps_out;\n");
-        w(out, "    _ps_out.oC0 = oC0;\n");
-        w(out, "    _ps_out.oDepth = _depth_storage.x;\n");
+        for i in 0..4u32 {
+            if exported_colors & (1 << i) != 0 {
+                let _ = writeln!(out, "    _ps_out.oC{i} = oC{i};");
+            }
+        }
+        if has_depth_out {
+            w(out, "    _ps_out.oDepth = _depth_storage.x;\n");
+        }
         w(out, "    return _ps_out;\n");
     } else {
         w(out, "    return oC0;\n");

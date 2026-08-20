@@ -822,6 +822,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
+        color_out_mask: 0,
         flags: VariantFlags::empty(),
     };
     let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
@@ -3358,4 +3359,130 @@ fn constant_register_limits_reject_out_of_range_files() {
             .violates_constant_register_limits(),
         "i16 overflows the integer constant file"
     );
+}
+
+/// `ps_3_0 { def c0, 0,1,0,0; def c1, 0,0,1,0; mov oC0, c0; mov oC1, c1; }`
+///
+/// The two-target shape a deferred renderer's G-buffer pass uses.
+fn two_target_ps() -> Vec<u32> {
+    vec![
+        PS3_HEADER,
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 0, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        f32::to_bits(0.0),
+        f32::to_bits(0.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 1, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        f32::to_bits(0.0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 1, 0xF, false),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]
+}
+
+#[test]
+fn color_out_mask_reports_written_targets() {
+    let ps = parse(&two_target_ps()).expect("ps parse");
+    assert_eq!(ps.color_out_mask(), 0b11);
+    let single = parse(&red_constant_ps()).expect("ps parse");
+    assert_eq!(single.color_out_mask(), 0b1);
+    // A write beyond oC3 is outside the D3D9 limit and is not reported.
+    let mut beyond = two_target_ps();
+    let oc1_dst = dst_token(TYPE_COLOROUT, 1, 0xF, false);
+    let slot = beyond
+        .iter()
+        .position(|&t| t == oc1_dst)
+        .expect("oC1 dst present");
+    beyond[slot] = dst_token(TYPE_COLOROUT, 4, 0xF, false);
+    assert_eq!(parse(&beyond).expect("ps parse").color_out_mask(), 0b1);
+}
+
+#[test]
+fn ps_oc1_exports_color1_when_the_attachment_is_present() {
+    let ps = parse(&two_target_ps()).expect("ps parse");
+    let variant = VariantKey {
+        color_out_mask: 0b11,
+        ..VariantKey::default()
+    };
+    let msl = emit_ps_programmable(&ps, variant).expect("emit");
+    assert!(
+        msl.contains("fragment PsOut "),
+        "two targets return a struct:\n{msl}"
+    );
+    assert!(msl.contains("float4 oC0 [[color(0)]];"), "{msl}");
+    assert!(msl.contains("float4 oC1 [[color(1)]];"), "{msl}");
+    assert!(msl.contains("_ps_out.oC1 = oC1;"), "{msl}");
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn ps_oc1_sinks_when_the_attachment_is_absent() {
+    // The default key means render target 0 only: the oC1 store lands in a
+    // plain local and the function keeps its bare float4 return, so a pass
+    // with one colour attachment never sees an output it cannot bind.
+    let ps = parse(&two_target_ps()).expect("ps parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit");
+    assert!(msl.contains("fragment float4 "), "{msl}");
+    assert!(!msl.contains("color(1)"), "{msl}");
+    assert!(msl.contains("float4 oC1 = float4(0.0);"), "{msl}");
+    assert!(
+        msl.contains("    oC1 = c1;"),
+        "the write still has a target:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn ps_oc1_with_depth_out_returns_every_member() {
+    const TYPE_DEPTHOUT: u32 = 9;
+    let mut bc = two_target_ps();
+    bc.pop();
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_DEPTHOUT, 0, 0x1, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    let ps = parse(&bc).expect("ps parse");
+    let variant = VariantKey {
+        color_out_mask: 0b11,
+        flags: VariantFlags::SRGB_WRITE,
+        ..VariantKey::default()
+    };
+    let msl = emit_ps_programmable(&ps, variant).expect("emit");
+    assert!(msl.contains("float4 oC1 [[color(1)]];"), "{msl}");
+    assert!(msl.contains("float oDepth [[depth(any)]];"), "{msl}");
+    assert!(msl.contains("_ps_out.oDepth = _depth_storage.x;"), "{msl}");
+    assert!(
+        msl.contains("oC0.rgb = mtld3d_linear_to_srgb(oC0.rgb);"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("oC1.rgb = mtld3d_linear_to_srgb(oC1.rgb);"),
+        "{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn color_out_mask_bit0_is_implied_for_single_target_shaders() {
+    // A present mask that names extra attachments the shader never writes
+    // must not change a single-output shader's MSL at all.
+    let ps = parse(&red_constant_ps()).expect("ps parse");
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit");
+    let variant = VariantKey {
+        color_out_mask: 0b1111,
+        ..VariantKey::default()
+    };
+    let masked = emit_ps_programmable(&ps, variant).expect("emit");
+    assert_eq!(plain, masked);
 }
