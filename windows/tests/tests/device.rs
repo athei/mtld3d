@@ -7,8 +7,9 @@ use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, ass
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
     D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_X8R8G8B8,
-    D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_VERTEXTEXTURE,
     D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
@@ -227,6 +228,61 @@ fn device_caps_are_sane() {
         "no texture-creation restriction is advertised"
     );
     assert!(caps.max_streams >= 1, "no vertex streams");
+    // A 2.0+ device reports its SM2 sub-structs; all-zero reads as "no
+    // ps_2_x profile" to engines of that era (3DMark05 refused to start).
+    assert!(
+        caps.ps20_caps.num_temps >= 12,
+        "PS20Caps.NumTemps below the ps_2_0 floor"
+    );
+    assert!(
+        caps.ps20_caps.num_instruction_slots >= 96,
+        "PS20Caps.NumInstructionSlots below the ps_2_0 floor"
+    );
+    assert_ne!(caps.ps20_caps.caps, 0, "PS20Caps.Caps is empty");
+    assert!(
+        caps.vs20_caps.num_temps >= 12,
+        "VS20Caps.NumTemps below the vs_2_0 floor"
+    );
+    assert_eq!(
+        caps.cube_texture_filter_caps, caps.texture_filter_caps,
+        "cube filter caps differ from the 2D ones"
+    );
+    assert_eq!(
+        caps.volume_texture_filter_caps, caps.texture_filter_caps,
+        "volume filter caps differ from the 2D ones"
+    );
+    assert_eq!(
+        caps.volume_texture_address_caps, caps.texture_address_caps,
+        "volume address caps differ from the 2D ones"
+    );
+    // Both honoured presentation intervals are advertised; IMMEDIATE is a hard
+    // requirement of 3DMark05's startup check.
+    assert_ne!(
+        caps.presentation_intervals & D3DPRESENT_INTERVAL_IMMEDIATE,
+        0,
+        "IMMEDIATE presentation interval not advertised"
+    );
+    assert_ne!(
+        caps.presentation_intervals & D3DPRESENT_INTERVAL_ONE,
+        0,
+        "display-rate presentation interval not advertised"
+    );
+    // Vertex texture fetch is not implemented, and the two places that say so
+    // have to agree.
+    assert_eq!(
+        caps.vertex_texture_filter_caps, 0,
+        "VTF filter caps advertised"
+    );
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DRTYPE_TEXTURE,
+            D3DFMT_A8R8G8B8
+        ),
+        D3DERR_NOTAVAILABLE,
+        "QUERY_VERTEXTEXTURE accepted without VTF"
+    );
 }
 
 #[test]
