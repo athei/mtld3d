@@ -13,6 +13,7 @@ use mtld3d_core::{
         DecalHeuristicInputs, IMPLICIT_DECAL_BIAS_RAW, IMPLICIT_DECAL_SLOPE_SCALE,
         d3d_depth_bias_to_metal, d3d_to_metal_cull, looks_like_decal,
     },
+    depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
     dxso::{FfPsKey, FfVsKey, VariantKey},
     ids::{BufferId, ProgramId},
@@ -852,11 +853,15 @@ bitflags::bitflags! {
 /// blend/color-write fields live inside `pipeline_rs`. `scissor_rect`
 /// is `[u16; 4]` (D3D9 max texture/RT dim is 16384). `blend_factor` /
 /// `depth_bias` / `slope_scale_depth_bias` keep `u32` (D3DCOLOR or
-/// f32 bit pattern). Total ~32 B (was ~92 B as wide u32s).
+/// f32 bit pattern).
 pub struct RenderStateSnapshot {
     pub pipeline_rs: mtld3d_core::pipeline_state::PipelineRsBits,
     pub depth_scissor: DepthScissorFlags,
-    pub depth_func: u8,
+    /// Depth + stencil test, the sole input to the `MTLDepthStencilState` cache.
+    ///
+    /// `depth_scissor`'s `DEPTH_ENABLE` / `DEPTH_WRITE` bits are derived from
+    /// this same snapshot, so the two cannot drift apart.
+    pub depth_stencil_state: DepthStencilSnapshot,
     pub cull_mode: u8,
     pub scissor_rect: [u16; 4],
     /// Constant RGBA referenced by `MTLBlendFactor::BlendColor` / `OneMinusBlendColor`.
@@ -872,6 +877,12 @@ pub struct RenderStateSnapshot {
     pub depth_bias: u32,
     /// Raw `D3DRS_SLOPESCALEDEPTHBIAS` bit pattern.
     pub slope_scale_depth_bias: u32,
+    /// Raw `D3DRS_STENCILREF`, narrowed to `STENCIL_MASK_BITS` at emit.
+    ///
+    /// Kept out of `depth_stencil` on purpose: Metal carries the reference
+    /// on the encoder, so folding it into the state key would mint one
+    /// `MTLDepthStencilState` per reference value.
+    pub stencil_ref: u32,
 }
 
 impl RenderStateSnapshot {
@@ -1182,11 +1193,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         return;
     }
     let depth_state = if has_depth {
-        enc.get_or_create_depth_stencil(
-            u32::from(render_state.depth_enable()),
-            u32::from(render_state.depth_write()),
-            u32::from(render_state.depth_func),
-        )
+        let snapshot = render_state
+            .depth_stencil_state
+            .gated_on_stencil_attachment(has_stencil);
+        enc.get_or_create_depth_stencil(&snapshot)
     } else {
         0
     };
@@ -1394,6 +1404,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     drop(t_probe);
 
     let t_samplers = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Samplers));
+    // D3DRS_STENCILREF drives Metal's per-encoder stencil reference. Only
+    // meaningful while the stencil test is on, and unlike the blend color it
+    // is emitted on every change (including back to zero) so a pass that
+    // lowers the reference mid-encoder doesn't keep comparing against the
+    // previous one.
+    let stencil_ref = render_state.stencil_ref & STENCIL_MASK_BITS;
+    if render_state.depth_stencil_state.stencil_enable != 0
+        && has_stencil
+        && enc.last_bound().stencil_reference_changed(stencil_ref)
+    {
+        enc.emit_command(Command::set_stencil_reference(stencil_ref));
+    }
+
     // D3DRS_BLENDFACTOR drives Metal's per-encoder constant blend
     // color. Default is 0xFFFFFFFF (opaque white), which is also the
     // Metal default — only emit the command when the game has overridden

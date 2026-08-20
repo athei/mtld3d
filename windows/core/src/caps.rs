@@ -201,6 +201,15 @@ const ADDRESS_DEFAULT: AddressCaps = AddressCaps::WRAP
     .union(AddressCaps::INDEPENDENTUV)
     .union(AddressCaps::MIRRORONCE);
 
+/// Stencil operations the depth-stencil state builder implements.
+///
+/// Every `D3DSTENCILOP_*` has an exact `MTLStencilOperation` counterpart, and
+/// `TWOSIDED` is covered by writing both `MTLDepthStencilDescriptor` faces
+/// from the `D3DRS_CCW_STENCIL*` states. Metal's default front-facing winding
+/// is clockwise, which is also D3D9's front, so the D3D9 front-face states
+/// land on Metal's front face.
+const STENCIL_DEFAULT: StencilCaps = StencilCaps::all();
+
 /// Fixed-function texture blend operations the FF pixel-shader emitter implements.
 ///
 /// `BLENDTEXTUREALPHAPM` is intentionally absent: `dxso::ff` does not emit the
@@ -315,8 +324,7 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.texture_caps = TEXTURE_DEFAULT.bits();
     caps.texture_filter_caps = FILTER_DEFAULT.bits();
     caps.texture_address_caps = ADDRESS_DEFAULT.bits();
-    // No stencil wiring in the depth-stencil state builder.
-    caps.stencil_caps = StencilCaps::empty().bits();
+    caps.stencil_caps = STENCIL_DEFAULT.bits();
     caps.texture_op_caps = TEXOP_DEFAULT.bits();
     caps.max_texture_blend_stages = FF_TEXTURE_STAGES;
     caps.max_simultaneous_textures = FF_TEXTURE_STAGES;
@@ -362,8 +370,8 @@ const fn fill_default(caps: &mut D3DCAPS9) {
 ///
 /// ORs in every spec bit for each bitmask field whose consumer warn coverage is
 /// solid, and raises the handful of numeric fields whose
-/// attempted-but-unimplemented paths have detection hooks upstream (stencil
-/// RS / `SetRenderTarget`-index / vertex-decl `BLENDWEIGHT` /
+/// attempted-but-unimplemented paths have detection hooks upstream
+/// (`SetRenderTarget`-index / vertex-decl `BLENDWEIGHT` /
 /// `D3DPT_POINTLIST` draw). Skips `pixel_shader_version` /
 /// `vertex_shader_version` / `vs20_caps` / `ps20_caps` — the DXSO parser has
 /// zero warn coverage, so a shader-version bump risks silent miscompile with no
@@ -389,13 +397,11 @@ fn apply_advertise_all(caps: &mut D3DCAPS9) {
     caps.texture_op_caps |= TexOpCaps::all().bits();
     // Field-shape (non-bitmask) raises. Each has detection wired upstream
     // so the game's attempts at the path land as warns:
-    //  - stencil_caps: D3DRS_STENCIL* are PortCandidate; warn_rs_non_default_once fires.
     //  - num_simultaneous_rts: SetRenderTarget(index>0) already warn!s with the index.
     //  - max_point_size: D3DPT_POINTLIST draws fire a log_once_warn in
     //    d3d_to_metal_primitive (Metal still renders 1-pixel points).
     // `max_vertex_blend_matrices` needs no raise: the truthful floor in
     // `fill_default` is already the spec maximum.
-    caps.stencil_caps |= StencilCaps::all().bits();
     caps.num_simultaneous_rts = caps
         .num_simultaneous_rts
         .max(D3D_MAX_SIMULTANEOUS_RENDERTARGETS);
@@ -637,8 +643,10 @@ mod tests {
     }
 
     #[test]
-    fn stencil_remains_unimplemented() {
-        assert_eq!(filled().stencil_caps, StencilCaps::empty().bits());
+    fn stencil_advertises_every_operation() {
+        // Each D3DSTENCILOP_* maps 1:1 onto an MTLStencilOperation, so the
+        // truthful floor is the whole field.
+        assert_eq!(filled().stencil_caps, StencilCaps::all().bits());
     }
 
     #[test]

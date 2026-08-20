@@ -15,7 +15,7 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
     buffer_rename::BufferMapMode,
-    convert::d3d_to_metal_cmp,
+    depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey,
         emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
@@ -26,7 +26,7 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, LastBoundCache, Pass,
-        PassState, StoreAction as PassStoreAction,
+        PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -46,10 +46,10 @@ use mtld3d_core::{
 use mtld3d_shared::{
     BlitCommand, BufferCreateDesc, Command, CommandType, CompileShaderLibraryParams,
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
-    CreateDepthStencilStateParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle,
-    PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    CreateTexturesBatchParams, DestroyResourcesBulkParams, EnsureBlitPipelineParams,
+    EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle, PassDescriptor,
+    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
         StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
@@ -61,7 +61,7 @@ use mtld3d_shared::{
     },
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
-use mtld3d_types::{D3DCMP_ALWAYS, D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
+use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 // Fast non-cryptographic hasher for the per-draw resource caches below
 // (texture/lib/pipeline/sampler/buffer/...). Keys are small trusted integers
 // or fixed structs; SipHash's DoS resistance buys nothing here and its
@@ -894,7 +894,7 @@ fn apply_const_range_into(
 
 /// Cache key for the per-format-combo clear-quad pipeline.
 ///
-/// Used by `emit_clear_quad_depth_inner` / `emit_clear_quad_color_inner`.
+/// Used by `emit_clear_quad_depth_stencil_inner` / `emit_clear_quad_color_inner`.
 /// Mirrors `EnsureClearQuadPipelineParams` (modulo `device_handle`) so the
 /// PE-side cache and the unix-side cache agree on what counts as a
 /// distinct pipeline.
@@ -903,6 +903,24 @@ struct ClearQuadKey {
     depth_format: PixelFormat,
     color_format: PixelFormat,
     flags: ClearQuadFlags,
+}
+
+/// Where a mid-pass clear quad lands, as the depth and stencil clear chains report it.
+///
+/// `clear_depth_stencil` compares the two reports to decide whether one quad
+/// can serve both planes.
+struct ClearQuadTarget {
+    viewport: (u32, u32, u32, u32),
+    has_color: bool,
+    color_format: PixelFormat,
+}
+
+impl ClearQuadTarget {
+    fn same_as(&self, other: &Self) -> bool {
+        self.viewport == other.viewport
+            && self.has_color == other.has_color
+            && self.color_format == other.color_format
+    }
 }
 
 /// Cached `MTLBuffer` wrapper for one live VB/IB `PageBox`.
@@ -1941,9 +1959,9 @@ impl FrameEncoder {
         // re-emits its pipeline + bindings: the fresh encoder starts with none,
         // and `emit_draw`'s own reset would no-op here since this call already
         // opened the pass (a draw with no pipeline bound faults in Metal).
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.emit_command(cmd);
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
     }
 
     /// Close a visibility query.
@@ -1982,9 +2000,9 @@ impl FrameEncoder {
         // Symmetric with `begin_visibility_query`: if this mode-set opens a
         // fresh pass, reset `last_bound` so any later draw in the frame re-emits
         // its bindings across the encoder boundary.
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.emit_command(cmd);
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
         self.visibility.push_pending(submit_seq, core);
     }
 
@@ -2183,7 +2201,7 @@ impl FrameEncoder {
     }
 
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_color(r, g, b, a) {
             ColorClearOutcome::Folded => {}
             ColorClearOutcome::EmitQuad {
@@ -2191,7 +2209,7 @@ impl FrameEncoder {
                 viewport,
                 color_format,
             } => {
-                self.reset_last_bound_on_fresh_pass(was_closed);
+                self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_color_inner(rgba, viewport, color_format);
             }
         }
@@ -2274,51 +2292,181 @@ impl FrameEncoder {
         if regions.is_empty() {
             return;
         }
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         let color_format = self.pass_state.begin_region_color_clear();
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
         for region in regions {
             self.emit_clear_quad_color_inner((r, g, b, a), region, color_format);
         }
     }
 
     pub fn clear_depth(&mut self, value: u32) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_depth(value) {
-            DepthClearOutcome::Folded => {}
+            DepthClearOutcome::Folded | DepthClearOutcome::NoOp => {}
             DepthClearOutcome::EmitQuad {
                 value,
                 viewport,
                 has_color,
                 color_format,
             } => {
-                self.reset_last_bound_on_fresh_pass(was_closed);
-                self.emit_clear_quad_depth_inner(value, viewport, has_color, color_format);
+                self.reset_last_bound_if_pass_opened(passes_before);
+                self.emit_clear_quad_depth_stencil_inner(
+                    Some(value),
+                    None,
+                    viewport,
+                    has_color,
+                    color_format,
+                );
             }
         }
     }
 
-    /// Flush `last_bound` when a cross-pass clear-quad opened a fresh Metal encoder.
-    ///
-    /// `PassState::clear_{color,depth}` opens the new pass itself
-    /// (`ensure_pass_open`, with `loadAction = Load` to preserve prior
-    /// tiles), but it can't reach the `FrameEncoder`-owned `last_bound`,
-    /// so unlike `begin_render_pass_if_needed` the per-draw dedup would
-    /// carry stale bindings across the encoder boundary. The new encoder
-    /// starts with no bindings, so the next draw must re-emit everything
-    /// — including the FF VS constants at buffer 15, whose content-based
-    /// dedup otherwise suppresses the re-bind when the constants are
-    /// unchanged from the prior pass (e.g. a sample pass after
-    /// `SetDepthStencilSurface(NULL)` with the same viewport).
-    fn reset_last_bound_on_fresh_pass(&mut self, was_closed: bool) {
-        if was_closed {
-            self.last_bound.reset();
-            // Keep the debug-build emitted-command shadow in lockstep with the
-            // cache so the in-sync assertion shares the same fresh-encoder
-            // baseline (no bindings yet).
-            #[cfg(debug_assertions)]
-            self.pass_state.debug_reset_emitted();
+    pub fn clear_stencil(&mut self, value: u32) {
+        let passes_before = self.pass_state.passes().len();
+        match self.pass_state.clear_stencil(value) {
+            StencilClearOutcome::Folded | StencilClearOutcome::NoOp => {}
+            StencilClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => {
+                self.reset_last_bound_if_pass_opened(passes_before);
+                self.emit_clear_quad_depth_stencil_inner(
+                    None,
+                    Some(value),
+                    viewport,
+                    has_color,
+                    color_format,
+                );
+            }
         }
+    }
+
+    /// `Clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)`: both planes, one quad where a quad is due.
+    ///
+    /// Asks the depth chain and then the stencil chain. Neither call changes
+    /// the state the other reads, except through a single `ensure_pass_open`,
+    /// after which the stencil chain takes the branch that sees that same
+    /// open pass. So the two answers pair up: both fold, or both paint the
+    /// same rect, or both find nothing to clear; one draw writes both planes.
+    /// Shadow-volume renderers clear both planes between lights, so the
+    /// two-quad shape would double the clear draws on exactly that workload.
+    /// The single-plane fallback below only guards the pairing; it is not
+    /// expected to run.
+    pub fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
+        let passes_before = self.pass_state.passes().len();
+        let depth_outcome = self.pass_state.clear_depth(depth);
+        let stencil_outcome = self.pass_state.clear_stencil(stencil);
+        let depth_quad = match depth_outcome {
+            DepthClearOutcome::Folded | DepthClearOutcome::NoOp => None,
+            DepthClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => Some((
+                value,
+                ClearQuadTarget {
+                    viewport,
+                    has_color,
+                    color_format,
+                },
+            )),
+        };
+        let stencil_quad = match stencil_outcome {
+            StencilClearOutcome::Folded | StencilClearOutcome::NoOp => None,
+            StencilClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => Some((
+                value,
+                ClearQuadTarget {
+                    viewport,
+                    has_color,
+                    color_format,
+                },
+            )),
+        };
+        debug_assert!(
+            stencil_quad.is_none() || depth_quad.is_some(),
+            "depth folded while stencil painted"
+        );
+        debug_assert!(
+            depth_quad.is_none() || !matches!(stencil_outcome, StencilClearOutcome::Folded),
+            "depth painted while stencil folded"
+        );
+        if depth_quad.is_none() && stencil_quad.is_none() {
+            return;
+        }
+        self.reset_last_bound_if_pass_opened(passes_before);
+        match (depth_quad, stencil_quad) {
+            (Some((depth, at)), Some((stencil, stencil_at))) if at.same_as(&stencil_at) => {
+                self.emit_clear_quad_depth_stencil_inner(
+                    Some(depth),
+                    Some(stencil),
+                    at.viewport,
+                    at.has_color,
+                    at.color_format,
+                );
+            }
+            (depth_quad, stencil_quad) => {
+                if let Some((depth, at)) = depth_quad {
+                    self.emit_clear_quad_depth_stencil_inner(
+                        Some(depth),
+                        None,
+                        at.viewport,
+                        at.has_color,
+                        at.color_format,
+                    );
+                }
+                if let Some((stencil, at)) = stencil_quad {
+                    self.emit_clear_quad_depth_stencil_inner(
+                        None,
+                        Some(stencil),
+                        at.viewport,
+                        at.has_color,
+                        at.color_format,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Flush `last_bound` when a `PassState` call opened a fresh Metal encoder.
+    ///
+    /// `PassState::clear_{color,depth,stencil}` and the visibility mode-sets
+    /// open the new pass themselves (`ensure_pass_open`, with `loadAction =
+    /// Load` to preserve prior tiles), but they can't reach the
+    /// `FrameEncoder`-owned `last_bound`, so unlike
+    /// `begin_render_pass_if_needed` the per-draw dedup would carry stale
+    /// bindings across the encoder boundary. The new encoder starts with no
+    /// bindings, so the next draw must re-emit everything, including the FF
+    /// VS constants at buffer 15, whose content-based dedup otherwise
+    /// suppresses the re-bind when the constants are unchanged from the
+    /// prior pass (e.g. a sample pass after `SetDepthStencilSurface(NULL)`
+    /// with the same viewport).
+    ///
+    /// A fresh pass is detected by the pass count growing, not by whether
+    /// the pass was closed beforehand: a clear under a counting visibility
+    /// query ends the open pass and opens a new one within one call.
+    fn reset_last_bound_if_pass_opened(&mut self, passes_before: usize) {
+        if self.pass_state.passes().len() != passes_before {
+            self.reset_last_bound_for_fresh_encoder();
+        }
+    }
+
+    /// Flush `last_bound` for an encoder known to have just opened.
+    fn reset_last_bound_for_fresh_encoder(&mut self) {
+        self.last_bound.reset();
+        // Keep the debug-build emitted-command shadow in lockstep with the
+        // cache so the in-sync assertion shares the same fresh-encoder
+        // baseline (no bindings yet).
+        #[cfg(debug_assertions)]
+        self.pass_state.debug_reset_emitted();
     }
 
     /// Debug-build invariant on the per-draw dedup cache (`last_bound`).
@@ -2570,9 +2718,9 @@ impl FrameEncoder {
         // A fresh Metal encoder always opens here (the colour RT changed, which
         // ends any prior pass), so flush the per-draw dedup so every binding
         // below is actually emitted (the clear-quad cross-pass rule).
-        self.reset_last_bound_on_fresh_pass(true);
+        self.reset_last_bound_for_fresh_encoder();
 
-        let depth_state = self.get_or_create_depth_stencil(0, 0, D3DCMP_ALWAYS);
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
         if self.last_bound.pipeline_changed(pipeline) {
             self.pass_state
                 .emit_command(Command::set_render_pipeline_state(pipeline));
@@ -2629,24 +2777,43 @@ impl FrameEncoder {
         );
     }
 
-    /// Emit the per-tile clear-quad sequence for a depth-only (or depth+color) mid-pass `Clear`.
+    /// Emit the clear-quad sequence for a mid-pass depth, stencil, or depth+stencil `Clear`.
     ///
-    /// Sequence: pipeline → DSS → scissor → `SetVertexBytesAt(slot=0, &z)`
-    /// → `DrawPrimitives (Triangle, 0, 3)`. Pipeline/DSS/scissor are
-    /// routed through `LastBoundCache` so back-to-back clear-quads and
-    /// clear-quad-then-redraw both dedup (and the cache stays in sync
-    /// with the encoder's actual bound state). The 3-vertex VS uses
-    /// `vertex_id` to synthesise a fullscreen triangle covering
-    /// `[-1, 1]^2` in clip space; the scissor constrains writes to the
-    /// D3D9 viewport rect; the constant `z` becomes the depth value the
-    /// depth-stencil state writes to the depth attachment.
-    fn emit_clear_quad_depth_inner(
+    /// Sequence: pipeline → DSS → stencil reference (stencil clears only) →
+    /// scissor → `SetVertexBytesAt(slot=0, &z)` → `DrawPrimitives (Triangle,
+    /// 0, 3)`. Pipeline/DSS/reference/scissor are routed through
+    /// `LastBoundCache` so back-to-back clear-quads and
+    /// clear-quad-then-redraw both dedup (and the cache stays in sync with
+    /// the encoder's actual bound state). The 3-vertex VS uses `vertex_id`
+    /// to synthesise a fullscreen triangle covering `[-1, 1]^2` in clip
+    /// space; the scissor constrains writes to the D3D9 viewport rect.
+    ///
+    /// Which planes the quad writes is decided by the depth-stencil state
+    /// alone, so the same pipeline serves all three shapes. The constant `z`
+    /// becomes the depth value where depth is requested. MSL cannot export a
+    /// stencil value, so the stencil value rides the encoder as the stencil
+    /// reference, which a `Replace` operation on every outcome writes to each
+    /// covered fragment. `Clear(ZBUFFER | STENCIL)` therefore costs one draw.
+    fn emit_clear_quad_depth_stencil_inner(
         &mut self,
-        value: u32,
+        depth: Option<u32>,
+        stencil: Option<u32>,
         viewport: (u32, u32, u32, u32),
         has_color: bool,
         color_format: PixelFormat,
     ) {
+        let snapshot = match (depth.is_some(), stencil.is_some()) {
+            (true, true) => DepthStencilSnapshot::depth_stencil_overwrite(),
+            (true, false) => DepthStencilSnapshot::depth_overwrite(),
+            (false, true) => DepthStencilSnapshot::stencil_overwrite(),
+            (false, false) => {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "clear quad requested with neither plane; skipped"
+                );
+                return;
+            }
+        };
         // Hardcoded for now: every depth attachment mtld3d emits is
         // `Depth32Float` (D24X8 / D24 / D32 / D16) or
         // `Depth32FloatStencil8` (D24S8). Shadow-cascade caster passes
@@ -2690,11 +2857,19 @@ impl FrameEncoder {
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
-            self.pass_state.clear_depth_legacy_break(value);
+            if let Some(value) = depth {
+                self.pass_state.clear_depth_legacy_break(value);
+            }
+            if let Some(value) = stencil {
+                self.pass_state.clear_stencil_legacy_break(value);
+            }
             return;
         }
-        let depth_state = self.get_or_create_depth_stencil(1, 1, D3DCMP_ALWAYS);
-        let z_bytes = f32::from_bits(value).to_le_bytes();
+        let depth_state = self.get_or_create_depth_stencil(&snapshot);
+        // A stencil-only clear writes no depth, but the vertex stage still
+        // consumes a constant z at slot 0; any value inside the clip range
+        // will do.
+        let z_bytes = depth.map_or(0.0f32, f32::from_bits).to_le_bytes();
         let z_ptr = self.scratch.alloc(&z_bytes);
         let (vx, vy, vw, vh) = viewport;
         if self.last_bound.pipeline_changed(pipeline) {
@@ -2704,6 +2879,12 @@ impl FrameEncoder {
         if self.last_bound.depth_stencil_changed(depth_state) {
             self.pass_state
                 .emit_command(Command::set_depth_stencil_state(depth_state));
+        }
+        if let Some(value) = stencil
+            && self.last_bound.stencil_reference_changed(value)
+        {
+            self.pass_state
+                .emit_command(Command::set_stencil_reference(value));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
         self.pass_state
@@ -2772,7 +2953,7 @@ impl FrameEncoder {
         // Color clear doesn't write depth: bind a no-write depth-stencil
         // state so a transient color clear over an in-use depth
         // attachment doesn't perturb depth values.
-        let depth_state = self.get_or_create_depth_stencil(0, 0, D3DCMP_ALWAYS);
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
         // Color: write rgba as float4 via setFragmentBytes. The caller
         // (`device_clear` → `clear_color`/`clear_color_rects`) passes each
         // channel as f32 BITS, exactly like the folded load-action clear
@@ -2972,15 +3153,9 @@ impl FrameEncoder {
     /// `last_bound` so the per-draw dedup in `emit_draw` re-emits the full
     /// state on the first draw of the new Metal render encoder.
     pub fn begin_render_pass_if_needed(&mut self) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.ensure_pass_open();
-        if was_closed {
-            self.last_bound.reset();
-            // Reset the debug-build emitted-command shadow in lockstep so the
-            // in-sync assertion shares the same fresh-encoder baseline.
-            #[cfg(debug_assertions)]
-            self.pass_state.debug_reset_emitted();
-        }
+        self.reset_last_bound_if_pass_opened(passes_before);
     }
 
     /// Record that the draw being emitted read `[offset, offset + size)` from VB/IB `id`.
@@ -3050,29 +3225,14 @@ impl FrameEncoder {
 
     // ── D3D9→Metal translation + caching (runs on encoder thread) ──
 
-    /// Look up or create an `MTLDepthStencilState` for the given D3D9 params.
-    ///
-    /// `depth_func` is a D3DCMP_* value, translated to `MTLCompareFunction` here.
-    pub fn get_or_create_depth_stencil(
-        &mut self,
-        depth_enable: u32,
-        depth_write: u32,
-        depth_func: u32,
-    ) -> u64 {
-        let key = DepthStencilKey::from_state(depth_enable, depth_write, depth_func);
+    /// Look up or create an `MTLDepthStencilState` for the given D3D9 state.
+    pub fn get_or_create_depth_stencil(&mut self, snapshot: &DepthStencilSnapshot) -> u64 {
+        let key = key_from_snapshot(snapshot);
         if let Some(&handle) = self.depth_stencil_cache.get(&key) {
             return handle.raw();
         }
 
-        let metal_cmp = d3d_to_metal_cmp(depth_func);
-        let mut params = CreateDepthStencilStateParams {
-            device_handle: self.device_handle,
-            depth_test_enable: depth_enable,
-            depth_write_enable: depth_write,
-            depth_compare_func: metal_cmp,
-            id: key.raw(),
-            state_handle: MetalHandle::NULL,
-        };
+        let mut params = params_from_snapshot(snapshot, key, self.device_handle);
         let status = unix_call(&mut params);
         let state = params.state_handle;
         if status != 0 || state.is_null() {
@@ -6281,6 +6441,11 @@ fn pass_to_descriptor(
         DepthLoad::Clear { value } => (LoadAction::Clear, value),
         DepthLoad::DontCare => (LoadAction::DontCare, f32::to_bits(1.0)),
     };
+    let (stencil_load_action, stencil_clear_value) = match p.stencil_load() {
+        StencilLoad::Load => (LoadAction::Load, 0),
+        StencilLoad::Clear { value } => (LoadAction::Clear, value),
+        StencilLoad::DontCare => (LoadAction::DontCare, 0),
+    };
     let color_store_action = match p.color_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
@@ -6316,6 +6481,8 @@ fn pass_to_descriptor(
         depth_load_action,
         depth_store_action,
         depth_clear_value,
+        stencil_load_action,
+        stencil_clear_value,
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
@@ -6380,6 +6547,8 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         depth_load_action: LoadAction::DontCare,
         depth_store_action: StoreAction::DontCare,
         depth_clear_value: 0,
+        stencil_load_action: LoadAction::DontCare,
+        stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),

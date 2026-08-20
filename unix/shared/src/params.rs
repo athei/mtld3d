@@ -3,7 +3,7 @@ use super::{
     mtl::{
         AddressMode, BlendFactor, BlendOperation, BufferKind, ClearQuadFlags, ColorSpacePolicy,
         ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        StageTag, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
+        StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -34,8 +34,10 @@ const _: () = {
     assert!(core::mem::offset_of!(U64After4, b) == 8);
     // A real wire struct whose `u64 id` sits after device_handle(8) + three
     // 4-byte fields: offset 24 ⇒ u64 8-aligned; would be 20 if 4-aligned.
-    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, id) == 24);
-    assert!(core::mem::size_of::<CreateDepthStencilStateParams>() == 40);
+    assert!(core::mem::size_of::<StencilFaceParams>() == 16);
+    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, front) == 24);
+    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, id) == 64);
+    assert!(core::mem::size_of::<CreateDepthStencilStateParams>() == 80);
 
     // Device create / render / destroy structs: align must be 8 and size
     // identical on all targets.
@@ -45,7 +47,7 @@ const _: () = {
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 32);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 96);
-    assert!(core::mem::size_of::<PassDescriptor>() == 88);
+    assert!(core::mem::size_of::<PassDescriptor>() == 96);
 };
 
 /// One-shot "register `env_logger` on the unix side" thunk.
@@ -432,7 +434,7 @@ impl Thunk for CompileShaderLibraryParams {
 /// `StretchRect` lands after the last draw of the frame.
 ///
 /// Fields are ordered u64s-first then u32s so the natural struct layout
-/// is padding-free; size is 88 bytes on both 32- and 64-bit PE.
+/// is padding-free; size is 96 bytes on both 32- and 64-bit PE.
 #[repr(C, align(8))]
 pub struct PassDescriptor {
     pub color_texture: MetalHandle<MTLTextureKind>, // in
@@ -454,6 +456,14 @@ pub struct PassDescriptor {
     /// The unix side mirrors this value to both `setStoreAction:` calls.
     pub depth_store_action: StoreAction, // in
     pub depth_clear_value: u32,                     // in: f32 bits (default 1.0)
+    /// Load action for the stencil half of a combined depth/stencil texture.
+    ///
+    /// Independent of `depth_load_action` because D3D9 clears the two planes
+    /// separately: `Clear(D3DCLEAR_STENCIL)` without `D3DCLEAR_ZBUFFER` has to
+    /// reset stencil while carrying depth forward. Ignored when the depth
+    /// texture's format has no stencil plane.
+    pub stencil_load_action: LoadAction, // in
+    pub stencil_clear_value: u32,                   // in: 0..=255
     pub command_count: u32,                         // in
     pub leading_blits_count: u32,                   // in
     /// Leading-blit and color-subresource flags.
@@ -461,7 +471,7 @@ pub struct PassDescriptor {
     /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..3
     /// carry the color attachment slice, and bits 4..7 carry its mip level.
     /// Ordinary 2D level-zero passes therefore retain their previous 0/1
-    /// value and the descriptor remains 88 bytes.
+    /// value and the descriptor keeps its size.
     pub pass_flags: u32, // in
 }
 
@@ -605,8 +615,28 @@ pub struct CreateDepthStencilStateParams {
     pub depth_test_enable: u32,                    // in: non-zero = enabled
     pub depth_write_enable: u32,                   // in: non-zero = enabled
     pub depth_compare_func: CompareFunc,           // in
+    pub stencil_test_enable: u32,                  // in: non-zero = enabled
+    pub front: StencilFaceParams,                  // in
+    pub back: StencilFaceParams,                   // in
+    pub stencil_read_mask: u32,                    // in
+    pub stencil_write_mask: u32,                   // in
     pub id: u64,                                   // in: caller-defined label tag
     pub state_handle: MetalHandle<MTLDepthStencilStateKind>, // out
+}
+
+/// One face of the stencil test, mirroring `MTLStencilDescriptor`.
+///
+/// Embedded twice in `CreateDepthStencilStateParams`. D3D9 addresses the back
+/// face through the separate `D3DRS_CCW_STENCIL*` states, which apply only
+/// while `D3DRS_TWOSIDEDSTENCILMODE` is set; the PE side resolves that and
+/// sends both faces populated either way.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilFaceParams {
+    pub compare_func: CompareFunc,
+    pub stencil_fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
 }
 
 impl Thunk for CreateDepthStencilStateParams {
@@ -878,8 +908,8 @@ mod tests {
         assert_eq!(core::mem::align_of::<CreateTexturesBatchParams>(), 8);
         assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
 
-        // PassDescriptor: 5 * u64 + 12 * u32 = 40 + 48 = 88, already 8-aligned.
-        assert_eq!(core::mem::size_of::<PassDescriptor>(), 88);
+        // PassDescriptor: 5 * u64 + 14 * u32 = 40 + 56 = 96, already 8-aligned.
+        assert_eq!(core::mem::size_of::<PassDescriptor>(), 96);
 
         // SubmitFrameParams:
         //   8 queue_handle
@@ -912,6 +942,6 @@ mod tests {
             PassDescriptor::pack_flags(true, 5, 9),
             1 | (5 << 1) | (9 << 4)
         );
-        assert_eq!(core::mem::size_of::<PassDescriptor>(), 88);
+        assert_eq!(core::mem::size_of::<PassDescriptor>(), 96);
     }
 }

@@ -4,7 +4,7 @@ use mtld3d_shared::{
     VertexAttrDesc,
     mtl::{
         AddressMode, BlendFactor, BlendOperation, ColorWriteMask, CompareFunc, CullMode,
-        MinMagFilter, MipFilter, PrimitiveType, VertexFormat,
+        MinMagFilter, MipFilter, PrimitiveType, StencilOp, VertexFormat,
     },
 };
 use mtld3d_types::{
@@ -26,7 +26,9 @@ use mtld3d_types::{
     D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3,
     D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1, D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB4,
     D3DFVF_XYZB5, D3DFVF_XYZRHW, D3DFVF_XYZW, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
-    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DSTENCILOP_DECR, D3DSTENCILOP_DECRSAT,
+    D3DSTENCILOP_INCR, D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT, D3DSTENCILOP_KEEP,
+    D3DSTENCILOP_REPLACE, D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP,
     D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC,
     D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9,
 };
@@ -107,6 +109,24 @@ pub fn d3d_to_metal_cmp(d3d_func: u32) -> CompareFunc {
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "d3d_to_metal_cmp: D3DCMP {other} unmapped → Always");
             CompareFunc::Always
+        }
+    }
+}
+
+/// D3DSTENCILOP_* → Metal stencil operation.
+pub fn d3d_to_metal_stencil_op(d3d_op: u32) -> StencilOp {
+    match d3d_op {
+        D3DSTENCILOP_KEEP => StencilOp::Keep,
+        D3DSTENCILOP_ZERO => StencilOp::Zero,
+        D3DSTENCILOP_REPLACE => StencilOp::Replace,
+        D3DSTENCILOP_INCRSAT => StencilOp::IncrementClamp,
+        D3DSTENCILOP_DECRSAT => StencilOp::DecrementClamp,
+        D3DSTENCILOP_INVERT => StencilOp::Invert,
+        D3DSTENCILOP_INCR => StencilOp::IncrementWrap,
+        D3DSTENCILOP_DECR => StencilOp::DecrementWrap,
+        other => {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "d3d_to_metal_stencil_op: D3DSTENCILOP {other} unmapped → Keep");
+            StencilOp::Keep
         }
     }
 }
