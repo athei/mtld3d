@@ -7,6 +7,7 @@ unix/shared/src/commands.rs BlitCommandType Clone,Copy,Debug,PartialEq,Eq,FromRe
 unix/shared/src/commands.rs Command Clone,Copy
 unix/shared/src/commands.rs CommandType Clone,Copy,Debug,PartialEq,Eq,FromRepr
 unix/shared/src/commands.rs CopyBufferToTextureInfo Clone,Copy
+unix/shared/src/commands.rs NullTextureKind Clone,Copy,Debug,PartialEq,Eq,FromRepr
 unix/shared/src/ffi_boundary.rs Point Copy,Clone,Debug,PartialEq,Eq
 unix/shared/src/lib.rs Thunks Clone,Copy,EnumCount,VariantArray
 unix/shared/src/mtl.rs AddressMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -44,6 +45,7 @@ unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
+unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScalerSlot Clone,Copy
@@ -158,6 +160,7 @@ windows/d3d9/src/encoder.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 windows/d3d9/src/encoder.rs FrameDataFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/encoder.rs FrameEncoderFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/encoder.rs MipStagingBuffer Clone,Default
+windows/d3d9/src/encoder.rs PsSamplerDecls Clone,Copy
 windows/d3d9/src/encoder.rs StageLibHandles Clone,Copy
 windows/d3d9/src/encoder.rs SubmitMode Clone,Copy,PartialEq,Eq
 windows/d3d9/src/encoder.rs TextureInfo Clone

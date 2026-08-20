@@ -78,6 +78,32 @@ pub enum CommandType {
     /// than the depth/stencil state object, so `D3DRS_STENCILREF` changes
     /// cost a command instead of a new `MTLDepthStencilState`.
     SetStencilReference = 19,
+    /// Bind the shared 1×1 opaque-black texture + a default sampler at an index.
+    ///
+    /// A pixel shader declares a sampler (`dcl_2d`/`dcl_cube`/`dcl_volume`),
+    /// so the fragment function carries the matching `[[texture(n)]]` /
+    /// `[[sampler(n)]]` argument, but the game bound no texture to that stage.
+    /// D3D9 requires such a sample to read opaque black `(0,0,0,1)`, and Metal
+    /// requires every declared argument to be bound. `param_a` is the index;
+    /// `param_b` is a [`NullTextureKind`], selecting the 2D / cube / 3D black
+    /// texture whose type matches the declaration.
+    SetFragmentNullTexture = 20,
+}
+
+/// Dimensionality of the opaque-black texture a null-texture bind selects.
+///
+/// The value matches the shader's declared sampler type
+/// ([`CommandType::SetFragmentNullTexture`]) so the bound texture satisfies the
+/// `[[texture(n)]]` argument's type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
+#[repr(u32)]
+pub enum NullTextureKind {
+    /// `texture2d<float>` — a `dcl_2d` sampler.
+    Texture2D = 0,
+    /// `texturecube<float>` — a `dcl_cube` sampler.
+    TextureCube = 1,
+    /// `texture3d<float>` — a `dcl_volume` sampler.
+    Texture3D = 2,
 }
 
 /// Fixed-size command struct written by the API thread and read by the encoding thread.
@@ -207,6 +233,18 @@ impl Command {
             cmd: CommandType::SetFragmentSamplerState as u32,
             param_a: index,
             param_b: sampler_handle,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// Bind the shared opaque-black texture of `kind` and a default sampler at `index`.
+    #[must_use]
+    pub const fn set_fragment_null_texture(kind: NullTextureKind, index: u32) -> Self {
+        Self {
+            cmd: CommandType::SetFragmentNullTexture as u32,
+            param_a: index,
+            param_b: kind as u64,
             param_c: 0,
             param_d: 0,
         }

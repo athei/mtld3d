@@ -5,9 +5,9 @@ use mtld3d_types::{
     D3DPS20_MAX_STATICFLOWCONTROLDEPTH, D3DPS30_INSTRUCTIONSLOTS_MAX, D3DVBF_3WEIGHTS,
     D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH, D3DVS20_MAX_NUMTEMPS, D3DVS20_MAX_STATICFLOWCONTROLDEPTH,
     D3DVS30_INSTRUCTIONSLOTS_MAX, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps, LineCaps,
-    MAX_POINT_SIZE, MAX_STREAMS, MAX_VERTEX_SHADER_CONST, PrimitiveMiscCaps, Ps20Caps, RasterCaps,
-    ShadeCaps, StencilCaps, TexOpCaps, TextureCaps, Vs20Caps, VtxpCaps, d3dps_version,
-    d3dvs_version,
+    MAX_POINT_SIZE, MAX_STREAMS, MAX_VERTEX_SHADER_CONST, MAX_VOLUME_EXTENT, PrimitiveMiscCaps,
+    Ps20Caps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps, Vs20Caps, VtxpCaps,
+    d3dps_version, d3dvs_version,
 };
 
 use crate::ff_state::MAX_ACTIVE_LIGHTS;
@@ -188,7 +188,9 @@ const TEXTURE_DEFAULT: TextureCaps = TextureCaps::PERSPECTIVE
     .union(TextureCaps::PROJECTED)
     .union(TextureCaps::MIPMAP)
     .union(TextureCaps::CUBEMAP)
-    .union(TextureCaps::MIPCUBEMAP);
+    .union(TextureCaps::MIPCUBEMAP)
+    .union(TextureCaps::VOLUMEMAP)
+    .union(TextureCaps::MIPVOLUMEMAP);
 
 /// Filters `StretchRect` accepts: point and linear, which is also all it validates.
 ///
@@ -383,6 +385,7 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.max_simultaneous_textures = FF_TEXTURE_STAGES;
     caps.max_texture_width = MAX_TEXTURE_DIM;
     caps.max_texture_height = MAX_TEXTURE_DIM;
+    caps.max_volume_extent = MAX_VOLUME_EXTENT;
     caps.max_texture_repeat = MAX_TEXTURE_REPEAT;
     caps.max_texture_aspect_ratio = MAX_TEXTURE_DIM;
     caps.max_anisotropy = MAX_ANISOTROPY;
@@ -560,7 +563,9 @@ mod tests {
             | TextureCaps::PROJECTED
             | TextureCaps::MIPMAP
             | TextureCaps::CUBEMAP
-            | TextureCaps::MIPCUBEMAP;
+            | TextureCaps::MIPCUBEMAP
+            | TextureCaps::VOLUMEMAP
+            | TextureCaps::MIPVOLUMEMAP;
         assert_eq!(filled().texture_caps, expected.bits());
     }
 
@@ -819,6 +824,9 @@ mod tests {
         assert_eq!(caps.cube_texture_filter_caps, caps.texture_filter_caps);
         assert_eq!(caps.volume_texture_filter_caps, caps.texture_filter_caps);
         assert_eq!(caps.volume_texture_address_caps, caps.texture_address_caps);
+        assert_ne!(caps.texture_caps & TextureCaps::VOLUMEMAP.bits(), 0);
+        assert_ne!(caps.texture_caps & TextureCaps::MIPVOLUMEMAP.bits(), 0);
+        assert_eq!(caps.max_volume_extent, mtld3d_types::MAX_VOLUME_EXTENT);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use mtld3d_core::{
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
     dxso::{FfPsKey, FfVsKey, VariantKey},
     ids::{BufferId, ProgramId},
+    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
     pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
@@ -1595,15 +1596,17 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // with a plain `.sample()`, which requires a NON-comparison sampler — so
     // exclude them from the compare-sampler set.
     let fetch_mask = variant.depth_fetch_mask;
+    let mut bound_mask: u16 = 0;
     for (stage_u32, b) in stage_bindings.iter() {
         let handle = stage_texture_handles[stage_u32 as usize];
         if handle == 0 {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "draw: stage bound but texture handle is 0 — bind skipped, fragment shader will sample slot 0"
+                "draw: stage bound but texture handle is 0 — bind skipped, an unbound declared sampler reads opaque black"
             );
             continue;
         }
         let bit = 1u16 << stage_u32;
+        bound_mask |= bit;
         let is_compare = (depth_mask & bit) != 0 && (fetch_mask & bit) == 0;
         let sampler = enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare);
         if enc.last_bound().fragment_texture_changed(stage_u32, handle) {
@@ -1614,6 +1617,33 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             .fragment_sampler_changed(stage_u32, sampler)
         {
             enc.emit_command(Command::set_fragment_sampler_state(sampler, stage_u32));
+        }
+    }
+
+    // A pixel shader may declare a sampler the game bound no texture to. D3D9
+    // requires that sample to read opaque black, and Metal requires every
+    // declared `[[texture(n)]]` argument to be bound, so bind the shared 1×1
+    // black texture (of the declared type) plus a default sampler to each such
+    // slot. Only the programmable path can declare-without-binding; the FF PS
+    // only declares samplers for stages it actually samples a bound texture on.
+    if let PsSource::Programmable { ps_id, .. } = ps {
+        let decls = enc.ps_declared_samplers(*ps_id);
+        let mut unbound = decls.unbound(bound_mask);
+        while unbound != 0 {
+            let stage = unbound.trailing_zeros();
+            unbound &= unbound - 1;
+            let kind = decls.kind(stage);
+            let tex_sentinel = null_texture_tex_sentinel(kind as u64);
+            if enc
+                .last_bound()
+                .fragment_texture_changed(stage, tex_sentinel)
+            {
+                enc.emit_command(Command::set_fragment_null_texture(kind, stage));
+            }
+            // The null command also binds a default sampler; record a sentinel
+            // so a later real sampler bind to this slot is not deduped away.
+            enc.last_bound()
+                .fragment_sampler_changed(stage, NULL_TEXTURE_SAMPLER_SENTINEL);
         }
     }
     drop(t_samplers);

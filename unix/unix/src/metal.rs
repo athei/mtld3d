@@ -6,6 +6,7 @@ mod command;
 mod device;
 pub mod handle;
 mod macdrv;
+mod null_texture;
 mod pipeline;
 mod present;
 mod sampler;

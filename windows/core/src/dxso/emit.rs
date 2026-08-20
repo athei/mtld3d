@@ -599,6 +599,37 @@ fn vs_writes_fog(vs: &DxsoProgram, output_map: Option<&BTreeMap<(RegKind, u16), 
 
 // ── PS function ──
 
+/// Declared PS sampler slots and their texture dimensionality.
+///
+/// The single source of truth for which `[[texture(n)]]`/`[[sampler(n)]]`
+/// arguments the fragment function carries and their type: the emitter builds
+/// the signature from this, and the encoder binds an opaque-black fallback to
+/// any declared slot the game left unbound. SM2/SM3 read the explicit
+/// `dcl_<dim> sN`; SM1 has no sampler dcl, so a 2D sampler is synthesized for
+/// every stage a sampling op targets (dimensionality is not encoded in SM1
+/// bytecode, and 2D matches every conformance case).
+#[must_use]
+pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
+    let mut samplers: BTreeMap<u16, TextureType> = BTreeMap::new();
+    for decl in &ps.declarations {
+        if let Declaration::Sampler { texture_type, reg } = decl {
+            samplers.insert(reg.index, *texture_type);
+        }
+    }
+    if ps.major == 1 {
+        for inst in &ps.instructions {
+            if sm1_op_samples(inst.opcode)
+                && let Some(d) = inst.dst.as_ref()
+            {
+                samplers
+                    .entry(d.reg.index)
+                    .or_insert(TextureType::Texture2D);
+            }
+        }
+    }
+    samplers
+}
+
 fn emit_ps_function(
     out: &mut String,
     ps: &DxsoProgram,
@@ -615,68 +646,49 @@ fn emit_ps_function(
     // declared `usage_index`, not `reg.index`. Walk the dcls and pick
     // color/texcoord based on the declared usage when major == 3.
     let mut ps_input_map: BTreeMap<u16, String> = BTreeMap::new();
-    let mut samplers: BTreeMap<u16, TextureType> = BTreeMap::new();
     for decl in &ps.declarations {
-        match decl {
-            Declaration::Semantic {
-                reg,
-                usage,
-                usage_index,
-            } => {
-                if reg.kind == RegKind::Input {
-                    let mapped = if ps.major == 3 {
-                        match usage {
-                            DeclUsage::Color => format!("color{usage_index}"),
-                            DeclUsage::Texcoord => format!("texcoord{usage_index}"),
-                            // Fog gets its own varying that mirrors VS3
-                            // `dcl_fog oN` writes; the FF PS expects the
-                            // same `in.fog.x` channel so links stay clean.
-                            DeclUsage::Fog => "fog".to_string(),
-                            // PS3 `dcl_position0 vN` is the varying-syntax form
-                            // of vPos — clip-space position from VS post-
-                            // rasterizer becomes screen-space pixel coords on
-                            // read via the [[position]] field. POSITION1+ read
-                            // the matching interpolated user varying instead.
-                            DeclUsage::Position if *usage_index == 0 => "position".to_string(),
-                            DeclUsage::Position => format!("position{usage_index}"),
-                            other => {
-                                mtld3d_shared::log_once_warn_by!(
-                                    target: super::LOG_TARGET,
-                                    key: u64::from(*usage_index),
-                                    "dxso: PS3 input usage {other:?}{usage_index} unmapped → reads return color{usage_index}"
-                                );
-                                format!("color{usage_index}")
-                            }
-                        }
-                    } else {
-                        format!("color{}", reg.index)
-                    };
-                    ps_input_map.insert(reg.index, mapped);
+        if let Declaration::Semantic {
+            reg,
+            usage,
+            usage_index,
+        } = decl
+            && reg.kind == RegKind::Input
+        {
+            let mapped = if ps.major == 3 {
+                match usage {
+                    DeclUsage::Color => format!("color{usage_index}"),
+                    DeclUsage::Texcoord => format!("texcoord{usage_index}"),
+                    // Fog gets its own varying that mirrors VS3
+                    // `dcl_fog oN` writes; the FF PS expects the
+                    // same `in.fog.x` channel so links stay clean.
+                    DeclUsage::Fog => "fog".to_string(),
+                    // PS3 `dcl_position0 vN` is the varying-syntax form
+                    // of vPos — clip-space position from VS post-
+                    // rasterizer becomes screen-space pixel coords on
+                    // read via the [[position]] field. POSITION1+ read
+                    // the matching interpolated user varying instead.
+                    DeclUsage::Position if *usage_index == 0 => "position".to_string(),
+                    DeclUsage::Position => format!("position{usage_index}"),
+                    other => {
+                        mtld3d_shared::log_once_warn_by!(
+                            target: super::LOG_TARGET,
+                            key: u64::from(*usage_index),
+                            "dxso: PS3 input usage {other:?}{usage_index} unmapped → reads return color{usage_index}"
+                        );
+                        format!("color{usage_index}")
+                    }
                 }
-            }
-            Declaration::Sampler { texture_type, reg } => {
-                samplers.insert(reg.index, *texture_type);
-            }
+            } else {
+                format!("color{}", reg.index)
+            };
+            ps_input_map.insert(reg.index, mapped);
         }
     }
 
-    // SM1 has no `dcl_<dim> sN`: the sampler bound to a stage is implicit
-    // (stage N → sampler N). Synthesize a 2D sampler entry for every stage a
-    // sampling op references (the dst register number) so the texture/sampler
-    // function params + coord swizzle get emitted. Dimensionality isn't
-    // encoded in SM1 bytecode; 2D matches every conformance case (cube
-    // environment mapping via texm3x3spec/vspec is best-effort).
-    if ps.major == 1 {
-        for inst in &ps.instructions {
-            if sm1_op_samples(inst.opcode)
-                && let Some(d) = inst.dst.as_ref()
-            {
-                samplers
-                    .entry(d.reg.index)
-                    .or_insert(TextureType::Texture2D);
-            }
-        }
-    }
+    // The declared sampler set drives the fragment-function signature.
+    // Shared with the encoder's unbound-slot fallback so the MSL and the
+    // bind side cannot disagree on which slots exist or their type.
+    let samplers = declared_ps_samplers(ps);
 
     // SM3 PS dedicated registers: `MiscType` reg 0 = vPos (screen-space
     // pixel coord), reg 1 = vFace (front-facing flag). Identified by
