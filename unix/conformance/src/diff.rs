@@ -1,9 +1,15 @@
 //! Diff a fresh run against the baseline and render a human report.
 //!
-//! Gate contract (preserved from the shell runner): the process exits non-zero
-//! only on a *regression* — a site's count went up, a new failing site
-//! appeared, or a subtest started crashing. Improvements and persisted
-//! untriaged sites are reported but do not fail the gate.
+//! Gate contract: the process exits non-zero on a *regression* — a site's
+//! count went up, a new failing site appeared, or a subtest started
+//! crashing — and equally on a *stale baseline* — a site's count went down
+//! or a crash disappeared without the baseline being re-recorded. Gating
+//! improvements keeps baseline.txt in lockstep with reality; a tolerated
+//! improvement would silently widen the budget a later regression can hide
+//! in. The two tolerance classes are `flaky` (count not load-bearing, either
+//! direction) and `ceiling` (the pin is a cross-environment maximum; only
+//! upward movement gates). Persisted untriaged sites are reported but do not
+//! fail the gate (the triage sync test owns that).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,9 +22,15 @@ use crate::{
     triage::DocSite,
 };
 
-/// The diff outcome: whether any regression was found, plus the rendered report.
+/// The diff outcome: whether the gate fails, and why, plus the rendered report.
 pub struct Report {
+    /// A site's count went up, a new site appeared, or a subtest crashed.
     pub regressed: bool,
+    /// The baseline overstates reality: a count went down or a crash cleared.
+    ///
+    /// Fails the gate like a regression, but the fix is `make
+    /// conformance-baseline`, not a code hunt.
+    pub stale: bool,
     pub text: String,
 }
 
@@ -35,6 +47,7 @@ pub fn diff(
 ) -> Report {
     let mut text = String::new();
     let mut regressed = false;
+    let mut stale = false;
     for arch in Arch::ALL {
         for subtest in Subtest::ALL {
             let key = (arch, subtest);
@@ -48,7 +61,7 @@ pub fn diff(
 
             let mut details: Vec<String> = Vec::new();
             let mut sub_regressed = false;
-            let mut sub_improved = false;
+            let mut sub_stale = false;
 
             let mut locs: BTreeSet<&Site> = BTreeSet::new();
             if let Some(b) = base {
@@ -62,11 +75,14 @@ pub fn diff(
                 // A site a human pinned `flaky` fails non-deterministically on the
                 // identical binary; its count is not load-bearing, so a delta in
                 // *either* direction is a tolerated flutter, not a verdict — it
-                // sets neither `sub_regressed` nor `sub_improved`. The pin only
-                // applies to sites already in the baseline: a brand-new site
-                // regresses even if prose for it already exists.
+                // sets neither `sub_regressed` nor `sub_stale`. A `ceiling` pin
+                // is a cross-environment maximum: below it is tolerated, above
+                // it regresses. Both pins only apply to sites already in the
+                // baseline: a brand-new site regresses even if prose for it
+                // already exists.
                 let class = classes.get(site).map(|doc| doc.class);
                 let flaky = in_baseline && class == Some(Classification::Flaky);
+                let ceiling = in_baseline && class == Some(Classification::Ceiling);
                 if cc > bc {
                     if flaky {
                         details.push(format!(
@@ -86,12 +102,16 @@ pub fn diff(
                         details.push(format!(
                             "  {site}  {bc} -> {cc}  flaky (count down, tolerated)"
                         ));
+                    } else if ceiling {
+                        details.push(format!(
+                            "  {site}  {bc} -> {cc}  ceiling (below the pin, tolerated)"
+                        ));
                     } else {
-                        sub_improved = true;
+                        sub_stale = true;
                         let label = if cc == 0 {
-                            "improvement (site gone)"
+                            "STALE BASELINE (site gone)"
                         } else {
-                            "improvement (count down)"
+                            "STALE BASELINE (count down)"
                         };
                         details.push(format!("  {site}  {bc} -> {cc}  {label}"));
                     }
@@ -106,8 +126,8 @@ pub fn diff(
                 sub_regressed = true;
                 details.push("  crash  0 -> 1  REGRESSION (new crash)".to_owned());
             } else if !cur.crash && base_crash {
-                sub_improved = true;
-                details.push("  crash  1 -> 0  improvement (crash gone)".to_owned());
+                sub_stale = true;
+                details.push("  crash  1 -> 0  STALE BASELINE (crash gone)".to_owned());
             }
 
             if cur.crash && cur_failed != base_failed {
@@ -125,12 +145,13 @@ pub fn diff(
 
             let status = if sub_regressed {
                 "REGRESSION"
-            } else if sub_improved {
-                "improved"
+            } else if sub_stale {
+                "STALE BASELINE"
             } else {
                 "ok"
             };
             regressed |= sub_regressed;
+            stale |= sub_stale;
             let _ = writeln!(
                 text,
                 "{arch}/{subtest}  baseline(failed={base_failed} crash={}) current(failed={cur_failed} crash={}) {status}",
@@ -143,7 +164,11 @@ pub fn diff(
             }
         }
     }
-    Report { regressed, text }
+    Report {
+        regressed,
+        stale,
+        text,
+    }
 }
 
 fn total_failed(sub: &SubtestBaseline) -> u32 {
@@ -261,13 +286,68 @@ mod tests {
     }
 
     #[test]
-    fn count_down_and_crash_gone_are_improvements_not_regressions() {
+    fn count_down_and_crash_gone_gate_as_stale_baseline() {
+        // An improvement the baseline doesn't record is a stale baseline —
+        // tolerating it would widen the budget a later regression hides in.
         let base = baseline_with(&[(1, 5)], true);
         let classes = classes_with(&[(1, Classification::Real)]);
         let cur = current_with(&[(1, 3)], false);
         let report = diff(&base, &classes, &cur);
-        assert!(!report.regressed);
-        assert!(report.text.contains("improved"), "{}", report.text);
+        assert!(
+            !report.regressed,
+            "stale is not a regression: {}",
+            report.text
+        );
+        assert!(report.stale, "count down must gate: {}", report.text);
+        assert!(report.text.contains("STALE BASELINE"), "{}", report.text);
+    }
+
+    #[test]
+    fn ceiling_site_below_the_pin_is_tolerated() {
+        // A ceiling pin is a cross-environment maximum: an environment where
+        // the site reads lower (or zero) must neither gate nor demand a
+        // re-record.
+        let base = baseline_with(&[(2234, 1)], false);
+        let classes = classes_with(&[(2234, Classification::Ceiling)]);
+        let cur = current_with(&[(2234, 0)], false);
+        let report = diff(&base, &classes, &cur);
+        assert!(!report.regressed, "{}", report.text);
+        assert!(
+            !report.stale,
+            "below a ceiling pin is not stale: {}",
+            report.text
+        );
+        assert!(
+            report.text.contains("ceiling (below the pin"),
+            "{}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn ceiling_site_above_the_pin_is_a_regression() {
+        let base = baseline_with(&[(2234, 1)], false);
+        let classes = classes_with(&[(2234, Classification::Ceiling)]);
+        let cur = current_with(&[(2234, 2)], false);
+        let report = diff(&base, &classes, &cur);
+        assert!(
+            report.regressed,
+            "above a ceiling pin gates: {}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn new_site_still_regresses_even_with_a_ceiling_class_entry() {
+        // Like flaky, the ceiling pin applies only to sites already in the
+        // baseline.
+        let base = baseline_with(&[(2234, 1)], false);
+        let classes = classes_with(&[
+            (2234, Classification::Ceiling),
+            (9999, Classification::Ceiling),
+        ]);
+        let cur = current_with(&[(2234, 1), (9999, 1)], false);
+        assert!(diff(&base, &classes, &cur).regressed);
     }
 
     #[test]

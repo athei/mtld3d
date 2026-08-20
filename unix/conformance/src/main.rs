@@ -132,6 +132,11 @@ fn real_main() -> Result<ExitCode, String> {
     if report.regressed {
         println!("conformance: REGRESSIONS detected");
         Ok(ExitCode::from(1))
+    } else if report.stale {
+        println!(
+            "conformance: STALE BASELINE - some sites read below their pins; run `make conformance-baseline` and re-triage"
+        );
+        Ok(ExitCode::from(1))
     } else {
         println!("conformance: no regressions vs baseline");
         Ok(ExitCode::SUCCESS)
