@@ -1959,9 +1959,9 @@ impl FrameEncoder {
         // re-emits its pipeline + bindings: the fresh encoder starts with none,
         // and `emit_draw`'s own reset would no-op here since this call already
         // opened the pass (a draw with no pipeline bound faults in Metal).
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.emit_command(cmd);
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
     }
 
     /// Close a visibility query.
@@ -2000,9 +2000,9 @@ impl FrameEncoder {
         // Symmetric with `begin_visibility_query`: if this mode-set opens a
         // fresh pass, reset `last_bound` so any later draw in the frame re-emits
         // its bindings across the encoder boundary.
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.emit_command(cmd);
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
         self.visibility.push_pending(submit_seq, core);
     }
 
@@ -2201,7 +2201,7 @@ impl FrameEncoder {
     }
 
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_color(r, g, b, a) {
             ColorClearOutcome::Folded => {}
             ColorClearOutcome::EmitQuad {
@@ -2209,7 +2209,7 @@ impl FrameEncoder {
                 viewport,
                 color_format,
             } => {
-                self.reset_last_bound_on_fresh_pass(was_closed);
+                self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_color_inner(rgba, viewport, color_format);
             }
         }
@@ -2292,25 +2292,25 @@ impl FrameEncoder {
         if regions.is_empty() {
             return;
         }
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         let color_format = self.pass_state.begin_region_color_clear();
-        self.reset_last_bound_on_fresh_pass(was_closed);
+        self.reset_last_bound_if_pass_opened(passes_before);
         for region in regions {
             self.emit_clear_quad_color_inner((r, g, b, a), region, color_format);
         }
     }
 
     pub fn clear_depth(&mut self, value: u32) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_depth(value) {
-            DepthClearOutcome::Folded => {}
+            DepthClearOutcome::Folded | DepthClearOutcome::NoOp => {}
             DepthClearOutcome::EmitQuad {
                 value,
                 viewport,
                 has_color,
                 color_format,
             } => {
-                self.reset_last_bound_on_fresh_pass(was_closed);
+                self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_depth_stencil_inner(
                     Some(value),
                     None,
@@ -2323,7 +2323,7 @@ impl FrameEncoder {
     }
 
     pub fn clear_stencil(&mut self, value: u32) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_stencil(value) {
             StencilClearOutcome::Folded | StencilClearOutcome::NoOp => {}
             StencilClearOutcome::EmitQuad {
@@ -2332,7 +2332,7 @@ impl FrameEncoder {
                 has_color,
                 color_format,
             } => {
-                self.reset_last_bound_on_fresh_pass(was_closed);
+                self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_depth_stencil_inner(
                     None,
                     Some(value),
@@ -2350,20 +2350,17 @@ impl FrameEncoder {
     /// the state the other reads, except through a single `ensure_pass_open`,
     /// after which the stencil chain takes the branch that sees that same
     /// open pass. So the two answers pair up: both fold, or both paint the
-    /// same rect, and one draw writes both planes. The one odd pairing is a
-    /// depth quad beside a stencil `NoOp`, which paints depth alone.
+    /// same rect, or both find nothing to clear; one draw writes both planes.
     /// Shadow-volume renderers clear both planes between lights, so the
     /// two-quad shape would double the clear draws on exactly that workload.
-    ///
-    /// A fresh pass is detected by the pass count rather than by whether the
-    /// pass was closed beforehand: under a counting visibility query the
-    /// depth chain ends the open pass and opens a new one within one call.
+    /// The single-plane fallback below only guards the pairing; it is not
+    /// expected to run.
     pub fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
         let passes_before = self.pass_state.passes().len();
         let depth_outcome = self.pass_state.clear_depth(depth);
         let stencil_outcome = self.pass_state.clear_stencil(stencil);
         let depth_quad = match depth_outcome {
-            DepthClearOutcome::Folded => None,
+            DepthClearOutcome::Folded | DepthClearOutcome::NoOp => None,
             DepthClearOutcome::EmitQuad {
                 value,
                 viewport,
@@ -2405,11 +2402,7 @@ impl FrameEncoder {
         if depth_quad.is_none() && stencil_quad.is_none() {
             return;
         }
-        if self.pass_state.passes().len() != passes_before {
-            self.last_bound.reset();
-            #[cfg(debug_assertions)]
-            self.pass_state.debug_reset_emitted();
-        }
+        self.reset_last_bound_if_pass_opened(passes_before);
         match (depth_quad, stencil_quad) {
             (Some((depth, at)), Some((stencil, stencil_at))) if at.same_as(&stencil_at) => {
                 self.emit_clear_quad_depth_stencil_inner(
@@ -2443,27 +2436,37 @@ impl FrameEncoder {
         }
     }
 
-    /// Flush `last_bound` when a cross-pass clear-quad opened a fresh Metal encoder.
+    /// Flush `last_bound` when a `PassState` call opened a fresh Metal encoder.
     ///
-    /// `PassState::clear_{color,depth}` opens the new pass itself
-    /// (`ensure_pass_open`, with `loadAction = Load` to preserve prior
-    /// tiles), but it can't reach the `FrameEncoder`-owned `last_bound`,
-    /// so unlike `begin_render_pass_if_needed` the per-draw dedup would
-    /// carry stale bindings across the encoder boundary. The new encoder
-    /// starts with no bindings, so the next draw must re-emit everything
-    /// — including the FF VS constants at buffer 15, whose content-based
-    /// dedup otherwise suppresses the re-bind when the constants are
-    /// unchanged from the prior pass (e.g. a sample pass after
-    /// `SetDepthStencilSurface(NULL)` with the same viewport).
-    fn reset_last_bound_on_fresh_pass(&mut self, was_closed: bool) {
-        if was_closed {
-            self.last_bound.reset();
-            // Keep the debug-build emitted-command shadow in lockstep with the
-            // cache so the in-sync assertion shares the same fresh-encoder
-            // baseline (no bindings yet).
-            #[cfg(debug_assertions)]
-            self.pass_state.debug_reset_emitted();
+    /// `PassState::clear_{color,depth,stencil}` and the visibility mode-sets
+    /// open the new pass themselves (`ensure_pass_open`, with `loadAction =
+    /// Load` to preserve prior tiles), but they can't reach the
+    /// `FrameEncoder`-owned `last_bound`, so unlike
+    /// `begin_render_pass_if_needed` the per-draw dedup would carry stale
+    /// bindings across the encoder boundary. The new encoder starts with no
+    /// bindings, so the next draw must re-emit everything, including the FF
+    /// VS constants at buffer 15, whose content-based dedup otherwise
+    /// suppresses the re-bind when the constants are unchanged from the
+    /// prior pass (e.g. a sample pass after `SetDepthStencilSurface(NULL)`
+    /// with the same viewport).
+    ///
+    /// A fresh pass is detected by the pass count growing, not by whether
+    /// the pass was closed beforehand: a clear under a counting visibility
+    /// query ends the open pass and opens a new one within one call.
+    fn reset_last_bound_if_pass_opened(&mut self, passes_before: usize) {
+        if self.pass_state.passes().len() != passes_before {
+            self.reset_last_bound_for_fresh_encoder();
         }
+    }
+
+    /// Flush `last_bound` for an encoder known to have just opened.
+    fn reset_last_bound_for_fresh_encoder(&mut self) {
+        self.last_bound.reset();
+        // Keep the debug-build emitted-command shadow in lockstep with the
+        // cache so the in-sync assertion shares the same fresh-encoder
+        // baseline (no bindings yet).
+        #[cfg(debug_assertions)]
+        self.pass_state.debug_reset_emitted();
     }
 
     /// Debug-build invariant on the per-draw dedup cache (`last_bound`).
@@ -2715,7 +2718,7 @@ impl FrameEncoder {
         // A fresh Metal encoder always opens here (the colour RT changed, which
         // ends any prior pass), so flush the per-draw dedup so every binding
         // below is actually emitted (the clear-quad cross-pass rule).
-        self.reset_last_bound_on_fresh_pass(true);
+        self.reset_last_bound_for_fresh_encoder();
 
         let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
         if self.last_bound.pipeline_changed(pipeline) {
@@ -3150,15 +3153,9 @@ impl FrameEncoder {
     /// `last_bound` so the per-draw dedup in `emit_draw` re-emits the full
     /// state on the first draw of the new Metal render encoder.
     pub fn begin_render_pass_if_needed(&mut self) {
-        let was_closed = self.pass_state.current_pass_closed();
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.ensure_pass_open();
-        if was_closed {
-            self.last_bound.reset();
-            // Reset the debug-build emitted-command shadow in lockstep so the
-            // in-sync assertion shares the same fresh-encoder baseline.
-            #[cfg(debug_assertions)]
-            self.pass_state.debug_reset_emitted();
-        }
+        self.reset_last_bound_if_pass_opened(passes_before);
     }
 
     /// Record that the draw being emitted read `[offset, offset + size)` from VB/IB `id`.

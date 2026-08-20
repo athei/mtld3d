@@ -240,10 +240,13 @@ pub enum StoreAction {
 /// cache — emits a fullscreen-triangle draw inside the current
 /// encoder, scissored to the D3D9 viewport, that writes the constant
 /// clear value as depth (and color when `has_color`). The pass
-/// stays open.
+/// stays open. `NoOp` means there was nothing to clear: no depth-stencil
+/// texture is attached, or the viewport has no area, and D3D9 clears nothing
+/// in either case. The pass state is left untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthClearOutcome {
     Folded,
+    NoOp,
     EmitQuad {
         value: u32,
         viewport: (u32, u32, u32, u32),
@@ -1846,6 +1849,11 @@ impl PassState {
     /// 4. No open pass → stash as `pending_depth_clear`.
     pub fn clear_depth(&mut self, value: u32) -> DepthClearOutcome {
         let depth_texture = self.current_depth_texture;
+        if depth_texture.is_null() {
+            // Nothing is attached to clear. Folding would carry the clear
+            // onto whatever texture the next pass attaches.
+            return DepthClearOutcome::NoOp;
+        }
         if self.current_pass_has_work()
             && let Some(outcome) = self.clear_depth_in_active_pass(value, depth_texture)
         {
@@ -1864,7 +1872,9 @@ impl PassState {
     ///
     /// Returns `Some(EmitQuad)` on the normal path or `None` if a
     /// visibility-counting query forced the legacy pass-break fallback
-    /// (caller falls through to the cross-pass / amend chain).
+    /// (caller falls through to the cross-pass / amend chain). A zero-area
+    /// viewport is an explicit `NoOp`: D3D9 clears nothing, and a zero-size
+    /// quad would only cost the state switches around it.
     ///
     /// Falling through to `end_current_pass` here would open a new
     /// encoder with `loadAction = Clear`, which on Metal clears the
@@ -1892,6 +1902,9 @@ impl PassState {
             return None;
         }
         let vp = self.effective_viewport();
+        if vp.2 == 0 || vp.3 == 0 {
+            return Some(DepthClearOutcome::NoOp);
+        }
         mtld3d_shared::log_once_trace_by!(
             target: DEPTH_TRACE_TARGET,
             key: depth_texture.raw().rotate_left(13) ^ pack_viewport_key(vp),
@@ -2038,14 +2051,18 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<DepthClearOutcome> {
-        if depth_texture.is_null()
-            || !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
             return None;
         }
         let vp = self.effective_viewport();
+        if vp.2 == 0 || vp.3 == 0 {
+            // The game's viewport rounds to nothing at render resolution.
+            // Opening a pass for a zero-size quad would only cost an encoder.
+            return Some(DepthClearOutcome::NoOp);
+        }
         self.ensure_pass_open();
         if let Some(pass) = self.passes.last_mut()
             && matches!(pass.depth_load, DepthLoad::Clear { .. })
@@ -2069,13 +2086,15 @@ impl PassState {
     /// Amend branch.
     ///
     /// If a pass is open with no draws yet, set its depth load action to
-    /// `Clear` and clear any pending fallback.
+    /// `Clear` and clear any pending fallback. A pass that already holds
+    /// draws is never amended: its load action runs before those draws, so
+    /// the clear would land ahead of them.
     fn clear_depth_amend_open(
         &mut self,
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<DepthClearOutcome> {
-        if self.current_pass_closed {
+        if self.current_pass_closed || self.current_pass_has_work() {
             return None;
         }
         let pass = self.passes.last_mut()?;
@@ -5086,6 +5105,47 @@ mod tests {
     }
 
     #[test]
+    fn a_depth_clear_under_a_zero_area_viewport_is_a_no_op() {
+        // Depth twin of the stencil case: a viewport that rounds to nothing
+        // at render resolution used to paint a zero-size quad, paying the
+        // pipeline and state switches around it for no pixels.
+        let mut s = fresh_scaled();
+        s.emit_command(dummy_draw());
+        let before = s.passes()[0].depth_load();
+        s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (1, 1, 0, 0));
+
+        assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
+        assert_eq!(s.passes().len(), 1);
+        assert!(!s.current_pass_closed(), "the live pass stays open");
+        assert_eq!(s.passes()[0].depth_load(), before);
+        assert!(s.pending_depth_clear.is_none());
+    }
+
+    #[test]
+    fn a_depth_clear_under_a_zero_area_viewport_opens_no_pass() {
+        let mut s = fresh_scaled();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+
+        assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
+        assert_eq!(s.passes().len(), 1);
+        assert!(s.current_pass_closed());
+        assert!(s.pending_depth_clear.is_none());
+    }
+
+    #[test]
+    fn a_depth_clear_with_no_depth_attachment_is_a_no_op() {
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+
+        assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
+        assert!(s.pending_depth_clear.is_none());
+        assert!(s.passes().is_empty());
+    }
+
+    #[test]
     fn a_stencil_clear_with_no_depth_attachment_is_a_no_op() {
         // Nothing is attached, so there is nothing to fold or paint; stashing
         // would clear whatever texture the next pass happens to attach.
@@ -5743,7 +5803,7 @@ mod tests {
                     assert_eq!(viewport, (x, y, 683, 683));
                     quad_outcomes += 1;
                 }
-                DepthClearOutcome::Folded => {
+                DepthClearOutcome::Folded | DepthClearOutcome::NoOp => {
                     panic!("tile {tile} clear should have returned EmitQuad");
                 }
             }
