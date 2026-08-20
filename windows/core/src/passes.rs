@@ -3303,7 +3303,12 @@ impl PassState {
     ///   in forward order). For pass `i`, if `next_color_use[i.color]`
     ///   resolves and that next pass's `color_load` is `Clear`, flip
     ///   `i.color_store`. Then update the map with `i`.
-    pub fn finalize_store_actions(&mut self) {
+    ///
+    /// `preserve_color_stores` marks a mid-frame flush (a readback, not `Present`): the frame
+    /// continues afterwards and any colour target may still be read back or drawn into, so
+    /// Rule D does not run; the next-clear rule still does, since that proof does not depend
+    /// on the frame ending.
+    pub fn finalize_store_actions(&mut self, preserve_color_stores: bool) {
         if ENABLE_LAST_USE_DEPTH_DONTCARE {
             let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
                 FxHashSet::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
@@ -3371,7 +3376,7 @@ impl PassState {
                 }
             }
         }
-        if ENABLE_LAST_USE_COLOR_DONTCARE {
+        if ENABLE_LAST_USE_COLOR_DONTCARE && !preserve_color_stores {
             let mut handled: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
                 FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
             let backbuffer = self.backbuffer_texture;
@@ -5125,7 +5130,7 @@ mod tests {
         let mut s = fresh();
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].depth_store(), StoreAction::DontCare);
         // Color store is left as Store — the HDR present pass or next
@@ -5144,7 +5149,7 @@ mod tests {
         s.set_color_render_target(rt_b, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 3);
         // All three share depth(); only the last pass's depth_store is DontCare.
         assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
@@ -5172,7 +5177,7 @@ mod tests {
         s.set_depth_stencil_attachment(d2, false, false);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 4);
         assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
         assert_eq!(s.passes()[1].depth_store(), StoreAction::Store);
@@ -5189,7 +5194,7 @@ mod tests {
         let mut s = fresh();
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
     }
@@ -5215,7 +5220,7 @@ mod tests {
         );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
         assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
         assert_eq!(s.passes()[2].color_store(), StoreAction::Store);
@@ -5245,7 +5250,7 @@ mod tests {
         s.clear_color(5, 6, 7, 8);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 3);
         assert_eq!(s.passes()[0].color_texture(), backbuffer());
         assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
@@ -5274,7 +5279,7 @@ mod tests {
         );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 3);
         assert_eq!(s.passes()[0].color_texture(), backbuffer());
         assert_eq!(s.passes()[2].color_texture(), backbuffer());
@@ -5318,7 +5323,7 @@ mod tests {
         );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 5);
         // Pass 0 backbuffer() → next backbuffer() use is pass 4, which Loads → keep Store.
         assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
@@ -5355,7 +5360,7 @@ mod tests {
         s.clear_color(1, 1, 1, 1);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 3);
         // Pass 0 backbuffer() → next backbuffer() is pass 2 Clear → flip color.
         assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
@@ -5394,7 +5399,7 @@ mod tests {
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_load_actions();
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 2);
         // Pass 0 is the last (only) pass that depth-attaches cascade_depth;
         // without sampler awareness Rule B would flip Store→DontCare and
@@ -5475,7 +5480,7 @@ mod tests {
         s.end_current_pass("test");
         s.coalesce_clear_only_passes();
         s.finalize_load_actions();
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         s.strip_dead_color_in_clear_only_passes();
         s.cull_dead_clear_only_passes();
         // The cascade-d0 clear-only pass should now be depth-only:
@@ -5523,7 +5528,7 @@ mod tests {
         s.end_current_pass("test");
         s.coalesce_clear_only_passes();
         s.finalize_load_actions();
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         s.cull_dead_clear_only_passes();
         // The cascade clear-only pass should be gone; only the BB
         // scene pass remains.
@@ -5557,7 +5562,7 @@ mod tests {
         s.end_current_pass("test");
         s.coalesce_clear_only_passes();
         s.finalize_load_actions();
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         s.cull_dead_clear_only_passes();
         // Cascade clear-only pass stays — depth Store must commit to
         // VRAM for the scene's sample_compare to read it.
@@ -5874,7 +5879,7 @@ mod tests {
         );
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 2);
         assert_eq!(s.passes()[0].color_texture(), cascade_color);
         assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
@@ -5902,7 +5907,7 @@ mod tests {
         s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 2);
         assert_eq!(s.passes()[0].color_texture(), rt);
         assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
@@ -6000,7 +6005,7 @@ mod tests {
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
         s.finalize_load_actions();
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         assert_eq!(s.passes().len(), 3);
         assert_eq!(s.passes()[0].color_texture(), rt);
         // Without the sampler check, pass 0's color_store would be
@@ -6505,7 +6510,7 @@ mod tests {
         let mut s = fresh();
         s.set_depth_stencil_attachment(cascade_depth, /* is_sampleable */ true, false);
         s.emit_command(dummy_draw());
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         let cascade_pass = s
             .passes()
             .iter()
@@ -6532,7 +6537,7 @@ mod tests {
             rt_depth, /* is_sampleable */ false, /* has_stencil */ false,
         );
         s.emit_command(dummy_draw());
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         let rt_pass = s
             .passes()
             .iter()
@@ -6736,7 +6741,7 @@ mod tests {
         s.clear_color(1, 2, 3, 4);
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         let first = &s.passes()[0];
         // rt_a's next use clears it: Rule C flips the slot-1 store.
         assert_eq!(first.extra_color()[0].store(), StoreAction::DontCare);
@@ -6772,7 +6777,7 @@ mod tests {
         s.flush_pending_clears();
         // rt_a is read back later, so its store survives; rt_b's is dead.
         s.note_color_read_back(rt_a);
-        s.finalize_store_actions();
+        s.finalize_store_actions(false);
         s.strip_dead_color_in_clear_only_passes();
         assert_eq!(s.passes().len(), 1);
         let pass = &s.passes()[0];
@@ -6783,5 +6788,33 @@ mod tests {
         assert!(!pass.extra_color()[1].is_bound(), "dead extra stripped");
         s.cull_dead_clear_only_passes();
         assert_eq!(s.passes().len(), 1, "a live store keeps the pass");
+    }
+
+    #[test]
+    fn mid_frame_flush_keeps_every_colour_store() {
+        // Two clear-only passes on two targets; the first is read back, which
+        // flushes the frame. The second target is read back afterwards, so
+        // its last-use store must survive the flush (Rule D off) and Rule F
+        // must keep its pass.
+        let rt_a = tex(0x3000);
+        let rt_b = tex(0x3001);
+        let mut s = fresh();
+        s.set_color_render_target(rt_a, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        s.set_color_render_target(rt_b, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        s.flush_pending_clears();
+        s.note_color_read_back(rt_a);
+        s.finalize_store_actions(true);
+        s.cull_dead_clear_only_passes();
+        assert_eq!(
+            s.passes().len(),
+            2,
+            "both clear-only passes survive a readback flush"
+        );
+        assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
+        // At a real frame end the unread target's store is elided as before.
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
     }
 }

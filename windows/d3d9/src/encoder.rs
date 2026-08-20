@@ -6385,7 +6385,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     enc.pass_state.flush_pending_clears();
     enc.end_current_pass("submit");
 
-    apply_pass_rules(enc);
+    // A readback flush is not a frame end: the frame continues and any colour
+    // target may still be read back, so last-use colour stores survive it.
+    apply_pass_rules(enc, frame.flags.contains(FrameDataFlags::NO_PRESENT));
     log_cascade_frame_summary(enc);
 
     // StretchRect blits queued after the last draw of the frame have no
@@ -6672,10 +6674,10 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 /// to the no-color variant so Metal's RP-format validation stays happy.
 /// Rule F drops clear-only passes that nothing observes; must run after
 /// Rule G so the cull picks up the strip.
-fn apply_pass_rules(enc: &mut FrameEncoder) {
+fn apply_pass_rules(enc: &mut FrameEncoder, preserve_color_stores: bool) {
     enc.pass_state.coalesce_clear_only_passes();
     enc.pass_state.finalize_load_actions();
-    enc.pass_state.finalize_store_actions();
+    enc.pass_state.finalize_store_actions(preserve_color_stores);
     enc.pass_state.strip_dead_color_in_clear_only_passes();
     enc.pass_state
         .strip_color_from_no_color_draw_passes(&enc.no_color_pipeline_alt);
