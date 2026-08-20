@@ -3342,6 +3342,7 @@ extern "system" fn device_present(
     let dev = obj.inner();
 
     mtld3d_shared::crumb!("d3d9:present");
+    dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);
 

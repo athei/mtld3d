@@ -260,6 +260,51 @@ bitflags::bitflags! {
     }
 }
 
+/// Frame-hitch attribution around cursor transitions.
+///
+/// `CursorState::note_present` feeds it once per `Present`. It keeps a
+/// running typical Present-to-Present interval and, when one interval blows
+/// past it, logs a single debug line that ties the hitched frame to the
+/// last show/hide transition, to the wall time the Win32 cursor calls
+/// consumed since the previous `Present`, and to the `WM_SETCURSOR`
+/// re-asserts in that window. A clean game thread on a hitched frame (zero
+/// cursor microseconds, no other calls) points at the present side instead.
+struct HitchProbe {
+    last_present: Option<Instant>,
+    /// Exponential running average of the Present interval, microseconds.
+    ///
+    /// Zero until warm, so the first frames never trip the threshold.
+    interval_ewma_us: u64,
+    /// Instant of the last `ShowCursor` transition and whether it showed.
+    last_transition: Option<(Instant, bool)>,
+    /// Wall time of every Win32 cursor call since the last `Present`, µs.
+    calls_us_since_present: u64,
+    /// `WM_SETCURSOR` re-asserts consumed since the last `Present`.
+    setcursor_msgs_since_present: u32,
+}
+
+impl HitchProbe {
+    const fn new() -> Self {
+        Self {
+            last_present: None,
+            interval_ewma_us: 0,
+            last_transition: None,
+            calls_us_since_present: 0,
+            setcursor_msgs_since_present: 0,
+        }
+    }
+}
+
+/// A Present interval this many times the typical one is a hitch.
+const HITCH_RATIO: u64 = 2;
+/// Minimum excess over the typical interval for a hitch, µs.
+///
+/// Applied on top of `HITCH_RATIO`, so a 4 ms frame at 240 Hz doubling to
+/// 8 ms does not count.
+const HITCH_MIN_EXCESS_US: u64 = 4_000;
+/// Intervals above this are pauses (alt-tab, loading), not frame hitches.
+const HITCH_MAX_INTERVAL_US: u64 = 500_000;
+
 /// Cursor state owned by `DeviceInner` as a single field.
 ///
 /// Fields are private to this module — only code in `cursor.rs` reads or
@@ -271,6 +316,7 @@ pub struct CursorState {
     flags: CursorFlags,
     hash: u64,
     cache: HashMap<u64, *mut c_void>,
+    probe: HitchProbe,
     /// Nearest-neighbor upscale factor applied to the cursor bitmap.
     ///
     /// Sourced from the display's `backingScaleFactor` at `CreateDevice` so
@@ -291,8 +337,58 @@ impl CursorState {
             flags: CursorFlags::DIRTY,
             hash: 0,
             cache: HashMap::new(),
+            probe: HitchProbe::new(),
             scale: scale.clamp(1, 8),
         }
+    }
+
+    /// Fold one `Present` into the hitch probe; see `HitchProbe`.
+    ///
+    /// Called once per `Present` from `device_present`. Two `Instant` reads
+    /// per frame; the log line only forms on a hitched frame.
+    pub fn note_present(&mut self) {
+        let now = Instant::now();
+        let probe = &mut self.probe;
+        let calls_us = core::mem::take(&mut probe.calls_us_since_present);
+        let msgs = core::mem::take(&mut probe.setcursor_msgs_since_present);
+        let Some(last) = probe.last_present.replace(now) else {
+            return;
+        };
+        let interval_us = elapsed_us(last);
+        if interval_us > HITCH_MAX_INTERVAL_US {
+            return;
+        }
+        let typical_us = probe.interval_ewma_us;
+        // EWMA with a 1/16 weight; seeded by the first interval.
+        probe.interval_ewma_us = if typical_us == 0 {
+            interval_us
+        } else {
+            typical_us - typical_us / 16 + interval_us / 16
+        };
+        let hitch = typical_us != 0
+            && interval_us > typical_us * HITCH_RATIO
+            && interval_us > typical_us + HITCH_MIN_EXCESS_US;
+        if !hitch {
+            return;
+        }
+        // `since_transition_ms` is -1 when no transition happened yet.
+        let (transition, since_transition_ms) =
+            probe
+                .last_transition
+                .map_or(("none", -1i64), |(at, shown)| {
+                    let since = i64::try_from(elapsed_us(at) / 1000).unwrap_or(i64::MAX);
+                    (if shown { "show" } else { "hide" }, since)
+                });
+        debug!(
+            target: LOG_TARGET,
+            "frame hitch: present interval {interval_us} us (typical {typical_us} us) last_transition={transition} since_transition_ms={since_transition_ms} cursor_calls_since_present_us={calls_us} wm_setcursor_since_present={msgs} tid={}",
+            current_thread_id(),
+        );
+    }
+
+    /// Charge `us` of Win32 cursor-call wall time to the current frame.
+    const fn charge_call_us(&mut self, us: u64) {
+        self.probe.calls_us_since_present = self.probe.calls_us_since_present.saturating_add(us);
     }
 
     const fn visible(&self) -> bool {
@@ -531,6 +627,7 @@ pub extern "system" fn device_set_cursor_properties(
     // ShowCursor(TRUE); its glove is the game's own cursor).
     // `set_cursor_us` is 0 when nothing was realized.
     let set_cursor_us = if visible { timed_set_cursor(handle) } else { 0 };
+    cur.charge_call_us(set_cursor_us);
     debug!(
         target: LOG_TARGET,
         "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} set_cursor_us={set_cursor_us} cache_entries={} tid={}",
@@ -548,14 +645,21 @@ pub extern "system" fn device_set_cursor_position(this: *mut c_void, x: i32, y: 
     let started = Instant::now();
     let current = get_cursor_pos();
     let get_us = elapsed_us(started);
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return;
+    };
+    let cur = obj.inner().cursor_mut();
     let suppress = current.is_some_and(|p| p.x == x && p.y == y);
     if suppress {
+        cur.charge_call_us(get_us);
         debug!(target: LOG_TARGET, "SetCursorPosition: noop ({x},{y}) get_us={get_us}");
         return;
     }
     let started = Instant::now();
     set_cursor_pos(x, y);
     let set_us = elapsed_us(started);
+    cur.charge_call_us(get_us + set_us);
     if let Some(p) = current {
         debug!(
             target: LOG_TARGET,
@@ -616,6 +720,10 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     // through.
     let handle = if next { cur.handle } else { null_mut() };
     let set_cursor_us = timed_set_cursor(handle);
+    cur.charge_call_us(set_cursor_us);
+    if prev != next {
+        cur.probe.last_transition = Some((Instant::now(), next));
+    }
     if prev == next {
         trace!(
             target: LOG_TARGET,
@@ -675,6 +783,9 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             }
             set_cursor(cur.handle);
             let set_cursor_us = elapsed_us(started);
+            cur.charge_call_us(set_cursor_us);
+            cur.probe.setcursor_msgs_since_present =
+                cur.probe.setcursor_msgs_since_present.saturating_add(1);
             if was_dirty {
                 debug!(
                     target: LOG_TARGET,
