@@ -1,9 +1,13 @@
 use mtld3d_types::{
     AddressCaps, BlendCaps, Caps2, Caps3, CmpCaps, CursorCaps, D3D_MAX_SIMULTANEOUS_RENDERTARGETS,
-    D3DCAPS9, D3DDEVTYPE_HAL, D3DPS30_INSTRUCTIONSLOTS_MAX, D3DVBF_3WEIGHTS,
+    D3DCAPS9, D3DDEVTYPE_HAL, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH, D3DPS20_MAX_NUMINSTRUCTIONSLOTS, D3DPS20_MAX_NUMTEMPS,
+    D3DPS20_MAX_STATICFLOWCONTROLDEPTH, D3DPS30_INSTRUCTIONSLOTS_MAX, D3DVBF_3WEIGHTS,
+    D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH, D3DVS20_MAX_NUMTEMPS, D3DVS20_MAX_STATICFLOWCONTROLDEPTH,
     D3DVS30_INSTRUCTIONSLOTS_MAX, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps, LineCaps,
-    MAX_POINT_SIZE, MAX_STREAMS, MAX_VERTEX_SHADER_CONST, PrimitiveMiscCaps, RasterCaps, ShadeCaps,
-    StencilCaps, TexOpCaps, TextureCaps, VtxpCaps, d3dps_version, d3dvs_version,
+    MAX_POINT_SIZE, MAX_STREAMS, MAX_VERTEX_SHADER_CONST, PrimitiveMiscCaps, Ps20Caps, RasterCaps,
+    ShadeCaps, StencilCaps, TexOpCaps, TextureCaps, Vs20Caps, VtxpCaps, d3dps_version,
+    d3dvs_version,
 };
 
 use crate::ff_state::MAX_ACTIVE_LIGHTS;
@@ -186,6 +190,22 @@ const TEXTURE_DEFAULT: TextureCaps = TextureCaps::PERSPECTIVE
     .union(TextureCaps::CUBEMAP)
     .union(TextureCaps::MIPCUBEMAP);
 
+/// Filters `StretchRect` accepts: point and linear, which is also all it validates.
+///
+/// The copy itself is a blit, so the two are indistinguishable in the result;
+/// the cap describes what the call takes without `INVALIDCALL`.
+const STRETCH_RECT_FILTER: FilterCaps = FilterCaps::MINFPOINT
+    .union(FilterCaps::MINFLINEAR)
+    .union(FilterCaps::MAGFPOINT)
+    .union(FilterCaps::MAGFLINEAR);
+
+/// Half-width of the guard band, in pixels, on every side.
+///
+/// Metal clips in homogeneous space, so there is no rasterizer guard band to
+/// run out of; the D3D9 convention for such hardware is the +-32768 band that
+/// desktop drivers report.
+const GUARD_BAND: f32 = 32768.0;
+
 /// Filter caps for the 2D texture path: point, linear, and anisotropic minification.
 const FILTER_DEFAULT: FilterCaps = FilterCaps::MINFPOINT
     .union(FilterCaps::MINFLINEAR)
@@ -322,6 +342,12 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.device_type = D3DDEVTYPE_HAL;
     caps.caps2 = CAPS2_DEFAULT.bits();
     caps.caps3 = CAPS3_DEFAULT.bits();
+    // The two intervals the present path implements: display-rate vsync
+    // (`ONE`, also what `DEFAULT` resolves to) and `IMMEDIATE`. The divided
+    // rates are accepted by `CreateDevice` but fall through to `ONE` with a
+    // warn, so they are not advertised. 3DMark05 refuses to start without
+    // `IMMEDIATE` here.
+    caps.presentation_intervals = D3DPRESENT_INTERVAL_ONE | D3DPRESENT_INTERVAL_IMMEDIATE;
     caps.cursor_caps = CURSOR_CAPS_DEFAULT.bits();
     caps.dev_caps = DEV_CAPS_DEFAULT.bits();
     caps.primitive_misc_caps = PRIMITIVE_MISC_DEFAULT.bits();
@@ -335,7 +361,22 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.shade_caps = SHADE_DEFAULT.bits();
     caps.texture_caps = TEXTURE_DEFAULT.bits();
     caps.texture_filter_caps = FILTER_DEFAULT.bits();
+    // Cube and volume textures sample through the same Metal sampler state as
+    // 2D textures (`MTLTextureTypeCube` / `Type3D` on the unix texture path),
+    // so their filter and address caps are the 2D ones. The `VOLUMEMAP`
+    // TextureCaps bit is deliberately left off: it un-gates Wine's
+    // unbound-sampler visual test, which needs an unbound sampler to read back
+    // opaque black — a separate defect to fix before the bit is honest.
+    caps.cube_texture_filter_caps = FILTER_DEFAULT.bits();
+    caps.volume_texture_filter_caps = FILTER_DEFAULT.bits();
     caps.texture_address_caps = ADDRESS_DEFAULT.bits();
+    caps.volume_texture_address_caps = ADDRESS_DEFAULT.bits();
+    caps.stretch_rect_filter_caps = STRETCH_RECT_FILTER.bits();
+    // Vertex texture fetch is not implemented: no sampler binds on the vertex
+    // stage and `SetTexture` rejects the `D3DVERTEXTEXTURESAMPLER` range, so
+    // `vertex_texture_filter_caps` stays zero. That is a legal SM3 shape (ATI's
+    // R5xx shipped it), and `CheckDeviceFormat` denies
+    // `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
     caps.stencil_caps = STENCIL_DEFAULT.bits();
     caps.texture_op_caps = TEXOP_DEFAULT.bits();
     caps.max_texture_blend_stages = FF_TEXTURE_STAGES;
@@ -346,6 +387,10 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.max_texture_aspect_ratio = MAX_TEXTURE_DIM;
     caps.max_anisotropy = MAX_ANISOTROPY;
     caps.max_vertex_w = MAX_VERTEX_W;
+    caps.guard_band_left = -GUARD_BAND;
+    caps.guard_band_top = -GUARD_BAND;
+    caps.guard_band_right = GUARD_BAND;
+    caps.guard_band_bottom = GUARD_BAND;
     caps.line_caps = LINE_DEFAULT.bits();
     caps.fvf_caps = FVF_DEFAULT.bits();
     caps.vertex_processing_caps = VTXP_DEFAULT.bits();
@@ -357,6 +402,22 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.max_vertex_shader_const = MAX_VERTEX_SHADER_CONST;
     caps.pixel_shader_version = d3dps_version(3, 0);
     caps.pixel_shader_1x_max_value = PIXEL_SHADER_1X_MAX_VALUE;
+    // The SM2.x sub-structs at their spec maxima, which is what a 3.0 device
+    // reports. Each bit names something the DXSO emitter translates: `setp`
+    // and predicated writes (PREDICATION), `dsx`/`dsy` (GRADIENTINSTRUCTIONS),
+    // `if`/`ifc`/`breakc`/`loop`/`rep` (the flow-control depths), and MSL has
+    // neither a dependent-read nor a texture-instruction limit nor a swizzle
+    // restriction. Engines of the ps_2_x era pick their shader profile from
+    // these fields; all-zero reads as "no ps_2_x at all" to them.
+    caps.vs20_caps.caps = Vs20Caps::PREDICATION.bits();
+    caps.vs20_caps.dynamic_flow_control_depth = D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH;
+    caps.vs20_caps.num_temps = D3DVS20_MAX_NUMTEMPS;
+    caps.vs20_caps.static_flow_control_depth = D3DVS20_MAX_STATICFLOWCONTROLDEPTH;
+    caps.ps20_caps.caps = Ps20Caps::all().bits();
+    caps.ps20_caps.dynamic_flow_control_depth = D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH;
+    caps.ps20_caps.num_temps = D3DPS20_MAX_NUMTEMPS;
+    caps.ps20_caps.static_flow_control_depth = D3DPS20_MAX_STATICFLOWCONTROLDEPTH;
+    caps.ps20_caps.num_instruction_slots = D3DPS20_MAX_NUMINSTRUCTIONSLOTS;
     // SM3 capability claims sized to Metal's reality, not the D3D9 spec floor.
     // The `*_INSTRUCTIONSLOTS_MAX` values are the spec's stated upper bound and
     // what top-tier 2007 SM3 cards advertised; Metal has no per-shader
@@ -376,6 +437,8 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.decl_types = DECL_TYPES_DEFAULT.bits();
     caps.num_simultaneous_rts = DEFAULT_SIMULTANEOUS_RTS;
     caps.dev_caps2 = DEV_CAPS2_DEFAULT.bits();
+    // One adapter, which is its own group of one.
+    caps.number_of_adapters_in_group = 1;
 }
 
 /// Bring-up diagnostic: over-advertise caps only where the fallout would show up in the log.
@@ -385,8 +448,9 @@ const fn fill_default(caps: &mut D3DCAPS9) {
 /// attempted-but-unimplemented paths have detection hooks upstream
 /// (`SetRenderTarget`-index / vertex-decl `BLENDWEIGHT` /
 /// `D3DPT_POINTLIST` draw). Skips `pixel_shader_version` /
-/// `vertex_shader_version` / `vs20_caps` / `ps20_caps` — the DXSO parser has
-/// zero warn coverage, so a shader-version bump risks silent miscompile with no
+/// `vertex_shader_version` / `vs20_caps` / `ps20_caps` — the default path
+/// already reports the spec maxima there, and the DXSO parser has zero warn
+/// coverage, so a shader-version bump would risk silent miscompile with no
 /// log signal.
 fn apply_advertise_all(caps: &mut D3DCAPS9) {
     caps.raster_caps |= RasterCaps::all().bits();
@@ -729,17 +793,66 @@ mod tests {
     }
 
     #[test]
-    fn vs20_ps20_caps_remain_zero_until_sm2_extensions_implemented() {
-        // We don't advertise predication, dynamic flow control, or other
-        // SM2.x extensions yet. Leave these structs zero — flipping any
-        // bit must land in the same commit as the implementation.
+    fn vs20_ps20_caps_report_the_spec_maxima() {
+        // Every bit is backed by an emitter translation (setp + predicated
+        // writes, dsx/dsy, if/ifc/breakc/loop/rep) and MSL imposes none of
+        // the ps_2_0 limits the remaining bits lift. A 3.0 device reports the
+        // maxima; zeros here made 3DMark05 refuse to start.
         let caps = filled();
-        assert_eq!(caps.vs20_caps.caps, 0);
-        assert_eq!(caps.vs20_caps.dynamic_flow_control_depth, 0);
-        assert_eq!(caps.vs20_caps.static_flow_control_depth, 0);
-        assert_eq!(caps.ps20_caps.caps, 0);
-        assert_eq!(caps.ps20_caps.dynamic_flow_control_depth, 0);
-        assert_eq!(caps.ps20_caps.static_flow_control_depth, 0);
+        assert_eq!(
+            caps.vs20_caps.caps,
+            mtld3d_types::Vs20Caps::PREDICATION.bits()
+        );
+        assert_eq!(caps.vs20_caps.dynamic_flow_control_depth, 24);
+        assert_eq!(caps.vs20_caps.num_temps, 32);
+        assert_eq!(caps.vs20_caps.static_flow_control_depth, 4);
+        assert_eq!(caps.ps20_caps.caps, mtld3d_types::Ps20Caps::all().bits());
+        assert_eq!(caps.ps20_caps.dynamic_flow_control_depth, 24);
+        assert_eq!(caps.ps20_caps.num_temps, 32);
+        assert_eq!(caps.ps20_caps.static_flow_control_depth, 4);
+        assert_eq!(caps.ps20_caps.num_instruction_slots, 512);
+    }
+
+    #[test]
+    fn cube_and_volume_textures_share_the_2d_sampler_caps() {
+        let caps = filled();
+        assert_eq!(caps.cube_texture_filter_caps, caps.texture_filter_caps);
+        assert_eq!(caps.volume_texture_filter_caps, caps.texture_filter_caps);
+        assert_eq!(caps.volume_texture_address_caps, caps.texture_address_caps);
+    }
+
+    #[test]
+    fn stretch_rect_filter_caps_match_what_the_call_accepts() {
+        let expected = FilterCaps::MINFPOINT
+            | FilterCaps::MINFLINEAR
+            | FilterCaps::MAGFPOINT
+            | FilterCaps::MAGFLINEAR;
+        assert_eq!(filled().stretch_rect_filter_caps, expected.bits());
+    }
+
+    #[test]
+    fn vertex_texture_fetch_is_not_advertised() {
+        // No sampler binds on the vertex stage; `CheckDeviceFormat` denies
+        // `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
+        assert_eq!(filled().vertex_texture_filter_caps, 0);
+    }
+
+    #[test]
+    fn presentation_intervals_are_the_two_the_present_path_honours() {
+        assert_eq!(
+            filled().presentation_intervals,
+            mtld3d_types::D3DPRESENT_INTERVAL_ONE | mtld3d_types::D3DPRESENT_INTERVAL_IMMEDIATE
+        );
+    }
+
+    #[test]
+    fn guard_band_and_adapter_group_are_filled() {
+        let caps = filled();
+        assert_eq!(caps.guard_band_left.to_bits(), (-32768.0f32).to_bits());
+        assert_eq!(caps.guard_band_top.to_bits(), (-32768.0f32).to_bits());
+        assert_eq!(caps.guard_band_right.to_bits(), 32768.0f32.to_bits());
+        assert_eq!(caps.guard_band_bottom.to_bits(), 32768.0f32.to_bits());
+        assert_eq!(caps.number_of_adapters_in_group, 1);
     }
 
     fn advertised() -> D3DCAPS9 {
@@ -753,17 +866,19 @@ mod tests {
 
     #[test]
     fn advertise_all_does_not_touch_silent_miscompile_fields() {
-        // DXSO parser has no warn coverage — bumping shader_version or
-        // SM2.x sub-struct fields invites silent shader miscompiles, with
-        // no log signal to catch the bad path. Everything else now has
-        // upstream detection (RS warns, vertex-decl warn,
-        // d3d_to_metal_primitive POINTLIST warn) so it moved into the
+        // DXSO parser has no warn coverage — bumping shader_version invites
+        // silent shader miscompiles, with no log signal to catch the bad
+        // path, and the SM2.x sub-structs already sit at their maxima.
+        // Everything else now has upstream detection (RS warns, vertex-decl
+        // warn, d3d_to_metal_primitive POINTLIST warn) so it moved into the
         // diagnostic OR-in.
         let caps = advertised();
+        let base = filled();
         assert_eq!(caps.vertex_shader_version, d3dvs_version(3, 0));
         assert_eq!(caps.pixel_shader_version, d3dps_version(3, 0));
-        assert_eq!(caps.vs20_caps.caps, 0);
-        assert_eq!(caps.ps20_caps.caps, 0);
+        assert_eq!(caps.vs20_caps.caps, base.vs20_caps.caps);
+        assert_eq!(caps.ps20_caps.caps, base.ps20_caps.caps);
+        assert_eq!(caps.ps20_caps.num_temps, base.ps20_caps.num_temps);
     }
 
     #[test]

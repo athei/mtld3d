@@ -11,7 +11,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | File | Coverage |
 | --- | --- |
 | `smoke.rs` | Clear-to-colour fill; `DrawPrimitiveUP` triangle with interpolated diffuse. |
-| `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity; `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize, fullscreen monitor-rect + style adoption and restore, fullscreen ignores the requested resolution, undrawn post-resize `Present` reads back black). |
+| `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity (SM2 sub-structs at the ps_2_0 floor, cube/volume filter and address caps, no VTF and `QUERY_VERTEXTEXTURE` rejected to match); `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize, fullscreen monitor-rect + style adoption and restore, fullscreen ignores the requested resolution, undrawn post-resize `Present` reads back black). |
 | `clear_present.rs` | (folded into smoke/device — clear flags exercised via `clear`). |
 | `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle-fan + `DrawIndexedPrimitiveUP` + `ProcessVertices` stubs. |
 | `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices` round-trips including higher streams and the NULL-bind offset/stride retention. |
@@ -28,6 +28,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `state_block.rs` | Capture/Apply (ALL); VERTEXSTATE restores FVF; PIXELSTATE restores sampler; Begin/EndStateBlock recording. |
 | `query.rs` | EVENT fence; OCCLUSION sample count; TIMESTAMP contract. |
 | `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice`/`SetClipPlane` stubs; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
+| `unload.rs` | `LoadLibrary` → `Direct3DCreate9` → `Release` → `FreeLibrary`, then a continuable exception raised with a resuming handler appended at the end of the chain: proves the unloaded image left no vectored exception handler behind (no harness: its `raw-dylib` import would keep the module mapped). |
 
 ## Documented limitations / stubs pinned by tests
 

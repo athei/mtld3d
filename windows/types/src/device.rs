@@ -202,6 +202,7 @@ pub const D3DUSAGE_AUTOGENMIPMAP: u32 = 0x0000_0400;
 pub const D3DUSAGE_QUERY_SRGBREAD: u32 = 0x0001_0000;
 pub const D3DUSAGE_QUERY_SRGBWRITE: u32 = 0x0004_0000;
 pub const D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING: u32 = 0x0008_0000;
+pub const D3DUSAGE_QUERY_VERTEXTEXTURE: u32 = 0x0010_0000;
 pub const D3DUSAGE_NONSECURE: u32 = 0x0080_0000;
 
 // ── D3D9 resource pools (`D3DPOOL`, the `Pool` arg of the Create*
@@ -764,6 +765,11 @@ pub struct D3DCAPS9 {
 // D3DPRESENTFLAG_* bits for D3DPRESENT_PARAMETERS::flags. Only the
 // LOCKABLE_BACKBUFFER bit is honoured today (WoW portrait read-back path).
 pub const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER: u32 = 0x0000_0001;
+
+// D3DPRESENT_INTERVAL_* values of D3DPRESENT_PARAMETERS::PresentationInterval,
+// which double as the bits of D3DCAPS9::PresentationIntervals.
+pub const D3DPRESENT_INTERVAL_ONE: u32 = 0x0000_0001;
+pub const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

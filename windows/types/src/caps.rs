@@ -29,6 +29,27 @@ pub const D3DVS30_INSTRUCTIONSLOTS_MAX: u32 = 32768;
 /// `D3DPS30_INSTRUCTIONSLOTS_MAX`: the SM3 spec ceiling on pixel-shader instruction slots.
 pub const D3DPS30_INSTRUCTIONSLOTS_MAX: u32 = 32768;
 
+/// `D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH`: ceiling of the VS20 dynamic flow-control depth.
+pub const D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH: i32 = 24;
+
+/// `D3DVS20_MAX_NUMTEMPS`: ceiling of the VS20 temporary-register count.
+pub const D3DVS20_MAX_NUMTEMPS: i32 = 32;
+
+/// `D3DVS20_MAX_STATICFLOWCONTROLDEPTH`: ceiling of the VS20 static flow-control depth.
+pub const D3DVS20_MAX_STATICFLOWCONTROLDEPTH: i32 = 4;
+
+/// `D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH`: ceiling of the PS20 dynamic flow-control depth.
+pub const D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH: i32 = 24;
+
+/// `D3DPS20_MAX_NUMTEMPS`: ceiling of the PS20 temporary-register count.
+pub const D3DPS20_MAX_NUMTEMPS: i32 = 32;
+
+/// `D3DPS20_MAX_STATICFLOWCONTROLDEPTH`: ceiling of the PS20 static flow-control depth.
+pub const D3DPS20_MAX_STATICFLOWCONTROLDEPTH: i32 = 4;
+
+/// `D3DPS20_MAX_NUMINSTRUCTIONSLOTS`: ceiling of the PS20 instruction-slot count.
+pub const D3DPS20_MAX_NUMINSTRUCTIONSLOTS: i32 = 512;
+
 /// Float constant registers an SM3 vertex shader can address (`c0`..`c255`).
 pub const MAX_VERTEX_SHADER_CONST: u32 = 256;
 
@@ -52,6 +73,24 @@ pub const fn d3dps_version(major: u32, minor: u32) -> u32 {
 }
 
 // ── D3DCAPS9 bitmask fields ──
+
+bitflags::bitflags! {
+    /// `D3DVS20CAPS_*` bits (`D3DVSHADERCAPS2_0::Caps`, the `VS20Caps` member).
+    pub struct Vs20Caps: u32 {
+        const PREDICATION = 0x0000_0001;
+    }
+}
+
+bitflags::bitflags! {
+    /// `D3DPS20CAPS_*` bits (`D3DPSHADERCAPS2_0::Caps`, the `PS20Caps` member).
+    pub struct Ps20Caps: u32 {
+        const ARBITRARYSWIZZLE = 0x0000_0001;
+        const GRADIENTINSTRUCTIONS = 0x0000_0002;
+        const PREDICATION = 0x0000_0004;
+        const NODEPENDENTREADLIMIT = 0x0000_0008;
+        const NOTEXINSTRUCTIONLIMIT = 0x0000_0010;
+    }
+}
 
 bitflags::bitflags! {
     /// `D3DCAPS2_*` bits (`D3DCAPS9::Caps2`).

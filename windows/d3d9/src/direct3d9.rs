@@ -17,7 +17,8 @@ use mtld3d_types::{
     D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN,
     D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -605,6 +606,11 @@ extern "system" fn d3d9_check_device_format(
     // D3DFMT_UNKNOWN is the "no format" sentinel — spec-correct to reject, and
     // games routinely probe it, so don't clutter the log with it.
     if check_format == 0 {
+        return D3DERR_NOTAVAILABLE;
+    }
+    // Vertex texture fetch is not implemented (no sampler binds on the vertex
+    // stage, `VertexTextureFilterCaps` is zero); the per-format query agrees.
+    if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {
         return D3DERR_NOTAVAILABLE;
     }
     // D3DUSAGE_QUERY_SRGBWRITE asks whether a format works as an sRGB-encoding
