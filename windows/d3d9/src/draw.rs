@@ -692,6 +692,11 @@ pub enum PsSource {
         /// The per-stage uniform goes to PS slot 12. False for the vast
         /// majority of shaders, which then pay no slot-12 bind.
         uses_bump_env: bool,
+        /// Bit `i` set ⇒ the bytecode writes `oCi`.
+        ///
+        /// Feeds the pipeline key so a render target the shader never
+        /// writes gets an empty write mask and keeps its contents.
+        color_out_mask: u8,
     },
     FixedFunction {
         key: FfPsKey,
@@ -990,6 +995,21 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         .expect("emit_draw: ps not populated")
         .as_ref();
     let variant = snap.variant.expect("emit_draw: variant not populated");
+    // The render pass decides which colour outputs the PS may export, and
+    // that is only known here on the encoder thread. Patch a PS-only copy so
+    // the VS key, which shares `variant`, is untouched; the FF PS writes one
+    // output and keeps the default so its library index never fragments.
+    let extra_attachments = enc.current_extra_color_attachments();
+    let (ps_variant, ps_color_out_mask) = match ps {
+        PsSource::Programmable { color_out_mask, .. } => (
+            VariantKey {
+                color_out_mask: extra_attachments.present_mask << 1,
+                ..variant
+            },
+            *color_out_mask,
+        ),
+        PsSource::FixedFunction { .. } => (variant, 1),
+    };
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1073,7 +1093,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_keys = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RKeys));
     let skip_set = skip_shader_hashes();
     if !skip_set.is_empty() {
-        let (vs_h, ps_h) = (vs.disk_key(), ps.disk_key(variant));
+        let (vs_h, ps_h) = (vs.disk_key(), ps.disk_key(ps_variant));
         if skip_set.contains(&vs_h) || skip_set.contains(&ps_h) {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
@@ -1099,8 +1119,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         );
         return;
     };
-    let Some(ps_handles) = enc.resolve_ps_library(ps, variant) else {
-        let dk = ps.disk_key(variant);
+    let Some(ps_handles) = enc.resolve_ps_library(ps, ps_variant) else {
+        let dk = ps.disk_key(ps_variant);
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: resolve_ps_library returned None");
         mtld3d_shared::log_once_trace_by!(
             target: crate::LOG_TARGET,
@@ -1176,6 +1196,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         color_format,
         attach,
         rs: render_state.pipeline_rs,
+        extra: extra_attachments,
+        ps_color_out_mask,
     };
     let pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref);
     if pipeline == 0 {

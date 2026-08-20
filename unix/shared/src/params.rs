@@ -47,7 +47,7 @@ const _: () = {
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 32);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 96);
-    assert!(core::mem::size_of::<PassDescriptor>() == 96);
+    assert!(core::mem::size_of::<PassDescriptor>() == 168);
 };
 
 /// One-shot "register `env_logger` on the unix side" thunk.
@@ -314,7 +314,25 @@ pub struct CreateRenderPipelineParams {
                            * default (pixelFormat=Invalid). Set zero by the pass-state
                            * machine for cascade caster passes where every draw has
                            * color_write_mask=0 (eliminates Apple "Unused Texture"). */
+    pub extra_present_mask: u32, // in: bit i = colorAttachments[i + 1] is declared
+    pub extra: [ExtraColorAttachmentParams; 3], // in: colorAttachments[1..=3]
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
+}
+
+/// One extra colour attachment (`colorAttachments[1..=3]`) of a render pipeline.
+///
+/// The blend operations are shared with attachment 0 (D3D9 has one blend
+/// state); the factors are resolved per attachment because the
+/// destination-alpha clamp depends on whether that target's D3D format has an
+/// alpha channel. Ignored unless the matching `extra_present_mask` bit is set.
+#[repr(C)]
+pub struct ExtraColorAttachmentParams {
+    pub format: PixelFormat,          // in
+    pub write_mask: ColorWriteMask,   // in
+    pub src_blend: BlendFactor,       // in: source RGB
+    pub dst_blend: BlendFactor,       // in: dest RGB
+    pub src_blend_alpha: BlendFactor, // in: source alpha (already effective)
+    pub dst_blend_alpha: BlendFactor, // in: dest alpha (already effective)
 }
 
 impl Thunk for CreateRenderPipelineParams {
@@ -434,7 +452,7 @@ impl Thunk for CompileShaderLibraryParams {
 /// `StretchRect` lands after the last draw of the frame.
 ///
 /// Fields are ordered u64s-first then u32s so the natural struct layout
-/// is padding-free; size is 96 bytes on both 32- and 64-bit PE.
+/// is padding-free; size is 168 bytes on both 32- and 64-bit PE.
 #[repr(C, align(8))]
 pub struct PassDescriptor {
     pub color_texture: MetalHandle<MTLTextureKind>, // in
@@ -473,6 +491,11 @@ pub struct PassDescriptor {
     /// Ordinary 2D level-zero passes therefore retain their previous 0/1
     /// value and the descriptor keeps its size.
     pub pass_flags: u32, // in
+    /// Render targets 1..3 (`colorAttachments[1..=3]`); `texture` null = unbound.
+    ///
+    /// They share `clear_r..clear_a` with attachment 0 (a D3D9 `Clear` has
+    /// one colour for every target) and carry their own load/store actions.
+    pub extra_color: [ExtraColorDesc; 3], // in
 }
 
 impl PassDescriptor {
@@ -504,6 +527,48 @@ impl PassDescriptor {
     #[must_use]
     pub const fn color_level(&self) -> u32 {
         (self.pass_flags >> Self::COLOR_LEVEL_SHIFT) & 0xf
+    }
+}
+
+/// One of render targets 1..3 on a [`PassDescriptor`].
+///
+/// `subresource` packs the array slice in bits 0..7 and the mip level in
+/// bits 8..15, the same packing the PE side keeps for attachment 0 before it
+/// folds it into `pass_flags`. 24 bytes, 8-aligned through `texture`.
+#[repr(C)]
+pub struct ExtraColorDesc {
+    pub texture: MetalHandle<MTLTextureKind>, // in (NULL = unbound)
+    pub subresource: u32,                     // in: slice | (level << 8)
+    pub load_action: LoadAction,              // in
+    pub store_action: StoreAction,            // in
+    pub reserved: u32,
+}
+
+impl ExtraColorDesc {
+    /// The unbound attachment.
+    pub const NONE: Self = Self {
+        texture: MetalHandle::NULL,
+        subresource: 0,
+        load_action: LoadAction::DontCare,
+        store_action: StoreAction::DontCare,
+        reserved: 0,
+    };
+
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        !self.texture.is_null()
+    }
+
+    /// Array slice of the attachment.
+    #[must_use]
+    pub const fn slice(&self) -> u32 {
+        self.subresource & 0xff
+    }
+
+    /// Mip level of the attachment.
+    #[must_use]
+    pub const fn level(&self) -> u32 {
+        self.subresource >> 8
     }
 }
 
@@ -845,7 +910,8 @@ impl Thunk for BlitTextureToBufferParams {
 mod tests {
     use super::{
         BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams,
-        DestroyResourcesBulkParams, PassDescriptor, SubmitFrameParams, TextureCreateDesc,
+        DestroyResourcesBulkParams, ExtraColorDesc, PassDescriptor, SubmitFrameParams,
+        TextureCreateDesc,
     };
 
     #[test]
@@ -908,8 +974,10 @@ mod tests {
         assert_eq!(core::mem::align_of::<CreateTexturesBatchParams>(), 8);
         assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
 
-        // PassDescriptor: 5 * u64 + 14 * u32 = 40 + 56 = 96, already 8-aligned.
-        assert_eq!(core::mem::size_of::<PassDescriptor>(), 96);
+        // PassDescriptor: 5 * u64 + 14 * u32 + 3 * ExtraColorDesc = 40 + 56 + 72 = 168.
+        assert_eq!(core::mem::size_of::<PassDescriptor>(), 168);
+        // ExtraColorDesc: 8 texture + 4 subresource + 4 load + 4 store + 4 reserved = 24.
+        assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 24);
 
         // SubmitFrameParams:
         //   8 queue_handle
@@ -942,6 +1010,6 @@ mod tests {
             PassDescriptor::pack_flags(true, 5, 9),
             1 | (5 << 1) | (9 << 4)
         );
-        assert_eq!(core::mem::size_of::<PassDescriptor>(), 96);
+        assert_eq!(core::mem::size_of::<PassDescriptor>(), 168);
     }
 }

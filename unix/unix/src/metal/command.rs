@@ -10,8 +10,8 @@ use std::{
 use block2::RcBlock;
 use log::{debug, error, trace};
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, Command, CommandType, MetalHandle, PassDescriptor,
-    SubmitFrameParams,
+    BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
+    PassDescriptor, SubmitFrameParams,
     mtl::{
         CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
         VisibilityResultMode,
@@ -1426,7 +1426,8 @@ fn encode_pass(
             LoadAction::Load => color0.setLoadAction(MTLLoadAction::Load),
             LoadAction::DontCare => color0.setLoadAction(MTLLoadAction::DontCare),
         }
-    } else if pass.depth_texture.is_null() {
+    } else if pass.depth_texture.is_null() && !pass.extra_color.iter().any(ExtraColorDesc::is_bound)
+    {
         // No color AND no depth attachment with a non-zero command
         // count would be an empty render encoder targeting nothing —
         // shouldn't happen, but bail rather than ask Metal to build a
@@ -1437,6 +1438,41 @@ fn encode_pass(
             pass.command_count,
         );
         return true;
+    }
+
+    // Render targets 1..3. Same slice/level/load/store handling as attachment
+    // 0; the clear colour is the shared one. A stripped slot is simply unbound.
+    for (i, extra) in pass.extra_color.iter().enumerate() {
+        if !extra.is_bound() {
+            continue;
+        }
+        mtld3d_shared::crumb!("pass:extraret", extra.texture.raw());
+        let Some(texture) = extra.texture.into_retained() else {
+            error!(target: LOG_TARGET, "encode_pass: color texture {} retain failed (handle={:#x})", i + 1, extra.texture);
+            return false;
+        };
+        // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+        // subscripts 1..=3 are within Metal's colour attachment count.
+        let color = unsafe { rp_desc.colorAttachments().objectAtIndexedSubscript(i + 1) };
+        color.setTexture(Some(&texture));
+        color.setSlice(extra.slice() as usize);
+        color.setLevel(extra.level() as usize);
+        rt_width = rt_width.min((texture.width() >> extra.level()).max(1));
+        rt_height = rt_height.min((texture.height() >> extra.level()).max(1));
+        color.setStoreAction(map_store_action(extra.store_action));
+        match extra.load_action {
+            LoadAction::Clear => {
+                color.setLoadAction(MTLLoadAction::Clear);
+                color.setClearColor(objc2_metal::MTLClearColor {
+                    red: f64::from(f32::from_bits(pass.clear_r)),
+                    green: f64::from(f32::from_bits(pass.clear_g)),
+                    blue: f64::from(f32::from_bits(pass.clear_b)),
+                    alpha: f64::from(f32::from_bits(pass.clear_a)),
+                });
+            }
+            LoadAction::Load => color.setLoadAction(MTLLoadAction::Load),
+            LoadAction::DontCare => color.setLoadAction(MTLLoadAction::DontCare),
+        }
     }
 
     if !pass.depth_texture.is_null() {

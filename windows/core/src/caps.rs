@@ -70,13 +70,14 @@ const MAX_STREAM_STRIDE: u32 = 508;
 /// SM2 and SM3 shaders ignore the field.
 const PIXEL_SHADER_1X_MAX_VALUE: f32 = 65504.0;
 
-/// Render targets bound at once on the default path.
+/// Render targets bound at once on the default path: the D3D9 maximum of four.
 ///
-/// `SetRenderTarget(index > 0)` is explicitly rejected device-side. Multi-pass
-/// rendering into RT0 (water reflections, portrait models) needs no cap bit;
-/// D3D9 advertises render-target format support through `CheckDeviceFormat`
-/// rather than a `D3DCAPS9` flag.
-const DEFAULT_SIMULTANEOUS_RTS: u32 = 1;
+/// Each one is a colour attachment of the same Metal render pass with its own
+/// format and write mask (`D3DRS_COLORWRITEENABLE1..3`), and the pixel shader
+/// exports one `[[color(i)]]` per target it writes. D3D9 advertises
+/// render-target format support through `CheckDeviceFormat` rather than a
+/// `D3DCAPS9` flag.
+const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 
 /// Point size the caps diagnostic raises `MaxPointSize` to.
 ///
@@ -111,7 +112,10 @@ const DEV_CAPS_DEFAULT: DevCaps = DevCaps::EXECUTESYSTEMMEMORY
 ///
 /// `CLIPTLVERTS` is factual: Metal clips every vertex — including the
 /// pre-transformed XYZRHW (TL) verts handed through as clip-space — to the NDC
-/// volume, so post-transform clipping always happens.
+/// volume, so post-transform clipping always happens. The three MRT bits are
+/// what the Metal render pass gives every colour attachment: its own write
+/// mask (`INDEPENDENTWRITEMASKS`), its own pixel format
+/// (`MRTINDEPENDENTBITDEPTHS`) and blending (`MRTPOSTPIXELSHADERBLENDING`).
 const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::CULLNONE)
     .union(PrimitiveMiscCaps::CULLCW)
@@ -119,7 +123,10 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::COLORWRITEENABLE)
     .union(PrimitiveMiscCaps::CLIPTLVERTS)
     .union(PrimitiveMiscCaps::BLENDOP)
+    .union(PrimitiveMiscCaps::INDEPENDENTWRITEMASKS)
     .union(PrimitiveMiscCaps::SEPARATEALPHABLEND)
+    .union(PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS)
+    .union(PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING)
     .union(PrimitiveMiscCaps::POSTBLENDSRGBCONVERT);
 
 /// Rasterizer caps.
@@ -397,7 +404,8 @@ fn apply_advertise_all(caps: &mut D3DCAPS9) {
     caps.texture_op_caps |= TexOpCaps::all().bits();
     // Field-shape (non-bitmask) raises. Each has detection wired upstream
     // so the game's attempts at the path land as warns:
-    //  - num_simultaneous_rts: SetRenderTarget(index>0) already warn!s with the index.
+    //  - num_simultaneous_rts: already the spec maximum on the default path,
+    //    so the raise is a no-op kept for symmetry.
     //  - max_point_size: D3DPT_POINTLIST draws fire a log_once_warn in
     //    d3d_to_metal_primitive (Metal still renders 1-pixel points).
     // `max_vertex_blend_matrices` needs no raise: the truthful floor in
@@ -450,7 +458,10 @@ mod tests {
             | PrimitiveMiscCaps::COLORWRITEENABLE
             | PrimitiveMiscCaps::CLIPTLVERTS
             | PrimitiveMiscCaps::BLENDOP
+            | PrimitiveMiscCaps::INDEPENDENTWRITEMASKS
             | PrimitiveMiscCaps::SEPARATEALPHABLEND
+            | PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS
+            | PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING
             | PrimitiveMiscCaps::POSTBLENDSRGBCONVERT;
         assert_eq!(filled().primitive_misc_caps, expected.bits());
         // CLIPPLANESCALEDPOINTS is meaningless given max_point_size = 1.0.
@@ -745,6 +756,14 @@ mod tests {
         assert_eq!(caps.pixel_shader_version, d3dps_version(3, 0));
         assert_eq!(caps.vs20_caps.caps, 0);
         assert_eq!(caps.ps20_caps.caps, 0);
+    }
+
+    #[test]
+    fn default_path_advertises_four_render_targets() {
+        assert_eq!(
+            filled().num_simultaneous_rts,
+            mtld3d_types::D3D_MAX_SIMULTANEOUS_RENDERTARGETS
+        );
     }
 
     #[test]

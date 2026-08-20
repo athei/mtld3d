@@ -35,12 +35,14 @@ impl Direct3DPixelShader9 {
         shader_id: ProgramId,
         max_const_used: u32,
         uses_bump_env: bool,
+        color_out_mask: u8,
     ) -> Self {
         let inner = Box::into_raw(Box::new(PixelShaderInner {
             device_inner,
             shader_id,
             max_const_used,
             uses_bump_env,
+            color_out_mask,
         }));
         Self {
             vtbl: &raw const DIRECT3D_PIXEL_SHADER9_VTBL,
@@ -68,6 +70,11 @@ impl Direct3DPixelShader9 {
         self.inner().uses_bump_env
     }
 
+    /// Bit `i` set ⇒ the bytecode writes `oCi` (see `DxsoProgram::color_out_mask`).
+    pub fn color_out_mask(&self) -> u8 {
+        self.inner().color_out_mask
+    }
+
     fn inner(&self) -> &PixelShaderInner {
         // SAFETY: `self.inner` was installed by `Self::new` as a
         // `Box::into_raw` and is dropped only in `ps_release` at refcount
@@ -81,6 +88,7 @@ struct PixelShaderInner {
     shader_id: ProgramId,
     max_const_used: u32,
     uses_bump_env: bool,
+    color_out_mask: u8,
 }
 
 #[inline]

@@ -15,6 +15,7 @@ use mtld3d_core::{
     format::{FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, map_d3d_format},
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
+    passes::ExtraColorSlot,
     perf::{
         ApiPerfState, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer, DeviceSubCategory,
         KeysGate,
@@ -28,16 +29,17 @@ use mtld3d_shared::{
     },
 };
 use mtld3d_types::{
-    D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS,
-    D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_YUY2,
-    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
-    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
-    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
-    D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC,
-    D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL, D3DRS_CLIPPING, D3DRS_COLORVERTEX,
-    D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS,
-    D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16,
+    D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
+    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
+    D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
+    D3DRS_CLIPPING, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
+    D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN,
+    D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
@@ -61,7 +63,7 @@ use mtld3d_types::{
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOINTERFACE, E_NOTIMPL, LOG_TARGET,
     bound_buffers::BoundBuffers,
-    bound_rt::BoundRt,
+    bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
     cursor::{self, CursorState},
     direct3d9::{depth_format_has_stencil, is_depth_stencil_format},
@@ -504,12 +506,16 @@ pub struct DeviceInner {
     /// follow a `GetRenderTargetData` keep rendering to the bound RT instead of
     /// silently reverting to the backbuffer format.
     last_color_rt_binding: Option<RtBinding>,
-    /// Texture id of the autogen render-target currently bound at RT0, if any.
+    /// Render targets 1..3 as most recently bound, re-asserted like `last_color_rt_binding`.
     ///
-    /// When RT0 changes away from it the mip chain is regenerated (a render or
-    /// clear into an `D3DUSAGE_AUTOGENMIPMAP` texture must refresh the lower
-    /// levels).
-    cur_autogen_rt_id: Option<TextureId>,
+    /// Index `i` holds slot `i + 1`; `None` is an unbound slot.
+    last_extra_rt_bindings: [Option<RtBinding>; RENDER_TARGET_SLOTS - 1],
+    /// Texture id of the autogen render-target bound at each slot, if any.
+    ///
+    /// When a slot changes away from it the mip chain is regenerated (a
+    /// render or clear into an `D3DUSAGE_AUTOGENMIPMAP` texture must refresh
+    /// the lower levels).
+    cur_autogen_rt_ids: [Option<TextureId>; RENDER_TARGET_SLOTS],
     /// The depth/stencil attachment most recently applied via `SetDepthStencilSurface`.
     ///
     /// Holds binding + `is_sampleable` + `depth_has_stencil`. `None` means the
@@ -1210,7 +1216,12 @@ impl DeviceInner {
         // the binding enums are wide aggregates, and frame swaps are rare
         // relative to draws.
         if let Some(info) = self.last_color_rt_binding.clone() {
-            self.push_color_rt_binding_op(info);
+            self.push_color_rt_binding_op(0, info);
+        }
+        for slot in 1..RENDER_TARGET_SLOTS {
+            if let Some(info) = self.last_extra_rt_bindings[slot - 1].clone() {
+                self.push_color_rt_binding_op(slot, info);
+            }
         }
         if let Some((binding, is_sampleable, has_stencil)) = self.last_depth_binding.clone() {
             self.push_depth_binding_op(binding, is_sampleable, has_stencil);
@@ -1255,11 +1266,11 @@ impl DeviceInner {
         }));
     }
 
-    /// Push the encoder op that binds `info` as the colour render target.
+    /// Push the encoder op that binds `info` as colour render target `slot` (0..=3).
     ///
     /// Factored out of `device_set_render_target` so `flush_current_frame_
     /// blocking` can re-assert the persistent binding into the fresh frame.
-    fn push_color_rt_binding_op(&mut self, info: RtBinding) {
+    fn push_color_rt_binding_op(&mut self, slot: usize, info: RtBinding) {
         // Every variant carries the size D3D9 reports for the target, and the
         // same rule decides all three: the back buffer's own scale if it was
         // created at the reported back-buffer resolution, the identity
@@ -1319,7 +1330,21 @@ impl DeviceInner {
                     )
                 }
             };
-            if slice == 0 && level == 0 {
+            if slot != 0 {
+                enc.set_extra_color_render_target(
+                    slot,
+                    Some(ExtraColorSlot {
+                        texture: handle,
+                        subresource: slice | (level << 8),
+                        // Derived from `logical_size` and `scale` by the setter.
+                        size: (0, 0),
+                        logical_size: (w, h),
+                        format: fmt,
+                        scale,
+                        has_alpha,
+                    }),
+                );
+            } else if slice == 0 && level == 0 {
                 enc.set_color_render_target(handle, w, h, fmt, has_alpha, scale);
             } else {
                 enc.set_color_render_target_subresource(
@@ -1331,6 +1356,24 @@ impl DeviceInner {
                     (slice, level),
                 );
             }
+        }));
+    }
+
+    /// Unbind render target `slot` (1..=3): `SetRenderTarget(slot, NULL)`.
+    ///
+    /// Regenerates the mip chain of an autogen texture that was bound there,
+    /// drops the persistent binding and tells the encoder.
+    fn unbind_extra_render_target(&mut self, slot: usize) {
+        if let Some(old_id) = self.cur_autogen_rt_ids[slot].take() {
+            self.push_op(Box::new(move |enc| {
+                enc.run_generate_mipmaps_ordered(old_id);
+            }));
+        }
+        self.bound_rt_mut()
+            .replace_render_target(slot, core::ptr::null_mut(), 0, 0);
+        self.last_extra_rt_bindings[slot - 1] = None;
+        self.push_op(Box::new(move |enc| {
+            enc.set_extra_color_render_target(slot, None);
         }));
     }
 
@@ -1730,8 +1773,18 @@ impl DeviceInner {
     pub fn reset_to_defaults(&mut self) {
         self.bound_rt.teardown();
         // Reset reverts the colour target to the implicit backbuffer and the
-        // depth/stencil to the implicit auto-depth default.
+        // depth/stencil to the implicit auto-depth default, and unbinds render
+        // targets 1..3. The encoder's frame reset already drops them; the
+        // explicit unbind covers the frame in flight.
         self.last_color_rt_binding = None;
+        for slot in 1..RENDER_TARGET_SLOTS {
+            if self.last_extra_rt_bindings[slot - 1].take().is_some() {
+                self.push_op(Box::new(move |enc| {
+                    enc.set_extra_color_render_target(slot, None);
+                }));
+            }
+        }
+        self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
         self.bound_buffers.teardown();
         self.stage_bindings
@@ -2128,7 +2181,8 @@ impl Direct3DDevice9 {
             recording_state_block: None,
             pending_display_sync_enabled: None,
             last_color_rt_binding: None,
-            cur_autogen_rt_id: None,
+            last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
+            cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
             live_textures: Mutex::new(Vec::new()),
             snapshot_dirty: SnapshotDirty::all(),
@@ -6143,24 +6197,31 @@ extern "system" fn device_set_render_target(
     surface: *mut c_void,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::RtDs);
-    if index != 0 {
+    if index >= D3D_MAX_SIMULTANEOUS_RENDERTARGETS {
         warn!(
             target: LOG_TARGET,
-            "reject SetRenderTarget(index={index}) → INVALIDCALL (only RT0 supported)"
+            "reject SetRenderTarget(index={index}) → INVALIDCALL (four simultaneous render targets)"
         );
         return D3DERR_INVALIDCALL;
     }
-    if surface.is_null() {
-        // D3D9 spec: RT0 must remain non-null.
-        warn!(target: LOG_TARGET, "reject SetRenderTarget(index=0, null) → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
+    let slot = usize::try_from(index).expect("index < 4 fits usize");
 
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+
+    if surface.is_null() {
+        if slot == 0 {
+            // D3D9 spec: RT0 must remain non-null.
+            warn!(target: LOG_TARGET, "reject SetRenderTarget(index=0, null) → INVALIDCALL");
+            return D3DERR_INVALIDCALL;
+        }
+        // Render targets 1..3 may be unbound; draws then leave the slot alone.
+        dev.unbind_extra_render_target(slot);
+        return D3D_OK;
+    }
 
     // Pull width/height via GetDesc through the surface vtable so we cover
     // both standalone (CreateRenderTarget) and texture-backed (GetSurfaceLevel
@@ -6277,10 +6338,10 @@ extern "system" fn device_set_render_target(
         }
     };
 
-    // Autogen render targets: if RT0 is changing away from an
+    // Autogen render targets: if the slot is changing away from an
     // `D3DUSAGE_AUTOGENMIPMAP` texture, regenerate its mip chain now (ordered
     // after the render/clear that just modified its level 0). Track the new
-    // RT0's autogen id for the next change.
+    // target's autogen id for the next change.
     let new_autogen = if parent.is_null() {
         None
     } else {
@@ -6288,24 +6349,32 @@ extern "system" fn device_set_render_target(
         let pt = unsafe { &*parent };
         pt.inner().autogen_mipmap().then(|| pt.texture_id())
     };
-    if let Some(old_id) = dev.cur_autogen_rt_id.take()
+    if let Some(old_id) = dev.cur_autogen_rt_ids[slot].take()
         && Some(old_id) != new_autogen
     {
         dev.push_op(Box::new(move |enc| {
             enc.run_generate_mipmaps_ordered(old_id);
         }));
     }
-    dev.cur_autogen_rt_id = new_autogen;
+    dev.cur_autogen_rt_ids[slot] = new_autogen;
 
     dev.bound_rt_mut()
-        .replace_render_target(surf, desc.width, desc.height);
+        .replace_render_target(slot, surf, desc.width, desc.height);
 
     // Remember the applied binding so a mid-frame readback flush can re-assert
     // it into the fresh frame (the encoder's pass state resets to the
     // backbuffer default each frame; a D3D9 RT binding outlives an internal
     // flush — see `last_color_rt_binding`).
+    if slot != 0 {
+        dev.last_extra_rt_bindings[slot - 1] = Some(info.clone());
+        dev.push_color_rt_binding_op(slot, info);
+        // Only render target 0 owns the viewport and scissor; the pipeline
+        // reads the extra targets' formats on the encoder thread, so no
+        // snapshot section goes stale here.
+        return D3D_OK;
+    }
     dev.last_color_rt_binding = Some(info.clone());
-    dev.push_color_rt_binding_op(info);
+    dev.push_color_rt_binding_op(0, info);
 
     // D3D9 spec: SetRenderTarget resets the viewport to cover the new
     // RT's full dimensions. Games rely on this, and skipping it leaves
@@ -6335,10 +6404,11 @@ extern "system" fn device_get_render_target(
     surface: *mut *mut c_void,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::RtDs);
-    if surface.is_null() || index != 0 {
+    if surface.is_null() || index >= D3D_MAX_SIMULTANEOUS_RENDERTARGETS {
         warn!(target: LOG_TARGET, "reject GetRenderTarget(index={index}) → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
+    let slot = usize::try_from(index).expect("index < 4 fits usize");
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -6350,9 +6420,15 @@ extern "system" fn device_get_render_target(
     // backbuffer surface — a single cached object returned by every call (the
     // `pRenderTarget == pBackBuffer` and refcount-0 identity the suite checks),
     // resolving its Metal handle live so StretchRect / LockRect readback see the
-    // current backbuffer.
-    let bound = inner.bound_rt().render_target();
+    // current backbuffer. Render targets 1..3 have no default: an unbound slot
+    // reports `D3DERR_NOTFOUND` with a null out-pointer.
+    let bound = inner.bound_rt().render_target(slot);
     let surf = if bound.is_null() {
+        if slot != 0 {
+            // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI.
+            unsafe { *surface = core::ptr::null_mut() };
+            return crate::D3DERR_NOTFOUND;
+        }
         inner.get_or_create_implicit_render_target()
     } else {
         bound
@@ -8082,6 +8158,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             dst_blend_alpha: to_u8(rs[D3DRS_DESTBLENDALPHA as usize]),
             blend_op_alpha: to_u8(rs[D3DRS_BLENDOPALPHA as usize]),
             color_write_mask: to_u8(rs[D3DRS_COLORWRITEENABLE as usize]),
+            color_write_mask_ext: [
+                to_u8(rs[D3DRS_COLORWRITEENABLE1 as usize]),
+                to_u8(rs[D3DRS_COLORWRITEENABLE2 as usize]),
+                to_u8(rs[D3DRS_COLORWRITEENABLE3 as usize]),
+            ],
         };
 
         let depth_stencil_state = mtld3d_core::depth_stencil_state::snapshot_from_state(rs);
@@ -8220,6 +8301,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 ps_id: ps_obj.shader_id(),
                 max_const_used: clamp_const_rows(ps_obj.max_const_used()),
                 uses_bump_env: ps_obj.uses_bump_env(),
+                color_out_mask: ps_obj.color_out_mask(),
             })
         }
     } else {
@@ -9668,6 +9750,7 @@ extern "system" fn device_create_pixel_shader(
     }
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
     let uses_bump_env = program.uses_bump_env();
+    let color_out_mask = program.color_out_mask();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -9675,8 +9758,13 @@ extern "system" fn device_create_pixel_shader(
     obj.inner().push_op(Box::new(move |enc| {
         enc.register_program(shader_id, program);
     }));
-    let shader_obj =
-        Direct3DPixelShader9::new(obj.inner_ptr(), shader_id, max_const_used, uses_bump_env);
+    let shader_obj = Direct3DPixelShader9::new(
+        obj.inner_ptr(),
+        shader_id,
+        max_const_used,
+        uses_bump_env,
+        color_out_mask,
+    );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
     unsafe { crate::com_ref::com_register_child(shader_ptr) };
@@ -10021,6 +10109,9 @@ const fn rs_classify(index: u32) -> RsClass {
         // PipelineSnapshot.srgb_write_enable field for the wiring.
         | D3DRS_SRGBWRITEENABLE
         | D3DRS_COLORWRITEENABLE
+        | D3DRS_COLORWRITEENABLE1
+        | D3DRS_COLORWRITEENABLE2
+        | D3DRS_COLORWRITEENABLE3
         | D3DRS_CULLMODE
         | D3DRS_SCISSORTESTENABLE
         | D3DRS_LIGHTING

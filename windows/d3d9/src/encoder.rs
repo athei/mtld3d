@@ -25,8 +25,8 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::PageBox,
     passes::{
-        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, LastBoundCache, Pass,
-        PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
+        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, ExtraColorSlot, LastBoundCache,
+        Pass, PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -47,9 +47,9 @@ use mtld3d_shared::{
     BlitCommand, BufferCreateDesc, Command, CommandType, CompileShaderLibraryParams,
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
     CreateTexturesBatchParams, DestroyResourcesBulkParams, EnsureBlitPipelineParams,
-    EnsureClearQuadPipelineParams, GetTaskFaultsParams, MetalHandle, PassDescriptor,
-    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams,
+    EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams, MetalHandle,
+    PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
         StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
@@ -2172,6 +2172,70 @@ impl FrameEncoder {
         self.pass_state.current_color_rt_has_alpha()
     }
 
+    /// Render targets 1..3 as the next pass attaches them, for the pipeline key.
+    pub fn current_extra_color_attachments(
+        &self,
+    ) -> mtld3d_core::pipeline_state::ExtraColorAttachments {
+        self.pass_state.extra_color_attachments()
+    }
+
+    /// Bind or unbind render target `slot` (1..=3).
+    ///
+    /// `binding.logical_size` is the D3D9-reported extent and `binding.scale`
+    /// what it is rasterized at, as for render target 0.
+    pub fn set_extra_color_render_target(&mut self, slot: usize, binding: Option<ExtraColorSlot>) {
+        self.pass_state.set_extra_color_render_target(slot, binding);
+    }
+
+    /// Run `f` once per bound colour target, each time with that target bound alone.
+    ///
+    /// The multi-target clear paths route through here: the clear-quad
+    /// pipelines and the fold rules are written for one colour attachment,
+    /// so each target gets the single-target treatment in turn, with depth
+    /// unbound for the scoped pass (a depth attachment smaller than the
+    /// target would clip the clear). `only_outside_pass` restricts the walk
+    /// to extras that are bound but sized unlike target 0 and therefore
+    /// attached to no pass. The device's binding set comes back exactly as
+    /// it was, alpha bits and extras included; the pass breaks this costs
+    /// are the price of a clear that cannot fold, never of a draw.
+    fn for_each_bound_color_target(
+        &mut self,
+        only_outside_pass: bool,
+        mut f: impl FnMut(&mut Self),
+    ) {
+        let saved = self.pass_state.take_color_attachments();
+        let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
+        let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
+        for slot in 0..4usize {
+            if only_outside_pass && (slot == 0 || saved.extra_matches_rt0(slot)) {
+                continue;
+            }
+            let Some(target) = saved.slot(slot) else {
+                continue;
+            };
+            self.pass_state.set_color_render_target_subresource(
+                target.texture,
+                target.logical_size.0,
+                target.logical_size.1,
+                target.format,
+                target.scale,
+                (target.subresource & 0xff, target.subresource >> 8),
+            );
+            self.pass_state.set_color_rt_has_alpha(target.has_alpha);
+            self.pass_state
+                .set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+            f(self);
+            self.end_current_pass("color_target_clear");
+        }
+        self.pass_state.set_depth_stencil_attachment(
+            prev_depth,
+            prev_depth_sampleable,
+            prev_depth_has_stencil,
+        );
+        self.pass_state.restore_color_attachments(saved);
+    }
+
     /// Current viewport `(x, y, w, h)` in pixels, with the `ensure_pass_open` fallback.
     ///
     /// Falls back to the bound RT size when the game never set a
@@ -2212,6 +2276,15 @@ impl FrameEncoder {
                 self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_color_inner(rgba, viewport, color_format);
             }
+            ColorClearOutcome::PerTarget => {
+                self.for_each_bound_color_target(false, |enc| enc.clear_color(r, g, b, a));
+                return;
+            }
+        }
+        // A target bound outside the pass (sized unlike target 0) is owed the
+        // clear too; the fold above never reached it.
+        if self.pass_state.has_extra_color_targets() {
+            self.for_each_bound_color_target(true, |enc| enc.clear_color(r, g, b, a));
         }
     }
 
@@ -2226,6 +2299,14 @@ impl FrameEncoder {
     /// clear stays on the fold path (`clear_color` + `clear_depth`) so
     /// the depth side is not forced onto the clear-quad path.
     pub fn clear_color_bounded_to_viewport(&mut self, r: u32, g: u32, b: u32, a: u32) {
+        if self.pass_state.has_extra_color_targets() {
+            // The viewport bound is evaluated per target, against that
+            // target's own extent.
+            self.for_each_bound_color_target(false, |enc| {
+                enc.clear_color_bounded_to_viewport(r, g, b, a);
+            });
+            return;
+        }
         if self.pass_state.viewport_covers_color_attachment() {
             self.clear_color(r, g, b, a);
         } else {
@@ -2259,6 +2340,12 @@ impl FrameEncoder {
         a: u32,
         rects: &[(i32, i32, i32, i32)],
     ) {
+        if self.pass_state.has_extra_color_targets() {
+            // The rects are clipped against each target's own viewport and
+            // converted at that target's scale.
+            self.for_each_bound_color_target(false, |enc| enc.clear_color_rects(r, g, b, a, rects));
+            return;
+        }
         // `rects` are the game's own; the viewport they clip against is already
         // the bound texture's, so convert before clipping rather than after, or
         // the intersection is taken between two different spaces.
@@ -2679,19 +2766,16 @@ impl FrameEncoder {
         let xform_ptr = self.scratch.alloc(&xform);
 
         // Save the device's current attachments + viewport so the one-off
-        // destination pass doesn't perturb the live render target.
-        let prev_color = self.pass_state.current_color_texture();
-        let prev_color_format = self.pass_state.current_color_format();
+        // destination pass doesn't perturb the live render target. The colour
+        // set comes back verbatim, scale and extra targets included: the
+        // blit's own binds run in already-converted coordinates and so declare
+        // the identity, which would otherwise leak onto the device's target.
+        let saved_color = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
-        // The device's binding is restored verbatim below, scale included: the
-        // blit's own binds run in already-converted coordinates and so declare
-        // the identity, which would otherwise leak onto the device's target.
-        let prev_color_logical = self.pass_state.current_color_logical_size();
-        let prev_color_scale = self.pass_state.target_scale();
 
         // Bind the destination as the colour RT with no depth attachment, then
         // open a Load pass scoped to the destination rect via the viewport.
@@ -2750,13 +2834,7 @@ impl FrameEncoder {
         self.end_current_pass("stretch_blit_scaled");
 
         // Restore the device's previous attachments + viewport.
-        self.pass_state.set_color_render_target(
-            prev_color,
-            prev_color_logical.0,
-            prev_color_logical.1,
-            prev_color_format,
-            prev_color_scale,
-        );
+        self.pass_state.restore_color_attachments(saved_color);
         self.pass_state.set_depth_stencil_attachment(
             prev_depth,
             prev_depth_sampleable,
@@ -3741,7 +3819,12 @@ impl FrameEncoder {
         // retroactively if every draw in the pass had `mask == 0`.
         // Building both is cheap — cache hit on the second call after
         // the first frame; CreateRenderPipeline thunk on cold-miss.
-        if !with_color.is_null() && snapshot.rs.color_write_mask == 0 && snapshot.has_color_output()
+        // Rule H never strips a pass with extra render targets, so the twin
+        // is only built for the single-target shape.
+        if !with_color.is_null()
+            && snapshot.rs.color_write_mask == 0
+            && snapshot.has_color_output()
+            && snapshot.extra.present_mask == 0
         {
             // No-color twin: same identity except the attach flag.
             // Explicit `.clone()` because PipelineSnapshot is no longer
@@ -6496,6 +6579,26 @@ fn pass_to_descriptor(
             p.color_slice(),
             p.color_level(),
         ),
+        extra_color: core::array::from_fn(|i| {
+            let a = &p.extra_color()[i];
+            if !a.is_bound() {
+                return ExtraColorDesc::NONE;
+            }
+            ExtraColorDesc {
+                texture: a.texture(),
+                subresource: a.slice() | (a.level() << 8),
+                load_action: match a.load() {
+                    ColorLoad::Load => LoadAction::Load,
+                    ColorLoad::Clear { .. } => LoadAction::Clear,
+                    ColorLoad::DontCare => LoadAction::DontCare,
+                },
+                store_action: match a.store() {
+                    PassStoreAction::Store => StoreAction::Store,
+                    PassStoreAction::DontCare => StoreAction::DontCare,
+                },
+                reserved: 0,
+            }
+        }),
     }
 }
 
@@ -6553,6 +6656,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
         pass_flags: PassDescriptor::pack_flags(true, 0, 0),
+        extra_color: [ExtraColorDesc::NONE; 3],
     }
 }
 
