@@ -191,6 +191,10 @@ case "${1:-}" in
         'extern "stdcall"' "$file"
     banned 'msg_send!|class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
         'untyped Obj-C selector' "$file"
+    banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
+        'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$file"
+    banned 'DefaultHasher|RandomState' 'FxHash for maps, xxh3 for content' \
+        'SipHash hasher: content hashing uses xxhash_rust::xxh3::Xxh3' "$file"
     confined 'inline\(always\)' 'Inline attributes' \
         '#[inline(always)] outside the one measured site' "$INLINE_ALWAYS_SITES" "$file"
     confined '^[ \t]*static .*: *OnceLock' 'LazyLock over OnceLock' \
@@ -230,6 +234,10 @@ banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
     'extern "stdcall"' "$@"
 banned 'msg_send!|class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
     'untyped Obj-C selector' "$@"
+banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
+    'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$@"
+banned 'DefaultHasher|RandomState' 'FxHash for maps, xxh3 for content' \
+    'SipHash hasher: content hashing uses xxhash_rust::xxh3::Xxh3' "$@"
 
 confined 'inline\(always\)' 'Inline attributes' \
     '#[inline(always)] outside the one measured site' "$INLINE_ALWAYS_SITES" "$@"

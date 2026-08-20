@@ -3,11 +3,6 @@
 //! Holds the `passes: Vec<Pass>` plus the bookkeeping for pass breaks on
 //! `SetRenderTarget`, `SetDepthStencilSurface`, and mid-frame `Clear`.
 
-use std::{
-    collections::{HashMap, HashSet},
-    hash::BuildHasher,
-};
-
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
@@ -617,11 +612,11 @@ pub struct PassState {
     /// so accumulated draws survive across pass breaks. Reset each frame
     /// in `reset_frame`. Capacity hint matches a typical frame shape
     /// (backbuffer + a few CSM ping-pong RTs).
-    seen_color_rts: HashSet<(MetalHandle<MTLTextureKind>, u32)>,
+    seen_color_rts: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
     /// Depth-attachment textures that have already been used as a depth rt in this frame.
     ///
     /// Same semantics as `seen_color_rts`.
-    seen_depth_rts: HashSet<MetalHandle<MTLTextureKind>>,
+    seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule D (last-use color `Store=DontCare`) exempts this handle so
@@ -697,18 +692,18 @@ pub struct PassState {
     /// handle in this set is a cascade-depth read, and is counted
     /// into `frame_cascade_samples`. Persistent across frames
     /// (textures are stable resource identities).
-    seen_sampleable_depth_textures: HashSet<MetalHandle<MTLTextureKind>>,
+    seen_sampleable_depth_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Per-frame counter: how many caster draws targeted each cascade depth handle.
     ///
     /// Counts the draws made this frame. Incremented in `note_caster_draw`,
     /// drained + cleared by `take_cascade_frame_summary`.
-    frame_caster_writes: HashMap<MetalHandle<MTLTextureKind>, u32>,
+    frame_caster_writes: FxHashMap<MetalHandle<MTLTextureKind>, u32>,
     /// Per-frame counter: how many `SetFragmentTexture` binds of a known cascade depth handle.
     ///
     /// Counts the binds emitted this frame. Incremented in `emit_command`
     /// when the bound texture is in `seen_sampleable_depth_textures`.
     /// Drained by `take_cascade_frame_summary`.
-    frame_cascade_samples: HashMap<MetalHandle<MTLTextureKind>, u32>,
+    frame_cascade_samples: FxHashMap<MetalHandle<MTLTextureKind>, u32>,
     /// Monotonic per-frame counter for the cascade-summary log line.
     ///
     /// Distinct from `submit_seq` (encoder-thread): incremented in
@@ -779,8 +774,8 @@ impl PassState {
             viewport_max_z: 1.0,
             last_emitted_viewport: None,
             pending_leading_blits: Vec::new(),
-            seen_color_rts: HashSet::with_capacity(4),
-            seen_depth_rts: HashSet::with_capacity(2),
+            seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
+            seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
@@ -791,9 +786,9 @@ impl PassState {
             backbuffer_logical_size: (0, 0),
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
-            seen_sampleable_depth_textures: HashSet::with_capacity(8),
-            frame_caster_writes: HashMap::with_capacity(8),
-            frame_cascade_samples: HashMap::with_capacity(8),
+            seen_sampleable_depth_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
+            frame_caster_writes: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            frame_cascade_samples: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             frame_seq: 0,
             cmd_vec_realloc_bytes: 0,
             command_vec_pool: Vec::with_capacity(MAX_CMD_VEC_POOL),
@@ -1210,8 +1205,9 @@ impl PassState {
     pub fn take_cascade_frame_summary(
         &mut self,
     ) -> (u64, Vec<(MetalHandle<MTLTextureKind>, u32, u32)>) {
-        let mut keys: HashSet<MetalHandle<MTLTextureKind>> = HashSet::with_capacity(
+        let mut keys: FxHashSet<MetalHandle<MTLTextureKind>> = FxHashSet::with_capacity_and_hasher(
             self.frame_caster_writes.len() + self.frame_cascade_samples.len(),
+            FxBuildHasher,
         );
         keys.extend(self.frame_caster_writes.keys().copied());
         keys.extend(self.frame_cascade_samples.keys().copied());
@@ -2361,9 +2357,9 @@ impl PassState {
     /// so clear-only passes are already handled, and before
     /// `cull_dead_clear_only_passes` (Rule F) — though Rule F won't
     /// touch the pass anyway because it still has draws.
-    pub fn strip_color_from_no_color_draw_passes<S: BuildHasher>(
+    pub fn strip_color_from_no_color_draw_passes(
         &mut self,
-        alt: &HashMap<u64, MetalHandle<MTLRenderPipelineStateKind>, S>,
+        alt: &FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
     ) {
         if !ENABLE_NO_COLOR_PASS_FOR_DRAWS {
             return;
@@ -2744,8 +2740,8 @@ impl PassState {
     ///   `i.color_store`. Then update the map with `i`.
     pub fn finalize_store_actions(&mut self) {
         if ENABLE_LAST_USE_DEPTH_DONTCARE {
-            let mut handled: HashSet<MetalHandle<MTLTextureKind>> =
-                HashSet::with_capacity(self.seen_depth_rts.len());
+            let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
+                FxHashSet::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
             for pass in self.passes.iter_mut().rev() {
                 if pass.depth_texture.is_null() {
                     continue;
@@ -2781,8 +2777,8 @@ impl PassState {
             }
         }
         if ENABLE_NEXT_CLEAR_COLOR_DONTCARE {
-            let mut next_color_use: HashMap<(MetalHandle<MTLTextureKind>, u32), usize> =
-                HashMap::with_capacity(self.seen_color_rts.len());
+            let mut next_color_use: FxHashMap<(MetalHandle<MTLTextureKind>, u32), usize> =
+                FxHashMap::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
             for i in (0..self.passes.len()).rev() {
                 let rt = self.passes[i].color_texture;
                 let key = (rt, self.passes[i].color_subresource);
@@ -2803,8 +2799,8 @@ impl PassState {
             }
         }
         if ENABLE_LAST_USE_COLOR_DONTCARE {
-            let mut handled: HashSet<(MetalHandle<MTLTextureKind>, u32)> =
-                HashSet::with_capacity(self.seen_color_rts.len());
+            let mut handled: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
+                FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
             for pass in self.passes.iter_mut().rev() {
                 let rt = pass.color_texture;
                 if rt.is_null() || rt == self.backbuffer_texture {
@@ -5457,7 +5453,7 @@ mod tests {
             s.emit_command(dummy_draw());
         }
         s.end_current_pass("test");
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
         s.strip_color_from_no_color_draw_passes(&alt);
         let pass = &s.passes()[0];
@@ -5495,7 +5491,7 @@ mod tests {
         s.emit_command(set_pso(PSO_WITH));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
         s.strip_color_from_no_color_draw_passes(&alt);
         let pass = &s.passes()[0];
@@ -5522,7 +5518,7 @@ mod tests {
         s.emit_command(set_pso(PSO_WITH));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
         s.strip_color_from_no_color_draw_passes(&alt);
         let pass = &s.passes()[0];
@@ -5540,7 +5536,7 @@ mod tests {
         let mut s = fresh();
         s.clear_color(0, 0, 0, 0);
         s.flush_pending_clears();
-        let alt: HashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = HashMap::new();
+        let alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = FxHashMap::default();
         s.strip_color_from_no_color_draw_passes(&alt);
         let pass = &s.passes()[0];
         // Color still attached — Rule H bailed because the pass had
@@ -5560,7 +5556,7 @@ mod tests {
         s.emit_command(set_pso(PSO_WITH));
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
-        let alt: HashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = HashMap::new();
+        let alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = FxHashMap::default();
         s.strip_color_from_no_color_draw_passes(&alt);
         let pass = &s.passes()[0];
         assert_eq!(
@@ -5599,7 +5595,7 @@ mod tests {
         }
         s.end_current_pass("test");
 
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_CASTER, pso(PSO_CASTER_NO_COLOR));
         alt.insert(PSO_CLEAR_QUAD_DEPTH, pso(PSO_CLEAR_QUAD_DEPTH));
         s.strip_color_from_no_color_draw_passes(&alt);
@@ -5656,7 +5652,7 @@ mod tests {
         s.end_current_pass("test");
         // Only the real caster needs a side-map entry; clear-quad
         // PSOs are removed wholesale and don't need to resolve.
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
         s.strip_color_from_no_color_draw_passes(&alt);
 
@@ -5712,7 +5708,7 @@ mod tests {
         s.emit_command(dummy_draw());
         s.end_current_pass("test");
 
-        let mut alt = HashMap::new();
+        let mut alt = FxHashMap::default();
         alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
         s.strip_color_from_no_color_draw_passes(&alt);
 
@@ -5759,7 +5755,7 @@ mod tests {
         s.close_color_clear_quad_block(start);
         s.end_current_pass("test");
 
-        let alt: HashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = HashMap::new();
+        let alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> = FxHashMap::default();
         s.strip_color_from_no_color_draw_passes(&alt);
 
         let pass = &s.passes()[0];

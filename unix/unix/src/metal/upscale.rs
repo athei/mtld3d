@@ -33,7 +33,7 @@
 //! release deferred to a command buffer that outlives the evicted scaler.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::hash_map::Entry,
     sync::{Mutex, OnceLock},
 };
 
@@ -49,6 +49,7 @@ use objc2_metal_fx::{
     MTLFXSpatialScaler, MTLFXSpatialScalerBase, MTLFXSpatialScalerColorProcessingMode,
     MTLFXSpatialScalerDescriptor,
 };
+use rustc_hash::FxHashMap;
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
@@ -87,7 +88,7 @@ static CACHE: OnceLock<Option<Mutex<ScalerCache>>> = OnceLock::new();
 /// The live scalers, plus what it takes to bound them.
 struct ScalerCache {
     /// One entry per geometry currently served.
-    scalers: HashMap<ScalerKey, ScalerEntry>,
+    scalers: FxHashMap<ScalerKey, ScalerEntry>,
     /// Monotonic lookup counter that orders [`ScalerEntry::last_used`].
     tick: u64,
     /// Evicted scalers, awaiting a command buffer to outlive them.
@@ -320,7 +321,7 @@ fn init_cache(device: &ProtocolObject<dyn MTLDevice>) -> Option<Mutex<ScalerCach
         return None;
     }
     Some(Mutex::new(ScalerCache {
-        scalers: HashMap::new(),
+        scalers: FxHashMap::default(),
         tick: 0,
         evicted: Vec::new(),
     }))
@@ -394,7 +395,7 @@ struct ScratchKey {
 /// Stores the wire handle rather than a `Retained` so the map is trivially
 /// `Send`; each use re-borrows through `IntoRetained`, which bumps the refcount
 /// and leaves the cache's own retain live.
-static SCRATCH: OnceLock<Mutex<HashMap<ScratchKey, u64>>> = OnceLock::new();
+static SCRATCH: OnceLock<Mutex<FxHashMap<ScratchKey, u64>>> = OnceLock::new();
 
 /// Get, or create and cache, a `Private` scratch texture of this size and format.
 ///
@@ -415,7 +416,7 @@ pub fn scratch_target(
         height,
         format,
     };
-    let cache = SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = SCRATCH.get_or_init(|| Mutex::new(FxHashMap::default()));
     let handle = {
         let mut scratch = cache.lock().ok()?;
         match scratch.entry(key) {

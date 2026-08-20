@@ -16,10 +16,7 @@
 //! Pipelines + library are process-lifetime (leaked via `Retained::into_raw`)
 //! — same posture as `clear_quad` / `present`.
 
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-};
+use std::sync::{Mutex, OnceLock};
 
 use mtld3d_shared::{
     EnsureBlitPipelineParams, MetalHandle,
@@ -32,6 +29,7 @@ use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
     MTLRenderPipelineDescriptor,
 };
+use rustc_hash::FxHashMap;
 
 use super::texture::mtl_pixel_format;
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -99,7 +97,7 @@ const PS_NAME: &str = "mtld3d_blit_ps";
 struct BlitCache {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
-    pipelines: Mutex<HashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>>,
+    pipelines: Mutex<FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>>,
 }
 
 static CACHE: OnceLock<Option<BlitCache>> = OnceLock::new();
@@ -166,7 +164,7 @@ fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option
     Some(BlitCache {
         vs_fn: vs_handle,
         ps_fn: ps_handle,
-        pipelines: Mutex::new(HashMap::new()),
+        pipelines: Mutex::new(FxHashMap::default()),
     })
 }
 
