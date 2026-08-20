@@ -27,6 +27,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `state_block.rs` | Capture/Apply (ALL); VERTEXSTATE restores FVF; PIXELSTATE restores sampler; Begin/EndStateBlock recording. |
 | `query.rs` | EVENT fence; OCCLUSION sample count; TIMESTAMP contract. |
 | `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice`/`SetClipPlane` stubs; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
+| `unload.rs` | `LoadLibrary` → `Direct3DCreate9` → `Release` → `FreeLibrary`, then a continuable exception raised with a resuming handler appended at the end of the chain: proves the unloaded image left no vectored exception handler behind (no harness: its `raw-dylib` import would keep the module mapped). |
 
 ## Documented limitations / stubs pinned by tests
 
