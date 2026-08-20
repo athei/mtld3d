@@ -263,8 +263,9 @@ bitflags::bitflags! {
 /// Frame-hitch attribution around cursor transitions.
 ///
 /// `CursorState::note_present` feeds it once per `Present`. It keeps a
-/// running typical Present-to-Present interval and, when one interval blows
-/// past it, logs a single debug line that ties the hitched frame to the
+/// running typical Present-to-Present interval and, when one interval exceeds
+/// 1.5x of it by at least `HITCH_MIN_EXCESS_US`, logs a single debug line
+/// that ties the hitched frame to the
 /// last show/hide transition, to the wall time the Win32 cursor calls
 /// consumed since the previous `Present`, and to the `WM_SETCURSOR`
 /// re-asserts in that window. A clean game thread on a hitched frame (zero
@@ -295,13 +296,11 @@ impl HitchProbe {
     }
 }
 
-/// A Present interval this many times the typical one is a hitch.
-const HITCH_RATIO: u64 = 2;
 /// Minimum excess over the typical interval for a hitch, µs.
 ///
-/// Applied on top of `HITCH_RATIO`, so a 4 ms frame at 240 Hz doubling to
-/// 8 ms does not count.
-const HITCH_MIN_EXCESS_US: u64 = 4_000;
+/// Applied on top of a 1.5x ratio, so jitter on a fast panel stays quiet
+/// while one dropped refresh at 120 Hz (8.3 ms to 16.6 ms) registers.
+const HITCH_MIN_EXCESS_US: u64 = 3_000;
 /// Intervals above this are pauses (alt-tab, loading), not frame hitches.
 const HITCH_MAX_INTERVAL_US: u64 = 500_000;
 
@@ -366,7 +365,7 @@ impl CursorState {
             typical_us - typical_us / 16 + interval_us / 16
         };
         let hitch = typical_us != 0
-            && interval_us > typical_us * HITCH_RATIO
+            && interval_us * 2 > typical_us * 3
             && interval_us > typical_us + HITCH_MIN_EXCESS_US;
         if !hitch {
             return;

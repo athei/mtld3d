@@ -640,6 +640,14 @@ pub fn set_display_sync_enabled(
     store_min_present_duration(panel_max_hz, pacing);
 }
 
+/// Host-time seconds (`CFTimeInterval`) to nanoseconds, saturating.
+///
+/// `presentedTime` is a `CACurrentMediaTime`-based host time; a session's
+/// uptime in nanoseconds sits far below `u64::MAX`.
+pub fn host_seconds_to_ns(secs: f64) -> u64 {
+    bounded_cast::f64_to_u64_saturating(secs * 1e9)
+}
+
 /// Numeric casts where the cast lints fire but the bounds are established by the caller.
 ///
 /// Grouping them under one mod-level allow collapses what would otherwise be
@@ -663,6 +671,20 @@ mod bounded_cast {
             return u32::MAX;
         }
         v as u32
+    }
+
+    /// Saturating `f64 → u64`.
+    ///
+    /// NaN/negative → 0, ≥ `u64::MAX` → `u64::MAX`; all other inputs land in
+    /// `(0.0, u64::MAX)` where the cast is exact to f64 precision.
+    pub fn f64_to_u64_saturating(v: f64) -> u64 {
+        if !v.is_finite() || v <= 0.0 {
+            return 0;
+        }
+        if v >= u64::MAX as f64 {
+            return u64::MAX;
+        }
+        v as u64
     }
 
     /// `f64 → f32` narrowing.
