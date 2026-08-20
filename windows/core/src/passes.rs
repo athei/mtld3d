@@ -832,6 +832,10 @@ pub struct PassState {
     /// the pipeline and the PS variant, so the size rule is evaluated once
     /// per bind rather than once per draw.
     current_extra_present_mask: u8,
+    /// `current_extra_color` as the pipeline key sees it, rebuilt on every colour bind.
+    ///
+    /// Cached so a draw copies 16 bytes instead of walking the three slots.
+    current_extra_attachments: ExtraColorAttachments,
     current_depth_texture: MetalHandle<MTLTextureKind>,
     /// Descriptor bits for the currently bound colour/depth attachments.
     ///
@@ -1030,6 +1034,7 @@ impl PassState {
             current_color_format: PixelFormat::Bgra8Unorm,
             current_extra_color: [ExtraColorSlot::NONE; 3],
             current_extra_present_mask: 0,
+            current_extra_attachments: ExtraColorAttachments::NONE,
             current_depth_texture: MetalHandle::NULL,
             // Placeholder; `reset_frame` reseeds these for the backbuffer, and
             // every `SetRenderTarget` bind overwrites `COLOR_HAS_ALPHA` via
@@ -1126,6 +1131,7 @@ impl PassState {
         // fresh frame, exactly as it does render target 0.
         self.current_extra_color = [ExtraColorSlot::NONE; 3];
         self.current_extra_present_mask = 0;
+        self.current_extra_attachments = ExtraColorAttachments::NONE;
         // The backbuffer is an alpha-bearing (`Bgra8Unorm` / A8R8G8B8) target,
         // so destination-alpha blend factors resolve unclamped — byte-identical
         // to the pre-`COLOR_HAS_ALPHA` behaviour. A sub-frame `SetRenderTarget`
@@ -1323,18 +1329,8 @@ impl PassState {
 
     /// Render targets 1..3 as the next pass will attach them, for the pipeline key.
     #[must_use]
-    pub fn extra_color_attachments(&self) -> ExtraColorAttachments {
-        let mut has_alpha_mask = 0u8;
-        for (i, slot) in self.current_extra_color.iter().enumerate() {
-            if slot.has_alpha {
-                has_alpha_mask |= 1 << i;
-            }
-        }
-        ExtraColorAttachments {
-            formats: core::array::from_fn(|i| self.current_extra_color[i].format),
-            present_mask: self.current_extra_present_mask,
-            has_alpha_mask: has_alpha_mask & self.current_extra_present_mask,
-        }
+    pub const fn extra_color_attachments(&self) -> ExtraColorAttachments {
+        self.current_extra_attachments
     }
 
     /// Bit `i` set ⇒ render target `i + 1` takes part in the next pass.
@@ -1471,6 +1467,17 @@ impl PassState {
             }
         }
         self.current_extra_present_mask = mask;
+        let mut has_alpha_mask = 0u8;
+        for (i, slot) in self.current_extra_color.iter().enumerate() {
+            if slot.has_alpha {
+                has_alpha_mask |= 1 << i;
+            }
+        }
+        self.current_extra_attachments = ExtraColorAttachments {
+            formats: core::array::from_fn(|i| self.current_extra_color[i].format),
+            present_mask: mask,
+            has_alpha_mask: has_alpha_mask & mask,
+        };
     }
 
     /// Record that a colour texture is read back this session.

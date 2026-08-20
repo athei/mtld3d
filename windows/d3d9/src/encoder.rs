@@ -2173,7 +2173,7 @@ impl FrameEncoder {
     }
 
     /// Render targets 1..3 as the next pass attaches them, for the pipeline key.
-    pub fn current_extra_color_attachments(
+    pub const fn current_extra_color_attachments(
         &self,
     ) -> mtld3d_core::pipeline_state::ExtraColorAttachments {
         self.pass_state.extra_color_attachments()
