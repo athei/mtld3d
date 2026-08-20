@@ -1473,10 +1473,10 @@ fn encode_pass(
                 // depth — flipping one without the other would either
                 // be a Metal validation error or a redundant store.
                 stencil_attach.setStoreAction(map_store_action(pass.depth_store_action));
-                match pass.depth_load_action {
+                match pass.stencil_load_action {
                     LoadAction::Clear => {
                         stencil_attach.setLoadAction(MTLLoadAction::Clear);
-                        stencil_attach.setClearStencil(0);
+                        stencil_attach.setClearStencil(pass.stencil_clear_value);
                     }
                     LoadAction::Load => stencil_attach.setLoadAction(MTLLoadAction::Load),
                     LoadAction::DontCare => {
@@ -1871,6 +1871,9 @@ fn encode_pass(
                     let blue = f32::from_bits(to_u32(cmd.param_c));
                     let alpha = f32::from_bits(to_u32(cmd.param_d));
                     encoder.setBlendColorRed_green_blue_alpha(red, green, blue, alpha);
+                }
+                Some(CommandType::SetStencilReference) => {
+                    encoder.setStencilReferenceValue(cmd.param_a);
                 }
                 None => {
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "unknown command type {t}", t = cmd.cmd);

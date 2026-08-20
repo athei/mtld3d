@@ -466,13 +466,7 @@ pub extern "C" fn create_depth_stencil_state_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateDepthStencilStateParams = &mut params;
 
-    if let Some(handle) = metal::create_depth_stencil_state(
-        params.device_handle,
-        params.depth_test_enable,
-        params.depth_write_enable,
-        params.depth_compare_func,
-        params.id,
-    ) {
+    if let Some(handle) = metal::create_depth_stencil_state(params) {
         params.state_handle = handle;
         STATUS_SUCCESS
     } else {

@@ -178,6 +178,20 @@ pub enum CompareFunc {
     Always = 7,
 }
 
+/// `MTLStencilOperation` wire encoding.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum StencilOp {
+    Keep = 0,
+    Zero = 1,
+    Replace = 2,
+    IncrementClamp = 3,
+    DecrementClamp = 4,
+    Invert = 5,
+    IncrementWrap = 6,
+    DecrementWrap = 7,
+}
+
 /// `MTLBlendFactor` wire encoding.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
@@ -540,6 +554,9 @@ mod tests {
 
         assert_eq!(LoadAction::Clear as u32, 2);
         assert_eq!(CompareFunc::Always as u32, 7);
+        assert_eq!(StencilOp::Keep as u32, 0);
+        assert_eq!(StencilOp::DecrementWrap as u32, 7);
+        assert_eq!(StencilOp::from_repr(8), None);
         assert_eq!(BlendFactor::OneMinusBlendColor as u32, 12);
         assert_eq!(BlendOperation::Add as u32, 0);
         assert_eq!(BlendOperation::Max as u32, 4);

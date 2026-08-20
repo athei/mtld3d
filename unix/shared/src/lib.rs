@@ -29,8 +29,8 @@ pub use params::{
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetTaskFaultsParams, InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
 };
 
 #[repr(u32)]

@@ -64,6 +64,8 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Depth**: sampleable depth textures (INTZ, DF16, DF24) with hardware
   shadow-compare PCF, depth bias and slope-scale bias, depth clamp for
   pre-transformed geometry.
+- **Stencil**: the full test, both faces, and every stencil operation, with
+  `Clear(D3DCLEAR_STENCIL)` bounded to the viewport independently of depth.
 - **Sampling and output**: anisotropic filtering, sRGB read (compressed
   formats) and sRGB write, alpha test, scissor, separate alpha blend, blend
   factor, color write masks.
@@ -83,8 +85,6 @@ Missing features a D3D9 application can reasonably want. Each fails cleanly,
 with an absent cap bit or a documented error return, so applications take their
 own fallback paths instead of breaking:
 
-- **Stencil**: the caps report no stencil support; stencil render states are
-  ignored and stencil clears are skipped.
 - **MSAA**: multisampled creates are rejected; CheckDeviceMultiSampleType only
   accepts D3DMULTISAMPLE_NONE.
 - **Multiple render targets**: one simultaneous render target is advertised.

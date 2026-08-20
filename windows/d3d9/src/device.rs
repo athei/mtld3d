@@ -2247,6 +2247,23 @@ impl DeviceInner {
         !self.bound_rt.depth_stencil().is_null() || !self.depth_stencil_handle.is_null()
     }
 
+    /// Whether the bound depth-stencil surface carries a stencil plane.
+    ///
+    /// D3D9 silently ignores `D3DCLEAR_STENCIL` against a depth-only format
+    /// (D16 / D24X8 / D32) rather than failing the call, so `Clear` masks the
+    /// flag off instead of rejecting it.
+    pub fn depth_stencil_has_stencil(&self) -> bool {
+        if !self.depth_stencil_bound() {
+            return false;
+        }
+        let bound = self.bound_rt.depth_stencil();
+        if bound.is_null() {
+            return depth_format_has_stencil(self.depth_stencil_format);
+        }
+        // SAFETY: non-null check passed; the bound-RT refcount holds it live.
+        depth_format_has_stencil(unsafe { (*bound).standalone_format() })
+    }
+
     /// The device's default depth-stencil format (`D3DFMT_*`), or `0` when none.
     pub const fn depth_stencil_format(&self) -> u32 {
         self.depth_stencil_format
@@ -6620,7 +6637,7 @@ extern "system" fn device_clear(
     flags: u32,
     color: u32,
     z: f32,
-    _stencil: u32,
+    stencil: u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Frame);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -6701,15 +6718,25 @@ extern "system" fn device_clear(
         }
     }
 
-    if flags & D3DCLEAR_ZBUFFER != 0 {
-        let value_bits = f32::to_bits(z);
-        dev.push_op(Box::new(move |enc| {
-            enc.clear_depth(value_bits);
-        }));
-    }
-
-    if flags & D3DCLEAR_STENCIL != 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Clear: D3DCLEAR_STENCIL flag set but stencil clear not implemented");
+    let z_bits = f32::to_bits(z);
+    // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
+    let stencil = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
+    let clear_z = flags & D3DCLEAR_ZBUFFER != 0;
+    let clear_s = flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil();
+    match (clear_z, clear_s) {
+        // Both planes in one op so a mid-frame clear paints one quad:
+        // shadow-volume renderers clear depth and stencil together between
+        // lights.
+        (true, true) => dev.push_op(Box::new(move |enc| {
+            enc.clear_depth_stencil(z_bits, stencil);
+        })),
+        (true, false) => dev.push_op(Box::new(move |enc| {
+            enc.clear_depth(z_bits);
+        })),
+        (false, true) => dev.push_op(Box::new(move |enc| {
+            enc.clear_stencil(stencil);
+        })),
+        (false, false) => {}
     }
 
     0 // S_OK
@@ -8057,14 +8084,15 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             color_write_mask: to_u8(rs[D3DRS_COLORWRITEENABLE as usize]),
         };
 
+        let depth_stencil_state = mtld3d_core::depth_stencil_state::snapshot_from_state(rs);
         let mut depth_scissor = DepthScissorFlags::empty();
         depth_scissor.set(
             DepthScissorFlags::DEPTH_ENABLE,
-            rs[D3DRS_ZENABLE as usize] != 0,
+            depth_stencil_state.depth_enable != 0,
         );
         depth_scissor.set(
             DepthScissorFlags::DEPTH_WRITE,
-            rs[D3DRS_ZWRITEENABLE as usize] != 0,
+            depth_stencil_state.depth_write != 0,
         );
         depth_scissor.set(
             DepthScissorFlags::SCISSOR_TEST,
@@ -8083,12 +8111,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         Some(RenderStateSnapshot {
             pipeline_rs,
             depth_scissor,
-            depth_func: to_u8(rs[D3DRS_ZFUNC as usize]),
+            depth_stencil_state,
             cull_mode: to_u8(rs[D3DRS_CULLMODE as usize]),
             scissor_rect,
             blend_factor: rs[D3DRS_BLENDFACTOR as usize],
             depth_bias: rs[D3DRS_DEPTHBIAS as usize],
             slope_scale_depth_bias: rs[D3DRS_SLOPESCALEDEPTHBIAS as usize],
+            stencil_ref: rs[D3DRS_STENCILREF as usize],
         })
     } else {
         None
@@ -10049,22 +10078,27 @@ const fn rs_classify(index: u32) -> RsClass {
         // decals (shadows, projectors, alpha overlays) z-fight with
         // the surface they sit on.
         | D3DRS_DEPTHBIAS
-        | D3DRS_SLOPESCALEDEPTHBIAS => RsClass::Consumed,
-
-        // Bucket B — not yet implemented → port-target candidates.
-        D3DRS_STENCILENABLE => RsClass::PortCandidate("stencil test"),
-        D3DRS_STENCILFAIL
+        | D3DRS_SLOPESCALEDEPTHBIAS
+        // The stencil states reach Metal through
+        // depth_stencil_state::snapshot_from_state, whose per-field tests
+        // assert that mutating any of them produces a different
+        // DepthStencilKey. STENCILREF is the exception by design: it rides
+        // the encoder as SetStencilReference, not the state object.
+        | D3DRS_STENCILENABLE
+        | D3DRS_STENCILFAIL
         | D3DRS_STENCILZFAIL
         | D3DRS_STENCILPASS
         | D3DRS_STENCILFUNC
         | D3DRS_STENCILMASK
         | D3DRS_STENCILWRITEMASK
-        | D3DRS_STENCILREF => RsClass::PortCandidate("stencil"),
-        D3DRS_TWOSIDEDSTENCILMODE => RsClass::PortCandidate("two-sided stencil"),
-        D3DRS_CCW_STENCILFAIL
+        | D3DRS_STENCILREF
+        | D3DRS_TWOSIDEDSTENCILMODE
+        | D3DRS_CCW_STENCILFAIL
         | D3DRS_CCW_STENCILZFAIL
         | D3DRS_CCW_STENCILPASS
-        | D3DRS_CCW_STENCILFUNC => RsClass::PortCandidate("CCW stencil"),
+        | D3DRS_CCW_STENCILFUNC => RsClass::Consumed,
+
+        // Bucket B — not yet implemented → port-target candidates.
         D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
         D3DRS_RANGEFOGENABLE => RsClass::PortCandidate("range fog"),
         D3DRS_FILLMODE => {
