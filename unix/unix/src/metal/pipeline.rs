@@ -74,7 +74,13 @@ pub fn create_render_pipeline(
         } else {
             ""
         };
-        let label = objc2_foundation::NSString::from_str(&format!("{vs_name} + {ps_name}{suffix}"));
+        let mrt = if params.extra_present_mask == 0 {
+            String::new()
+        } else {
+            format!(" mrt={:#x}", params.extra_present_mask)
+        };
+        let label =
+            objc2_foundation::NSString::from_str(&format!("{vs_name} + {ps_name}{suffix}{mrt}"));
         desc.setLabel(Some(&label));
     }
 
@@ -113,6 +119,30 @@ pub fn create_render_pipeline(
             color0.setSourceAlphaBlendFactor(mtl_blend_factor(params.src_blend_alpha));
             color0.setDestinationAlphaBlendFactor(mtl_blend_factor(params.dst_blend_alpha));
             color0.setAlphaBlendOperation(mtl_blend_op(params.blend_op_alpha));
+        }
+    }
+
+    // Render targets 1..3. Same format contract as attachment 0: each
+    // declared slot must match the texture the pass binds there. The blend
+    // operations are the shared ones; the factors arrive per attachment.
+    for (i, extra) in params.extra.iter().enumerate() {
+        if params.extra_present_mask & (1 << i) == 0 {
+            continue;
+        }
+        // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+        // subscripts 1..=3 are within Metal's colour attachment count.
+        let color = unsafe { desc.colorAttachments().objectAtIndexedSubscript(i + 1) };
+        color.setPixelFormat(mtl_pixel_format(extra.format));
+        let mask = MTLColorWriteMask::from_bits_truncate(extra.write_mask.bits() as usize);
+        color.setWriteMask(mask);
+        if params.blend_enable != 0 {
+            color.setBlendingEnabled(true);
+            color.setSourceRGBBlendFactor(mtl_blend_factor(extra.src_blend));
+            color.setDestinationRGBBlendFactor(mtl_blend_factor(extra.dst_blend));
+            color.setRgbBlendOperation(mtl_blend_op(params.blend_op));
+            color.setSourceAlphaBlendFactor(mtl_blend_factor(extra.src_blend_alpha));
+            color.setDestinationAlphaBlendFactor(mtl_blend_factor(extra.dst_blend_alpha));
+            color.setAlphaBlendOperation(mtl_blend_op(params.blend_op_alpha));
         }
     }
 

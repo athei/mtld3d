@@ -1595,6 +1595,24 @@ impl Harness {
         Surface::from_raw(out)
     }
 
+    /// `GetRenderTarget(index)` with the raw `HRESULT`.
+    ///
+    /// Returns `(hr, surface)`; the surface is `None` when the call left the
+    /// out-pointer null (an unbound slot reports `D3DERR_NOTFOUND` that way).
+    pub fn render_target_hr(&self, index: u32) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_render_target)(self.device, index, &raw mut out) };
+        let wrapped = (!out.is_null()).then(|| Surface::from_raw(out));
+        (hr, wrapped)
+    }
+
+    /// `SetRenderTarget(index, NULL)`.
+    pub fn clear_render_target(&self, index: u32) -> i32 {
+        // SAFETY: vtable thunk; a null surface is the documented unbind.
+        unsafe { (self.dev_vtbl().set_render_target)(self.device, index, core::ptr::null_mut()) }
+    }
+
     /// `SetDepthStencilSurface(surface)`.
     pub fn set_depth_stencil_surface(&self, surface: &Surface<'_>) -> i32 {
         // SAFETY: vtable thunk; `surface` is a live binding for the call.

@@ -27,10 +27,10 @@ pub use params::{
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
-    GetTaskFaultsParams, InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorAttachmentParams,
+    ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, PassDescriptor,
+    SetDisplaySyncEnabledParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
 };
 
 #[repr(u32)]

@@ -16,8 +16,8 @@ use mtld3d_types::{
     D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
     D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN,
     D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -615,6 +615,15 @@ extern "system" fn d3d9_check_device_format(
     if rtype == D3DRTYPE_SURFACE
         && usage & D3DUSAGE_QUERY_SRGBWRITE != 0
         && usage & D3DUSAGE_RENDERTARGET == 0
+    {
+        return D3DERR_NOTAVAILABLE;
+    }
+    // D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING asks whether the format blends
+    // as a render target. Every colour attachment blends on Metal, so the
+    // answer is the render-target question itself, whether or not the caller
+    // also passed D3DUSAGE_RENDERTARGET.
+    if usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING != 0
+        && !is_render_target_format(check_format)
     {
         return D3DERR_NOTAVAILABLE;
     }

@@ -1188,13 +1188,15 @@ impl FfState {
             fog_mode: fog.vertex_mode,
             fog_table_mode: fog.table_mode,
             // depth_sampler_mask / depth_fetch_mask / volume_sampler_mask /
-            // tt_projected_mask are per-bind-state / texture-stage properties,
-            // not render-state; the encoder folds them in at draw time.
+            // tt_projected_mask are per-bind-state / texture-stage properties
+            // and color_out_mask is a render-pass property, not render-state;
+            // the encoder folds them in at draw time.
             depth_sampler_mask: 0,
             depth_fetch_mask: 0,
             volume_sampler_mask: 0,
             cube_sampler_mask: 0,
             tt_projected_mask: 0,
+            color_out_mask: 0,
             flags,
         }
     }

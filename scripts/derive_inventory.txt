@@ -116,6 +116,7 @@ windows/core/src/perf.rs PairShaderId Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/perf.rs PairStatsSample Clone,Copy
 windows/core/src/perf.rs PerPairStats Default,Clone,Copy
 windows/core/src/perf.rs Stat Clone,Copy,Default
+windows/core/src/pipeline_state.rs ExtraColorAttachments Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineAttachFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineRsBits Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineRsFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash

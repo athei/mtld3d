@@ -12,7 +12,7 @@
 //! single cached pipeline.
 
 use mtld3d_shared::{
-    CreateRenderPipelineParams, MetalHandle, VertexAttrDesc,
+    CreateRenderPipelineParams, ExtraColorAttachmentParams, MetalHandle, VertexAttrDesc,
     mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat},
     mtl_handle::MTLFunctionKind,
 };
@@ -90,6 +90,54 @@ pub struct PipelineRsBits {
     pub blend_op_alpha: u8,
     /// `D3DRS_COLORWRITEENABLE` (4 D3DCOLORWRITEENABLE_* bits).
     pub color_write_mask: u8,
+    /// `D3DRS_COLORWRITEENABLE1..3`, the write masks of render targets 1..3.
+    ///
+    /// Index `i` holds the mask for target `i + 1`. Only consulted for
+    /// targets present in the pass; an absent target contributes a zero
+    /// mask to the key so single-target draws never fragment the cache on
+    /// these states.
+    pub color_write_mask_ext: [u8; 3],
+}
+
+/// Colour attachments 1..3 of the render pass a draw lands in.
+///
+/// Render target 0 stays on [`PipelineSnapshot`] itself; this carries the
+/// extra simultaneous render targets. `present_mask` bit `i` (0..3) says slot
+/// `i + 1` is bound in the pass, `formats[i]` is its Metal format (ignored
+/// when absent) and `has_alpha_mask` bit `i` mirrors `COLOR_HAS_ALPHA` for it.
+/// `Copy` because the encoder copies it out of the pass state once per draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExtraColorAttachments {
+    pub formats: [PixelFormat; 3],
+    pub present_mask: u8,
+    pub has_alpha_mask: u8,
+}
+
+impl ExtraColorAttachments {
+    /// No extra attachment: the single-render-target shape.
+    pub const NONE: Self = Self {
+        formats: [PixelFormat::Bgra8Unorm; 3],
+        present_mask: 0,
+        has_alpha_mask: 0,
+    };
+
+    #[inline]
+    #[must_use]
+    pub const fn is_present(&self, extra_index: usize) -> bool {
+        self.present_mask & (1 << extra_index) != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn has_alpha(&self, extra_index: usize) -> bool {
+        self.has_alpha_mask & (1 << extra_index) != 0
+    }
+}
+
+impl Default for ExtraColorAttachments {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl PipelineRsBits {
@@ -146,9 +194,67 @@ pub struct PipelineSnapshot {
     /// `PipelineRsBits` substruct so per-draw construction is one field
     /// copy.
     pub rs: PipelineRsBits,
+    /// Render targets 1..3 bound in the pass.
+    pub extra: ExtraColorAttachments,
+    /// Bit `i` set ⇒ the bound pixel shader writes `oCi`.
+    ///
+    /// An extra target the shader never writes gets an empty write mask so
+    /// its contents survive the draw (Metal leaves an unwritten colour
+    /// output undefined). Fixed-function and SM1 shaders report bit 0.
+    pub ps_color_out_mask: u8,
 }
 
 impl PipelineSnapshot {
+    /// Effective Metal write mask of extra target `extra_index` (slot `extra_index + 1`).
+    ///
+    /// Empty when the target is absent from the pass or the shader does not
+    /// write it; otherwise the D3D9 `COLORWRITEENABLEn` mask.
+    fn extra_write_mask(&self, extra_index: usize) -> ColorWriteMask {
+        let written = self.ps_color_out_mask & (1 << (extra_index + 1)) != 0;
+        if self.extra.is_present(extra_index) && written {
+            d3d_to_metal_write_mask(u32::from(self.rs.color_write_mask_ext[extra_index]))
+        } else {
+            ColorWriteMask::empty()
+        }
+    }
+
+    /// `true` when no colour target of the pass receives a write from this draw.
+    ///
+    /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
+    /// mask (present, written by the shader, non-zero `COLORWRITEENABLEn`).
+    /// Rule H builds the no-colour pipeline twin for such draws.
+    #[must_use]
+    pub fn writes_no_color(&self) -> bool {
+        self.rs.color_write_mask == 0 && (0..3).all(|i| self.extra_write_mask(i).is_empty())
+    }
+
+    /// Metal format keyed for extra target `extra_index`, normalised when absent.
+    const fn extra_format(&self, extra_index: usize) -> PixelFormat {
+        if self.extra.is_present(extra_index) {
+            self.extra.formats[extra_index]
+        } else {
+            ExtraColorAttachments::NONE.formats[extra_index]
+        }
+    }
+
+    /// Blend factors for extra target `extra_index`, with its own alpha clamp.
+    ///
+    /// `(src, dst, src_alpha, dst_alpha)`; the blend ops are shared with
+    /// target 0 (D3D9 has one blend state).
+    fn extra_blend_factors(
+        &self,
+        extra_index: usize,
+    ) -> (BlendFactor, BlendFactor, BlendFactor, BlendFactor) {
+        let has_alpha = self.extra.is_present(extra_index) && self.extra.has_alpha(extra_index);
+        let (src_a, dst_a, _) = effective_alpha_blend(self);
+        (
+            d3d_to_metal_blend_rt(u32::from(self.rs.src_blend), has_alpha),
+            d3d_to_metal_blend_rt(u32::from(self.rs.dst_blend), has_alpha),
+            d3d_to_metal_blend_rt(src_a, has_alpha),
+            d3d_to_metal_blend_rt(dst_a, has_alpha),
+        )
+    }
+
     #[inline]
     #[must_use]
     pub const fn has_depth(&self) -> bool {
@@ -204,6 +310,15 @@ pub struct PipelineKey {
     color_format: PixelFormat,
     srgb_write_enable: u32,
     has_color_output: u32,
+    /// Render targets 1..3: presence, format, effective write mask, alpha clamp.
+    ///
+    /// The alpha bit stands in for the per-target blend factors: they differ
+    /// from target 0's only through the destination-alpha clamp, which is a
+    /// pure function of this bit, so keying the bit keys the factors.
+    extra_present_mask: u8,
+    extra_has_alpha_mask: u8,
+    extra_formats: [PixelFormat; 3],
+    extra_write_masks: [ColorWriteMask; 3],
 }
 
 /// Per-draw thunk-params builder input.
@@ -242,6 +357,11 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
         color_format: s.color_format,
         srgb_write_enable: u32::from(s.rs.srgb_write_enable()),
         has_color_output: u32::from(s.has_color_output()),
+        extra_present_mask: s.extra.present_mask,
+        // Absent slots drop their alpha bit so the key stays canonical.
+        extra_has_alpha_mask: s.extra.has_alpha_mask & s.extra.present_mask,
+        extra_formats: core::array::from_fn(|i| s.extra_format(i)),
+        extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
     }
 }
 
@@ -278,6 +398,18 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         has_stencil: u32::from(s.has_stencil()),
         color_format: s.color_format,
         has_color_output: u32::from(s.has_color_output()),
+        extra_present_mask: u32::from(s.extra.present_mask),
+        extra: core::array::from_fn(|i| {
+            let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) = s.extra_blend_factors(i);
+            ExtraColorAttachmentParams {
+                format: s.extra_format(i),
+                write_mask: s.extra_write_mask(i),
+                src_blend,
+                dst_blend,
+                src_blend_alpha,
+                dst_blend_alpha,
+            }
+        }),
         pipeline_handle: MetalHandle::NULL,
     }
 }
@@ -337,8 +469,105 @@ mod tests {
                 dst_blend_alpha: 1, // D3DBLEND_ZERO
                 blend_op_alpha: 1,  // D3DBLENDOP_ADD
                 color_write_mask: 0xF,
+                color_write_mask_ext: [0xF; 3],
             },
+            extra: ExtraColorAttachments::NONE,
+            ps_color_out_mask: 0b1,
         }
+    }
+
+    /// `base()` with render target 1 bound as an `R8Unorm` target the PS writes.
+    fn with_rt1() -> PipelineSnapshot {
+        let mut s = base();
+        s.extra = ExtraColorAttachments {
+            formats: [PixelFormat::R8Unorm; 3],
+            present_mask: 0b001,
+            has_alpha_mask: 0b001,
+        };
+        s.ps_color_out_mask = 0b11;
+        s
+    }
+
+    #[test]
+    fn extra_targets_key_presence_format_mask_and_alpha() {
+        let k1 = key_from_snapshot(&with_rt1());
+        assert_ne!(key_from_snapshot(&base()), k1, "presence");
+        let mutate = |f: fn(&mut PipelineSnapshot)| {
+            let mut s = with_rt1();
+            f(&mut s);
+            key_from_snapshot(&s)
+        };
+        assert_ne!(
+            k1,
+            mutate(|s| s.extra.formats[0] = PixelFormat::Bgra8Unorm),
+            "format"
+        );
+        assert_ne!(
+            k1,
+            mutate(|s| s.rs.color_write_mask_ext[0] = 0x1),
+            "write mask"
+        );
+        assert_ne!(k1, mutate(|s| s.extra.has_alpha_mask = 0), "has_alpha");
+        // Slot 2 is absent: its format, mask and alpha bit are normalised
+        // away so a single-target draw never fragments on them.
+        assert_eq!(
+            k1,
+            mutate(|s| s.extra.formats[1] = PixelFormat::Bgra8Unorm),
+            "absent format"
+        );
+        assert_eq!(
+            k1,
+            mutate(|s| s.rs.color_write_mask_ext[1] = 0x1),
+            "absent mask"
+        );
+        assert_eq!(
+            k1,
+            mutate(|s| s.extra.has_alpha_mask |= 0b010),
+            "absent alpha"
+        );
+    }
+
+    #[test]
+    fn unwritten_extra_target_gets_an_empty_write_mask() {
+        // A target the shader never writes must keep its contents: it keys
+        // and binds exactly like an RS mask of zero.
+        let mut unwritten = with_rt1();
+        unwritten.ps_color_out_mask = 0b01;
+        let mut masked = with_rt1();
+        masked.rs.color_write_mask_ext[0] = 0;
+        assert_eq!(key_from_snapshot(&unwritten), key_from_snapshot(&masked));
+        assert_eq!(
+            key_from_snapshot(&unwritten).extra_write_masks[0],
+            ColorWriteMask::empty()
+        );
+        // Target 0 keeps the RS mask regardless of the written bit.
+        assert_eq!(
+            key_from_snapshot(&unwritten).color_write_mask,
+            ColorWriteMask::ALL
+        );
+    }
+
+    #[test]
+    fn extra_target_blend_factors_clamp_on_their_own_alpha() {
+        let mut s = with_rt1();
+        s.rs.src_blend = 7; // D3DBLEND_DESTALPHA
+        s.rs.dst_blend = 8; // D3DBLEND_INVDESTALPHA
+        s.extra.has_alpha_mask = 0; // RT1 is alpha-less, RT0 keeps alpha
+        let attrs: [VertexAttrDesc; 0] = [];
+        // SAFETY: tests; opaque values never dereferenced.
+        let dev = unsafe { MetalHandle::new(0xDEAD) };
+        let p = params_from_snapshot(&PipelineBuildInputs {
+            snapshot: &s,
+            vertex_attrs: &attrs,
+            device_handle: dev,
+        });
+        assert_eq!(p.src_blend, BlendFactor::DestinationAlpha);
+        assert_eq!(p.extra_present_mask, 0b001);
+        assert_eq!(p.extra[0].src_blend, BlendFactor::One);
+        assert_eq!(p.extra[0].dst_blend, BlendFactor::Zero);
+        assert_eq!(p.extra[0].format, PixelFormat::R8Unorm);
+        assert_eq!(p.extra[0].write_mask, ColorWriteMask::ALL);
+        assert_eq!(p.extra[1].write_mask, ColorWriteMask::empty());
     }
 
     /// Per-field static invariant check.
@@ -515,5 +744,10 @@ mod tests {
         assert_eq!(p.has_stencil, k.has_stencil);
         assert_eq!(p.color_format, k.color_format);
         assert_eq!(p.has_color_output, k.has_color_output);
+        assert_eq!(p.extra_present_mask, u32::from(k.extra_present_mask));
+        for i in 0..3 {
+            assert_eq!(p.extra[i].format, k.extra_formats[i]);
+            assert_eq!(p.extra[i].write_mask, k.extra_write_masks[i]);
+        }
     }
 }

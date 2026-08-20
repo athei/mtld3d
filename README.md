@@ -69,6 +69,9 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Sampling and output**: anisotropic filtering, sRGB read (compressed
   formats) and sRGB write, alpha test, scissor, separate alpha blend, blend
   factor, color write masks.
+- **Multiple render targets**: four simultaneous targets with independent
+  formats and write masks, post-pixel-shader blending on each, and Clear
+  reaching every bound target.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
   enumeration, hardware color cursors, and MetalFX upscaling on the way to the
   screen with `render.scale` choosing the render resolution. Fullscreen never
@@ -87,7 +90,6 @@ own fallback paths instead of breaking:
 
 - **MSAA**: multisampled creates are rejected; CheckDeviceMultiSampleType only
   accepts D3DMULTISAMPLE_NONE.
-- **Multiple render targets**: one simultaneous render target is advertised.
 - **Point sprites** and non-solid fill modes (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
   as the spec allows.

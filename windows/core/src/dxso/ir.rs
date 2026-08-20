@@ -450,6 +450,42 @@ impl DxsoProgram {
             .iter()
             .any(|inst| matches!(inst.opcode, Opcode::TexBem | Opcode::TexBemL | Opcode::Bem))
     }
+
+    /// Bitmask of the colour-output registers `oC0..oC3` this pixel shader writes.
+    ///
+    /// Bit `i` is set when any instruction in the main body or a subroutine
+    /// has `oCi` as its destination. `ps_1_x` has no `oC` register (the result
+    /// is whatever `r0` holds at the end), so SM1 programs report bit 0. A
+    /// write to an index above 3 is outside the D3D9 limit of four
+    /// simultaneous render targets and is ignored here, with a one-shot warn.
+    /// Always bit 0 for a vertex shader.
+    #[must_use]
+    pub fn color_out_mask(&self) -> u8 {
+        if self.shader_type != ShaderType::Pixel || self.major < 2 {
+            return 1;
+        }
+        let mut mask = 0u8;
+        let bodies = core::iter::once(&self.instructions).chain(self.subroutines.values());
+        for inst in bodies.flatten() {
+            let Some(dst) = inst.dst.as_ref() else {
+                continue;
+            };
+            if dst.reg.kind != RegKind::ColorOut {
+                continue;
+            }
+            match dst.reg.index {
+                i @ 0..=3 => mask |= 1 << i,
+                other => {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: super::LOG_TARGET,
+                        key: u64::from(other),
+                        "dxso: PS writes oC{other}, beyond the four D3D9 render targets → write ignored"
+                    );
+                }
+            }
+        }
+        mask
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
