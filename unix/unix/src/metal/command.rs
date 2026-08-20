@@ -103,8 +103,9 @@ const PRESENTED_MIN_EXCESS_NS: u64 = 3_000_000;
 /// frame's sequence number and its `nextDrawable` wait. Together with the
 /// PE-side `frame hitch` line (Present-call cadence on the API thread) it
 /// separates a stalled game thread from a frame that was produced on time
-/// and displayed late. One block allocation per frame; the line only forms
-/// on a hitch.
+/// and displayed late. One block allocation per frame while the target is
+/// at debug or below; the caller skips the registration otherwise, and the
+/// line only forms on a hitch.
 fn register_presented_probe(
     drawable: &ProtocolObject<dyn CAMetalDrawable>,
     seq: u64,
@@ -500,7 +501,11 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             } else {
                 cmd_buf.presentDrawable(drawable_obj);
             }
-            register_presented_probe(&drawable, params.submit_seq, params.drawable_wait_ns);
+            // Debug and trace output only, so the per-frame block allocation
+            // and handler registration are skipped when the target is off.
+            if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
+                register_presented_probe(&drawable, params.submit_seq, params.drawable_wait_ns);
+            }
         }
     }
 

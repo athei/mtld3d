@@ -343,13 +343,18 @@ impl CursorState {
 
     /// Fold one `Present` into the hitch probe; see `HitchProbe`.
     ///
-    /// Called once per `Present` from `device_present`. Two `Instant` reads
-    /// per frame; the log line only forms on a hitched frame.
+    /// Called once per `Present` from `device_present`. Everything it
+    /// produces is a debug or trace line, so with the cursor target below
+    /// debug the whole body is one level check; with it on, two `Instant`
+    /// reads per frame and the log line only on a hitched frame.
     pub fn note_present(&mut self) {
-        let now = Instant::now();
         let probe = &mut self.probe;
         let calls_us = core::mem::take(&mut probe.calls_us_since_present);
         let msgs = core::mem::take(&mut probe.setcursor_msgs_since_present);
+        if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+            return;
+        }
+        let now = Instant::now();
         let Some(last) = probe.last_present.replace(now) else {
             return;
         };
