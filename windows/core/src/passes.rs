@@ -2191,6 +2191,16 @@ impl PassState {
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
+        // A cascade depth surface saved and restored through
+        // `GetDepthStencilSurface` comes back via the `Eager` bind path with
+        // `is_sampleable = false` — the returned surface carries
+        // `parent_texture = null` — even though the underlying Metal texture is
+        // the same sampleable shadow map. Resolve the flag against the
+        // session-wide "ever sampleable" set so such a rebind neither breaks
+        // the pass (an encoder close/open, Load+Store of every attachment) nor
+        // clears Rule B's keep-Store exemption for the cascade.
+        let is_sampleable = is_sampleable
+            || (!texture.is_null() && self.seen_sampleable_depth_textures.contains(&texture));
         // `has_stencil` is a property of the bound texture's format, so a
         // repeat bind of the same texture carries the same value — fold it
         // before the no-change early-out below.
@@ -6755,6 +6765,52 @@ mod tests {
             rt_pass.depth_store(),
             StoreAction::DontCare,
             "non-sampleable depth never sampled → Rule B optimization preserved",
+        );
+    }
+
+    /// A cascade rebound with a stale `is_sampleable=false` is a no-op.
+    ///
+    /// Neither the pass break nor the loss of Rule B's exemption fires.
+    ///
+    /// `GetDepthStencilSurface` returns a surface with `parent_texture=null`,
+    /// so a save/restore cycle re-binds the same cascade handle through the
+    /// `Eager` path with `is_sampleable=false`. The sticky resolve against
+    /// `seen_sampleable_depth_textures` keeps the pass open and keeps Rule B's
+    /// keep-Store exemption in force.
+    #[test]
+    fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
+        let cascade_depth = tex(0xCAFE_7000);
+        let mut s = fresh();
+        // First bind as sampleable, draw into it, then rebind the SAME handle
+        // with a stale is_sampleable=false (the GetDepthStencilSurface path).
+        s.set_depth_stencil_attachment(cascade_depth, true, false);
+        s.emit_command(dummy_draw());
+        let passes_before = s.passes().len();
+        s.set_depth_stencil_attachment(cascade_depth, false, false);
+        assert!(
+            !s.current_pass_closed(),
+            "a rebind of a known-sampleable cascade must not break the pass",
+        );
+        assert_eq!(
+            s.passes().len(),
+            passes_before,
+            "no new pass opened by the rebind",
+        );
+        assert!(
+            s.current_depth_is_sampleable(),
+            "the sampleable flag stays set through the stale rebind",
+        );
+        s.emit_command(dummy_draw());
+        s.finalize_store_actions(false);
+        let cascade_pass = s
+            .passes()
+            .iter()
+            .find(|p| p.depth_texture() == cascade_depth)
+            .expect("cascade pass present");
+        assert_eq!(
+            cascade_pass.depth_store(),
+            StoreAction::Store,
+            "Rule B keeps Store through the stale rebind",
         );
     }
 
