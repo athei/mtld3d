@@ -5,7 +5,7 @@
 //! instance count; `D3DSTREAMSOURCE_INSTANCEDATA` marks a per-instance stream
 //! whose count is the number of instances that share one element. The
 //! validation rules and the instance-count derivation follow the D3D9
-//! runtime as implemented by DXVK and wined3d, which agree on every rule.
+//! runtime's observable behaviour.
 
 use mtld3d_shared::mtl::VertexStepFunction;
 use mtld3d_types::{D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, MAX_STREAMS};
