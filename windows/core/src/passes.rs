@@ -3855,6 +3855,23 @@ fn update_inline_bytes(cache: &mut Vec<u8>, bytes: &[u8]) -> bool {
 /// fully covered. Multi-field slots keep their command's *packed* `param_*`
 /// form so decoding never needs a truncating cast; `debug_assert_in_sync`
 /// re-packs the cache side with widening casts only.
+/// Last-bound sentinel a null-texture bind records for its texture slot.
+///
+/// A `SetFragmentNullTexture` command binds the shared opaque-black texture, not
+/// a game texture, so the per-slot dedup stores a reserved value — never a Metal
+/// handle pointer, and distinct per kind so a slot's declared type changing
+/// re-emits. Shared by the draw path and the in-sync shadow so the two agree.
+#[must_use]
+pub const fn null_texture_tex_sentinel(kind: u64) -> u64 {
+    u64::MAX - kind
+}
+
+/// Last-bound sentinel for the default sampler a null-texture bind installs.
+///
+/// Reserved, never a Metal sampler pointer; recorded so a later real sampler
+/// bind to the slot is not deduped away.
+pub const NULL_TEXTURE_SAMPLER_SENTINEL: u64 = u64::MAX - 8;
+
 #[cfg(debug_assertions)]
 #[derive(Default)]
 pub struct DebugBoundShadow {
@@ -3891,6 +3908,11 @@ impl DebugBoundShadow {
             self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
         } else if t == CommandType::SetFragmentSamplerState as u32 {
             self.fragment_samplers[cmd.param_a as usize] = cmd.param_b;
+        } else if t == CommandType::SetFragmentNullTexture as u32 {
+            // Binds the opaque-black texture + default sampler; mirror the same
+            // sentinels the draw path records so the cache and shadow agree.
+            self.fragment_textures[cmd.param_a as usize] = null_texture_tex_sentinel(cmd.param_b);
+            self.fragment_samplers[cmd.param_a as usize] = NULL_TEXTURE_SAMPLER_SENTINEL;
         } else if t == CommandType::SetScissorRect as u32 {
             self.scissor_rect = Some((cmd.param_a, cmd.param_b, cmd.param_c));
         } else if t == CommandType::SetVertexBuffer as u32 {

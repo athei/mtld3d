@@ -16,7 +16,7 @@ pub mod tsc;
 
 pub use commands::{
     BlitCommand, BlitCommandType, Command, CommandType, CopyBufferToBufferInfo,
-    CopyBufferToTextureInfo, CopyTextureSubRectInfo,
+    CopyBufferToTextureInfo, CopyTextureSubRectInfo, NullTextureKind,
 };
 pub use ffi_boundary::{InPtr, InPtrMut, OutPtr, ValueIn, VtableThis};
 pub use log_filter::init_logger;

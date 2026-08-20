@@ -11,7 +11,7 @@ use block2::RcBlock;
 use log::{debug, error, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
-    PassDescriptor, SubmitFrameParams,
+    NullTextureKind, PassDescriptor, SubmitFrameParams,
     mtl::{
         CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
         VisibilityResultMode,
@@ -34,7 +34,10 @@ use objc2_metal::{
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
 
-use crate::{LOG_TARGET, metal::handle::IntoRetained};
+use crate::{
+    LOG_TARGET,
+    metal::{handle::IntoRetained, null_texture},
+};
 
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
 ///
@@ -1715,6 +1718,45 @@ fn encode_pass(
                     };
                     // SAFETY: objc2 typed binding; `sampler` is retained for
                     // the duration of the binding.
+                    unsafe {
+                        encoder
+                            .setFragmentSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetFragmentNullTexture) => {
+                    let Some(kind) = NullTextureKind::from_repr(to_u32(cmd.param_b)) else {
+                        mtld3d_shared::log_once_warn!(
+                            target: LOG_TARGET,
+                            "null texture: unknown kind {}; leaving the slot unbound",
+                            cmd.param_b,
+                        );
+                        continue;
+                    };
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
+                        continue;
+                    };
+                    // SAFETY: the handle came from `null_texture::create`'s
+                    // `Retained::into_raw`, alive for the process lifetime.
+                    let Some(tex) =
+                        (unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) })
+                            .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: as above, for the shared default sampler.
+                    let Some(sampler) =
+                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) })
+                            .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; both are retained for the
+                    // binding's duration.
+                    unsafe {
+                        encoder.setFragmentTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                    }
+                    // SAFETY: objc2 typed binding; retained for the duration.
                     unsafe {
                         encoder
                             .setFragmentSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);

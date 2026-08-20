@@ -17,8 +17,9 @@ use mtld3d_core::{
     buffer_rename::BufferMapMode,
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
-        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey,
-        emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
+        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, TextureType, VariantKey,
+        declared_ps_samplers, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
+        emit_vs_programmable_named,
     },
     format::map_d3d_format,
     gpu_caps::GpuCaps,
@@ -48,8 +49,8 @@ use mtld3d_shared::{
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
     CreateTexturesBatchParams, DestroyResourcesBulkParams, EnsureBlitPipelineParams,
     EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams, MetalHandle,
-    PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
         StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
@@ -564,6 +565,65 @@ bitflags::bitflags! {
     }
 }
 
+/// A programmable pixel shader's declared sampler slots and their types.
+///
+/// `mask` has a bit set for every stage the shader declares a sampler for;
+/// `kinds[stage]` is the matching texture dimensionality, valid only where the
+/// mask bit is set. The draw path binds an opaque-black texture of that kind to
+/// any declared slot the game did not bind a texture to.
+#[derive(Clone, Copy)]
+pub struct PsSamplerDecls {
+    mask: u16,
+    kinds: [NullTextureKind; crate::stage_bindings::STAGE_COUNT],
+}
+
+impl Default for PsSamplerDecls {
+    fn default() -> Self {
+        Self {
+            mask: 0,
+            kinds: [NullTextureKind::Texture2D; crate::stage_bindings::STAGE_COUNT],
+        }
+    }
+}
+
+impl PsSamplerDecls {
+    /// Collect the declared samplers from a parsed program (empty for a VS).
+    ///
+    /// Uses `declared_ps_samplers`, the same source the emitter builds the
+    /// fragment-function signature from, so the bind side cannot drift from it.
+    /// Stages at or past `STAGE_COUNT` are ignored (a D3D9 PS declares s0..s15).
+    fn from_program(program: &DxsoProgram) -> Self {
+        let mut decls = Self::default();
+        for (&slot, &texture_type) in &declared_ps_samplers(program) {
+            let slot = slot as usize;
+            if slot >= crate::stage_bindings::STAGE_COUNT {
+                continue;
+            }
+            decls.mask |= 1u16 << slot;
+            decls.kinds[slot] = match texture_type {
+                TextureType::TextureCube => NullTextureKind::TextureCube,
+                TextureType::Texture3D => NullTextureKind::Texture3D,
+                // A 2D declaration, or `Unknown`, which the emitter also treats
+                // as `texture2d<float>`.
+                TextureType::Texture2D | TextureType::Unknown => NullTextureKind::Texture2D,
+            };
+        }
+        decls
+    }
+
+    /// Slots this shader declares a sampler for but `bound_mask` leaves unbound.
+    #[must_use]
+    pub const fn unbound(&self, bound_mask: u16) -> u16 {
+        self.mask & !bound_mask
+    }
+
+    /// The fallback texture kind for a declared slot.
+    #[must_use]
+    pub const fn kind(&self, stage: u32) -> NullTextureKind {
+        self.kinds[stage as usize]
+    }
+}
+
 pub struct FrameEncoder {
     /// Pass-management state (passes, pending clears, current attachments).
     ///
@@ -728,6 +788,12 @@ pub struct FrameEncoder {
     /// the unchanged resolve path.
     last_pipeline_memo: Option<(PipelineSnapshot, u64)>,
     program_cache: FxHashMap<ProgramId, Box<DxsoProgram>>,
+    /// Per-PS declared sampler slots + types, computed once at registration.
+    ///
+    /// Read on every programmable draw to bind an opaque-black fallback to any
+    /// declared sampler the game left unbound. Only PS programs get an entry;
+    /// VS programs (no samplers) fall through to the empty default.
+    prog_sampler_decls: FxHashMap<ProgramId, PsSamplerDecls>,
     /// Compiled `MTLLibrary` handles keyed by content hash (`disk_key`).
     ///
     /// One entry per unique shader source; a single shader compiled
@@ -1099,6 +1165,7 @@ impl FrameEncoder {
             no_color_pipeline_alt: FxHashMap::default(),
             last_pipeline_memo: None,
             program_cache: FxHashMap::default(),
+            prog_sampler_decls: FxHashMap::default(),
             lib_cache: FxHashMap::default(),
             ff_vs_libs: FxHashMap::default(),
             prog_vs_libs: FxHashMap::default(),
@@ -3337,9 +3404,24 @@ impl FrameEncoder {
     /// the first draw that could reference them. Idempotent — a second
     /// register for the same id (identical bytecode re-create) is a no-op.
     pub fn register_program(&mut self, shader_id: ProgramId, program: DxsoProgram) {
+        // Precompute the declared sampler slots so the draw path never scans the
+        // program. A PS with no samplers, and every VS, stores the empty default.
+        self.prog_sampler_decls
+            .entry(shader_id)
+            .or_insert_with(|| PsSamplerDecls::from_program(&program));
         self.program_cache
             .entry(shader_id)
             .or_insert_with(|| Box::new(program));
+    }
+
+    /// The declared sampler slots + types for a programmable pixel shader.
+    ///
+    /// Empty for an unregistered id (the draw path then binds no fallback).
+    pub fn ps_declared_samplers(&self, ps_id: ProgramId) -> PsSamplerDecls {
+        self.prog_sampler_decls
+            .get(&ps_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Absorb the pre-warm thread's compiled MSL → `MTLLibrary` handles into `lib_cache`.

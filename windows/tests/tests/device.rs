@@ -255,6 +255,11 @@ fn device_caps_are_sane() {
         caps.volume_texture_address_caps, caps.texture_address_caps,
         "volume address caps differ from the 2D ones"
     );
+    assert_ne!(
+        caps.texture_caps & TextureCaps::VOLUMEMAP.bits(),
+        0,
+        "volume maps not advertised"
+    );
     // Both honoured presentation intervals are advertised; IMMEDIATE is a hard
     // requirement of 3DMark05's startup check.
     assert_ne!(

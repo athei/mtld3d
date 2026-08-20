@@ -50,6 +50,12 @@ pub const D3DPS20_MAX_STATICFLOWCONTROLDEPTH: i32 = 4;
 /// `D3DPS20_MAX_NUMINSTRUCTIONSLOTS`: ceiling of the PS20 instruction-slot count.
 pub const D3DPS20_MAX_NUMINSTRUCTIONSLOTS: i32 = 512;
 
+/// Largest edge of a 3D texture (`D3DCAPS9::MaxVolumeExtent`).
+///
+/// Metal caps 3D textures at 2048 per dimension on every Apple GPU family,
+/// independent of the 16384 limit for 2D and cube textures.
+pub const MAX_VOLUME_EXTENT: u32 = 2048;
+
 /// Float constant registers an SM3 vertex shader can address (`c0`..`c255`).
 pub const MAX_VERTEX_SHADER_CONST: u32 = 256;
 

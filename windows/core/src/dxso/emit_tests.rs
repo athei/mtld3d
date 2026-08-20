@@ -10,7 +10,10 @@
 use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 
 use super::{
-    emit::{VariantFlags, VariantKey, emit_ps_programmable, emit_vs_programmable},
+    emit::{
+        VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
+    },
+    ir::TextureType,
     parser::parse,
 };
 
@@ -3493,4 +3496,43 @@ fn color_out_mask_bit0_is_implied_for_single_target_shaders() {
     };
     let masked = emit_ps_programmable(&ps, variant).expect("emit");
     assert_eq!(plain, masked);
+}
+
+// An unbound-sampler pixel shader: `dcl_<dim> s0; dcl t0; texld r0, t0, s0;
+// mov oC0, r0`. The dcl token's high nibble selects the sampler dimension.
+const UNBOUND_PS_2D: [u32; 12] = [
+    0xffff_0200,
+    0x0200_001f,
+    0x9000_0000,
+    0xa00f_0800,
+    0x0200_001f,
+    0x8000_0000,
+    0xb00f_0000,
+    0x0300_0042,
+    0x800f_0000,
+    0xb0e4_0000,
+    0xa0e4_0800,
+    0x0000_ffff,
+];
+
+#[test]
+fn declared_ps_samplers_reads_the_sampler_dimension() {
+    // 2D (0x90000000), cube (0x98000000), volume (0xa0000000): the dcl token's
+    // high nibble carries the sampler dimensionality.
+    for (dcl, expected) in [
+        (0x9000_0000u32, TextureType::Texture2D),
+        (0x9800_0000, TextureType::TextureCube),
+        (0xa000_0000, TextureType::Texture3D),
+    ] {
+        let mut bc = UNBOUND_PS_2D;
+        bc[2] = dcl;
+        let prog = parse(&bc).expect("unbound-sampler ps_2_0 should parse");
+        let samplers = declared_ps_samplers(&prog);
+        assert_eq!(samplers.len(), 1, "one declared sampler");
+        assert_eq!(
+            samplers.get(&0),
+            Some(&expected),
+            "sampler s0 dimensionality"
+        );
+    }
 }

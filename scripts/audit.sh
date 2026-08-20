@@ -26,6 +26,7 @@ windows/core/src/config.rs'
 
 ONCELOCK_SITES='unix/unix/src/metal/blit.rs
 unix/unix/src/metal/clear_quad.rs
+unix/unix/src/metal/null_texture.rs
 unix/unix/src/metal/present.rs
 unix/unix/src/metal/upscale.rs'
 
