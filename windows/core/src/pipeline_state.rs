@@ -218,6 +218,16 @@ impl PipelineSnapshot {
         }
     }
 
+    /// `true` when no colour target of the pass receives a write from this draw.
+    ///
+    /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
+    /// mask (present, written by the shader, non-zero `COLORWRITEENABLEn`).
+    /// Rule H builds the no-colour pipeline twin for such draws.
+    #[must_use]
+    pub fn writes_no_color(&self) -> bool {
+        self.rs.color_write_mask == 0 && (0..3).all(|i| self.extra_write_mask(i).is_empty())
+    }
+
     /// Metal format keyed for extra target `extra_index`, normalised when absent.
     const fn extra_format(&self, extra_index: usize) -> PixelFormat {
         if self.extra.is_present(extra_index) {

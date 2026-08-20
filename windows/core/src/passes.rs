@@ -19,6 +19,10 @@ use crate::{
 struct ClearMerge {
     color: MetalHandle<MTLTextureKind>,
     color_subresource: u32,
+    /// Render targets 1..3 as `(texture, subresource)`; a null texture is an unbound slot.
+    ///
+    /// A merge target must carry exactly this set, slot for slot.
+    extra: [(MetalHandle<MTLTextureKind>, u32); 3],
     depth: MetalHandle<MTLTextureKind>,
     needs_color: bool,
     needs_depth: bool,
@@ -280,12 +284,6 @@ pub enum ColorClearOutcome {
         viewport: (u32, u32, u32, u32),
         color_format: PixelFormat,
     },
-    /// More than one colour target is bound and the clear cannot fold.
-    ///
-    /// The caller runs the clear once per bound target with that target
-    /// bound alone (`FrameEncoder::for_each_bound_color_target`), which
-    /// routes each one through the single-target machinery above.
-    PerTarget,
 }
 
 /// Render target 1..3 as currently bound, before any pass has frozen it.
@@ -1340,14 +1338,23 @@ impl PassState {
     }
 
     /// `true` when any of render targets 1..3 is bound, whether or not it matches target 0.
-    ///
-    /// The multi-target clear paths key on this: a bound but mismatched
-    /// target is outside every pass and is still owed its clear.
     #[must_use]
     pub fn has_extra_color_targets(&self) -> bool {
         self.current_extra_color
             .iter()
             .any(ExtraColorSlot::is_bound)
+    }
+
+    /// `true` when a render target 1..3 is bound but sized unlike target 0.
+    ///
+    /// Such a target is attached to no pass and is still owed every
+    /// `Clear`; the encoder clears it on its own.
+    #[must_use]
+    pub fn has_extra_color_targets_outside_pass(&self) -> bool {
+        self.current_extra_color
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) == 0)
     }
 
     /// Bind or unbind render target `slot` (1..=3) for the next pass.
@@ -2157,18 +2164,13 @@ impl PassState {
     /// as pending for the next pass-begin.
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) -> ColorClearOutcome {
         let color_texture = self.current_color_texture;
-        let multi_target = self.current_extra_present_mask != 0;
         if self.current_pass_has_work() {
             // Pass has draws — translate the D3D9 viewport-clipped Clear
             // by asking the caller to emit a scissored clear-quad inside
-            // this encoder. Visibility-counting passes (occlusion queries
-            // active) fall back to the legacy pass-break: see comment in
+            // this encoder (the quad writes every colour target of the
+            // pass). Visibility-counting passes (occlusion queries active)
+            // fall back to the legacy pass-break: see comment in
             // `clear_depth`.
-            if multi_target {
-                // The clear-quad writes one colour output; with several
-                // targets in the pass the caller clears them one at a time.
-                return ColorClearOutcome::PerTarget;
-            }
             if self.current_pass_has_counting_visibility() {
                 mtld3d_shared::log_once_trace_by!(
                     target: DEPTH_TRACE_TARGET,
@@ -2198,20 +2200,10 @@ impl PassState {
         // content) and emit a scissored clear-quad instead. Only
         // applies when the new viewport is meaningful (non-zero size)
         // and a color texture is bound.
-        if multi_target
-            && self.viewport_width > 0
-            && self.viewport_height > 0
-            && self.any_bound_color_target_seen()
-        {
-            // Same cross-pass rule as below, over every target in the pass.
-            return ColorClearOutcome::PerTarget;
-        }
-        if !color_texture.is_null()
-            && self
-                .seen_color_rts
-                .contains(&(color_texture, self.current_color_subresource))
-            && self.viewport_width > 0
-            && self.viewport_height > 0
+        // Any colour target of the pass, not just render target 0: the
+        // clear-quad writes all of them, so one seen target makes the quad
+        // the only safe path for the whole set.
+        if self.any_bound_color_target_seen() && self.viewport_width > 0 && self.viewport_height > 0
         {
             let vp = self.effective_viewport();
             // Open the pass first (or take the existing one). When
@@ -2220,10 +2212,15 @@ impl PassState {
             // thing that lands in this tile; the previous tile's
             // content survives outside the scissor rect.
             self.ensure_pass_open();
-            if let Some(pass) = self.passes.last_mut()
-                && matches!(pass.color_load, ColorLoad::Clear { .. })
-            {
-                pass.color_load = ColorLoad::Load;
+            if let Some(pass) = self.passes.last_mut() {
+                if matches!(pass.color_load, ColorLoad::Clear { .. }) {
+                    pass.color_load = ColorLoad::Load;
+                }
+                for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                    if matches!(attachment.load, ColorLoad::Clear { .. }) {
+                        attachment.load = ColorLoad::Load;
+                    }
+                }
             }
             mtld3d_shared::log_once_trace_by!(
                 target: DEPTH_TRACE_TARGET,
@@ -2303,12 +2300,21 @@ impl PassState {
         if was_closed
             && !had_pending_clear
             && let Some(pass) = self.passes.last_mut()
-            && matches!(
+        {
+            if matches!(
                 pass.color_load,
                 ColorLoad::Clear { .. } | ColorLoad::DontCare
-            )
-        {
-            pass.color_load = ColorLoad::Load;
+            ) {
+                pass.color_load = ColorLoad::Load;
+            }
+            for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                if matches!(
+                    attachment.load,
+                    ColorLoad::Clear { .. } | ColorLoad::DontCare
+                ) {
+                    attachment.load = ColorLoad::Load;
+                }
+            }
         }
         self.current_color_format
     }
@@ -2332,21 +2338,13 @@ impl PassState {
             // onto whatever texture the next pass attaches.
             return DepthClearOutcome::NoOp;
         }
-        if self.current_extra_present_mask != 0 {
-            // The depth clear-quad pipeline declares colour attachment 0
-            // only and cannot run inside a pass with several colour targets.
-            // Break the pass instead and let the clear fold into the next
-            // pass's load action, which clears the whole plane.
-            self.end_multi_target_pass_for_depth_clear(depth_texture);
-        } else {
-            if self.current_pass_has_work()
-                && let Some(outcome) = self.clear_depth_in_active_pass(value, depth_texture)
-            {
-                return outcome;
-            }
-            if let Some(outcome) = self.clear_depth_cross_pass(value, depth_texture) {
-                return outcome;
-            }
+        if self.current_pass_has_work()
+            && let Some(outcome) = self.clear_depth_in_active_pass(value, depth_texture)
+        {
+            return outcome;
+        }
+        if let Some(outcome) = self.clear_depth_cross_pass(value, depth_texture) {
+            return outcome;
         }
         if let Some(outcome) = self.clear_depth_amend_open(value, depth_texture) {
             return outcome;
@@ -2421,18 +2419,13 @@ impl PassState {
             // onto whatever texture the next pass attaches.
             return StencilClearOutcome::NoOp;
         }
-        if self.current_extra_present_mask != 0 {
-            // Same single-colour-output limit as the depth clear-quad.
-            self.end_multi_target_pass_for_depth_clear(depth_texture);
-        } else {
-            if self.current_pass_has_work()
-                && let Some(outcome) = self.clear_stencil_in_active_pass(value)
-            {
-                return outcome;
-            }
-            if let Some(outcome) = self.clear_stencil_cross_pass(value, depth_texture) {
-                return outcome;
-            }
+        if self.current_pass_has_work()
+            && let Some(outcome) = self.clear_stencil_in_active_pass(value)
+        {
+            return outcome;
+        }
+        if let Some(outcome) = self.clear_stencil_cross_pass(value, depth_texture) {
+            return outcome;
         }
         if let Some(outcome) = self.clear_stencil_amend_open(value) {
             return outcome;
@@ -2637,26 +2630,6 @@ impl PassState {
     pub fn clear_depth_legacy_break(&mut self, value: u32) {
         self.end_current_pass("clear_depth_legacy_fallback");
         self.pending_depth_clear = Some(value);
-    }
-
-    /// Close a multi-target pass that holds work so a depth or stencil clear can fold.
-    ///
-    /// The fold clears the whole plane regardless of the viewport, which is
-    /// the one divergence of this path from the clear-quad one; it only
-    /// applies to a mid-pass depth clear under several colour targets, so it
-    /// is traced rather than warned.
-    fn end_multi_target_pass_for_depth_clear(
-        &mut self,
-        depth_texture: MetalHandle<MTLTextureKind>,
-    ) {
-        if self.current_pass_has_work() {
-            mtld3d_shared::log_once_trace_by!(
-                target: DEPTH_TRACE_TARGET,
-                key: depth_texture.raw(),
-                "clear-quad depth: several colour targets bound → pass-break (tex={depth_texture:#x})"
-            );
-            self.end_current_pass("clear_depth_multi_target");
-        }
     }
 
     /// `true` when render target 0 or any extra in the pass already has content this frame.
@@ -2911,12 +2884,9 @@ impl PassState {
             return;
         }
         for pass in &mut self.passes {
-            // The no-colour twin declares no colour attachment at all, so a
-            // pass with extra targets is left alone.
             if pass.color_writes_observed
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
-                || pass.extra_present_mask() != 0
                 // A folded color Clear (`color_load == Clear`) is a real color
                 // write even with no draw to tag `color_writes_observed` — e.g.
                 // a backbuffer color Clear that shares a pass with a cross-pass
@@ -2980,6 +2950,9 @@ impl PassState {
             pass.color_subresource = 0;
             pass.color_load = ColorLoad::DontCare;
             pass.color_store = StoreAction::DontCare;
+            // The no-colour twin declares no colour attachment at all, so
+            // render targets 1..3 go with target 0.
+            pass.extra_color = [PassColorAttachment::NONE; 3];
             if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                 trace!(
                     target: TRACE_TARGET,
@@ -3061,21 +3034,28 @@ impl PassState {
                 c.cmd == CommandType::DrawPrimitives as u32
                     || c.cmd == CommandType::DrawIndexedPrimitives as u32
             });
-            let needs_color = !has_draw && matches!(p.color_load, ColorLoad::Clear { .. });
+            // Any colour target of the pass with a Clear makes the colour
+            // side a candidate; the whole set then moves together.
+            let needs_color = !has_draw
+                && (matches!(p.color_load, ColorLoad::Clear { .. })
+                    || p.extra_color
+                        .iter()
+                        .any(|a| a.is_bound() && matches!(a.load, ColorLoad::Clear { .. })));
             let needs_depth = !has_draw && matches!(p.depth_load, DepthLoad::Clear { .. });
             let needs_stencil = !has_draw
                 && !p.depth_texture.is_null()
                 && matches!(p.stencil_load, StencilLoad::Clear { .. });
-            // A multi-target clear-only pass stays where it is: its clears
-            // would have to move as a set into a pass with the same set.
-            if (!needs_color && !needs_depth && !needs_stencil) || p.extra_present_mask() != 0 {
+            if !needs_color && !needs_depth && !needs_stencil {
                 i += 1;
                 continue;
             }
             let target_color = p.color_texture;
             let target_color_subresource = p.color_subresource;
+            let target_extra: [(MetalHandle<MTLTextureKind>, u32); 3] =
+                core::array::from_fn(|k| (p.extra_color[k].texture, p.extra_color[k].subresource));
             let target_depth = p.depth_texture;
             let color_load = p.color_load;
+            let extra_loads: [ColorLoad; 3] = core::array::from_fn(|k| p.extra_color[k].load);
             let depth_load = p.depth_load;
             let stencil_load = p.stencil_load;
             // Pass has only Clear load actions; no real draws / state.
@@ -3088,6 +3068,7 @@ impl PassState {
                 &ClearMerge {
                     color: target_color,
                     color_subresource: target_color_subresource,
+                    extra: target_extra,
                     depth: target_depth,
                     needs_color,
                     needs_depth,
@@ -3097,6 +3078,11 @@ impl PassState {
             if let Some(t) = target_idx {
                 if needs_color {
                     self.passes[t].color_load = color_load;
+                    for (k, load) in extra_loads.iter().enumerate() {
+                        if self.passes[t].extra_color[k].is_bound() {
+                            self.passes[t].extra_color[k].load = *load;
+                        }
+                    }
                 }
                 if needs_depth {
                     self.passes[t].depth_load = depth_load;
@@ -3129,6 +3115,7 @@ impl PassState {
         let ClearMerge {
             color: target_color,
             color_subresource: target_color_subresource,
+            extra: target_extra,
             depth: target_depth,
             needs_color,
             needs_depth,
@@ -3136,14 +3123,45 @@ impl PassState {
         } = *want;
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
-            // A multi-target pass may attach the target on a slot the
-            // single-target match below does not look at.
-            if cand.extra_present_mask() != 0 {
-                return None;
-            }
             // Intervening read on a side we care about kills the merge.
             if needs_color && pass_reads_texture(cand, target_color) {
                 return None;
+            }
+            if needs_color
+                && target_extra
+                    .iter()
+                    .any(|&(tex, _)| !tex.is_null() && pass_reads_texture(cand, tex))
+            {
+                return None;
+            }
+            // Render targets 1..3 travel as a set: only a candidate with
+            // exactly this set can take the colour clears. One with a
+            // different set that attaches any of our extra textures, clearing
+            // or loading them, either supersedes or consumes the clear; one
+            // that touches none of them is simply not the target.
+            let cand_extra: [(MetalHandle<MTLTextureKind>, u32); 3] = core::array::from_fn(|k| {
+                (cand.extra_color[k].texture, cand.extra_color[k].subresource)
+            });
+            let same_set = cand_extra == target_extra;
+            if needs_color {
+                let touches_extra = target_extra.iter().any(|&(tex, _)| {
+                    !tex.is_null()
+                        && (cand.color_texture == tex
+                            || cand.extra_color.iter().any(|a| a.texture == tex))
+                });
+                if !same_set && touches_extra {
+                    return None;
+                }
+                if same_set
+                    && cand
+                        .extra_color
+                        .iter()
+                        .any(|a| a.is_bound() && !matches!(a.load, ColorLoad::Load))
+                {
+                    // Same set, but an extra is cleared or first-used there:
+                    // that pass supersedes the move for the whole set.
+                    return None;
+                }
             }
             if (needs_depth || needs_stencil) && pass_reads_texture(cand, target_depth) {
                 return None;
@@ -3170,7 +3188,8 @@ impl PassState {
             }
             // Match: same attachments, currently loading.
             let color_ok = !needs_color
-                || (cand.color_texture == target_color
+                || (same_set
+                    && cand.color_texture == target_color
                     && cand.color_subresource == target_color_subresource
                     && matches!(cand.color_load, ColorLoad::Load));
             let depth_ok = !needs_depth
@@ -6662,22 +6681,35 @@ mod tests {
     }
 
     #[test]
-    fn clear_with_work_in_a_multi_target_pass_goes_per_target() {
+    fn clear_with_work_in_a_multi_target_pass_emits_one_quad() {
+        // The quad writes every colour target of the pass, so the pass stays
+        // open and nothing breaks per target.
         let mut s = fresh();
         s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
         s.emit_command(dummy_draw());
-        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::PerTarget);
+        assert!(matches!(
+            s.clear_color(1, 2, 3, 4),
+            ColorClearOutcome::EmitQuad { .. }
+        ));
+        assert!(!s.current_pass_closed());
+        assert_eq!(s.passes().len(), 1);
     }
 
     #[test]
-    fn clear_after_a_target_was_drawn_goes_per_target() {
+    fn clear_after_a_target_was_drawn_opens_a_load_pass_for_every_target() {
         let mut s = fresh();
         s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
         s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
         s.emit_command(dummy_draw());
         // A depth change ends the pass; the extra target has content now.
         s.set_depth_stencil_attachment(tex(0x5000), false, false);
-        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::PerTarget);
+        assert!(matches!(
+            s.clear_color(1, 2, 3, 4),
+            ColorClearOutcome::EmitQuad { .. }
+        ));
+        let pass = &s.passes()[1];
+        assert_eq!(pass.color_load(), ColorLoad::Load);
+        assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
     }
 
     #[test]
@@ -6715,21 +6747,22 @@ mod tests {
     }
 
     #[test]
-    fn depth_clear_in_a_multi_target_pass_breaks_instead_of_quad() {
+    fn depth_clear_in_a_multi_target_pass_stays_a_quad() {
+        // The depth clear-quad declares the extra targets with an empty
+        // write mask, so it runs inside the live pass like on a single
+        // target.
         let mut s = fresh();
         s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
         s.emit_command(dummy_draw());
-        assert_eq!(s.clear_depth(f32::to_bits(0.5)), DepthClearOutcome::Folded);
-        assert!(s.current_pass_closed());
-        s.emit_command(dummy_draw());
-        s.end_current_pass("test");
-        assert_eq!(s.passes().len(), 2);
-        assert_eq!(
-            s.passes()[1].depth_load(),
-            DepthLoad::Clear {
-                value: f32::to_bits(0.5)
+        assert!(matches!(
+            s.clear_depth(f32::to_bits(0.5)),
+            DepthClearOutcome::EmitQuad {
+                has_color: true,
+                ..
             }
-        );
+        ));
+        assert!(!s.current_pass_closed());
+        assert_eq!(s.passes().len(), 1);
     }
 
     #[test]
@@ -6759,7 +6792,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_h_leaves_multi_target_passes_alone() {
+    fn rule_h_strips_every_target_when_nothing_writes_colour() {
         let mut s = fresh();
         s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
         s.note_draw_color_write_mask(0);
@@ -6770,7 +6803,82 @@ mod tests {
         // SAFETY: tests; opaque value never dereferenced.
         alt.insert(0x77u64, unsafe { MetalHandle::new(0x78) });
         s.strip_color_from_no_color_draw_passes(&alt);
-        assert_eq!(s.passes()[0].color_texture(), backbuffer());
+        let pass = &s.passes()[0];
+        assert_eq!(pass.color_texture(), MetalHandle::NULL);
+        assert!(!pass.extra_color()[0].is_bound(), "extras go with target 0");
+        assert_eq!(pass.extra_present_mask(), 0);
+    }
+
+    #[test]
+    fn rule_e_merges_a_clear_only_pass_into_the_same_target_set() {
+        // Clear the set, bind another target (a clear-only pass materialises),
+        // come back to the set and draw: the clear folds into the draw pass.
+        let rt_a = tex(0x3000);
+        let mut s = fresh();
+        s.set_extra_color_render_target(1, Some(slot(rt_a, BB_SIZE)));
+        s.clear_color(1, 2, 3, 4);
+        s.set_extra_color_render_target(1, None);
+        s.set_color_render_target(
+            tex(0x4000),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.set_extra_color_render_target(1, Some(slot(rt_a, BB_SIZE)));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 3);
+        s.coalesce_clear_only_passes();
+        assert_eq!(s.passes().len(), 2, "clear-only pass folded");
+        let merged = &s.passes()[1];
+        let clear = ColorLoad::Clear {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 4,
+        };
+        assert_eq!(merged.color_load(), clear);
+        assert_eq!(merged.extra_color()[0].load(), clear);
+    }
+
+    #[test]
+    fn rule_e_refuses_a_different_target_set() {
+        // The clear-only pass carries {backbuffer, rt_a}; the next pass on
+        // the backbuffer carries {backbuffer} alone, so the set does not
+        // match and the clear stays where it was.
+        let rt_a = tex(0x3000);
+        let mut s = fresh();
+        s.set_extra_color_render_target(1, Some(slot(rt_a, BB_SIZE)));
+        s.clear_color(1, 2, 3, 4);
+        s.set_extra_color_render_target(1, None);
+        s.set_color_render_target(
+            tex(0x4000),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.coalesce_clear_only_passes();
+        assert_eq!(s.passes().len(), 3, "different set, no merge");
     }
 
     #[test]

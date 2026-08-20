@@ -9,7 +9,7 @@
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING, D3DUSAGE_RENDERTARGET, PrimitiveMiscCaps,
 };
 
@@ -373,4 +373,71 @@ fn caps_advertise_four_targets() {
             | PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS
             | PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING
     ));
+}
+
+#[test]
+fn mid_pass_clear_reaches_every_target_without_ending_the_draw_sequence() {
+    // Draw, then Clear with the pass still open, then draw again: the clear
+    // runs as an in-pass quad writing both targets, and the second draw lands
+    // on top of it.
+    let h = Harness::new();
+    let (rt0, rt1) = two_targets(&h);
+    assert_eq!(h.clear_target(BLACK), D3D_OK, "clear both");
+    let ps = h.create_pixel_shader(&PS_TWO_TARGETS);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+        D3D_OK,
+        "first draw"
+    );
+    assert_eq!(h.clear_target(RED), D3D_OK, "mid-pass clear");
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_color(
+        read_rt_pixel(&h, &rt0.surface_level(0), 32, 32),
+        RED,
+        "slot 0 cleared mid-pass",
+    );
+    assert_color(
+        read_rt_pixel(&h, &rt1.surface_level(0), 32, 32),
+        RED,
+        "slot 1 cleared mid-pass",
+    );
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+        D3D_OK,
+        "second draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_color(
+        read_rt_pixel(&h, &rt0.surface_level(0), 32, 32),
+        GREEN,
+        "slot 0 drawn after the clear",
+    );
+    assert_color(
+        read_rt_pixel(&h, &rt1.surface_level(0), 32, 32),
+        BLUE,
+        "slot 1 drawn after the clear",
+    );
+    assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}
+
+#[test]
+fn rect_clear_reaches_every_target_inside_the_rect_only() {
+    let h = Harness::new();
+    let (rt0, rt1) = two_targets(&h);
+    assert_eq!(h.clear_target(BLACK), D3D_OK, "clear both");
+    let rect = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 32,
+        y2: 32,
+    };
+    assert_eq!(h.clear_target_rects(RED, &[rect]), D3D_OK, "rect clear");
+    for (rt, name) in [(&rt0, "slot 0"), (&rt1, "slot 1")] {
+        let surface = rt.surface_level(0);
+        assert_color(read_rt_pixel(&h, &surface, 8, 8), RED, name);
+        assert_color(read_rt_pixel(&h, &surface, 48, 48), BLACK, name);
+    }
 }

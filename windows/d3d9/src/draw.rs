@@ -1232,7 +1232,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // with this still false, Rule H strips the color attachment + swaps
     // the bound pipeline to the no-color variant. Must run after
     // begin_render_pass_if_needed so the tag lands on the right pass.
-    enc.note_draw_color_write_mask(u32::from(render_state.pipeline_rs.color_write_mask));
+    enc.note_draw_color_write_mask(u32::from(!pipeline_snapshot.writes_no_color()));
     enc.emit_scissor(
         render_state.scissor_test_enable(),
         render_state.scissor_rect.map(u32::from),

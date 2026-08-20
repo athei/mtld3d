@@ -367,6 +367,13 @@ pub struct EnsureClearQuadPipelineParams {
     pub depth_format: PixelFormat,                 // in (ignored when HAS_DEPTH unset)
     pub color_format: PixelFormat,                 // in (ignored when HAS_COLOR unset)
     pub flags: ClearQuadFlags,                     // in: HAS_COLOR | HAS_DEPTH | HAS_STENCIL
+    /// Render targets 1..3 of the pass the quad draws into: bit `i` = slot `i + 1` bound.
+    ///
+    /// A colour quad writes its clear colour to every declared slot; a
+    /// depth quad declares them with an empty write mask, as it does for
+    /// slot 0 under `COLOR_FORMAT_NO_WRITE`. Zero on a single-target pass.
+    pub extra_present_mask: u32, // in
+    pub extra_formats: [PixelFormat; 3],           // in (ignored where the mask bit is clear)
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
 }
 

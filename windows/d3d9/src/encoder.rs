@@ -903,6 +903,8 @@ struct ClearQuadKey {
     depth_format: PixelFormat,
     color_format: PixelFormat,
     flags: ClearQuadFlags,
+    /// Render targets 1..3 of the pass, alpha bits cleared (the quad blends nothing).
+    extra: mtld3d_core::pipeline_state::ExtraColorAttachments,
 }
 
 /// Where a mid-pass clear quad lands, as the depth and stencil clear chains report it.
@@ -2187,28 +2189,33 @@ impl FrameEncoder {
         self.pass_state.set_extra_color_render_target(slot, binding);
     }
 
-    /// Run `f` once per bound colour target, each time with that target bound alone.
+    /// Render targets 1..3 as a clear-quad pipeline must declare them.
     ///
-    /// The multi-target clear paths route through here: the clear-quad
-    /// pipelines and the fold rules are written for one colour attachment,
-    /// so each target gets the single-target treatment in turn, with depth
-    /// unbound for the scoped pass (a depth attachment smaller than the
-    /// target would clip the clear). `only_outside_pass` restricts the walk
-    /// to extras that are bound but sized unlike target 0 and therefore
-    /// attached to no pass. The device's binding set comes back exactly as
-    /// it was, alpha bits and extras included; the pass breaks this costs
-    /// are the price of a clear that cannot fold, never of a draw.
-    fn for_each_bound_color_target(
-        &mut self,
-        only_outside_pass: bool,
-        mut f: impl FnMut(&mut Self),
-    ) {
+    /// The quad blends nothing, so the alpha bits are dropped to keep the
+    /// pipeline key canonical.
+    const fn clear_quad_extra_targets(&self) -> mtld3d_core::pipeline_state::ExtraColorAttachments {
+        let mut extra = self.pass_state.extra_color_attachments();
+        extra.has_alpha_mask = 0;
+        extra
+    }
+
+    /// Run `f` once per colour target that is bound but outside the pass, with it bound alone.
+    ///
+    /// A render target 1..3 sized unlike target 0 is attached to no pass
+    /// (the D3D9 rule), yet `Clear` still reaches it. Each such target gets
+    /// the single-target clear treatment in turn, with depth unbound for the
+    /// scoped pass (a depth attachment smaller than the target would clip
+    /// the clear). The device's binding set comes back exactly as it was,
+    /// alpha bits and extras included. Never runs when every bound target
+    /// matches target 0, so the common multi-target shape costs no pass
+    /// break here.
+    fn clear_targets_outside_pass(&mut self, mut f: impl FnMut(&mut Self)) {
         let saved = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
-        for slot in 0..4usize {
-            if only_outside_pass && (slot == 0 || saved.extra_matches_rt0(slot)) {
+        for slot in 1..4usize {
+            if saved.extra_matches_rt0(slot) {
                 continue;
             }
             let Some(target) = saved.slot(slot) else {
@@ -2276,15 +2283,11 @@ impl FrameEncoder {
                 self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_color_inner(rgba, viewport, color_format);
             }
-            ColorClearOutcome::PerTarget => {
-                self.for_each_bound_color_target(false, |enc| enc.clear_color(r, g, b, a));
-                return;
-            }
         }
         // A target bound outside the pass (sized unlike target 0) is owed the
-        // clear too; the fold above never reached it.
-        if self.pass_state.has_extra_color_targets() {
-            self.for_each_bound_color_target(true, |enc| enc.clear_color(r, g, b, a));
+        // clear too; neither the fold nor the quad above reached it.
+        if self.pass_state.has_extra_color_targets_outside_pass() {
+            self.clear_targets_outside_pass(|enc| enc.clear_color(r, g, b, a));
         }
     }
 
@@ -2299,14 +2302,6 @@ impl FrameEncoder {
     /// clear stays on the fold path (`clear_color` + `clear_depth`) so
     /// the depth side is not forced onto the clear-quad path.
     pub fn clear_color_bounded_to_viewport(&mut self, r: u32, g: u32, b: u32, a: u32) {
-        if self.pass_state.has_extra_color_targets() {
-            // The viewport bound is evaluated per target, against that
-            // target's own extent.
-            self.for_each_bound_color_target(false, |enc| {
-                enc.clear_color_bounded_to_viewport(r, g, b, a);
-            });
-            return;
-        }
         if self.pass_state.viewport_covers_color_attachment() {
             self.clear_color(r, g, b, a);
         } else {
@@ -2321,6 +2316,12 @@ impl FrameEncoder {
             // texture's space — goes to the resolved entry point, not the
             // converting one.
             self.clear_color_rects_resolved(r, g, b, a, &[rect]);
+            // A target outside the pass bounds the clear to its own extent.
+            if self.pass_state.has_extra_color_targets_outside_pass() {
+                self.clear_targets_outside_pass(|enc| {
+                    enc.clear_color_bounded_to_viewport(r, g, b, a);
+                });
+            }
         }
     }
 
@@ -2340,23 +2341,22 @@ impl FrameEncoder {
         a: u32,
         rects: &[(i32, i32, i32, i32)],
     ) {
-        if self.pass_state.has_extra_color_targets() {
-            // The rects are clipped against each target's own viewport and
-            // converted at that target's scale.
-            self.for_each_bound_color_target(false, |enc| enc.clear_color_rects(r, g, b, a, rects));
-            return;
-        }
         // `rects` are the game's own; the viewport they clip against is already
         // the bound texture's, so convert before clipping rather than after, or
         // the intersection is taken between two different spaces.
         let scale = self.pass_state.target_scale();
         if scale.is_identity() {
             self.clear_color_rects_resolved(r, g, b, a, rects);
-            return;
+        } else {
+            let scaled: Vec<(i32, i32, i32, i32)> =
+                rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
+            self.clear_color_rects_resolved(r, g, b, a, &scaled);
         }
-        let scaled: Vec<(i32, i32, i32, i32)> =
-            rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
-        self.clear_color_rects_resolved(r, g, b, a, &scaled);
+        // A target outside the pass clips the rects against its own viewport
+        // and converts them at its own scale.
+        if self.pass_state.has_extra_color_targets_outside_pass() {
+            self.clear_targets_outside_pass(|enc| enc.clear_color_rects(r, g, b, a, rects));
+        }
     }
 
     /// `clear_color_rects` for rects already in the bound texture's space.
@@ -2585,6 +2585,8 @@ impl FrameEncoder {
             depth_format: key.depth_format,
             color_format: key.color_format,
             flags: key.flags,
+            extra_present_mask: u32::from(key.extra.present_mask),
+            extra_formats: key.extra.formats,
             pipeline_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut params);
@@ -2609,6 +2611,7 @@ impl FrameEncoder {
             // for the unstripped case too.)
             let sibling_key = ClearQuadKey {
                 flags: key.flags - ClearQuadFlags::COLOR_FORMAT_NO_WRITE,
+                extra: mtld3d_core::pipeline_state::ExtraColorAttachments::NONE,
                 ..key
             };
             let _ = self.get_or_create_clear_quad_pipeline(sibling_key);
@@ -2932,6 +2935,11 @@ impl FrameEncoder {
                 PixelFormat::Bgra8Unorm
             },
             flags,
+            extra: if has_color {
+                self.clear_quad_extra_targets()
+            } else {
+                mtld3d_core::pipeline_state::ExtraColorAttachments::NONE
+            },
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
@@ -3017,6 +3025,7 @@ impl FrameEncoder {
             depth_format: PixelFormat::Depth32Float,
             color_format,
             flags,
+            extra: self.clear_quad_extra_targets(),
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
@@ -3819,19 +3828,15 @@ impl FrameEncoder {
         // retroactively if every draw in the pass had `mask == 0`.
         // Building both is cheap — cache hit on the second call after
         // the first frame; CreateRenderPipeline thunk on cold-miss.
-        // Rule H never strips a pass with extra render targets, so the twin
-        // is only built for the single-target shape.
-        if !with_color.is_null()
-            && snapshot.rs.color_write_mask == 0
-            && snapshot.has_color_output()
-            && snapshot.extra.present_mask == 0
-        {
-            // No-color twin: same identity except the attach flag.
-            // Explicit `.clone()` because PipelineSnapshot is no longer
+        if !with_color.is_null() && snapshot.writes_no_color() && snapshot.has_color_output() {
+            // No-color twin: same identity except the attach flag (and no
+            // render targets 1..3, which Rule H strips together with target
+            // 0). Explicit `.clone()` because PipelineSnapshot is no longer
             // Copy; fires once per unique pipeline (cache hit thereafter).
             let mut alt = snapshot.clone();
             alt.attach
                 .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
+            alt.extra = mtld3d_core::pipeline_state::ExtraColorAttachments::NONE;
             let no_color = self.resolve_pipeline(&alt, vertex_attrs);
             if !no_color.is_null() {
                 self.no_color_pipeline_alt
