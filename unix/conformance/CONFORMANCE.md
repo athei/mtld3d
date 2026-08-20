@@ -166,8 +166,8 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **45 `real` · 124 `expected` ·
-6 `caps` · 2 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
+re-checked before retagging. Headline: **45 `real` · 123 `expected` ·
+6 `caps` · 3 `flaky` · 0 `untriaged`** unique sites; all 8 subtest-arches
 `crash=0`. Tags do not affect the gate (which rejects count/site/crash
 regressions), so tag corrections are documentation, not gate changes.
 
@@ -641,12 +641,17 @@ broken(). Accepted platform limitation (no cap branch — old `caps` tag was
 wrong).
 
 ### visual.c/test_map_synchronisation
-Sites: 25148=expected
+Sites: 25148=flaky
 
 The failing config is exactly the plain (no DISCARD/NOOVERWRITE) PARTIAL
 lock of a contended Direct buffer, which native stalls for. Our buffer-
 rename design deliberately removed that stall (`plan_lock` → WriteInPlace);
-re-adding it is the only fix and is a rejected perf regression.
+re-adding it is the only fix and is a rejected perf regression. Whether the
+test observes the divergence is a per-run CPU-vs-GPU race (the probe's Lock
+write lands before or after the GPU consumes the in-flight draw), so the
+count flutters between 0 and 1 across runs of the same binary; it read 0 on
+the CI runner and tripped the stale-baseline gate (PR #12), hence the flaky
+tolerance. The kept divergence itself is unchanged.
 
 ### visual.c/test_sysmem_draw
 Sites: 25431=real 25436=real 25505=expected 25518=expected 25565=expected
