@@ -897,18 +897,37 @@ pub struct PassState {
     /// still run.
     pending_leading_blits: Vec<BlitCommand>,
 
-    /// Color-attachment textures that have already been used as an rt in this frame.
+    /// Color-attachment textures that have already been used as an rt this D3D9 frame.
     ///
     /// Inserted at `ensure_pass_open`. First-use opens the door to
     /// `ColorLoad::DontCare` (Rule A) — subsequent uses default to `Load`
-    /// so accumulated draws survive across pass breaks. Reset each frame
-    /// in `reset_frame`. Capacity hint matches a typical frame shape
-    /// (backbuffer + a few CSM ping-pong RTs).
+    /// so accumulated draws survive across pass breaks. Consulted only by the
+    /// load/store rules (Rule A first-use, the finalisers), which reason about
+    /// the whole D3D9 frame, so a mid-frame flush does *not* clear it (the
+    /// content it tracks stays in VRAM across the flush). Reset on a real
+    /// `Present`. Capacity hint matches a typical frame shape (backbuffer + a
+    /// few CSM ping-pong RTs).
     seen_color_rts: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
-    /// Depth-attachment textures that have already been used as a depth rt in this frame.
+    /// Depth-attachment textures that have already been used as a depth rt this D3D9 frame.
     ///
     /// Same semantics as `seen_color_rts`.
     seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Colour rts that received content in the *current submission segment*.
+    ///
+    /// Reset on every `reset_frame`, mid-frame flush included, unlike
+    /// [`Self::seen_color_rts`]. The clear paths key on this: a cross-pass
+    /// `Clear` paints a scissored quad (preserving prior tiles) only when the
+    /// target already holds content Metal's full-attachment `loadAction =
+    /// Clear` would wipe *within this segment*. After a flush every attachment
+    /// is safely stored to VRAM, so a fresh full clear is correct and must fold
+    /// — a shared shadow-atlas ping-pong lives inside one segment, so the
+    /// preserve-tiles case still fires there.
+    seen_color_rts_segment: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
+    /// Depth rts that received content in the current submission segment.
+    ///
+    /// Segment-scoped twin of [`Self::seen_depth_rts`]; drives the depth and
+    /// stencil cross-pass clear decisions for the same reason.
+    seen_depth_rts_segment: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Textures a queued blit writes this frame (`StretchRect` destinations, mipmap regens).
     ///
     /// Inserted by `push_pending_leading_blit`, which sees every ordered blit
@@ -1080,6 +1099,8 @@ impl PassState {
             pending_leading_blits: Vec::new(),
             seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            seen_color_rts_segment: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
+            seen_depth_rts_segment: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
@@ -1189,15 +1210,19 @@ impl PassState {
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
-        // Keep the seen-rt sets across a mid-frame flush: the D3D9 frame
-        // continues, so the targets already drawn keep their VRAM content and
-        // their first use in the continuation must Load, not `DontCare`. On a
-        // real `Present` (`continues_frame` false) the frame ended and every
-        // target starts fresh.
+        // Keep the frame-scoped seen-rt sets across a mid-frame flush: the D3D9
+        // frame continues, so the targets already drawn keep their VRAM content
+        // and their first use in the continuation must Load, not `DontCare`. On
+        // a real `Present` (`continues_frame` false) the frame ended and every
+        // target starts fresh. The segment-scoped sets always reset: after the
+        // flush every attachment is stored, so a fresh full clear is correct
+        // and must fold rather than paint a scissored quad.
         if !continues_frame {
             self.seen_color_rts.clear();
             self.seen_depth_rts.clear();
         }
+        self.seen_color_rts_segment.clear();
+        self.seen_depth_rts_segment.clear();
         self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
@@ -1930,15 +1955,19 @@ impl PassState {
             None => StencilLoad::Load,
         };
         if !self.current_color_texture.is_null() {
-            self.seen_color_rts
-                .insert((self.current_color_texture, self.current_color_subresource));
+            let key = (self.current_color_texture, self.current_color_subresource);
+            self.seen_color_rts.insert(key);
+            self.seen_color_rts_segment.insert(key);
         }
         for attachment in extra_color.iter().filter(|a| a.is_bound()) {
-            self.seen_color_rts
-                .insert((attachment.texture, attachment.subresource));
+            let key = (attachment.texture, attachment.subresource);
+            self.seen_color_rts.insert(key);
+            self.seen_color_rts_segment.insert(key);
         }
         if !self.current_depth_texture.is_null() {
             self.seen_depth_rts.insert(self.current_depth_texture);
+            self.seen_depth_rts_segment
+                .insert(self.current_depth_texture);
         }
 
         // Reuse a `Vec<Command>` recycled from a previous frame's pass
@@ -2542,7 +2571,7 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<StencilClearOutcome> {
-        if !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts_segment.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
@@ -2610,7 +2639,7 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<DepthClearOutcome> {
-        if !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts_segment.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
@@ -2707,11 +2736,16 @@ impl PassState {
         self.pending_depth_clear = Some(value);
     }
 
-    /// `true` when render target 0 or any extra in the pass already has content this frame.
+    /// `true` when rt 0 or a bound extra already has content in this submission segment.
+    ///
+    /// Segment-scoped, not frame-scoped: a full `loadAction = Clear` only wipes
+    /// content in the current encoder chain, so a clear on a target last drawn
+    /// before a mid-frame flush (already stored to VRAM) correctly folds to a
+    /// full clear rather than a scissored quad.
     fn any_bound_color_target_seen(&self) -> bool {
         let rt0_seen = !self.current_color_texture.is_null()
             && self
-                .seen_color_rts
+                .seen_color_rts_segment
                 .contains(&(self.current_color_texture, self.current_color_subresource));
         rt0_seen
             || self
@@ -2721,7 +2755,7 @@ impl PassState {
                 .any(|(i, slot)| {
                     self.current_extra_present_mask & (1 << i) != 0
                         && self
-                            .seen_color_rts
+                            .seen_color_rts_segment
                             .contains(&(slot.texture, slot.subresource))
                 })
     }
@@ -7419,5 +7453,57 @@ mod tests {
         s.emit_command(dummy_draw());
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
         assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    }
+
+    #[test]
+    fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
+        // The frame continues past a mid-frame flush, so the backbuffer stays
+        // "seen" for the load rules — but a Clear issued after the flush must
+        // still fold to a full loadAction=Clear, not the cross-pass scissored
+        // quad, because the pre-flush content is safely in VRAM. A sub-rect
+        // viewport is set to expose the bug: the quad would clip to it.
+        // (This is the `test_viewport` conformance shape: readback mid-frame,
+        // then Clear under a viewport.)
+        let mut s = fresh();
+        s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: true,
+        });
+        s.set_viewport(100, 100, 64, 64, 0.0, 1.0);
+        assert_eq!(
+            s.clear_color(1, 2, 3, 4),
+            ColorClearOutcome::Folded,
+            "a full clear after a flush folds, even though the target is still seen this frame",
+        );
+        // And the depth clear on the same sequence folds too, not a quad.
+        assert_eq!(
+            s.clear_depth(f32::to_bits(1.0)),
+            DepthClearOutcome::Folded,
+            "depth clear after a flush folds as well",
+        );
+    }
+
+    #[test]
+    fn a_clear_within_one_segment_still_paints_a_quad() {
+        // The contrast: within one submission segment (no flush), a second
+        // clear of a target already drawn takes the cross-pass quad path so a
+        // full loadAction=Clear cannot wipe the earlier content.
+        let mut s = fresh();
+        s.set_viewport(0, 0, 683, 683, 0.0, 1.0);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.set_viewport(683, 0, 683, 683, 0.0, 1.0);
+        assert!(
+            matches!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::EmitQuad { .. }),
+            "a cross-pass clear inside one segment still scissors a quad",
+        );
     }
 }
