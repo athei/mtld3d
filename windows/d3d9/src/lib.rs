@@ -124,6 +124,11 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
         // SAFETY: pseudo-handle to current process; exit code 0.
         unsafe { TerminateProcess(proc, 0) };
     }
+    if reason == DLL_PROCESS_DETACH {
+        // A FreeLibrary the process survives: take the process-wide pointers
+        // into this image down with it.
+        crash::uninstall();
+    }
     if reason != DLL_PROCESS_ATTACH {
         return 1;
     }

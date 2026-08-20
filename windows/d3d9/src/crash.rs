@@ -1,6 +1,16 @@
 //! Always-on PE-side crash diagnostics.
 //!
-//! Installed once from `init_logger()` during `DllMain` `PROCESS_ATTACH`.
+//! Installed once from `init_logger()` during `DllMain` `PROCESS_ATTACH`, and
+//! the vectored handler is removed again on a `PROCESS_DETACH` the process
+//! survives: a VEH registration is a process-wide pointer into this image, and
+//! launchers and benchmarks routinely `LoadLibrary` d3d9, probe the caps and
+//! `FreeLibrary` it before carrying on. Left behind, the registration turns
+//! the process's next exception (C++ throws included) into an instruction
+//! fetch from unmapped memory, which raises the next exception, which reaches
+//! the same stale entry, until the main thread's stack is gone. The panic hook
+//! needs no such care: it lives in this cdylib's own `std` and nothing else in
+//! the process can reach it once the image is gone.
+//!
 //! Two pieces, both diagnostic-only — they print the crumb trail and
 //! delegate termination to the normal SEH / `panic_abort` paths:
 //!
@@ -47,6 +57,8 @@ const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// The registration `RtlAddVectoredExceptionHandler` handed back, for [`uninstall`].
+static VEH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 #[repr(C)]
 struct ExceptionRecord {
@@ -68,6 +80,7 @@ type VectoredHandler = extern "system" fn(*mut ExceptionPointers) -> i32;
 
 unsafe extern "system" {
     fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
+    fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetStdHandle(handle: u32) -> *mut c_void;
     fn WriteFile(
@@ -98,11 +111,27 @@ pub fn install(d3d9_module: *mut c_void) {
     }
 
     D3D9_HMODULE.store(d3d9_module, Ordering::Release);
-    // SAFETY: kernel32 export; safe to call from DllMain.
-    unsafe {
-        RtlAddVectoredExceptionHandler(1, handler);
-    }
+    // SAFETY: ntdll export; safe to call from DllMain.
+    let veh = unsafe { RtlAddVectoredExceptionHandler(1, handler) };
+    VEH_HANDLE.store(veh, Ordering::Release);
     install_panic_hook();
+}
+
+/// Remove the VEH before the image goes away. Idempotent.
+///
+/// Called from `DllMain` `PROCESS_DETACH` on the path the process survives
+/// (a `FreeLibrary` before any device was created); the real-exit path
+/// terminates the process instead and never gets here.
+pub fn uninstall() {
+    if !INSTALLED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let veh = VEH_HANDLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if veh.is_null() {
+        return;
+    }
+    // SAFETY: `veh` is the live registration `install` stored; ntdll export.
+    unsafe { RtlRemoveVectoredExceptionHandler(veh) };
 }
 
 fn install_panic_hook() {
