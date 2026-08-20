@@ -805,6 +805,25 @@ bitflags::bitflags! {
     }
 }
 
+/// The per-frame inputs `PassState::reset_frame` seeds a new frame from.
+///
+/// A parameter struct rather than a long argument list: the frame's
+/// backbuffer identity, its logical size and format, the depth surface and
+/// whether it carries stencil, the back-buffer render scale, and whether this
+/// frame continues one that a mid-frame flush interrupted (see
+/// [`PassState::reset_frame`]).
+pub struct FrameReset {
+    pub backbuffer: MetalHandle<MTLTextureKind>,
+    /// Logical back-buffer size, the resolution D3D9 reports.
+    pub backbuffer_size: (u32, u32),
+    pub backbuffer_format: PixelFormat,
+    pub depth_texture: MetalHandle<MTLTextureKind>,
+    pub depth_has_stencil: bool,
+    pub render_scale: RenderScale,
+    /// `true` when the previous submit was a mid-frame flush, not a `Present`.
+    pub continues_frame: bool,
+}
+
 /// Pass-management state machine.
 ///
 /// Owned by the encoder thread's `FrameEncoder`; every frame begins with
@@ -878,18 +897,46 @@ pub struct PassState {
     /// still run.
     pending_leading_blits: Vec<BlitCommand>,
 
-    /// Color-attachment textures that have already been used as an rt in this frame.
+    /// Color-attachment textures that have already been used as an rt this D3D9 frame.
     ///
     /// Inserted at `ensure_pass_open`. First-use opens the door to
     /// `ColorLoad::DontCare` (Rule A) — subsequent uses default to `Load`
-    /// so accumulated draws survive across pass breaks. Reset each frame
-    /// in `reset_frame`. Capacity hint matches a typical frame shape
-    /// (backbuffer + a few CSM ping-pong RTs).
+    /// so accumulated draws survive across pass breaks. Consulted only by the
+    /// load/store rules (Rule A first-use, the finalisers), which reason about
+    /// the whole D3D9 frame, so a mid-frame flush does *not* clear it (the
+    /// content it tracks stays in VRAM across the flush). Reset on a real
+    /// `Present`. Capacity hint matches a typical frame shape (backbuffer + a
+    /// few CSM ping-pong RTs).
     seen_color_rts: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
-    /// Depth-attachment textures that have already been used as a depth rt in this frame.
+    /// Depth-attachment textures that have already been used as a depth rt this D3D9 frame.
     ///
     /// Same semantics as `seen_color_rts`.
     seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Colour rts that received content in the *current submission segment*.
+    ///
+    /// Reset on every `reset_frame`, mid-frame flush included, unlike
+    /// [`Self::seen_color_rts`]. The clear paths key on this: a cross-pass
+    /// `Clear` paints a scissored quad (preserving prior tiles) only when the
+    /// target already holds content Metal's full-attachment `loadAction =
+    /// Clear` would wipe *within this segment*. After a flush every attachment
+    /// is safely stored to VRAM, so a fresh full clear is correct and must fold
+    /// — a shared shadow-atlas ping-pong lives inside one segment, so the
+    /// preserve-tiles case still fires there.
+    seen_color_rts_segment: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
+    /// Depth rts that received content in the current submission segment.
+    ///
+    /// Segment-scoped twin of [`Self::seen_depth_rts`]; drives the depth and
+    /// stencil cross-pass clear decisions for the same reason.
+    seen_depth_rts_segment: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Textures a queued blit writes this frame (`StretchRect` destinations, mipmap regens).
+    ///
+    /// Inserted by `push_pending_leading_blit`, which sees every ordered blit
+    /// before it is drained into some pass's `leading_blits`. Rule A consults
+    /// it: the blit that wrote the texture may sit in an earlier pass's
+    /// leading list, not the one that first attaches the texture, so the
+    /// attachment's own `leading_blits` are not enough to know that its
+    /// content is live. Reset each frame in `reset_frame`.
+    blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule D (last-use color `Store=DontCare`) exempts this handle so
@@ -1052,6 +1099,9 @@ impl PassState {
             pending_leading_blits: Vec::new(),
             seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            seen_color_rts_segment: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
+            seen_depth_rts_segment: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
@@ -1084,15 +1134,25 @@ impl PassState {
     /// `render_scale` converts it to the size of the texture actually bound.
     /// Callers stay in the game's coordinate space and this is the one place
     /// the two are reconciled.
-    pub fn reset_frame(
-        &mut self,
-        backbuffer: MetalHandle<MTLTextureKind>,
-        backbuffer_size: (u32, u32),
-        backbuffer_format: PixelFormat,
-        depth_texture: MetalHandle<MTLTextureKind>,
-        depth_has_stencil: bool,
-        render_scale: RenderScale,
-    ) {
+    ///
+    /// `continues_frame` is `true` when the previous submit was a mid-frame
+    /// flush (a readback / retention drain, `NO_PRESENT`) rather than a
+    /// `Present`. The D3D9 frame the game is drawing did not end there, so the
+    /// render targets and depth surface it already wrote keep their content in
+    /// VRAM. The per-frame "seen" sets are kept across the boundary so Rule A
+    /// loads those attachments on their first use in the continuation instead
+    /// of discarding them with `DontCare` (the store side is handled by
+    /// `finalize_store_actions` skipping Rules B and D on the flush).
+    pub fn reset_frame(&mut self, reset: &FrameReset) {
+        let &FrameReset {
+            backbuffer,
+            backbuffer_size,
+            backbuffer_format,
+            depth_texture,
+            depth_has_stencil,
+            render_scale,
+            continues_frame,
+        } = reset;
         // Recycle each retired pass's `commands` Vec back into the pool
         // (capacity preserved, length zeroed). Once warm, the pool's
         // Vecs carry the steady-state high-water capacity and the next
@@ -1150,8 +1210,20 @@ impl PassState {
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
-        self.seen_color_rts.clear();
-        self.seen_depth_rts.clear();
+        // Keep the frame-scoped seen-rt sets across a mid-frame flush: the D3D9
+        // frame continues, so the targets already drawn keep their VRAM content
+        // and their first use in the continuation must Load, not `DontCare`. On
+        // a real `Present` (`continues_frame` false) the frame ended and every
+        // target starts fresh. The segment-scoped sets always reset: after the
+        // flush every attachment is stored, so a fresh full clear is correct
+        // and must fold rather than paint a scissored quad.
+        if !continues_frame {
+            self.seen_color_rts.clear();
+            self.seen_depth_rts.clear();
+        }
+        self.seen_color_rts_segment.clear();
+        self.seen_depth_rts_segment.clear();
+        self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
@@ -1838,7 +1910,7 @@ impl PassState {
                     && !texture.is_null()
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
-                    && !blit_list_writes(&leading_blits, texture) =>
+                    && !self.blit_written_rts.contains(&texture) =>
                 {
                     ColorLoad::DontCare
                 }
@@ -1871,7 +1943,7 @@ impl PassState {
             && !self
                 .seen_sampled_textures
                 .contains(&self.current_depth_texture)
-            && !blit_list_writes(&leading_blits, self.current_depth_texture);
+            && !self.blit_written_rts.contains(&self.current_depth_texture);
         let depth_load = match self.pending_depth_clear.take() {
             Some(value) => DepthLoad::Clear { value },
             None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
@@ -1883,15 +1955,19 @@ impl PassState {
             None => StencilLoad::Load,
         };
         if !self.current_color_texture.is_null() {
-            self.seen_color_rts
-                .insert((self.current_color_texture, self.current_color_subresource));
+            let key = (self.current_color_texture, self.current_color_subresource);
+            self.seen_color_rts.insert(key);
+            self.seen_color_rts_segment.insert(key);
         }
         for attachment in extra_color.iter().filter(|a| a.is_bound()) {
-            self.seen_color_rts
-                .insert((attachment.texture, attachment.subresource));
+            let key = (attachment.texture, attachment.subresource);
+            self.seen_color_rts.insert(key);
+            self.seen_color_rts_segment.insert(key);
         }
         if !self.current_depth_texture.is_null() {
             self.seen_depth_rts.insert(self.current_depth_texture);
+            self.seen_depth_rts_segment
+                .insert(self.current_depth_texture);
         }
 
         // Reuse a `Vec<Command>` recycled from a previous frame's pass
@@ -1971,7 +2047,25 @@ impl PassState {
     /// draws. If no further pass opens this frame, `submit` drains the queue
     /// into a synthetic trailing blit-only pass via
     /// `take_pending_leading_blits`.
+    ///
+    /// The blit is also entered into the read/write model the load/store rules
+    /// reason over. A texture-to-texture copy reads its source from device
+    /// memory after every pass that wrote it, so the source counts as read
+    /// (`seen_sampled_textures`, which Rules B/C/D consult before discarding a
+    /// store). The destination of any texture-writing blit goes into
+    /// `blit_written_rts` so Rule A loads it instead of discarding the copy.
     pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
+        if BlitCommandType::from_repr(blit.cmd) == Some(BlitCommandType::CopyTextureToTexture)
+            && blit.src_handle != 0
+        {
+            // SAFETY: a texture copy carries a non-null MTLTexture handle in
+            // `src_handle`, packed from the encoder's typed cache via `.raw()`.
+            let src = unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) };
+            self.note_texture_read(src);
+        }
+        if let Some(dst) = blit_written_texture(&blit) {
+            self.blit_written_rts.insert(dst);
+        }
         self.pending_leading_blits.push(blit);
     }
 
@@ -2126,6 +2220,16 @@ impl PassState {
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
+        // A cascade depth surface saved and restored through
+        // `GetDepthStencilSurface` comes back via the `Eager` bind path with
+        // `is_sampleable = false` — the returned surface carries
+        // `parent_texture = null` — even though the underlying Metal texture is
+        // the same sampleable shadow map. Resolve the flag against the
+        // session-wide "ever sampleable" set so such a rebind neither breaks
+        // the pass (an encoder close/open, Load+Store of every attachment) nor
+        // clears Rule B's keep-Store exemption for the cascade.
+        let is_sampleable = is_sampleable
+            || (!texture.is_null() && self.seen_sampleable_depth_textures.contains(&texture));
         // `has_stencil` is a property of the bound texture's format, so a
         // repeat bind of the same texture carries the same value — fold it
         // before the no-change early-out below.
@@ -2467,7 +2571,7 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<StencilClearOutcome> {
-        if !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts_segment.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
@@ -2535,7 +2639,7 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<DepthClearOutcome> {
-        if !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts_segment.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
@@ -2632,11 +2736,16 @@ impl PassState {
         self.pending_depth_clear = Some(value);
     }
 
-    /// `true` when render target 0 or any extra in the pass already has content this frame.
+    /// `true` when rt 0 or a bound extra already has content in this submission segment.
+    ///
+    /// Segment-scoped, not frame-scoped: a full `loadAction = Clear` only wipes
+    /// content in the current encoder chain, so a clear on a target last drawn
+    /// before a mid-frame flush (already stored to VRAM) correctly folds to a
+    /// full clear rather than a scissored quad.
     fn any_bound_color_target_seen(&self) -> bool {
         let rt0_seen = !self.current_color_texture.is_null()
             && self
-                .seen_color_rts
+                .seen_color_rts_segment
                 .contains(&(self.current_color_texture, self.current_color_subresource));
         rt0_seen
             || self
@@ -2646,7 +2755,7 @@ impl PassState {
                 .any(|(i, slot)| {
                     self.current_extra_present_mask & (1 << i) != 0
                         && self
-                            .seen_color_rts
+                            .seen_color_rts_segment
                             .contains(&(slot.texture, slot.subresource))
                 })
     }
@@ -3025,15 +3134,18 @@ impl PassState {
     /// "Clear-only" means the pass has zero `DrawPrimitives` /
     /// `DrawIndexedPrimitives` commands; any setviewport / setscissor /
     /// setpipeline / setBlendColor that the encoder pushed without a
-    /// subsequent draw still counts as clear-only here.
+    /// subsequent draw still counts as clear-only here. A pass carrying
+    /// leading blits is never a candidate: the blits are real work that the
+    /// merge would drop along with the pass.
     pub fn coalesce_clear_only_passes(&mut self) {
         let mut i = 0;
         while i < self.passes.len() {
             let p = &self.passes[i];
-            let has_draw = p.commands.iter().any(|c| {
-                c.cmd == CommandType::DrawPrimitives as u32
-                    || c.cmd == CommandType::DrawIndexedPrimitives as u32
-            });
+            let has_draw = !p.leading_blits.is_empty()
+                || p.commands.iter().any(|c| {
+                    c.cmd == CommandType::DrawPrimitives as u32
+                        || c.cmd == CommandType::DrawIndexedPrimitives as u32
+                });
             // Any colour target of the pass with a Clear makes the colour
             // side a candidate; the whole set then moves together.
             let needs_color = !has_draw
@@ -3110,7 +3222,9 @@ impl PassState {
     /// Rule E's Clear into it. Bail on any intervening pass that reads
     /// the target as a fragment sampler input, as a blit source, or
     /// attaches it with `Clear` itself (that pass already overwrites
-    /// whatever we'd move).
+    /// whatever we'd move), and on any intervening leading blit that
+    /// writes the target: the copy landed after the clear, so a clear moved
+    /// past it would wipe it.
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
@@ -3131,6 +3245,20 @@ impl PassState {
                 && target_extra
                     .iter()
                     .any(|&(tex, _)| !tex.is_null() && pass_reads_texture(cand, tex))
+            {
+                return None;
+            }
+            // Intervening blit write on a side we care about kills the merge
+            // too: the copy is ordered after our clear.
+            if needs_color
+                && (blit_list_writes(&cand.leading_blits, target_color)
+                    || target_extra
+                        .iter()
+                        .any(|&(tex, _)| blit_list_writes(&cand.leading_blits, tex)))
+            {
+                return None;
+            }
+            if (needs_depth || needs_stencil) && blit_list_writes(&cand.leading_blits, target_depth)
             {
                 return None;
             }
@@ -3330,12 +3458,15 @@ impl PassState {
     ///   resolves and that next pass's `color_load` is `Clear`, flip
     ///   `i.color_store`. Then update the map with `i`.
     ///
-    /// `preserve_color_stores` marks a mid-frame flush (a readback, not `Present`): the frame
-    /// continues afterwards and any colour target may still be read back or drawn into, so
-    /// Rule D does not run; the next-clear rule still does, since that proof does not depend
-    /// on the frame ending.
-    pub fn finalize_store_actions(&mut self, preserve_color_stores: bool) {
-        if ENABLE_LAST_USE_DEPTH_DONTCARE {
+    /// `frame_continues` marks a mid-frame flush (a readback or retention drain, not
+    /// `Present`): the D3D9 frame keeps going afterwards, so a colour target may still be
+    /// read back or drawn into and a depth surface may still be tested against. Both last-use
+    /// rules are therefore suppressed — Rule D (colour) and Rule B (depth/stencil) would
+    /// discard content the continuation still needs. Rule C (next-clear) still runs, since a
+    /// pass that a later pass *in this submission* clears is provably overwritten regardless
+    /// of whether the frame ends here.
+    pub fn finalize_store_actions(&mut self, frame_continues: bool) {
+        if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
                 FxHashSet::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
             for pass in self.passes.iter_mut().rev() {
@@ -3402,7 +3533,7 @@ impl PassState {
                 }
             }
         }
-        if ENABLE_LAST_USE_COLOR_DONTCARE && !preserve_color_stores {
+        if ENABLE_LAST_USE_COLOR_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
                 FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
             let backbuffer = self.backbuffer_texture;
@@ -3478,47 +3609,46 @@ fn pass_reads_texture(pass: &Pass, target_handle: MetalHandle<MTLTextureKind>) -
         })
 }
 
-/// True if any blit in `blits` writes to texture `target_handle`.
-///
-/// Used at pass-open to disqualify `LoadAction::DontCare` on an
-/// attachment that just got a leading blit's output (`StretchRect`'s
-/// typical pattern: copy A → B, then render onto B; the next pass MUST
-/// `Load` to preserve the blit's contents).
+/// The texture a blit writes, if it writes one.
 ///
 /// `NotifyBufferDidModifyRange` and `CopyBufferToBuffer` carry buffer
-/// handles in `src_handle`/`dst_handle` — never texture handles — so
-/// they're safely filtered out by the type-mismatch on the handle
-/// value (texture handles are disjoint from buffer handles in Metal).
-/// The exhaustive match makes any new `BlitCommandType` a compile
-/// error here, forcing the author to classify it.
+/// handles in `src_handle`/`dst_handle`, never texture handles, so they
+/// write no texture. An unknown variant on the wire is conservatively
+/// treated as texture-writing. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let writes_texture = match BlitCommandType::from_repr(blit.cmd) {
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyTextureToTexture
+            | BlitCommandType::GenerateMipmaps,
+        )
+        | None => true,
+        Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
+            false
+        }
+    };
+    if !writes_texture || blit.dst_handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-writing blit carries a non-null MTLTexture handle in
+    // `dst_handle`, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.dst_handle) })
+}
+
+/// True if any blit in `blits` writes to texture `target_handle`.
+///
+/// Used by Rule E to refuse moving a clear past a pass whose leading blits
+/// write the cleared target (`StretchRect`'s typical pattern: copy A → B,
+/// then render onto B; a clear folded into that render pass would wipe the
+/// copy).
 fn blit_list_writes(blits: &[BlitCommand], target_handle: MetalHandle<MTLTextureKind>) -> bool {
     if target_handle.is_null() {
         return false;
     }
-    let target_raw = target_handle.raw();
-    // allow: identical bodies (`=> true`) on the texture-writing arms and
-    // the `None` arm are intentional — the exhaustive match on `Some(...)`
-    // turns "new BlitCommandType variant" into a compile error here,
-    // forcing the author to classify it. Collapsing to `Some(_) | None
-    // => true` would silently default new variants to "texture-writing",
-    // defeating that.
-    blits.iter().any(|b| {
-        // Unknown variants on the wire → conservatively assume "writes texture".
-        let Some(ty) = BlitCommandType::from_repr(b.cmd) else {
-            return b.dst_handle == target_raw;
-        };
-        // Exhaustive match keeps the compile-error-on-new-variant safety:
-        // any new BlitCommandType forces an author here to classify it.
-        let writes_texture = match ty {
-            BlitCommandType::CopyBufferToTexture
-            | BlitCommandType::CopyTextureToTexture
-            | BlitCommandType::GenerateMipmaps => true,
-            BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange => {
-                false
-            }
-        };
-        writes_texture && b.dst_handle == target_raw
-    })
+    blits
+        .iter()
+        .any(|b| blit_written_texture(b) == Some(target_handle))
 }
 
 impl Default for PassState {
@@ -4040,28 +4170,30 @@ mod tests {
 
     fn fresh() -> PassState {
         let mut s = PassState::new();
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s
     }
 
     /// A frame rasterizing the back buffer at half the reported resolution.
     fn fresh_scaled() -> PassState {
         let mut s = PassState::new();
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::from_percent(50),
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::from_percent(50),
+            continues_frame: false,
+        });
         s
     }
 
@@ -4174,14 +4306,15 @@ mod tests {
         let atlas = tex(0x7E10);
         s.emit_command(Command::set_fragment_texture(atlas.raw(), 0));
         assert!(s.texture_sampled_this_frame(atlas));
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         // Per-frame set resets — a next-frame upload before the first
         // sample goes to the live texture again.
         assert!(!s.texture_sampled_this_frame(atlas));
@@ -4489,14 +4622,15 @@ mod tests {
         let mut s = fresh();
         s.clear_color(1, 2, 3, 4);
         assert!(s.pending_color_clear().is_some());
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         assert!(s.pending_color_clear().is_none());
         assert!(s.passes().is_empty());
     }
@@ -5127,14 +5261,15 @@ mod tests {
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
         // Next frame: same backbuffer is "first use again" because the
         // seen set was reset.
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
@@ -5182,14 +5317,15 @@ mod tests {
         s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            true,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: true,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
@@ -6666,6 +6802,52 @@ mod tests {
         );
     }
 
+    /// A cascade rebound with a stale `is_sampleable=false` is a no-op.
+    ///
+    /// Neither the pass break nor the loss of Rule B's exemption fires.
+    ///
+    /// `GetDepthStencilSurface` returns a surface with `parent_texture=null`,
+    /// so a save/restore cycle re-binds the same cascade handle through the
+    /// `Eager` path with `is_sampleable=false`. The sticky resolve against
+    /// `seen_sampleable_depth_textures` keeps the pass open and keeps Rule B's
+    /// keep-Store exemption in force.
+    #[test]
+    fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
+        let cascade_depth = tex(0xCAFE_7000);
+        let mut s = fresh();
+        // First bind as sampleable, draw into it, then rebind the SAME handle
+        // with a stale is_sampleable=false (the GetDepthStencilSurface path).
+        s.set_depth_stencil_attachment(cascade_depth, true, false);
+        s.emit_command(dummy_draw());
+        let passes_before = s.passes().len();
+        s.set_depth_stencil_attachment(cascade_depth, false, false);
+        assert!(
+            !s.current_pass_closed(),
+            "a rebind of a known-sampleable cascade must not break the pass",
+        );
+        assert_eq!(
+            s.passes().len(),
+            passes_before,
+            "no new pass opened by the rebind",
+        );
+        assert!(
+            s.current_depth_is_sampleable(),
+            "the sampleable flag stays set through the stale rebind",
+        );
+        s.emit_command(dummy_draw());
+        s.finalize_store_actions(false);
+        let cascade_pass = s
+            .passes()
+            .iter()
+            .find(|p| p.depth_texture() == cascade_depth)
+            .expect("cascade pass present");
+        assert_eq!(
+            cascade_pass.depth_store(),
+            StoreAction::Store,
+            "Rule B keeps Store through the stale rebind",
+        );
+    }
+
     /// Visibility-counting passes fall back to the legacy pass-break path.
     ///
     /// Emitting a clear-quad mid-pass would falsely increment the
@@ -7021,5 +7203,307 @@ mod tests {
         // At a real frame end the unread target's store is elided as before.
         s.finalize_store_actions(false);
         assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
+    }
+
+    // ── Blits in the read/write model ─────────────────────────────
+
+    fn copy_blit(
+        src: MetalHandle<MTLTextureKind>,
+        dst: MetalHandle<MTLTextureKind>,
+    ) -> BlitCommand {
+        BlitCommand::copy_texture_to_texture_full_mip(src.raw(), dst.raw(), 0, 64, 64)
+    }
+
+    #[test]
+    fn rule_d_keeps_store_when_a_stretch_rect_reads_the_target() {
+        // Render into rt, then copy rt to the backbuffer after the pass: the
+        // copy reads rt from device memory, so its last-use store must stay.
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.push_pending_leading_blit(copy_blit(rt, backbuffer()));
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes().len(), 1);
+        assert_eq!(s.passes()[0].color_texture(), rt);
+        assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+        // The blit is still queued for the trailing blit-only pass.
+        assert_eq!(s.take_pending_leading_blits().len(), 1);
+    }
+
+    #[test]
+    fn rule_c_keeps_store_when_a_blit_reads_between_write_and_clear() {
+        // rt written in pass 0, copied out by a blit that pass 1 carries, then
+        // cleared in pass 2. The next-clear rule must not discard pass 0's
+        // store: the copy reads it.
+        let rt = tex(0x3000);
+        let other = tex(0x5000);
+        let mut s = fresh();
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.push_pending_leading_blit(copy_blit(rt, other));
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(
+            s.passes()[2].color_load(),
+            ColorLoad::Clear {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 4
+            }
+        );
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+    }
+
+    #[test]
+    fn rule_a_loads_a_target_written_by_a_blit_in_an_earlier_pass() {
+        // A copy into rt_x is queued while rt_y is bound, so it lands in
+        // rt_y's pass. rt_x's own first pass must still Load the copy.
+        let rt_src = tex(0x3000);
+        let rt_x = tex(0x4000);
+        let rt_y = tex(0x5000);
+        let mut s = fresh();
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes().len(), 2);
+        assert_eq!(s.passes()[0].color_texture(), rt_y);
+        assert_eq!(s.passes()[0].leading_blits().len(), 1);
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+        assert_eq!(s.passes()[1].color_texture(), rt_x);
+        assert_eq!(s.passes()[1].leading_blits().len(), 0);
+        assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+    }
+
+    #[test]
+    fn blit_written_set_resets_with_the_frame() {
+        let rt_src = tex(0x3000);
+        let rt_x = tex(0x4000);
+        let mut s = fresh();
+        s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+        s.take_pending_leading_blits();
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    }
+
+    #[test]
+    fn rule_e_keeps_a_clear_only_pass_that_carries_leading_blits() {
+        // A copy is queued, then Clear(rt_x) goes pending, and SetRT(rt_y)
+        // materialises it as a clear-only pass that drains the copy. The later
+        // Load pass on rt_x would be a merge target; merging would drop the
+        // copy with the pass.
+        let rt_x = tex(0x3000);
+        let rt_y = tex(0x4000);
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.push_pending_leading_blit(dummy_blit());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 4);
+        assert_eq!(s.passes()[1].color_texture(), rt_x);
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(s.passes()[3].color_load(), ColorLoad::Load);
+        s.coalesce_clear_only_passes();
+        assert_eq!(
+            s.passes().len(),
+            4,
+            "a pass with leading blits is never merged away"
+        );
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(s.passes()[3].color_load(), ColorLoad::Load);
+    }
+
+    #[test]
+    fn rule_e_aborts_when_an_intervening_blit_writes_the_target() {
+        // Clear(rt_x) materialises as pass 0, a copy rt_y -> rt_x is queued
+        // after pass 1, and pass 2 attaches rt_x with Load and carries that
+        // copy. The clear is ordered before the copy, so it must not move
+        // into pass 2's load action.
+        let rt_x = tex(0x3000);
+        let rt_y = tex(0x4000);
+        let mut s = fresh();
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.push_pending_leading_blit(copy_blit(rt_y, rt_x));
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(s.passes()[2].leading_blits().len(), 1);
+        assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+        s.coalesce_clear_only_passes();
+        assert_eq!(s.passes().len(), 3, "the clear stays ahead of the copy");
+        assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+    }
+
+    // ── B3: a mid-frame flush is not a frame end ─────────────────
+
+    #[test]
+    fn mid_frame_flush_keeps_the_depth_store() {
+        // A depth-tested pass, then a mid-frame flush (a readback): the depth
+        // surface may still be tested against in the continuation, so Rule B
+        // must not discard its store at the flush. A real Present still elides
+        // it (the TBDR depth-store optimisation).
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.finalize_store_actions(true);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::Store,
+            "depth store survives a mid-frame flush",
+        );
+        s.finalize_store_actions(false);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::DontCare,
+            "depth store is still elided at a real Present",
+        );
+    }
+
+    #[test]
+    fn continuation_loads_targets_drawn_before_the_flush() {
+        // Draw to the backbuffer + depth, then a mid-frame flush. The
+        // continuation's first pass on the same attachments must Load
+        // (preserving the pre-flush pixels), not open first-use `DontCare`.
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: true,
+        });
+        s.emit_command(dummy_draw());
+        assert_eq!(
+            s.passes()[0].color_load(),
+            ColorLoad::Load,
+            "continuation loads the backbuffer drawn before the flush",
+        );
+        assert_eq!(
+            s.passes()[0].depth_load(),
+            DepthLoad::Load,
+            "continuation loads the depth surface too",
+        );
+    }
+
+    #[test]
+    fn a_real_present_still_dontcares_first_use() {
+        // The contrast to `continuation_loads_targets_drawn_before_the_flush`:
+        // a real Present (continues_frame false) clears the seen sets, so the
+        // next frame's first use of the backbuffer is `DontCare` again.
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    }
+
+    #[test]
+    fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
+        // The frame continues past a mid-frame flush, so the backbuffer stays
+        // "seen" for the load rules — but a Clear issued after the flush must
+        // still fold to a full loadAction=Clear, not the cross-pass scissored
+        // quad, because the pre-flush content is safely in VRAM. A sub-rect
+        // viewport is set to expose the bug: the quad would clip to it.
+        // (This is the `test_viewport` conformance shape: readback mid-frame,
+        // then Clear under a viewport.)
+        let mut s = fresh();
+        s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: true,
+        });
+        s.set_viewport(100, 100, 64, 64, 0.0, 1.0);
+        assert_eq!(
+            s.clear_color(1, 2, 3, 4),
+            ColorClearOutcome::Folded,
+            "a full clear after a flush folds, even though the target is still seen this frame",
+        );
+        // And the depth clear on the same sequence folds too, not a quad.
+        assert_eq!(
+            s.clear_depth(f32::to_bits(1.0)),
+            DepthClearOutcome::Folded,
+            "depth clear after a flush folds as well",
+        );
+    }
+
+    #[test]
+    fn a_clear_within_one_segment_still_paints_a_quad() {
+        // The contrast: within one submission segment (no flush), a second
+        // clear of a target already drawn takes the cross-pass quad path so a
+        // full loadAction=Clear cannot wipe the earlier content.
+        let mut s = fresh();
+        s.set_viewport(0, 0, 683, 683, 0.0, 1.0);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.set_viewport(683, 0, 683, 683, 0.0, 1.0);
+        assert!(
+            matches!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::EmitQuad { .. }),
+            "a cross-pass clear inside one segment still scissors a quad",
+        );
     }
 }
