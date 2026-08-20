@@ -6717,19 +6717,25 @@ extern "system" fn device_clear(
         }
     }
 
-    if flags & D3DCLEAR_ZBUFFER != 0 {
-        let value_bits = f32::to_bits(z);
-        dev.push_op(Box::new(move |enc| {
-            enc.clear_depth(value_bits);
-        }));
-    }
-
-    if flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil() {
-        // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
-        let value = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
-        dev.push_op(Box::new(move |enc| {
-            enc.clear_stencil(value);
-        }));
+    let z_bits = f32::to_bits(z);
+    // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
+    let stencil = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
+    let clear_z = flags & D3DCLEAR_ZBUFFER != 0;
+    let clear_s = flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil();
+    match (clear_z, clear_s) {
+        // Both planes in one op so a mid-frame clear paints one quad:
+        // shadow-volume renderers clear depth and stencil together between
+        // lights.
+        (true, true) => dev.push_op(Box::new(move |enc| {
+            enc.clear_depth_stencil(z_bits, stencil);
+        })),
+        (true, false) => dev.push_op(Box::new(move |enc| {
+            enc.clear_depth(z_bits);
+        })),
+        (false, true) => dev.push_op(Box::new(move |enc| {
+            enc.clear_stencil(stencil);
+        })),
+        (false, false) => {}
     }
 
     0 // S_OK

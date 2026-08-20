@@ -34,6 +34,18 @@ struct ClearMerge {
 /// surfaces that reads prior-frame contents on first use of frame N.
 const ENABLE_FIRST_USE_DONTCARE: bool = true;
 
+/// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
+///
+/// The stencil plane shares the depth texture, so its first use in a frame
+/// takes the same `DontCare` the depth plane takes, under the same
+/// predicate. Stencil written in frame N and tested in frame N+1 without a
+/// clear in between was already undefined before this rule: the stencil
+/// store mirrors the depth store, so whenever Rule B discards depth at frame
+/// end the stencil content goes with it. Flip to `false` if a game surfaces
+/// that carries stencil across `Present` and a frame-start `Load` turns out
+/// to matter.
+const ENABLE_FIRST_USE_STENCIL_DONTCARE: bool = true;
+
 /// Compile-time gate for Rule B (last-use depth/stencil `DontCare`).
 ///
 /// Flip to `false` if a game using `INTZ`-style late-frame depth-readback
@@ -187,14 +199,15 @@ pub enum DepthLoad {
 /// Separate from `DepthLoad` because the two planes of a combined
 /// `Depth32Float_Stencil8` attachment take independent load actions:
 /// `Clear(D3DCLEAR_STENCIL)` without `D3DCLEAR_ZBUFFER` resets stencil while
-/// carrying depth forward. A stencil clear value is also an integer rather
-/// than an f32 bit pattern, and there is no `DontCare`: unlike depth, games
-/// carry stencil across passes within a frame, so a first-use discard would
-/// drop live content.
+/// carrying depth forward, and a stencil clear value is an integer rather
+/// than an f32 bit pattern. `DontCare` is Rule A's first-use discard and
+/// nothing else: games carry stencil across passes within a frame, so a
+/// later pass in the same frame always loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StencilLoad {
     Load,
     Clear { value: u32 },
+    DontCare,
 }
 
 /// How the render-pass should store its attachment at pass end.
@@ -243,10 +256,14 @@ pub enum DepthClearOutcome {
 ///
 /// `Folded` means the clear became the next pass's `loadAction`; `EmitQuad`
 /// means the caller paints a scissored quad instead, because folding would
-/// clear the whole attachment and wipe tiles the frame already drew.
+/// clear the whole attachment and wipe tiles the frame already drew. `NoOp`
+/// means there was nothing to clear: no depth-stencil texture is attached, or
+/// the viewport has no area, and D3D9 clears nothing in either case. The pass
+/// state is left untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StencilClearOutcome {
     Folded,
+    NoOp,
     EmitQuad {
         value: u32,
         viewport: (u32, u32, u32, u32),
@@ -1384,28 +1401,29 @@ impl PassState {
             }
             None => ColorLoad::Load,
         };
+        // The depth texture's first use this frame under a viewport that
+        // covers it: the Rule A predicate, shared by the depth plane and the
+        // stencil plane because both live in that one texture.
+        let depth_first_use = viewport_covers_attachment
+            && !self.current_depth_texture.is_null()
+            && !self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+            && !self.seen_depth_rts.contains(&self.current_depth_texture)
+            && !self
+                .seen_sampled_textures
+                .contains(&self.current_depth_texture)
+            && !blit_list_writes(&leading_blits, self.current_depth_texture);
         let depth_load = match self.pending_depth_clear.take() {
             Some(value) => DepthLoad::Clear { value },
-            None if ENABLE_FIRST_USE_DONTCARE
-                && viewport_covers_attachment
-                && !self.current_depth_texture.is_null()
-                && !self
-                    .current_attachments
-                    .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
-                && !self.seen_depth_rts.contains(&self.current_depth_texture)
-                && !self
-                    .seen_sampled_textures
-                    .contains(&self.current_depth_texture)
-                && !blit_list_writes(&leading_blits, self.current_depth_texture) =>
-            {
-                DepthLoad::DontCare
-            }
+            None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
             None => DepthLoad::Load,
         };
-        let stencil_load = self
-            .pending_stencil_clear
-            .take()
-            .map_or(StencilLoad::Load, |value| StencilLoad::Clear { value });
+        let stencil_load = match self.pending_stencil_clear.take() {
+            Some(value) => StencilLoad::Clear { value },
+            None if ENABLE_FIRST_USE_STENCIL_DONTCARE && depth_first_use => StencilLoad::DontCare,
+            None => StencilLoad::Load,
+        };
         if !self.current_color_texture.is_null() {
             self.seen_color_rts
                 .insert((self.current_color_texture, self.current_color_subresource));
@@ -1899,8 +1917,13 @@ impl PassState {
     /// the depth plane the two share.
     pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
         let depth_texture = self.current_depth_texture;
+        if depth_texture.is_null() {
+            // Nothing is attached to clear. Folding would carry the clear
+            // onto whatever texture the next pass attaches.
+            return StencilClearOutcome::NoOp;
+        }
         if self.current_pass_has_work()
-            && let Some(outcome) = self.clear_stencil_in_active_pass(value, depth_texture)
+            && let Some(outcome) = self.clear_stencil_in_active_pass(value)
         {
             return outcome;
         }
@@ -1915,24 +1938,20 @@ impl PassState {
 
     /// Active-pass branch: paint into the live encoder.
     ///
-    /// Returns `None` when a visibility-counting query is armed, since the
-    /// quad's own fragments would inflate the occlusion counter, or when the
-    /// viewport is degenerate; the caller falls through to the folding chain.
-    fn clear_stencil_in_active_pass(
-        &mut self,
-        value: u32,
-        depth_texture: MetalHandle<MTLTextureKind>,
-    ) -> Option<StencilClearOutcome> {
-        if depth_texture.is_null() {
-            return None;
-        }
+    /// Returns `None` only when a visibility-counting query is armed, since
+    /// the quad's own fragments would inflate the occlusion counter; that path
+    /// ends the pass first, so the folding chain sees a closed pass and cannot
+    /// amend one that already holds draws. A zero-area viewport is an explicit
+    /// `NoOp`: D3D9 clears nothing, and falling through would fold a
+    /// full-attachment clear into this pass, ahead of its recorded draws.
+    fn clear_stencil_in_active_pass(&mut self, value: u32) -> Option<StencilClearOutcome> {
         if self.current_pass_has_counting_visibility() {
             self.end_current_pass("clear_stencil_vis_fallback");
             return None;
         }
         let vp = self.effective_viewport();
         if vp.2 == 0 || vp.3 == 0 {
-            return None;
+            return Some(StencilClearOutcome::NoOp);
         }
         Some(StencilClearOutcome::EmitQuad {
             value,
@@ -1951,14 +1970,18 @@ impl PassState {
         value: u32,
         depth_texture: MetalHandle<MTLTextureKind>,
     ) -> Option<StencilClearOutcome> {
-        if depth_texture.is_null()
-            || !self.seen_depth_rts.contains(&depth_texture)
+        if !self.seen_depth_rts.contains(&depth_texture)
             || self.viewport_width == 0
             || self.viewport_height == 0
         {
             return None;
         }
         let vp = self.effective_viewport();
+        if vp.2 == 0 || vp.3 == 0 {
+            // The game's viewport rounds to nothing at render resolution.
+            // Opening a pass for a zero-size quad would only cost an encoder.
+            return Some(StencilClearOutcome::NoOp);
+        }
         self.ensure_pass_open();
         if let Some(pass) = self.passes.last_mut()
             && matches!(pass.stencil_load, StencilLoad::Clear { .. })
@@ -1974,8 +1997,11 @@ impl PassState {
     }
 
     /// Amend branch: a pass is open with no draws, so its load action is free.
+    ///
+    /// A pass that already holds draws is never amended: its load action
+    /// runs before those draws, so the clear would land ahead of them.
     fn clear_stencil_amend_open(&mut self, value: u32) -> Option<StencilClearOutcome> {
-        if self.current_pass_closed {
+        if self.current_pass_closed || self.current_pass_has_work() {
             return None;
         }
         let pass = self.passes.last_mut()?;
@@ -2577,6 +2603,9 @@ impl PassState {
             let depth_ok = !needs_depth
                 || (cand.depth_texture == target_depth
                     && matches!(cand.depth_load, DepthLoad::Load));
+            // A `DontCare` candidate cannot occur here: the clear-only pass
+            // was this texture's first use of the frame, so every later pass
+            // on it opened with `Load` or its own `Clear`.
             let stencil_ok = !needs_stencil
                 || (cand.depth_texture == target_depth
                     && matches!(cand.stencil_load, StencilLoad::Load));
@@ -2623,7 +2652,7 @@ impl PassState {
     /// already completed against VRAM), trading one tile load for
     /// safety.
     pub fn finalize_load_actions(&mut self) {
-        if !ENABLE_FIRST_USE_DONTCARE {
+        if !ENABLE_FIRST_USE_DONTCARE && !ENABLE_FIRST_USE_STENCIL_DONTCARE {
             return;
         }
         for pass in &mut self.passes {
@@ -2647,6 +2676,18 @@ impl PassState {
                     trace!(
                         target: TRACE_TARGET,
                         "pass-load depth={:#x} DontCare → Load (sampled this frame)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+            if matches!(pass.stencil_load, StencilLoad::DontCare)
+                && self.seen_sampled_textures.contains(&pass.depth_texture)
+            {
+                pass.stencil_load = StencilLoad::Load;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load stencil={:#x} DontCare → Load (sampled this frame)",
                         pass.depth_texture,
                     );
                 }
@@ -4387,6 +4428,80 @@ mod tests {
     }
 
     #[test]
+    fn rule_a_first_use_stencil_is_dontcare_and_later_use_loads() {
+        // The stencil plane lives in the depth texture, so it takes the
+        // first-use DontCare under the depth predicate. A second pass on the
+        // same texture in the frame loads: games carry stencil across passes.
+        let ds = tex(0x3300);
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
+        assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+        assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
+    }
+
+    #[test]
+    fn rule_a_pending_stencil_clear_beats_dontcare() {
+        let ds = tex(0x3300);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        assert_eq!(s.clear_stencil(5), StencilClearOutcome::Folded);
+        s.emit_command(dummy_draw());
+        assert_eq!(
+            s.passes()[0].stencil_load(),
+            StencilLoad::Clear { value: 5 }
+        );
+        // Depth had no pending clear, so it still takes the discard.
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    }
+
+    #[test]
+    fn rule_a_reset_frame_re_arms_stencil_dontcare() {
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            true,
+            RenderScale::IDENTITY,
+        );
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes().len(), 1);
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
+    }
+
+    #[test]
+    fn rule_a_reverts_stencil_dontcare_when_depth_sampled_later() {
+        // A texture declared sampleable never gets the discard up front; this
+        // is the other route, a depth-stencil texture the frame samples
+        // without having declared it. The stencil plane is reverted with the
+        // depth plane, since the sampler reads the texture both live in.
+        let ds = tex(0x3300);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
+        s.set_depth_stencil_attachment(depth(), false, false);
+        s.emit_command(Command::set_fragment_texture(ds.raw(), 0));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.finalize_load_actions();
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::Load);
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
+    }
+
+    #[test]
     fn rule_a_leading_blit_to_rt_forces_load() {
         let rt_src = tex(0x3000);
         let rt_dst = tex(0x4000);
@@ -4924,6 +5039,109 @@ mod tests {
             ),
             "a clear over an in-use plane must be a quad, not a load action"
         );
+    }
+
+    #[test]
+    fn a_stencil_clear_under_a_zero_area_viewport_is_a_no_op() {
+        // Under identity scale a zero viewport means "unset" and reads as the
+        // whole attachment, so the degenerate case only arises when the
+        // game's viewport rounds to nothing at render resolution. D3D9 clears
+        // nothing for a zero-area viewport. The fall-through this replaces
+        // folded a whole-attachment clear into a pass that already held
+        // draws, ahead of them.
+        let ds = tex(0x3300);
+        let mut s = fresh_scaled();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.emit_command(dummy_draw());
+        let before = s.passes()[0].stencil_load();
+        s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+        assert_eq!(s.effective_viewport(), (1, 1, 0, 0));
+
+        assert_eq!(s.clear_stencil(7), StencilClearOutcome::NoOp);
+        assert_eq!(s.passes().len(), 1);
+        assert!(!s.current_pass_closed(), "the live pass stays open");
+        assert_eq!(
+            s.passes()[0].stencil_load(),
+            before,
+            "a pass with draws keeps its load action"
+        );
+        assert!(s.pending_stencil_clear.is_none());
+    }
+
+    #[test]
+    fn a_stencil_clear_under_a_zero_area_viewport_opens_no_pass() {
+        // The same degenerate viewport between passes: nothing to paint, so
+        // no encoder is opened for it either.
+        let ds = tex(0x3300);
+        let mut s = fresh_scaled();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+
+        assert_eq!(s.clear_stencil(7), StencilClearOutcome::NoOp);
+        assert_eq!(s.passes().len(), 1);
+        assert!(s.current_pass_closed());
+        assert!(s.pending_stencil_clear.is_none());
+    }
+
+    #[test]
+    fn a_stencil_clear_with_no_depth_attachment_is_a_no_op() {
+        // Nothing is attached, so there is nothing to fold or paint; stashing
+        // would clear whatever texture the next pass happens to attach.
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+
+        assert_eq!(s.clear_stencil(1), StencilClearOutcome::NoOp);
+        assert!(s.pending_stencil_clear.is_none());
+        assert!(s.passes().is_empty());
+    }
+
+    #[test]
+    fn depth_and_stencil_clears_over_draws_paint_matching_quads() {
+        // Clear(ZBUFFER | STENCIL) asks the two chains in turn and paints one
+        // quad when both answer EmitQuad over the same rect, which they do
+        // because neither call changes the state the other reads.
+        let ds = tex(0x3300);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.emit_command(dummy_draw());
+
+        let depth = s.clear_depth(f32::to_bits(1.0));
+        let stencil = s.clear_stencil(1);
+        let DepthClearOutcome::EmitQuad { viewport: dvp, .. } = depth else {
+            panic!("depth over draws must paint, got {depth:?}");
+        };
+        let StencilClearOutcome::EmitQuad { viewport: svp, .. } = stencil else {
+            panic!("stencil over draws must paint, got {stencil:?}");
+        };
+        assert_eq!(dvp, svp);
+        assert_eq!(s.passes().len(), 1, "both quads land in the live pass");
+    }
+
+    #[test]
+    fn depth_and_stencil_clears_under_a_counting_query_share_the_fresh_pass() {
+        // With a visibility query armed the depth chain ends the pass and
+        // reopens one with Load; the stencil chain then finds that fresh pass
+        // with no draws and paints into it as well. The pass count is what
+        // the encoder uses to know its binding cache must start over.
+        let ds = tex(0x3300);
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(ds, false, true);
+        s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+        s.emit_command(dummy_draw());
+        s.emit_command(Command::set_visibility_result_mode(
+            mtld3d_shared::mtl::VisibilityResultMode::Counting,
+            0,
+        ));
+
+        let depth = s.clear_depth(f32::to_bits(1.0));
+        let stencil = s.clear_stencil(1);
+        assert!(matches!(depth, DepthClearOutcome::EmitQuad { .. }));
+        assert!(matches!(stencil, StencilClearOutcome::EmitQuad { .. }));
+        assert_eq!(s.passes().len(), 2);
+        assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+        assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
     }
 
     #[test]

@@ -173,6 +173,19 @@ impl DepthStencilSnapshot {
         }
     }
 
+    /// Depth and stencil both overwritten: the combined `Clear(ZBUFFER | STENCIL)` quad.
+    ///
+    /// `depth_overwrite` and `stencil_overwrite` in one state, so a mid-frame
+    /// clear of both planes is a single draw.
+    #[must_use]
+    pub const fn depth_stencil_overwrite() -> Self {
+        Self {
+            depth_enable: 1,
+            depth_write: 1,
+            ..Self::stencil_overwrite()
+        }
+    }
+
     /// Drop the stencil test when the bound attachment carries no stencil plane.
     ///
     /// An app can leave `D3DRS_STENCILENABLE` set from an earlier pass and then
@@ -476,6 +489,36 @@ mod tests {
         let params = params_from_snapshot(&wide, key_from_snapshot(&wide), dev);
         assert_eq!(params.stencil_read_mask, 0x12);
         assert_eq!(params.stencil_write_mask, 0x34);
+    }
+
+    #[test]
+    fn clear_quad_states_are_distinct_and_write_what_they_claim() {
+        // SAFETY: tests; opaque value never dereferenced.
+        let dev = unsafe { MetalHandle::new(0xDEAD) };
+        let states = [
+            DepthStencilSnapshot::inert(),
+            DepthStencilSnapshot::depth_overwrite(),
+            DepthStencilSnapshot::stencil_overwrite(),
+            DepthStencilSnapshot::depth_stencil_overwrite(),
+        ];
+        let keys: Vec<_> = states.iter().map(key_from_snapshot).collect();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b, "each clear-quad state needs its own Metal object");
+            }
+        }
+
+        let both = DepthStencilSnapshot::depth_stencil_overwrite();
+        let params = params_from_snapshot(&both, key_from_snapshot(&both), dev);
+        assert_eq!(params.depth_write_enable, 1);
+        assert_eq!(params.depth_compare_func, d3d_to_metal_cmp(D3DCMP_ALWAYS));
+        assert_eq!(params.stencil_test_enable, 1);
+        assert_eq!(
+            params.front.pass_op,
+            d3d_to_metal_stencil_op(D3DSTENCILOP_REPLACE)
+        );
+        assert_eq!(params.front, params.back);
+        assert_eq!(params.stencil_write_mask, STENCIL_MASK_BITS);
     }
 
     #[test]

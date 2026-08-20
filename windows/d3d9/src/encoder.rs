@@ -894,7 +894,7 @@ fn apply_const_range_into(
 
 /// Cache key for the per-format-combo clear-quad pipeline.
 ///
-/// Used by `emit_clear_quad_depth_inner` / `emit_clear_quad_color_inner`.
+/// Used by `emit_clear_quad_depth_stencil_inner` / `emit_clear_quad_color_inner`.
 /// Mirrors `EnsureClearQuadPipelineParams` (modulo `device_handle`) so the
 /// PE-side cache and the unix-side cache agree on what counts as a
 /// distinct pipeline.
@@ -903,6 +903,24 @@ struct ClearQuadKey {
     depth_format: PixelFormat,
     color_format: PixelFormat,
     flags: ClearQuadFlags,
+}
+
+/// Where a mid-pass clear quad lands, as the depth and stencil clear chains report it.
+///
+/// `clear_depth_stencil` compares the two reports to decide whether one quad
+/// can serve both planes.
+struct ClearQuadTarget {
+    viewport: (u32, u32, u32, u32),
+    has_color: bool,
+    color_format: PixelFormat,
+}
+
+impl ClearQuadTarget {
+    fn same_as(&self, other: &Self) -> bool {
+        self.viewport == other.viewport
+            && self.has_color == other.has_color
+            && self.color_format == other.color_format
+    }
 }
 
 /// Cached `MTLBuffer` wrapper for one live VB/IB `PageBox`.
@@ -2293,7 +2311,13 @@ impl FrameEncoder {
                 color_format,
             } => {
                 self.reset_last_bound_on_fresh_pass(was_closed);
-                self.emit_clear_quad_depth_inner(value, viewport, has_color, color_format);
+                self.emit_clear_quad_depth_stencil_inner(
+                    Some(value),
+                    None,
+                    viewport,
+                    has_color,
+                    color_format,
+                );
             }
         }
     }
@@ -2301,7 +2325,7 @@ impl FrameEncoder {
     pub fn clear_stencil(&mut self, value: u32) {
         let was_closed = self.pass_state.current_pass_closed();
         match self.pass_state.clear_stencil(value) {
-            StencilClearOutcome::Folded => {}
+            StencilClearOutcome::Folded | StencilClearOutcome::NoOp => {}
             StencilClearOutcome::EmitQuad {
                 value,
                 viewport,
@@ -2309,69 +2333,114 @@ impl FrameEncoder {
                 color_format,
             } => {
                 self.reset_last_bound_on_fresh_pass(was_closed);
-                self.emit_clear_quad_stencil_inner(value, viewport, has_color, color_format);
+                self.emit_clear_quad_depth_stencil_inner(
+                    None,
+                    Some(value),
+                    viewport,
+                    has_color,
+                    color_format,
+                );
             }
         }
     }
 
-    /// Stencil mirror of `emit_clear_quad_depth_inner`.
+    /// `Clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)`: both planes, one quad where a quad is due.
     ///
-    /// Reuses the depth clear-quad pipeline: its fragment stage exports depth,
-    /// so the pipeline needs a depth attachment either way, and the
-    /// depth-stencil state is what decides which plane is actually written.
-    /// The clear value rides the encoder as the stencil reference, which the
-    /// `Replace` op then writes to every covered fragment.
-    fn emit_clear_quad_stencil_inner(
-        &mut self,
-        value: u32,
-        viewport: (u32, u32, u32, u32),
-        has_color: bool,
-        color_format: PixelFormat,
-    ) {
-        let mut flags = ClearQuadFlags::HAS_DEPTH;
-        flags.set(ClearQuadFlags::HAS_STENCIL, true);
-        flags.set(ClearQuadFlags::COLOR_FORMAT_NO_WRITE, has_color);
-        let key = ClearQuadKey {
-            depth_format: PixelFormat::Depth32Float,
-            color_format: if has_color {
-                color_format
-            } else {
-                PixelFormat::Bgra8Unorm
-            },
-            flags,
+    /// Asks the depth chain and then the stencil chain. Neither call changes
+    /// the state the other reads, except through a single `ensure_pass_open`,
+    /// after which the stencil chain takes the branch that sees that same
+    /// open pass. So the two answers pair up: both fold, or both paint the
+    /// same rect, and one draw writes both planes. The one odd pairing is a
+    /// depth quad beside a stencil `NoOp`, which paints depth alone.
+    /// Shadow-volume renderers clear both planes between lights, so the
+    /// two-quad shape would double the clear draws on exactly that workload.
+    ///
+    /// A fresh pass is detected by the pass count rather than by whether the
+    /// pass was closed beforehand: under a counting visibility query the
+    /// depth chain ends the open pass and opens a new one within one call.
+    pub fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
+        let passes_before = self.pass_state.passes().len();
+        let depth_outcome = self.pass_state.clear_depth(depth);
+        let stencil_outcome = self.pass_state.clear_stencil(stencil);
+        let depth_quad = match depth_outcome {
+            DepthClearOutcome::Folded => None,
+            DepthClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => Some((
+                value,
+                ClearQuadTarget {
+                    viewport,
+                    has_color,
+                    color_format,
+                },
+            )),
         };
-        let pipeline = self.get_or_create_clear_quad_pipeline(key);
-        if pipeline == 0 {
-            self.pass_state.clear_stencil_legacy_break(value);
+        let stencil_quad = match stencil_outcome {
+            StencilClearOutcome::Folded | StencilClearOutcome::NoOp => None,
+            StencilClearOutcome::EmitQuad {
+                value,
+                viewport,
+                has_color,
+                color_format,
+            } => Some((
+                value,
+                ClearQuadTarget {
+                    viewport,
+                    has_color,
+                    color_format,
+                },
+            )),
+        };
+        debug_assert!(
+            stencil_quad.is_none() || depth_quad.is_some(),
+            "depth folded while stencil painted"
+        );
+        debug_assert!(
+            depth_quad.is_none() || !matches!(stencil_outcome, StencilClearOutcome::Folded),
+            "depth painted while stencil folded"
+        );
+        if depth_quad.is_none() && stencil_quad.is_none() {
             return;
         }
-        let depth_state =
-            self.get_or_create_depth_stencil(&DepthStencilSnapshot::stencil_overwrite());
-        // Depth is not written, but the vertex stage still consumes a constant
-        // z at slot 0; any value inside the clip range will do.
-        let z_bytes = 0.0f32.to_le_bytes();
-        let z_ptr = self.scratch.alloc(&z_bytes);
-        let (vx, vy, vw, vh) = viewport;
-        if self.last_bound.pipeline_changed(pipeline) {
-            self.pass_state
-                .emit_command(Command::set_render_pipeline_state(pipeline));
+        if self.pass_state.passes().len() != passes_before {
+            self.last_bound.reset();
+            #[cfg(debug_assertions)]
+            self.pass_state.debug_reset_emitted();
         }
-        if self.last_bound.depth_stencil_changed(depth_state) {
-            self.pass_state
-                .emit_command(Command::set_depth_stencil_state(depth_state));
+        match (depth_quad, stencil_quad) {
+            (Some((depth, at)), Some((stencil, stencil_at))) if at.same_as(&stencil_at) => {
+                self.emit_clear_quad_depth_stencil_inner(
+                    Some(depth),
+                    Some(stencil),
+                    at.viewport,
+                    at.has_color,
+                    at.color_format,
+                );
+            }
+            (depth_quad, stencil_quad) => {
+                if let Some((depth, at)) = depth_quad {
+                    self.emit_clear_quad_depth_stencil_inner(
+                        Some(depth),
+                        None,
+                        at.viewport,
+                        at.has_color,
+                        at.color_format,
+                    );
+                }
+                if let Some((stencil, at)) = stencil_quad {
+                    self.emit_clear_quad_depth_stencil_inner(
+                        None,
+                        Some(stencil),
+                        at.viewport,
+                        at.has_color,
+                        at.color_format,
+                    );
+                }
+            }
         }
-        if self.last_bound.stencil_reference_changed(value) {
-            self.pass_state
-                .emit_command(Command::set_stencil_reference(value));
-        }
-        self.emit_scissor_rect_resolved((vx, vy, vw, vh));
-        self.pass_state
-            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
-        self.last_bound.invalidate_vertex_buffer();
-        #[cfg(debug_assertions)]
-        self.debug_assert_cache_in_sync();
-        self.pass_state
-            .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
     }
 
     /// Flush `last_bound` when a cross-pass clear-quad opened a fresh Metal encoder.
@@ -2705,24 +2774,43 @@ impl FrameEncoder {
         );
     }
 
-    /// Emit the per-tile clear-quad sequence for a depth-only (or depth+color) mid-pass `Clear`.
+    /// Emit the clear-quad sequence for a mid-pass depth, stencil, or depth+stencil `Clear`.
     ///
-    /// Sequence: pipeline → DSS → scissor → `SetVertexBytesAt(slot=0, &z)`
-    /// → `DrawPrimitives (Triangle, 0, 3)`. Pipeline/DSS/scissor are
-    /// routed through `LastBoundCache` so back-to-back clear-quads and
-    /// clear-quad-then-redraw both dedup (and the cache stays in sync
-    /// with the encoder's actual bound state). The 3-vertex VS uses
-    /// `vertex_id` to synthesise a fullscreen triangle covering
-    /// `[-1, 1]^2` in clip space; the scissor constrains writes to the
-    /// D3D9 viewport rect; the constant `z` becomes the depth value the
-    /// depth-stencil state writes to the depth attachment.
-    fn emit_clear_quad_depth_inner(
+    /// Sequence: pipeline → DSS → stencil reference (stencil clears only) →
+    /// scissor → `SetVertexBytesAt(slot=0, &z)` → `DrawPrimitives (Triangle,
+    /// 0, 3)`. Pipeline/DSS/reference/scissor are routed through
+    /// `LastBoundCache` so back-to-back clear-quads and
+    /// clear-quad-then-redraw both dedup (and the cache stays in sync with
+    /// the encoder's actual bound state). The 3-vertex VS uses `vertex_id`
+    /// to synthesise a fullscreen triangle covering `[-1, 1]^2` in clip
+    /// space; the scissor constrains writes to the D3D9 viewport rect.
+    ///
+    /// Which planes the quad writes is decided by the depth-stencil state
+    /// alone, so the same pipeline serves all three shapes. The constant `z`
+    /// becomes the depth value where depth is requested. MSL cannot export a
+    /// stencil value, so the stencil value rides the encoder as the stencil
+    /// reference, which a `Replace` operation on every outcome writes to each
+    /// covered fragment. `Clear(ZBUFFER | STENCIL)` therefore costs one draw.
+    fn emit_clear_quad_depth_stencil_inner(
         &mut self,
-        value: u32,
+        depth: Option<u32>,
+        stencil: Option<u32>,
         viewport: (u32, u32, u32, u32),
         has_color: bool,
         color_format: PixelFormat,
     ) {
+        let snapshot = match (depth.is_some(), stencil.is_some()) {
+            (true, true) => DepthStencilSnapshot::depth_stencil_overwrite(),
+            (true, false) => DepthStencilSnapshot::depth_overwrite(),
+            (false, true) => DepthStencilSnapshot::stencil_overwrite(),
+            (false, false) => {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "clear quad requested with neither plane; skipped"
+                );
+                return;
+            }
+        };
         // Hardcoded for now: every depth attachment mtld3d emits is
         // `Depth32Float` (D24X8 / D24 / D32 / D16) or
         // `Depth32FloatStencil8` (D24S8). Shadow-cascade caster passes
@@ -2766,12 +2854,19 @@ impl FrameEncoder {
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
-            self.pass_state.clear_depth_legacy_break(value);
+            if let Some(value) = depth {
+                self.pass_state.clear_depth_legacy_break(value);
+            }
+            if let Some(value) = stencil {
+                self.pass_state.clear_stencil_legacy_break(value);
+            }
             return;
         }
-        let depth_state =
-            self.get_or_create_depth_stencil(&DepthStencilSnapshot::depth_overwrite());
-        let z_bytes = f32::from_bits(value).to_le_bytes();
+        let depth_state = self.get_or_create_depth_stencil(&snapshot);
+        // A stencil-only clear writes no depth, but the vertex stage still
+        // consumes a constant z at slot 0; any value inside the clip range
+        // will do.
+        let z_bytes = depth.map_or(0.0f32, f32::from_bits).to_le_bytes();
         let z_ptr = self.scratch.alloc(&z_bytes);
         let (vx, vy, vw, vh) = viewport;
         if self.last_bound.pipeline_changed(pipeline) {
@@ -2781,6 +2876,12 @@ impl FrameEncoder {
         if self.last_bound.depth_stencil_changed(depth_state) {
             self.pass_state
                 .emit_command(Command::set_depth_stencil_state(depth_state));
+        }
+        if let Some(value) = stencil
+            && self.last_bound.stencil_reference_changed(value)
+        {
+            self.pass_state
+                .emit_command(Command::set_stencil_reference(value));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
         self.pass_state
@@ -6346,6 +6447,7 @@ fn pass_to_descriptor(
     let (stencil_load_action, stencil_clear_value) = match p.stencil_load() {
         StencilLoad::Load => (LoadAction::Load, 0),
         StencilLoad::Clear { value } => (LoadAction::Clear, value),
+        StencilLoad::DontCare => (LoadAction::DontCare, 0),
     };
     let color_store_action = match p.color_store() {
         PassStoreAction::Store => StoreAction::Store,

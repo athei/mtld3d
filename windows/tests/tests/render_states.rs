@@ -16,6 +16,7 @@ use mtld3d_types::{
 const BLACK: u32 = 0xFF00_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
+const RED: u32 = 0xFFFF_0000;
 
 fn arm_diffuse(h: &Harness) {
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
@@ -379,6 +380,50 @@ fn stencil_clear_leaves_depth_intact() {
         h.read_pixel(320, 240),
         GREEN,
         "depth survived the stencil clear"
+    );
+}
+
+#[test]
+fn combined_depth_stencil_clear_resets_both_planes_mid_frame() {
+    // Clear(ZBUFFER | STENCIL) after a draw takes the clear-quad path, and
+    // one quad has to reset both planes. Prime depth with a near quad, clear
+    // both planes with stencil 1, then draw a farther quad gated on stencil
+    // EQUAL 1: it paints only if depth went back to 1.0 and stencil holds 1.
+    // A nearer quad gated on stencil 2 then fails the stencil test, which
+    // proves the plane holds exactly 1 rather than passing by accident.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, 0.25)),
+            0,
+            "near draw"
+        );
+        assert_eq!(
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 1),
+            0,
+            "combined clear"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(BLUE, 0.75)),
+            0,
+            "far draw behind the primed depth"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 2), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, 0.5)),
+            0,
+            "draw with the wrong reference"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLUE,
+        "one quad reset depth to 1.0 and stencil to 1"
     );
 }
 
