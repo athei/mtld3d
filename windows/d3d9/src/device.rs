@@ -2404,14 +2404,14 @@ enum RtBinding {
 
 /// Constructs an `ApiTimer` keyed to this device's `ApiPerfState`.
 ///
-/// Hot path: every `IDirect3DDevice9` vtable entry calls it. `#[inline]`
-/// suffices — release uses thin-LTO so the null-check + handoff folds
-/// into the caller. The `sub` arg picks which `DeviceSubCategory`
-/// bucket the elapsed cycles land in for the per-sub breakdown in the
-/// 5-second summary; the top-level `Device` bucket is bumped in
-/// parallel under one `rdtsc()` delta.
+/// Hot path: every `IDirect3DDevice9` vtable entry calls it, the cursor
+/// thunks in `cursor.rs` included. `#[inline]` suffices — release uses
+/// thin-LTO so the null-check + handoff folds into the caller. The `sub`
+/// arg picks which `DeviceSubCategory` bucket the elapsed cycles land in
+/// for the per-sub breakdown in the 5-second summary; the top-level
+/// `Device` bucket is bumped in parallel under one `rdtsc()` delta.
 #[inline]
-fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
+pub fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let perf_ptr = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
         .map_or(core::ptr::null_mut(), |obj| {
@@ -3342,6 +3342,7 @@ extern "system" fn device_present(
     let dev = obj.inner();
 
     mtld3d_shared::crumb!("d3d9:present");
+    dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);
 

@@ -33,6 +33,7 @@ log = "0.4"
 # value come back and makes capturable debug builds behave like production.
 objc2 = { version = "0.6", features = ["disable-encoding-assertions"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSApplication",
     "NSColorSpace",
     "NSResponder",
     "NSScreen",
@@ -42,7 +43,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "objc2-core-graphics",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
-objc2-core-graphics = { version = "0.3", features = ["CGColorSpace"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSURL",

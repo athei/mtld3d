@@ -2,10 +2,10 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use libloading::os::unix::Library;
-use log::{error, info};
+use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
     MetalHandle,
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
@@ -187,6 +187,193 @@ fn install_occlusion_tracking(view: *mut c_void) {
             .contains(NSWindowOcclusionState::Visible);
         WINDOW_OCCLUDED.store(occluded, Ordering::Relaxed);
         install_occlusion_observer_once();
+        // SAFETY: inside the main-thread dispatch above.
+        let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
+        install_screen_params_filter_once(mtm);
+    });
+}
+
+/// Count of `NSApplicationDidChangeScreenParametersNotification` deliveries.
+static SCREEN_PARAM_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Wine's `NSApplication` delegate, retained for the process lifetime.
+///
+/// Set once by [`install_screen_params_filter_once`]; zero until then. Held
+/// as an address because the observer block that reads it must not capture
+/// a `!Send` `Retained`, and the delegate is only ever touched on the main
+/// thread, where the notification is posted.
+static WINE_APP_DELEGATE_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// One screen's contribution to the configuration snapshot.
+///
+/// Floats are kept as bit patterns so the comparison is exact and the
+/// struct stays `Eq`.
+#[derive(PartialEq, Eq)]
+struct ScreenEntry {
+    frame: [u64; 4],
+    visible_frame: [u64; 4],
+    scale: u64,
+}
+
+/// The screen configuration Wine's view of the displays depends on.
+///
+/// The per-screen geometry and scale, plus the main display's CG mode
+/// (size, refresh rate, IO mode id), which is what macdrv reports through
+/// `EnumDisplaySettings`. A refresh-rate-only change on a secondary display
+/// is the one real change this misses; it is picked up on the next change
+/// that moves any geometry.
+#[derive(PartialEq, Eq)]
+struct ScreenConfiguration {
+    screens: Vec<ScreenEntry>,
+    main_mode: (usize, usize, u64, i32),
+}
+
+/// Snapshot the current screen configuration. **Main thread only.**
+fn current_screen_configuration(mtm: objc2::MainThreadMarker) -> ScreenConfiguration {
+    use objc2_app_kit::NSScreen;
+    use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID};
+
+    let rect_bits = |r: objc2_foundation::NSRect| {
+        [
+            r.origin.x.to_bits(),
+            r.origin.y.to_bits(),
+            r.size.width.to_bits(),
+            r.size.height.to_bits(),
+        ]
+    };
+    let screens = NSScreen::screens(mtm)
+        .iter()
+        .map(|s| ScreenEntry {
+            frame: rect_bits(s.frame()),
+            visible_frame: rect_bits(s.visibleFrame()),
+            scale: s.backingScaleFactor().to_bits(),
+        })
+        .collect();
+    let main_mode = CGDisplayCopyDisplayMode(CGMainDisplayID()).map_or((0, 0, 0, 0), |m| {
+        (
+            CGDisplayMode::width(Some(&m)),
+            CGDisplayMode::height(Some(&m)),
+            CGDisplayMode::refresh_rate(Some(&m)).to_bits(),
+            CGDisplayMode::io_display_mode_id(Some(&m)),
+        )
+    });
+    ScreenConfiguration { screens, main_mode }
+}
+
+/// Last configuration forwarded to Wine. **Main thread only.**
+static LAST_SCREEN_CONFIGURATION: Mutex<Option<ScreenConfiguration>> = Mutex::new(None);
+
+/// Take over `NSApplicationDidChangeScreenParametersNotification` from Wine. **Main thread only.**
+///
+/// macOS posts this notification not only for display topology or mode
+/// changes but for every step of an EDR headroom ramp, and the headroom
+/// follows ambient light, thermal state and on-screen content, so with the
+/// HDR layer attached it arrives at up to the refresh rate. Wine's macdrv
+/// answers each one as a display-mode change: a window-level pass here, a
+/// full display re-enumeration in the desktop process and a display-cache
+/// invalidation everywhere, all of it on the main thread that `SetCapture`
+/// and `SetCursorPos` wait on synchronously. That wait is what made every
+/// mouse press and release frame run 1 to 3 ms long.
+///
+/// `AppKit` wires the notification to the delegate's
+/// `applicationDidChangeScreenParameters:` through the default notification
+/// center, so unregistering the delegate for this one name and observing it
+/// ourselves lets us forward only the deliveries whose
+/// [`ScreenConfiguration`] differs from the last one forwarded. Everything
+/// Wine does in its handler still happens on real changes, and nothing at
+/// all happens on a headroom step. The desktop process never loads mtld3d,
+/// so its own copy of the storm is out of reach here; that half is a Wine
+/// patch. Installed once; the observer token is leaked for the process
+/// lifetime like the occlusion observer.
+fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
+    use core::ptr::NonNull;
+    use std::sync::Once;
+
+    use block2::RcBlock;
+    use objc2::{MainThreadMarker, runtime::ProtocolObject};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationDelegate, NSApplicationDidChangeScreenParametersNotification,
+        NSScreen,
+    };
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let Some(delegate) = NSApplication::sharedApplication(mtm).delegate() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: NSApp has no delegate; screen-parameter notifications are not \
+                 filtered, every EDR headroom step will cost a Wine display re-enumeration",
+            );
+            return;
+        };
+        let center = NSNotificationCenter::defaultCenter();
+        // SAFETY: AppKit-exported notification-name constant, valid for the
+        // process lifetime.
+        let name = unsafe { NSApplicationDidChangeScreenParametersNotification };
+        // SAFETY: `ProtocolObject` is a transparent wrapper over `AnyObject`,
+        // so the pointer reinterprets losslessly for the call below.
+        let observer = unsafe { &*Retained::as_ptr(&delegate).cast::<objc2::runtime::AnyObject>() };
+        // SAFETY: objc2 typed binding; the delegate is a live observer of the
+        // center (AppKit registered it), and removing a registration that
+        // does not exist is a documented no-op.
+        unsafe { center.removeObserver_name_object(observer, Some(name), None) };
+        WINE_APP_DELEGATE_PTR.store(Retained::as_ptr(&delegate) as usize, Ordering::Release);
+        // Leaked on purpose: the delegate is Wine's application controller
+        // and lives as long as the process.
+        core::mem::forget(delegate);
+
+        let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
+            let count = SCREEN_PARAM_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+            // SAFETY: AppKit posts this notification on the main thread.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let config = current_screen_configuration(mtm);
+            let changed = {
+                let mut last = LAST_SCREEN_CONFIGURATION
+                    .lock()
+                    .expect("screen-configuration mutex poisoned");
+                let changed = last.as_ref() != Some(&config);
+                if changed {
+                    *last = Some(config);
+                }
+                changed
+            };
+            if log_enabled!(target: LOG_TARGET, log::Level::Debug) {
+                let headroom = NSScreen::mainScreen(mtm)
+                    .map_or(0.0, |s| s.maximumExtendedDynamicRangeColorComponentValue());
+                debug!(
+                    target: LOG_TARGET,
+                    "screen params changed #{count}: headroom={headroom:.3} {}",
+                    if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
+                );
+            }
+            if !changed {
+                return;
+            }
+            let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
+            if delegate_ptr == 0 {
+                return;
+            }
+            // SAFETY: the pointer was taken from a `Retained` that is leaked
+            // above, so the delegate outlives this block, and the call is on
+            // the main thread, which is the delegate's thread.
+            let delegate =
+                unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
+            // SAFETY: the notification pointer is valid for the handler's
+            // duration; Wine implements this optional delegate method.
+            unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
+        });
+        // SAFETY: objc2 typed binding; the center copies the block, and the
+        // token is leaked below so the observer is never removed.
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+        };
+        core::mem::forget(token);
+        info!(
+            target: LOG_TARGET,
+            "present: filtering NSApplicationDidChangeScreenParametersNotification for Wine \
+             (forwarded only when screen geometry, scale or the main display mode changed)",
+        );
     });
 }
 
@@ -640,6 +827,14 @@ pub fn set_display_sync_enabled(
     store_min_present_duration(panel_max_hz, pacing);
 }
 
+/// Host-time seconds (`CFTimeInterval`) to nanoseconds, saturating.
+///
+/// `presentedTime` is a `CACurrentMediaTime`-based host time; a session's
+/// uptime in nanoseconds sits far below `u64::MAX`.
+pub fn host_seconds_to_ns(secs: f64) -> u64 {
+    bounded_cast::f64_to_u64_saturating(secs * 1e9)
+}
+
 /// Numeric casts where the cast lints fire but the bounds are established by the caller.
 ///
 /// Grouping them under one mod-level allow collapses what would otherwise be
@@ -663,6 +858,20 @@ mod bounded_cast {
             return u32::MAX;
         }
         v as u32
+    }
+
+    /// Saturating `f64 → u64`.
+    ///
+    /// NaN/negative → 0, ≥ `u64::MAX` → `u64::MAX`; all other inputs land in
+    /// `(0.0, u64::MAX)` where the cast is exact to f64 precision.
+    pub fn f64_to_u64_saturating(v: f64) -> u64 {
+        if !v.is_finite() || v <= 0.0 {
+            return 0;
+        }
+        if v >= u64::MAX as f64 {
+            return u64::MAX;
+        }
+        v as u64
     }
 
     /// `f64 → f32` narrowing.
