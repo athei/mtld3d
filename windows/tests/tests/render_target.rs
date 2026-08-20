@@ -4,12 +4,12 @@
 
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL,
-    D3DFMT_A8R8G8B8, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
+    D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
     D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
     D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
@@ -1217,5 +1217,99 @@ fn sample_float_texture_into_float_rt_round_trips() {
     assert!(
         (r - 0.5).abs() < 0.05 && (g - 0.25).abs() < 0.05,
         "float RT sample of (0.5,0.25) should be ~(0.5,0.25); got ({r},{g})"
+    );
+}
+
+/// Draw a full-cover triangle in `color` at clip-space depth `z`.
+fn draw_fill_at_z(h: &Harness, color: u32, z: f32) {
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_LIGHTING, 0),
+        0,
+        "lighting off"
+    );
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z,
+            color,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "fill draw"
+    );
+}
+
+#[test]
+fn depth_survives_a_mid_frame_readback_flush() {
+    // A readback taken between two depth-tested draw groups forces a mid-frame
+    // flush (NO_PRESENT). The depth surface the first group wrote must survive
+    // it: the far second group is gated LESS against the primed near depth and
+    // must fail. Before the fix the flush elided the depth store (Rule B) and
+    // reset first-use (Rule A), so the far group tested against discarded
+    // depth. The colour side is deterministic here: the near group's green is
+    // the surviving pixel iff depth held.
+    let h = Harness::with_depth();
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth",
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "z on");
+
+    // Near group: green, writes depth 0.25.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "zwrite on");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+        0,
+        "zfunc lessequal"
+    );
+    draw_fill_at_z(&h, GREEN, 0.25);
+
+    // Force a mid-frame flush between the groups (readback of the backbuffer).
+    let _ = h.read_pixel(0, 0);
+
+    // Far group: red at 0.75, gated LESS. 0.75 < 0.25 is false, so it must
+    // fail against the primed depth and leave green in place.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0, "zwrite off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS),
+        0,
+        "zfunc less"
+    );
+    draw_fill_at_z(&h, RED, 0.75);
+
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the far group failed depth against the primed near depth that survived the flush",
     );
 }

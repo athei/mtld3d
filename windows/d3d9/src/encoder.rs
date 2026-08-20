@@ -684,6 +684,12 @@ pub struct FrameEncoder {
     ///
     /// The `Async` per-frame perf summary reports this (lagged ≤1 frame).
     last_submit_status: i32,
+    /// Whether the previous submit was a mid-frame flush (`NO_PRESENT`).
+    ///
+    /// Set in `finalize_submit` from the frame's flags, read in the next
+    /// `begin_frame` so `PassState::reset_frame` keeps the seen-rt sets when
+    /// the D3D9 frame did not actually end at the flush. Encoder-thread only.
+    prev_submit_no_present: bool,
     /// Arc clones of staging `PageBoxes` referenced by blits emitted this frame.
     ///
     /// Moved into `pending_blit_retention` at submit time with the frame's
@@ -1147,6 +1153,7 @@ impl FrameEncoder {
             submit_in_flight: 0,
             submit_payloads_total: 0,
             last_submit_status: 0,
+            prev_submit_no_present: false,
             current_blit_retention: Vec::new(),
             pending_blit_retention: VecDeque::new(),
             coherent_seq_ptr: 0,
@@ -1759,14 +1766,19 @@ impl FrameEncoder {
         mtld3d_shared::crumb!("phase:BfVisRst");
         self.visibility.reset_frame();
         mtld3d_shared::crumb!("phase:BfPassRst");
-        self.pass_state.reset_frame(
-            frame.backbuffer_handle,
-            (frame.backbuffer_width, frame.backbuffer_height),
-            frame.backbuffer_format,
-            frame.depth_texture,
-            frame.flags.contains(FrameDataFlags::DEPTH_HAS_STENCIL),
-            frame.render_scale,
-        );
+        // Keep the seen-rt sets when the previous submit was a mid-frame flush
+        // (the D3D9 frame did not end there); `finalize_submit` consumes the
+        // flag by the time this reads it.
+        self.pass_state
+            .reset_frame(&mtld3d_core::passes::FrameReset {
+                backbuffer: frame.backbuffer_handle,
+                backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
+                backbuffer_format: frame.backbuffer_format,
+                depth_texture: frame.depth_texture,
+                depth_has_stencil: frame.flags.contains(FrameDataFlags::DEPTH_HAS_STENCIL),
+                render_scale: frame.render_scale,
+                continues_frame: self.prev_submit_no_present,
+            });
         mtld3d_shared::crumb!("phase:BfDone");
     }
 
@@ -6490,8 +6502,12 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     enc.end_current_pass("submit");
 
     // A readback flush is not a frame end: the frame continues and any colour
-    // target may still be read back, so last-use colour stores survive it.
-    apply_pass_rules(enc, frame.flags.contains(FrameDataFlags::NO_PRESENT));
+    // or depth target may still be read back or drawn into, so the last-use
+    // rules (D colour, B depth/stencil) are suppressed. Remember it so the
+    // next `begin_frame` keeps the seen-rt sets for the continuation's Rule A.
+    let no_present = frame.flags.contains(FrameDataFlags::NO_PRESENT);
+    enc.prev_submit_no_present = no_present;
+    apply_pass_rules(enc, no_present);
     log_cascade_frame_summary(enc);
 
     // StretchRect blits queued after the last draw of the frame have no
@@ -6778,10 +6794,10 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 /// to the no-color variant so Metal's RP-format validation stays happy.
 /// Rule F drops clear-only passes that nothing observes; must run after
 /// Rule G so the cull picks up the strip.
-fn apply_pass_rules(enc: &mut FrameEncoder, preserve_color_stores: bool) {
+fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
     enc.pass_state.coalesce_clear_only_passes();
     enc.pass_state.finalize_load_actions();
-    enc.pass_state.finalize_store_actions(preserve_color_stores);
+    enc.pass_state.finalize_store_actions(frame_continues);
     enc.pass_state.strip_dead_color_in_clear_only_passes();
     enc.pass_state
         .strip_color_from_no_color_draw_passes(&enc.no_color_pipeline_alt);

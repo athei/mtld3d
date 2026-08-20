@@ -805,6 +805,25 @@ bitflags::bitflags! {
     }
 }
 
+/// The per-frame inputs `PassState::reset_frame` seeds a new frame from.
+///
+/// A parameter struct rather than a long argument list: the frame's
+/// backbuffer identity, its logical size and format, the depth surface and
+/// whether it carries stencil, the back-buffer render scale, and whether this
+/// frame continues one that a mid-frame flush interrupted (see
+/// [`PassState::reset_frame`]).
+pub struct FrameReset {
+    pub backbuffer: MetalHandle<MTLTextureKind>,
+    /// Logical back-buffer size, the resolution D3D9 reports.
+    pub backbuffer_size: (u32, u32),
+    pub backbuffer_format: PixelFormat,
+    pub depth_texture: MetalHandle<MTLTextureKind>,
+    pub depth_has_stencil: bool,
+    pub render_scale: RenderScale,
+    /// `true` when the previous submit was a mid-frame flush, not a `Present`.
+    pub continues_frame: bool,
+}
+
 /// Pass-management state machine.
 ///
 /// Owned by the encoder thread's `FrameEncoder`; every frame begins with
@@ -1094,15 +1113,25 @@ impl PassState {
     /// `render_scale` converts it to the size of the texture actually bound.
     /// Callers stay in the game's coordinate space and this is the one place
     /// the two are reconciled.
-    pub fn reset_frame(
-        &mut self,
-        backbuffer: MetalHandle<MTLTextureKind>,
-        backbuffer_size: (u32, u32),
-        backbuffer_format: PixelFormat,
-        depth_texture: MetalHandle<MTLTextureKind>,
-        depth_has_stencil: bool,
-        render_scale: RenderScale,
-    ) {
+    ///
+    /// `continues_frame` is `true` when the previous submit was a mid-frame
+    /// flush (a readback / retention drain, `NO_PRESENT`) rather than a
+    /// `Present`. The D3D9 frame the game is drawing did not end there, so the
+    /// render targets and depth surface it already wrote keep their content in
+    /// VRAM. The per-frame "seen" sets are kept across the boundary so Rule A
+    /// loads those attachments on their first use in the continuation instead
+    /// of discarding them with `DontCare` (the store side is handled by
+    /// `finalize_store_actions` skipping Rules B and D on the flush).
+    pub fn reset_frame(&mut self, reset: &FrameReset) {
+        let &FrameReset {
+            backbuffer,
+            backbuffer_size,
+            backbuffer_format,
+            depth_texture,
+            depth_has_stencil,
+            render_scale,
+            continues_frame,
+        } = reset;
         // Recycle each retired pass's `commands` Vec back into the pool
         // (capacity preserved, length zeroed). Once warm, the pool's
         // Vecs carry the steady-state high-water capacity and the next
@@ -1160,8 +1189,15 @@ impl PassState {
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
-        self.seen_color_rts.clear();
-        self.seen_depth_rts.clear();
+        // Keep the seen-rt sets across a mid-frame flush: the D3D9 frame
+        // continues, so the targets already drawn keep their VRAM content and
+        // their first use in the continuation must Load, not `DontCare`. On a
+        // real `Present` (`continues_frame` false) the frame ended and every
+        // target starts fresh.
+        if !continues_frame {
+            self.seen_color_rts.clear();
+            self.seen_depth_rts.clear();
+        }
         self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
@@ -3378,12 +3414,15 @@ impl PassState {
     ///   resolves and that next pass's `color_load` is `Clear`, flip
     ///   `i.color_store`. Then update the map with `i`.
     ///
-    /// `preserve_color_stores` marks a mid-frame flush (a readback, not `Present`): the frame
-    /// continues afterwards and any colour target may still be read back or drawn into, so
-    /// Rule D does not run; the next-clear rule still does, since that proof does not depend
-    /// on the frame ending.
-    pub fn finalize_store_actions(&mut self, preserve_color_stores: bool) {
-        if ENABLE_LAST_USE_DEPTH_DONTCARE {
+    /// `frame_continues` marks a mid-frame flush (a readback or retention drain, not
+    /// `Present`): the D3D9 frame keeps going afterwards, so a colour target may still be
+    /// read back or drawn into and a depth surface may still be tested against. Both last-use
+    /// rules are therefore suppressed — Rule D (colour) and Rule B (depth/stencil) would
+    /// discard content the continuation still needs. Rule C (next-clear) still runs, since a
+    /// pass that a later pass *in this submission* clears is provably overwritten regardless
+    /// of whether the frame ends here.
+    pub fn finalize_store_actions(&mut self, frame_continues: bool) {
+        if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
                 FxHashSet::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
             for pass in self.passes.iter_mut().rev() {
@@ -3450,7 +3489,7 @@ impl PassState {
                 }
             }
         }
-        if ENABLE_LAST_USE_COLOR_DONTCARE && !preserve_color_stores {
+        if ENABLE_LAST_USE_COLOR_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
                 FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
             let backbuffer = self.backbuffer_texture;
@@ -4087,28 +4126,30 @@ mod tests {
 
     fn fresh() -> PassState {
         let mut s = PassState::new();
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s
     }
 
     /// A frame rasterizing the back buffer at half the reported resolution.
     fn fresh_scaled() -> PassState {
         let mut s = PassState::new();
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::from_percent(50),
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::from_percent(50),
+            continues_frame: false,
+        });
         s
     }
 
@@ -4221,14 +4262,15 @@ mod tests {
         let atlas = tex(0x7E10);
         s.emit_command(Command::set_fragment_texture(atlas.raw(), 0));
         assert!(s.texture_sampled_this_frame(atlas));
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         // Per-frame set resets — a next-frame upload before the first
         // sample goes to the live texture again.
         assert!(!s.texture_sampled_this_frame(atlas));
@@ -4536,14 +4578,15 @@ mod tests {
         let mut s = fresh();
         s.clear_color(1, 2, 3, 4);
         assert!(s.pending_color_clear().is_some());
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         assert!(s.pending_color_clear().is_none());
         assert!(s.passes().is_empty());
     }
@@ -5174,14 +5217,15 @@ mod tests {
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
         // Next frame: same backbuffer is "first use again" because the
         // seen set was reset.
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
@@ -5229,14 +5273,15 @@ mod tests {
         s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            true,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: true,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s.emit_command(dummy_draw());
         assert_eq!(s.passes().len(), 1);
         assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
@@ -7170,14 +7215,15 @@ mod tests {
         let mut s = fresh();
         s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
         s.take_pending_leading_blits();
-        s.reset_frame(
-            backbuffer(),
-            BB_SIZE,
-            BB_FORMAT,
-            depth(),
-            false,
-            RenderScale::IDENTITY,
-        );
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
         s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
         assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
@@ -7240,5 +7286,82 @@ mod tests {
         s.coalesce_clear_only_passes();
         assert_eq!(s.passes().len(), 3, "the clear stays ahead of the copy");
         assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+    }
+
+    // ── B3: a mid-frame flush is not a frame end ─────────────────
+
+    #[test]
+    fn mid_frame_flush_keeps_the_depth_store() {
+        // A depth-tested pass, then a mid-frame flush (a readback): the depth
+        // surface may still be tested against in the continuation, so Rule B
+        // must not discard its store at the flush. A real Present still elides
+        // it (the TBDR depth-store optimisation).
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.finalize_store_actions(true);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::Store,
+            "depth store survives a mid-frame flush",
+        );
+        s.finalize_store_actions(false);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::DontCare,
+            "depth store is still elided at a real Present",
+        );
+    }
+
+    #[test]
+    fn continuation_loads_targets_drawn_before_the_flush() {
+        // Draw to the backbuffer + depth, then a mid-frame flush. The
+        // continuation's first pass on the same attachments must Load
+        // (preserving the pre-flush pixels), not open first-use `DontCare`.
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: true,
+        });
+        s.emit_command(dummy_draw());
+        assert_eq!(
+            s.passes()[0].color_load(),
+            ColorLoad::Load,
+            "continuation loads the backbuffer drawn before the flush",
+        );
+        assert_eq!(
+            s.passes()[0].depth_load(),
+            DepthLoad::Load,
+            "continuation loads the depth surface too",
+        );
+    }
+
+    #[test]
+    fn a_real_present_still_dontcares_first_use() {
+        // The contrast to `continuation_loads_targets_drawn_before_the_flush`:
+        // a real Present (continues_frame false) clears the seen sets, so the
+        // next frame's first use of the backbuffer is `DontCare` again.
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
     }
 }
