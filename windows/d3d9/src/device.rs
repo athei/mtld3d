@@ -5677,6 +5677,7 @@ fn emit_stretch_rect_blit(
              Set render.scale = 1.0 if this surface's contents matter",
             src_region.w, src_region.h, dst_region.w, dst_region.h,
         );
+        enc.flush_pending_clears();
         enc.end_current_pass("stretch_rect");
         let region_w = src_region.w.min(dst_region.w);
         let region_h = src_region.h.min(dst_region.h);
@@ -5734,6 +5735,9 @@ fn emit_stretch_rect_blit(
         }
         return;
     }
+    // A `Clear` on either endpoint that is still waiting for a pass must land
+    // before the copy: D3D9 ordered it first.
+    enc.flush_pending_clears();
     enc.end_current_pass("stretch_rect");
     enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
         &CopyTextureSubRectInfo {

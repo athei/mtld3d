@@ -890,6 +890,15 @@ pub struct PassState {
     ///
     /// Same semantics as `seen_color_rts`.
     seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Textures a queued blit writes this frame (`StretchRect` destinations, mipmap regens).
+    ///
+    /// Inserted by `push_pending_leading_blit`, which sees every ordered blit
+    /// before it is drained into some pass's `leading_blits`. Rule A consults
+    /// it: the blit that wrote the texture may sit in an earlier pass's
+    /// leading list, not the one that first attaches the texture, so the
+    /// attachment's own `leading_blits` are not enough to know that its
+    /// content is live. Reset each frame in `reset_frame`.
+    blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule D (last-use color `Store=DontCare`) exempts this handle so
@@ -1052,6 +1061,7 @@ impl PassState {
             pending_leading_blits: Vec::new(),
             seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
@@ -1152,6 +1162,7 @@ impl PassState {
         self.pending_leading_blits.clear();
         self.seen_color_rts.clear();
         self.seen_depth_rts.clear();
+        self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
@@ -1838,7 +1849,7 @@ impl PassState {
                     && !texture.is_null()
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
-                    && !blit_list_writes(&leading_blits, texture) =>
+                    && !self.blit_written_rts.contains(&texture) =>
                 {
                     ColorLoad::DontCare
                 }
@@ -1871,7 +1882,7 @@ impl PassState {
             && !self
                 .seen_sampled_textures
                 .contains(&self.current_depth_texture)
-            && !blit_list_writes(&leading_blits, self.current_depth_texture);
+            && !self.blit_written_rts.contains(&self.current_depth_texture);
         let depth_load = match self.pending_depth_clear.take() {
             Some(value) => DepthLoad::Clear { value },
             None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
@@ -1971,7 +1982,25 @@ impl PassState {
     /// draws. If no further pass opens this frame, `submit` drains the queue
     /// into a synthetic trailing blit-only pass via
     /// `take_pending_leading_blits`.
+    ///
+    /// The blit is also entered into the read/write model the load/store rules
+    /// reason over. A texture-to-texture copy reads its source from device
+    /// memory after every pass that wrote it, so the source counts as read
+    /// (`seen_sampled_textures`, which Rules B/C/D consult before discarding a
+    /// store). The destination of any texture-writing blit goes into
+    /// `blit_written_rts` so Rule A loads it instead of discarding the copy.
     pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
+        if BlitCommandType::from_repr(blit.cmd) == Some(BlitCommandType::CopyTextureToTexture)
+            && blit.src_handle != 0
+        {
+            // SAFETY: a texture copy carries a non-null MTLTexture handle in
+            // `src_handle`, packed from the encoder's typed cache via `.raw()`.
+            let src = unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) };
+            self.note_texture_read(src);
+        }
+        if let Some(dst) = blit_written_texture(&blit) {
+            self.blit_written_rts.insert(dst);
+        }
         self.pending_leading_blits.push(blit);
     }
 
@@ -3025,15 +3054,18 @@ impl PassState {
     /// "Clear-only" means the pass has zero `DrawPrimitives` /
     /// `DrawIndexedPrimitives` commands; any setviewport / setscissor /
     /// setpipeline / setBlendColor that the encoder pushed without a
-    /// subsequent draw still counts as clear-only here.
+    /// subsequent draw still counts as clear-only here. A pass carrying
+    /// leading blits is never a candidate: the blits are real work that the
+    /// merge would drop along with the pass.
     pub fn coalesce_clear_only_passes(&mut self) {
         let mut i = 0;
         while i < self.passes.len() {
             let p = &self.passes[i];
-            let has_draw = p.commands.iter().any(|c| {
-                c.cmd == CommandType::DrawPrimitives as u32
-                    || c.cmd == CommandType::DrawIndexedPrimitives as u32
-            });
+            let has_draw = !p.leading_blits.is_empty()
+                || p.commands.iter().any(|c| {
+                    c.cmd == CommandType::DrawPrimitives as u32
+                        || c.cmd == CommandType::DrawIndexedPrimitives as u32
+                });
             // Any colour target of the pass with a Clear makes the colour
             // side a candidate; the whole set then moves together.
             let needs_color = !has_draw
@@ -3110,7 +3142,9 @@ impl PassState {
     /// Rule E's Clear into it. Bail on any intervening pass that reads
     /// the target as a fragment sampler input, as a blit source, or
     /// attaches it with `Clear` itself (that pass already overwrites
-    /// whatever we'd move).
+    /// whatever we'd move), and on any intervening leading blit that
+    /// writes the target: the copy landed after the clear, so a clear moved
+    /// past it would wipe it.
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
@@ -3131,6 +3165,20 @@ impl PassState {
                 && target_extra
                     .iter()
                     .any(|&(tex, _)| !tex.is_null() && pass_reads_texture(cand, tex))
+            {
+                return None;
+            }
+            // Intervening blit write on a side we care about kills the merge
+            // too: the copy is ordered after our clear.
+            if needs_color
+                && (blit_list_writes(&cand.leading_blits, target_color)
+                    || target_extra
+                        .iter()
+                        .any(|&(tex, _)| blit_list_writes(&cand.leading_blits, tex)))
+            {
+                return None;
+            }
+            if (needs_depth || needs_stencil) && blit_list_writes(&cand.leading_blits, target_depth)
             {
                 return None;
             }
@@ -3478,47 +3526,46 @@ fn pass_reads_texture(pass: &Pass, target_handle: MetalHandle<MTLTextureKind>) -
         })
 }
 
-/// True if any blit in `blits` writes to texture `target_handle`.
-///
-/// Used at pass-open to disqualify `LoadAction::DontCare` on an
-/// attachment that just got a leading blit's output (`StretchRect`'s
-/// typical pattern: copy A → B, then render onto B; the next pass MUST
-/// `Load` to preserve the blit's contents).
+/// The texture a blit writes, if it writes one.
 ///
 /// `NotifyBufferDidModifyRange` and `CopyBufferToBuffer` carry buffer
-/// handles in `src_handle`/`dst_handle` — never texture handles — so
-/// they're safely filtered out by the type-mismatch on the handle
-/// value (texture handles are disjoint from buffer handles in Metal).
-/// The exhaustive match makes any new `BlitCommandType` a compile
-/// error here, forcing the author to classify it.
+/// handles in `src_handle`/`dst_handle`, never texture handles, so they
+/// write no texture. An unknown variant on the wire is conservatively
+/// treated as texture-writing. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let writes_texture = match BlitCommandType::from_repr(blit.cmd) {
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyTextureToTexture
+            | BlitCommandType::GenerateMipmaps,
+        )
+        | None => true,
+        Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
+            false
+        }
+    };
+    if !writes_texture || blit.dst_handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-writing blit carries a non-null MTLTexture handle in
+    // `dst_handle`, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.dst_handle) })
+}
+
+/// True if any blit in `blits` writes to texture `target_handle`.
+///
+/// Used by Rule E to refuse moving a clear past a pass whose leading blits
+/// write the cleared target (`StretchRect`'s typical pattern: copy A → B,
+/// then render onto B; a clear folded into that render pass would wipe the
+/// copy).
 fn blit_list_writes(blits: &[BlitCommand], target_handle: MetalHandle<MTLTextureKind>) -> bool {
     if target_handle.is_null() {
         return false;
     }
-    let target_raw = target_handle.raw();
-    // allow: identical bodies (`=> true`) on the texture-writing arms and
-    // the `None` arm are intentional — the exhaustive match on `Some(...)`
-    // turns "new BlitCommandType variant" into a compile error here,
-    // forcing the author to classify it. Collapsing to `Some(_) | None
-    // => true` would silently default new variants to "texture-writing",
-    // defeating that.
-    blits.iter().any(|b| {
-        // Unknown variants on the wire → conservatively assume "writes texture".
-        let Some(ty) = BlitCommandType::from_repr(b.cmd) else {
-            return b.dst_handle == target_raw;
-        };
-        // Exhaustive match keeps the compile-error-on-new-variant safety:
-        // any new BlitCommandType forces an author here to classify it.
-        let writes_texture = match ty {
-            BlitCommandType::CopyBufferToTexture
-            | BlitCommandType::CopyTextureToTexture
-            | BlitCommandType::GenerateMipmaps => true,
-            BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange => {
-                false
-            }
-        };
-        writes_texture && b.dst_handle == target_raw
-    })
+    blits
+        .iter()
+        .any(|b| blit_written_texture(b) == Some(target_handle))
 }
 
 impl Default for PassState {
@@ -7021,5 +7068,177 @@ mod tests {
         // At a real frame end the unread target's store is elided as before.
         s.finalize_store_actions(false);
         assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
+    }
+
+    // ── Blits in the read/write model ─────────────────────────────
+
+    fn copy_blit(
+        src: MetalHandle<MTLTextureKind>,
+        dst: MetalHandle<MTLTextureKind>,
+    ) -> BlitCommand {
+        BlitCommand::copy_texture_to_texture_full_mip(src.raw(), dst.raw(), 0, 64, 64)
+    }
+
+    #[test]
+    fn rule_d_keeps_store_when_a_stretch_rect_reads_the_target() {
+        // Render into rt, then copy rt to the backbuffer after the pass: the
+        // copy reads rt from device memory, so its last-use store must stay.
+        let rt = tex(0x3000);
+        let mut s = fresh();
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.push_pending_leading_blit(copy_blit(rt, backbuffer()));
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes().len(), 1);
+        assert_eq!(s.passes()[0].color_texture(), rt);
+        assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+        // The blit is still queued for the trailing blit-only pass.
+        assert_eq!(s.take_pending_leading_blits().len(), 1);
+    }
+
+    #[test]
+    fn rule_c_keeps_store_when_a_blit_reads_between_write_and_clear() {
+        // rt written in pass 0, copied out by a blit that pass 1 carries, then
+        // cleared in pass 2. The next-clear rule must not discard pass 0's
+        // store: the copy reads it.
+        let rt = tex(0x3000);
+        let other = tex(0x5000);
+        let mut s = fresh();
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.push_pending_leading_blit(copy_blit(rt, other));
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(
+            s.passes()[2].color_load(),
+            ColorLoad::Clear {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 4
+            }
+        );
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+    }
+
+    #[test]
+    fn rule_a_loads_a_target_written_by_a_blit_in_an_earlier_pass() {
+        // A copy into rt_x is queued while rt_y is bound, so it lands in
+        // rt_y's pass. rt_x's own first pass must still Load the copy.
+        let rt_src = tex(0x3000);
+        let rt_x = tex(0x4000);
+        let rt_y = tex(0x5000);
+        let mut s = fresh();
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes().len(), 2);
+        assert_eq!(s.passes()[0].color_texture(), rt_y);
+        assert_eq!(s.passes()[0].leading_blits().len(), 1);
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+        assert_eq!(s.passes()[1].color_texture(), rt_x);
+        assert_eq!(s.passes()[1].leading_blits().len(), 0);
+        assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+    }
+
+    #[test]
+    fn blit_written_set_resets_with_the_frame() {
+        let rt_src = tex(0x3000);
+        let rt_x = tex(0x4000);
+        let mut s = fresh();
+        s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+        s.take_pending_leading_blits();
+        s.reset_frame(
+            backbuffer(),
+            BB_SIZE,
+            BB_FORMAT,
+            depth(),
+            false,
+            RenderScale::IDENTITY,
+        );
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    }
+
+    #[test]
+    fn rule_e_keeps_a_clear_only_pass_that_carries_leading_blits() {
+        // A copy is queued, then Clear(rt_x) goes pending, and SetRT(rt_y)
+        // materialises it as a clear-only pass that drains the copy. The later
+        // Load pass on rt_x would be a merge target; merging would drop the
+        // copy with the pass.
+        let rt_x = tex(0x3000);
+        let rt_y = tex(0x4000);
+        let mut s = fresh();
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.push_pending_leading_blit(dummy_blit());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 4);
+        assert_eq!(s.passes()[1].color_texture(), rt_x);
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(s.passes()[3].color_load(), ColorLoad::Load);
+        s.coalesce_clear_only_passes();
+        assert_eq!(
+            s.passes().len(),
+            4,
+            "a pass with leading blits is never merged away"
+        );
+        assert_eq!(s.passes()[1].leading_blits().len(), 1);
+        assert_eq!(s.passes()[3].color_load(), ColorLoad::Load);
+    }
+
+    #[test]
+    fn rule_e_aborts_when_an_intervening_blit_writes_the_target() {
+        // Clear(rt_x) materialises as pass 0, a copy rt_y -> rt_x is queued
+        // after pass 1, and pass 2 attaches rt_x with Load and carries that
+        // copy. The clear is ordered before the copy, so it must not move
+        // into pass 2's load action.
+        let rt_x = tex(0x3000);
+        let rt_y = tex(0x4000);
+        let mut s = fresh();
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+        s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.push_pending_leading_blit(copy_blit(rt_y, rt_x));
+        s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(s.passes()[2].leading_blits().len(), 1);
+        assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+        s.coalesce_clear_only_passes();
+        assert_eq!(s.passes().len(), 3, "the clear stays ahead of the copy");
+        assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
     }
 }

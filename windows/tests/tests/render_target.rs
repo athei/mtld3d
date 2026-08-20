@@ -376,9 +376,9 @@ fn back_buffer_desc_matches_device() {
 #[test]
 fn stretch_rect_accepts_one_to_one_same_format() {
     // StretchRect is accepted for a 1:1 same-format blit between a render-target
-    // texture surface and the backbuffer (both BGRA8). The blit itself lands as
-    // a per-pass leading blit; its pixel timing is exercised by the in-game
-    // water/portrait paths rather than this synthetic single-frame flow.
+    // texture surface and the backbuffer (both BGRA8), and the copy carries the
+    // source's content: a clear-only pass whose target is then copied out must
+    // keep its store.
     let h = Harness::new();
     let rt = h.create_texture(
         640,
@@ -391,7 +391,6 @@ fn stretch_rect_accepts_one_to_one_same_format() {
     let rt_surface = rt.surface_level(0);
     let backbuffer = h.render_target(0);
 
-    // Give the RT real content first (a clear-only pass can be dropped on TBDR).
     assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
     assert_eq!(h.clear_target(RED), 0, "clear RT red");
     assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
@@ -400,6 +399,11 @@ fn stretch_rect_accepts_one_to_one_same_format() {
         h.stretch_rect(&rt_surface, &backbuffer, D3DTEXF_NONE),
         0,
         "1:1 same-format StretchRect is accepted",
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "the copy carries the cleared colour into the backbuffer"
     );
 }
 
@@ -805,11 +809,8 @@ fn render_to_default_pool_target_round_trips() {
     // the readback blit both resolve via metal_color_handle. Metal validation is on
     // under `make test`, so a malformed RT attachment would abort the draw.
     //
-    // The blit's *pixel* contents are not asserted: nothing inside the frame
-    // samples the offscreen RT, so the load/store optimiser culls its colour
-    // store (the post-flush GetRenderTargetData blit is invisible to it). Pixel
-    // round-trips through a drawn-into offscreen RT need that store preserved — a
-    // separate optimiser change. Here we assert the API contract.
+    // Nothing inside the frame samples the offscreen RT, so only the read-back
+    // note keeps its colour store; the pixel assert at the end pins that.
     const TEAL: u32 = 0xFF00_8080;
     let h = Harness::new();
     // Capture the implicit backbuffer so we can restore RT0 before `rt` drops.
@@ -859,37 +860,158 @@ fn render_to_default_pool_target_round_trips() {
     // retaining a dangling pointer to `rt` after it drops.
     assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer RT");
 
-    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
     assert_eq!(
-        h.get_render_target_data_hr(&rt, &sysmem),
-        0,
-        "GetRenderTargetData DEFAULT RT → SYSTEMMEM",
+        read_surface_pixel(&h, &rt, 32, 32),
+        TEAL,
+        "the drawn-into DEFAULT RT reads back its fill colour"
     );
 }
 
 #[test]
 fn stretch_rect_between_default_pool_targets() {
-    // 1:1 same-format StretchRect is accepted between two DEFAULT render targets,
-    // and the destination is then a valid GetRenderTargetData source — i.e. a
-    // standalone color surface works as both StretchRect src and dst. Pixel
-    // timing of a synthetic single-frame StretchRect is unreliable on TBDR (see
-    // stretch_rect_accepts_one_to_one_same_format), so this asserts the API
-    // contract, not the propagated colour.
+    // 1:1 same-format StretchRect between two DEFAULT render targets: a
+    // standalone colour surface works as both src and dst, and a Clear issued
+    // on the source right before the copy lands first, as D3D9 ordered it.
     let h = Harness::new();
+    let bb = h.render_target(0);
 
     let src = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
     let dst = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &src), 0, "bind src");
+    assert_eq!(h.clear_target(GREEN), 0, "clear src green");
     assert_eq!(
         h.stretch_rect(&src, &dst, D3DTEXF_NONE),
         0,
         "1:1 same-format StretchRect between DEFAULT RTs",
     );
-
-    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
     assert_eq!(
-        h.get_render_target_data_hr(&dst, &sysmem),
+        read_surface_pixel(&h, &dst, 32, 32),
+        GREEN,
+        "the copy reads the source after its pending clear"
+    );
+}
+
+/// Read one pixel of `surface` as `0xAARRGGBB` through `GetRenderTargetData`.
+fn read_surface_pixel(h: &Harness, surface: &mtld3d_tests::Surface<'_>, x: u32, y: u32) -> u32 {
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, 0, "GetDesc for read_surface_pixel");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(surface, &sysmem),
         0,
-        "GetRenderTargetData DEFAULT-RT dst → SYSTEMMEM",
+        "GetRenderTargetData for read_surface_pixel"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_px + x) as usize;
+    locked.as_u32(idx + 1)[idx]
+}
+
+/// Draw a full-target triangle in `color` through the diffuse channel.
+fn draw_fill(h: &Harness, color: u32) {
+    // Lighting defaults on and would replace the diffuse with black.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "fill draw"
+    );
+}
+
+#[test]
+fn stretch_rect_from_rendered_target_survives_present() {
+    // Render into an offscreen RT, copy it to the backbuffer, Present. Nothing
+    // samples the RT, so its last-use store is the optimiser's to elide; the
+    // copy reads it from device memory after the pass, so the store must
+    // stay. Observed on the next frame, which only reads the persistent
+    // backbuffer back.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_render_target(640, 480, D3DFMT_A8R8G8B8);
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, GREEN);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(
+        h.stretch_rect(&rt, &bb, D3DTEXF_NONE),
+        0,
+        "StretchRect RT -> backbuffer"
+    );
+    assert_eq!(h.present(), 0, "Present");
+
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the backbuffer holds the RT's rendered content after Present"
+    );
+}
+
+#[test]
+fn stretch_rect_into_a_target_with_a_pending_clear_keeps_the_copy() {
+    // Clear(backbuffer) with no pass open, then copy a rendered RT into the
+    // backbuffer: D3D9 ordered the clear first, so the copy wins.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_render_target(640, 480, D3DFMT_A8R8G8B8);
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, GREEN);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(
+        h.stretch_rect(&rt, &bb, D3DTEXF_NONE),
+        0,
+        "StretchRect RT -> backbuffer"
+    );
+
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the copy lands after the backbuffer clear"
     );
 }
 

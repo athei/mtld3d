@@ -2173,12 +2173,22 @@ impl FrameEncoder {
 
     /// Queue a `StretchRect` blit to run before the *next* pass.
     ///
-    /// Caller must `end_current_pass()` first so the blit is correctly
-    /// ordered between the just-ended pass's draws and the next pass's
-    /// draws. If no further pass opens this frame, `submit` synthesises
-    /// a trailing blit-only `PassDescriptor` to drain it.
+    /// Caller must `flush_pending_clears()` and `end_current_pass()` first so
+    /// the blit is correctly ordered after a `Clear` still waiting for a pass
+    /// and between the just-ended pass's draws and the next pass's draws. If
+    /// no further pass opens this frame, `submit` synthesises a trailing
+    /// blit-only `PassDescriptor` to drain it.
     pub fn push_stretch_rect_blit(&mut self, blit: BlitCommand) {
         self.pass_state.push_pending_leading_blit(blit);
+    }
+
+    /// Materialize any pending clears as a pass on the current attachments.
+    ///
+    /// A `Clear` issued with no pass open waits for the next pass's load
+    /// action; a blit queued in between would otherwise run before it and
+    /// either read the pre-clear source or be wiped by the clear.
+    pub fn flush_pending_clears(&mut self) {
+        self.pass_state.flush_pending_clears();
     }
 
     pub fn set_color_render_target(
