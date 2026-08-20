@@ -15,9 +15,11 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::Hasher,
     sync::{LazyLock, Mutex},
+    time::Instant,
 };
 
 use log::{Level, debug, error, log_enabled, trace, warn};
+use mtld3d_core::perf::DeviceSubCategory;
 use mtld3d_shared::InPtr;
 use mtld3d_types::{
     D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO, IDirect3DSurface9Vtbl, POINT,
@@ -25,7 +27,7 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL,
-    device::{DeviceInner, Direct3DDevice9},
+    device::{DeviceInner, Direct3DDevice9, device_timer},
     fullscreen::set_window_long_ptr,
 };
 
@@ -73,6 +75,26 @@ fn set_cursor(handle: *mut c_void) {
     unsafe {
         SetCursor(handle);
     }
+}
+
+/// `set_cursor` plus its wall time in microseconds.
+///
+/// The Win32 cursor calls can stall the calling thread on Wine's Cocoa
+/// main thread: `SetCursorPos` and an idle `GetCursorPos` (no pointer
+/// change for 100 ms) go through a synchronous `OnMainThread`, and
+/// `SetCursor` is a wineserver round trip. Every cursor log line carries
+/// the microseconds its calls took, so a frame hitch around a cursor
+/// transition can be attributed to, or cleared of, these calls from a
+/// `RUST_LOG=mtld3d::d3d9::cursor=debug` log alone.
+fn timed_set_cursor(handle: *mut c_void) -> u64 {
+    let started = Instant::now();
+    set_cursor(handle);
+    elapsed_us(started)
+}
+
+/// Microseconds since `started`, saturating.
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn set_cursor_pos(x: i32, y: i32) {
@@ -387,6 +409,7 @@ pub extern "system" fn device_set_cursor_properties(
     y_hotspot: u32,
     cursor_bitmap: *mut c_void,
 ) -> i32 {
+    let _timer = device_timer(this, DeviceSubCategory::Misc);
     if cursor_bitmap.is_null() {
         warn!(target: LOG_TARGET, "reject SetCursorProperties(null bitmap) → INVALIDCALL");
         return D3DERR_INVALIDCALL;
@@ -502,41 +525,53 @@ pub extern "system" fn device_set_cursor_properties(
     cur.hash = hash;
     cur.handle = handle;
     let visible = cur.effective_visible();
-    debug!(
-        target: LOG_TARGET,
-        "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} cache_entries={} tid={}",
-        desc.format, desc.pool, cur.cache.len(), current_thread_id(),
-    );
     // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
     // While hidden the game owns the win32 cursor — pushing null here clobbers
     // the cursor the game's own wndproc set (WoW's login screen never calls
     // ShowCursor(TRUE); its glove is the game's own cursor).
-    if visible {
-        set_cursor(handle);
-    }
+    // `set_cursor_us` is 0 when nothing was realized.
+    let set_cursor_us = if visible { timed_set_cursor(handle) } else { 0 };
+    debug!(
+        target: LOG_TARGET,
+        "SetCursorProperties: {width}x{height} fmt={} pool={} hotspot=({x_hotspot},{y_hotspot}) hash={hash:#018x} outcome={outcome} handle={handle:p} visible={visible} set_cursor_us={set_cursor_us} cache_entries={} tid={}",
+        desc.format, desc.pool, cur.cache.len(), current_thread_id(),
+    );
     D3D_OK
 }
 
-pub extern "system" fn device_set_cursor_position(_this: *mut c_void, x: i32, y: i32, _flags: u32) {
+pub extern "system" fn device_set_cursor_position(this: *mut c_void, x: i32, y: i32, _flags: u32) {
+    let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // The pre-check earns its keep: a `SetCursorPos` to the current position
+    // still queues a `WM_MOUSEMOVE`, so skipping it keeps the game's message
+    // queue quiet. Its cost is the idle `GetCursorPos` main-thread hop
+    // described on `timed_set_cursor`, hence the timing.
+    let started = Instant::now();
     let current = get_cursor_pos();
+    let get_us = elapsed_us(started);
     let suppress = current.is_some_and(|p| p.x == x && p.y == y);
     if suppress {
-        debug!(target: LOG_TARGET, "SetCursorPosition: noop ({x},{y})");
+        debug!(target: LOG_TARGET, "SetCursorPosition: noop ({x},{y}) get_us={get_us}");
         return;
     }
+    let started = Instant::now();
+    set_cursor_pos(x, y);
+    let set_us = elapsed_us(started);
     if let Some(p) = current {
         debug!(
             target: LOG_TARGET,
-            "SetCursorPosition: ({},{}) → ({x},{y}) dx={} dy={}",
+            "SetCursorPosition: ({},{}) → ({x},{y}) dx={} dy={} get_us={get_us} set_us={set_us}",
             p.x, p.y, x - p.x, y - p.y,
         );
     } else {
-        debug!(target: LOG_TARGET, "SetCursorPosition: → ({x},{y}) got_current=none");
+        debug!(
+            target: LOG_TARGET,
+            "SetCursorPosition: → ({x},{y}) got_current=none get_us={get_us} set_us={set_us}",
+        );
     }
-    set_cursor_pos(x, y);
 }
 
 pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
+    let _timer = device_timer(this, DeviceSubCategory::Misc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -580,17 +615,17 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     // WM_SETCURSOR branch below, or the pointer re-entering the window gets
     // through.
     let handle = if next { cur.handle } else { null_mut() };
-    set_cursor(handle);
+    let set_cursor_us = timed_set_cursor(handle);
     if prev == next {
         trace!(
             target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} handle={handle:p} tid={} (re-assert)",
+            "ShowCursor(show={show}) → prev={prev} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (re-assert)",
             current_thread_id(),
         );
     } else {
         debug!(
             target: LOG_TARGET,
-            "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} tid={} (transition)",
+            "ShowCursor(show={show}) → prev={prev} next={next} handle={handle:p} set_cursor_us={set_cursor_us} tid={} (transition)",
             current_thread_id(),
         );
     }
@@ -631,6 +666,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // WM_SETCURSOR): the game shows its own cursor — WoW's login
             // screen never calls ShowCursor(TRUE) and relies on exactly that.
             let was_dirty = cur.dirty();
+            let started = Instant::now();
             if was_dirty {
                 cur.set_dirty(false);
                 // Null-then-set forces macdrv to drop a lingering native
@@ -638,17 +674,18 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
                 set_cursor(null_mut());
             }
             set_cursor(cur.handle);
+            let set_cursor_us = elapsed_us(started);
             if was_dirty {
                 debug!(
                     target: LOG_TARGET,
-                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=true → re-asserted handle={:p} tid={} → consumed",
+                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=true → re-asserted handle={:p} set_cursor_us={set_cursor_us} tid={} → consumed",
                     cur.handle,
                     current_thread_id(),
                 );
             } else if log_enabled!(target: LOG_TARGET, Level::Trace) {
                 trace!(
                     target: LOG_TARGET,
-                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=false handle={:p} tid={} → consumed",
+                    "wndproc WM_SETCURSOR: hit_test={hit_test:#x} (HTCLIENT) dirty_was=false handle={:p} set_cursor_us={set_cursor_us} tid={} → consumed",
                     cur.handle,
                     current_thread_id(),
                 );
