@@ -1793,8 +1793,8 @@ fn encode_pass(
                         );
                         continue;
                     };
-                    let index_count = (cmd.param_d >> 8) as usize;
-                    let index_type_raw = (cmd.param_d & 0xFF) as u32;
+                    let (index_count, index_type_raw, instance_count) =
+                        Command::unpack_indexed_draw_counts(cmd.param_d);
                     let index_type = match IndexType::from_repr(index_type_raw) {
                         Some(IndexType::UInt16) => MTLIndexType::UInt16,
                         Some(IndexType::UInt32) => MTLIndexType::UInt32,
@@ -1815,16 +1815,16 @@ fn encode_pass(
                     let base_vertex = isize::try_from(base_vertex_u32.cast_signed())
                         .expect("i32 fits isize on 64-bit unix");
                     // SAFETY: objc2 typed binding; `index_buffer` is retained
-                    // for the call; index count/offset come from the PE-side
+                    // for the call; the counts and offset come from the PE-side
                     // packed `param_c`/`param_d` per the wire contract.
                     unsafe {
                         encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
                             prim_type,
-                            index_count,
+                            to_usize(u64::from(index_count)),
                             index_type,
                             &index_buffer,
                             offset,
-                            1,
+                            to_usize(u64::from(instance_count.max(1))),
                             base_vertex,
                             0,
                         );
@@ -1837,8 +1837,8 @@ fn encode_pass(
                         continue;
                     };
                     let byte_len = to_usize(cmd.param_c);
-                    let index_count = (cmd.param_d >> 8) as usize;
-                    let index_type_raw = (cmd.param_d & 0xFF) as u32;
+                    let (index_count, index_type_raw, instance_count) =
+                        Command::unpack_indexed_draw_counts(cmd.param_d);
                     let index_type = match IndexType::from_repr(index_type_raw) {
                         Some(IndexType::UInt16) => MTLIndexType::UInt16,
                         Some(IndexType::UInt32) => MTLIndexType::UInt32,
@@ -1871,16 +1871,15 @@ fn encode_pass(
                         continue;
                     };
                     // SAFETY: objc2 typed binding; `index_buffer` is retained for
-                    // the call; inline UP indices are absolute (base vertex 0,
-                    // single instance).
+                    // the call; inline UP indices are absolute (base vertex 0).
                     unsafe {
                         encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
                             prim_type,
-                            index_count,
+                            to_usize(u64::from(index_count)),
                             index_type,
                             &index_buffer,
                             0,
-                            1,
+                            to_usize(u64::from(instance_count.max(1))),
                             0,
                             0,
                         );

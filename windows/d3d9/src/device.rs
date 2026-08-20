@@ -20,6 +20,7 @@ use mtld3d_core::{
         ApiPerfState, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer, DeviceSubCategory,
         KeysGate,
     },
+    streams::validate_stream_freq,
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
@@ -70,8 +71,8 @@ use super::{
     draw::{
         AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DepthScissorFlags, DepthStencilFlags,
         DrawOp, IndexSource, PsSource, PsSourcePtr, RenderStatePtr, RenderStateSnapshot,
-        ScratchSlice, StageBinding, VertexSource, VsSource, VsSourcePtr, arena_alloc_bytes,
-        build_alpha_ref_bytes, bump_packed_stage_bindings,
+        ScratchSlice, StageBinding, StreamBinding, VertexSource, VsSource, VsSourcePtr,
+        arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
     },
     encoder::{
         BlitSide, EncoderThread, FrameData, FrameEncoder, FrameInit, Op, StagingWarmupEntry,
@@ -582,7 +583,7 @@ pub struct DeviceInner {
     /// Covers every frame this device has rotated through `stamp_and_swap`.
     /// Used to pre-reserve the new frame's ops Vec so steady-state and
     /// post-burst frames never pay a realloc. Monotonically grows;
-    /// memory cost = peak × `size_of::<Op>()` (~72 B).
+    /// memory cost = peak × `size_of::<Op>()`.
     peak_ops_count: usize,
 }
 
@@ -7755,43 +7756,81 @@ extern "system" fn device_draw_indexed_primitive(
 /// CPU writes are flushed here. The lock stays open and `dirty` stays set, so
 /// `Unlock` still flushes afterwards.
 fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
-    let vb = dev.bound_buffers().vertex_buffer();
-    let ib = dev.bound_buffers().index_buffer();
-    if !vb.is_null() {
-        // SAFETY: a bound vertex buffer is a live wrapper while bound.
-        unsafe { (*vb).inner_mut() }.flush_staged_if_mapped(dev);
+    for stream in 0..mtld3d_types::MAX_STREAMS as usize {
+        let vb = dev.bound_buffers().stream_vertex_buffer(stream);
+        if !vb.is_null() {
+            // SAFETY: a bound vertex buffer is a live wrapper while bound.
+            unsafe { (*vb).inner_mut() }.flush_staged_if_mapped(dev);
+        }
     }
+    let ib = dev.bound_buffers().index_buffer();
     if !ib.is_null() {
         // SAFETY: a bound index buffer is a live wrapper while bound.
         unsafe { (*ib).inner_mut() }.flush_staged_if_mapped(dev);
     }
 }
 
-/// Snapshot the bound vertex buffer into `VertexSource::Bound`.
+/// Snapshot the bound vertex streams the declaration reads into `VertexSource::Bound`.
 ///
-/// Stamps the current submit seq so the retention pipeline keeps the `PageBox`
-/// alive until that seq retires. Runs on the API thread.
+/// Only streams the bound declaration names are snapshotted (an implicit
+/// FVF declaration names stream 0 alone), so a single-stream draw pays for
+/// one binding. Each bound stream is stamped with the current submit seq so
+/// the retention pipeline keeps its `PageBox` alive until that seq retires; a
+/// named stream with nothing bound is left out and reads zeros at draw time.
+/// `None` when no named stream has a buffer. Runs on the API thread.
 fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
-    let ptr = dev.bound_buffers().vertex_buffer();
-    if ptr.is_null() {
+    let decl_ptr = dev.vertex_decl();
+    let decl_mask = if decl_ptr.is_null() {
+        1
+    } else {
+        // SAFETY: non-null; the device slot's refcount keeps the declaration
+        // alive while bound.
+        unsafe { &*decl_ptr }.inner().stream_mask()
+    };
+    let bound = dev.bound_buffers();
+    let mut mask = decl_mask & bound.bound_mask();
+    if mask == 0 {
         return None;
     }
-    let offset = dev.bound_buffers().vb_offset();
-    let stride = dev.bound_buffers().vb_stride();
     let seq = dev.current_seq();
-    // SAFETY: `ptr` is non-null (checked above) and points to a live
-    // `Direct3DVertexBuffer9` whose refcount keeps it alive while bound
+    let mut first: Option<StreamBinding> = None;
+    let mut extra = Vec::new();
+    while mask != 0 {
+        let stream = mask.trailing_zeros();
+        mask &= mask - 1;
+        let binding = snapshot_stream_binding(bound, stream, seq);
+        if first.is_none() {
+            first = Some(binding);
+        } else {
+            extra.push(binding);
+        }
+    }
+    Some(VertexSource::Bound {
+        first: first?,
+        extra: extra.into_boxed_slice(),
+        stream0_freq: bound.stream_freq(0),
+    })
+}
+
+/// Snapshot one bound stream, stamping its buffer with `seq`.
+fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> StreamBinding {
+    let s = stream as usize;
+    let ptr = bound.stream_vertex_buffer(s);
+    // SAFETY: the caller selected `stream` from the bound mask, so `ptr` is a
+    // live `Direct3DVertexBuffer9` whose refcount keeps it alive while bound
     // on the device.
     let vb = unsafe { &mut *ptr };
     let inner = vb.inner_mut();
     inner.stamp_submit_seq(seq);
-    Some(VertexSource::Bound {
+    StreamBinding {
+        stream: u8::try_from(stream).expect("stream index below MAX_STREAMS"),
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
-        offset,
-        stride,
-    })
+        offset: bound.stream_offset(s),
+        stride: bound.stream_stride(s),
+        freq: bound.stream_freq(s),
+    }
 }
 
 /// Snapshot the bound index buffer into `IndexSource::Bound`.
@@ -8069,7 +8108,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
         let fvf = dev.fvf;
         let decl_ptr = dev.vertex_decl();
-        let (attrs_vec, stride, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
+        let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
             let (elements, _fvf_stride) = fvf_to_elements(fvf);
             // `fvf == 0` only when the format came from SetVertexDeclaration
             // (SetFVF always carries D3DFVF_XYZ); a real declaration reads 0
@@ -8078,42 +8117,42 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
             // D3D9 runs the FF pre-transformed path regardless, even when a
             // VS is still bound — so the attrs must resolve for the FF VS too.
-            let (attrs, stride) = if bound_vertex_shader.is_null() || layout.has_rhw() {
+            let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
                 resolve_attrs_for_ff(&elements)
             } else {
                 // SAFETY: non-null check passed; refcount holds it live.
                 let vs_obj = unsafe { &*bound_vertex_shader };
                 resolve_attrs_for_vs(&elements, vs_obj.input_semantics())
             };
-            (attrs, stride, u64::from(fvf), layout)
+            (resolved, u64::from(fvf), layout)
         } else {
             // SAFETY: non-null check passed; refcount holds it live.
             let decl = unsafe { &*decl_ptr };
             let elements = decl.inner().elements();
             let layout = convert::ff_vs_layout_from_elements(elements, fvf == 0);
             // See the FVF arm: POSITIONT bypasses a bound VS.
-            let (attrs, stride) = if bound_vertex_shader.is_null() || layout.has_rhw() {
+            let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
                 resolve_attrs_for_ff(elements)
             } else {
                 // SAFETY: see above.
                 let vs_obj = unsafe { &*bound_vertex_shader };
                 resolve_attrs_for_vs(elements, vs_obj.input_semantics())
             };
-            (attrs, stride, decl.inner().hash(), layout)
+            (resolved, decl.inner().hash(), layout)
         };
         dev.cached_ff_vs_layout = ff_vs_layout;
         // Which VS input registers the declaration backs — folded into a
         // programmable VsSource so a shader reading an unprovided input gets a
         // distinct zero-filled variant. For the FF
         // path the value is unused.
-        dev.cached_vs_provided_mask = attrs_vec.iter().fold(0u16, |m, a| {
+        dev.cached_vs_provided_mask = resolved.attrs.iter().fold(0u16, |m, a| {
             if a.attr_index < 16 {
                 m | (1u16 << a.attr_index)
             } else {
                 m
             }
         });
-        Some((attrs_vec, stride, vdecl_hash))
+        Some((resolved, vdecl_hash))
     } else {
         None
     };
@@ -8573,13 +8612,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let ptr = unsafe { bump_packed_stage_bindings(scratch, packed_mask, prefix) };
         dev.snapshot_cache.stage_bindings = Some(ptr);
     }
-    if let Some((attrs_vec, stride, vdecl_hash)) = vdecl_value {
-        let (raw_ptr, len) = scratch.alloc_slice(&attrs_vec);
+    if let Some((resolved, vdecl_hash)) = vdecl_value {
+        let (raw_ptr, len) = scratch.alloc_slice(&resolved.attrs);
         let ptr = NonNull::new(raw_ptr).expect("ScratchArena alloc_slice returned non-null");
         dev.snapshot_cache.attrs = Some(AttrSnapshot {
             ptr,
             len,
-            stride,
+            extents: resolved.extents,
+            used_streams: resolved.used_streams,
             vdecl_hash,
         });
     }
@@ -9565,18 +9605,15 @@ extern "system" fn device_set_stream_source(
     let dev = obj.inner();
     let vb = data.cast::<Direct3DVertexBuffer9>();
     if let Some(rec) = dev.recording_state_block_mut() {
-        if stream == 0 {
-            // SAFETY: `vb` is null or a *mut Direct3DVertexBuffer9 supplied by
-            // the calling game via SetStreamSource.
-            let adopted = unsafe { CachedComPtr::adopt(vb) };
-            rec.record(StateOp::StreamSource {
-                vb: adopted,
-                offset,
-                stride,
-            });
-        }
-        // Streams > 0 are not captured by state blocks (single-stream
-        // architecture; the multi-stream capture cluster is by design absent).
+        // SAFETY: `vb` is null or a *mut Direct3DVertexBuffer9 supplied by
+        // the calling game via SetStreamSource.
+        let adopted = unsafe { CachedComPtr::adopt(vb) };
+        rec.record(StateOp::StreamSource {
+            stream,
+            vb: adopted,
+            offset,
+            stride,
+        });
         return D3D_OK;
     }
     dev.bound_buffers_mut()
@@ -9600,10 +9637,10 @@ extern "system" fn device_get_stream_source(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // Streams 0..MAX round-trip their binding (only stream 0 is rendered); a
-    // caller that binds a higher stream and reads it back — relying on the
-    // binding outliving its own Release — sees the buffer. An out-of-range
-    // stream is unbound → NULL/0 per the "nothing bound" contract (S_OK).
+    // Streams 0..MAX round-trip their binding; a caller that binds a stream
+    // and reads it back — relying on the binding outliving its own Release —
+    // sees the buffer. An out-of-range stream is unbound → NULL/0 per the
+    // "nothing bound" contract (S_OK).
     let (vb_ptr, offset, vb_stride) = if stream < mtld3d_types::MAX_STREAMS {
         let b = dev.bound_buffers();
         (
@@ -9638,22 +9675,51 @@ extern "system" fn device_get_stream_source(
 
 extern "system" fn device_set_stream_source_freq(
     this: *mut c_void,
-    _stream: u32,
-    _setting: u32,
+    stream: u32,
+    setting: u32,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Buffer);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::SetStreamSourceFreq → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    if let Err(reason) = validate_stream_freq(stream, setting) {
+        // A rejected call leaves the stored frequency untouched.
+        warn!(
+            target: LOG_TARGET,
+            "reject SetStreamSourceFreq(stream={stream}, setting={setting:#x}) → INVALIDCALL ({reason:?})"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let dev = obj.inner();
+    if let Some(rec) = dev.recording_state_block_mut() {
+        rec.record(StateOp::StreamSourceFreq { stream, setting });
+        return D3D_OK;
+    }
+    dev.bound_buffers_mut()
+        .set_stream_freq(stream as usize, setting);
+    D3D_OK
 }
 
 extern "system" fn device_get_stream_source_freq(
     this: *mut c_void,
-    _stream: u32,
-    _setting: *mut u32,
+    stream: u32,
+    setting: *mut u32,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Buffer);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::GetStreamSourceFreq → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    if setting.is_null() || stream >= mtld3d_types::MAX_STREAMS {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // The raw word round-trips, flags included.
+    let value = obj.inner().bound_buffers().stream_freq(stream as usize);
+    // SAFETY: `setting` is non-null (checked) and per the D3D9 ABI points to a
+    // writable `u32` slot owned by the caller.
+    unsafe { *setting = value };
+    D3D_OK
 }
 
 extern "system" fn device_set_indices(this: *mut c_void, index_data: *mut c_void) -> i32 {

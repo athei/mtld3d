@@ -27,6 +27,7 @@
 
 use std::fmt::Write;
 
+use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
@@ -100,12 +101,9 @@ bitflags::bitflags! {
         /// key build: only set when lighting + specular are both on, so draws
         /// that never read V don't fork variants.
         const LOCAL_VIEWER = 1 << 9;
-        /// A COLOR0 (diffuse) element is declared on a non-zero, *unbound* stream.
-        ///
-        /// The descriptor drops it. The vertex reads 0 from the unbound
-        /// stream, so the unlit FF VS outputs black for diffuse — NOT the
-        /// white material default it uses when diffuse is entirely absent.
-        const DIFFUSE_DECLARED_UNBOUND = 1 << 10;
+        // Bit 10 was DIFFUSE_DECLARED_UNBOUND: a COLOR0 on a stream nothing
+        // feeds now reaches the shader as zeros through the stream's
+        // constant layout, so the plain HAS_COLOR0 path covers it.
         /// The vertex format came from `SetVertexDeclaration`, not `SetFVF`.
         ///
         /// A COLORVERTEX material source pointing at a vertex colour the
@@ -227,11 +225,6 @@ impl FfVsKey {
     #[must_use]
     pub const fn has_color1(&self) -> bool {
         self.flags.contains(FfVsFlags::HAS_COLOR1)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn has_diffuse_declared_unbound(&self) -> bool {
-        self.flags.contains(FfVsFlags::DIFFUSE_DECLARED_UNBOUND)
     }
     #[inline]
     #[must_use]
@@ -637,13 +630,19 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey) {
 fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     let _ = writeln!(out, "vertex Varyings {entry}(");
     out.push_str("    VertexIn in [[stage_in]],\n");
-    out.push_str("    constant float4 *vs_c [[buffer(15)]],\n");
-    // Half-pixel rasterization fixup uniform (VS buffer 13): `(1/vp_w,
-    // -1/vp_h, 0, 0)`, supplied per-draw by the encoder from the live
-    // viewport. Read by the transformed-position epilogue below (the XYZRHW
-    // branch folds the same offset into `ndc_x`/`ndc_y` directly). Vertex
-    // buffer 13 is free — the FF VS uses only slots 0 (stream) and 15 (vs_c).
-    out.push_str("    constant float4 &pos_fixup [[buffer(13)]]\n");
+    let _ = writeln!(
+        out,
+        "    constant float4 *vs_c [[buffer({VS_FLOAT_CONST_SLOT})]],"
+    );
+    // Half-pixel rasterization fixup uniform: `(1/vp_w, -1/vp_h, 0, 0)`,
+    // supplied per-draw by the encoder from the live viewport. Read by the
+    // transformed-position epilogue below (the XYZRHW branch folds the same
+    // offset into `ndc_x`/`ndc_y` directly). The uniform slots sit above the
+    // sixteen vertex-stream slots, so no app stream can collide with them.
+    let _ = writeln!(
+        out,
+        "    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+    );
     out.push_str(") {\n");
     out.push_str("    Varyings out;\n");
     // FF VS doesn't currently expose PSIZE in the FVF decoder (caps
@@ -686,8 +685,6 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
 
         if vs.has_color0() {
             out.push_str("    out.color0 = in.v2;\n");
-        } else if vs.has_diffuse_declared_unbound() {
-            out.push_str("    out.color0 = float4(0.0);\n");
         } else {
             out.push_str("    out.color0 = float4(1.0);\n");
         }
@@ -993,10 +990,6 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     } else {
         if vs.has_color0() {
             out.push_str("    out.color0 = in.v2;\n");
-        } else if vs.has_diffuse_declared_unbound() {
-            // DIFFUSE declared on an unbound (non-stream-0) source reads 0,
-            // not the white material default used when diffuse is absent.
-            out.push_str("    out.color0 = float4(0.0);\n");
         } else {
             // A missing DIFFUSE stream reads opaque white in FF — the
             // same default the XYZRHW branch uses. Material diffuse is

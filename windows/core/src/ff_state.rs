@@ -1668,10 +1668,6 @@ fn build_vs_flags(
     let mut flags = FfVsFlags::empty();
     flags.set(FfVsFlags::HAS_NORMAL, layout.has_normal());
     flags.set(FfVsFlags::HAS_COLOR0, layout.has_color0());
-    flags.set(
-        FfVsFlags::DIFFUSE_DECLARED_UNBOUND,
-        layout.has_diffuse_declared_unbound(),
-    );
     flags.set(FfVsFlags::USES_VERTEX_DECL, layout.uses_vertex_decl());
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);

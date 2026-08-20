@@ -23,7 +23,7 @@ use log::warn;
 use mtld3d_core::ff_state::FfStateSnapshot;
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
-    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl,
+    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
     RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, StateBlockType,
 };
 
@@ -100,14 +100,16 @@ pub enum StateOp {
         values: Vec<[f32; 4]>,
     },
     StreamSource {
+        stream: u32,
         /// Null for SetStreamSource(stream, NULL, ..).
-        ///
-        /// Only stream 0 reaches the recorder — the live setter stores
-        /// higher streams for the Get round-trip, but state blocks do not
-        /// capture them (single-stream architecture).
         vb: CachedComPtr<Direct3DVertexBuffer9>,
         offset: u32,
         stride: u32,
+    },
+    StreamSourceFreq {
+        stream: u32,
+        /// Raw `SetStreamSourceFreq` word, already validated by the setter.
+        setting: u32,
     },
     Indices(CachedComPtr<Direct3DIndexBuffer9>),
     PixelShader(CachedComPtr<Direct3DPixelShader9>),
@@ -248,14 +250,23 @@ impl RecordingStateBlock {
                         values[..end - s].copy_from_slice(&copy[s..end]);
                     }
                 }
-                StateOp::StreamSource { vb, offset, stride } => {
-                    let live = dev.bound_buffers().vertex_buffer();
+                StateOp::StreamSource {
+                    stream,
+                    vb,
+                    offset,
+                    stride,
+                } => {
+                    let s = *stream as usize;
+                    let live = dev.bound_buffers().stream_vertex_buffer(s);
                     if vb.raw() != live {
                         // SAFETY: `live` from device's bound vertex-buffer slot.
                         *vb = unsafe { CachedComPtr::adopt(live) };
                     }
-                    *offset = dev.bound_buffers().vb_offset();
-                    *stride = dev.bound_buffers().vb_stride();
+                    *offset = dev.bound_buffers().stream_offset(s);
+                    *stride = dev.bound_buffers().stream_stride(s);
+                }
+                StateOp::StreamSourceFreq { stream, setting } => {
+                    *setting = dev.bound_buffers().stream_freq(*stream as usize);
                 }
                 StateOp::Indices(cur) => {
                     let live = dev.bound_buffers().index_buffer();
@@ -381,9 +392,22 @@ impl RecordingStateBlock {
                     dev.shader_bindings_mut().write_vs_constants(*start, values);
                     crate::device::propagate_vs_const_delta(dev, *start, values);
                 }
-                StateOp::StreamSource { vb, offset, stride } => {
+                StateOp::StreamSource {
+                    stream,
+                    vb,
+                    offset,
+                    stride,
+                } => {
+                    dev.bound_buffers_mut().set_stream(
+                        *stream as usize,
+                        vb.raw(),
+                        *offset,
+                        *stride,
+                    );
+                }
+                StateOp::StreamSourceFreq { stream, setting } => {
                     dev.bound_buffers_mut()
-                        .replace_vertex_buffer(vb.raw(), *offset, *stride);
+                        .set_stream_freq(*stream as usize, *setting);
                 }
                 StateOp::Indices(ib) => {
                     dev.bound_buffers_mut().replace_index_buffer(ib.raw());
@@ -514,12 +538,26 @@ struct StateSnapshot {
     /// snapshot keeps the object alive even after the app releases its ref.
     bound_vertex_decl: CachedComPtr<Direct3DVertexDeclaration9>,
     bound_index_buffer: CachedComPtr<Direct3DIndexBuffer9>,
+    /// Every vertex stream's binding and frequency, indexed by stream.
+    ///
+    /// Same ownership as the index buffer. Restored by `D3DSBT_ALL` only:
+    /// stream sources and frequencies belong to neither the vertex nor the
+    /// pixel state group.
+    streams: [StreamSnapshot; MAX_STREAMS as usize],
     vs_constants: Box<[[f32; 4]; 256]>,
     ps_constants: Box<[[f32; 4]; 256]>,
     vs_constants_i: Box<[[i32; 4]; INT_CONSTANT_ROWS]>,
     vs_constants_b: Box<[i32; BOOL_CONSTANT_COUNT]>,
     ps_constants_i: Box<[[i32; 4]; INT_CONSTANT_ROWS]>,
     ps_constants_b: Box<[i32; BOOL_CONSTANT_COUNT]>,
+}
+
+/// One vertex stream as a `D3DSBT_ALL` snapshot captures it.
+struct StreamSnapshot {
+    vb: CachedComPtr<Direct3DVertexBuffer9>,
+    offset: u32,
+    stride: u32,
+    freq: u32,
 }
 
 impl StateSnapshot {
@@ -529,6 +567,17 @@ impl StateSnapshot {
             // SAFETY: `ptr` comes from the device's stage-binding slot,
             // which is null or a live IDirect3DTexture9.
             unsafe { CachedComPtr::adopt(ptr) }
+        });
+        let streams = core::array::from_fn(|s| {
+            let bound = dev.bound_buffers();
+            StreamSnapshot {
+                // SAFETY: `ptr` comes from the device's stream slot, which is
+                // null or a live IDirect3DVertexBuffer9.
+                vb: unsafe { CachedComPtr::adopt(bound.stream_vertex_buffer(s)) },
+                offset: bound.stream_offset(s),
+                stride: bound.stream_stride(s),
+                freq: bound.stream_freq(s),
+            }
         });
         // SAFETY: `vs` from device's vertex-shader slot.
         let bound_vertex_shader =
@@ -553,6 +602,7 @@ impl StateSnapshot {
             bound_pixel_shader,
             bound_vertex_decl,
             bound_index_buffer,
+            streams,
             vs_constants: Box::new(dev.shader_bindings().vs_constants_copy()),
             ps_constants: Box::new(dev.shader_bindings().ps_constants_copy()),
             vs_constants_i: Box::new(dev.shader_bindings().vs_constants_i_copy()),
@@ -625,14 +675,18 @@ impl StateSnapshot {
                 .write_ps_constants_b(0, self.ps_constants_b.as_ref());
         }
 
-        // Bound textures + index buffer are D3DSBT_ALL-only — a filtered block
-        // leaves them at their live values.
+        // Bound textures, index buffer and vertex streams are D3DSBT_ALL-only —
+        // a filtered block leaves them at their live values.
         if matches!(block_type, StateBlockType::All) {
             for (i, tex) in self.bound_textures.iter().enumerate() {
                 dev.stage_bindings_mut().replace_texture(i, tex.raw());
             }
-            dev.bound_buffers_mut()
-                .replace_index_buffer(self.bound_index_buffer.raw());
+            let bound = dev.bound_buffers_mut();
+            bound.replace_index_buffer(self.bound_index_buffer.raw());
+            for (s, stream) in self.streams.iter().enumerate() {
+                bound.restore_stream(s, stream.vb.raw(), stream.offset, stream.stride);
+                bound.set_stream_freq(s, stream.freq);
+            }
         }
 
         // Vertex shader + declaration are vertex-pipeline; pixel shader is
@@ -800,7 +854,15 @@ extern "system" fn sb_capture(this: *mut c_void) -> i32 {
             // the next Apply writes back the same slice. Assignment drops the
             // previous snapshot (releases its AddRef'd slots).
             let block_type = snap.block_type;
-            **snap = StateSnapshot::capture_from(dev, device_obj.fvf(), block_type);
+            let mut fresh = StateSnapshot::capture_from(dev, device_obj.fvf(), block_type);
+            // D3D9 keeps the stream offsets a `CreateStateBlock` block captured
+            // at creation: a later `Capture` refreshes the buffer and stride of
+            // each stream but not its offset. Recorded blocks (`BeginStateBlock`)
+            // refresh all three.
+            for (stream, old) in fresh.streams.iter_mut().zip(snap.streams.iter()) {
+                stream.offset = old.offset;
+            }
+            **snap = fresh;
         }
         StateBlockBody::Recorded(rec) => {
             rec.capture_from(dev);

@@ -1,7 +1,7 @@
 //! Vertex/index buffers and buffer-backed draws (`DrawPrimitive` / `DrawIndexedPrimitive`).
 //!
-//! Plus the stream/index getter round-trip and the `SetStreamSourceFreq` stub
-//! contract.
+//! Plus the stream/index getter round-trip. Streams beyond stream 0 and
+//! `SetStreamSourceFreq` are exercised in `streams.rs`.
 
 use mtld3d_tests::{Harness, Vertex};
 use mtld3d_types::{
@@ -204,10 +204,9 @@ fn stream_source_higher_index_roundtrips() {
     let h = Harness::new();
     let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
 
-    // Higher streams (1..max_streams) are accepted and round-trip their binding,
-    // even though only stream 0 is ever rendered. A caller that binds a higher
-    // stream and reads it back — relying on the binding to outlive its own
-    // Release — must see the buffer.
+    // Higher streams (1..max_streams) round-trip their binding. A caller that
+    // binds a higher stream and reads it back — relying on the binding to
+    // outlive its own Release — must see the buffer.
     assert_eq!(
         h.set_stream_source(1, &vb, 8, stride()),
         D3D_OK,
@@ -296,12 +295,5 @@ fn buffer_getters_roundtrip() {
         (offset, stride_out),
         (4, stride()),
         "offset/stride retained across a NULL stream-source bind",
-    );
-
-    // SetStreamSourceFreq remains unimplemented.
-    assert_eq!(
-        h.set_stream_source_freq(0, 1),
-        D3DERR_INVALIDCALL,
-        "SetStreamSourceFreq stub",
     );
 }

@@ -1,7 +1,7 @@
 use log::{debug, error};
 use mtld3d_shared::{
-    CreateRenderPipelineParams, MetalHandle, VertexAttrDesc,
-    mtl::{BlendOperation, VertexFormat},
+    CreateRenderPipelineParams, MetalHandle, VertexAttrDesc, VertexBufferLayoutDesc,
+    mtl::{BlendOperation, VertexFormat, VertexStepFunction},
     mtl_handle::MTLRenderPipelineStateKind,
 };
 use objc2::rc::Retained;
@@ -20,22 +20,26 @@ use crate::{
 ///
 /// The vertex descriptor is caller-supplied. Shader compilation happens
 /// upstream in `compile_shader_library`; this function deals purely with
-/// pipeline state. `vertex_attrs` is reconstructed at the handler boundary
-/// because the FFI struct carries only a raw pointer + length.
+/// pipeline state. `vertex_attrs` and `vertex_layouts` are reconstructed at
+/// the handler boundary because the FFI struct carries only raw pointers +
+/// lengths.
 pub fn create_render_pipeline(
     params: &CreateRenderPipelineParams,
     vertex_attrs: &[VertexAttrDesc],
+    vertex_layouts: &[VertexBufferLayoutDesc],
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
     let device = params.device_handle.into_retained()?;
     let vertex_function = params.vs_fn_handle.into_retained()?;
     let fragment_function = params.ps_fn_handle.into_retained()?;
 
-    // Vertex descriptor: one attribute entry per supplied VertexAttrDesc; a single
-    // buffer layout at index 0 (multi-stream support lands with vertex declarations).
+    // Vertex descriptor: one attribute entry per supplied VertexAttrDesc and
+    // one buffer layout per supplied VertexBufferLayoutDesc. A layout's
+    // `buffer_index` is the D3D9 stream the attributes on it come from; the
+    // PE side never emits an attribute on a buffer it did not lay out.
     //
-    // The six `unsafe` blocks below are all objc2 typed bindings whose
+    // The `unsafe` blocks below are all objc2 typed bindings whose
     // arguments (`attr_index`, `offset`, `buffer_index`, `stride`,
-    // subscript 0) are caller-validated for the vertex descriptor capacity.
+    // `step_rate`) are caller-validated for the vertex descriptor capacity.
     let vertex_desc = MTLVertexDescriptor::new();
     let attrs = vertex_desc.attributes();
     for a in vertex_attrs {
@@ -49,12 +53,16 @@ pub fn create_render_pipeline(
         unsafe { entry.setBufferIndex(a.buffer_index as usize) };
     }
     let buffer_layouts = vertex_desc.layouts();
-    // SAFETY: objc2 typed binding; subscript 0 is always valid on the
-    // buffer-layout array.
-    let buffer0 = unsafe { buffer_layouts.objectAtIndexedSubscript(0) };
-    // SAFETY: objc2 typed binding; pure accessor passthrough.
-    unsafe { buffer0.setStride(params.vertex_stride as usize) };
-    buffer0.setStepFunction(MTLVertexStepFunction::PerVertex);
+    for l in vertex_layouts {
+        // SAFETY: objc2 typed binding; `buffer_index` is a vertex buffer slot
+        // below Metal's 31-entry layout table (PE side keeps streams under 16).
+        let layout = unsafe { buffer_layouts.objectAtIndexedSubscript(l.buffer_index as usize) };
+        // SAFETY: objc2 typed binding; pure accessor passthrough.
+        unsafe { layout.setStride(l.stride as usize) };
+        layout.setStepFunction(mtl_step_function(l.step_function));
+        // SAFETY: objc2 typed binding; pure accessor passthrough.
+        unsafe { layout.setStepRate(l.step_rate as usize) };
+    }
 
     let desc = MTLRenderPipelineDescriptor::new();
     desc.setVertexFunction(Some(&vertex_function));
@@ -168,9 +176,9 @@ pub fn create_render_pipeline(
 
     debug!(
         target: LOG_TARGET,
-        "created render pipeline (attrs={}, stride={}, blend={}, depth={})",
+        "created render pipeline (attrs={}, layouts={}, blend={}, depth={})",
         vertex_attrs.len(),
-        params.vertex_stride,
+        vertex_layouts.len(),
         params.blend_enable,
         params.has_depth != 0
     );
@@ -187,6 +195,14 @@ const fn mtl_blend_op(op: BlendOperation) -> MTLBlendOperation {
         BlendOperation::ReverseSubtract => MTLBlendOperation::ReverseSubtract,
         BlendOperation::Min => MTLBlendOperation::Min,
         BlendOperation::Max => MTLBlendOperation::Max,
+    }
+}
+
+const fn mtl_step_function(wire: VertexStepFunction) -> MTLVertexStepFunction {
+    match wire {
+        VertexStepFunction::Constant => MTLVertexStepFunction::Constant,
+        VertexStepFunction::PerVertex => MTLVertexStepFunction::PerVertex,
+        VertexStepFunction::PerInstance => MTLVertexStepFunction::PerInstance,
     }
 }
 

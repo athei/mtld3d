@@ -54,6 +54,12 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   pre-transformed (RHW), and programmable paths.
 - **All four draw paths**: DrawPrimitive / DrawIndexedPrimitive and both UP
   variants.
+- **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
+  per-stream offsets and strides; a declared stream with nothing bound reads
+  zeros, as on hardware.
+- **Hardware instancing**: `SetStreamSourceFreq` with `INDEXEDDATA` /
+  `INSTANCEDATA`, including per-instance step rates, on the indexed draws
+  (D3D9 never instances a non-indexed draw).
 - **State blocks**: recorded (Begin/End) and D3DSBT_* snapshots.
 - **Queries**: occlusion queries backed by real Metal visibility results; event
   queries.
@@ -135,8 +141,6 @@ and no game depends on them:
   processing, no ProcessVertices, no RegisterSoftwareDevice. HAL on the default
   Metal device is the only device type; multi-adapter setups are not
   enumerated.
-- **Hardware instancing** (SetStreamSourceFreq): the renderer is single-stream
-  by architecture.
 - **Clip-plane application**: SetClipPlane state round-trips but planes are not
   applied on the GPU.
 - **Legacy remnants**: N-patch/RT-patch tessellation, vertex tweening,

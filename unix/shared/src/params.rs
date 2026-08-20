@@ -4,6 +4,7 @@ use super::{
         AddressMode, BlendFactor, BlendOperation, BufferKind, ClearQuadFlags, ColorSpacePolicy,
         ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter, MipFilter, PixelFormat,
         StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
+        VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -288,14 +289,29 @@ pub struct VertexAttrDesc {
     pub format: VertexFormat, // in
 }
 
+/// One vertex buffer layout of a render pipeline: a D3D9 stream the draw reads.
+///
+/// Packed as an array pointed to by `CreateRenderPipelineParams::vertex_layouts_ptr`,
+/// one entry per stream that contributes an attribute. `stride` is never 0
+/// (Metal rejects it for every step function). `step_rate` is the instances
+/// per advance for `PerInstance`, 1 for `PerVertex`, 0 for `Constant`.
+#[repr(C, align(4))]
+pub struct VertexBufferLayoutDesc {
+    pub buffer_index: u32, // in: Metal vertex buffer slot (= D3D9 stream)
+    pub stride: u32,       // in: bytes per step
+    pub step_function: VertexStepFunction, // in
+    pub step_rate: u32,    // in
+}
+
 #[repr(C, align(8))]
 pub struct CreateRenderPipelineParams {
     pub device_handle: MetalHandle<MTLDeviceKind>,  // in
     pub vs_fn_handle: MetalHandle<MTLFunctionKind>, // in
     pub ps_fn_handle: MetalHandle<MTLFunctionKind>, // in
     pub vertex_attrs_ptr: u64,                      // in: *const VertexAttrDesc
+    pub vertex_layouts_ptr: u64,                    // in: *const VertexBufferLayoutDesc
     pub vertex_attr_count: u32,                     // in
-    pub vertex_stride: u32,                         // in: bytes per vertex on buffer 0
+    pub vertex_layout_count: u32,                   // in
     pub blend_enable: u32,                          // in: non-zero = enabled
     pub src_blend: BlendFactor,                     // in: source RGB
     pub dst_blend: BlendFactor,                     // in: dest RGB

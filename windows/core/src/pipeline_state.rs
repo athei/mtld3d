@@ -13,9 +13,11 @@
 
 use mtld3d_shared::{
     CreateRenderPipelineParams, ExtraColorAttachmentParams, MetalHandle, VertexAttrDesc,
-    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat},
+    VertexBufferLayoutDesc,
+    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
     mtl_handle::MTLFunctionKind,
 };
+use mtld3d_types::MAX_STREAMS;
 
 use crate::convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask};
 
@@ -181,7 +183,12 @@ pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
     pub ps_fn: MetalHandle<MTLFunctionKind>,
     pub vdecl_hash: u64,
-    pub vertex_stride: u32,
+    /// Vertex buffer layout per D3D9 stream, indexed by stream.
+    ///
+    /// Canonical: a stream the draw does not read is
+    /// [`StreamLayout::UNUSED`], so two draws that differ only in streams
+    /// neither reads share a pipeline.
+    pub stream_layouts: [StreamLayout; MAX_STREAMS as usize],
     pub color_format: PixelFormat,
     /// Attachment-shape flags: `HAS_DEPTH`, `HAS_STENCIL`, `HAS_COLOR_OUTPUT`.
     ///
@@ -295,7 +302,7 @@ pub struct PipelineKey {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
     vdecl_hash: u64,
-    vertex_stride: u32,
+    stream_layouts: [StreamLayout; MAX_STREAMS as usize],
     blend_enable: u32,
     src_blend: BlendFactor,
     dst_blend: BlendFactor,
@@ -332,7 +339,61 @@ pub struct PipelineKey {
 pub struct PipelineBuildInputs<'a> {
     pub snapshot: &'a PipelineSnapshot,
     pub vertex_attrs: &'a [VertexAttrDesc],
+    /// The wire form of `snapshot.stream_layouts`, used streams only.
+    ///
+    /// Built by [`vertex_layouts_from_snapshot`]; the slice outlives the
+    /// synchronous `CreateRenderPipeline` thunk that reads it by pointer.
+    pub vertex_layouts: &'a [VertexBufferLayoutDesc],
     pub device_handle: MetalHandle<mtld3d_shared::mtl_handle::MTLDeviceKind>,
+}
+
+/// One vertex buffer layout of a pipeline: how Metal steps through a D3D9 stream.
+///
+/// Part of the pipeline identity: a stream bound with a different stride or
+/// a different `SetStreamSourceFreq` needs a different vertex descriptor.
+/// `Copy` because the snapshot carries an array of them and the draw path
+/// builds that array by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StreamLayout {
+    /// Bytes per step; never 0 for a used stream (Metal rejects it).
+    pub stride: u32,
+    pub step: VertexStepFunction,
+    /// Instances per advance (`PerInstance`); 1 for `PerVertex`, 0 for `Constant`.
+    pub step_rate: u32,
+}
+
+impl StreamLayout {
+    /// The canonical value of a stream the draw does not read.
+    pub const UNUSED: Self = Self {
+        stride: 0,
+        step: VertexStepFunction::PerVertex,
+        step_rate: 0,
+    };
+
+    #[inline]
+    #[must_use]
+    pub const fn is_used(&self) -> bool {
+        self.stride != 0
+    }
+}
+
+/// The wire layouts of a snapshot, one per used stream.
+///
+/// Allocates; called only on a pipeline-cache miss, never per draw.
+#[must_use]
+pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLayoutDesc> {
+    // `0u32..` yields the stream index as a u32 without a fallible width
+    // conversion.
+    (0u32..)
+        .zip(s.stream_layouts.iter())
+        .filter(|(_, l)| l.is_used())
+        .map(|(stream, l)| VertexBufferLayoutDesc {
+            buffer_index: stream,
+            stride: l.stride,
+            step_function: l.step,
+            step_rate: l.step_rate,
+        })
+        .collect()
 }
 
 #[must_use]
@@ -342,7 +403,7 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
         vs_fn: s.vs_fn,
         ps_fn: s.ps_fn,
         vdecl_hash: s.vdecl_hash,
-        vertex_stride: s.vertex_stride,
+        stream_layouts: s.stream_layouts,
         blend_enable: u32::from(s.rs.blend_enable()),
         src_blend: d3d_to_metal_blend_rt(u32::from(s.rs.src_blend), s.color_has_alpha()),
         dst_blend: d3d_to_metal_blend_rt(u32::from(s.rs.dst_blend), s.color_has_alpha()),
@@ -369,21 +430,24 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
 ///
 /// # Panics
 ///
-/// Panics if `inputs.vertex_attrs.len()` exceeds `u32::MAX` (unreachable —
-/// D3D9 caps the count at 16).
+/// Panics if `inputs.vertex_attrs.len()` or `inputs.vertex_layouts.len()`
+/// exceeds `u32::MAX` (unreachable — D3D9 caps both at 16).
 #[must_use]
 pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPipelineParams {
     let s = inputs.snapshot;
     let (src_a, dst_a, op_a) = effective_alpha_blend(s);
     let vertex_attr_count =
         u32::try_from(inputs.vertex_attrs.len()).expect("vertex attr count ≤ D3D9 max 16");
+    let vertex_layout_count =
+        u32::try_from(inputs.vertex_layouts.len()).expect("vertex layout count ≤ MaxStreams");
     CreateRenderPipelineParams {
         device_handle: inputs.device_handle,
         vs_fn_handle: s.vs_fn,
         ps_fn_handle: s.ps_fn,
         vertex_attrs_ptr: inputs.vertex_attrs.as_ptr() as u64,
+        vertex_layouts_ptr: inputs.vertex_layouts.as_ptr() as u64,
         vertex_attr_count,
-        vertex_stride: s.vertex_stride,
+        vertex_layout_count,
         blend_enable: u32::from(s.rs.blend_enable()),
         src_blend: d3d_to_metal_blend_rt(u32::from(s.rs.src_blend), s.color_has_alpha()),
         dst_blend: d3d_to_metal_blend_rt(u32::from(s.rs.dst_blend), s.color_has_alpha()),
@@ -445,6 +509,17 @@ mod tests {
     /// different" rather than "change this field from zero" — the latter
     /// can false-positive when a raw-D3D value falls through to a
     /// fallback.
+    /// Stream 0 only, per-vertex at `stride` bytes.
+    fn stream0(stride: u32) -> [StreamLayout; MAX_STREAMS as usize] {
+        let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+        layouts[0] = StreamLayout {
+            stride,
+            step: VertexStepFunction::PerVertex,
+            step_rate: 1,
+        };
+        layouts
+    }
+
     fn base() -> PipelineSnapshot {
         PipelineSnapshot {
             // SAFETY: tests; opaque values never dereferenced.
@@ -452,7 +527,7 @@ mod tests {
             // SAFETY: tests; opaque values never dereferenced.
             ps_fn: unsafe { MetalHandle::new(0x2000) },
             vdecl_hash: 0x3000,
-            vertex_stride: 32,
+            stream_layouts: stream0(32),
             color_format: PixelFormat::Bgra8Unorm,
             // Bgra8Unorm here models an A8R8G8B8 RT, so the default (has-alpha)
             // blend path is exercised — destination-alpha factors pass through
@@ -554,11 +629,13 @@ mod tests {
         s.rs.dst_blend = 8; // D3DBLEND_INVDESTALPHA
         s.extra.has_alpha_mask = 0; // RT1 is alpha-less, RT0 keeps alpha
         let attrs: [VertexAttrDesc; 0] = [];
+        let layouts = vertex_layouts_from_snapshot(&s);
         // SAFETY: tests; opaque values never dereferenced.
         let dev = unsafe { MetalHandle::new(0xDEAD) };
         let p = params_from_snapshot(&PipelineBuildInputs {
             snapshot: &s,
             vertex_attrs: &attrs,
+            vertex_layouts: &layouts,
             device_handle: dev,
         });
         assert_eq!(p.src_blend, BlendFactor::DestinationAlpha);
@@ -602,7 +679,30 @@ mod tests {
             "ps_fn"
         );
         assert_ne!(k0, mutate(|s| s.vdecl_hash = 0xFACE), "vdecl_hash");
-        assert_ne!(k0, mutate(|s| s.vertex_stride = 64), "vertex_stride");
+        assert_ne!(
+            k0,
+            mutate(|s| s.stream_layouts[0].stride = 64),
+            "stream 0 stride"
+        );
+        assert_ne!(
+            k0,
+            mutate(|s| s.stream_layouts[1] = StreamLayout {
+                stride: 12,
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            }),
+            "stream 1 present"
+        );
+        assert_ne!(
+            k0,
+            mutate(|s| s.stream_layouts[0].step = VertexStepFunction::PerInstance),
+            "stream 0 step function"
+        );
+        assert_ne!(
+            k0,
+            mutate(|s| s.stream_layouts[0].step_rate = 2),
+            "stream 0 step rate"
+        );
         assert_ne!(
             k0,
             mutate(|s| s.color_format = PixelFormat::Rgba16Float),
@@ -721,14 +821,21 @@ mod tests {
         let s = base();
         let k = key_from_snapshot(&s);
         let attrs: [VertexAttrDesc; 0] = [];
+        let layouts = vertex_layouts_from_snapshot(&s);
         // SAFETY: tests; opaque values never dereferenced.
         let dev = unsafe { MetalHandle::new(0xDEAD) };
         let p = params_from_snapshot(&PipelineBuildInputs {
             snapshot: &s,
             vertex_attrs: &attrs,
+            vertex_layouts: &layouts,
             device_handle: dev,
         });
         assert_eq!(p.device_handle, dev);
+        assert_eq!(p.vertex_layout_count, 1);
+        assert_eq!(layouts[0].buffer_index, 0);
+        assert_eq!(layouts[0].stride, 32);
+        assert_eq!(layouts[0].step_function, VertexStepFunction::PerVertex);
+        assert_eq!(layouts[0].step_rate, 1);
         assert_eq!(p.vs_fn_handle, k.vs_fn);
         assert_eq!(p.ps_fn_handle, k.ps_fn);
         assert_eq!(p.src_blend, k.src_blend);
@@ -749,5 +856,23 @@ mod tests {
             assert_eq!(p.extra[i].format, k.extra_formats[i]);
             assert_eq!(p.extra[i].write_mask, k.extra_write_masks[i]);
         }
+    }
+
+    #[test]
+    fn wire_layouts_carry_used_streams_with_their_slot() {
+        // Streams 0 and 2 used, stream 1 not: two wire entries, each at the
+        // Metal slot of its D3D9 stream, with the per-instance step intact.
+        let mut s = base();
+        s.stream_layouts[2] = StreamLayout {
+            stride: 16,
+            step: VertexStepFunction::PerInstance,
+            step_rate: 3,
+        };
+        let layouts = vertex_layouts_from_snapshot(&s);
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[1].buffer_index, 2);
+        assert_eq!(layouts[1].stride, 16);
+        assert_eq!(layouts[1].step_function, VertexStepFunction::PerInstance);
+        assert_eq!(layouts[1].step_rate, 3);
     }
 }

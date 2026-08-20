@@ -225,7 +225,7 @@ use crate::shader_compile_stats::CompileBucket;
 /// programmable PS declares `oC0..oC3` locals and returns a `PsOut` struct
 /// with one `[[color(i)]]` member per exported target, changing the key hash
 /// of every pixel shader and the MSL of any that writes `oC1` or above.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 57;
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 58;
 
 /// File magic.
 ///

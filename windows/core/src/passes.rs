@@ -6,7 +6,7 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{CullMode, PixelFormat, VisibilityResultMode},
+    mtl::{CullMode, PixelFormat, VERTEX_STREAM_SLOTS, VisibilityResultMode},
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -3547,9 +3547,9 @@ pub struct LastBoundCache {
     depth_stencil: u64,
     stencil_reference: u32,
     cull_mode: Option<CullMode>,
-    /// VS slot 15 — programmable / FF vertex constant buffer.
+    /// VS float constant slot — programmable / FF vertex constant buffer.
     vs_constants: Vec<u8>,
-    /// VS slot 13 — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
+    /// VS pos-fixup slot — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
     ///
     /// Re-bound only when the viewport dims change (rare), so the per-draw
     /// cost is a length-then-memcmp against 16 bytes.
@@ -3564,11 +3564,11 @@ pub struct LastBoundCache {
     ///
     /// Set when the bound PS uses `texbem`/`texbeml`/`bem`.
     ps_bump_env: Vec<u8>,
-    /// VS slot 0 — bound `MTLBuffer` handle + byte offset.
+    /// Vertex stream slots 0..16 — bound `MTLBuffer` handle + byte offset each.
     ///
-    /// `(0, _)` is the unset sentinel (Metal buffer handles are never
-    /// zero).
-    vertex_buffer: (u64, u32),
+    /// Indexed by D3D9 stream, which is the Metal vertex buffer slot. `(0, _)`
+    /// is the unset sentinel (Metal buffer handles are never zero).
+    vertex_buffers: [(u64, u32); VERTEX_STREAM_SLOTS as usize],
     /// Resolved `(x, y, w, h)` scissor rect.
     ///
     /// `None` is the unset sentinel — a brand-new render encoder has no
@@ -3608,7 +3608,7 @@ impl LastBoundCache {
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
-            vertex_buffer: (0, 0),
+            vertex_buffers: [(0, 0); VERTEX_STREAM_SLOTS as usize],
             scissor_rect: None,
             blend_color: 0xFFFF_FFFF,
             depth_bias_bits: (0, 0),
@@ -3634,7 +3634,7 @@ impl LastBoundCache {
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
-        self.vertex_buffer = (0, 0);
+        self.vertex_buffers = [(0, 0); VERTEX_STREAM_SLOTS as usize];
         self.scissor_rect = None;
         self.blend_color = 0xFFFF_FFFF;
         self.depth_bias_bits = (0, 0);
@@ -3695,20 +3695,25 @@ impl LastBoundCache {
         true
     }
 
+    /// Whether vertex stream `slot` needs a `setVertexBuffer` for `(handle, offset)`.
+    ///
+    /// Records the binding when it does. `slot` is the D3D9 stream index,
+    /// below [`VERTEX_STREAM_SLOTS`].
     #[inline]
-    pub const fn vertex_buffer_changed(&mut self, handle: u64, offset: u32) -> bool {
-        if self.vertex_buffer.0 == handle && self.vertex_buffer.1 == offset {
+    pub const fn vertex_buffer_changed(&mut self, slot: u32, handle: u64, offset: u32) -> bool {
+        let cur = &mut self.vertex_buffers[slot as usize];
+        if cur.0 == handle && cur.1 == offset {
             false
         } else {
-            self.vertex_buffer = (handle, offset);
+            *cur = (handle, offset);
             true
         }
     }
 
-    /// Forget the bound slot-0 vertex buffer.
+    /// Forget the vertex buffer bound at stream slot 0.
     ///
-    /// Forces the next `vertex_buffer_changed` to report a change. Call
-    /// after binding slot 0 with inline bytes
+    /// Forces the next `vertex_buffer_changed(0, ..)` to report a change.
+    /// Call after binding slot 0 with inline bytes
     /// (`setVertexBytes(..., index 0)`): that clobbers the real Metal
     /// vertex-buffer binding while leaving this cache pointing at the
     /// previously bound buffer, so without this a following bound draw
@@ -3717,7 +3722,16 @@ impl LastBoundCache {
     /// unset sentinel (Metal buffer handles are never zero).
     #[inline]
     pub const fn invalidate_vertex_buffer(&mut self) {
-        self.vertex_buffer = (0, 0);
+        self.invalidate_vertex_buffer_slot(0);
+    }
+
+    /// Forget the vertex buffer bound at stream `slot`.
+    ///
+    /// The per-slot form of [`Self::invalidate_vertex_buffer`], for a stream
+    /// the draw path fed inline zero bytes because nothing was bound to it.
+    #[inline]
+    pub const fn invalidate_vertex_buffer_slot(&mut self, slot: u32) {
+        self.vertex_buffers[slot as usize] = (0, 0);
     }
 
     #[inline]
@@ -3850,8 +3864,8 @@ pub struct DebugBoundShadow {
     depth_stencil: u64,
     /// Raw `CullMode` discriminant (`Command::param_a`).
     cull_mode: Option<u32>,
-    /// `(handle, offset)`, `offset` kept as the command's `u64` param.
-    vertex_buffer: (u64, u64),
+    /// Per vertex stream slot `(handle, offset)`, `offset` kept as the command's `u64` param.
+    vertex_buffers: [(u64, u64); VERTEX_STREAM_SLOTS as usize],
     /// Raw `(param_a, param_b, param_c)` of `Command::set_scissor_rect`.
     scissor_rect: Option<(u32, u64, u64)>,
     /// Raw `(param_a, param_b)` of `Command::set_depth_bias`.
@@ -3863,7 +3877,7 @@ impl DebugBoundShadow {
     /// Mirror a just-pushed `Command` into its slot.
     ///
     /// Untracked command types (viewport, draws, blend color, fragment
-    /// bytes, inline vertex bytes at a non-zero slot, visibility) are
+    /// bytes, inline vertex bytes at a uniform slot, visibility) are
     /// ignored.
     const fn record(&mut self, cmd: &Command) {
         let t = cmd.cmd;
@@ -3880,19 +3894,21 @@ impl DebugBoundShadow {
         } else if t == CommandType::SetScissorRect as u32 {
             self.scissor_rect = Some((cmd.param_a, cmd.param_b, cmd.param_c));
         } else if t == CommandType::SetVertexBuffer as u32 {
-            // The cache tracks slot 0 only.
-            if cmd.param_a == 0 {
-                self.vertex_buffer = (cmd.param_b, cmd.param_c);
+            // The cache tracks the vertex stream slots; the uniform slots
+            // above them are never bound through `SetVertexBuffer`.
+            if cmd.param_a < VERTEX_STREAM_SLOTS {
+                self.vertex_buffers[cmd.param_a as usize] = (cmd.param_b, cmd.param_c);
             }
         } else if t == CommandType::SetDepthBias as u32 {
             self.depth_bias = (cmd.param_a, cmd.param_b);
         } else if (t == CommandType::SetVertexBytes as u32
             || t == CommandType::SetVertexBytesAt as u32)
-            && cmd.param_a == 0
+            && cmd.param_a < VERTEX_STREAM_SLOTS
         {
-            // Inline slot-0 bind clobbers the real Metal vertex buffer; mirror
-            // `LastBoundCache::invalidate_vertex_buffer` so both forget it.
-            self.vertex_buffer = (0, 0);
+            // An inline bind at a stream slot clobbers the real Metal vertex
+            // buffer there; mirror `LastBoundCache::invalidate_vertex_buffer_slot`
+            // so both forget it.
+            self.vertex_buffers[cmd.param_a as usize] = (0, 0);
         }
     }
 }
@@ -3922,11 +3938,18 @@ impl LastBoundCache {
             shadow.cull_mode,
             "cull-mode cache desync (cache vs encoder-emitted)"
         );
-        assert_eq!(
-            (self.vertex_buffer.0, u64::from(self.vertex_buffer.1)),
-            shadow.vertex_buffer,
-            "vertex-buffer cache desync (cache vs encoder-emitted)"
-        );
+        for (slot, (&(cache_h, cache_off), &emitted)) in self
+            .vertex_buffers
+            .iter()
+            .zip(&shadow.vertex_buffers)
+            .enumerate()
+        {
+            assert_eq!(
+                (cache_h, u64::from(cache_off)),
+                emitted,
+                "vertex-buffer[{slot}] cache desync (cache vs encoder-emitted)"
+            );
+        }
         assert_eq!(
             self.scissor_rect.map(|(x, y, w, h)| (
                 x,
@@ -4153,14 +4176,32 @@ mod tests {
     fn inline_slot0_bind_forces_next_bound_vertex_buffer_reemit() {
         let mut cache = LastBoundCache::new();
         // First bind of a real VB handle reports a change and caches it.
-        assert!(cache.vertex_buffer_changed(0xDEAD, 0));
+        assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
         // A redundant rebind of the same (handle, offset) would be skipped.
-        assert!(!cache.vertex_buffer_changed(0xDEAD, 0));
+        assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
         // An inline slot-0 bind (setVertexBytes) clobbers the Metal binding;
         // invalidating the cache must force the next bound draw to re-emit
         // even though it targets the same (handle, offset).
         cache.invalidate_vertex_buffer();
-        assert!(cache.vertex_buffer_changed(0xDEAD, 0));
+        assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
+    }
+
+    #[test]
+    fn vertex_buffer_slots_are_tracked_independently() {
+        let mut cache = LastBoundCache::new();
+        assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
+        assert!(cache.vertex_buffer_changed(1, 0xBEEF, 16));
+        // Slot 1's bind leaves slot 0's cache intact, and vice versa.
+        assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
+        assert!(!cache.vertex_buffer_changed(1, 0xBEEF, 16));
+        // Invalidating slot 0 (inline UP bytes) does not touch slot 1.
+        cache.invalidate_vertex_buffer();
+        assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
+        assert!(!cache.vertex_buffer_changed(1, 0xBEEF, 16));
+        // A null-stream inline bind at slot 1 forgets only slot 1.
+        cache.invalidate_vertex_buffer_slot(1);
+        assert!(cache.vertex_buffer_changed(1, 0xBEEF, 16));
+        assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
     }
 
     #[test]
@@ -4799,7 +4840,7 @@ mod tests {
         c.ps_constants_changed(&[5, 6, 7, 8]);
         c.ps_alpha_ref_changed(&[9, 10, 11, 12]);
         c.ps_fog_color_changed(&[13, 14, 15, 16]);
-        c.vertex_buffer_changed(0xEEEE, 32);
+        c.vertex_buffer_changed(0, 0xEEEE, 32);
         c.scissor_rect_changed((1, 2, 3, 4));
         c.blend_color_changed(0xFF11_2233);
         c.reset();
@@ -4812,7 +4853,7 @@ mod tests {
         assert!(c.ps_constants_changed(&[5, 6, 7, 8]));
         assert!(c.ps_alpha_ref_changed(&[9, 10, 11, 12]));
         assert!(c.ps_fog_color_changed(&[13, 14, 15, 16]));
-        assert!(c.vertex_buffer_changed(0xEEEE, 32));
+        assert!(c.vertex_buffer_changed(0, 0xEEEE, 32));
         assert!(c.scissor_rect_changed((1, 2, 3, 4)));
         assert!(c.blend_color_changed(0xFF11_2233));
     }
@@ -4855,12 +4896,12 @@ mod tests {
     #[test]
     fn last_bound_vertex_buffer_dedup() {
         let mut c = LastBoundCache::new();
-        assert!(c.vertex_buffer_changed(0xAAAA, 0));
-        assert!(!c.vertex_buffer_changed(0xAAAA, 0));
+        assert!(c.vertex_buffer_changed(0, 0xAAAA, 0));
+        assert!(!c.vertex_buffer_changed(0, 0xAAAA, 0));
         // Same handle, different offset → changed.
-        assert!(c.vertex_buffer_changed(0xAAAA, 64));
+        assert!(c.vertex_buffer_changed(0, 0xAAAA, 64));
         // Same offset, different handle → changed.
-        assert!(c.vertex_buffer_changed(0xBBBB, 64));
+        assert!(c.vertex_buffer_changed(0, 0xBBBB, 64));
     }
 
     #[test]
@@ -4949,7 +4990,7 @@ mod tests {
         shadow.record(&Command::set_fragment_texture(0x7E10, 3));
         assert!(cache.fragment_sampler_changed(3, 0x5A77));
         shadow.record(&Command::set_fragment_sampler_state(0x5A77, 3));
-        assert!(cache.vertex_buffer_changed(0xBEEF, 0x40));
+        assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x40));
         shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x40, 0));
         assert!(cache.scissor_rect_changed((7, 9, 1024, 768)));
         shadow.record(&Command::set_scissor_rect(7, 9, 1024, 768));
@@ -4969,7 +5010,7 @@ mod tests {
         let mut cache = LastBoundCache::new();
         let mut shadow = DebugBoundShadow::default();
 
-        assert!(cache.vertex_buffer_changed(0xBEEF, 0x10));
+        assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
         shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
         cache.debug_assert_in_sync(&shadow);
 
@@ -4979,8 +5020,35 @@ mod tests {
         cache.debug_assert_in_sync(&shadow);
 
         // The next bound draw re-binds the same buffer and stays in sync.
-        assert!(cache.vertex_buffer_changed(0xBEEF, 0x10));
+        assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
         shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
+        cache.debug_assert_in_sync(&shadow);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_guard_tracks_every_vertex_stream_slot() {
+        // A second stream bound at slot 1 is mirrored by the shadow, and a
+        // null-stream inline bind there is forgotten by both sides; a
+        // uniform-slot inline bind (above the stream slots) touches neither.
+        let mut cache = LastBoundCache::new();
+        let mut shadow = DebugBoundShadow::default();
+
+        assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
+        shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
+        assert!(cache.vertex_buffer_changed(1, 0xCAFE, 0x20));
+        shadow.record(&Command::set_vertex_buffer(0xCAFE, 0x20, 1));
+        cache.debug_assert_in_sync(&shadow);
+
+        shadow.record(&Command::set_vertex_bytes_at(0xA000, 16, 1));
+        cache.invalidate_vertex_buffer_slot(1);
+        cache.debug_assert_in_sync(&shadow);
+
+        shadow.record(&Command::set_vertex_bytes_at(
+            0xB000,
+            16,
+            mtld3d_shared::mtl::VS_POS_FIXUP_SLOT,
+        ));
         cache.debug_assert_in_sync(&shadow);
     }
 

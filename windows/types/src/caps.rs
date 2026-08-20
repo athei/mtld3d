@@ -17,8 +17,7 @@
 ///
 /// Advertised as `D3DCAPS9::MaxStreams` and used by the binding layer to size
 /// its stream-slot array, so the advertised cap and the slot count cannot
-/// drift. Stream 0 is the only stream the renderer fetches; the higher slots
-/// exist so `SetStreamSource` / `GetStreamSource` round-trip.
+/// drift. Stream `n` is fetched from Metal vertex buffer slot `n`.
 pub const MAX_STREAMS: u32 = 16;
 
 /// Render targets a D3D9 device can bind simultaneously (`D3D_MAX_SIMULTANEOUS_RENDERTARGETS`).
