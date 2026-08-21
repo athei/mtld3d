@@ -5,10 +5,8 @@
 
 use mtld3d_shared::mtl::VS_POS_FIXUP_SLOT;
 
-use super::{
-    emit::{VariantFlags, VariantKey},
-    ff::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff},
-};
+use super::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
+use crate::dxso::emit::{VariantFlags, VariantKey};
 
 fn emit_pair_for_tests(vs_key: &FfVsKey, ps_key: &FfPsKey, variant: VariantKey) -> String {
     let vs = emit_vs_ff(vs_key);

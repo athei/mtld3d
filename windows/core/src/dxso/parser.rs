@@ -451,3 +451,6 @@ const fn decode_texture_type(bits: u32) -> TextureType {
         _ => TextureType::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests;

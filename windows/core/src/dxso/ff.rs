@@ -1626,3 +1626,6 @@ fn apply_op_scalar(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) ->
     // Same algebra — MSL handles float4 and scalar uniformly; we take .a below.
     apply_op(op, a, b, stage, has_texture)
 }
+
+#[cfg(test)]
+mod tests;
