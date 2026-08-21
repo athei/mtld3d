@@ -1,3 +1,14 @@
+//! Unit test for the bound on the `MetalFX` scaler cache.
+//!
+//! Scalers are the one Metal object here that is not leaked for the
+//! process: each holds tens of MiB of intermediates, and a window drag
+//! walks through a fresh geometry per size the user rests at. The test
+//! encodes through four times as many geometries as the cap holds and
+//! pins both halves of the bound, that the live cache never exceeds
+//! `MAX_CACHED_SCALERS`, and that every eviction is released once the
+//! following command buffer retires. It skips when the GPU has no
+//! `MetalFX`.
+
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
     MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage,

@@ -1,3 +1,11 @@
+//! Unit tests for the x87-free `ftol` truncation kernel.
+//!
+//! Every in-range case is checked against Rust's own `as i64` cast, so the bit
+//! manipulation stays equivalent to the reference lowering: signs, the boundaries at
+//! `2^52` and `2^63`, subnormals collapsing to zero, and a sweep across the whole
+//! exponent range. NaN, infinities and overflowing magnitudes are pinned separately,
+//! since those must return the x87 indefinite value rather than saturate.
+
 use super::ftol;
 
 /// In-range values match the hardware truncating cast exactly.

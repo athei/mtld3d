@@ -1,3 +1,11 @@
+//! Unit tests for logical-to-render resolution conversion.
+//!
+//! Pins the properties the call sites depend on: 100% is an exact identity,
+//! `dimension` rounds up so a small target never collapses to zero, and an
+//! out-of-range percentage clamps (rendering above the presented size is not
+//! offered). The rect cases cover edge-based scaling, so abutting rects still
+//! share an edge, and `rect` and `rect_edges_i32` land on the same pixels.
+
 use super::*;
 
 #[test]

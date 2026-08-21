@@ -1,3 +1,11 @@
+//! Packing and layout tests for the `Command` and `BlitCommand` wire structs.
+//!
+//! The PE side writes these structs and the unix side decodes them, so every bit packing is a
+//! two-sided contract. Among those built and read back here: index count, index type and instance
+//! count share `param_d`, index offset and signed base vertex share `param_c`, and a blit
+//! destination folds its slice or its origin into `BlitCommand::dst_offset`. One test asserts
+//! `BlitCommand`'s 8-byte alignment and 88-byte size at run time; a layout change fails that test.
+
 use super::*;
 
 /// Decode the packing that the unix-side `CommandType::DrawIndexedPrimitives` handler uses.

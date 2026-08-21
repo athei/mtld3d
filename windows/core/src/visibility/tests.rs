@@ -1,3 +1,11 @@
+//! Unit tests for the occlusion-query logic behind `IDirect3DQuery9`.
+//!
+//! Covers slot allocation (bump, reset, exhaustion), `sum_slots` over half-open and
+//! out-of-range spans, and the BEGIN/END/finalize state machine with its `u32` clamp. The
+//! pool and state cases pin the lifetime rules: intake finalizes only queries whose END frame
+//! has retired, reuse waits for `coherent_seq` to reach a buffer's `release_seq`, and an
+//! over-cap retire hands the evicted entry back.
+
 use mtld3d_shared::MetalHandle;
 
 use super::{

@@ -1,3 +1,11 @@
+//! Unit tests for present routing and the geometry settle filter.
+//!
+//! `present_route` is checked across the geometries a present can produce: equal extents
+//! copy, an enlargement in both axes reaches `MetalFX` only if it exists, and anything
+//! else falls to the stretch shader. The settle tests pin the other half of the decision,
+//! that a scaler is spent on a geometry that held still rather than on a ratio, which is
+//! what keeps a window drag from building one scaler per frame.
+
 use super::{PresentGeometry, PresentRoute, SETTLED_PRESENTS, geometry_settled, present_route};
 
 /// Matching extents take the blit whether or not `MetalFX` exists.

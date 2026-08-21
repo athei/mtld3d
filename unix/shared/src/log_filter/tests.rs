@@ -1,3 +1,10 @@
+//! Unit tests for `RUST_LOG` filter composition.
+//!
+//! Logger init keeps an `info` baseline and appends whatever the user asked for, relying
+//! on `env_logger` giving the last matching spec priority so a bare level or a per-module
+//! override still takes effect. These cases pin the composed string for an unset or empty
+//! variable, a bare level, root and sub-namespace targets, and a multi-spec passthrough.
+
 use super::resolved_log_filter;
 
 #[test]

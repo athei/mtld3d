@@ -1,3 +1,11 @@
+//! Unit tests for the vertex-stream frequency word.
+//!
+//! Covers the `SetStreamSourceFreq` validation rules (stream range, `INSTANCEDATA` on
+//! stream 0, both flags at once, a literal zero) and the derivations a draw makes from a
+//! frequency word: the instance count taken from stream 0, the Metal step function and
+//! rate, and the saturating byte range an instanced draw reads from a per-instance stream.
+//! A flag with a zero count is the corner case: accepted, one instance, a `Constant` layout.
+
 use super::*;
 
 #[test]

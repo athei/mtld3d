@@ -1,3 +1,11 @@
+//! Unit tests for the clear-quad shader sources, fixed and generated.
+//!
+//! Compiling `CLEAR_QUAD_MSL` on the host `MTLDevice` and resolving its entry points
+//! catches a typo or a rename before a mid-pass `Clear` does. The generated multi-target
+//! variants carry the real risk: Metal rejects a fragment function that writes a colour
+//! slot the pass leaves unbound, so every present mask from 1 to 7 is generated, checked
+//! slot by slot, and compiled.
+
 use super::*;
 
 /// Smoke test: the inline MSL compiles on the host `MTLDevice`.

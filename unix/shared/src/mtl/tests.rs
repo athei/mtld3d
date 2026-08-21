@@ -1,3 +1,11 @@
+//! Unit tests for the Metal wire enums and flag sets.
+//!
+//! These pin the encoding, not behaviour: discriminants match the native
+//! Metal values, `from_repr` rejects codes outside the declared set, and
+//! the sRGB twin table only pairs formats the project actually plumbs. The
+//! layout checks keep every enum 4 bytes with 4-byte alignment, so it can
+//! stand in for a `u32` thunk field without shifting a neighbouring offset.
+
 use super::*;
 
 /// Sanity: every enum variant round-trips through `as u32 → from_repr`.

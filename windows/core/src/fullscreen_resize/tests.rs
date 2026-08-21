@@ -1,3 +1,11 @@
+//! Unit tests for the external-resize policy of a fullscreen window.
+//!
+//! `ExternalResizeGuard` is pure state, so its ping-pong rules are pinned here
+//! against a fixed monitor rect: a covered window is left alone, each distinct
+//! clamp size earns exactly one re-assert and its repeat is suppressed, and
+//! covering the monitor or calling `reset` refills the budget. The budget caps
+//! the alternating-clamp pathology instead of re-asserting every frame.
+
 use super::{ExternalResizeAction, ExternalResizeGuard, REASSERT_BUDGET};
 
 const MONITOR: (u32, u32) = (3456, 2234);

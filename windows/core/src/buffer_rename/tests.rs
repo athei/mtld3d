@@ -1,3 +1,11 @@
+//! Unit tests for the VB/IB `Lock` planner.
+//!
+//! A matrix over lock flags, usage, lock range and submit-seq contention pins every arm of
+//! `plan_lock`: `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY` and uncontended locks write in
+//! place, `D3DLOCK_DISCARD` renames with no preserve, a contended whole-buffer lock renames
+//! and preserves, and a contended partial lock stays in place so an append-only batcher is
+//! not renamed per call. `classify_map_mode` pins `Direct` to `DEFAULT` plus `DYNAMIC` alone.
+
 use mtld3d_types::D3DUSAGE_WRITEONLY;
 
 use super::*;

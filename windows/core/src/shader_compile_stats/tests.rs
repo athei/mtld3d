@@ -1,3 +1,11 @@
+//! Unit tests for the shader-compile counters and their burst debounce.
+//!
+//! `CompileBucket::from_sm_major` is pinned on both sides: majors 1/2/3 map to `Sm1`/`Sm2`/`Sm3`,
+//! anything else yields `None`. `format_summary` is checked against exact strings so the
+//! fixed-column layout stays stable across emits: all four buckets print, zeros included, and the
+//! verb substitutes in place. One test round-trips `record`, `current_counts` and `drain` under a
+//! lock, and five walk `BurstTracker` through the zero state, arm, growth reset, fire and disarm.
+
 use std::sync::Mutex;
 
 use super::*;

@@ -1,10 +1,10 @@
-//! Unit tests for the fixed-function state block.
+//! Unit tests for the Fixed-Function pipeline state stored on `DeviceInner`.
 //!
-//! Pins the light and texture-transform masks the setters maintain (and that a
-//! state-block restore must rebuild), the FF shader keys derived from render
-//! state (fog source, local viewer, texcoord routing past a disabled color op,
-//! vertex blend), sparse lights compacting into dense eye-space shader slots,
-//! and the const-row extent checked against the `vs_c` rows the emitter reads.
+//! Pins the light and texture-transform masks the setters maintain (and that a state-block
+//! restore must rebuild), the FF shader keys derived from render state (fog source, local
+//! viewer, texcoord routing past a disabled color op, vertex blend), sparse lights compacting
+//! into dense eye-space shader slots, the const-row extent checked against the `vs_c` rows the
+//! emitter reads, and `inverse` round-tripping affine matrices while rejecting singular ones.
 
 use mtld3d_types::{
     D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE,

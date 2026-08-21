@@ -1,3 +1,11 @@
+//! Unit tests for the conjoined dirty span and the vertex-buffer read-range helpers.
+//!
+//! Half-open semantics carry the correctness argument: touching spans must not count as
+//! overlapping, a zero size means to the end of the buffer, and disjoint locks widen one range
+//! over the gap. The draw-range helpers must never under-cover, since a missed overlap reuses
+//! a buffer a later upload corrupts, and the exact non-indexed range must not reach past the
+//! bytes read. Start overflow falls back to the whole tail, size overflow keeps the exact start.
+
 use super::{DirtyRange, indexed_vb_range_lower_bound, nonindexed_vb_range};
 
 const LEN: u32 = 4096;

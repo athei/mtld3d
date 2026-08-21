@@ -1,3 +1,13 @@
+//! Unit tests for the present pass shader library and its pipelines.
+//!
+//! Both tests need a real Metal device and skip when there is none. The
+//! first compiles the embedded MSL and resolves the shared vertex stage
+//! plus all three fragment entry points (copy, HDR pass-through,
+//! BT.2446), so a typo or a rename landed on one side only fails here
+//! instead of at the first present. The second builds every pipeline for
+//! the drawable format its route writes, where a format that disagrees
+//! with the fragment output would otherwise surface as a black frame.
+
 use super::*;
 
 /// Smoke test: the present MSL compiles and every entry point resolves.

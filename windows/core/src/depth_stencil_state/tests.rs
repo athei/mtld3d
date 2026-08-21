@@ -1,3 +1,11 @@
+//! Unit tests for the depth/stencil snapshot, its cache key, and the wire params.
+//!
+//! Every snapshot field must reach the key, and the key packs translated Metal enums so an
+//! out-of-range `SetRenderState` value cannot alias a valid one and be handed the wrong
+//! `MTLDepthStencilState`. The folding rules are pinned too: a disabled depth or stencil test
+//! collapses its own fields, the CCW states stay inert until two-sided mode, the masks narrow to
+//! the width `Stencil8` observes, and each clear-quad state keeps a key of its own.
+
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESSEQUAL, D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE,
     render_state_defaults,

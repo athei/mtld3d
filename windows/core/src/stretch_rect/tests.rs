@@ -1,3 +1,11 @@
+//! Unit tests for the host-testable half of `StretchRect`.
+//!
+//! `parse_rect` is checked against its clamping contract: a null rect covers the whole
+//! surface, out-of-bounds corners clamp to the surface instead of wrapping, and a rect
+//! that is empty after clamping reports `None` so the caller can fail the call. A
+//! separate check keeps every `RejectReason` key distinct, which is what makes the
+//! once-per-reason warn fire once per reason rather than collapsing to a single line.
+
 use super::*;
 
 #[test]

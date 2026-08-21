@@ -1,3 +1,11 @@
+//! Unit tests for the per-draw vertex-stage uniform packing.
+//!
+//! Pins the exact byte layout the vertex shaders read: point size with its
+//! clamp range and scale factors in lane order, the inverse view rows that map
+//! an eye-space position back to world space, and the enabled clip planes
+//! packed from index zero (`D3DRS_CLIPPING` off drops them all). One check ties
+//! `VS_DRAW_MSL` to `VS_DRAW_BYTES` so a shifted lane cannot pass silently.
+
 use mtld3d_types::render_state_defaults;
 
 use super::*;

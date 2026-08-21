@@ -1,3 +1,11 @@
+//! Unit tests for repeat-mode flap characterization.
+//!
+//! These pin the stability rule: a site is stable only if it fired in every
+//! run at one constant count, and the rendered distribution folds in the runs
+//! where it did not fire. The report test checks that flapping sites are
+//! called out individually, stable ones collapse into one summary line, and
+//! upstream flaky-marked sites stay in their own non-gating list.
+
 use super::{Aggregate, SiteFlap, render};
 use crate::model::{Arch, Site, Subtest};
 

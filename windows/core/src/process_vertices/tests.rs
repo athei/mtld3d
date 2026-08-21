@@ -1,3 +1,11 @@
+//! Unit tests for the software `ProcessVertices` transform.
+//!
+//! An identity world-view-projection through a 640x480 viewport must land a quad on the
+//! expected screen coordinates, including the y flip, and a projection with w = 2 must
+//! produce `rhw = 0.5`, so the perspective divide and the viewport map stay separable and
+//! correct. A destination FVF that carries no transformed position is rejected instead of
+//! writing garbage into the destination buffer.
+
 use mtld3d_types::{D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW};
 
 use super::*;

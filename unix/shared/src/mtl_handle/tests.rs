@@ -1,3 +1,10 @@
+//! Unit tests for the typed Metal protocol-object handle.
+//!
+//! `MetalHandle` has to stay wire-compatible with the bare `u64` it wraps,
+//! so a const block pins size and alignment at compile time and the runtime
+//! tests cover the null sentinel, `Default`, a raw round-trip through the
+//! unsafe constructor, and the lower-hex formatting traces rely on.
+
 use super::*;
 
 const _: () = {

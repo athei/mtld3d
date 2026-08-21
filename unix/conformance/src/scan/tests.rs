@@ -1,3 +1,11 @@
+//! Unit tests for the subtest output scanner.
+//!
+//! Recorded fixtures and hand-written snippets pin the counting rules: repeats
+//! at one location accumulate, `flaky` and `todo` markers are tallied apart from
+//! real failures, and a panic keeps its location and message. Crash detection
+//! gets its own cases: a signal kill, a host-side abort with no failures and a
+//! missing end-of-run summary all count, but a marker quoted in a failure does not.
+
 use super::parse_subtest_output;
 use crate::model::Site;
 

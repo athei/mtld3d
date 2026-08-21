@@ -1,3 +1,12 @@
+//! Self-test for the crash handler's fault report.
+//!
+//! The handler reads the faulting frame out of `__darwin_mcontext64` at byte
+//! offsets hand-derived per architecture, which nothing else checks: a wrong one
+//! prints zeros in the single report a crash leaves behind. A signal handler can
+//! only be exercised by taking the signal, so the test re-executes the binary,
+//! faults on a known address, and asserts the child died through the handler's
+//! own exit path with a decodable banner, PC, stack pointer and argument labels.
+
 /// Set in the re-executed child so it faults instead of asserting.
 ///
 /// A signal handler can only be exercised by actually taking the signal,

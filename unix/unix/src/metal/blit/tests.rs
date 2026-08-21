@@ -1,3 +1,10 @@
+//! Unit tests for the blit-quad shader source.
+//!
+//! The MSL is a string constant compiled at runtime, so a typo in it or a rename of an
+//! entry point would first surface as a scaling `StretchRect` that silently stopped
+//! working. Compiling `BLIT_MSL` on the host `MTLDevice` with the options the pipeline
+//! builder uses, then resolving both entry-point names, moves that failure to the test.
+
 use super::*;
 
 /// Smoke test: the inline MSL compiles on the host `MTLDevice`.

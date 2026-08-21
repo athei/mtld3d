@@ -1,3 +1,12 @@
+//! Unit test for the nanosecond-to-cycle conversion.
+//!
+//! Cycle counts are never comparable across linkage units, because each
+//! calibrates its own counter, so a duration that crosses the boundary travels
+//! in nanoseconds and is rescaled here by the local `tsc_hz`. The test pins that
+//! scaling (one second of nanoseconds is one second of calibrated ticks), the
+//! ordering of frame-sized waits, and the zero short-circuit that keeps a build
+//! which measures nothing from paying the calibration sleep.
+
 use super::{ns_to_cycles, tsc_hz};
 
 /// A duration handed across the boundary lands on this side's own rate.

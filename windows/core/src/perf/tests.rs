@@ -1,3 +1,11 @@
+//! Unit tests for the perf counters, the bottleneck classifier and the summary layout.
+//!
+//! Built only under `perf_tracking`, these pin arithmetic that otherwise fails silently:
+//! the API-to-encoder counter drain with its per-frame reset, window accumulation keeping
+//! encoder CPU separate from submit-thread drawable wait, exclusive-time accounting for
+//! nested timers (self-times partition the outer span), every `Bottleneck::classify`
+//! branch, and a golden snapshot of the summary grid in both plain and ANSI form.
+
 use super::*;
 
 const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {

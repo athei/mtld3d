@@ -1,3 +1,11 @@
+//! Unit tests for the per-frame bump arena.
+//!
+//! The arena hands raw pointers to another thread, so these pin the invariants
+//! that make that sound: an earlier pointer stays valid and readable after later
+//! allocations, every allocation is 16-byte aligned, and an oversized request
+//! gets its own chunk without displacing the hot cursor. The `clear` cases pin
+//! high-water retention, the reason steady-state frames never call the allocator.
+
 use super::*;
 
 const TEST_CHUNK: usize = 256;

@@ -1,3 +1,11 @@
+//! Unit tests for the `mtld3d.conf` parser.
+//!
+//! `parse` is driven with file text plus optional env-override text and the result checked
+//! field by field: documented defaults, both values of every boolean, later assignments and
+//! env segments winning in that order, and malformed or unknown entries keeping the previous
+//! value instead of derailing the rest of the input. Per-value shapes (MiB caps, decimal
+//! render scale and its bounds, hex id lists, quoted strings) get their own cases.
+
 use mtld3d_shared::mtl::ColorSpacePolicy;
 
 use super::{CursorScale, Mtld3dConfig, parse};

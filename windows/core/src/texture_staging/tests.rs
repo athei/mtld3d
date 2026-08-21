@@ -1,3 +1,11 @@
+//! Unit tests for the texture-staging Lock decision tree.
+//!
+//! Several cases per arm of `decide_lock_action`: flag priority, the uncontended shortcut,
+//! `D3DLOCK_DISCARD`, and whole-mip renames with `D3DUSAGE_DYNAMIC` dropping the CPU preserve.
+//! The partial arms mostly resolve to `WriteInPlace`; only an unaligned compressed rect forces
+//! a preserve, since the encoder widens its read to the whole mip. The `texture_lock_offset`
+//! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
+
 use super::*;
 
 const DEFAULT_FLAGS: u32 = 0;

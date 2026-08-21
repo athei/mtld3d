@@ -1,3 +1,11 @@
+//! Unit tests for the on-disk shader-cache binary format.
+//!
+//! Hand-built files cover the round trips, the damage paths (torn tail, flipped chunk-header
+//! bit, scrambled zstd frame, unknown chunk kind), duplicate keys and a header-only file. Every
+//! one of those but the scrambled-frame case pins the `needs_compaction` verdict the pre-warm
+//! rewrite keys off. Further tests cover header validation, `CachedKind` mapping and
+//! `ff_key_hash` stability.
+
 use super::*;
 
 fn write_file(entries_per_chunk: &[Vec<CacheEntry>], bundle_last: bool) -> Vec<u8> {

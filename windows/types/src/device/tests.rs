@@ -1,3 +1,11 @@
+//! Unit tests for the `D3DSTATEBLOCKTYPE` state-block filter.
+//!
+//! `StateBlockType` decides which states a filtered block captures and writes
+//! back, so the membership predicates are pinned by exact set sizes (45 vertex
+//! and 60 pixel render states, plus sampler and texture-stage counts) and by
+//! spot checks on states that belong to both sets or to only one. A predicate
+//! that drifts shows up here, not as an `Apply` clobbering the other pipeline.
+
 use super::{
     D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
     StateBlockType,

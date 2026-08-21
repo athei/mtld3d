@@ -1,3 +1,10 @@
+//! Unit tests for the `DirtyRect` clamp and full helpers.
+//!
+//! Four cases drive `clamp` against a 128x128 mip: the interior identity, trimming a rect that
+//! overhangs the mip, rejecting one whose origin sits past the edge, and the saturating add
+//! that keeps an absurd width from wrapping into a bogus in-bounds rect. A fifth checks that
+//! `full` builds a rect at the origin spanning the mip extent it is given.
+
 use super::DirtyRect;
 
 #[test]

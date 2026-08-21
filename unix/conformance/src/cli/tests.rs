@@ -1,3 +1,11 @@
+//! Unit tests for the conformance runner's argument parser.
+//!
+//! One invocation runs one test binary, so `--wine`, `--exe` and `--arch` are
+//! mandatory and each missing one must name itself in the error. The rest pin
+//! the guard rails: unknown and retired flags fail loudly instead of being
+//! ignored, `--repeat` refuses zero, and a filtered `--update-baseline` is
+//! rejected before it can drop unselected subtests from the baseline.
+
 use super::parse_args;
 use crate::model::{Arch, Subtest};
 

@@ -1,3 +1,11 @@
+//! Unit tests for the log-once macros and their per-key latch.
+//!
+//! `first_seen` mirrors the first-seen check the `_by` macros run, so dedup semantics can
+//! be asserted without installing a `log` sink: a repeated key stays silent, distinct keys
+//! (including packed multi-field ones) each get their line. The second test never asserts
+//! anything, it only has to compile, which catches regressions in macro argument parsing
+//! across the call shapes the tree actually uses.
+
 use std::{collections::BTreeSet, sync::Mutex};
 
 use super::first_seen;

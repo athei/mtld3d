@@ -1,3 +1,11 @@
+//! Unit tests for the render-pass state machine and its load/store optimizer.
+//!
+//! `PassState` is driven through synthetic frames of opaque handles, so pass breaking and
+//! every load/store rule run without a GPU: clears folded into load actions versus painted
+//! as quads, the `DontCare` rules with their sampler, blit and mid-frame-flush guards,
+//! render scale, multiple render targets, and the `last_bound` dedup cache. A rule that
+//! fires one case too wide loses pixels, so each guard gets a case that fails without it.
+
 use mtld3d_shared::CommandType;
 
 use super::*;

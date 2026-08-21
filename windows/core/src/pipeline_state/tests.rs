@@ -1,3 +1,11 @@
+//! Unit tests for D3D9 to Metal pipeline-state translation.
+//!
+//! One test mutates a default `PipelineSnapshot` field by field and asserts each change produces
+//! a different `PipelineKey`, so unlike draws cannot share a cached pipeline. Others cover
+//! normalisation and the wire format: an absent extra target drops out of the key, an extra target
+//! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
+//! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
+
 use super::*;
 
 /// Default snapshot with sane non-zero values.

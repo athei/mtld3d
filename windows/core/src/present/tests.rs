@@ -1,3 +1,11 @@
+//! Unit tests for the present-interval to display-sync mapping.
+//!
+//! `D3DPRESENT_INTERVAL_DEFAULT` and `ONE` enable vsync, `IMMEDIATE` disables it, and every
+//! other value (the non-1:1 ratios and any unknown bit pattern) takes the `Fallthrough` arm,
+//! which still runs at display rate but asks the caller to warn. The polarity assertions
+//! guard `enabled()`, where flipping a single arm would silently drop vsync for a whole
+//! class of intervals.
+
 use super::{DisplaySync, display_sync_for, present_interval as pi};
 
 #[test]

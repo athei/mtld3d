@@ -1,3 +1,11 @@
+//! Unit tests for the baseline text (de)serializer.
+//!
+//! A round-trip over a populated model pins canonical output: parsing then
+//! re-serializing is byte-identical, so a re-baseline shows a minimal diff. One
+//! test lifts the `# Wine:` comment line into `wine_version`. Three error paths
+//! follow: a site line before any header, a stale per-site `class=` token
+//! (classes moved to CONFORMANCE.md), and a header crash flag that is not `0` or `1`.
+
 use std::collections::BTreeMap;
 
 use super::{Arch, Baseline, Site, Subtest, SubtestBaseline};

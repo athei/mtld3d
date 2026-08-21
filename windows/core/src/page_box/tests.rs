@@ -1,3 +1,11 @@
+//! Unit tests for the page-aligned heap backing behind dynamic VB/IB data.
+//!
+//! Two halves. The allocator cutoff maths: the over-1-MiB uncached band stays
+//! derived from snmalloc's chunk rounding rather than hardcoded, and the bound
+//! agrees with upstream's mask-bits form at every chunk size. Then `PageBox`
+//! itself: page-aligned pointers, a padded length rounded up to a page multiple
+//! (one page even at zero), and the full logical range readable and writable.
+
 use super::{
     PAGE_SIZE, PageBox, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache, snmalloc_chunk_size,
 };

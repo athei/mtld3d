@@ -1,3 +1,11 @@
+//! Size and alignment checks for a dozen of the PE/unix thunk parameter structs.
+//!
+//! Each covered struct pins `size_of` against a field-by-field tally in a comment, and `align_of`
+//! against 8 (`ExtraColorDesc` gets only the size check); the other param structs are not covered.
+//! No test reads `offset_of`, so swapping two same-width fields still passes here; the parent
+//! module asserts field offsets at compile time only for `CreateDepthStencilStateParams`. One
+//! test also pins `PassDescriptor::pack_flags`, where an ordinary pass encodes as zero.
+
 use super::{
     BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams,
     DestroyResourcesBulkParams, ExtraColorDesc, PassDescriptor, SubmitFrameParams,

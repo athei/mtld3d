@@ -1,3 +1,11 @@
+//! Unit tests for the arch-scoped baseline merge.
+//!
+//! A re-baseline is a plain re-record of counts, so what matters is the change
+//! report: already-failing sites are carried, fresh ones land in `new_sites`,
+//! and sites that stopped failing land in `dropped_sites`. The arch scope is
+//! pinned too: a run measures one architecture, so the other arch's entries
+//! survive untouched and contribute nothing to the summary.
+
 use std::collections::BTreeMap;
 
 use super::merge;

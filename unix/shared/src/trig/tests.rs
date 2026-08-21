@@ -1,3 +1,12 @@
+//! Accuracy tests for the hand-rolled single-precision trig approximations.
+//!
+//! Dense sweeps compare `sin_cos`, `atan`, `atan2` and `acos` against an `f64`
+//! reference under fixed error bounds, so a mistyped minimax coefficient or a
+//! flipped sign fails loudly instead of skewing a spotlight cone. The rest pins
+//! the octant bookkeeping (cardinal angles, odd/even symmetry, the Pythagorean
+//! identity), the `f64` fallback that keeps huge angles inside `[-1, 1]`, and
+//! non-finite inputs returning NaN rather than panicking or hanging.
+
 use core::f32::consts::PI;
 
 use super::{acos, atan, atan2, sin_cos};

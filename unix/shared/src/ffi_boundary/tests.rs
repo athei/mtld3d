@@ -1,3 +1,11 @@
+//! Unit tests for the typed FFI-boundary pointer wrappers.
+//!
+//! A local `#[repr(C)]` struct stands in for a C in-param: the tests pin that `opt` filters null
+//! on `InPtr` and `OutPtr`, that reads and writes through `InPtr`, `InPtrMut`, `ValueIn`,
+//! `OutPtr` and `VtableThis` land on the original storage, and that `InPtr`, `Option<InPtr>`
+//! (which relies on the null-pointer niche), `OutPtr` and `VtableThis` are still exactly
+//! pointer-sized, so those four cost nothing at the call seam.
+
 use super::*;
 
 #[repr(C)]

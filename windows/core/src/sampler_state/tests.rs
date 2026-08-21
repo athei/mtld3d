@@ -1,3 +1,11 @@
+//! Unit tests for D3D9 sampler-state translation.
+//!
+//! The per-field sweep asserts that mutating any `SamplerSnapshot` field changes
+//! the cache key, which is what makes a silently dropped sampler state
+//! impossible: a new field that never reaches the key fails here. The rest pins
+//! the packed key layout by bit position, the 1:1 filter mapping (no implicit
+//! promote), and that `params_from_snapshot` agrees with the key it was given.
+
 use super::*;
 
 fn base() -> SamplerSnapshot {

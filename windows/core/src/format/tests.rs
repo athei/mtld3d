@@ -1,3 +1,11 @@
+//! Unit tests for the D3D9 depth-format mapping.
+//!
+//! Apple Silicon has no 24-bit depth, so the whole D24 family and the FOURCC
+//! sampleable-depth formats collapse onto `Depth32Float`, and the
+//! stencil-bearing ones onto `Depth32FloatStencil8`. These pin that collapse,
+//! keep `is_depth_format` in step with the mapping it wraps, and check that
+//! color and unknown formats stay unmapped.
+
 use super::{
     D3DFMT_A8R8G8B8, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8,
     D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16,

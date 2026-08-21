@@ -1,3 +1,11 @@
+//! Unit tests for the `D3DCAPS9` defaults and the `debug.capsAll` override.
+//!
+//! Most bitmask fields covered here are respelled bit by bit, so a bit dropped while its consumer
+//! is live fails; `z_cmp_caps`, `alpha_cmp_caps` and `stencil_caps` pin the whole spec field, and
+//! many fields `fill_default` writes carry no assertion. Other cases tie a cap to its backing
+//! code: clip planes to the vertex-shader uniform, active lights to the FF light slots. The
+//! `debug.capsAll` fill is pinned as a superset that leaves shader versions and SM2.x caps alone.
+
 use mtld3d_types::{
     AddressCaps, BlendCaps, CmpCaps, D3DCAPS9, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps,
     FvfCaps, LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps,

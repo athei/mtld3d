@@ -1,3 +1,11 @@
+//! Unit tests for the baseline diff and its gate verdicts.
+//!
+//! Synthetic baselines and run results drive every branch: a count up, a new
+//! site or a fresh crash regress, while a count down or a vanished crash gate
+//! as a stale baseline rather than passing quietly. The tolerance classes get
+//! their own cases, `flaky` in both directions and `ceiling` only below the
+//! pin, each applying only to sites already in the baseline.
+
 use std::collections::BTreeMap;
 
 use super::diff;

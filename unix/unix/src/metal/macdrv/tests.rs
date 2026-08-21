@@ -1,3 +1,12 @@
+//! Unit tests for the present-throttle duration derivation.
+//!
+//! `min_present_duration` folds the guest's vsync request and the user's
+//! `present.maxFps` ceiling into the minimum seconds handed to
+//! `presentDrawable:afterMinimumDuration:`. Bit-exact assertions pin every
+//! combination of the two inputs: the lower of the two rates wins, an
+//! unknown panel rate still honours the user cap, and only IMMEDIATE with
+//! no cap resolves to `0.0` for an unthrottled free run.
+
 use super::{PresentPacing, min_present_duration};
 
 #[test]

@@ -1,3 +1,11 @@
+//! The anti-drift gate between `baseline.txt` and `CONFORMANCE.md`.
+//!
+//! Classifications live only in the prose and failure counts live only in the baseline, so
+//! nothing keeps the two in step but this check: it loads both from the crate's asset
+//! directory and asserts they name exactly the same sites. A baseline site with no `Sites:`
+//! entry is untriaged work, a documented site that no longer fails is stale prose, and
+//! either direction fails the test run with the offending sites listed.
+
 use std::{collections::BTreeSet, path::Path};
 
 use super::load;

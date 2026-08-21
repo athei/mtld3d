@@ -1,3 +1,11 @@
+//! Unit tests for the bounded `PageBox` recycle pool.
+//!
+//! The tests cover one rule each: exact padded-size class matching (a hit keeps the same backing
+//! pages and is retargeted to the new logical length), LIFO order within a class, the largest
+//! accepted class, and the three refusal paths (disabled pool, oversize class, byte cap) handing
+//! the box back for a plain drop. The exact round trip and the mixed-class case also walk
+//! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set.
+
 use super::{MAX_POOL_CLASSES, PageBoxPool};
 use crate::page_box::{PAGE_SIZE, PageBox};
 

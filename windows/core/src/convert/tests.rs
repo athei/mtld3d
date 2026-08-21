@@ -1,3 +1,11 @@
+//! Unit tests for the D3D9 to Metal translation helpers.
+//!
+//! Pins the enum tables (blend ops, `D3DDECLTYPE_*` formats) alongside the conversions that
+//! have no second source of truth: D3DCOLOR byte order and the `ColorFill` encodings, FVF
+//! expansion into `D3DVERTEXELEMENT9`, attribute resolution against declared VS semantics and
+//! the fixed-function convention, triangle-fan rewriting, and the depth-bias scale with its
+//! decal heuristic. A wrong mapping here reaches the screen as wrong pixels, not a crash.
+
 use super::*;
 use crate::dxso::DeclUsage;
 
