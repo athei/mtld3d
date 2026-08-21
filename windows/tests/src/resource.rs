@@ -8,16 +8,91 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3DINDEXBUFFER_DESC, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
-    IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl,
-    IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
-    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
+    D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
+    D3DVOLUME_DESC, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
+    IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl,
+    IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
+    IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolumeTexture9Vtbl,
 };
 
 use crate::{
     check::{expect_created, expect_ok},
     vtbl::deref_vtbl,
 };
+
+// ── Volume texture ──
+
+/// An `IDirect3DVolumeTexture9`.
+pub struct VolumeTexture<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl VolumeTexture<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DVolumeTexture9Vtbl {
+        // SAFETY: `self.ptr` is a live volume texture for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DVolumeTexture9Vtbl>(self.ptr) }
+    }
+
+    /// Describe mip `level`. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn level_desc(&self, level: u32) -> (i32, D3DVOLUME_DESC) {
+        let mut desc = D3DVOLUME_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe {
+            (self.vtbl().get_level_desc)(self.ptr, level, (&raw mut desc).cast::<c_void>())
+        };
+        (hr, desc)
+    }
+
+    /// `LockBox` over the whole of mip `level`. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The struct is seeded with a garbage pointer first, so a rejected lock
+    /// that leaves it untouched reads as non-null.
+    #[must_use]
+    pub fn lock_box_probe(&self, level: u32, flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null box locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(self.ptr, level, &raw mut locked, core::ptr::null(), flags)
+        };
+        (hr, locked.bits.is_null())
+    }
+
+    /// `UnlockBox` for mip `level`. Returns the hr.
+    #[must_use]
+    pub fn unlock_box(&self, level: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_box)(self.ptr, level) }
+    }
+}
+
+impl Drop for VolumeTexture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
 
 // ── Texture ──
 

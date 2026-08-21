@@ -3989,6 +3989,12 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    // D3DUSAGE_DYNAMIC is a DEFAULT/SYSTEMMEM-pool property: the managed pool
+    // and the scratch pool reject it.
+    if usage & D3DUSAGE_DYNAMIC != 0 && matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SCRATCH) {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     // A per-level 3D mip chain. Each level's box is the block-aware 2D slice
     // size (`compute_mip_size`, correct for DXT/ATI as well as plain formats)
     // times the level's depth; `LockBox` hands the game a pointer into the

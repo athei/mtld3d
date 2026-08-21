@@ -166,8 +166,8 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **14 `real` · 70 `expected` ·
-1 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
+re-checked before retagging. Headline: **12 `real` · 93 `expected` ·
+2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
@@ -231,16 +231,22 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (6 distinct defects behind the 11 sites)
+### The `real` backlog (5 distinct defects behind the 9 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
 | Reset: no outstanding-DEFAULT-pool / implicit-surface-ref rejection (surface + volume) | test_reset | 6 |
 | TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
-| IDirect3DVolume9::GetContainer does not return the parent volume texture | test_volume_get_container | 2 |
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
+
+The `device` subtest used to die silently inside test_volume_get_container
+(a `GetContainer` that answered E_NOINTERFACE with a null container, which
+the test then released), and the baseline recorded before the runner learnt
+to treat a missing end-of-run summary as a crash carried only the sites
+before that point. Every cluster from test_occlusion_query on was
+re-triaged when the run first reached its end again.
 
 Vertex streams 1..15 and `SetStreamSourceFreq` instancing are implemented, so
 the clusters that used to sit on "single-stream rendering" (stream_test,
@@ -387,15 +393,129 @@ The device window must adopt the *requested mode's* rect across a fullscreen
 Reset. Ours adopts the monitor rect instead, since there is no mode. (5951 and
 5971, which check that the window covers the screen at all, now pass.)
 
-### device.c/test_volume_get_container
-Sites: 6210=real 6211=real
+### device.c/test_occlusion_query
+Sites: 6780=expected
 
-`IDirect3DVolume9::GetContainer` must return the parent volume texture: the
-test creates a volume texture, `GetVolumeLevel(0)`s a volume, and expects
-`GetContainer(IID_IUnknown)` to hand back the texture (6210) as that exact
-pointer (6211). We do not yet plumb the parent container through the volume
-sub-object, so the query fails. Reachable only now that VOLUMEMAP is
-advertised; intend-to-fix alongside the volume sub-object work.
+The >2^32-sample query (65 fullscreen 8192x8192 quads under one query, depth
+test off) undercounts because Apple's TBDR hidden-surface removal merges
+same-encoder opaque overdraw before fragment processing: the visibility
+counter reports the samples that *survive* HSR, not every sample that would
+have passed the depth test on an immediate-mode GPU. Proven by
+instrumentation, not inferred: the GPU-written slot value itself is short
+(our BEGIN..END span is a single slot in a single frame, summed correctly),
+the value is always an integer number of 8192-wide quad ROWS (0x1de98f00 =
+8192 x 61260; an earlier environment read 0x077a63c0 = 8192 x 15315), and
+tile-row-granular partial renders decide how many overdraw layers escape
+culling, which is why the number moves between environments. The same test's
+single-quad section counts bit-exactly (0x75cf00 = one 3456x2234 quad), so
+the machinery is precise whenever HSR has nothing to merge. Counting all
+overdraw layers would need an encoder per draw under active queries,
+destroying pass batching; the kept optimization is single-encoder pass
+batching, so this is `expected`. Real-game occlusion (a bounding box tested
+against a populated depth buffer, read as zero/non-zero) is unaffected.
+
+### device.c/test_lockrect_invalid
+Sites: 8664=expected 8682=expected 8701=expected
+
+We PASS the accept-invalid lock checks (the `broken()`-guarded Win7 reject
+alternative is not what we take). These offset assertions then compare our
+returned pointer against blind `top*pitch + left*bpp` arithmetic on the
+invalid rect. `parse_rect` clamps invalid rects (negatives to 0,
+inverted/zero-area to the full mip), so our offsets differ; matching XP
+exactly would require handing out pointers OUTSIDE the staging allocation,
+which the lock-safety model forbids (`lock_region_ptr` bounds assert).
+Deliberate safety tradeoff, kept. (Cube's garbage offsets are pointer diffs
+across unrelated per-lock allocations: meaningless, not out-of-bounds.)
+
+### device.c/test_pinned_buffers
+Sites: 10074=expected 10079=expected
+
+The test expects a DISCARD re-lock to return the same pinned pointer with
+prior contents intact, a driver-specific optimization probe with no cap
+branch. Our rename-on-DISCARD model returns fresh backing by design, and
+DISCARD contents are spec-undefined, so our behavior is legal. Intent to
+keep (the rename model is core).
+
+### device.c/test_lost_device
+Sites: 12144=expected 12146=expected 12153=expected 12155=expected
+Sites: 12199=expected
+
+Focus-loss/device-lost lifecycle: TestCooperativeLevel/Present/Reset must
+report DEVICELOST/DEVICENOTRESET across a fullscreen focus cycle. Our
+device is never lost by design (no exclusive fullscreen, no GPU loss on
+Metal). The only non-OK `TestCooperativeLevel` answer we give is the
+DEVICENOTRESET latch a failed `Reset` leaves behind, which is the windowed
+API contract test_reset exercises, not focus-driven loss.
+
+### device.c/test_check_device_format
+Sites: 12689=expected 12694=expected
+
+CheckDepthStencilMatch(..., D3DFMT_D32): native returns NOTAVAILABLE; we
+return D3D_OK because D32 genuinely maps to Depth32Float and works. We
+advertise MORE than native here, deliberately; not an omitted-cap (`caps`)
+case, and our answer is truthful for our backend.
+
+### device.c/test_miptree_layout
+Sites: 12784=expected 12823=expected
+
+The test asserts each mip's lock pointer sits at a contiguous offset from
+level 0 (single-allocation mip chain). Our staging is one PageBox per mip,
+which is load-bearing for the rename-at-overlap versioning model (each
+mip's Arc swaps independently); a contiguous chain is structurally
+incompatible with that design, which we keep. Site 12823 is the same pointer
+layout assertion across six cube faces and their mip levels. Cube staging is
+also one PageBox per subresource so a face or mip can rename independently.
+Per-subresource pixel data is correct.
+
+### device.c/test_resource_access
+Sites: 13838=caps
+
+"Test 2D 6" creates a DEFAULT-pool, `D3DUSAGE_DEPTHSTENCIL` texture in the
+device's depth format and derives the expected HRESULT from
+`CheckDeviceFormat(usage = 0, D3DRTYPE_TEXTURE, depth format)`: on every
+desktop driver a depth format that works as a depth-stencil texture also
+works as a plain (usage 0) texture, so the test treats the two queries as
+one capability. They are two capabilities here. We expose depth textures
+only with `D3DUSAGE_DEPTHSTENCIL` (the shadow-map idiom: bind as depth, then
+sample), never as plain textures (no mip chains, no lockable levels), and
+each query answers for its own usage: the usage-0 query says NOTAVAILABLE
+and a usage-0 create fails with it, the DEPTHSTENCIL query says OK and the
+DEPTHSTENCIL create succeeds with it. The test's inference from the first
+answer to the second create is the cap-blind step; our responses are each
+the conformant one for the capability set we advertise.
+
+### device.c/test_get_display_mode
+Sites: 14383=expected 14384=expected 14480=expected 14482=expected
+Sites: 14491=expected 14493=expected
+
+All one decision. A fullscreen device's and swap chain's `GetDisplayMode`
+report the honored mode (14378/14379, 14390/14391 pass) and a windowed
+device's reports the desktop mode, so the windowed halves of
+14480/14482 and 14491/14493 pass too. What remains: `GetAdapterDisplayMode`
+must report the *switched* desktop mode after a fullscreen create
+(14383/14384), and the fullscreen halves of 14480-14493 expect
+`GetDisplayMode` to equal the monitor rect because a real mode-set would
+have shrunk the monitor to the mode. We change no mode, so the monitor keeps
+its native size while the device reports the mode it honored.
+
+Raw output confirms the remaining halves: 14480-14493 fail only as
+"Adapter 0 test 1" (the CREATE_DEVICE_FULLSCREEN iteration), "Expect width
+3456, got 640", deterministic, not a GetMonitorInfoW environment cascade.
+Their sibling sites 14451/14454 and 14472/14474 pass with the harness's
+pinned Retina mode.
+
+### device.c/init_d3d9on12_modules
+Sites: 15088=expected
+
+`win_skip("Direct3DCreate9On12 is not supported…")`: under Wine, win_skip
+counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
+Metal.
+
+### device.c/test_d3d9on12
+Sites: 15160=expected
+
+The `win_skip("Failed to load d3d9on12 modules…")` companion to 15088,
+same rationale.
 
 ### visual.c clusters
 

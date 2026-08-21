@@ -18,7 +18,7 @@ use crate::{
     ffi::Direct3DCreate9,
     resource::{
         CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, Texture, VertexBuffer,
-        VertexDeclaration, VertexShader,
+        VertexDeclaration, VertexShader, VolumeTexture,
     },
     vtbl::deref_vtbl,
     win32,
@@ -1059,9 +1059,22 @@ impl Harness {
         format: u32,
         pool: u32,
     ) -> i32 {
+        self.try_create_volume_texture(extent, levels, usage, format, pool)
+            .0
+    }
+
+    /// `CreateVolumeTexture` returning the hr and the texture when it succeeded.
+    pub fn try_create_volume_texture(
+        &self,
+        extent: [u32; 3],
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, Option<VolumeTexture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
-        unsafe {
+        let hr = unsafe {
             (self.dev_vtbl().create_volume_texture)(
                 self.device,
                 extent[0],
@@ -1074,7 +1087,9 @@ impl Harness {
                 &raw mut out,
                 core::ptr::null_mut(),
             )
-        }
+        };
+        let texture = (hr == 0 && !out.is_null()).then(|| VolumeTexture::from_raw(out));
+        (hr, texture)
     }
 
     /// `CreateVertexBuffer`, asserting success.
