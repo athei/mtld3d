@@ -6738,6 +6738,47 @@ extern "system" fn device_clear(
         return D3DERR_INVALIDCALL;
     }
 
+    // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
+    // region is additionally clipped to the (non-degenerate) device scissor
+    // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
+    // `scissor_rect()` is stored as [x, y, width, height]; convert to the
+    // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
+    let s = dev.scissor_rect(); // [x, y, width, height]
+    let scissor_on =
+        dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
+    let scissor = (
+        s[0].cast_signed(),
+        s[1].cast_signed(),
+        s[0].saturating_add(s[2]).cast_signed(),
+        s[1].saturating_add(s[3]).cast_signed(),
+    );
+
+    // D3D9 Clear's pRects/Count semantics, shared by every plane:
+    //  - pRects == NULL  → clear the whole target (Count ignored). With the
+    //    scissor on, whole target ∩ scissor == the scissor rect.
+    //  - pRects != NULL, Count == 0 → clear NOTHING (a no-op).
+    //  - pRects != NULL, Count >  0 → clear each rect (∩ scissor if on).
+    // `None` is the whole target; `Some` is an explicit list, already clipped
+    // to the scissor and possibly empty.
+    let regions: Option<Vec<(i32, i32, i32, i32)>> = if rects.is_null() {
+        scissor_on.then(|| vec![scissor])
+    } else {
+        let mut list = if count > 0 {
+            clear_target_rects(count, rects)
+        } else {
+            Vec::new()
+        };
+        if scissor_on {
+            list.retain_mut(|r| {
+                intersect_d3d_rects(*r, scissor).is_some_and(|clipped| {
+                    *r = clipped;
+                    true
+                })
+            });
+        }
+        Some(list)
+    };
+
     if flags & D3DCLEAR_TARGET != 0 {
         // D3DCOLOR is ARGB; unpack to normalized float bits so the encoder
         // can fold them into a Metal `MTLLoadAction::Clear` at pass-begin.
@@ -6754,81 +6795,57 @@ extern "system" fn device_clear(
         let b_bits = f32::to_bits(rgba[2]);
         let a_bits = f32::to_bits(rgba[3]);
 
-        // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
-        // region is additionally clipped to the (non-degenerate) device scissor
-        // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
-        // `scissor_rect()` is stored as [x, y, width, height]; convert to the
-        // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
-        let s = dev.scissor_rect(); // [x, y, width, height]
-        let scissor_on =
-            dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
-        let scissor = (
-            s[0].cast_signed(),
-            s[1].cast_signed(),
-            s[0].saturating_add(s[2]).cast_signed(),
-            s[1].saturating_add(s[3]).cast_signed(),
-        );
-
-        // D3D9 Clear's pRects/Count semantics:
-        //  - pRects == NULL  → clear the whole target (Count ignored). With the
-        //    scissor on, whole target ∩ scissor == the scissor rect.
-        //  - pRects != NULL, Count == 0 → clear NOTHING (a no-op).
-        //  - pRects != NULL, Count >  0 → clear each rect (∩ scissor if on).
         // A combined TARGET|ZBUFFER clear keeps both attachments on the fold
         // path (whole-attachment loadAction); only a colour-ONLY Clear(NULL)
         // honours viewport bounding via a scissored clear-quad, so the depth
         // side is never forced onto the (state-sensitive) clear-quad path.
         let color_only = flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) == 0;
-        if rects.is_null() {
-            if scissor_on {
-                let rects = vec![scissor];
+        match &regions {
+            None if color_only => dev.push_op(Box::new(move |enc| {
+                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
+            })),
+            None => dev.push_op(Box::new(move |enc| {
+                enc.clear_color(r_bits, g_bits, b_bits, a_bits);
+            })),
+            Some(list) if list.is_empty() => {}
+            Some(list) => {
+                let rects = list.clone();
                 dev.push_op(Box::new(move |enc| {
                     enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, &rects);
                 }));
-            } else if color_only {
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
-                }));
-            } else {
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_color(r_bits, g_bits, b_bits, a_bits);
-                }));
             }
-        } else if count > 0 {
-            let mut rects = clear_target_rects(count, rects);
-            if scissor_on {
-                rects.retain_mut(|r| {
-                    intersect_d3d_rects(*r, scissor).is_some_and(|clipped| {
-                        *r = clipped;
-                        true
-                    })
-                });
-            }
-            dev.push_op(Box::new(move |enc| {
-                enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, &rects);
-            }));
         }
     }
 
     let z_bits = f32::to_bits(z);
     // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
     let stencil = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
-    let clear_z = flags & D3DCLEAR_ZBUFFER != 0;
-    let clear_s = flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil();
-    match (clear_z, clear_s) {
+    let depth_plane = (flags & D3DCLEAR_ZBUFFER != 0).then_some(z_bits);
+    let stencil_plane =
+        (flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil()).then_some(stencil);
+    match (regions, depth_plane, stencil_plane) {
+        (_, None, None) => {}
+        // Explicit regions (or the scissor) bound the depth/stencil clear
+        // exactly as they bound the colour clear: one scissored quad per rect.
+        (Some(list), depth, stencil) => {
+            if !list.is_empty() {
+                dev.push_op(Box::new(move |enc| {
+                    enc.clear_depth_stencil_rects(depth, stencil, &list);
+                }));
+            }
+        }
         // Both planes in one op so a mid-frame clear paints one quad:
         // shadow-volume renderers clear depth and stencil together between
         // lights.
-        (true, true) => dev.push_op(Box::new(move |enc| {
+        (None, Some(z_bits), Some(stencil)) => dev.push_op(Box::new(move |enc| {
             enc.clear_depth_stencil(z_bits, stencil);
         })),
-        (true, false) => dev.push_op(Box::new(move |enc| {
+        (None, Some(z_bits), None) => dev.push_op(Box::new(move |enc| {
             enc.clear_depth(z_bits);
         })),
-        (false, true) => dev.push_op(Box::new(move |enc| {
+        (None, None, Some(stencil)) => dev.push_op(Box::new(move |enc| {
             enc.clear_stencil(stencil);
         })),
-        (false, false) => {}
     }
 
     0 // S_OK

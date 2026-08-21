@@ -2478,6 +2478,54 @@ impl FrameEncoder {
         }
     }
 
+    /// Depth and/or stencil `Clear` with explicit `pRects`: clip each rect to the viewport.
+    ///
+    /// The depth-stencil mirror of `clear_color_rects`: one scissored
+    /// clear-quad per surviving region, through
+    /// `PassState::begin_region_depth_stencil_clear` so the pass is open
+    /// before any draw and pixels outside the rects keep their content.
+    /// `rects` are the game's own; they are converted to the bound texture's
+    /// space before clipping. `depth`/`stencil` carry the f32 bits / the
+    /// masked stencil value of the planes being cleared.
+    pub fn clear_depth_stencil_rects(
+        &mut self,
+        depth: Option<u32>,
+        stencil: Option<u32>,
+        rects: &[(i32, i32, i32, i32)],
+    ) {
+        let scale = self.pass_state.target_scale();
+        let vp = self.pass_state.effective_viewport();
+        let regions: Vec<(u32, u32, u32, u32)> = rects
+            .iter()
+            .map(|&rc| {
+                if scale.is_identity() {
+                    rc
+                } else {
+                    scale.rect_edges_i32(rc)
+                }
+            })
+            .filter_map(|rc| clip_rect_to_viewport(rc, vp))
+            .collect();
+        if regions.is_empty() {
+            return;
+        }
+        let passes_before = self.pass_state.passes().len();
+        let Some((has_color, color_format)) = self.pass_state.begin_region_depth_stencil_clear()
+        else {
+            return;
+        };
+        self.reset_last_bound_if_pass_opened(passes_before);
+        for region in regions {
+            self.emit_clear_quad_depth_stencil_inner(
+                depth,
+                stencil,
+                region,
+                has_color,
+                color_format,
+            );
+        }
+    }
+
     pub fn clear_depth(&mut self, value: u32) {
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_depth(value) {

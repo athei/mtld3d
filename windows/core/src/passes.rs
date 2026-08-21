@@ -2423,6 +2423,53 @@ impl PassState {
         self.current_color_format
     }
 
+    /// Open (or reuse) the pass for a depth/stencil `Clear` with explicit `pRects` sub-regions.
+    ///
+    /// The depth/stencil mirror of [`Self::begin_region_color_clear`]: a
+    /// rect-clear can never fold into a whole-attachment `loadAction =
+    /// Clear`, so a freshly opened pass loads both planes unless a pending
+    /// whole-attachment clear is due to land under the rect quads (which
+    /// `ensure_pass_open` has just turned into the load action, and which
+    /// must stay). A pass that was already open keeps its committed load
+    /// actions. The caller then paints one scissored clear-quad per clipped
+    /// rect. Returns whether the pass carries a colour attachment and its
+    /// format, which the quad pipeline key needs; `None` when no
+    /// depth-stencil is bound (nothing to clear).
+    pub fn begin_region_depth_stencil_clear(&mut self) -> Option<(bool, PixelFormat)> {
+        if self.current_depth_texture.is_null() {
+            return None;
+        }
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("region_depth_clear_vis");
+        }
+        let was_closed = self.current_pass_closed();
+        let had_pending_depth = self.pending_depth_clear.is_some();
+        let had_pending_stencil = self.pending_stencil_clear.is_some();
+        self.ensure_pass_open();
+        if was_closed && let Some(pass) = self.passes.last_mut() {
+            if !had_pending_depth
+                && matches!(
+                    pass.depth_load,
+                    DepthLoad::Clear { .. } | DepthLoad::DontCare
+                )
+            {
+                pass.depth_load = DepthLoad::Load;
+            }
+            if !had_pending_stencil
+                && matches!(
+                    pass.stencil_load,
+                    StencilLoad::Clear { .. } | StencilLoad::DontCare
+                )
+            {
+                pass.stencil_load = StencilLoad::Load;
+            }
+        }
+        Some((
+            !self.current_color_texture.is_null(),
+            self.current_color_format,
+        ))
+    }
+
     /// Apply a depth clear.
     ///
     /// Mirrors `clear_color` semantics for the depth attachment's load
@@ -4603,6 +4650,40 @@ mod tests {
             s.passes()[0].color_load(),
             ColorLoad::Clear { .. }
         ));
+    }
+
+    #[test]
+    fn region_depth_clear_as_first_touch_loads_instead_of_dontcare() {
+        // The depth mirror of `region_clear_as_first_touch_loads_instead_of_
+        // dontcare`: the rect quads cover only the rects, so the pass opens
+        // with `Load` on both planes.
+        let mut s = fresh();
+        let target = s.begin_region_depth_stencil_clear();
+        assert!(target.is_some());
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::Load);
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
+    }
+
+    #[test]
+    fn region_depth_clear_after_pending_full_clear_keeps_the_clear() {
+        // `Clear(NULL, 1.0)` then `Clear(rects, 0.0)`: the pending whole-
+        // attachment depth clear lands under the rect quads.
+        let mut s = fresh();
+        let z = f32::to_bits(1.0);
+        s.clear_depth(z);
+        s.begin_region_depth_stencil_clear();
+        assert!(matches!(
+            s.passes()[0].depth_load(),
+            DepthLoad::Clear { value } if value == z
+        ));
+    }
+
+    #[test]
+    fn region_depth_clear_without_depth_attachment_is_noop() {
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+        assert!(s.begin_region_depth_stencil_clear().is_none());
+        assert!(s.passes().is_empty());
     }
 
     #[test]

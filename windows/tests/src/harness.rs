@@ -370,6 +370,35 @@ impl Harness {
         }
     }
 
+    /// `Clear` with explicit flags / colour / depth / stencil restricted to `pRects`.
+    ///
+    /// # Panics
+    ///
+    /// If `rects` holds more than `u32::MAX` entries, which no test writes.
+    pub fn clear_rects(
+        &self,
+        flags: u32,
+        color: u32,
+        z: f32,
+        stencil: u32,
+        rects: &[D3DRECT],
+    ) -> i32 {
+        let count = u32::try_from(rects.len()).expect("test rect count fits u32");
+        // SAFETY: vtable thunk; `rects` is a live slice of `count` D3DRECTs,
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().clear)(
+                self.device,
+                count,
+                rects.as_ptr().cast(),
+                flags,
+                color,
+                z,
+                stencil,
+            )
+        }
+    }
+
     /// `Clear(D3DCLEAR_TARGET)` to a solid colour.
     pub fn clear_target(&self, color: u32) -> i32 {
         self.clear(D3DCLEAR_TARGET, color, 1.0, 0)

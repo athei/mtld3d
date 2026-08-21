@@ -303,6 +303,70 @@ fn create_depth_stencil_surface_succeeds() {
 }
 
 #[test]
+fn depth_clear_with_rects_touches_only_the_rects() {
+    // `Clear(D3DCLEAR_ZBUFFER, pRects)` clears depth inside the rects and
+    // leaves the rest of the attachment alone, like a colour clear does.
+    let h = Harness::with_depth();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_half = [D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 320,
+        y2: 480,
+    }];
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0, &left_half),
+        0,
+        "rect-bounded depth clear"
+    );
+
+    // A full-screen quad at 0.5 passes only where depth stayed 1.0.
+    let cover = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.read_pixel(160, 240),
+        BLACK,
+        "inside the rect depth is 0.0 and rejects the quad"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        GREEN,
+        "outside the rect depth keeps 1.0 and accepts the quad"
+    );
+}
+
+#[test]
 fn stretch_rect_addresses_source_and_destination_mip_levels() {
     // A StretchRect between surfaces that are upper mip levels reads and
     // writes those levels, on both the scaling and the 1:1 path.
