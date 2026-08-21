@@ -52,18 +52,29 @@ const CRASH_MARKERS: &[&str] = &[
 /// process, so it is always a crash.
 const PANIC_MARKER: &str = "panicked at";
 
+/// The end-of-run summary every Wine test prints, whatever its outcome.
+///
+/// `<name>: N tests executed (M marked as todo, F failures), S skipped.`
+/// Its absence means the process ended before the framework did: an
+/// unhandled Win32 exception exits the process with a status code rather than
+/// a signal, prints nothing under `WINEDEBUG=-all`, and leaves every later
+/// test unrun. Counting such a run as a clean one would record a truncated
+/// baseline.
+const SUMMARY_MARKER: &str = " tests executed (";
+
 /// Scan combined stdout+stderr for failing sites and a crash bit.
 ///
 /// `signaled` is set when the spawned process died by a fatal signal — a
 /// crash signal independent of stdout. Crash markers are only honoured on lines
 /// that are *not* themselves failure lines, so a failure message that happens to
-/// quote a signal name cannot false-positive the crash bit.
+/// quote a signal name cannot false-positive the crash bit. Output without the
+/// end-of-run summary is a crash too, whatever else it holds.
 #[must_use]
 pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
     let mut sites: BTreeMap<Site, u32> = BTreeMap::new();
     let mut flaky_marked: BTreeMap<Site, u32> = BTreeMap::new();
     let mut todo_marked: BTreeMap<Site, u32> = BTreeMap::new();
-    let mut crash = signaled;
+    let mut crash = signaled || !output.contains(SUMMARY_MARKER);
     let mut panic: Option<String> = None;
     // The Rust panic message sits on the line *after* the `panicked at` header
     // (`panicked at <loc>:\n<message>`); set when the header is seen so the next
@@ -225,7 +236,8 @@ mod tests {
             "device.c:5368: Test failed: Got 1.\n\
              device.c:5406: Test marked flaky: Didn't receive MOUSEMOVE 7 (0, 0).\n\
              device.c:5406: Test marked flaky: Didn't receive MOUSEMOVE 7 (0, 0).\n\
-             visual.c:15668: Test marked todo: Got unexpected colour 0x00fefe00.\n",
+             visual.c:15668: Test marked todo: Got unexpected colour 0x00fefe00.\n\
+             0104:device: 9 tests executed (1 marked as todo, 0 as flaky, 1 failures), 0 skipped.\n",
             false,
         );
         // The real failure is counted; neither marked line inflates `sites`.
@@ -238,8 +250,31 @@ mod tests {
     }
 
     #[test]
+    fn output_without_the_end_of_run_summary_is_a_crash() {
+        // A process that dies of an unhandled Win32 exception exits without a
+        // signal and prints nothing under `WINEDEBUG=-all`; the only trace is
+        // the missing summary line.
+        let out = parse_subtest_output(
+            "device.c:6210: Test failed: Failed to get volume container, hr 0x80004002.\n",
+            false,
+        );
+        assert!(out.crash, "no summary line means the run was cut short");
+        assert_eq!(out.sites.get(&site("device.c", 6210)), Some(&1));
+        let out = parse_subtest_output(
+            "device.c:6210: Test failed: Failed to get volume container, hr 0x80004002.\n\
+             03e4:device: 159651 tests executed (102 marked as todo, 1 as flaky, 1 failures), 23 skipped.\n",
+            false,
+        );
+        assert!(
+            !out.crash,
+            "the summary line marks a run that reached its end"
+        );
+    }
+
+    #[test]
     fn crash_marker_inside_a_failure_message_does_not_false_positive() {
-        let line = "device.c:1: Test failed: expected no SIGSEGV but the handler saw one\n";
+        let line = "device.c:1: Test failed: expected no SIGSEGV but the handler saw one\n\
+                    0104:device: 1 tests executed (0 marked as todo, 0 as flaky, 1 failures), 0 skipped.\n";
         let out = parse_subtest_output(line, false);
         assert_eq!(out.sites.get(&site("device.c", 1)), Some(&1));
         assert!(
