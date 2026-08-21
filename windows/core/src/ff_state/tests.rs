@@ -1,41 +1,10 @@
-mod inverse {
-    use mtld3d_types::D3DMATRIX;
-
-    use crate::ff_state::FfState;
-
-    fn assert_close(a: &D3DMATRIX, b: &D3DMATRIX) {
-        for (x, y) in a.m.iter().zip(b.m) {
-            assert!((x - y).abs() < 1e-5, "{:?} != {:?}", a.m, b.m);
-        }
-    }
-
-    #[test]
-    fn inverse_undoes_a_translation_and_a_scaled_rotation() {
-        let mut t = D3DMATRIX::IDENTITY;
-        t.m[12] = 3.0;
-        t.m[13] = -2.0;
-        t.m[14] = 7.5;
-        let inv = FfState::inverse(&t).expect("translation is invertible");
-        assert_close(&FfState::mat_mul(&t, &inv), &D3DMATRIX::IDENTITY);
-        // 90-degree rotation about Z scaled by 2, translated.
-        let r = D3DMATRIX {
-            m: [
-                0.0, 2.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 2.0, 3.0, 1.0,
-            ],
-        };
-        let inv = FfState::inverse(&r).expect("rigid transform is invertible");
-        assert_close(&FfState::mat_mul(&r, &inv), &D3DMATRIX::IDENTITY);
-        assert_close(&FfState::mat_mul(&inv, &r), &D3DMATRIX::IDENTITY);
-    }
-
-    #[test]
-    fn singular_matrix_has_no_inverse() {
-        let mut z = D3DMATRIX::IDENTITY;
-        z.m[5] = 0.0;
-        assert!(FfState::inverse(&z).is_none());
-        assert!(FfState::inverse(&D3DMATRIX { m: [0.0; 16] }).is_none());
-    }
-}
+//! Unit tests for the fixed-function state block.
+//!
+//! Pins the light and texture-transform masks the setters maintain (and that a
+//! state-block restore must rebuild), the FF shader keys derived from render
+//! state (fog source, local viewer, texcoord routing past a disabled color op,
+//! vertex blend), sparse lights compacting into dense eye-space shader slots,
+//! and the const-row extent checked against the `vs_c` rows the emitter reads.
 
 use mtld3d_types::{
     D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE,
@@ -1167,4 +1136,43 @@ fn view_change_marks_lights_dirty() {
         dirty.contains(super::FfVsDirty::LIGHTS),
         "a VIEW change must invalidate the eye-space LIGHTS section"
     );
+}
+
+mod inverse {
+    use mtld3d_types::D3DMATRIX;
+
+    use crate::ff_state::FfState;
+
+    fn assert_close(a: &D3DMATRIX, b: &D3DMATRIX) {
+        for (x, y) in a.m.iter().zip(b.m) {
+            assert!((x - y).abs() < 1e-5, "{:?} != {:?}", a.m, b.m);
+        }
+    }
+
+    #[test]
+    fn inverse_undoes_a_translation_and_a_scaled_rotation() {
+        let mut t = D3DMATRIX::IDENTITY;
+        t.m[12] = 3.0;
+        t.m[13] = -2.0;
+        t.m[14] = 7.5;
+        let inv = FfState::inverse(&t).expect("translation is invertible");
+        assert_close(&FfState::mat_mul(&t, &inv), &D3DMATRIX::IDENTITY);
+        // 90-degree rotation about Z scaled by 2, translated.
+        let r = D3DMATRIX {
+            m: [
+                0.0, 2.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 2.0, 3.0, 1.0,
+            ],
+        };
+        let inv = FfState::inverse(&r).expect("rigid transform is invertible");
+        assert_close(&FfState::mat_mul(&r, &inv), &D3DMATRIX::IDENTITY);
+        assert_close(&FfState::mat_mul(&inv, &r), &D3DMATRIX::IDENTITY);
+    }
+
+    #[test]
+    fn singular_matrix_has_no_inverse() {
+        let mut z = D3DMATRIX::IDENTITY;
+        z.m[5] = 0.0;
+        assert!(FfState::inverse(&z).is_none());
+        assert!(FfState::inverse(&D3DMATRIX { m: [0.0; 16] }).is_none());
+    }
 }

@@ -21,6 +21,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `HashMap` / `HashSet` = 0 (maps are `FxHashMap` / `FxHashSet`) | §FxHash for maps, xxh3 for content |
 | `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
+| Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -65,7 +66,7 @@ How to apply:
 - Helpers needing `unix_call` inject it via `fn` pointer or trait, not a direct `mtld3d_shared` import. E.g. `slab::SeqWaiter = fn(&Arc<AtomicU64>, u64)`.
 - "Done" = green host tests, not only a green Windows build.
 
-Refactor signals: a module in `windows/d3d9/src/` has `#[cfg(test)] mod tests` · a function references nothing outside its own args + well-known types · a comment says "wrapper around …" · the same mapping table appears in two `d3d9` modules.
+Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;` · a function references nothing outside its own args + well-known types · a comment says "wrapper around …" · the same mapping table appears in two `d3d9` modules.
 
 ## End every edit cycle with `make fmt` + `make install`
 
@@ -95,6 +96,24 @@ On MSVC i386, `raw-dylib` imports add stdcall decoration (`_Name@N`), but DLL ex
 
 Rust 2018+ module layout. Keeps meaningful filenames in editor tabs.
 
+## Unit tests live in `<stem>/tests.rs`
+
+A module's unit tests are a child module in their own file: `foo.rs` carries the two-line declaration, and the tests themselves live in `foo/tests.rs`.
+
+```rust
+// foo.rs, last item in the file
+#[cfg(test)]
+mod tests;
+```
+
+Never an inline `#[cfg(test)] mod tests { ... }` block. Two reasons. Editing a test then produces a diff against `foo/tests.rs` instead of against the production file, so review and `git blame` on `foo.rs` stay about `foo.rs`; before this rule, `passes.rs` was 7,714 lines of which 3,471 were tests. And nothing is lost by moving them, because a child module still sees every private item of its parent and the module path `foo::tests` is unchanged, so `super::`, `crate::` and private-item access all keep working exactly as they did inline.
+
+Carry the cfg predicate verbatim. `perf.rs` declares `#[cfg(all(test, perf_tracking))] mod tests;`, and weakening that to a plain `#[cfg(test)]` compiles clean while silently dropping the tests from every run.
+
+Two things do not move. A `#[cfg(test)]` helper that is an inherent method on a production type stays in the parent next to that type (`passes.rs` keeps a test-only `emit_scissor`), as does a `#[cfg(test)] pub fn` the tests import through `super::` (`log_helpers.rs` keeps `first_seen`).
+
+Watch relative paths on the way out: `include_str!` resolves against the containing file, so a path that was `../tests/fixtures/x.txt` inline becomes `../../tests/fixtures/x.txt` one directory down.
+
 ## No `pub(crate)` — use module hierarchy
 
 Visibility via module hierarchy: private modules already restrict `pub` items to the crate.
@@ -108,7 +127,7 @@ Visibility via module hierarchy: private modules already restrict `pub` items to
 5. `unsafe extern "ABI" { ... }` blocks with `#[link(...)]` attributes (top, not in the private section)
 6. `pub use` re-exports + all `pub` items including `pub mod foo { ... }` inline modules
 7. All private items including private inline `mod foo { ... }` blocks
-8. `#[cfg(test)] mod tests { ... }` last
+8. `#[cfg(test)] mod tests;` last (the one `mod` declaration that does *not* join the group at 3; see §Unit tests live in `<stem>/tests.rs`)
 
 `impl` blocks stay adjacent to their type. Inline `mod foo { ... }` follows the same pub/private rule as other items.
 
@@ -413,7 +432,7 @@ The audit bans `HashMap`, `HashSet`, `DefaultHasher` and `RandomState` outside c
 No glob imports. Explicit named imports only — never `use foo::*`. Two exceptions:
 
 - A `pub use submodule::*` re-export of a crate's **own** constant-definition modules (`mtld3d-types`' `lib.rs` re-exports `device::*` / `direct3d9::*`): the glob is the crate's public API surface, and it lets a new `pub const` land in those modules without a parallel `lib.rs` edit. That is a re-export of in-crate items, not a glob *import* of another module's names into local scope.
-- `use super::*` at the top of a `#[cfg(test)] mod tests` block: the standard Rust idiom for pulling the module-under-test's items into its unit tests. The test module is private, so nothing leaks past the crate, and the glob tracks the parent's surface without churn as items come and go.
+- `use super::*` at the top of a `#[cfg(test)]` test module file (`foo/tests.rs`): the standard Rust idiom for pulling the module-under-test's items into its unit tests. The test module is private, so nothing leaks past the crate, and the glob tracks the parent's surface without churn as items come and go.
 
 ## Inline attributes
 
