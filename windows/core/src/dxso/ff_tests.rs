@@ -94,15 +94,30 @@ fn emits_one_directional_light() {
 
     let ps = default_ps_key();
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
-    // The eye normal uses the D3D9 normal matrix via the cofactor (cross-product)
-    // form, and is NOT renormalized when D3DRS_NORMALIZENORMALS is clear (the
-    // default) — a non-unit model normal scales the lighting.
-    assert!(msl.contains("cross(wvr1, wvr2)"), "{msl}");
-    // The cofactor inputs must be the WV columns (vs_c[i].xyz), NOT the
-    // transposed components — feeding the transpose computes the inverse
-    // rotation and makes lighting swim as the camera turns.
-    assert!(msl.contains("float3 wvr0 = vs_c[0].xyz;"), "{msl}");
-    assert!(!msl.contains("float3(vs_c[0].x, vs_c[1].x"), "{msl}");
+    // The eye normal uses the D3D9 normal matrix, the upper-left block of the
+    // full 4x4 inverse of WV, built from generalised cross products of the
+    // WV columns (`vs_c[0..3]`), and is NOT renormalized when
+    // D3DRS_NORMALIZENORMALS is clear (the default) — a non-unit model normal
+    // scales the lighting.
+    assert!(msl.contains("static inline float4 mtld3d_cross4("), "{msl}");
+    assert!(
+        msl.contains("float4 nadj0 = -mtld3d_cross4(vs_c[1], vs_c[2], vs_c[3]);"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("float4 nadj1 = mtld3d_cross4(vs_c[2], vs_c[3], vs_c[0]);"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("float4 nadj2 = -mtld3d_cross4(vs_c[3], vs_c[0], vs_c[1]);"),
+        "{msl}"
+    );
+    // The inverse rows are applied to the model normal as-is; only the
+    // singular fallback reads the transposed components.
+    assert!(
+        msl.contains("dot(nadj0.xyz, in.v1.xyz), dot(nadj1.xyz, in.v1.xyz), dot(nadj2.xyz, in.v1.xyz)) / nwvdet"),
+        "{msl}"
+    );
     assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(msl.contains("ndotl"), "{msl}");
     assert!(msl.contains("saturate(diffuseAccum)"), "{msl}");
