@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use mtld3d_shared::{
     VertexAttrDesc,
     mtl::{
-        AddressMode, BlendFactor, BlendOperation, ColorWriteMask, CompareFunc, CullMode,
+        AddressMode, BlendFactor, BlendOperation, ColorWriteMask, CompareFunc, CullMode, IndexType,
         MinMagFilter, MipFilter, PrimitiveType, StencilOp, VertexFormat,
     },
 };
@@ -26,11 +26,12 @@ use mtld3d_types::{
     D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3,
     D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1, D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB4,
     D3DFVF_XYZB5, D3DFVF_XYZRHW, D3DFVF_XYZW, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
-    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DSTENCILOP_DECR, D3DSTENCILOP_DECRSAT,
-    D3DSTENCILOP_INCR, D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT, D3DSTENCILOP_KEEP,
-    D3DSTENCILOP_REPLACE, D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP,
-    D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC,
-    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9, MAX_STREAMS,
+    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DSTENCILOP_DECR,
+    D3DSTENCILOP_DECRSAT, D3DSTENCILOP_INCR, D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT,
+    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP,
+    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9,
+    MAX_STREAMS,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -431,14 +432,109 @@ pub fn expand_triangle_fan(src: &[u8], stride: usize, primitive_count: u32) -> V
     out
 }
 
+/// A triangle fan rewritten as a triangle-list index stream.
+///
+/// Built by [`triangle_fan_indices`] / [`triangle_fan_indices_from`] for the
+/// bound-buffer draw paths: the vertices stay in the application's vertex
+/// buffers and only this generated index list is staged per draw.
+pub struct FanIndices {
+    /// `primitive_count * 3` little-endian indices, each `index_type` wide.
+    pub bytes: Vec<u8>,
+    /// `UInt16` when every index fits, `UInt32` otherwise.
+    pub index_type: IndexType,
+    /// Lowest vertex-buffer index the list references.
+    pub min_vertex: u32,
+    /// Highest vertex-buffer index the list references.
+    pub max_vertex: u32,
+}
+
+/// Pack `fan` (the fan's vertices, in order) into triangles `0, i+1, i+2`.
+fn build_fan_indices(fan: &[u32], primitive_count: u32) -> FanIndices {
+    let (min_vertex, max_vertex) = fan
+        .iter()
+        .fold((u32::MAX, 0), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let wide = max_vertex > u32::from(u16::MAX);
+    let index_type = if wide {
+        IndexType::UInt32
+    } else {
+        IndexType::UInt16
+    };
+    let pc = primitive_count as usize;
+    let mut bytes = Vec::with_capacity(pc * 3 * if wide { 4 } else { 2 });
+    let mut push = |v: u32| {
+        if wide {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        } else {
+            let narrow = u16::try_from(v).expect("narrow index stream only when every index fits");
+            bytes.extend_from_slice(&narrow.to_le_bytes());
+        }
+    };
+    for i in 0..pc {
+        push(fan[0]);
+        push(fan[i + 1]);
+        push(fan[i + 2]);
+    }
+    FanIndices {
+        bytes,
+        index_type,
+        min_vertex,
+        max_vertex,
+    }
+}
+
+/// Index stream for a non-indexed triangle fan (`DrawPrimitive`).
+///
+/// Metal has no triangle-fan primitive. The fan's `primitive_count + 2`
+/// vertices sit back-to-back from `start_vertex`, and triangle `i` is fan
+/// vertices `0, i+1, i+2`; the result references them by absolute index.
+/// `None` when the vertex range overflows `u32`.
+#[must_use]
+pub fn triangle_fan_indices(start_vertex: u32, primitive_count: u32) -> Option<FanIndices> {
+    let count = primitive_count.checked_add(2)?;
+    start_vertex.checked_add(count - 1)?;
+    let fan: Vec<u32> = (0..count).map(|k| start_vertex + k).collect();
+    Some(build_fan_indices(&fan, primitive_count))
+}
+
+/// Index stream for an indexed triangle fan (`DrawIndexedPrimitive`).
+///
+/// `src` holds the fan's `primitive_count + 2` application indices, each
+/// `index_size` (2 or 4) bytes, starting at the draw's `StartIndex`.
+/// `base_vertex` is folded into every index so the result is absolute, which
+/// is what the inline-index draw form takes. `None` when `src` is short, the
+/// index size is unknown, or an index leaves `u32` after the base offset.
+#[must_use]
+pub fn triangle_fan_indices_from(
+    src: &[u8],
+    index_size: usize,
+    base_vertex: i32,
+    primitive_count: u32,
+) -> Option<FanIndices> {
+    let count = usize::try_from(primitive_count.checked_add(2)?).ok()?;
+    if src.len() < count.checked_mul(index_size)? {
+        return None;
+    }
+    let mut fan = Vec::with_capacity(count);
+    for k in 0..count {
+        let raw = &src[k * index_size..(k + 1) * index_size];
+        let index = match index_size {
+            2 => u32::from(u16::from_le_bytes([raw[0], raw[1]])),
+            4 => u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            _ => return None,
+        };
+        fan.push(u32::try_from(i64::from(index) + i64::from(base_vertex)).ok()?);
+    }
+    Some(build_fan_indices(&fan, primitive_count))
+}
+
 /// Compute vertex count from D3D9 primitive type and primitive count.
 pub fn vertex_count(d3d_type: u32, primitive_count: u32) -> u32 {
     match d3d_type {
-        D3DPT_POINTLIST => primitive_count,         // point list
-        D3DPT_LINELIST => primitive_count * 2,      // line list
-        D3DPT_LINESTRIP => primitive_count + 1,     // line strip
-        D3DPT_TRIANGLELIST => primitive_count * 3,  // triangle list
-        D3DPT_TRIANGLESTRIP => primitive_count + 2, // triangle strip
+        D3DPT_POINTLIST => primitive_count,        // point list
+        D3DPT_LINELIST => primitive_count * 2,     // line list
+        D3DPT_LINESTRIP => primitive_count + 1,    // line strip
+        D3DPT_TRIANGLELIST => primitive_count * 3, // triangle list
+        D3DPT_TRIANGLESTRIP | D3DPT_TRIANGLEFAN => primitive_count + 2, // strip / fan
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vertex_count: D3DPRIMITIVETYPE {other} unhandled → 0 verts");
             0
@@ -1007,6 +1103,71 @@ mod tests {
         let src = [0u8, 0, 1, 1, 2, 2, 3, 3];
         let out = expand_triangle_fan(&src, 2, 2);
         assert_eq!(out, vec![0, 0, 1, 1, 2, 2, 0, 0, 2, 2, 3, 3]);
+    }
+
+    fn u16_indices(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    fn u32_indices(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn nonindexed_fan_becomes_absolute_u16_triangles() {
+        // DrawPrimitive(FAN, start 10, 3 prims): fan vertices 10..=14.
+        let fan = triangle_fan_indices(10, 3).expect("fits");
+        assert_eq!(fan.index_type, IndexType::UInt16);
+        assert_eq!(
+            u16_indices(&fan.bytes),
+            vec![10, 11, 12, 10, 12, 13, 10, 13, 14]
+        );
+        assert_eq!((fan.min_vertex, fan.max_vertex), (10, 14));
+    }
+
+    #[test]
+    fn fan_widens_to_u32_past_u16_range() {
+        let fan = triangle_fan_indices(0xFFFE, 1).expect("fits");
+        assert_eq!(fan.index_type, IndexType::UInt32);
+        assert_eq!(u32_indices(&fan.bytes), vec![0xFFFE, 0xFFFF, 0x1_0000]);
+        assert!(triangle_fan_indices(u32::MAX - 1, 1).is_none());
+    }
+
+    #[test]
+    fn indexed_fan_folds_the_base_vertex_in() {
+        // 16-bit app indices 5,6,7,8 with base vertex 100: triangles over
+        // 105..=108.
+        let src: Vec<u8> = [5u16, 6, 7, 8]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let fan = triangle_fan_indices_from(&src, 2, 100, 2).expect("fits");
+        assert_eq!(fan.index_type, IndexType::UInt16);
+        assert_eq!(u16_indices(&fan.bytes), vec![105, 106, 107, 105, 107, 108]);
+        assert_eq!((fan.min_vertex, fan.max_vertex), (105, 108));
+        // A negative base is legal as long as no index goes below zero.
+        let fan = triangle_fan_indices_from(&src, 2, -5, 2).expect("fits");
+        assert_eq!(u16_indices(&fan.bytes), vec![0, 1, 2, 0, 2, 3]);
+        assert!(triangle_fan_indices_from(&src, 2, -6, 2).is_none());
+    }
+
+    #[test]
+    fn indexed_fan_reads_32_bit_indices_and_rejects_short_streams() {
+        let src: Vec<u8> = [1u32, 2, 0x2_0000]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let fan = triangle_fan_indices_from(&src, 4, 0, 1).expect("fits");
+        assert_eq!(fan.index_type, IndexType::UInt32);
+        assert_eq!(u32_indices(&fan.bytes), vec![1, 2, 0x2_0000]);
+        assert!(triangle_fan_indices_from(&src, 4, 0, 2).is_none());
+        assert!(triangle_fan_indices_from(&src, 3, 0, 1).is_none());
     }
 
     fn pos3() -> D3DVERTEXELEMENT9 {

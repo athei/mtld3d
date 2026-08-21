@@ -13,7 +13,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `smoke.rs` | Clear-to-colour fill; `DrawPrimitiveUP` triangle with interpolated diffuse. |
 | `device.rs` | `Direct3DCreate9`; adapter count/identifier/display-mode; `GetAdapterModeCount`/`EnumAdapterModes` (valid + out-of-range); `CheckDeviceType`/`CheckDeviceFormat`/`CheckDeviceFormatConversion` (accept + reject); `GetDeviceCaps` sanity (SM2 sub-structs at the ps_2_0 floor, cube/volume filter and address caps, no VTF and `QUERY_VERTEXTEXTURE` rejected to match); `TestCooperativeLevel`; `Reset` (0×0 reject, same-size state-default restore, resize, fullscreen monitor-rect + style adoption and restore, fullscreen ignores the requested resolution, undrawn post-resize `Present` reads back black). |
 | `clear_present.rs` | (folded into smoke/device — clear flags exercised via `clear`). |
-| `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle-fan + `DrawIndexedPrimitiveUP` + `ProcessVertices` stubs. |
+| `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle fans through `DrawPrimitiveUP`, `DrawPrimitive` (bound stream, `StartVertex`) and `DrawIndexedPrimitive` (bound 16-bit indices, `StartIndex` + `BaseVertexIndex`), all rewritten as triangle lists; `DrawIndexedPrimitiveUP`; `ProcessVertices` stubs. |
 | `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices` round-trips including higher streams and the NULL-bind offset/stride retention. |
 | `streams.rs` | A two-stream declaration through a programmable VS; the `SetStreamSourceFreq` contract (defaults, rejections leaving state untouched, flag round-trip); instanced indexed draws (count from stream 0, per-instance step rate, non-indexed draws never instance, no per-instance stream means one instance); recorded and `D3DSBT_ALL` state blocks restoring stream bindings and frequencies. |
 | `render_states.rs` | Alpha + additive blend; COLORWRITEENABLE mask; scissor; cull-mode winding; defaults vs `render_state_defaults()`; set/get round-trip; stencil round-trip; stencil test gating a draw; stencil clear preserving depth; combined depth+stencil mid-frame clear resetting both planes; stencil reference compared through the mask; stencil clear and test against a depth-only surface; wireframe no-op (pinned).; a Clear after a draw in the same pass (clear quad) surviving the draw's cull mode. |
@@ -36,8 +36,7 @@ These return `D3DERR_INVALIDCALL` (or are no-ops) by design — the target
 workload does not need them, or Metal cannot represent them. Tests pin the
 contract so a future implementation flips a known assertion.
 
-- **Draw:** `DrawIndexedPrimitiveUP`, `ProcessVertices`; `D3DPT_TRIANGLEFAN`
-  (no Metal fan primitive).
+- **Draw:** `DrawIndexedPrimitiveUP`, `ProcessVertices`.
 - **Textures:** ATI1 and YUV cubes are CPU-only `D3DPOOL_SCRATCH` resources;
   GPU-backed cubes support mapped color and DXT formats. `SetLOD` is a
   managed-pool-only no-op.

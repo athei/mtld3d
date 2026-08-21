@@ -3944,6 +3944,15 @@ impl FrameEncoder {
                 index_type,
                 ..
             } => format!("ib=UP idx={index_count} {index_type:?}"),
+            IndexSource::Generated {
+                index_count,
+                index_type,
+                min_vertex,
+                max_vertex,
+                ..
+            } => {
+                format!("ib=fan idx={index_count} {index_type:?} verts={min_vertex}..={max_vertex}")
+            }
         };
         trace!(
             target: DRAW_TRACE_TARGET,

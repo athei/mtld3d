@@ -7780,6 +7780,17 @@ extern "system" fn device_draw_primitive(
     if !has_vertex_layout_source(dev) {
         return D3DERR_INVALIDCALL;
     }
+    // Triangle fan has no Metal primitive: rewrite it as a triangle-list index
+    // stream over the bound streams. Kept off the (non-fan) hot path below.
+    if primitive_type == D3DPT_TRIANGLEFAN {
+        if primitive_count == 0 {
+            return D3DERR_INVALIDCALL;
+        }
+        let Some(fan) = convert::triangle_fan_indices(start_vertex, primitive_count) else {
+            return D3DERR_INVALIDCALL;
+        };
+        return draw_bound_triangle_fan(&obj, fan, primitive_count, D3DERR_INVALIDCALL);
+    }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;
     };
@@ -7810,6 +7821,99 @@ extern "system" fn device_draw_primitive(
     D3D_OK
 }
 
+/// Emit a bound-stream triangle fan as a generated triangle-list index draw.
+///
+/// `DrawPrimitive` and `DrawIndexedPrimitive` hand their fans here with the
+/// rewritten index list; the vertices stay the bound streams, snapshotted
+/// exactly as for any other bound draw. `no_vertex_buffer_hr` is what the
+/// caller returns when no named stream has a buffer (the two entry points
+/// differ there, see `device_draw_indexed_primitive`).
+fn draw_bound_triangle_fan(
+    obj: &Direct3DDevice9,
+    fan: convert::FanIndices,
+    primitive_count: u32,
+    no_vertex_buffer_hr: i32,
+) -> i32 {
+    // Flush any bound buffer that's drawn while still mapped, before the draw
+    // snapshot reads it.
+    flush_mapped_bound_buffers(obj.inner());
+    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
+    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let Some(vertex_source) = snapshot_bound_vertex_source(obj.inner()) else {
+        warn!(target: LOG_TARGET, "triangle fan: no vertex buffer bound");
+        return no_vertex_buffer_hr;
+    };
+    emit_snapshot_deltas(obj);
+    drop(snap);
+    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    obj.inner().push_op_inline(Op::Draw(DrawOp {
+        metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
+        vertex_source,
+        index_source: IndexSource::Generated {
+            bytes: fan.bytes,
+            index_count: primitive_count * 3,
+            index_type: fan.index_type,
+            min_vertex: fan.min_vertex,
+            max_vertex: fan.max_vertex,
+        },
+    }));
+    D3D_OK
+}
+
+/// Rewrite the fan a `DrawIndexedPrimitive` addresses in the bound index buffer.
+///
+/// Reads the application's indices straight from the buffer's CPU-side backing,
+/// which is current under both map modes (the `Direct` box is the GPU memory
+/// itself, the `Staged` box is the copy every Lock writes), so no GPU round
+/// trip is needed. `None`, with a warn, when nothing is bound, the format is
+/// unknown, or the draw reads past the buffer.
+fn bound_index_fan(
+    dev: &DeviceInner,
+    start_index: u32,
+    base_vertex: i32,
+    primitive_count: u32,
+) -> Option<convert::FanIndices> {
+    let ptr = dev.bound_buffers().index_buffer();
+    if ptr.is_null() {
+        warn!(target: LOG_TARGET, "DrawIndexedPrimitive: no index buffer bound");
+        return None;
+    }
+    // SAFETY: `ptr` is non-null (checked above) and points to a live
+    // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
+    let inner = unsafe { &*ptr }.inner();
+    let index_size: u64 = match inner.format() {
+        D3DFMT_INDEX16 => 2,
+        D3DFMT_INDEX32 => 4,
+        other => {
+            warn!(
+                target: LOG_TARGET,
+                "DrawIndexedPrimitive: unsupported index format {other}"
+            );
+            return None;
+        }
+    };
+    let first = u64::from(start_index) * index_size;
+    let len = (u64::from(primitive_count) + 2) * index_size;
+    if first + len > inner.current_backing_len() {
+        warn!(
+            target: LOG_TARGET,
+            "DrawIndexedPrimitive: triangle fan reads past the index buffer (start {start_index}, {primitive_count} primitives)"
+        );
+        return None;
+    }
+    let base = usize::try_from(inner.current_backing_ptr() + first).ok()?;
+    let len = usize::try_from(len).ok()?;
+    // SAFETY: `[first, first + len)` lies inside the live backing box (checked
+    // above); the API thread owns CPU access to it while the buffer is bound.
+    let src = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+    convert::triangle_fan_indices_from(
+        src,
+        usize::try_from(index_size).ok()?,
+        base_vertex,
+        primitive_count,
+    )
+}
+
 extern "system" fn device_draw_indexed_primitive(
     this: *mut c_void,
     primitive_type: u32,
@@ -7827,6 +7931,20 @@ extern "system" fn device_draw_indexed_primitive(
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
         return D3DERR_INVALIDCALL;
+    }
+    // Triangle fan has no Metal primitive: rewrite the addressed indices as a
+    // triangle list over the bound streams. Kept off the (non-fan) hot path.
+    if primitive_type == D3DPT_TRIANGLEFAN {
+        if primitive_count == 0 {
+            return D3DERR_INVALIDCALL;
+        }
+        let Some(fan) = bound_index_fan(dev, start_index, base_vertex_index, primitive_count)
+        else {
+            return D3DERR_INVALIDCALL;
+        };
+        // A valid declaration with no stream bound is S_OK for indexed draws,
+        // same as the non-fan path below.
+        return draw_bound_triangle_fan(&obj, fan, primitive_count, D3D_OK);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;

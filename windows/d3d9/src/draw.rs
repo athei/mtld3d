@@ -238,6 +238,21 @@ pub enum IndexSource {
         /// Signed — D3D9 explicitly allows negative values.
         base_vertex: i32,
     },
+    /// Indexed draw over the bound vertex streams with a generated index list.
+    ///
+    /// Triangle fans from `DrawPrimitive` / `DrawIndexedPrimitive`: Metal has
+    /// no fan primitive, so the API thread rewrites the fan as a triangle-list
+    /// index stream (`convert::triangle_fan_indices*`) that the encoder stages
+    /// like `Up` indices, while the vertices stay the bound buffers. The
+    /// indices are absolute, and `min_vertex..=max_vertex` is the vertex span
+    /// they reference, which gives the exact VB read range.
+    Generated {
+        bytes: Vec<u8>,
+        index_count: u32,
+        index_type: IndexType,
+        min_vertex: u32,
+        max_vertex: u32,
+    },
     /// Indexed draw from an inline (user-pointer) index stream (`DrawIndexedPrimitiveUP`).
     ///
     /// The bytes are copied per draw and uploaded via the encoder scratch
@@ -1786,6 +1801,22 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                         *base_vertex,
                         *index_count,
                     ),
+                    // A generated index list knows exactly which vertices it
+                    // references, so the range is as tight as a non-indexed
+                    // draw's.
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::Generated {
+                            min_vertex,
+                            max_vertex,
+                            ..
+                        },
+                    ) => nonindexed_vb_range(
+                        b.offset,
+                        layout.stride,
+                        *min_vertex,
+                        max_vertex - min_vertex + 1,
+                    ),
                     // `Up` indices only ever pair with `VertexSource::Up`,
                     // never a bound VB, so this arm is unreachable in
                     // practice; record no read range.
@@ -1901,11 +1932,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             bytes,
             index_count,
             index_type,
+        }
+        | IndexSource::Generated {
+            bytes,
+            index_count,
+            index_type,
+            ..
         } => {
             // Inline index stream: stage the bytes in the per-frame scratch
             // arena and let the unix side wrap them in a transient MTLBuffer
-            // (Metal has no inline-index draw form). The paired vertices were
-            // already bound above via `VertexSource::Up`.
+            // (Metal has no inline-index draw form). The vertices were
+            // already bound above: `VertexSource::Up` for `Up` indices, the
+            // application's buffers for a `Generated` list.
             let scratch_ptr = enc.alloc_scratch(&bytes);
             let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             enc.emit_command(Command::draw_indexed_primitives_up(

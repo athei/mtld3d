@@ -53,7 +53,8 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Fog**: vertex fog and per-pixel table fog, across the fixed-function,
   pre-transformed (RHW), and programmable paths.
 - **All four draw paths**: DrawPrimitive / DrawIndexedPrimitive and both UP
-  variants.
+  variants, every primitive type including triangle fans (rewritten as
+  triangle lists, which Metal lacks).
 - **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
   per-stream offsets and strides; a declared stream with nothing bound reads
   zeros, as on hardware.
