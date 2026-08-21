@@ -7,11 +7,12 @@ use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, ass
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
     D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
-    D3DFMT_X8R8G8B8, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
+    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ,
+    D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE,
+    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    DevCaps, TextureCaps,
 };
 
 #[test]
@@ -184,6 +185,74 @@ fn check_format_conversion() {
         h.check_device_format_conversion(D3DFMT_A8R8G8B8, D3DFMT_DXT1),
         D3DERR_NOTAVAILABLE,
         "mismatched conversion must reject",
+    );
+    // StretchRect converts any renderable colour format and the packed YUV
+    // formats into a renderable colour format (render-quad sample/decode),
+    // so the query says so, as every desktop driver does for these rows.
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
+        D3D_OK,
+        "R5G6B5 -> X8R8G8B8 is a supported StretchRect conversion",
+    );
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_YUY2, D3DFMT_X8R8G8B8),
+        D3D_OK,
+        "YUY2 -> X8R8G8B8 is decoded by the StretchRect render quad",
+    );
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_UYVY, D3DFMT_R5G6B5),
+        D3D_OK,
+        "UYVY -> R5G6B5 is decoded by the StretchRect render quad",
+    );
+    // Only renderable colour formats are conversion targets: YUV and
+    // luminance destinations reject.
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_X8R8G8B8, D3DFMT_YUY2),
+        D3DERR_NOTAVAILABLE,
+        "RGB -> YUY2 is not a conversion target",
+    );
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_X8R8G8B8, D3DFMT_L8),
+        D3DERR_NOTAVAILABLE,
+        "RGB -> L8 is not a conversion target",
+    );
+    // A format converts to itself, L8 included.
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_L8, D3DFMT_L8),
+        D3D_OK,
+        "identity conversion holds for non-RGB formats too",
+    );
+}
+
+#[test]
+fn windowed_device_type_follows_format_conversion() {
+    // The runtime requires windowed CheckDeviceType to equal
+    // CheckDeviceFormat(RT, bb) && CheckDeviceFormatConversion(bb, display),
+    // so a 16-bit windowed backbuffer on a 32-bit display is advertised
+    // (CreateDevice substitutes the BGRA8 layer format for it). Fullscreen has
+    // no present conversion and keeps rejecting the pair.
+    let h = Harness::factory_only();
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
+        D3D_OK,
+        "precondition: the conversion is supported",
+    );
+    assert_eq!(
+        h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, true),
+        D3D_OK,
+        "windowed R5G6B5 backbuffer on an X8R8G8B8 display follows the conversion predicate",
+    );
+    assert_eq!(
+        h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, false),
+        D3DERR_NOTAVAILABLE,
+        "fullscreen has no present conversion: the pair stays rejected",
+    );
+    // A conversion source that is not a render target (YUY2) is never a
+    // backbuffer, windowed or not.
+    assert_eq!(
+        h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_YUY2, true),
+        D3DERR_NOTAVAILABLE,
+        "YUY2 converts but is not renderable, so it is no backbuffer",
     );
 }
 
