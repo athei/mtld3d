@@ -1,7 +1,7 @@
 use core::{ffi::c_void, mem::MaybeUninit, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use log::{debug, error, info, trace, warn};
@@ -276,6 +276,12 @@ bitflags::bitflags! {
         /// `EndScene` without an open scene both return `D3DERR_INVALIDCALL`.
         /// Rendering does not otherwise depend on scene state.
         const IN_SCENE = 1 << 1;
+        /// Set by a `Reset` that failed after validating its parameters.
+        ///
+        /// `TestCooperativeLevel` reports `D3DERR_DEVICENOTRESET` until a
+        /// later `Reset` succeeds, which is how an app learns it must retry
+        /// (after releasing the `D3DPOOL_DEFAULT` resources that blocked it).
+        const NOT_RESET = 1 << 2;
     }
 }
 
@@ -414,6 +420,13 @@ pub struct DeviceInner {
     /// `VRAM_BUDGET - this`, so the value visibly decreases as the app
     /// allocates GPU resources.
     vram_bytes_used: Arc<AtomicU64>,
+    /// Number of `D3DPOOL_DEFAULT` resources and implicit surfaces the app holds a reference to.
+    ///
+    /// Maintained by the COM engine on each such object's public 0↔1
+    /// refcount edge (`ComChild::blocks_reset_while_referenced`); the
+    /// device's own bind slots never count. `Reset` fails with
+    /// `D3DERR_INVALIDCALL` while it is non-zero, as D3D9 requires.
+    outstanding_reset_blockers: AtomicU32,
     /// Monotonic submit seq.
     ///
     /// Each `present()` bumps this before stamping it onto the outgoing
@@ -2159,6 +2172,7 @@ impl Direct3DDevice9 {
             upload_coherent_seq,
             vbib_retained_bytes,
             vram_bytes_used: Arc::new(AtomicU64::new(0)),
+            outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.
             current_seq: 1,
             perf: ApiPerfState::new(),
@@ -2803,6 +2817,29 @@ pub fn device_wrapper_add_ref(wrapper: *mut c_void) {
     unsafe { (*wrapper.cast::<Direct3DDevice9>()).add_ref_self() };
 }
 
+/// Record that the app acquired (`true`) or dropped (`false`) its reference to a `Reset` blocker.
+///
+/// Fired by the COM engine on the public 0↔1 edge of a child whose
+/// `blocks_reset_while_referenced` is set; `wrapper` is that child's
+/// forwarding device (null when the child has none, a no-op).
+pub fn device_wrapper_note_reset_blocker(wrapper: *mut c_void, acquired: bool) {
+    if wrapper.is_null() {
+        return;
+    }
+    // SAFETY: `wrapper` is the live `Direct3DDevice9` that owns the forwarding
+    // child; the counter is atomic, so a shared borrow suffices.
+    let counter = unsafe {
+        &(*wrapper.cast::<Direct3DDevice9>())
+            .inner()
+            .outstanding_reset_blockers
+    };
+    if acquired {
+        counter.fetch_add(1, Ordering::AcqRel);
+    } else {
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Forward an implicit child object's `Release` to its owning device wrapper.
 ///
 /// Fires on the child's 1→0 transition. Counterpart to
@@ -2834,7 +2871,16 @@ struct ParentIUnknownVtbl {
 
 extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    0 // S_OK
+    // The device is never lost (no exclusive mode is ever taken), so the only
+    // non-OK answer is the latch a failed `Reset` leaves behind.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let not_reset = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        .is_some_and(|obj| obj.inner().flags.contains(DeviceFlags::NOT_RESET));
+    if not_reset {
+        mtld3d_types::D3DERR_DEVICENOTRESET
+    } else {
+        D3D_OK
+    }
 }
 
 extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
@@ -3094,6 +3140,20 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return D3DERR_INVALIDCALL;
+    }
+    // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
+    // resource or an implicit surface: those are backed by the device memory
+    // the Reset recreates, and D3D9 makes the app release them first. The
+    // device's own bindings do not count (they are reset below on success).
+    let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
+    if blockers != 0 {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset — {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still referenced",
+        );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
     // Window transition first, then size against the window it produced: a
@@ -3124,6 +3184,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}, fmt={}) — zero-dim present params",
             pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
         );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
 
@@ -3156,6 +3217,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp) {
+            dev.flags.insert(DeviceFlags::NOT_RESET);
             return hr;
         }
     } else {
@@ -3170,6 +3232,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
+            dev.flags.insert(DeviceFlags::NOT_RESET);
             return hr;
         }
         debug!(
@@ -3193,6 +3256,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // 7. Reset device state to D3D9 defaults. Cursor + silent-write
     //    warn latches survive (per-spec / process-lifetime telemetry).
     dev.reset_to_defaults();
+    dev.flags.remove(DeviceFlags::NOT_RESET);
 
     // 8. Reseed `current_frame` so it carries the new backbuffer/depth
     //    handles. The post-flush frame still referenced the destroyed

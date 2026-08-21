@@ -29,7 +29,9 @@ use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
 use mtld3d_shared::VtableThis;
 
-use crate::device::{device_wrapper_add_ref, device_wrapper_release};
+use crate::device::{
+    device_wrapper_add_ref, device_wrapper_note_reset_blocker, device_wrapper_release,
+};
 
 /// COM types whose vtable starts with the `IUnknown` head.
 ///
@@ -259,6 +261,18 @@ pub unsafe trait ComChild: Sized {
         true
     }
 
+    /// Whether an outstanding public reference to this object blocks `Reset`.
+    ///
+    /// True for a `D3DPOOL_DEFAULT` resource and for the device's implicit
+    /// surfaces: D3D9 rejects `Reset` while the app still holds any of them.
+    /// The engine counts such objects on the owning device across their
+    /// public 0↔1 edges (`AddRef` / `Release` / creation), so only
+    /// app-visible references count, never the device's own bind slots.
+    /// Requires a non-null [`device_forward_target`](Self::device_forward_target).
+    fn blocks_reset_while_referenced(&self) -> bool {
+        false
+    }
+
     /// Free the wrapper and all backing allocations.
     ///
     /// Called at most once, when both the public and private refcounts have
@@ -277,7 +291,7 @@ pub unsafe trait ComChild: Sized {
 /// # Safety
 /// `this` is a live `*mut T` obtained from a `T` vtable `AddRef` thunk.
 pub unsafe fn com_add_ref<T: ComChild>(this: *mut c_void) -> u32 {
-    let (rc, forward) = {
+    let (rc, forward, blocks_reset) = {
         // SAFETY: IUnknown AddRef thunk — D3D9 ABI guarantees `this` is the
         // live `*mut T` for the call; null `this` is UB per spec.
         let mut wrap = unsafe { VtableThis::<T>::new(this) };
@@ -289,10 +303,13 @@ pub unsafe fn com_add_ref<T: ComChild>(this: *mut c_void) -> u32 {
         } else {
             null_mut()
         };
-        (rc, forward)
+        (rc, forward, obj.blocks_reset_while_referenced())
     };
     // No-op when `forward` is null (object does not forward to the device).
     device_wrapper_add_ref(forward);
+    if blocks_reset {
+        device_wrapper_note_reset_blocker(forward, true);
+    }
     rc
 }
 
@@ -310,6 +327,9 @@ pub unsafe fn com_register_child<T: ComChild>(this: *mut T) {
     // SAFETY: caller passes a live, freshly created wrapper.
     let obj = unsafe { &*this };
     device_wrapper_add_ref(obj.device_forward_target());
+    if obj.blocks_reset_while_referenced() {
+        device_wrapper_note_reset_blocker(obj.device_forward_target(), true);
+    }
 }
 
 /// `IUnknown::Release` for a [`ComChild`]: drop the public refcount.
@@ -320,7 +340,7 @@ pub unsafe fn com_register_child<T: ComChild>(this: *mut T) {
 /// # Safety
 /// `this` is a live `*mut T` obtained from a `T` vtable `Release` thunk.
 pub unsafe fn com_release<T: ComChild>(this: *mut c_void) -> u32 {
-    let (rc, forward, finalize_now) = {
+    let (rc, forward, finalize_now, blocks_reset) = {
         // SAFETY: IUnknown Release thunk — D3D9 ABI guarantees `this` is the
         // live `*mut T` for the call; null `this` is UB per spec.
         let mut wrap = unsafe { VtableThis::<T>::new(this) };
@@ -340,12 +360,20 @@ pub unsafe fn com_release<T: ComChild>(this: *mut c_void) -> u32 {
         // any finalize frees the wrapper.
         let forward = obj.device_forward_target();
         let finalize_now = obj.finalizes_on_zero() && obj.private_refcount() == 0;
-        (rc, forward, finalize_now)
+        (
+            rc,
+            forward,
+            finalize_now,
+            obj.blocks_reset_while_referenced(),
+        )
     };
     if finalize_now {
         // SAFETY: both counters are zero (`finalizes_on_zero()` true and
         // `private_refcount()` zero) — no other reference can survive.
         unsafe { T::finalize(this.cast::<T>()) };
+    }
+    if blocks_reset {
+        device_wrapper_note_reset_blocker(forward, false);
     }
     // Forward the device release last: it may run `device_release` and tear the
     // device down. No-op when `forward` is null. The wrapper may already be

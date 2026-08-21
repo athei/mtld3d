@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **12 `real` · 93 `expected` ·
+re-checked before retagging. Headline: **5 `real` · 93 `expected` ·
 2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -231,12 +231,10 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (5 distinct defects behind the 9 sites)
+### The `real` backlog (3 distinct defects behind the 5 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
-| Reset: no outstanding-DEFAULT-pool / implicit-surface-ref rejection (surface + volume) | test_reset | 6 |
-| TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
@@ -288,7 +286,6 @@ Sites: 2126=expected 2127=expected 2179=expected 2180=expected
 Sites: 2234=ceiling 2237=ceiling 2238=ceiling 2250=ceiling
 Sites: 2251=ceiling 2519=expected 2521=expected 2529=expected
 Sites: 2531=expected
-Sites: 2370=real 2372=real 2388=real 2390=real 2496=real 2498=real 2541=real
 
 Everything fullscreen in this cluster follows from one decision: we never
 change the desktop mode. The back buffer honors the resolution it was asked
@@ -310,15 +307,9 @@ request at 2133/2134 and 2172/2173, `GetPresentParameters` reporting it at
   resolutions Wine really does enumerate. Zero dimensions are still rejected,
   since the D3D9 "zero means the client area" rule is windowed-only.
 
-The rest is windowed API contract, not environment:
-Reset must return INVALIDCALL with an outstanding DEFAULT-pool surface
-(2370), a DEFAULT-pool volume texture (2388), or a held implicit-backbuffer
-reference (2496), with TestCooperativeLevel reporting DEVICENOTRESET
-afterwards (2372/2390/2498); and a failed Reset (0x0 — which we do reject)
-must latch DEVICENOTRESET until a successful Reset (2541).
-`device_test_cooperative_level` hardcodes S_OK. The volume pair (2388/2390)
-is the same outstanding-DEFAULT-resource gap as 2370/2372, reachable only
-now that VOLUMEMAP is advertised; it fixes with the same tracking.
+The windowed API contract in this test passes: Reset rejects an outstanding
+app reference to a DEFAULT-pool resource or an implicit surface, and a
+failed Reset latches DEVICENOTRESET until one succeeds.
 
 ### device.c/test_scissor_size
 Sites: 3685=expected 3700=expected

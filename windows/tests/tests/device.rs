@@ -5,9 +5,10 @@
 
 use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DDISPLAYMODE, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
-    D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_X8R8G8B8,
-    D3DOK_NOAUTOGEN, D3DPOOL_SCRATCH, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3D_OK, D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
+    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
+    D3DFMT_X8R8G8B8, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_VERTEXTEXTURE,
     D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
@@ -298,6 +299,56 @@ fn cooperative_level_ok() {
         0,
         "device should be cooperative"
     );
+}
+
+#[test]
+fn reset_rejects_outstanding_default_pool_resources() {
+    // D3D9 rejects Reset while the app still references a D3DPOOL_DEFAULT
+    // resource or an implicit surface, and TestCooperativeLevel reports
+    // DEVICENOTRESET until a later Reset succeeds.
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a referenced DEFAULT-pool vertex buffer blocks Reset"
+    );
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3DERR_DEVICENOTRESET,
+        "a failed Reset latches DEVICENOTRESET"
+    );
+    drop(vb);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset succeeds once released");
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3D_OK,
+        "a successful Reset clears the latch"
+    );
+
+    let backbuffer = h.back_buffer(0);
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a held implicit back buffer blocks Reset"
+    );
+    drop(backbuffer);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset succeeds once released");
+
+    // Other pools never block, and neither does the device's own binding of
+    // a DEFAULT resource the app has released.
+    let managed = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_MANAGED);
+    let sysmem = h.create_offscreen_plain_surface(16, 16, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let bound = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.set_texture(0, &bound), 0);
+    drop(bound);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "MANAGED / SYSTEMMEM resources and device-held bindings do not block Reset"
+    );
+    drop(managed);
+    drop(sysmem);
 }
 
 #[test]

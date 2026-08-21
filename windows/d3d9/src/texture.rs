@@ -1957,6 +1957,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     fn refcount_mut(&mut self) -> &mut u32 {
         &mut self.refcount
     }
+    fn blocks_reset_while_referenced(&self) -> bool {
+        self.inner().is_default_pool()
+    }
     fn private_refcount(&self) -> u32 {
         self.private_refcount
     }
