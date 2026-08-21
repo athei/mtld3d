@@ -182,6 +182,7 @@ windows/tests/src/vertex.rs TexturedVertex Clone,Copy
 windows/tests/src/vertex.rs Vertex Clone,Copy
 windows/tests/src/win32.rs Rect Clone,Copy,PartialEq,Eq,Debug
 windows/tests/tests/draw.rs PaddedVertex Clone,Copy
+windows/tests/tests/points.rs PsizeVertex Clone,Copy
 windows/tests/tests/texture_stages.rs PaddedVertex Clone,Copy
 windows/tests/tests/texture_stages.rs PosNormalTexVertex Clone,Copy
 windows/tests/tests/texture_stages.rs RhwTexVertex Clone,Copy

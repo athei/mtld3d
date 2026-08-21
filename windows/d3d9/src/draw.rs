@@ -15,7 +15,7 @@ use mtld3d_core::{
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
-    dxso::{FfPsKey, FfVsKey, VariantKey},
+    dxso::{FfPsKey, FfVsKey, VariantFlags, VariantKey},
     ids::{BufferId, ProgramId},
     passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
@@ -23,15 +23,23 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache,
     streams::{instance_count, instanced_stream_read_bytes, is_instance_data, stream_step},
+    vs_draw::{VS_DRAW_BYTES, build_vs_draw_bytes},
 };
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PrimitiveType, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
-        VertexStepFunction,
+        IndexType, PrimitiveType, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
+        VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
-use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT};
+use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
+
+/// `VsDraw` bytes for the default render states.
+///
+/// The fallback bind when a snapshot reaches `emit_draw` without its own
+/// (never expected; warned once).
+static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> =
+    std::sync::LazyLock::new(|| build_vs_draw_bytes(&render_state_defaults()));
 
 use super::{encoder::FrameEncoder, stage_bindings::STAGE_COUNT};
 
@@ -585,6 +593,11 @@ pub struct CurrentSnapshot {
     /// Bound only for a VS that reads a dynamic integer constant
     /// (`VsSource::Programmable::uses_int_const`).
     pub vs_int_const_bytes: Option<ScratchSlice>,
+    /// Per-draw `VsDraw` uniform (`mtld3d_core::vs_draw`): point size state.
+    ///
+    /// Every vertex shader reads it, so it is bound for every draw and
+    /// rebuilt when a point render state changes (`SnapshotDirty::VS_DRAW`).
+    pub vs_draw_bytes: Option<ScratchSlice>,
     pub depth_stencil: DepthStencilFlags,
 }
 
@@ -606,6 +619,7 @@ impl CurrentSnapshot {
         fog_color_bytes: None,
         bump_env_bytes: None,
         vs_int_const_bytes: None,
+        vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
     };
 }
@@ -1150,7 +1164,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the VS key, which shares `variant`, is untouched; the FF PS writes one
     // output and keeps the default so its library index never fragments.
     let extra_attachments = enc.current_extra_color_attachments();
-    let (ps_variant, ps_color_out_mask) = match ps {
+    let (mut ps_variant, ps_color_out_mask) = match ps {
         PsSource::Programmable { color_out_mask, .. } => (
             VariantKey {
                 color_out_mask: extra_attachments.present_mask << 1,
@@ -1160,6 +1174,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         ),
         PsSource::FixedFunction { .. } => (variant, 1),
     };
+    // Point sprites only exist on point primitives: the API thread raises the
+    // flag from `D3DRS_POINTSPRITEENABLE` alone, so every other primitive
+    // drops it here and keeps its non-sprite library.
+    if metal_prim != PrimitiveType::Point {
+        ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1702,6 +1722,28 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if enc.last_bound().vs_pos_fixup_changed(pos_fixup_bytes) {
         let ptr = enc.alloc_scratch(pos_fixup_bytes);
         enc.emit_command(Command::set_vertex_bytes_at(ptr, 16, VS_POS_FIXUP_SLOT));
+    }
+    // Per-draw `VsDraw` uniform (point size state). Every vertex shader
+    // declares it, so it must be bound before the first draw of a pass; the
+    // API thread rebuilds the bytes only when a point render state changes
+    // and the dedup skips the bind when they match the last ones emitted.
+    let vs_draw = snap.vs_draw_bytes.unwrap_or(ScratchSlice::EMPTY);
+    let vs_draw_bytes = vs_draw.as_slice();
+    if vs_draw_bytes.is_empty() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "draw: VsDraw uniform not populated; binding the render-state defaults"
+        );
+        if enc.last_bound().vs_draw_changed(&*VS_DRAW_DEFAULT) {
+            let ptr = enc.alloc_scratch(&*VS_DRAW_DEFAULT);
+            enc.emit_command(Command::set_vertex_bytes_at(
+                ptr,
+                u32::try_from(VS_DRAW_BYTES).expect("32 fits u32"),
+                VS_DRAW_SLOT,
+            ));
+        }
+    } else if enc.last_bound().vs_draw_changed(vs_draw_bytes) {
+        let (p, n) = vs_draw.as_raw();
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_DRAW_SLOT));
     }
     if !ps_const_bytes.is_empty() && enc.last_bound().ps_constants_changed(ps_const_bytes) {
         let (p, n) = ps_constants.as_raw();

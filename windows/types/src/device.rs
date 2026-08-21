@@ -355,12 +355,14 @@ pub const RENDER_STATE_COUNT: usize = 210;
 
 /// The maximum point size we advertise as `D3DCAPS9::MaxPointSize`.
 ///
-/// Point sprites / point scaling are not implemented and Metal renders
-/// 1-pixel points, so this caps at 1.0 to steer titles away from large points.
-/// D3D9 defines the `D3DRS_POINTSIZE_MAX` render-state default as *equal to*
-/// this cap, so [`render_state_defaults`] and `caps.max_point_size` both read
-/// it — the two can't drift out of the spec relationship.
-pub const MAX_POINT_SIZE: f32 = 1.0;
+/// The vertex shaders emit `[[point_size]]` from `D3DRS_POINTSIZE`, a PSIZE
+/// vertex element or `oPts`, scaled and clamped per D3D9; Metal rasterizes
+/// points up to 511 pixels, so the cap is a policy choice, and 64 is what
+/// 3DMark05's requirement check asks for. D3D9 defines the
+/// `D3DRS_POINTSIZE_MAX` render-state default as *equal to* this cap, so
+/// [`render_state_defaults`] and `caps.max_point_size` both read it and the
+/// two can't drift out of the spec relationship.
+pub const MAX_POINT_SIZE: f32 = 64.0;
 
 // ── D3D9 state-block filtering (`D3DSTATEBLOCKTYPE`) ──
 

@@ -2431,15 +2431,17 @@ fn vs_writing_psize_via_opts_routes_through_storage_local() {
         "Varyings must declare a [[point_size]] field:\n{vs_msl}"
     );
     assert!(
-        vs_msl.contains("float4 _psize_storage = float4(1.0);"),
-        "VS prologue must default _psize_storage to 1.0:\n{vs_msl}"
+        vs_msl.contains("float4 _psize_storage = float4(vs_draw.point.x);"),
+        "VS prologue must seed _psize_storage with D3DRS_POINTSIZE:\n{vs_msl}"
     );
     assert!(
         vs_msl.contains("_psize_storage = vs_c[0];"),
         "oPts write must land in _psize_storage:\n{vs_msl}"
     );
     assert!(
-        vs_msl.contains("out.point_size = _psize_storage.x;"),
+        vs_msl.contains(
+            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);"
+        ),
         "VS epilogue must extract scalar point size from storage:\n{vs_msl}"
     );
 }
@@ -2473,7 +2475,9 @@ fn sm3_vs_writing_psize_via_dcl_routes_through_storage_local() {
         "SM3 dcl_psize write must land in _psize_storage:\n{vs_msl}"
     );
     assert!(
-        vs_msl.contains("out.point_size = _psize_storage.x;"),
+        vs_msl.contains(
+            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);"
+        ),
         "VS epilogue must extract scalar point size:\n{vs_msl}"
     );
 }

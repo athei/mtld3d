@@ -45,17 +45,19 @@ use mtld3d_types::{
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
     D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE,
-    D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE,
-    D3DRS_SCISSORTESTENABLE, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE,
-    D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND,
-    D3DRS_SRCBLENDALPHA, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL,
-    D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
-    D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR,
-    D3DRS_TWOSIDEDSTENCILMODE, D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
-    D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE,
+    D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE,
+    D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
+    D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
+    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_STENCILWRITEMASK,
+    D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR, D3DRS_TWOSIDEDSTENCILMODE,
+    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY,
     D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
     TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
@@ -641,11 +643,12 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
             .union(SnapshotDirty::VS_CONST),
         D3DRS_TEXTUREFACTOR => rs.union(SnapshotDirty::PS_CONST),
         // FLAT vs GOURAUD flips the PS `[[flat]]` varying qualifier (VariantKey
-        // flat_shade), and SRGBWRITEENABLE toggles the in-shader linear→sRGB OETF
-        // (VariantKey srgb_write); both rebuild the PS source + variant key.
+        // flat_shade), SRGBWRITEENABLE toggles the in-shader linear→sRGB OETF
+        // (VariantKey srgb_write) and POINTSPRITEENABLE flips
+        // VariantFlags::POINT_SPRITE; all rebuild the PS source + variant key.
         // (SRGBWRITEENABLE also retains its RS bit elsewhere, keeping the
         // pipeline's SRGB_WRITE flag current.)
-        D3DRS_SHADEMODE | D3DRS_SRGBWRITEENABLE => rs
+        D3DRS_SHADEMODE | D3DRS_SRGBWRITEENABLE | D3DRS_POINTSPRITEENABLE => rs
             .union(SnapshotDirty::VARIANT)
             .union(SnapshotDirty::PS_SOURCE),
         D3DRS_LIGHTING
@@ -663,9 +666,15 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
             .union(SnapshotDirty::VS_SOURCE)
             .union(SnapshotDirty::VS_CONST)
             .union(SnapshotDirty::PS_SOURCE),
-        // Key-only: flips FfVsFlags::LOCAL_VIEWER (specular view-vector
-        // model); no constant section reads it.
-        D3DRS_LOCALVIEWER => rs.union(SnapshotDirty::VS_SOURCE),
+        // Key-only: LOCALVIEWER flips FfVsFlags::LOCAL_VIEWER (specular
+        // view-vector model) and POINTSCALEENABLE flips
+        // FfVsFlags::POINT_SCALE (eye-distance attenuation); no constant
+        // section reads either.
+        D3DRS_LOCALVIEWER | D3DRS_POINTSCALEENABLE => rs.union(SnapshotDirty::VS_SOURCE),
+        // The point size, its clamp and the scale factors travel in the
+        // per-draw VsDraw uniform every vertex shader reads.
+        D3DRS_POINTSIZE | D3DRS_POINTSIZE_MIN | D3DRS_POINTSIZE_MAX | D3DRS_POINTSCALE_A
+        | D3DRS_POINTSCALE_B | D3DRS_POINTSCALE_C => rs.union(SnapshotDirty::VS_DRAW),
         _ => rs,
     }
 }
@@ -712,6 +721,11 @@ bitflags::bitflags! {
         /// `vs_constants_i`, consumed by a VS reading a dynamic (non-`defi`)
         /// integer constant.
         const VS_CONST_I  = 1 << 13;
+        /// Per-draw `VsDraw` uniform bytes (point size state).
+        ///
+        /// `mtld3d_core::vs_draw::build_vs_draw_bytes` over the point render
+        /// states, bound for every draw.
+        const VS_DRAW     = 1 << 14;
     }
 }
 
@@ -8757,6 +8771,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // Per-draw VsDraw uniform (point size state), read by every vertex shader.
+    let vs_draw_buf = if dirty.contains(SnapshotDirty::VS_DRAW) {
+        Some(mtld3d_core::vs_draw::build_vs_draw_bytes(rs))
+    } else {
+        None
+    };
     // Bump-environment matrix bytes (PS slot 12). Built only when a bump TSS
     // state changed (rare); the slot is bound at draw time only for a PS that
     // actually uses texbem/texbeml/bem.
@@ -8809,6 +8829,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     if let Some(buf) = vs_int_const_buf {
         dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = vs_draw_buf {
+        dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     drop(consts_timer);
     // ── END consts_timer SCOPE ──
@@ -10533,11 +10556,20 @@ const fn rs_classify(index: u32) -> RsClass {
         // core/src/ff_state.rs::resolve_vertex_blend_count.
         | D3DRS_VERTEXBLEND
         | D3DRS_INDEXEDVERTEXBLENDENABLE
-        // POINTSIZE_MIN / POINTSIZE_MAX are no-ops under the current
-        // cap (caps.rs::max_point_size = 1.0; no POINTSPRITE / POINTSCALE
-        // support). Intentionally silenced.
+        // POINTSIZE / POINTSIZE_MIN / POINTSIZE_MAX / POINTSCALE_A..C ride
+        // the per-draw VsDraw uniform (core/src/vs_draw.rs) that every vertex
+        // shader clamps `[[point_size]]` from; POINTSCALEENABLE is the
+        // FfVsFlags::POINT_SCALE key bit; POINTSPRITEENABLE is the
+        // VariantFlags::POINT_SPRITE PS variant that samples
+        // `[[point_coord]]`.
+        | D3DRS_POINTSIZE
         | D3DRS_POINTSIZE_MIN
         | D3DRS_POINTSIZE_MAX
+        | D3DRS_POINTSCALE_A
+        | D3DRS_POINTSCALE_B
+        | D3DRS_POINTSCALE_C
+        | D3DRS_POINTSCALEENABLE
+        | D3DRS_POINTSPRITEENABLE
         // CLIPPING is a driver-side hint for frustum clipping — Metal
         // always clips to the viewport, so disabling this state on our
         // side is a no-op by construction, not a missing feature.

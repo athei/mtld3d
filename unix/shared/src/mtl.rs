@@ -394,9 +394,16 @@ pub const VS_INT_CONST_SLOT: u32 = 29;
 /// Vertex-stage buffer slot of the float constant table (`vs_c`).
 pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 
+/// Vertex-stage buffer slot of the per-draw `VsDraw` uniform.
+///
+/// Point size, its clamp range and the point scale factors, serialised by
+/// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
+pub const VS_DRAW_SLOT: u32 = 27;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {
+    assert!(VS_DRAW_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_POS_FIXUP_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);

@@ -393,13 +393,7 @@ pub fn d3d_to_metal_write_mask(d3d_mask: u32) -> ColorWriteMask {
 /// D3DPT_* → Metal primitive type.
 pub fn d3d_to_metal_primitive(d3d_type: u32) -> Option<PrimitiveType> {
     match d3d_type {
-        D3DPT_POINTLIST => {
-            mtld3d_shared::log_once_warn!(
-                target: crate::LOG_TARGET,
-                "DrawPrimitive(D3DPT_POINTLIST) — Metal renders as 1-pixel points; D3DRS_POINTSIZE / D3DRS_POINTSPRITEENABLE not honored"
-            );
-            Some(PrimitiveType::Point)
-        }
+        D3DPT_POINTLIST => Some(PrimitiveType::Point),
         D3DPT_LINELIST => Some(PrimitiveType::Line),
         D3DPT_LINESTRIP => Some(PrimitiveType::LineStrip),
         D3DPT_TRIANGLELIST => Some(PrimitiveType::Triangle),
@@ -847,6 +841,8 @@ bitflags::bitflags! {
         /// A COLORVERTEX material source pointing at a vertex colour the
         /// declaration omits reads 0 (FVF instead falls back to the material).
         const USES_VERTEX_DECL = 1 << 5;
+        /// Vertex declaration has a PSIZE element (per-vertex point size).
+        const HAS_PSIZE = 1 << 6;
     }
 }
 
@@ -860,6 +856,11 @@ impl FfVsLayout {
     #[must_use]
     pub const fn uses_vertex_decl(&self) -> bool {
         self.flags.contains(FfVsLayoutFlags::USES_VERTEX_DECL)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn has_psize(&self) -> bool {
+        self.flags.contains(FfVsLayoutFlags::HAS_PSIZE)
     }
     #[inline]
     #[must_use]
@@ -934,6 +935,7 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
                 };
             }
             u if u == D3DDECLUSAGE_BLENDINDICES => flags.insert(FfVsLayoutFlags::DECLARED_INDICES),
+            u if u == D3DDECLUSAGE_PSIZE => flags.insert(FfVsLayoutFlags::HAS_PSIZE),
             _ => {}
         }
     }

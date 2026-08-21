@@ -3771,6 +3771,11 @@ pub struct LastBoundCache {
     /// Re-bound only when the viewport dims change (rare), so the per-draw
     /// cost is a length-then-memcmp against 16 bytes.
     vs_pos_fixup: Vec<u8>,
+    /// VS draw slot — the per-draw `VsDraw` uniform (point size state).
+    ///
+    /// Re-bound only when a point render state changes, so the per-draw
+    /// cost is a length-then-memcmp against 32 bytes.
+    vs_draw: Vec<u8>,
     /// PS slot 15 — programmable / FF pixel constant buffer.
     ps_constants: Vec<u8>,
     /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
@@ -3821,6 +3826,7 @@ impl LastBoundCache {
             cull_mode: None,
             vs_constants: Vec::new(),
             vs_pos_fixup: Vec::new(),
+            vs_draw: Vec::new(),
             ps_constants: Vec::new(),
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
@@ -3847,6 +3853,7 @@ impl LastBoundCache {
         self.cull_mode = None;
         self.vs_constants.clear();
         self.vs_pos_fixup.clear();
+        self.vs_draw.clear();
         self.ps_constants.clear();
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
@@ -4005,6 +4012,11 @@ impl LastBoundCache {
     #[inline]
     pub fn vs_pos_fixup_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_pos_fixup, bytes)
+    }
+
+    #[inline]
+    pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_draw, bytes)
     }
 
     #[inline]

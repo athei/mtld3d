@@ -27,20 +27,22 @@
 
 use std::fmt::Write;
 
-use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
-    D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_TEXCOORD, D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT,
-    D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD,
-    D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA,
+    D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DTA_ALPHAREPLICATE,
+    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTA_TFACTOR,
+    D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA,
     D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_DISABLE,
     D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1,
     D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
-use super::emit::{VariantFlags, VariantKey, fog_blend_active, write_fog_blend};
+use super::emit::{
+    VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+};
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -117,6 +119,16 @@ bitflags::bitflags! {
         /// transformed normal keeps its magnitude, so a non-unit model normal
         /// scales the lighting.
         const NORMALIZE_NORMALS = 1 << 12;
+        /// Vertex declaration has a PSIZE element (`D3DFVF_PSIZE`).
+        ///
+        /// The per-vertex size replaces `D3DRS_POINTSIZE` as the point size
+        /// before the scale and clamp.
+        const HAS_PSIZE = 1 << 13;
+        /// `D3DRS_POINTSCALEENABLE`: the point size is attenuated by eye distance.
+        ///
+        /// Only ever set on an untransformed layout; pre-transformed vertices
+        /// have no eye-space distance to scale by.
+        const POINT_SCALE = 1 << 14;
     }
 }
 
@@ -243,6 +255,16 @@ impl FfVsKey {
     }
     #[inline]
     #[must_use]
+    pub const fn has_psize(&self) -> bool {
+        self.flags.contains(FfVsFlags::HAS_PSIZE)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn point_scale(&self) -> bool {
+        self.flags.contains(FfVsFlags::POINT_SCALE)
+    }
+    #[inline]
+    #[must_use]
     pub const fn color_vertex(&self) -> bool {
         self.flags.contains(FfVsFlags::COLOR_VERTEX)
     }
@@ -349,6 +371,7 @@ pub const fn ff_attr_index_for_semantic(usage: u8, usage_index: u8) -> Option<u1
         (D3DDECLUSAGE_TEXCOORD, i) if i < 8 => Some(4 + i as u16),
         (D3DDECLUSAGE_BLENDWEIGHT, 0) => Some(12),
         (D3DDECLUSAGE_BLENDINDICES, 0) => Some(13),
+        (D3DDECLUSAGE_PSIZE, 0) => Some(14),
         _ => None,
     }
 }
@@ -370,6 +393,7 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
     emit_varyings(&mut out, false);
+    out.push_str(crate::vs_draw::VS_DRAW_MSL);
     if vs_key.lighting_enabled() && vs_key.has_normal() {
         emit_normal_matrix_helpers(&mut out);
     }
@@ -438,6 +462,11 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     }
     if vs.vertex_blend_count > 0 && vs.declared_indices() {
         out.push_str("    uint4 blend_indices [[attribute(13)]];\n");
+    }
+    // Per-vertex point size (`D3DFVF_PSIZE`), a FLOAT1 the descriptor
+    // zero-pads; only `.x` is read.
+    if vs.has_psize() {
+        out.push_str("    float4 psize [[attribute(14)]];\n");
     }
     out.push_str("};\n\n");
 }
@@ -512,6 +541,31 @@ fn emit_varyings(out: &mut String, flat: bool) {
     // layout has to stay identical.
     out.push_str("    float point_size [[point_size]];\n");
     out.push_str("};\n\n");
+}
+
+/// Emit `out.point_size` from the per-vertex or render-state size.
+///
+/// `D3DFVF_PSIZE` wins over `D3DRS_POINTSIZE`. With `scale` (the
+/// `D3DRS_POINTSCALEENABLE` key bit), the D3D9 attenuation applies:
+/// `S = Vh * Si / sqrt(A + B * De + C * De^2)` with `De` the eye-space
+/// distance of the vertex and `Vh` the viewport height, which the
+/// half-pixel fixup already carries as `-1 / Vh`. The attenuation
+/// denominator is floored at zero so a degenerate factor set clamps to
+/// `POINTSIZE_MAX` instead of producing a NaN size. `POINTSIZE_MIN/MAX`
+/// clamp the result either way. Needs `pos_view` in scope when `scale`.
+fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
+    if vs.has_psize() {
+        out.push_str("    float psize = in.psize.x;\n");
+    } else {
+        out.push_str("    float psize = vs_draw.point.x;\n");
+    }
+    if scale {
+        out.push_str("    float de = length(pos_view.xyz);\n");
+        out.push_str(
+            "    psize *= (-1.0 / pos_fixup.y) / sqrt(max(vs_draw.point_scale.x + vs_draw.point_scale.y * de + vs_draw.point_scale.z * de * de, 0.0));\n",
+        );
+    }
+    out.push_str("    out.point_size = clamp(psize, vs_draw.point.y, vs_draw.point.z);\n");
 }
 
 /// Emit the vertex-blending block that computes `pos_view` and (when the VS reads normals) `n`.
@@ -663,14 +717,17 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // sixteen vertex-stream slots, so no app stream can collide with them.
     let _ = writeln!(
         out,
-        "    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+        "    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]],"
+    );
+    // Per-draw point state (`crate::vs_draw`): `D3DRS_POINTSIZE` for a
+    // layout without PSIZE, the `POINTSIZE_MIN/MAX` clamp, and the
+    // `POINTSCALE_A/B/C` attenuation factors.
+    let _ = writeln!(
+        out,
+        "    constant VsDraw &vs_draw [[buffer({VS_DRAW_SLOT})]]"
     );
     out.push_str(") {\n");
     out.push_str("    Varyings out;\n");
-    // FF VS doesn't currently expose PSIZE in the FVF decoder (caps
-    // skip D3DFVFCAPS_PSIZE), so just default to 1.0 — matches D3D9
-    // spec for point primitives without an explicit size.
-    out.push_str("    out.point_size = 1.0;\n");
 
     if vs.has_rhw() {
         // Pre-transformed screen-space vertices: `(in.v0.x, in.v0.y)` are
@@ -704,6 +761,10 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             "    float ndc_y = 1.0 - ((in.v0.y - vp_origin.y) / vp.y) * 2.0 - 1.0 / vp.y;\n",
         );
         out.push_str("    out.position = float4(ndc_x * w, ndc_y * w, in.v0.z * w, w);\n");
+        // Pre-transformed points take their size as given (per vertex or from
+        // the render state) and skip the eye-distance scale, which has no
+        // eye space to measure in.
+        emit_point_size(out, vs, false);
 
         if vs.has_color0() {
             out.push_str("    out.color0 = in.v2;\n");
@@ -813,6 +874,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // after the perspective divide.
     out.push_str("    out.position.x += pos_fixup.x * out.position.w;\n");
     out.push_str("    out.position.y += pos_fixup.y * out.position.w;\n");
+    emit_point_size(out, vs, vs.point_scale());
 
     // TCI pre-scan: if any active stage needs eye-space normal / position
     // but the lighting branch below won't declare them, emit them here.
@@ -1255,7 +1317,14 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // Discover which stages sample a texture so we know which textures+samplers
     // to declare in the entry-point signature.
     let _ = writeln!(out, "fragment float4 {entry}(");
-    out.push_str("    Varyings in [[stage_in]],\n");
+    let point_sprite = variant.flags.contains(VariantFlags::POINT_SPRITE);
+    if point_sprite {
+        // See `emit::write_point_sprite_prologue`.
+        out.push_str("    Varyings in_stage [[stage_in]],\n");
+        out.push_str("    float2 point_coord [[point_coord]],\n");
+    } else {
+        out.push_str("    Varyings in [[stage_in]],\n");
+    }
     out.push_str("    constant float4 *ps_c [[buffer(15)]]");
     let alpha_test_active =
         variant.alpha_func != 0 && u32::from(variant.alpha_func) != D3DCMP_ALWAYS;
@@ -1293,6 +1362,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         }
     }
     out.push_str("\n) {\n");
+    if point_sprite {
+        write_point_sprite_prologue(out);
+    }
 
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
     // since no previous stage contributed).

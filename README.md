@@ -55,6 +55,8 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **All four draw paths**: DrawPrimitive / DrawIndexedPrimitive and both UP
   variants, every primitive type including triangle fans (rewritten as
   triangle lists, which Metal lacks).
+- **Points**: `D3DRS_POINTSIZE`, per-vertex PSIZE and `oPts`, the min/max
+  clamp, eye-distance scaling, and point sprites through `[[point_coord]]`.
 - **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
   per-stream offsets and strides; a declared stream with nothing bound reads
   zeros, as on hardware.
@@ -97,7 +99,7 @@ own fallback paths instead of breaking:
 
 - **MSAA**: multisampled creates are rejected; CheckDeviceMultiSampleType only
   accepts D3DMULTISAMPLE_NONE.
-- **Point sprites** and non-solid fill modes (Metal has no native wireframe).
+- **Non-solid fill modes** (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
   as the spec allows.
 - **YUV conversion**: YUY2/UYVY surfaces can be created and locked, but no

@@ -22,13 +22,14 @@ use mtld3d_types::{
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_COLORVERTEX, D3DRS_DEPTHBIAS, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
     D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE,
-    D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_SPECULARENABLE,
-    D3DRS_SPECULARMATERIALSOURCE, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTOP_DISABLE,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
-    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED, RENDER_STATE_COUNT, StateBlockType,
-    TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
+    D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_POINTSCALEENABLE,
+    D3DRS_POINTSPRITEENABLE, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE,
+    D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTOP_DISABLE, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2,
+    D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00,
+    D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
+    D3DTTFF_PROJECTED, RENDER_STATE_COUNT, StateBlockType, TEXTURE_STAGE_STATE_COUNT,
+    texture_stage_state_defaults,
 };
 
 use crate::{
@@ -1179,6 +1180,12 @@ impl FfState {
             VariantFlags::SRGB_WRITE,
             render_states[D3DRS_SRGBWRITEENABLE as usize] != 0,
         );
+        // Set from the render state alone; `emit_draw` clears it for every
+        // primitive type but points, where the coordinate has no meaning.
+        flags.set(
+            VariantFlags::POINT_SPRITE,
+            render_states[D3DRS_POINTSPRITEENABLE as usize] != 0,
+        );
         VariantKey {
             alpha_func: if alpha_test_on {
                 u8::try_from(render_states[D3DRS_ALPHAFUNC as usize]).expect("D3DCMP_* ≤ 8 fits u8")
@@ -1699,6 +1706,14 @@ fn build_vs_flags(
     );
     flags.set(FfVsFlags::VERTEX_BLEND_INDEXED, vertex_blend_indexed);
     flags.set(FfVsFlags::DECLARED_INDICES, layout.declared_indices());
+    flags.set(FfVsFlags::HAS_PSIZE, layout.has_psize());
+    // Eye-distance point scaling needs an eye-space position, which a
+    // pre-transformed layout does not have; keep the bit clear there so RHW
+    // draws don't fork a variant on the render state.
+    flags.set(
+        FfVsFlags::POINT_SCALE,
+        !layout.has_rhw() && render_states[D3DRS_POINTSCALEENABLE as usize] != 0,
+    );
     flags
 }
 
