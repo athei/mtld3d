@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **2 `real` · 91 `expected` ·
+re-checked before retagging. Headline: **2 `real` · 92 `expected` ·
 2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -525,6 +525,23 @@ Sites: 5360=expected 5398=expected 5436=expected 5454=expected
 The ps_1_4 depth-gradient math is correct (the same-frame cycle passes and
 is absent here). The failing cycles read the gradient across Presents —
 the same Rule B depth-store elision as z_range_test.
+
+### visual.c/pixelshader_blending_test
+Sites: 12008=expected
+
+Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
+G32R32F) with blending on, then samples it and expects the channels the
+format does not store to read as 1.0 (`0x001820ff`, blue forced to `ff`). We
+return `0x00182000`: the stored channels are exact, the missing ones read 0.
+The 1.0 rule is implemented as a sampler swizzle on the texture view, and
+Metal forbids `RenderTarget` usage on a swizzled view, so a render-target
+texture is bound as its base texture and loses the swizzle when sampled. The
+same trade already covers X8R8G8B8 render targets (`unix/unix/src/metal/
+texture.rs`). Lifting it means carrying two handles per render-target
+texture (base for attachment, swizzled view for sampling); worth doing only
+if a workload samples its own single/dual-channel render target and relies
+on the missing lanes. The four-channel members (A16B16G16R16F,
+A32B32G32R32F) and L8 pass.
 
 ### visual.c/test_fetch4
 Sites: 15617=caps 15668=ceiling 15824=ceiling 15829=ceiling

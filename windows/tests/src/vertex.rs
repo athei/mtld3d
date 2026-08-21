@@ -30,6 +30,21 @@ pub struct TexturedVertex {
     pub v: f32,
 }
 
+/// Position + diffuse colour + one three-component texture coordinate.
+///
+/// The FVF is `D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 |
+/// D3DFVF_TEXCOORDSIZE3(0)`, the shape a volume-texture lookup takes.
+#[repr(C)]
+pub struct VolumeVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub color: u32,
+    pub u: f32,
+    pub v: f32,
+    pub w: f32,
+}
+
 /// Position + normal (`D3DFVF_XYZ | D3DFVF_NORMAL`).
 ///
 /// For lit FF draws that take their colors from the material.

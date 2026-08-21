@@ -869,3 +869,92 @@ fn d3d_to_metal_blend_op_table() {
     assert_eq!(d3d_to_metal_blend_op(0), BlendOperation::Add);
     assert_eq!(d3d_to_metal_blend_op(99), BlendOperation::Add);
 }
+
+#[test]
+fn color_fill_float_formats_carry_normalized_channels() {
+    // 0xAARRGGBB = 0x8040_2010 → R=0x40, G=0x20, B=0x10, A=0x80, each
+    // normalized by 255 and stored in R, G, B, A order.
+    let expect = |byte: u8| f32::from(byte) / 255.0;
+
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A32B32G32R32F).unwrap();
+    assert_eq!(bytes.len(), 16);
+    for (i, byte) in [0x40u8, 0x20, 0x10, 0x80].into_iter().enumerate() {
+        let lane = f32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+        assert_eq!(lane.to_bits(), expect(byte).to_bits(), "lane {i}");
+    }
+
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_G32R32F).unwrap();
+    assert_eq!(bytes.len(), 8);
+    assert_eq!(
+        f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]).to_bits(),
+        expect(0x20).to_bits()
+    );
+
+    // The half-float twins carry the same values through binary16.
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A16B16G16R16F).unwrap();
+    assert_eq!(bytes.len(), 8);
+    for (i, byte) in [0x40u8, 0x20, 0x10, 0x80].into_iter().enumerate() {
+        let lane = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        assert_eq!(lane, f32_to_f16_bits(expect(byte)), "lane {i}");
+    }
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_G16R16F)
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_R16F).unwrap(),
+        f32_to_f16_bits(expect(0x40)).to_le_bytes().to_vec()
+    );
+}
+
+#[test]
+fn color_fill_unorm16_formats_replicate_each_channel() {
+    // 0xab widens to 0xabab: exact at both endpoints, half an LSB elsewhere.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A16B16G16R16).unwrap(),
+        vec![0x40, 0x40, 0x20, 0x20, 0x10, 0x10, 0x80, 0x80]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xff00_ff00, D3DFMT_G16R16).unwrap(),
+        vec![0x00, 0x00, 0xff, 0xff]
+    );
+}
+
+#[test]
+fn f32_to_f16_bits_matches_the_ieee_encoding() {
+    // Exactly representable values, both signs.
+    assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+    assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+    assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+    assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
+    assert_eq!(f32_to_f16_bits(0.5), 0x3800);
+    // Largest finite binary16, and the first magnitude that overflows it.
+    assert_eq!(f32_to_f16_bits(65504.0), 0x7bff);
+    assert_eq!(f32_to_f16_bits(65536.0), 0x7c00);
+    assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+    assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+    // NaN stays a NaN (exponent all ones, non-zero payload).
+    let nan = f32_to_f16_bits(f32::NAN);
+    assert_eq!(nan & 0x7c00, 0x7c00);
+    assert_ne!(nan & 0x03ff, 0);
+    // Subnormals: the smallest one, and a magnitude below it flushing to
+    // a signed zero.
+    assert_eq!(f32_to_f16_bits(f32::from_bits(0x3380_0000)), 0x0001);
+    assert_eq!(f32_to_f16_bits(-1.0e-9), 0x8000);
+    // Ties round to even. binary16's ulp at 1.0 is 2^-10, so 1.0 + 2^-11
+    // sits exactly between 1.0 (even) and its successor, and lands on 1.0;
+    // 1.0 + 3 * 2^-11 sits between the successor (odd) and the one after
+    // (even), and lands on the one after.
+    assert_eq!(f32_to_f16_bits(1.0 + 0.000_488_281_25), 0x3c00);
+    assert_eq!(
+        f32_to_f16_bits(3.0f32.mul_add(0.000_488_281_25, 1.0)),
+        0x3c02
+    );
+}

@@ -1,12 +1,13 @@
 use log::warn;
 use mtld3d_shared::mtl::{PixelFormat, Swizzle};
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
-    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE,
-    D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE,
-    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5,
-    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16,
+    D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32,
+    D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
+    D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2,
 };
 
 use super::LOG_TARGET;
@@ -98,8 +99,13 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_A8L8 => "A8L8",
         D3DFMT_L8 => "L8",
         D3DFMT_L16 => "L16",
+        D3DFMT_G16R16 => "G16R16",
+        D3DFMT_A16B16G16R16 => "A16B16G16R16",
         D3DFMT_R16F => "R16F",
+        D3DFMT_G16R16F => "G16R16F",
+        D3DFMT_A16B16G16R16F => "A16B16G16R16F",
         D3DFMT_R32F => "R32F",
+        D3DFMT_G32R32F => "G32R32F",
         D3DFMT_A32B32G32R32F => "A32B32G32R32F",
         D3DFMT_ATI1 => "ATI1",
         D3DFMT_V8U8 => "V8U8",
@@ -186,8 +192,33 @@ pub const fn is_dxt_format(d3d_format: u32) -> bool {
     )
 }
 
+/// Map a D3D9 colour format to its Metal counterpart, warning when there is none.
+///
+/// The lookup itself lives in `lookup_d3d_format`; this wrapper adds the
+/// rejection warn, so callers that only ask "is this format mapped?" (the
+/// `CheckDeviceFormat` predicates, which are hit by routine capability probes
+/// for formats no one intends to create) can use the silent form instead.
 #[must_use]
 pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
+    let mapping = lookup_d3d_format(d3d_format);
+    if mapping.is_none() {
+        warn!(target: LOG_TARGET, "reject map_d3d_format(format={d3d_format}) → unsupported");
+    }
+    mapping
+}
+
+/// True when `lookup_d3d_format` has a Metal counterpart for `d3d_format`.
+///
+/// This is the set the colour create paths accept, so it is also the set
+/// `CheckDeviceFormat` must advertise for `D3DRTYPE_TEXTURE`. Silent: a
+/// capability probe for an unmapped format is not a fault.
+#[must_use]
+pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
+    lookup_d3d_format(d3d_format).is_some()
+}
+
+#[must_use]
+const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
     match d3d_format {
         D3DFMT_A8R8G8B8 => Some(FormatMapping {
             metal_pixel_format: PixelFormat::Bgra8Unorm,
@@ -348,15 +379,63 @@ pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             swizzle: Some([Swizzle::Red, Swizzle::Red, Swizzle::Red, Swizzle::One]),
             has_alpha: false,
         }),
+        D3DFMT_G16R16 => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rg16Unorm,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            // Two-channel unorm samples as (r, g, 1, 1) in D3D9, the same
+            // missing-channel rule the float family follows below.
+            swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One]),
+            has_alpha: false,
+        }),
+        D3DFMT_A16B16G16R16 => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rgba16Unorm,
+            bytes_per_pixel: 8,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 8,
+            // Named most-significant first, so the stored order is R, G, B, A:
+            // byte-identical to Metal's RGBA16Unorm.
+            swizzle: None,
+            has_alpha: true,
+        }),
         D3DFMT_R16F => Some(FormatMapping {
             metal_pixel_format: PixelFormat::R16Float,
             bytes_per_pixel: 2,
             block_width: 1,
             block_height: 1,
-            block_bytes: 2, // R16F: single red channel; G=B=0, A=1 (Metal's native single-channel
-            // sample), matching D3D9.
-            swizzle: None,
+            block_bytes: 2,
+            // D3D9 reads the channels a float format does not store as 1.0,
+            // not 0.0 (an R16F texel of 0.0 samples as (0, 1, 1, 1)). Metal's
+            // native single-channel sample is (r, 0, 0, 1), so the missing
+            // lanes are forced.
+            swizzle: Some([Swizzle::Red, Swizzle::One, Swizzle::One, Swizzle::One]),
             has_alpha: false,
+        }),
+        D3DFMT_G16R16F => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rg16Float,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            // Blue and alpha are not stored, so they sample as 1.0 (see R16F).
+            swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One]),
+            has_alpha: false,
+        }),
+        D3DFMT_A16B16G16R16F => Some(FormatMapping {
+            // The D3D9 name lists channels most-significant first, so the
+            // stored order is R, G, B, A in ascending addresses — byte-for-byte
+            // Metal's RGBA16Float, no swizzle needed. Same reasoning as
+            // A32B32G32R32F below.
+            metal_pixel_format: PixelFormat::Rgba16Float,
+            bytes_per_pixel: 8,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 8,
+            swizzle: None,
+            has_alpha: true,
         }),
         D3DFMT_R32F => Some(FormatMapping {
             metal_pixel_format: PixelFormat::R32Float,
@@ -364,7 +443,18 @@ pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             block_width: 1,
             block_height: 1,
             block_bytes: 4,
-            swizzle: None,
+            // Green, blue and alpha sample as 1.0 (see R16F).
+            swizzle: Some([Swizzle::Red, Swizzle::One, Swizzle::One, Swizzle::One]),
+            has_alpha: false,
+        }),
+        D3DFMT_G32R32F => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rg32Float,
+            bytes_per_pixel: 8,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 8,
+            // Blue and alpha are not stored, so they sample as 1.0 (see R16F).
+            swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One]),
             has_alpha: false,
         }),
         D3DFMT_A32B32G32R32F => Some(FormatMapping {
@@ -385,10 +475,7 @@ pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             swizzle: Some([Swizzle::Red, Swizzle::Red, Swizzle::Red, Swizzle::One]),
             has_alpha: false,
         }),
-        _ => {
-            warn!(target: LOG_TARGET, "reject map_d3d_format(format={d3d_format}) → unsupported");
-            None
-        }
+        _ => None,
     }
 }
 

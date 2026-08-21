@@ -611,6 +611,13 @@ impl Harness {
         unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
     }
 
+    /// `SetTexture(stage, volume_texture)`.
+    pub fn set_volume_texture(&self, stage: u32, texture: &VolumeTexture<'_>) -> i32 {
+        // SAFETY: volume textures implement `IDirect3DBaseTexture9` and remain
+        // live for the call.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
+    }
+
     /// `SetTexture(stage, null)` — unbind whatever is on `stage`.
     pub fn clear_texture(&self, stage: u32) -> i32 {
         // SAFETY: vtable thunk; null unbinds the stage.
@@ -1767,6 +1774,16 @@ impl Harness {
     /// `UpdateTexture` between two cube textures.
     pub fn update_cube_texture_hr(&self, src: &CubeTexture<'_>, dst: &CubeTexture<'_>) -> i32 {
         // SAFETY: vtable thunk; both cube textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` between two volume textures. Returns the hr.
+    pub fn update_volume_texture_hr(
+        &self,
+        src: &VolumeTexture<'_>,
+        dst: &VolumeTexture<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both volume textures are live base textures.
         unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
     }
 

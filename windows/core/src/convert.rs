@@ -21,17 +21,18 @@ use mtld3d_types::{
     D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFMT_A8R8G8B8,
-    D3DFMT_R5G6B5, D3DFMT_R32F, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_LASTBETA_D3DCOLOR,
-    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK, D3DFVF_PSIZE, D3DFVF_SPECULAR,
-    D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3,
-    D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1, D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB4,
-    D3DFVF_XYZB5, D3DFVF_XYZRHW, D3DFVF_XYZW, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
-    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DSTENCILOP_DECR,
-    D3DSTENCILOP_DECRSAT, D3DSTENCILOP_INCR, D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT,
-    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER,
-    D3DTADDRESS_CLAMP, D3DTADDRESS_MIRROR, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP,
-    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DVERTEXELEMENT9,
-    MAX_STREAMS,
+    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F,
+    D3DFMT_G32R32F, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK,
+    D3DFVF_PSIZE, D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT,
+    D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1,
+    D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB4, D3DFVF_XYZB5, D3DFVF_XYZRHW, D3DFVF_XYZW,
+    D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DPT_TRIANGLESTRIP, D3DSTENCILOP_DECR, D3DSTENCILOP_DECRSAT, D3DSTENCILOP_INCR,
+    D3DSTENCILOP_INCRSAT, D3DSTENCILOP_INVERT, D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE,
+    D3DSTENCILOP_ZERO, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP, D3DTADDRESS_MIRROR,
+    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DVERTEXELEMENT9, MAX_STREAMS,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -111,10 +112,122 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
                 ((u16::from(r) >> 3) << 11) | ((u16::from(g) >> 2) << 5) | (u16::from(b) >> 3);
             Some(packed.to_le_bytes().to_vec())
         }
-        // Single 32-bit float carrying the red channel normalised to [0, 1].
+        // Float formats carry the D3DCOLOR channels normalised to [0, 1], in
+        // channel order R, G, B, A — the D3D9 names list them most-significant
+        // first, so the stored order is the reverse of the name.
         D3DFMT_R32F => Some((f32::from(r) / 255.0).to_le_bytes().to_vec()),
+        D3DFMT_G32R32F => {
+            let mut bytes = (f32::from(r) / 255.0).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&(f32::from(g) / 255.0).to_le_bytes());
+            Some(bytes)
+        }
+        D3DFMT_A32B32G32R32F => {
+            let mut bytes = Vec::with_capacity(16);
+            for channel in d3dcolor_to_rgba_f32(color) {
+                bytes.extend_from_slice(&channel.to_le_bytes());
+            }
+            Some(bytes)
+        }
+        D3DFMT_R16F => Some(f32_to_f16_bits(f32::from(r) / 255.0).to_le_bytes().to_vec()),
+        // 16-bit unorm widens each 8-bit channel by replication (0xab -> 0xabab),
+        // which is exact for the 0 and 255 endpoints and within half an LSB
+        // elsewhere.
+        D3DFMT_G16R16 => {
+            let mut bytes = unorm8_to_unorm16(r).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&unorm8_to_unorm16(g).to_le_bytes());
+            Some(bytes)
+        }
+        D3DFMT_A16B16G16R16 => {
+            let mut bytes = Vec::with_capacity(8);
+            for channel in [r, g, b, a] {
+                bytes.extend_from_slice(&unorm8_to_unorm16(channel).to_le_bytes());
+            }
+            Some(bytes)
+        }
+        D3DFMT_G16R16F => {
+            let mut bytes = f32_to_f16_bits(f32::from(r) / 255.0).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&f32_to_f16_bits(f32::from(g) / 255.0).to_le_bytes());
+            Some(bytes)
+        }
+        D3DFMT_A16B16G16R16F => {
+            let mut bytes = Vec::with_capacity(8);
+            for channel in d3dcolor_to_rgba_f32(color) {
+                bytes.extend_from_slice(&f32_to_f16_bits(channel).to_le_bytes());
+            }
+            Some(bytes)
+        }
         _ => None,
     }
+}
+
+/// Widen an 8-bit unorm channel to 16 bits by replication.
+const fn unorm8_to_unorm16(channel: u8) -> u16 {
+    u16::from_le_bytes([channel, channel])
+}
+
+/// Encode an `f32` as IEEE-754 binary16 bits, rounding to nearest even.
+///
+/// The D3D9 half-float formats (`R16F`, `G16R16F`, `A16B16G16R16F`) store this
+/// encoding, and `ColorFill` has to produce it on the CPU because the fill
+/// writes destination bytes directly. Magnitudes above the binary16 range
+/// saturate to an infinity, magnitudes below the smallest subnormal flush to a
+/// zero, and a NaN stays a NaN — the same edges the GPU's conversion has.
+#[must_use]
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    // Exponent thresholds, in binary32 biased form, so the whole encode stays
+    // in unsigned arithmetic: binary16's bias is 112 lower, its largest finite
+    // exponent is 142, its smallest normal is 113, and the ten subnormal steps
+    // reach down to 103.
+    const HALF_BIAS_SHIFT: u32 = 112;
+    const FIRST_OVERFLOW: u32 = 143;
+    const SMALLEST_NORMAL: u32 = 113;
+    const SMALLEST_SUBNORMAL: u32 = 103;
+
+    let bits = value.to_bits();
+    let sign: u32 = if bits >> 31 == 0 { 0 } else { 0x8000 };
+    let exponent = (bits >> 23) & 0xff;
+    let mantissa = bits & 0x007f_ffff;
+
+    // Infinity keeps an empty payload; NaN keeps its quiet bit, so a NaN in
+    // never becomes an infinity out.
+    if exponent == 0xff {
+        let payload = if mantissa == 0 { 0 } else { 0x0200 };
+        return narrow_f16(sign | 0x7c00 | payload);
+    }
+    if exponent >= FIRST_OVERFLOW {
+        return narrow_f16(sign | 0x7c00);
+    }
+
+    // Normal and subnormal differ only in where the 24-bit significand lands:
+    // a normal keeps a rebiased exponent field and drops 13 mantissa bits, a
+    // subnormal zeroes the exponent field and shifts the significand
+    // (implicit bit restored) further down. Rounding is the same on both, and
+    // a carry out of the mantissa propagates into the exponent field on its
+    // own — including the carry that turns the largest finite into infinity.
+    let (unrounded, dropped, shift) = if exponent >= SMALLEST_NORMAL {
+        let field = exponent - HALF_BIAS_SHIFT;
+        ((field << 10) | (mantissa >> 13), mantissa & 0x1fff, 13)
+    } else if exponent >= SMALLEST_SUBNORMAL {
+        let shift = HALF_BIAS_SHIFT + 14 - exponent;
+        let significand = mantissa | 0x0080_0000;
+        (
+            significand >> shift,
+            significand & ((1 << shift) - 1),
+            shift,
+        )
+    } else {
+        // Smaller than the smallest subnormal, zero included.
+        return narrow_f16(sign);
+    };
+
+    let halfway = 1 << (shift - 1);
+    let round_up = dropped > halfway || (dropped == halfway && unrounded & 1 == 1);
+    narrow_f16(sign | (unrounded + u32::from(round_up)))
+}
+
+/// Narrow an assembled binary16 bit pattern, which is 16 bits wide by construction.
+fn narrow_f16(bits: u32) -> u16 {
+    u16::try_from(bits).expect("binary16 pattern is 16 bits wide")
 }
 
 /// D3DCMP_* → Metal compare function.

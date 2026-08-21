@@ -5,9 +5,9 @@
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
-    D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
+    D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8,
+    D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
     D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE,
     D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
@@ -1065,6 +1065,89 @@ fn create_render_target_rgba32f_succeeds() {
         desc.format, D3DFMT_A32B32G32R32F,
         "RGBA32F format round-trips"
     );
+}
+
+#[test]
+fn create_render_target_rgba16f_succeeds() {
+    // D3DFMT_A16B16G16R16F is the half-float HDR scene target D3D9 engines
+    // ask for (MTLPixelFormatRGBA16Float). CreateRenderTarget must accept it,
+    // and GetDesc must report the format back unsubstituted.
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 48, D3DFMT_A16B16G16R16F);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "RGBA16F render-target GetDesc");
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "render target is DEFAULT pool");
+    assert_eq!(
+        desc.usage, D3DUSAGE_RENDERTARGET,
+        "reports RENDERTARGET usage"
+    );
+    assert_eq!(
+        desc.format, D3DFMT_A16B16G16R16F,
+        "RGBA16F format round-trips"
+    );
+}
+
+/// Decode IEEE-754 binary16 bits into an `f32`.
+///
+/// Covers zero, subnormals and normals — everything a `[0, 1]` colour
+/// read-back can produce.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let mantissa = f32::from(bits & 0x03ff) / 1024.0;
+    if exponent == 0 {
+        sign * mantissa * 2.0_f32.powi(-14)
+    } else {
+        sign * (1.0 + mantissa) * 2.0_f32.powi(exponent - 15)
+    }
+}
+
+#[test]
+fn render_into_rgba16f_target_round_trips() {
+    // Draw a known diffuse colour into a half-float render target and read it
+    // back: the create, the colour attachment, and the read-back blit all have
+    // to agree on RGBA16Float. This is the shape an engine's HDR scene pass
+    // uses before it tone-maps down to the 8-bit backbuffer.
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(64, 64, D3DFMT_A16B16G16R16F);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind half-float RT");
+    assert_eq!(h.clear_target(0), 0, "clear RT to 0");
+    // 0xFF804020 → R = 0x80/255, G = 0x40/255, B = 0x20/255.
+    draw_fill_at_z(&h, 0xFF80_4020, 0.5);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData half-float RT → SYSTEMMEM"
+    );
+    let lanes = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("non-negative pitch");
+        // One texel is four halves; sample the middle of the surface.
+        let texel = 32 * pitch / 2 + 32 * 4;
+        let halves = locked.as_u16(texel + 4);
+        [
+            f16_to_f32(halves[texel]),
+            f16_to_f32(halves[texel + 1]),
+            f16_to_f32(halves[texel + 2]),
+            f16_to_f32(halves[texel + 3]),
+        ]
+    };
+    let expected = [
+        f32::from(0x80u8) / 255.0,
+        f32::from(0x40u8) / 255.0,
+        f32::from(0x20u8) / 255.0,
+        1.0,
+    ];
+    for (lane, (got, want)) in lanes.into_iter().zip(expected).enumerate() {
+        assert!(
+            (got - want).abs() < 0.01,
+            "half-float RT lane {lane} should hold {want}; got {got}"
+        );
+    }
 }
 
 #[test]

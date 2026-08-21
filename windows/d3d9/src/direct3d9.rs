@@ -11,14 +11,14 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A1R5G5B5,
-    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16,
-    D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
-    D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1,
+    D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1,
+    D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
+    D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -266,38 +266,26 @@ const fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
 
 // Formats the texture pool can sample or receive uploads in.
 //
-// The FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`) belong
-// here too: D3D9-era engines (incl. WoW's CSM path) probe them via
-// `CheckDeviceFormat(rtype=TEXTURE, fmt=INTZ)` without `USAGE_DEPTHSTENCIL`
-// in the query, and only enable hardware shadow mapping when at least one
-// comes back available.
+// Derived from the create path rather than listed: `CreateTexture` accepts
+// exactly the formats `map_d3d_format` maps, so an independent list here
+// drifts — the answer then disagrees with what a create actually does, and
+// callers that probe first (every engine that picks a scene format from
+// `CheckDeviceFormat`) take a fallback path for a format we support. That
+// covers the odd ones deliberately: YUY2/UYVY back a creatable, lockable RG8
+// surface with no YUV sampling, and ATI1 is a creatable BC4 texture.
+//
+// The FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`) belong here
+// too, and are not colour mappings: D3D9-era engines (incl. WoW's CSM path)
+// probe them via `CheckDeviceFormat(rtype=TEXTURE, fmt=INTZ)` without
+// `USAGE_DEPTHSTENCIL` in the query, and only enable hardware shadow mapping
+// when at least one comes back available.
 const fn is_texture_format(fmt: u32) -> bool {
-    matches!(
-        fmt,
-        D3DFMT_A8R8G8B8
-            | D3DFMT_X8R8G8B8
-            | D3DFMT_R5G6B5
-            | D3DFMT_A1R5G5B5
-            | D3DFMT_A4R4G4B4
-            | D3DFMT_A8
-            | D3DFMT_L8
-            | D3DFMT_A8L8
-            | D3DFMT_V8U8
-            | D3DFMT_DXT1
-            | D3DFMT_DXT2
-            | D3DFMT_DXT3
-            | D3DFMT_DXT4
-            | D3DFMT_DXT5
-            // YUY2/UYVY back a creatable, lockable RG8 surface (no YUV sampling)
-            // — `map_d3d_format` maps them, so the create paths succeed and
-            // `CheckDeviceFormat` must agree, or callers derive a mismatched
-            // expected HRESULT from the disagreement.
-            | D3DFMT_YUY2
-            | D3DFMT_UYVY
-            | D3DFMT_INTZ
-            | D3DFMT_DF24
-            | D3DFMT_DF16
-    )
+    // ATI1 is the one carve-out, for the same reason it is excluded from the
+    // cube answer: it creates, but its lock reports the BC4 block pitch
+    // (8 bytes per 4x4 block) where D3D9 reports ATI1N a byte per pixel, so
+    // advertising it would hand callers a pitch they cannot use.
+    (mtld3d_core::format::is_mapped_color_format(fmt) && !matches!(fmt, D3DFMT_ATI1))
+        || mtld3d_core::format::is_raw_depth_fetch_format(fmt)
 }
 
 /// Sampleable cube colour formats backed by `MTLTextureTypeCube`.
@@ -305,8 +293,8 @@ const fn is_texture_format(fmt: u32) -> bool {
 /// ATI1 requires extension-specific cube lock semantics that are not
 /// implemented. Packed YUV has no shader sampling path, and depth cube maps
 /// are not implemented.
-fn is_cube_texture_format(fmt: u32) -> bool {
-    mtld3d_core::format::map_d3d_format(fmt).is_some()
+const fn is_cube_texture_format(fmt: u32) -> bool {
+    mtld3d_core::format::is_mapped_color_format(fmt)
         && !matches!(fmt, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY)
         && !is_depth_stencil_format(fmt)
 }
@@ -321,10 +309,29 @@ fn is_cube_texture_format(fmt: u32) -> bool {
 // in the wrong bits — so `A4R4G4B4` is a sampling-only format. Backbuffer /
 // CAMetalLayer is hardcoded BGRA8, so a request for one of these as a backbuffer
 // format hits the existing substitute-warn at `d3d9_create_device`.
+//
+// The float family is renderable: every one of R16F / G16R16F /
+// A16B16G16R16F / R32F / G32R32F / A32B32G32R32F builds a colour pipeline —
+// blend-enabled included — on Apple Silicon, and `supports32BitFloatFiltering`
+// is true there, so the 32-bit members sample with linear filtering as well.
+// Engines that render HDR internally (an off-screen float scene target, their
+// own tone-map into the 8-bit backbuffer) probe exactly this before choosing
+// their scene format.
 pub const fn is_render_target_format(fmt: u32) -> bool {
     matches!(
         fmt,
-        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5
+        D3DFMT_A8R8G8B8
+            | D3DFMT_X8R8G8B8
+            | D3DFMT_R5G6B5
+            | D3DFMT_A1R5G5B5
+            | D3DFMT_G16R16
+            | D3DFMT_A16B16G16R16
+            | D3DFMT_R16F
+            | D3DFMT_G16R16F
+            | D3DFMT_A16B16G16R16F
+            | D3DFMT_R32F
+            | D3DFMT_G32R32F
+            | D3DFMT_A32B32G32R32F
     )
 }
 
@@ -1270,13 +1277,17 @@ fn spawn_encoder_and_prewarm(
 
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
 ///
-/// See `format::BACKBUFFER_PIXEL_FORMAT`. That matches `D3DFMT_A8R8G8B8` /
-/// `D3DFMT_X8R8G8B8` byte-for-byte, which is all `WoW` requests. Windowed
-/// `CheckDeviceType` advertises the 16-bit backbuffer formats too (it answers
-/// with the `StretchRect` conversion predicate, as the runtime requires), and
-/// such a request is substituted by decision rather than plumbed: the layer
-/// cannot take a 16-bit drawable, so a real 16-bit backbuffer would need a
-/// conversion pass on every present. Warn once so a game that asked shows up.
+/// That matches `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, which is
+/// all `WoW` requests. Windowed `CheckDeviceType` advertises the 16-bit and
+/// float backbuffer formats too (it answers with the `StretchRect` conversion
+/// predicate, as the runtime requires), and such a request is substituted by
+/// decision rather than plumbed: a real 16-bit backbuffer would need a
+/// conversion pass on every present, and a float one would need the whole
+/// present path to carry a format (a second drawable format, a present
+/// pipeline per format, and format-derived read-back pitches). Games that
+/// render HDR internally do it in their own off-screen float targets and
+/// tone-map into an 8-bit backbuffer, so nothing has needed it. Warn once so a
+/// game that asked shows up.
 fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

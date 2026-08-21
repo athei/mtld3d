@@ -2,15 +2,15 @@
 //!
 //! Plus cube and volume texture contracts.
 
-use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, assert_pixel_eq};
+use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq};
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE,
+    D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -595,6 +595,78 @@ fn update_texture_keeps_cube_faces_independent() {
         0xFF00_FF00,
         "UpdateTexture negative-X face",
     );
+}
+
+/// Sample the volume bound on stage 0 at texcoord `(0.5, 0.5, w)` with point filtering.
+fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
+    const WHITE: u32 = 0xFFFF_FFFF;
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u: 0.5,
+        v: 0.5,
+        w,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "volume sample draw"
+        );
+    });
+    h.read_pixel(320, 240)
+}
+
+/// `UpdateTexture` carries every slice of a SYSTEMMEM volume into its DEFAULT twin.
+///
+/// The pattern an engine uses to upload a colour-grading LUT: fill a
+/// system-memory volume through `LockBox`, then `UpdateTexture` it into the
+/// default-pool volume the shader samples. Each slice carries its own colour
+/// so a copy that forgets the dirty mark (nothing arrives) or stops after the
+/// first slice (every deeper lookup reads slice 0, or whatever the GPU
+/// allocation held) is told apart from a correct one.
+#[test]
+fn update_texture_copies_every_volume_slice() {
+    const SLICE_COLORS: [u32; 4] = [0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+    let h = Harness::new();
+    let (hr, src) =
+        h.try_create_volume_texture([2, 2, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "SYSTEMMEM volume");
+    let src = src.expect("source volume");
+    let texels: Vec<u32> = SLICE_COLORS.iter().flat_map(|&color| [color; 4]).collect();
+    src.write_u32(0, &texels);
+    let (hr, dst) = h.try_create_volume_texture([2, 2, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "DEFAULT volume");
+    let dst = dst.expect("destination volume");
+    assert_eq!(h.update_volume_texture_hr(&src, &dst), 0, "UpdateTexture");
+
+    assert_eq!(h.set_volume_texture(0, &dst), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    for (z, expected) in (0u8..).zip(SLICE_COLORS) {
+        // Slice centres of a four-deep volume.
+        let w = (f32::from(z) + 0.5) / 4.0;
+        assert_pixel_eq(
+            sample_volume_depth(&h, w),
+            expected,
+            &format!("volume slice {z} after UpdateTexture"),
+        );
+    }
 }
 
 /// `D3DFMT_V8U8` must sample its content, not black.

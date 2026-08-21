@@ -62,8 +62,12 @@ pub enum PixelFormat {
     Abgr4Unorm = 42,
     /// 16-bit packed 5/5/5/1. D3D9 `D3DFMT_A1R5G5B5`.
     Bgr5A1Unorm = 43,
+    /// 32-bit two-channel unorm. D3D9 `D3DFMT_G16R16`.
+    Rg16Unorm = 60,
     /// 32-bit single-channel float. D3D9 `D3DFMT_R32F`.
     R32Float = 55,
+    /// 16-bit two-channel float. D3D9 `D3DFMT_G16R16F`.
+    Rg16Float = 65,
     Bgra8Unorm = 80,
     /// sRGB-encoded twin of `Bgra8Unorm`.
     ///
@@ -72,6 +76,11 @@ pub enum PixelFormat {
     /// `newTextureViewWithPixelFormat:` over a `Bgra8Unorm` texture when a
     /// sampler requests `D3DSAMP_SRGBTEXTURE`.
     Bgra8UnormSrgb = 81,
+    /// 64-bit two-channel float. D3D9 `D3DFMT_G32R32F`.
+    Rg32Float = 105,
+    /// 64-bit four-channel unorm. D3D9 `D3DFMT_A16B16G16R16`.
+    Rgba16Unorm = 110,
+    /// 64-bit four-channel float. D3D9 `D3DFMT_A16B16G16R16F`.
     Rgba16Float = 115,
     /// 128-bit four-channel float. D3D9 `D3DFMT_A32B32G32R32F`.
     Rgba32Float = 125,
