@@ -6,13 +6,15 @@
 use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
 use mtld3d_types::{
     D3D_OK, D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
-    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
-    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ,
-    D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS, D3DRS_FILLMODE,
-    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    DevCaps, TextureCaps,
+    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F,
+    D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
 #[test]
@@ -162,6 +164,103 @@ fn check_device_format_accept_and_reject() {
         D3D_OK,
         "cube render-target autogen query agrees with creation",
     );
+}
+
+/// The D3D9 wide-channel texture formats.
+///
+/// 16-bit unorm plus the half- and single-precision floats.
+/// Engines that render HDR internally pick a scene target from this set after
+/// probing `CheckDeviceFormat`, so the probe and the create path have to give
+/// the same answer for every member.
+const WIDE_FORMATS: [(u32, &str); 8] = [
+    (D3DFMT_G16R16, "G16R16"),
+    (D3DFMT_A16B16G16R16, "A16B16G16R16"),
+    (D3DFMT_R16F, "R16F"),
+    (D3DFMT_G16R16F, "G16R16F"),
+    (D3DFMT_A16B16G16R16F, "A16B16G16R16F"),
+    (D3DFMT_R32F, "R32F"),
+    (D3DFMT_G32R32F, "G32R32F"),
+    (D3DFMT_A32B32G32R32F, "A32B32G32R32F"),
+];
+
+#[test]
+fn check_device_format_advertises_the_wide_channel_family() {
+    let h = Harness::factory_only();
+    for (fmt, name) in WIDE_FORMATS {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, fmt),
+            D3D_OK,
+            "{name} texture must be advertised",
+        );
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_RENDERTARGET,
+                D3DRTYPE_SURFACE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} render target must be advertised",
+        );
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+                D3DRTYPE_TEXTURE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} blends as a render target",
+        );
+        // No float format has an sRGB twin, so the sRGB queries stay negative.
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_SRGBREAD,
+                D3DRTYPE_TEXTURE,
+                fmt
+            ),
+            D3DERR_NOTAVAILABLE,
+            "{name} has no sRGB decode",
+        );
+    }
+}
+
+#[test]
+fn wide_channel_family_creates_what_check_device_format_advertises() {
+    // The bug this pins: the probe answered NOTAVAILABLE for formats the
+    // create paths accepted, so an engine that asks first concluded the whole
+    // family was missing and shut down instead of falling back.
+    let h = Harness::new();
+    for (fmt, name) in WIDE_FORMATS {
+        let advertised = h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, fmt);
+        assert_eq!(advertised, D3D_OK, "{name} texture probe");
+        // Panics with the HRESULT if the create disagrees with the probe.
+        drop(h.create_texture(32, 32, 1, 0, fmt, D3DPOOL_MANAGED));
+
+        // Cube maps too: an environment-map lookup table in G16R16 is the
+        // second thing an HDR engine creates after its scene target.
+        let advertised = h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, fmt);
+        assert_eq!(advertised, D3D_OK, "{name} cube probe");
+        assert_eq!(
+            h.create_cube_texture(16, 1, 0, fmt, D3DPOOL_MANAGED),
+            D3D_OK,
+            "{name} CreateCubeTexture",
+        );
+
+        let advertised = h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_SURFACE,
+            fmt,
+        );
+        assert_eq!(advertised, D3D_OK, "{name} render-target probe");
+        assert_eq!(
+            h.create_render_target_hr(32, 32, fmt),
+            D3D_OK,
+            "{name} CreateRenderTarget",
+        );
+    }
 }
 
 #[test]

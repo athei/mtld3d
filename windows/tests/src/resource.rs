@@ -41,6 +41,11 @@ impl VolumeTexture<'_> {
         unsafe { deref_vtbl::<IDirect3DVolumeTexture9Vtbl>(self.ptr) }
     }
 
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
     /// Describe mip `level`. Returns `(hr, desc)`.
     #[must_use]
     pub fn level_desc(&self, level: u32) -> (i32, D3DVOLUME_DESC) {
@@ -84,6 +89,57 @@ impl VolumeTexture<'_> {
     pub fn unlock_box(&self, level: u32) -> i32 {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().unlock_box)(self.ptr, level) }
+    }
+
+    /// Fill mip `level` of a 32-bit-per-texel volume through `LockBox` / `UnlockBox`.
+    ///
+    /// `texels` is the whole level, tightly packed slice by slice, row by
+    /// row; the write honours the row and slice pitches the lock reports.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32(&self, level: u32, texels: &[u32]) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "VolumeTexture GetLevelDesc");
+        let (width, height, depth) = (
+            desc.width as usize,
+            desc.height as usize,
+            desc.depth as usize,
+        );
+        assert_eq!(texels.len(), width * height * depth, "one level of texels");
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null box locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(self.ptr, level, &raw mut locked, core::ptr::null(), 0)
+        };
+        expect_ok(hr, "VolumeTexture LockBox");
+        assert!(!locked.bits.is_null(), "LockBox handed out a pointer");
+        let row_pitch = usize::try_from(locked.row_pitch).expect("row pitch is positive");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("slice pitch is positive");
+        for z in 0..depth {
+            for y in 0..height {
+                let row = &texels[(z * height + y) * width..][..width];
+                // SAFETY: `LockBox` mapped `slice_pitch * depth` writable bytes
+                // at `bits`, so the row start lands inside its own slice.
+                let dst = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                // SAFETY: `width * 4` bytes from the row start never exceed
+                // `row_pitch`, so the copy stays inside the mapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, width * 4);
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
     }
 }
 
@@ -870,6 +926,17 @@ impl LockedRect<'_> {
         // SAFETY: `bits` is valid for `count` u32s within the locked region
         // (caller's contract) and lives until this guard drops.
         unsafe { core::slice::from_raw_parts(self.bits.cast::<u32>(), count) }
+    }
+
+    /// View the first `count` `u16` lanes of the mapped span.
+    ///
+    /// For the 16-bit-per-channel formats, where one texel spans several
+    /// lanes (a half-float RGBA texel is four of them).
+    #[must_use]
+    pub const fn as_u16(&self, count: usize) -> &[u16] {
+        // SAFETY: `bits` is valid for `count` u16s within the locked region
+        // (caller's contract) and lives until this guard drops.
+        unsafe { core::slice::from_raw_parts(self.bits.cast::<u16>(), count) }
     }
 }
 

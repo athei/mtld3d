@@ -309,6 +309,67 @@ fn up_fvf_samples_float_texture() {
     );
 }
 
+/// A 2x1 A16B16G16R16F (half-float) texture sampled at u = 0.75 must return its second texel.
+///
+/// The half-float twin of the A32B32G32R32F case above: it pins the binary16
+/// upload path (bytes go in as the CPU encoded them) and the sampler's decode.
+#[test]
+fn up_fvf_samples_half_float_texture() {
+    use mtld3d_core::convert::f32_to_f16_bits;
+    use mtld3d_types::D3DFMT_A16B16G16R16F;
+
+    let h = Harness::new();
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_A16B16G16R16F, 0);
+    // texel 0 = red (1,0,0,1), texel 1 = green (0,1,0,1), RGBA half order.
+    let texels: Vec<u16> = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+        .into_iter()
+        .map(f32_to_f16_bits)
+        .collect();
+    tex.lock_rect(0, 0).write::<u16>(&texels);
+
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        0
+    );
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+
+    let v = |x: f32, y: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0,
+        u: 0.75,
+        v: 0.5,
+    };
+    let verts = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts),
+            0,
+            "draw"
+        );
+    });
+    let px = h.read_pixel(320, 240);
+    assert_eq!(
+        Rgba8::from_pixel(px),
+        Rgba8::from_pixel(0xFF00_FF00),
+        "u=0.75 must sample the GREEN half-float texel; got {px:#010x}"
+    );
+}
+
 /// A larger A32B32G32R32F texture filled row-by-row honouring the locked pitch.
 ///
 /// Texel (x,y) = (x/W, y/H, 0, 1), then sampled at a known texcoord. If the
