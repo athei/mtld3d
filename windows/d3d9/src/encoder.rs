@@ -213,6 +213,8 @@ pub struct BlitSide {
     pub handle: u64,
     pub rect: mtld3d_core::stretch_rect::StretchRegion,
     pub dims: (u32, u32),
+    /// Mip level of `handle` the blit reads or writes.
+    pub mip: u32,
 }
 
 /// Parameter bag for `FrameEncoder::run_texture_upload`.
@@ -2775,7 +2777,10 @@ impl FrameEncoder {
         let mut ss = [0u32; mtld3d_types::SAMPLER_STATE_COUNT];
         ss[mtld3d_types::D3DSAMP_MINFILTER as usize] = min_mag;
         ss[mtld3d_types::D3DSAMP_MAGFILTER as usize] = min_mag;
-        ss[mtld3d_types::D3DSAMP_MIPFILTER as usize] = mtld3d_types::D3DTEXF_NONE;
+        // The blit shader samples an explicit source level; a point mip filter
+        // makes that level exact (without one the texture's level 0 is read
+        // regardless of the explicit level).
+        ss[mtld3d_types::D3DSAMP_MIPFILTER as usize] = mtld3d_types::D3DTEXF_POINT;
         ss[mtld3d_types::D3DSAMP_ADDRESSU as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSV as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSW as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
@@ -2813,11 +2818,13 @@ impl FrameEncoder {
             handle: src_handle,
             rect: src_rect,
             dims: src_dims,
+            mip: src_mip,
         } = src;
         let &BlitSide {
             handle: dst_handle,
             rect: dst_rect,
             dims: dst_dims,
+            mip: dst_mip,
         } = dst;
         if dst_handle == 0 || src_handle == 0 {
             return;
@@ -2856,6 +2863,11 @@ impl FrameEncoder {
             xform[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
         }
         let xform_ptr = self.scratch.alloc(&xform);
+        // The source level, as the float the blit PS passes to `level()`; mip
+        // counts are tiny, so the conversion is exact.
+        let mut src_level = [0u8; 16];
+        src_level[..4].copy_from_slice(&to_f(src_mip).to_le_bytes());
+        let src_level_ptr = self.scratch.alloc(&src_level);
 
         // Save the device's current attachments + viewport so the one-off
         // destination pass doesn't perturb the live render target. The colour
@@ -2876,12 +2888,13 @@ impl FrameEncoder {
         // `dst_dims` and `dst_rect` are already in the destination texture's own
         // space (the caller converted them), so this binding declares the
         // identity rather than converting a second time.
-        self.pass_state.set_color_render_target(
+        self.pass_state.set_color_render_target_subresource(
             dst_tex,
             dst_dims.0,
             dst_dims.1,
             dst_format,
             RenderScale::IDENTITY,
+            (0, dst_mip),
         );
         self.pass_state
             .set_depth_stencil_attachment(MetalHandle::NULL, false, false);
@@ -2918,6 +2931,11 @@ impl FrameEncoder {
         }
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(xform_ptr, RGBA_BYTE_LEN, 0));
+        self.pass_state.emit_command(Command::set_fragment_bytes_at(
+            src_level_ptr,
+            RGBA_BYTE_LEN,
+            0,
+        ));
         // Inline slot-0 vertex bind clobbers any real bound VB; drop the cache
         // so a subsequent bound draw re-emits its `setVertexBuffer`.
         self.last_bound.invalidate_vertex_buffer();

@@ -303,6 +303,95 @@ fn create_depth_stencil_surface_succeeds() {
 }
 
 #[test]
+fn stretch_rect_addresses_source_and_destination_mip_levels() {
+    // A StretchRect between surfaces that are upper mip levels reads and
+    // writes those levels, on both the scaling and the 1:1 path.
+    let h = Harness::new();
+    let tex = h.create_texture(
+        128,
+        128,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level0 = tex.surface_level(0);
+    let level1 = tex.surface_level(1);
+    let backbuffer = h.render_target(0);
+    let small = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+
+    assert_eq!(h.set_render_target(0, &level0), 0);
+    assert_eq!(h.clear_target(RED), 0);
+    assert_eq!(h.set_render_target(0, &level1), 0);
+    assert_eq!(h.clear_target(GREEN), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+
+    // Scaling path: level 1 (64x64) onto the 640x480 back buffer.
+    assert_eq!(
+        h.stretch_rect(&level1, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from level 1"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "scaled copy samples the source's own level"
+    );
+
+    // 1:1 path: level 1 (64x64) into a 64x64 target, then that target onto
+    // the back buffer so it can be read.
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level1, &small, D3DTEXF_NONE),
+        0,
+        "1:1 copy from level 1"
+    );
+    assert_eq!(
+        h.stretch_rect(&small, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy of the 1:1 result"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "1:1 copy reads the source's own level"
+    );
+
+    // 1:1 into level 1: paint the small target, copy it into level 1, then
+    // read level 1 back through the scaling path.
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(h.clear_target(WHITE), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.stretch_rect(&small, &level1, D3DTEXF_NONE),
+        0,
+        "1:1 copy into level 1"
+    );
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level1, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from the written level 1"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        WHITE,
+        "1:1 copy writes the destination's own level"
+    );
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level0, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from level 0"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "level 0 is untouched by the level-1 writes"
+    );
+}
+
+#[test]
 fn clear_zbuffer_without_depth_stencil_is_invalid() {
     // `Clear(D3DCLEAR_ZBUFFER)` with no depth-stencil attachment bound is
     // invalid per the D3D9 spec. The guard must key on
