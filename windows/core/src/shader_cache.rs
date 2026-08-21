@@ -235,7 +235,12 @@ use crate::shader_compile_stats::CompileBucket;
 /// also reads a PSIZE attribute and applies `D3DRS_POINTSCALE*`), and
 /// `VariantFlags::POINT_SPRITE` makes a pixel shader take `[[point_coord]]`,
 /// changing the MSL of every vertex shader and the PS key hash shape.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 60;
+///
+/// `61` user clip planes: `VsDraw` grows the inverse view and six planes, the
+/// vertex shaders emit `[[clip_distance]]` lanes keyed on the enabled-plane
+/// count (a new `FfVsKey` field and a new programmable-VS disk-key input),
+/// changing every vertex shader's MSL and both VS key hash shapes.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 61;
 
 /// File magic.
 ///

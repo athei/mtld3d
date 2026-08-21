@@ -220,6 +220,12 @@ pub struct FfVsKey {
     pub vertex_blend_count: u8,
     /// Number of weight lanes the vertex decl declares.
     pub declared_weights_count: u8,
+    /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
+    ///
+    /// The VS emits one `[[clip_distance]]` lane per plane, computed from
+    /// the world-space position; always 0 on an RHW layout, which D3D9 never
+    /// clips against user planes.
+    pub clip_plane_count: u8,
 }
 
 impl FfVsKey {
@@ -392,7 +398,7 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("#include <metal_stdlib>\n");
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
-    emit_varyings(&mut out, false);
+    emit_varyings(&mut out, false, vs_key.clip_plane_count);
     out.push_str(crate::vs_draw::VS_DRAW_MSL);
     if vs_key.lighting_enabled() && vs_key.has_normal() {
         emit_normal_matrix_helpers(&mut out);
@@ -425,7 +431,11 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
     let mut out = String::new();
     out.push_str("#include <metal_stdlib>\n");
     out.push_str("using namespace metal;\n\n");
-    emit_varyings(&mut out, variant.flags.contains(VariantFlags::FLAT_SHADE));
+    emit_varyings(
+        &mut out,
+        variant.flags.contains(VariantFlags::FLAT_SHADE),
+        0,
+    );
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
     }
@@ -506,7 +516,7 @@ fn masked_input_rhs(vs: &FfVsKey, stage: usize, src: u32) -> String {
     }
 }
 
-fn emit_varyings(out: &mut String, flat: bool) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     out.push_str("struct Varyings {\n");
     // Must match `dxso::emit::emit_varyings` byte-for-byte — see the
     // invariance comment there. Analog of an `Invariant` decoration on
@@ -540,6 +550,13 @@ fn emit_varyings(out: &mut String, flat: bool) {
     // oPts / dcl_psize must link to an FF PS, and vice versa, so the
     // layout has to stay identical.
     out.push_str("    float point_size [[point_size]];\n");
+    // VS-only: see `dxso::emit::emit_varyings`.
+    if clip_planes > 0 {
+        let _ = writeln!(
+            out,
+            "    float clip_distance [[clip_distance]] [{clip_planes}];"
+        );
+    }
     out.push_str("};\n\n");
 }
 
@@ -875,6 +892,23 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     out.push_str("    out.position.x += pos_fixup.x * out.position.w;\n");
     out.push_str("    out.position.y += pos_fixup.y * out.position.w;\n");
     emit_point_size(out, vs, vs.point_scale());
+    // User clip planes are world-space for the fixed-function pipeline.
+    // The shader only has the eye-space position (WV is pre-multiplied on
+    // the CPU), so it walks back through the inverse view the VsDraw
+    // uniform carries (rows = columns of inverse(view), same convention
+    // as the `vs_c` matrices) and emits one clip distance per enabled
+    // plane; Metal discards fragments where any lane is negative.
+    if vs.clip_plane_count > 0 {
+        out.push_str(
+            "    float4 world_pos = float4(dot(pos_view, vs_draw.inv_view[0]), dot(pos_view, vs_draw.inv_view[1]), dot(pos_view, vs_draw.inv_view[2]), dot(pos_view, vs_draw.inv_view[3]));\n",
+        );
+        for i in 0..vs.clip_plane_count {
+            let _ = writeln!(
+                out,
+                "    out.clip_distance[{i}] = dot(world_pos, vs_draw.clip[{i}]);"
+            );
+        }
+    }
 
     // TCI pre-scan: if any active stage needs eye-space normal / position
     // but the lighting branch below won't declare them, emit them here.

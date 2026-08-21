@@ -23,7 +23,7 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache,
     streams::{instance_count, instanced_stream_read_bytes, is_instance_data, stream_step},
-    vs_draw::{VS_DRAW_BYTES, build_vs_draw_bytes},
+    vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, build_vs_draw_bytes},
 };
 use mtld3d_shared::{
     Command, VertexAttrDesc,
@@ -32,14 +32,19 @@ use mtld3d_shared::{
         VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
-use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
+use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
 
 /// `VsDraw` bytes for the default render states.
 ///
 /// The fallback bind when a snapshot reaches `emit_draw` without its own
 /// (never expected; warned once).
-static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> =
-    std::sync::LazyLock::new(|| build_vs_draw_bytes(&render_state_defaults()));
+static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::LazyLock::new(|| {
+    build_vs_draw_bytes(
+        &render_state_defaults(),
+        &D3DMATRIX::IDENTITY,
+        &[[0.0; 4]; MAX_CLIP_PLANES],
+    )
+});
 
 use super::{encoder::FrameEncoder, stage_bindings::STAGE_COUNT};
 
@@ -642,6 +647,8 @@ pub enum VsKey {
         ///
         /// See `VsSource::Programmable::provided_input_mask`.
         provided_input_mask: u16,
+        /// See `VsSource::Programmable::clip_plane_count`.
+        clip_plane_count: u8,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -677,8 +684,9 @@ impl VsKey {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask),
+            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }
     }
@@ -721,10 +729,16 @@ impl PsKey {
 /// The provided-input mask IS folded in: a shader reading an unprovided
 /// input emits different MSL (the input becomes `float4(0)` and `VertexIn`
 /// drops the attribute), so each `(vs_id, mask)` compiles a distinct
-/// `MTLLibrary`. Variant bits still don't change VS MSL, so they are
-/// intentionally left out.
-pub fn vs_source_disk_key_programmable(vs_id: ProgramId, provided_input_mask: u16) -> u64 {
-    shader_cache::ff_key_hash(&(vs_id.raw(), provided_input_mask))
+/// `MTLLibrary`. So is the user clip plane count: it sizes the
+/// `[[clip_distance]]` output and the distances the epilogue computes.
+/// Variant bits still don't change VS MSL, so they are intentionally left
+/// out.
+pub fn vs_source_disk_key_programmable(
+    vs_id: ProgramId,
+    provided_input_mask: u16,
+    clip_plane_count: u8,
+) -> u64 {
+    shader_cache::ff_key_hash(&(vs_id.raw(), provided_input_mask, clip_plane_count))
 }
 
 pub fn vs_source_disk_key_ff(ff: &FfVsKey) -> u64 {
@@ -788,6 +802,14 @@ pub enum VsSource {
         /// 14. False for the vast majority of shaders, which then pay no
         /// slot-14 bind.
         uses_int_const: bool,
+        /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
+        ///
+        /// Folds into the VS library + disk keys: the shader declares one
+        /// `[[clip_distance]]` lane per plane and computes it in the
+        /// epilogue, so each count is a distinct variant. Zero for every
+        /// draw that never enables a plane, which keeps the common case at
+        /// one variant.
+        clip_plane_count: u8,
     },
     FixedFunction {
         key: FfVsKey,
@@ -814,11 +836,13 @@ impl VsSource {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => VsKey::Programmable {
                 vs_id: *vs_id,
                 variant,
                 provided_input_mask: *provided_input_mask,
+                clip_plane_count: *clip_plane_count,
             },
             Self::FixedFunction { key, .. } => VsKey::FixedFunction {
                 ff: key.clone(),
@@ -836,8 +860,9 @@ impl VsSource {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask),
+            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
             Self::FixedFunction { key, .. } => vs_source_disk_key_ff(key),
         }
     }

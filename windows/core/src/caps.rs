@@ -436,6 +436,11 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.dev_caps2 = DEV_CAPS2_DEFAULT.bits();
     // One adapter, which is its own group of one.
     caps.number_of_adapters_in_group = 1;
+    // User clip planes: the vertex shaders emit one `[[clip_distance]]` lane
+    // per enabled plane from the `VsDraw` uniform (`crate::vs_draw`), whose
+    // `MAX_CLIP_PLANES` this must match (pinned by a unit test; a const fn
+    // cannot convert the usize).
+    caps.max_user_clip_planes = 6;
 }
 
 /// Bring-up diagnostic: over-advertise caps only where the fallout would show up in the log.
@@ -495,6 +500,18 @@ mod tests {
         let mut caps: D3DCAPS9 = unsafe { core::mem::zeroed() };
         fill_default(&mut caps);
         caps
+    }
+
+    #[test]
+    fn user_clip_planes_match_the_uniform_capacity() {
+        // 3DMark05 requires at least one; the uniform carries six, the
+        // D3D9-era hardware figure, one `[[clip_distance]]` lane each.
+        let caps = filled();
+        assert_eq!(
+            usize::try_from(caps.max_user_clip_planes).expect("fits"),
+            crate::vs_draw::MAX_CLIP_PLANES
+        );
+        assert!(caps.max_user_clip_planes >= 1);
     }
 
     #[test]
@@ -704,12 +721,15 @@ mod tests {
         // D3D9 defines the D3DRS_POINTSIZE_MAX default as MaxPointSize; both
         // read mtld3d_types::MAX_POINT_SIZE, and 3DMark05 requires >= 64.
         let caps = filled();
-        assert_eq!(caps.max_point_size, mtld3d_types::MAX_POINT_SIZE);
+        assert_eq!(
+            caps.max_point_size.to_bits(),
+            mtld3d_types::MAX_POINT_SIZE.to_bits()
+        );
         assert!(caps.max_point_size >= 64.0);
         let defaults = mtld3d_types::render_state_defaults();
         assert_eq!(
-            f32::from_bits(defaults[mtld3d_types::D3DRS_POINTSIZE_MAX as usize]),
-            caps.max_point_size
+            defaults[mtld3d_types::D3DRS_POINTSIZE_MAX as usize],
+            caps.max_point_size.to_bits()
         );
     }
 
@@ -914,7 +934,10 @@ mod tests {
             "stencil mask must span the single-sided ops and the two-sided bit"
         );
         // max_point_size is already truthful in fill_default; no raise.
-        assert_eq!(caps.max_point_size, filled().max_point_size);
+        assert_eq!(
+            caps.max_point_size.to_bits(),
+            filled().max_point_size.to_bits()
+        );
         // vertex_blend_matrices stays at the truthful floor from fill_default.
         assert_eq!(
             caps.max_vertex_blend_matrices,

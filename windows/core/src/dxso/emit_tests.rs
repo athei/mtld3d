@@ -12,6 +12,7 @@ use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SL
 use super::{
     emit::{
         VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
+        emit_vs_programmable_named,
     },
     ir::TextureType,
     parser::parse,
@@ -2808,6 +2809,7 @@ fn vertex_blend_msl_compiles_under_metal() {
         tt_flags: [0; 8],
         vertex_blend_count: 3,
         declared_weights_count: 2,
+        clip_plane_count: 0,
     };
     metal_compile_or_fail(&emit_vs_ff(&sequential));
 
@@ -2821,6 +2823,7 @@ fn vertex_blend_msl_compiles_under_metal() {
     let indexed_only = FfVsKey {
         vertex_blend_count: 1,
         declared_weights_count: 0,
+        clip_plane_count: 0,
         ..sequential
     };
     metal_compile_or_fail(&emit_vs_ff(&indexed_only));
@@ -2853,8 +2856,100 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
+        clip_plane_count: 0,
     };
     metal_compile_or_fail(&emit_vs_ff(&key));
+}
+
+#[test]
+fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
+    use super::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    // Two enabled planes: the VS-only Varyings member carries two lanes (MSL
+    // wants the attribute between the name and the dimension), the world
+    // position comes back through the inverse view, and one distance is
+    // written per plane. The PS struct must stay free of the member.
+    let key = FfVsKey {
+        flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
+        input_tex_coord_count: 0,
+        tex_coord_count: 0,
+        light_active_mask: 0,
+        light_directional_mask: 0,
+        light_spot_mask: 0,
+        diffuse_source: 1,
+        ambient_source: 0,
+        specular_source: 2,
+        emissive_source: 0,
+        fog_mode: 0,
+        tci_modes: [0; 8],
+        tci_coord_indices: [0; 8],
+        tex_coord_dims: [0; 8],
+        tt_flags: [0; 8],
+        vertex_blend_count: 0,
+        declared_weights_count: 0,
+        clip_plane_count: 2,
+    };
+    let msl = emit_vs_ff(&key);
+    assert!(
+        msl.contains("float clip_distance [[clip_distance]] [2];"),
+        "VS Varyings must declare two clip lanes:\n{msl}"
+    );
+    assert!(
+        msl.contains("dot(pos_view, vs_draw.inv_view[3])"),
+        "FF clip planes go through the inverse view:\n{msl}"
+    );
+    assert!(
+        msl.contains("out.clip_distance[1] = dot(world_pos, vs_draw.clip[1]);"),
+        "one distance per enabled plane:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+    let no_clip = FfVsKey {
+        clip_plane_count: 0,
+        ..key
+    };
+    assert!(
+        !emit_vs_ff(&no_clip).contains("clip_distance"),
+        "a draw without planes pays nothing"
+    );
+}
+
+#[test]
+fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
+    // vs_1_1 { dcl_position v0; mov oPos, v0 } with three planes: the
+    // distances are taken against the shader's own clip-space position,
+    // before the half-pixel fixup.
+    let bc = [
+        0xFFFE_0101,
+        opcode_token(OP_DCL, 2),
+        0x0000_0000,
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("vs_1_1 parse");
+    let msl = emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3).expect("emit");
+    assert!(
+        msl.contains("float clip_distance [[clip_distance]] [3];"),
+        "VS Varyings must declare three clip lanes:\n{msl}"
+    );
+    let clip = msl
+        .find("out.clip_distance[2] = dot(out.position, vs_draw.clip[2]);")
+        .expect("third clip distance");
+    let fixup = msl
+        .find("out.position.x += pos_fixup.x * out.position.w;")
+        .expect("pos fixup");
+    assert!(
+        clip < fixup,
+        "clip distances use the unfixed position:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+    assert!(
+        !emit_vs_programmable(&vs)
+            .expect("emit")
+            .contains("clip_distance"),
+        "the zero-plane variant has no clip lanes"
+    );
 }
 
 #[test]

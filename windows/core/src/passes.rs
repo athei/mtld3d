@@ -3771,10 +3771,11 @@ pub struct LastBoundCache {
     /// Re-bound only when the viewport dims change (rare), so the per-draw
     /// cost is a length-then-memcmp against 16 bytes.
     vs_pos_fixup: Vec<u8>,
-    /// VS draw slot — the per-draw `VsDraw` uniform (point size state).
+    /// VS draw slot — the per-draw `VsDraw` uniform (point and clip state).
     ///
-    /// Re-bound only when a point render state changes, so the per-draw
-    /// cost is a length-then-memcmp against 32 bytes.
+    /// Re-bound only when a point state, a clip plane or the view matrix
+    /// changes, so the per-draw cost is a length-then-memcmp against
+    /// `vs_draw::VS_DRAW_BYTES`.
     vs_draw: Vec<u8>,
     /// PS slot 15 — programmable / FF pixel constant buffer.
     ps_constants: Vec<u8>,

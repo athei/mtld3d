@@ -179,7 +179,7 @@ pub const DEFAULT_PS_ENTRY: &str = "mtld3d_ps";
 ///
 /// See [`emit_vs_programmable_named`].
 pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
-    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX)
+    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX, 0)
 }
 
 /// Emit MSL for a pixel shader using the default `mtld3d_ps` entry name.
@@ -203,6 +203,7 @@ pub fn emit_vs_programmable_named(
     vs: &DxsoProgram,
     entry: &str,
     provided_mask: u16,
+    clip_plane_count: u8,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -211,10 +212,10 @@ pub fn emit_vs_programmable_named(
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs, provided_mask);
-    emit_varyings(&mut out, false);
+    emit_varyings(&mut out, false, clip_plane_count);
     w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
-    emit_vs_function(&mut out, vs, entry, provided_mask)?;
+    emit_vs_function(&mut out, vs, entry, provided_mask, clip_plane_count)?;
     Ok(out)
 }
 
@@ -275,7 +276,11 @@ pub fn emit_ps_programmable_named(
     let mut out = String::new();
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
-    emit_varyings(&mut out, variant.flags.contains(VariantFlags::FLAT_SHADE));
+    emit_varyings(
+        &mut out,
+        variant.flags.contains(VariantFlags::FLAT_SHADE),
+        0,
+    );
     emit_const_rel_helper(&mut out, ps);
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         emit_srgb_write_helper(&mut out);
@@ -343,7 +348,7 @@ fn emit_vertex_in(out: &mut String, vs: &DxsoProgram, provided_mask: u16) {
 // return; Metal's pipeline validation doesn't complain, and unused inputs get
 // dead-code-eliminated by the MSL compiler.
 
-fn emit_varyings(out: &mut String, flat: bool) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     w(out, "struct Varyings {\n");
     // `invariant` — the analog of an `Invariant` decoration on a SPIR-V
     // `gl_Position` output — keeps the clip-space position bit-stable WITHIN a
@@ -383,6 +388,18 @@ fn emit_varyings(out: &mut String, flat: bool) {
     // into fragment input. Always-present so VS and PS struct layouts
     // stay aligned (FF + programmable mix-and-match).
     w(out, "    float point_size [[point_size]];\n");
+    // User clip planes: one `[[clip_distance]]` lane per enabled plane, a
+    // VS-only output the rasterizer consumes (a fragment with any negative
+    // lane is discarded). Metal rejects the attribute on a fragment input,
+    // so the PS struct is emitted with `clip_planes == 0`; Metal links the
+    // two structs by member name, so the VS-side extra member is fine.
+    // MSL puts the attribute between the name and the array dimension.
+    if clip_planes > 0 {
+        let _ = writeln!(
+            out,
+            "    float clip_distance [[clip_distance]] [{clip_planes}];"
+        );
+    }
     w(out, "};\n\n");
 }
 
@@ -393,6 +410,7 @@ fn emit_vs_function(
     vs: &DxsoProgram,
     entry: &str,
     provided_mask: u16,
+    clip_plane_count: u8,
 ) -> Result<(), EmitError> {
     let _ = writeln!(out, "vertex Varyings {entry}(");
     w(out, "    VertexIn in [[stage_in]],\n");
@@ -524,6 +542,16 @@ fn emit_vs_function(
     // is fully fogged — matching the D3D9 zero specular-alpha default.
     if !vs_writes_fog(vs, vs_output_map.as_ref()) {
         w(out, "    out.fog = float4(out.color1.w);\n");
+    }
+    // User clip planes are clip-space for the programmable pipeline: one
+    // distance per enabled plane against the shader's own `oPos`, taken
+    // before the half-pixel fixup below so the plane sees the position the
+    // application computed, which is the space D3D9 defines the planes in.
+    for i in 0..clip_plane_count {
+        let _ = writeln!(
+            out,
+            "    out.clip_distance[{i}] = dot(out.position, vs_draw.clip[{i}]);"
+        );
     }
     // Half-pixel rasterization fixup (see the buffer-13 `pos_fixup` arg): shift
     // the clip-space position half a pixel right (+x) and down (−y in Metal's

@@ -38,16 +38,16 @@ use mtld3d_types::{
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
     D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
-    D3DRS_CLIPPING, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
-    D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN,
-    D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
-    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
-    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
-    D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE,
-    D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE,
-    D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE,
-    D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
+    D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
+    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
+    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR,
+    D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE,
+    D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
+    D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS,
+    D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
+    D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
+    D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
@@ -241,12 +241,13 @@ static DIRECT3D_DEVICE9_VTBL: IDirect3DDevice9Vtbl = IDirect3DDevice9Vtbl {
     create_query: device_create_query,
 };
 
-/// Number of user-clip-plane storage slots.
+/// Number of user-clip-plane storage slots: `D3DCAPS9::MaxUserClipPlanes`.
 ///
-/// D3D9 defines `D3DMAXUSERCLIPPLANES = 32`; the conformance suite probes
-/// indices across `0..2*32`, so the store is sized to cover the full probed
-/// range with every index addressable.
-const CLIP_PLANE_SLOTS: usize = 64;
+/// D3D9 aliases every index at or past `MaxUserClipPlanes - 1` onto the last
+/// slot, for `SetClipPlane` and `GetClipPlane` alike (Wine's
+/// `test_clip_planes_limits` probes `0..2*D3DMAXUSERCLIPPLANES`), so the store
+/// is exactly the planes the GPU can apply.
+const CLIP_PLANE_SLOTS: usize = mtld3d_core::vs_draw::MAX_CLIP_PLANES;
 
 // ── DeviceInner — non-repr(C) state behind the inner pointer ──
 
@@ -485,10 +486,12 @@ pub struct DeviceInner {
     viewport: D3DVIEWPORT9,
     /// User clip planes set by `SetClipPlane`, served back by `GetClipPlane`.
     ///
-    /// CPU round-trip only — GPU application is a no-op (the
-    /// `D3DRS_CLIPPLANEENABLE` render state is stored but not consumed), so this
-    /// has no rendering effect. The index is clamped into range, so an
-    /// out-of-range plane aliases the last slot instead of being rejected.
+    /// The first `vs_draw::MAX_CLIP_PLANES` slots reach the GPU through the
+    /// per-draw `VsDraw` uniform whenever `D3DRS_CLIPPLANEENABLE` names them
+    /// (and `D3DRS_CLIPPING` is on); the rest are a CPU round-trip for the
+    /// conformance suite's out-of-range probes. The index is clamped into
+    /// range, so an out-of-range plane aliases the last slot instead of
+    /// being rejected.
     clip_planes: [[f32; 4]; CLIP_PLANE_SLOTS],
 
     // Submodule-owned state. Each group's fields are private to its own
@@ -675,6 +678,12 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
         // per-draw VsDraw uniform every vertex shader reads.
         D3DRS_POINTSIZE | D3DRS_POINTSIZE_MIN | D3DRS_POINTSIZE_MAX | D3DRS_POINTSCALE_A
         | D3DRS_POINTSCALE_B | D3DRS_POINTSCALE_C => rs.union(SnapshotDirty::VS_DRAW),
+        // The enabled-plane set repacks the VsDraw clip rows and its count
+        // keys both vertex-shader sources (the programmable side is added
+        // past `ff_aware_mask` by the SetRenderState thunk).
+        D3DRS_CLIPPLANEENABLE | D3DRS_CLIPPING => rs
+            .union(SnapshotDirty::VS_DRAW)
+            .union(SnapshotDirty::VS_SOURCE),
         _ => rs,
     }
 }
@@ -808,12 +817,19 @@ impl DeviceInner {
 
     /// Store a user clip plane set via `SetClipPlane`.
     ///
-    /// CPU round-trip only — see the `clip_planes` field doc. The index is
-    /// clamped into range so an out-of-range plane aliases the last slot
-    /// rather than panicking.
+    /// The first `vs_draw::MAX_CLIP_PLANES` feed the per-draw `VsDraw`
+    /// uniform when `D3DRS_CLIPPLANEENABLE` names them, so the uniform is
+    /// marked for a rebuild. The index is clamped into range so an
+    /// out-of-range plane aliases the last slot rather than panicking.
     pub fn set_clip_plane(&mut self, index: u32, plane: [f32; 4]) {
         let slot = (index as usize).min(CLIP_PLANE_SLOTS - 1);
         self.clip_planes[slot] = plane;
+        self.mark_snapshot_dirty(SnapshotDirty::VS_DRAW);
+    }
+
+    /// Every stored user clip plane, by index.
+    pub const fn clip_planes(&self) -> &[[f32; 4]; CLIP_PLANE_SLOTS] {
+        &self.clip_planes
     }
 
     /// Read back a user clip plane for `GetClipPlane`.
@@ -6982,6 +6998,11 @@ extern "system" fn device_set_transform(
     {
         mask |= SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE;
     }
+    // The fixed-function clip planes walk back from eye space through the
+    // inverse view the VsDraw uniform carries.
+    if state == mtld3d_types::D3DTS_VIEW {
+        mask |= SnapshotDirty::VS_DRAW;
+    }
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -7209,7 +7230,15 @@ extern "system" fn device_set_clip_plane(this: *mut c_void, index: u32, plane: *
     // SAFETY: `plane` is non-null (checked) and per the D3D9 ABI points to the
     // 4 readable f32 plane-equation coefficients (A, B, C, D).
     let coeffs = unsafe { *plane.cast::<[f32; 4]>() };
-    obj.inner().set_clip_plane(index, coeffs);
+    let dev = obj.inner();
+    if let Some(rec) = dev.recording_state_block_mut() {
+        rec.record(StateOp::ClipPlane {
+            index,
+            plane: coeffs,
+        });
+        return D3D_OK;
+    }
+    dev.set_clip_plane(index, coeffs);
     0 // S_OK
 }
 
@@ -7247,7 +7276,12 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
     // value yields a byte-identical snapshot, so skip the dirty mark.
     let changed = dev.set_render_state(state as usize, value);
     if changed {
-        let mask = dev.ff_aware_mask(rs_dirty_mask(state));
+        let mut mask = dev.ff_aware_mask(rs_dirty_mask(state));
+        // The user clip plane count is a key input of the programmable VS as
+        // well, which `ff_aware_mask` would otherwise strip.
+        if matches!(state, D3DRS_CLIPPLANEENABLE | D3DRS_CLIPPING) {
+            mask |= SnapshotDirty::VS_SOURCE;
+        }
         dev.mark_snapshot_dirty(mask);
     }
     dev.perf_mut()
@@ -8571,6 +8605,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 uses_rel_const: vs_obj.uses_rel_const(),
                 provided_input_mask: dev.cached_vs_provided_mask,
                 uses_int_const: vs_obj.uses_int_const(),
+                clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
             })
         }
     } else {
@@ -8771,9 +8806,19 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
-    // Per-draw VsDraw uniform (point size state), read by every vertex shader.
+    // Per-draw VsDraw uniform (point size, inverse view, clip planes), read
+    // by every vertex shader.
     let vs_draw_buf = if dirty.contains(SnapshotDirty::VS_DRAW) {
-        Some(mtld3d_core::vs_draw::build_vs_draw_bytes(rs))
+        let view = dev
+            .ff_state()
+            .transform(mtld3d_types::D3DTS_VIEW)
+            .copied()
+            .unwrap_or(D3DMATRIX::IDENTITY);
+        Some(mtld3d_core::vs_draw::build_vs_draw_bytes(
+            rs,
+            &view,
+            dev.clip_planes(),
+        ))
     } else {
         None
     };
@@ -10570,10 +10615,13 @@ const fn rs_classify(index: u32) -> RsClass {
         | D3DRS_POINTSCALE_C
         | D3DRS_POINTSCALEENABLE
         | D3DRS_POINTSPRITEENABLE
-        // CLIPPING is a driver-side hint for frustum clipping — Metal
-        // always clips to the viewport, so disabling this state on our
-        // side is a no-op by construction, not a missing feature.
+        // CLIPPING is the master clipping switch: it gates the user clip
+        // planes (`vs_draw::clip_plane_count`); its frustum half is a no-op, Metal always
+        // clips to the viewport. CLIPPLANEENABLE selects which of the
+        // `SetClipPlane` planes the VsDraw uniform packs and keys the
+        // `[[clip_distance]]` lane count of both vertex-shader sources.
         | D3DRS_CLIPPING
+        | D3DRS_CLIPPLANEENABLE
         // BLENDFACTOR feeds the per-encoder constant blend color via
         // `Command::set_blend_color`, emitted in `emit_draw` whenever
         // the value differs from the default opaque white.

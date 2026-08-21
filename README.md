@@ -57,6 +57,9 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   triangle lists, which Metal lacks).
 - **Points**: `D3DRS_POINTSIZE`, per-vertex PSIZE and `oPts`, the min/max
   clamp, eye-distance scaling, and point sprites through `[[point_coord]]`.
+- **User clip planes**: six planes through `[[clip_distance]]`, world-space
+  for the fixed-function pipeline and clip-space for vertex shaders, gated by
+  `D3DRS_CLIPPING` and carried by `D3DSBT_ALL` state blocks.
 - **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
   per-stream offsets and strides; a declared stream with nothing bound reads
   zeros, as on hardware.

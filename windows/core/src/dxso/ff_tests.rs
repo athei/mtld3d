@@ -42,6 +42,7 @@ fn default_vs_key() -> FfVsKey {
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
+        clip_plane_count: 0,
     }
 }
 

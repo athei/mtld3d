@@ -917,6 +917,62 @@ impl FfState {
         D3DMATRIX { m: r }
     }
 
+    /// General 4x4 inverse by cofactors, `None` for a singular matrix.
+    ///
+    /// Used for the view matrix the fixed-function clip planes need (world
+    /// space from eye space); a camera matrix is always invertible, so `None`
+    /// only ever signals application garbage.
+    #[must_use]
+    pub fn inverse(mat: &D3DMATRIX) -> Option<D3DMATRIX> {
+        /// `a * d - b * c`, the 2x2 minor.
+        fn det2(a: f32, b: f32, c: f32, d: f32) -> f32 {
+            a.mul_add(d, -(b * c))
+        }
+        /// `a0 * x0 + a1 * x1 + a2 * x2`, one cofactor row.
+        fn sum3(a0: f32, x0: f32, a1: f32, x1: f32, a2: f32, x2: f32) -> f32 {
+            a0.mul_add(x0, a1.mul_add(x1, a2 * x2))
+        }
+        let m = &mat.m;
+        // Cofactor expansion over the 2x2 minors of rows 0-1 (`s`) and rows
+        // 2-3 (`c`).
+        let s0 = det2(m[0], m[4], m[1], m[5]);
+        let s1 = det2(m[0], m[4], m[2], m[6]);
+        let s2 = det2(m[0], m[4], m[3], m[7]);
+        let s3 = det2(m[1], m[5], m[2], m[6]);
+        let s4 = det2(m[1], m[5], m[3], m[7]);
+        let s5 = det2(m[2], m[6], m[3], m[7]);
+        let c5 = det2(m[10], m[14], m[11], m[15]);
+        let c4 = det2(m[9], m[13], m[11], m[15]);
+        let c3 = det2(m[9], m[13], m[10], m[14]);
+        let c2 = det2(m[8], m[12], m[11], m[15]);
+        let c1 = det2(m[8], m[12], m[10], m[14]);
+        let c0 = det2(m[8], m[12], m[9], m[13]);
+        let det = sum3(s0, c5, -s1, c4, s2, c3) + sum3(s3, c2, -s4, c1, s5, c0);
+        if det == 0.0 || !det.is_finite() {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let r = [
+            sum3(m[5], c5, -m[6], c4, m[7], c3) * inv_det,
+            sum3(-m[1], c5, m[2], c4, -m[3], c3) * inv_det,
+            sum3(m[13], s5, -m[14], s4, m[15], s3) * inv_det,
+            sum3(-m[9], s5, m[10], s4, -m[11], s3) * inv_det,
+            sum3(-m[4], c5, m[6], c2, -m[7], c1) * inv_det,
+            sum3(m[0], c5, -m[2], c2, m[3], c1) * inv_det,
+            sum3(-m[12], s5, m[14], s2, -m[15], s1) * inv_det,
+            sum3(m[8], s5, -m[10], s2, m[11], s1) * inv_det,
+            sum3(m[4], c4, -m[5], c2, m[7], c0) * inv_det,
+            sum3(-m[0], c4, m[1], c2, -m[3], c0) * inv_det,
+            sum3(m[12], s4, -m[13], s2, m[15], s0) * inv_det,
+            sum3(-m[8], s4, m[9], s2, -m[11], s0) * inv_det,
+            sum3(-m[4], c3, m[5], c1, -m[6], c0) * inv_det,
+            sum3(m[0], c3, -m[1], c1, m[2], c0) * inv_det,
+            sum3(-m[12], s3, m[13], s1, -m[14], s0) * inv_det,
+            sum3(m[8], s3, -m[9], s1, m[10], s0) * inv_det,
+        ];
+        Some(D3DMATRIX { m: r })
+    }
+
     /// `bound_texture_mask` has bit `i` set if stage `i` has a texture bound.
     ///
     /// Mirrors `build_ps_key`; used to decide which stages need a VS output
@@ -1093,6 +1149,13 @@ impl FfState {
             tt_flags,
             vertex_blend_count,
             declared_weights_count: layout.declared_weights_count,
+            // Pre-transformed vertices have no world space to clip in; D3D9
+            // never applies user planes to them.
+            clip_plane_count: if layout.has_rhw() {
+                0
+            } else {
+                crate::vs_draw::clip_plane_count(render_states)
+            },
         }
     }
 
@@ -2036,6 +2099,45 @@ const fn tss_classify(ty: u32) -> TssClass {
 
 #[cfg(test)]
 mod tests {
+    mod inverse {
+        use mtld3d_types::D3DMATRIX;
+
+        use crate::ff_state::FfState;
+
+        fn assert_close(a: &D3DMATRIX, b: &D3DMATRIX) {
+            for (x, y) in a.m.iter().zip(b.m) {
+                assert!((x - y).abs() < 1e-5, "{:?} != {:?}", a.m, b.m);
+            }
+        }
+
+        #[test]
+        fn inverse_undoes_a_translation_and_a_scaled_rotation() {
+            let mut t = D3DMATRIX::IDENTITY;
+            t.m[12] = 3.0;
+            t.m[13] = -2.0;
+            t.m[14] = 7.5;
+            let inv = FfState::inverse(&t).expect("translation is invertible");
+            assert_close(&FfState::mat_mul(&t, &inv), &D3DMATRIX::IDENTITY);
+            // 90-degree rotation about Z scaled by 2, translated.
+            let r = D3DMATRIX {
+                m: [
+                    0.0, 2.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 2.0, 3.0, 1.0,
+                ],
+            };
+            let inv = FfState::inverse(&r).expect("rigid transform is invertible");
+            assert_close(&FfState::mat_mul(&r, &inv), &D3DMATRIX::IDENTITY);
+            assert_close(&FfState::mat_mul(&inv, &r), &D3DMATRIX::IDENTITY);
+        }
+
+        #[test]
+        fn singular_matrix_has_no_inverse() {
+            let mut z = D3DMATRIX::IDENTITY;
+            z.m[5] = 0.0;
+            assert!(FfState::inverse(&z).is_none());
+            assert!(FfState::inverse(&D3DMATRIX { m: [0.0; 16] }).is_none());
+        }
+    }
+
     use mtld3d_types::{
         D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE,
         D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_TEXTUREFACTOR,
@@ -2693,6 +2795,7 @@ mod tests {
             tt_flags: [0; 8],
             vertex_blend_count: 0,
             declared_weights_count: 0,
+            clip_plane_count: 0,
         }
     }
 

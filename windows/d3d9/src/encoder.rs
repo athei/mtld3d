@@ -819,11 +819,13 @@ pub struct FrameEncoder {
     ///
     /// `FxHash` + exact `Eq`, probed by borrow — no per-draw content hash,
     /// no clone. One pair of maps per stage; VS keys exclude `variant`
-    /// (variants share one `MTLLibrary`), PS keys fold it in. The Xxh3
+    /// (variants share one `MTLLibrary`) but carry the user clip plane count
+    /// (a programmable VS compiles one library per count), PS keys fold the
+    /// variant in. The Xxh3
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
     /// (warm-load) and address the on-disk cache.
     ff_vs_libs: FxHashMap<FfVsKey, StageLibHandles>,
-    prog_vs_libs: FxHashMap<(ProgramId, u16), StageLibHandles>,
+    prog_vs_libs: FxHashMap<(ProgramId, u16, u8), StageLibHandles>,
     ff_ps_libs: FxHashMap<FfPsKey, FxHashMap<VariantKey, StageLibHandles>>,
     prog_ps_libs: FxHashMap<(ProgramId, VariantKey), StageLibHandles>,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
@@ -3129,8 +3131,6 @@ impl FrameEncoder {
                 .emit_command(Command::set_stencil_reference(value));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
-        self.pass_state
-            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // The quad is one counter-clockwise triangle, back-facing under
         // Metal's default clockwise front face, so the cull mode the last
         // draw left behind (D3D's default CULL_CCW is cull-back) would drop
@@ -3140,6 +3140,8 @@ impl FrameEncoder {
             self.pass_state
                 .emit_command(Command::set_cull_mode(CullMode::None));
         }
+        self.pass_state
+            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
         // drop the cached bound-VB so the next bound draw re-emits its
         // `setVertexBuffer` instead of reading this constant-z payload.
@@ -3238,8 +3240,6 @@ impl FrameEncoder {
                 .emit_command(Command::set_depth_stencil_state(depth_state));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
-        self.pass_state
-            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // The quad is one counter-clockwise triangle, back-facing under
         // Metal's default clockwise front face, so the cull mode the last
         // draw left behind (D3D's default CULL_CCW is cull-back) would drop
@@ -3249,6 +3249,8 @@ impl FrameEncoder {
             self.pass_state
                 .emit_command(Command::set_cull_mode(CullMode::None));
         }
+        self.pass_state
+            .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
         // drop the cached bound-VB so the next bound draw re-emits its
         // `setVertexBuffer` instead of reading this constant-z payload.
@@ -3649,9 +3651,13 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
-                if let Some(&handles) = self.prog_vs_libs.get(&(*vs_id, *provided_input_mask)) {
+                if let Some(&handles) =
+                    self.prog_vs_libs
+                        .get(&(*vs_id, *provided_input_mask, *clip_plane_count))
+                {
                     return Some(handles);
                 }
             }
@@ -3664,10 +3670,11 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
                 self.prog_vs_libs
-                    .insert((*vs_id, *provided_input_mask), handles);
+                    .insert((*vs_id, *provided_input_mask, *clip_plane_count), handles);
             }
         }
         Some(handles)
@@ -3698,6 +3705,7 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
                 let Some(program) = self.program_cache.get(vs_id) else {
@@ -3705,14 +3713,18 @@ impl FrameEncoder {
                     return None;
                 };
                 let bucket = CompileBucket::from_sm_major(program.major);
-                let msl =
-                    match emit_vs_programmable_named(program, &entry_name, *provided_input_mask) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
-                            return None;
-                        }
-                    };
+                let msl = match emit_vs_programmable_named(
+                    program,
+                    &entry_name,
+                    *provided_input_mask,
+                    *clip_plane_count,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
+                        return None;
+                    }
+                };
                 (msl, bucket)
             }
             VsSource::FixedFunction { key, .. } => {
@@ -6996,11 +7008,16 @@ fn shader_source_tag_vs(source: &VsSource) -> String {
         VsSource::Programmable {
             vs_id,
             provided_input_mask,
+            clip_plane_count,
             ..
         } => {
             format!(
                 "prog {:#x}",
-                draw::vs_source_disk_key_programmable(*vs_id, *provided_input_mask)
+                draw::vs_source_disk_key_programmable(
+                    *vs_id,
+                    *provided_input_mask,
+                    *clip_plane_count
+                )
             )
         }
         VsSource::FixedFunction { key, .. } => {
