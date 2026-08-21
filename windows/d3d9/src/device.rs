@@ -5204,12 +5204,27 @@ extern "system" fn device_stretch_rect(
             );
             return D3DERR_INVALIDCALL;
         }
-        // The HR contract (a valid full-surface depth→depth StretchRect succeeds)
-        // is honoured, but the actual GPU depth copy is a no-op here: a raw
-        // copyFromTexture between the two Private depth textures does not survive
-        // to the conformance depth read-back on this backend (the bound-DS pass
-        // reloads/clears the attachment), so emitting it produces a WRONG result.
-        // WoW does not StretchRect depth surfaces, so the no-op is inert.
+        // Same-format Private→Private depth copy on the 1:1 blit path. The
+        // blit is entered into the load/store model like a colour copy: the
+        // source counts as read (its last pass keeps its depth store) and the
+        // destination counts as blit-written (its next pass loads rather than
+        // discards), and a clear still waiting for a pass on either endpoint
+        // is materialized before the copy.
+        let mip_level = src_info.mip_level;
+        dev.push_op(Box::new(move |enc| {
+            emit_stretch_rect_blit(
+                enc,
+                &src_info,
+                &dst_info,
+                &StretchBlitParams {
+                    src_region,
+                    dst_region,
+                    mip_level,
+                    render_quad: false,
+                    filter,
+                },
+            );
+        }));
         return D3D_OK;
     }
 

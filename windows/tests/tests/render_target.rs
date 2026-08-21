@@ -9,15 +9,16 @@ use mtld3d_types::{
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
     D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
-    D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
 const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
 const GREEN: u32 = 0xFF00_FF00;
+const BLUE: u32 = 0xFF00_00FF;
 
 /// `ps_3_0 { dcl_2d s0; dcl_texcoord0 v0; texld r0, v0, s0; mov oC0, r0; }`
 ///
@@ -364,6 +365,117 @@ fn depth_clear_with_rects_touches_only_the_rects() {
         GREEN,
         "outside the rect depth keeps 1.0 and accepts the quad"
     );
+}
+
+#[test]
+fn depth_to_depth_stretch_rect_copies_depth() {
+    // A full-surface depth→depth StretchRect copies the source depth, so a
+    // later depth test against the destination sees the copied values rather
+    // than the destination's own clear.
+    let h = Harness::with_depth();
+    let src = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let dst = h.depth_stencil_surface().expect("implicit depth-stencil");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    // Source: depth 0.0 everywhere, 0.5 over the top-left 480x360 and 1.0
+    // over the top-left 320x240 (rect-bounded clears, so the source pass
+    // holds only clear quads).
+    assert_eq!(h.set_depth_stencil_surface(&src), 0, "bind source depth");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0), 0);
+    let rect = |x2, y2| {
+        [D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2,
+            y2,
+        }]
+    };
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 0.5, 0, &rect(480, 360)),
+        0
+    );
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0, &rect(320, 240)),
+        0
+    );
+    // Copies into the still-unbound destination are valid and are then
+    // overwritten by its clear below; the filtered form is accepted too.
+    assert_eq!(h.stretch_rect(&src, &dst, D3DTEXF_POINT), 0, "early copy");
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_LINEAR),
+        0,
+        "filtered copy"
+    );
+
+    // Destination: cleared to red / 1.0, then its depth is overwritten by
+    // the copy while the red clear must survive underneath.
+    assert_eq!(
+        h.set_depth_stencil_surface(&dst),
+        0,
+        "bind destination depth"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 1.0, 0), 0);
+    assert_eq!(h.stretch_rect(&src, &dst, D3DTEXF_POINT), 0, "depth copy");
+
+    // Two full-screen quads, green at 0.33 and blue at 0.66, depth-tested
+    // against the copy without writing depth.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    let cover = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover(0.33, GREEN)),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover(0.66, BLUE)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+    // Copied 1.0: both quads pass, blue on top. Copied 0.5: only green.
+    // Copied 0.0: neither, the red clear shows.
+    let expected = [
+        [BLUE, BLUE, GREEN, RED],
+        [BLUE, BLUE, GREEN, RED],
+        [GREEN, GREEN, GREEN, RED],
+        [RED, RED, RED, RED],
+    ];
+    for (i, row) in (0u32..).zip(&expected) {
+        for (j, &want) in (0u32..).zip(row) {
+            let x = 80 * (2 * j + 1);
+            let y = 60 * (2 * i + 1);
+            assert_eq!(
+                h.read_pixel(x, y),
+                want,
+                "depth copied into the destination at ({x}, {y})"
+            );
+        }
+    }
 }
 
 #[test]

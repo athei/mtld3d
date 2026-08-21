@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **15 `real` · 70 `expected` ·
+re-checked before retagging. Headline: **14 `real` · 70 `expected` ·
 1 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -231,7 +231,7 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (7 distinct defects behind the 12 sites)
+### The `real` backlog (6 distinct defects behind the 11 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
@@ -240,7 +240,6 @@ walk further):
 | IDirect3DVolume9::GetContainer does not return the parent volume texture | test_volume_get_container | 2 |
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
-| Depth→depth StretchRect is an S_OK no-op | depth_blit_test | 1 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
 
 Vertex streams 1..15 and `SetStreamSourceFreq` instancing are implemented, so
@@ -417,17 +416,6 @@ Sites: 5360=expected 5398=expected 5436=expected 5454=expected
 The ps_1_4 depth-gradient math is correct (the same-frame cycle passes and
 is absent here). The failing cycles read the gradient across Presents —
 the same Rule B depth-store elision as z_range_test.
-
-### visual.c/depth_blit_test
-Sites: 14835=real
-
-Depth→depth StretchRect returns S_OK but emits no GPU copy, so the
-destination keeps its cleared depth and 12 of 16 probe pixels mismatch —
-all within one frame (readback precedes the Present), so this is NOT the
-Rule B family. The no-op exists because a naive copyFromTexture didn't
-survive the bound-DS pass reload, i.e. "the naive fix was wrong" — not a
-kept tradeoff (it buys no perf). Real: emit the copy and order it against
-the deferred depth clear.
 
 ### visual.c/test_fetch4
 Sites: 15617=caps 15668=ceiling 15824=ceiling 15829=ceiling

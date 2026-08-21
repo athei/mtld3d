@@ -93,7 +93,6 @@
   visual.c:5398 count=1
   visual.c:5436 count=1
   visual.c:5454 count=1
-  visual.c:14835 count=12
   visual.c:15617 count=144
   visual.c:15668 count=17
   visual.c:15824 count=8
@@ -205,7 +204,6 @@
   visual.c:5398 count=1
   visual.c:5436 count=1
   visual.c:5454 count=1
-  visual.c:14835 count=12
   visual.c:15617 count=144
   visual.c:15668 count=15
   visual.c:15824 count=8
