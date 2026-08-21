@@ -52,8 +52,9 @@ use mtld3d_shared::{
     NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
     TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
-        BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
-        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
+        BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
+        StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage,
+        VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -3130,6 +3131,15 @@ impl FrameEncoder {
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
+        // The quad is one counter-clockwise triangle, back-facing under
+        // Metal's default clockwise front face, so the cull mode the last
+        // draw left behind (D3D's default CULL_CCW is cull-back) would drop
+        // it whole. Go through the dedup cache so the next draw re-emits
+        // its own mode.
+        if self.last_bound.cull_mode_changed(CullMode::None) {
+            self.pass_state
+                .emit_command(Command::set_cull_mode(CullMode::None));
+        }
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
         // drop the cached bound-VB so the next bound draw re-emits its
         // `setVertexBuffer` instead of reading this constant-z payload.
@@ -3230,6 +3240,15 @@ impl FrameEncoder {
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
+        // The quad is one counter-clockwise triangle, back-facing under
+        // Metal's default clockwise front face, so the cull mode the last
+        // draw left behind (D3D's default CULL_CCW is cull-back) would drop
+        // it whole. Go through the dedup cache so the next draw re-emits
+        // its own mode.
+        if self.last_bound.cull_mode_changed(CullMode::None) {
+            self.pass_state
+                .emit_command(Command::set_cull_mode(CullMode::None));
+        }
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
         // drop the cached bound-VB so the next bound draw re-emits its
         // `setVertexBuffer` instead of reading this constant-z payload.
