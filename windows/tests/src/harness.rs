@@ -135,6 +135,7 @@ impl Harness {
     /// Panics if the factory, window, or device cannot be created.
     #[must_use]
     pub fn create(cfg: &HarnessConfig) -> Self {
+        win32::install_failure_exit_hook();
         // SAFETY: Win32-style factory entrypoint with no preconditions.
         let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
         assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");

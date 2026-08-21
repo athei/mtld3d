@@ -58,6 +58,16 @@ failed:
 - A pipeline reports the last stage's status, so `make test | tee log` returns
   the exit code of `tee`.
 
+A third one is closed by the harness itself, and worth knowing about when a
+test process looks wrong: `d3d9.dll` terminates the process from its
+`DLL_PROCESS_DETACH` once a device exists (it cannot survive the allocator's
+thread-local teardown on Wine's 1 MB main-thread stack), and that exit carries
+code 0 whatever libtest was exiting with. Until the harness installed a panic
+hook that terminates the process with libtest's failure code at the first
+failed assertion (`windows/tests/src/win32.rs`), every e2e failure after
+`CreateDevice` reported as `PASS`. A test that prints `test result: FAILED`
+and still shows as passing means that hook is not in place.
+
 So capture with a plain redirect, in this order, `make test > out.log 2>&1`, and
 judge the run by grepping per-test results on both architectures rather than by
 the summary or by `$?`. Every test name appears once per architecture, and the
