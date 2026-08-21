@@ -7834,10 +7834,23 @@ extern "system" fn device_draw_primitive(
         if primitive_count == 0 {
             return D3DERR_INVALIDCALL;
         }
-        let Some(fan) = convert::triangle_fan_indices(start_vertex, primitive_count) else {
-            return D3DERR_INVALIDCALL;
+        // The encoder's shared 16-bit pattern covers every fan a 16-bit index
+        // can address and costs nothing per draw; anything longer, or a start
+        // vertex past the base-vertex range, gets a generated 32-bit list.
+        let index_source = if primitive_count <= convert::FAN_PATTERN_MAX_TRIANGLES
+            && i32::try_from(start_vertex).is_ok()
+        {
+            IndexSource::Fan {
+                start_vertex,
+                primitive_count,
+            }
+        } else {
+            let Some(fan) = convert::triangle_fan_indices(start_vertex, primitive_count) else {
+                return D3DERR_INVALIDCALL;
+            };
+            generated_fan_source(fan, primitive_count)
         };
-        return draw_bound_triangle_fan(&obj, fan, primitive_count, D3DERR_INVALIDCALL);
+        return draw_bound_triangle_fan(&obj, index_source, D3DERR_INVALIDCALL);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;
@@ -7869,17 +7882,28 @@ extern "system" fn device_draw_primitive(
     D3D_OK
 }
 
-/// Emit a bound-stream triangle fan as a generated triangle-list index draw.
+/// The `IndexSource` for a fan rewritten into an explicit index list.
+fn generated_fan_source(fan: convert::FanIndices, primitive_count: u32) -> IndexSource {
+    IndexSource::Generated {
+        bytes: fan.bytes,
+        index_count: primitive_count * 3,
+        index_type: fan.index_type,
+        min_vertex: fan.min_vertex,
+        max_vertex: fan.max_vertex,
+    }
+}
+
+/// Emit a bound-stream triangle fan as a triangle-list index draw.
 ///
-/// `DrawPrimitive` and `DrawIndexedPrimitive` hand their fans here with the
-/// rewritten index list; the vertices stay the bound streams, snapshotted
+/// `DrawPrimitive` and `DrawIndexedPrimitive` hand their fans here as an
+/// `IndexSource::Fan` (the encoder's shared pattern) or `IndexSource::Generated`
+/// (an explicit list); the vertices stay the bound streams, snapshotted
 /// exactly as for any other bound draw. `no_vertex_buffer_hr` is what the
 /// caller returns when no named stream has a buffer (the two entry points
 /// differ there, see `device_draw_indexed_primitive`).
 fn draw_bound_triangle_fan(
     obj: &Direct3DDevice9,
-    fan: convert::FanIndices,
-    primitive_count: u32,
+    index_source: IndexSource,
     no_vertex_buffer_hr: i32,
 ) -> i32 {
     // Flush any bound buffer that's drawn while still mapped, before the draw
@@ -7897,13 +7921,7 @@ fn draw_bound_triangle_fan(
     obj.inner().push_op_inline(Op::Draw(DrawOp {
         metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
         vertex_source,
-        index_source: IndexSource::Generated {
-            bytes: fan.bytes,
-            index_count: primitive_count * 3,
-            index_type: fan.index_type,
-            min_vertex: fan.min_vertex,
-            max_vertex: fan.max_vertex,
-        },
+        index_source,
     }));
     D3D_OK
 }
@@ -7992,7 +8010,7 @@ extern "system" fn device_draw_indexed_primitive(
         };
         // A valid declaration with no stream bound is S_OK for indexed draws,
         // same as the non-fan path below.
-        return draw_bound_triangle_fan(&obj, fan, primitive_count, D3D_OK);
+        return draw_bound_triangle_fan(&obj, generated_fan_source(fan, primitive_count), D3D_OK);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;

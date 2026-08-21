@@ -476,12 +476,47 @@ fn build_fan_indices(fan: &[u32], primitive_count: u32) -> FanIndices {
     }
 }
 
+/// Most triangles the shared 16-bit fan pattern can address.
+///
+/// Triangle `i` of a fan reads fan vertex `i + 2`, and a 16-bit index stops
+/// at `u16::MAX`.
+pub const FAN_PATTERN_MAX_TRIANGLES: u32 = u16::MAX as u32 - 1;
+
+/// Bytes the shared 16-bit fan pattern needs for `primitive_count` triangles.
+#[must_use]
+pub const fn fan_pattern_bytes(primitive_count: u32) -> usize {
+    primitive_count as usize * 3 * 2
+}
+
+/// Write the first `primitive_count` triangles of the shared fan pattern.
+///
+/// Triangle `i` is `(0, i + 1, i + 2)` as little-endian `u16`, relative to
+/// the fan's first vertex, which the draw supplies as its base vertex. Every
+/// non-indexed fan is a prefix of this one pattern, so the encoder keeps a
+/// single buffer of it instead of generating indices per draw. Writes the
+/// triangles that fit in `out`; the caller sizes it with
+/// [`fan_pattern_bytes`].
+pub fn fill_fan_pattern_u16(out: &mut [u8], primitive_count: u32) {
+    let triangles = usize::try_from(primitive_count).unwrap_or(usize::MAX);
+    for (i, tri) in out.chunks_exact_mut(6).take(triangles).enumerate() {
+        // `i + 2 <= FAN_PATTERN_MAX_TRIANGLES + 1 == u16::MAX` whenever the
+        // caller respects the pattern limit; clamp rather than wrap past it.
+        let second = u16::try_from(i + 1).unwrap_or(u16::MAX);
+        let third = u16::try_from(i + 2).unwrap_or(u16::MAX);
+        tri[0..2].copy_from_slice(&0u16.to_le_bytes());
+        tri[2..4].copy_from_slice(&second.to_le_bytes());
+        tri[4..6].copy_from_slice(&third.to_le_bytes());
+    }
+}
+
 /// Index stream for a non-indexed triangle fan (`DrawPrimitive`).
 ///
 /// Metal has no triangle-fan primitive. The fan's `primitive_count + 2`
 /// vertices sit back-to-back from `start_vertex`, and triangle `i` is fan
 /// vertices `0, i+1, i+2`; the result references them by absolute index.
-/// `None` when the vertex range overflows `u32`.
+/// `None` when the vertex range overflows `u32`. The draw path only comes
+/// here for fans the shared pattern ([`fill_fan_pattern_u16`]) cannot
+/// address.
 #[must_use]
 pub fn triangle_fan_indices(start_vertex: u32, primitive_count: u32) -> Option<FanIndices> {
     let count = primitive_count.checked_add(2)?;
@@ -1131,6 +1166,24 @@ mod tests {
             vec![10, 11, 12, 10, 12, 13, 10, 13, 14]
         );
         assert_eq!((fan.min_vertex, fan.max_vertex), (10, 14));
+    }
+
+    #[test]
+    fn fan_pattern_is_the_relative_fan_and_clips_to_the_buffer() {
+        let mut out = vec![0xAAu8; fan_pattern_bytes(3)];
+        fill_fan_pattern_u16(&mut out, 3);
+        assert_eq!(u16_indices(&out), vec![0, 1, 2, 0, 2, 3, 0, 3, 4]);
+        // Asking for more triangles than the buffer holds writes what fits.
+        let mut short = vec![0xAAu8; fan_pattern_bytes(1)];
+        fill_fan_pattern_u16(&mut short, 5);
+        assert_eq!(u16_indices(&short), vec![0, 1, 2]);
+        // The last addressable triangle ends exactly at u16::MAX.
+        let mut tail = vec![0u8; fan_pattern_bytes(FAN_PATTERN_MAX_TRIANGLES)];
+        fill_fan_pattern_u16(&mut tail, FAN_PATTERN_MAX_TRIANGLES);
+        assert_eq!(
+            &u16_indices(&tail)[tail.len() / 2 - 3..],
+            &[0, u16::MAX - 1, u16::MAX]
+        );
     }
 
     #[test]

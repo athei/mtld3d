@@ -251,14 +251,27 @@ pub enum IndexSource {
         /// Signed — D3D9 explicitly allows negative values.
         base_vertex: i32,
     },
+    /// Non-indexed triangle fan over the bound vertex streams (`DrawPrimitive`).
+    ///
+    /// Metal has no fan primitive. Every non-indexed fan is a prefix of the
+    /// same index pattern, `(0, i+1, i+2)` relative to its first vertex, so
+    /// the encoder keeps one shared 16-bit buffer of that pattern
+    /// (`FrameEncoder::fan_index_buffer`) and the draw passes `start_vertex`
+    /// as Metal's base vertex: nothing is generated or staged per draw. Fans
+    /// the 16-bit pattern cannot address take the `Generated` path.
+    Fan {
+        start_vertex: u32,
+        primitive_count: u32,
+    },
     /// Indexed draw over the bound vertex streams with a generated index list.
     ///
-    /// Triangle fans from `DrawPrimitive` / `DrawIndexedPrimitive`: Metal has
-    /// no fan primitive, so the API thread rewrites the fan as a triangle-list
-    /// index stream (`convert::triangle_fan_indices*`) that the encoder stages
-    /// like `Up` indices, while the vertices stay the bound buffers. The
-    /// indices are absolute, and `min_vertex..=max_vertex` is the vertex span
-    /// they reference, which gives the exact VB read range.
+    /// Triangle fans from `DrawIndexedPrimitive` (and `DrawPrimitive` fans
+    /// past the shared pattern's reach): Metal has no fan primitive, so the
+    /// API thread rewrites the fan as a triangle-list index stream
+    /// (`convert::triangle_fan_indices*`) that the encoder stages like `Up`
+    /// indices, while the vertices stay the bound buffers. The indices are
+    /// absolute, and `min_vertex..=max_vertex` is the vertex span they
+    /// reference, which gives the exact VB read range.
     Generated {
         bytes: Vec<u8>,
         index_count: u32,
@@ -1347,7 +1360,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
     let instances = match (&vertex_source, &index_source) {
-        (_, IndexSource::None { .. }) | (VertexSource::Up { .. }, _) => 1,
+        (_, IndexSource::None { .. } | IndexSource::Fan { .. }) | (VertexSource::Up { .. }, _) => 1,
         (VertexSource::Bound { stream0_freq, .. }, _) => {
             let any_instanced = vertex_source
                 .bindings()
@@ -1868,6 +1881,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                         *base_vertex,
                         *index_count,
                     ),
+                    // A fan over the shared pattern reads `primitive_count + 2`
+                    // vertices from its start, like a non-indexed draw.
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::Fan {
+                            start_vertex,
+                            primitive_count,
+                        },
+                    ) => nonindexed_vb_range(
+                        b.offset,
+                        layout.stride,
+                        *start_vertex,
+                        primitive_count.saturating_add(2),
+                    ),
                     // A generated index list knows exactly which vertices it
                     // references, so the range is as tight as a non-indexed
                     // draw's.
@@ -1990,6 +2017,38 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 index_type,
                 buffer_handle,
                 offset,
+                base_vertex,
+                instances,
+            ));
+            index_count
+        }
+        IndexSource::Fan {
+            start_vertex,
+            primitive_count,
+        } => {
+            // The shared pattern is relative to the fan's first vertex;
+            // `start_vertex` becomes Metal's base vertex. The device routes
+            // only fans the pattern can address here, so the narrowing and
+            // the buffer are expected to succeed; both failures drop the
+            // draw loudly rather than draw the wrong triangles.
+            let Ok(base_vertex) = i32::try_from(start_vertex) else {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "draw dropped: triangle fan start vertex {start_vertex} exceeds the base vertex range");
+                return;
+            };
+            let buffer_handle = enc.fan_index_buffer(primitive_count);
+            if buffer_handle == 0 {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "draw dropped: the shared triangle fan index buffer could not be created");
+                return;
+            }
+            let index_count = primitive_count * 3;
+            enc.emit_command(Command::draw_indexed_primitives(
+                metal_prim,
+                index_count,
+                IndexType::UInt16,
+                buffer_handle,
+                0,
                 base_vertex,
                 instances,
             ));

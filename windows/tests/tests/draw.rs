@@ -246,6 +246,56 @@ fn bound_triangle_fan_draws_from_a_vertex_buffer() {
 }
 
 #[test]
+fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
+    // Bound `DrawPrimitive` fans share one index pattern buffer that starts
+    // at 256 triangles and grows on demand. A short fan and then a 300
+    // triangle fan in the same frame make it grow while the short fan's draw
+    // still references the first buffer; both must render.
+    const RIM: u16 = 300;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = fan_diamond().to_vec();
+    let diamond_len = u32::try_from(verts.len()).expect("count fits u32");
+    // A disc of radius 0.8: the centre, then the rim clockwise on screen
+    // (decreasing angle) so the default cull keeps every triangle, closed by
+    // repeating the first rim vertex.
+    verts.push(PosColorVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.5,
+        color: GREEN,
+    });
+    for k in 0..=RIM {
+        let angle = core::f32::consts::FRAC_PI_2
+            - f32::from(k % RIM) * core::f32::consts::TAU / f32::from(RIM);
+        verts.push(PosColorVertex {
+            x: 0.8 * angle.cos(),
+            y: 0.8 * angle.sin(),
+            z: 0.5,
+            color: GREEN,
+        });
+    }
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    let rim = u32::from(RIM);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLEFAN, 0, 2), 0, "short fan");
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLEFAN, diamond_len, rim),
+            0,
+            "300 triangle fan",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside both fans");
+    // (0.5, 0.5) in clip space: outside the diamond, inside the disc.
+    assert_eq!(h.read_pixel(480, 120), GREEN, "the long fan's rim renders");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the disc");
+}
+
+#[test]
 fn bound_indexed_triangle_fan_honours_base_vertex_and_start_index() {
     // `DrawIndexedPrimitive(D3DPT_TRIANGLEFAN)`: the fan's indices are read
     // from the bound 16-bit index buffer at `StartIndex`, the base vertex is
