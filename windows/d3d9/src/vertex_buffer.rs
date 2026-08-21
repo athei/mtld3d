@@ -109,6 +109,53 @@ impl VertexBufferInner {
         self.buffer_id
     }
 
+    /// The buffer's CPU backing bytes.
+    ///
+    /// Used as the `ProcessVertices` source read: the source stream is a
+    /// system-memory or default buffer whose current backing holds what the
+    /// app wrote.
+    #[must_use]
+    pub const fn backing(&self) -> &[u8] {
+        self.current_box.as_slice()
+    }
+
+    /// The buffer's creation FVF.
+    #[must_use]
+    pub const fn fvf(&self) -> u32 {
+        self.fvf
+    }
+
+    /// Write processed vertices into the backing at `offset`, uploading a `Staged` destination.
+    ///
+    /// The `ProcessVertices` destination sink: the transformed bytes land in
+    /// the CPU backing (which a later `Lock` reads back for a system-memory
+    /// buffer), and a `Staged` buffer additionally uploads the written span so
+    /// a later draw from a default-pool destination sees it. Out-of-range
+    /// writes are clipped to the backing.
+    pub fn write_processed(&mut self, offset: usize, bytes: &[u8], dev: &mut DeviceInner) {
+        let dst = self.current_box.as_mut_slice();
+        let end = offset.saturating_add(bytes.len()).min(dst.len());
+        if offset >= end {
+            return;
+        }
+        dst[offset..end].copy_from_slice(&bytes[..end - offset]);
+        if !matches!(self.map_mode, BufferMapMode::Staged) {
+            return;
+        }
+        let size = end - offset;
+        let mut transient = dev.alloc_pagebox_capped(size);
+        // SAFETY: `offset < end <= len`, so the read stays inside `current_box`.
+        let src = unsafe { self.current_box.as_ptr().add(offset) };
+        // SAFETY: `src` spans `[offset, end)` of `current_box`; `transient` is a
+        // fresh `PageBox` of at least `size` bytes; the two are disjoint.
+        unsafe { core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size) };
+        let (min, len) = (
+            u32::try_from(offset).expect("VB offset fits u32"),
+            u32::try_from(size).expect("VB span fits u32"),
+        );
+        dev.push_stage_upload(self.buffer_id, transient, min, len);
+    }
+
     /// Upload a still-mapped `Staged` buffer's dirty span without ending the lock.
     ///
     /// A draw issued while the buffer is mapped reads the latest CPU writes,

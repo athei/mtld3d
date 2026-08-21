@@ -6,8 +6,8 @@
 use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex};
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DPOOL_DEFAULT,
-    D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
-    D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
+    D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
 };
 
 const MAGENTA: u32 = 0xFFFF_00FF;
@@ -317,13 +317,76 @@ fn indexed_primitive_up_triangle_fan_draws() {
 }
 
 #[test]
-fn process_vertices_is_a_stub() {
+fn process_vertices_transforms_to_screen_space() {
+    // A null destination is still rejected.
     let h = Harness::new();
     assert_eq!(
         h.process_vertices_hr(),
         D3DERR_INVALIDCALL,
-        "ProcessVertices is a documented stub",
+        "ProcessVertices with a null destination is INVALIDCALL",
     );
+
+    // A quad at z=0 through the default (identity) transforms maps to
+    // (x*320+320, -y*240+240, 0, 1) in the 640x480 viewport.
+    let vtx = |x: f32, y: f32, color: u32| PosColorVertex {
+        x,
+        y,
+        z: 0.0,
+        color,
+    };
+    let quad = [
+        vtx(-0.5, -0.5, 0xFFFF_0000),
+        vtx(-0.5, 0.5, 0xFF00_FF00),
+        vtx(0.5, -0.5, 0xFF00_00FF),
+        vtx(0.5, 0.5, 0xFFFF_FFFF),
+    ];
+    let src = h.create_vertex_buffer(
+        u32::try_from(core::mem::size_of_val(&quad)).unwrap(),
+        0,
+        D3DFVF_XYZ | D3DFVF_DIFFUSE,
+        D3DPOOL_SYSTEMMEM,
+    );
+    src.lock(0, 0, 0).write(&quad);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(
+        h.set_stream_source(
+            0,
+            &src,
+            0,
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).unwrap()
+        ),
+        0,
+        "SetStreamSource",
+    );
+
+    let dst = h.create_vertex_buffer(
+        u32::try_from(quad.len() * 16).unwrap(),
+        0,
+        D3DFVF_XYZRHW,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.process_vertices(0, 0, u32::try_from(quad.len()).unwrap(), &dst),
+        0,
+        "ProcessVertices",
+    );
+
+    let out: Vec<f32> = dst.lock(0, 0, 0).read(quad.len() * 4);
+    for (i, v) in quad.iter().enumerate() {
+        let b = i * 4;
+        assert!(
+            (out[b] - v.x.mul_add(320.0, 320.0)).abs() < 1e-3,
+            "x[{i}] = {}",
+            out[b]
+        );
+        assert!(
+            (out[b + 1] - (-v.y).mul_add(240.0, 240.0)).abs() < 1e-3,
+            "y[{i}] = {}",
+            out[b + 1]
+        );
+        assert!(out[b + 2].abs() < 1e-3, "z[{i}] = {}", out[b + 2]);
+        assert!((out[b + 3] - 1.0).abs() < 1e-6, "rhw[{i}] = {}", out[b + 3]);
+    }
 }
 
 #[test]

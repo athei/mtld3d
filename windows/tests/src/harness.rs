@@ -865,9 +865,9 @@ impl Harness {
         unsafe { (self.dev_vtbl().set_indices)(self.device, ib.as_ptr()) }
     }
 
-    /// `ProcessVertices` (a documented stub today). Returns the hr.
+    /// `ProcessVertices` with a null destination — the argument-validation path.
     pub fn process_vertices_hr(&self) -> i32 {
-        // SAFETY: vtable thunk; the stub ignores its (null) buffer/decl args.
+        // SAFETY: vtable thunk; a null destination is the rejection this checks.
         unsafe {
             (self.dev_vtbl().process_vertices)(
                 self.device,
@@ -875,6 +875,29 @@ impl Harness {
                 0,
                 0,
                 core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// `ProcessVertices(src_start, dst_index, count, dst_vb, NULL, 0)`. Returns the hr.
+    pub fn process_vertices(
+        &self,
+        src_start: u32,
+        dst_index: u32,
+        count: u32,
+        dst_vb: &VertexBuffer<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `dst_vb` is a live buffer, the declaration is
+        // NULL (the current-FVF path).
+        unsafe {
+            (self.dev_vtbl().process_vertices)(
+                self.device,
+                src_start,
+                dst_index,
+                count,
+                dst_vb.as_ptr(),
                 core::ptr::null_mut(),
                 0,
             )

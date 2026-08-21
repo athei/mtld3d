@@ -30,6 +30,7 @@ pub mod passes;
 pub mod perf;
 pub mod pipeline_state;
 pub mod present;
+pub mod process_vertices;
 pub mod render_scale;
 pub mod sampler_state;
 pub mod scratch;

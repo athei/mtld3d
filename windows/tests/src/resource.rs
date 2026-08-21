@@ -918,6 +918,22 @@ impl BufferLock<'_> {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.bits.cast::<T>(), data.len());
         }
     }
+
+    /// Read `count` `Copy` POD values from the mapped span at byte offset 0.
+    ///
+    /// # Panics
+    /// The caller must ensure `count` values fit within the locked region.
+    #[must_use]
+    pub fn read<T: Copy>(&self, count: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(count);
+        // SAFETY: `bits` maps at least `count * size_of::<T>()` bytes of the
+        // locked region (caller's contract); `out` has `count` capacity and the
+        // values are `Copy` POD, so the bytes are a valid `T` sequence.
+        unsafe { core::ptr::copy_nonoverlapping(self.bits.cast::<T>(), out.as_mut_ptr(), count) };
+        // SAFETY: the copy above initialised `count` elements.
+        unsafe { out.set_len(count) };
+        out
+    }
 }
 
 impl Drop for BufferLock<'_> {

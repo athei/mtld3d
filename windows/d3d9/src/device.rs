@@ -9012,16 +9012,98 @@ extern "system" fn device_draw_indexed_primitive_up(
 
 extern "system" fn device_process_vertices(
     this: *mut c_void,
-    _src_start: u32,
-    _dst_index: u32,
-    _count: u32,
-    _dst_buffer: *mut c_void,
-    _decl: *mut c_void,
+    src_start: u32,
+    dst_index: u32,
+    count: u32,
+    dst_buffer: *mut c_void,
+    decl: *mut c_void,
     _flags: u32,
 ) -> i32 {
+    use crate::vertex_buffer::Direct3DVertexBuffer9;
+
     let _timer = device_timer(this, DeviceSubCategory::Draws);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::ProcessVertices → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    if dst_buffer.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // A vertex declaration source (as opposed to the current FVF) is not
+    // implemented; software vertex processing is a conformance-only path.
+    if !decl.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices with an explicit vertex declaration is unimplemented → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let dev = obj.inner();
+
+    // The source is stream 0 read through the device's current FVF.
+    let src_vb = dev.bound_buffers().stream_vertex_buffer(0);
+    if src_vb.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices with no stream-0 vertex buffer bound → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let src_fvf = dev.fvf_field();
+    let src_stream_offset = dev.bound_buffers().stream_offset(0);
+    let src_stride = dev.bound_buffers().stream_stride(0);
+    let wvp = dev.ff_state().world_view_projection();
+    let viewport = dev.viewport();
+
+    // SAFETY: `src_vb` is a live bound `Direct3DVertexBuffer9` (non-null
+    // checked); the bound-slot reference keeps it alive for this call.
+    let src_inner = unsafe { (*src_vb).inner() };
+    let src_bytes = src_inner.backing();
+    let first = (src_stream_offset + src_start.saturating_mul(src_stride)) as usize;
+    if first > src_bytes.len() {
+        return D3DERR_INVALIDCALL;
+    }
+
+    // SAFETY: `dst_buffer` is a live `Direct3DVertexBuffer9*` per the D3D9 ABI;
+    // it is distinct from `src_vb` (the source is a bound stream, the
+    // destination a caller-owned buffer) so the two borrows do not alias.
+    let dst_obj = unsafe { &mut *dst_buffer.cast::<Direct3DVertexBuffer9>() };
+    let dst_fvf = dst_obj.inner().fvf();
+
+    let processed = mtld3d_core::process_vertices::process_vertices(
+        &mtld3d_core::process_vertices::ProcessVerticesRequest {
+            src: &src_bytes[first..],
+            src_stride,
+            src_fvf,
+            dst_fvf,
+            count,
+            wvp,
+            viewport,
+        },
+    );
+    let Some(processed) = processed else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices: destination FVF {dst_fvf:#x} has no transformed position or the \
+             source is too short → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    if mtld3d_core::process_vertices::dst_wants_shaded_output(dst_fvf)
+        && dev.render_state(D3DRS_LIGHTING as usize) != 0
+    {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices does not run software lighting; the destination colour is the \
+             source colour passed through"
+        );
+    }
+    let (_, dst_stride) = mtld3d_core::convert::fvf_to_elements(dst_fvf);
+    let dst_offset = (dst_index.saturating_mul(dst_stride)) as usize;
+    dst_obj
+        .inner_mut()
+        .write_processed(dst_offset, &processed, dev);
+    D3D_OK
 }
 
 extern "system" fn device_create_vertex_declaration(
