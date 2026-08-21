@@ -1969,6 +1969,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     #[cfg(debug_assertions)]
     enc.debug_assert_cache_in_sync();
     let t_draw = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BDraw));
+    // The generated-index fan is the slow path (per-draw rewrite plus a
+    // transient index buffer); the PERF grid counts it as a tripwire.
+    if matches!(index_source, IndexSource::Generated { .. }) {
+        enc.bump_fan_generated();
+    }
     let verts = match index_source {
         IndexSource::None {
             start_vertex,

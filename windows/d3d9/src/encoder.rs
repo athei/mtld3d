@@ -4076,6 +4076,11 @@ impl FrameEncoder {
     /// `PairShaderId`s — including their `disk_key` content hash — are built
     /// *after* the gate from the sources, so the hot path pays nothing (this
     /// is no longer on the per-draw cache lookup path).
+    /// Count a triangle-fan draw that took the generated-index slow path.
+    pub const fn bump_fan_generated(&mut self) {
+        self.perf.bump_fan_generated();
+    }
+
     pub fn bump_pair_stats(
         &mut self,
         shaders: ShaderRef,

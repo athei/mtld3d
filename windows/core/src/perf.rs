@@ -847,6 +847,13 @@ struct EncoderFrameCounters {
     /// rebuilding the key.
     pipeline_memo_hits: u32,
     pipeline_memo_calls: u32,
+    /// Triangle-fan draws that took the generated-index slow path.
+    ///
+    /// Indexed fans and fans past the 16-bit pattern's reach: the API
+    /// thread rewrote the index list per draw and the unix side wrapped
+    /// it in a transient `MTLBuffer`. Non-indexed fans ride the shared
+    /// pattern buffer and are not counted. A tripwire: 0 is the goal.
+    fan_generated: u32,
     /// Encoder-thread submit cost.
     ///
     /// Finalize (close passes, build descriptors, swap buffers, hand off)
@@ -900,6 +907,7 @@ impl EncoderFrameCounters {
             op_sub_cycles: [0; OpSub::COUNT],
             op_sub_detail: [0; OpSubDetail::COUNT],
             pipeline_memo_hits: 0,
+            fan_generated: 0,
             pipeline_memo_calls: 0,
             submit_cycles: 0,
             drawable_wait_cycles: 0,
@@ -1647,6 +1655,11 @@ impl EncoderPerfState {
         self.enc.pipeline_memo_hits = self.enc.pipeline_memo_hits.saturating_add(1);
     }
 
+    /// Count one triangle-fan draw that rewrote its index list per draw.
+    pub const fn bump_fan_generated(&mut self) {
+        self.enc.fan_generated = self.enc.fan_generated.saturating_add(1);
+    }
+
     /// Pointer the encoder thread's `CycleSetTimer` writes into for the per-frame submit.
     ///
     /// Covers `drawable_wait` + commit. Bracketed by `run_frame`.
@@ -2040,6 +2053,8 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_pipeline_memo_hit(&mut self) {}
     #[inline]
+    pub const fn bump_fan_generated(&mut self) {}
+    #[inline]
     pub const fn submit_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
@@ -2264,6 +2279,7 @@ struct PerfWindow {
     op_sub_detail: [Stat; OpSubDetail::COUNT],
     /// Pipeline-resolve memo hits / calls — rendered as a hit rate (sum only).
     pipeline_memo_hits: Stat,
+    fan_generated: Stat,
     pipeline_memo_calls: Stat,
     submit_cyc: Stat,
     drawable_wait: Stat,
@@ -2456,6 +2472,7 @@ impl PerfWindow {
         }
         self.pipeline_memo_hits
             .add(u64::from(s.enc.pipeline_memo_hits));
+        self.fan_generated.add(u64::from(s.enc.fan_generated));
         self.pipeline_memo_calls
             .add(u64::from(s.enc.pipeline_memo_calls));
         self.submit_cyc.add(s.enc.submit_cycles);
@@ -4131,6 +4148,13 @@ impl<'a> Summary<'a> {
             out,
             "  pipeline memo  {memo_hits} / {memo_calls}  ({memo_pct:.1}%)  consecutive-draw resolve elided",
         );
+        // Fan draws off the shared pattern buffer: each one rewrote its
+        // index list on the API thread and cost a transient MTLBuffer.
+        let _ = writeln!(
+            out,
+            "  fan generated  {fans:<9} indexed / oversized fans rewritten per draw (slow path; 0 is the goal)",
+            fans = w.fan_generated.sum,
+        );
     }
 
     /// Per-[`KeysGate`] redundant-skip rate.
@@ -4648,6 +4672,7 @@ mod tests {
             "Commands / passes (raw window totals)\n",
             "  passes=4         commands=140         draws=100\n",
             "  pipeline memo  97 / 100  (97.0%)  consecutive-draw resolve elided\n",
+            "  fan generated  0         indexed / oversized fans rewritten per draw (slow path; 0 is the goal)\n",
             "\n",
             "Keys gating  — redundant snapshot dirty-marks elided (skips/calls); higher = more `keys` work avoided\n",
             "  SetTexture               0 / 0         (  0.0%)\n",
@@ -4868,6 +4893,7 @@ mod tests {
                 op_sub_detail: [150_000, 90_000, 30_000, 120_000, 50_000, 20_000],
                 // 97 of 100 pipeline resolves served from the memo → 97.0%.
                 pipeline_memo_hits: 97,
+                fan_generated: 0,
                 pipeline_memo_calls: 100,
                 submit_cycles: 300_000,
                 // Submit thread: total execute 6.1M = encode+commit 0.1M +
