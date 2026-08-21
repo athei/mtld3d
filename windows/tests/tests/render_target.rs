@@ -1085,6 +1085,9 @@ fn render_to_default_pool_target_round_trips() {
     assert_eq!(h.set_render_target(0, &rt), 0, "bind DEFAULT RT");
     assert_eq!(h.clear_target(TEAL), 0, "clear RT teal");
     assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    // Lighting defaults on; a lit vertex with no lights would come out
+    // black instead of its diffuse colour.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
     // Emit the diffuse colour directly so the fill does not depend on a bound
     // texture.
     for (state, value) in [

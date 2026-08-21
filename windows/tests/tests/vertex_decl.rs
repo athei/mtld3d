@@ -268,11 +268,12 @@ fn two_stream_declaration_drives_ff_draw() {
 
 /// A declared stream with nothing bound reads zeros and the draw succeeds.
 ///
-/// The colour element lives on stream 1, which stays unbound: the diffuse
-/// reads as black, which is what a D3D9 vertex sees on an unbound stream.
+/// The colour element lives on stream 1, which stays unbound: all four
+/// components of the diffuse read as zero, alpha included, so the
+/// unlit fixed-function draw writes transparent black.
 #[test]
 fn unbound_declared_stream_reads_zeros() {
-    const BLACK: u32 = 0xFF00_0000;
+    const BLACK: u32 = 0x0000_0000;
     const BLUE: u32 = 0xFF00_00FF;
 
     let h = Harness::new();
