@@ -7502,7 +7502,10 @@ mod tests {
         s.end_current_pass("test");
         s.set_viewport(683, 0, 683, 683, 0.0, 1.0);
         assert!(
-            matches!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::EmitQuad { .. }),
+            matches!(
+                s.clear_color(1, 2, 3, 4),
+                ColorClearOutcome::EmitQuad { .. }
+            ),
             "a cross-pass clear inside one segment still scissors a quad",
         );
     }
