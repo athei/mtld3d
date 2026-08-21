@@ -229,7 +229,18 @@ use crate::shader_compile_stats::CompileBucket;
 /// `59` derives the lit FF vertex shader's normal matrix from the full 4x4
 /// inverse of the world-view matrix (a projective fourth column changes the
 /// normal), changing the MSL of every lit FF vertex shader with a normal.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 59;
+///
+/// `60` point size and point sprites: every vertex shader declares the
+/// per-draw `VsDraw` uniform and clamps `[[point_size]]` from it (the FF VS
+/// also reads a PSIZE attribute and applies `D3DRS_POINTSCALE*`), and
+/// `VariantFlags::POINT_SPRITE` makes a pixel shader take `[[point_coord]]`,
+/// changing the MSL of every vertex shader and the PS key hash shape.
+///
+/// `61` user clip planes: `VsDraw` grows the inverse view and six planes, the
+/// vertex shaders emit `[[clip_distance]]` lanes keyed on the enabled-plane
+/// count (a new `FfVsKey` field and a new programmable-VS disk-key input),
+/// changing every vertex shader's MSL and both VS key hash shapes.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 61;
 
 /// File magic.
 ///

@@ -15,7 +15,7 @@ use mtld3d_core::{
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
-    dxso::{FfPsKey, FfVsKey, VariantKey},
+    dxso::{FfPsKey, FfVsKey, VariantFlags, VariantKey},
     ids::{BufferId, ProgramId},
     passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
@@ -23,15 +23,28 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache,
     streams::{instance_count, instanced_stream_read_bytes, is_instance_data, stream_step},
+    vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, build_vs_draw_bytes},
 };
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PrimitiveType, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
-        VertexStepFunction,
+        IndexType, PrimitiveType, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
+        VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
-use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT};
+use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
+
+/// `VsDraw` bytes for the default render states.
+///
+/// The fallback bind when a snapshot reaches `emit_draw` without its own
+/// (never expected; warned once).
+static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::LazyLock::new(|| {
+    build_vs_draw_bytes(
+        &render_state_defaults(),
+        &D3DMATRIX::IDENTITY,
+        &[[0.0; 4]; MAX_CLIP_PLANES],
+    )
+});
 
 use super::{encoder::FrameEncoder, stage_bindings::STAGE_COUNT};
 
@@ -237,6 +250,34 @@ pub enum IndexSource {
         /// Added to every vertex index fetched via the index buffer.
         /// Signed — D3D9 explicitly allows negative values.
         base_vertex: i32,
+    },
+    /// Non-indexed triangle fan over the bound vertex streams (`DrawPrimitive`).
+    ///
+    /// Metal has no fan primitive. Every non-indexed fan is a prefix of the
+    /// same index pattern, `(0, i+1, i+2)` relative to its first vertex, so
+    /// the encoder keeps one shared 16-bit buffer of that pattern
+    /// (`FrameEncoder::fan_index_buffer`) and the draw passes `start_vertex`
+    /// as Metal's base vertex: nothing is generated or staged per draw. Fans
+    /// the 16-bit pattern cannot address take the `Generated` path.
+    Fan {
+        start_vertex: u32,
+        primitive_count: u32,
+    },
+    /// Indexed draw over the bound vertex streams with a generated index list.
+    ///
+    /// Triangle fans from `DrawIndexedPrimitive` (and `DrawPrimitive` fans
+    /// past the shared pattern's reach): Metal has no fan primitive, so the
+    /// API thread rewrites the fan as a triangle-list index stream
+    /// (`convert::triangle_fan_indices*`) that the encoder stages like `Up`
+    /// indices, while the vertices stay the bound buffers. The indices are
+    /// absolute, and `min_vertex..=max_vertex` is the vertex span they
+    /// reference, which gives the exact VB read range.
+    Generated {
+        bytes: Vec<u8>,
+        index_count: u32,
+        index_type: IndexType,
+        min_vertex: u32,
+        max_vertex: u32,
     },
     /// Indexed draw from an inline (user-pointer) index stream (`DrawIndexedPrimitiveUP`).
     ///
@@ -570,6 +611,11 @@ pub struct CurrentSnapshot {
     /// Bound only for a VS that reads a dynamic integer constant
     /// (`VsSource::Programmable::uses_int_const`).
     pub vs_int_const_bytes: Option<ScratchSlice>,
+    /// Per-draw `VsDraw` uniform (`mtld3d_core::vs_draw`): point size state.
+    ///
+    /// Every vertex shader reads it, so it is bound for every draw and
+    /// rebuilt when a point render state changes (`SnapshotDirty::VS_DRAW`).
+    pub vs_draw_bytes: Option<ScratchSlice>,
     pub depth_stencil: DepthStencilFlags,
 }
 
@@ -591,6 +637,7 @@ impl CurrentSnapshot {
         fog_color_bytes: None,
         bump_env_bytes: None,
         vs_int_const_bytes: None,
+        vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
     };
 }
@@ -613,6 +660,8 @@ pub enum VsKey {
         ///
         /// See `VsSource::Programmable::provided_input_mask`.
         provided_input_mask: u16,
+        /// See `VsSource::Programmable::clip_plane_count`.
+        clip_plane_count: u8,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -648,8 +697,9 @@ impl VsKey {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask),
+            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }
     }
@@ -692,10 +742,16 @@ impl PsKey {
 /// The provided-input mask IS folded in: a shader reading an unprovided
 /// input emits different MSL (the input becomes `float4(0)` and `VertexIn`
 /// drops the attribute), so each `(vs_id, mask)` compiles a distinct
-/// `MTLLibrary`. Variant bits still don't change VS MSL, so they are
-/// intentionally left out.
-pub fn vs_source_disk_key_programmable(vs_id: ProgramId, provided_input_mask: u16) -> u64 {
-    shader_cache::ff_key_hash(&(vs_id.raw(), provided_input_mask))
+/// `MTLLibrary`. So is the user clip plane count: it sizes the
+/// `[[clip_distance]]` output and the distances the epilogue computes.
+/// Variant bits still don't change VS MSL, so they are intentionally left
+/// out.
+pub fn vs_source_disk_key_programmable(
+    vs_id: ProgramId,
+    provided_input_mask: u16,
+    clip_plane_count: u8,
+) -> u64 {
+    shader_cache::ff_key_hash(&(vs_id.raw(), provided_input_mask, clip_plane_count))
 }
 
 pub fn vs_source_disk_key_ff(ff: &FfVsKey) -> u64 {
@@ -759,6 +815,14 @@ pub enum VsSource {
         /// 14. False for the vast majority of shaders, which then pay no
         /// slot-14 bind.
         uses_int_const: bool,
+        /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
+        ///
+        /// Folds into the VS library + disk keys: the shader declares one
+        /// `[[clip_distance]]` lane per plane and computes it in the
+        /// epilogue, so each count is a distinct variant. Zero for every
+        /// draw that never enables a plane, which keeps the common case at
+        /// one variant.
+        clip_plane_count: u8,
     },
     FixedFunction {
         key: FfVsKey,
@@ -785,11 +849,13 @@ impl VsSource {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => VsKey::Programmable {
                 vs_id: *vs_id,
                 variant,
                 provided_input_mask: *provided_input_mask,
+                clip_plane_count: *clip_plane_count,
             },
             Self::FixedFunction { key, .. } => VsKey::FixedFunction {
                 ff: key.clone(),
@@ -807,8 +873,9 @@ impl VsSource {
             Self::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask),
+            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
             Self::FixedFunction { key, .. } => vs_source_disk_key_ff(key),
         }
     }
@@ -1135,7 +1202,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the VS key, which shares `variant`, is untouched; the FF PS writes one
     // output and keeps the default so its library index never fragments.
     let extra_attachments = enc.current_extra_color_attachments();
-    let (ps_variant, ps_color_out_mask) = match ps {
+    let (mut ps_variant, ps_color_out_mask) = match ps {
         PsSource::Programmable { color_out_mask, .. } => (
             VariantKey {
                 color_out_mask: extra_attachments.present_mask << 1,
@@ -1145,6 +1212,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         ),
         PsSource::FixedFunction { .. } => (variant, 1),
     };
+    // Point sprites only exist on point primitives: the API thread raises the
+    // flag from `D3DRS_POINTSPRITEENABLE` alone, so every other primitive
+    // drops it here and keeps its non-sprite library.
+    if metal_prim != PrimitiveType::Point {
+        ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1287,7 +1360,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
     let instances = match (&vertex_source, &index_source) {
-        (_, IndexSource::None { .. }) | (VertexSource::Up { .. }, _) => 1,
+        (_, IndexSource::None { .. } | IndexSource::Fan { .. }) | (VertexSource::Up { .. }, _) => 1,
         (VertexSource::Bound { stream0_freq, .. }, _) => {
             let any_instanced = vertex_source
                 .bindings()
@@ -1688,6 +1761,28 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let ptr = enc.alloc_scratch(pos_fixup_bytes);
         enc.emit_command(Command::set_vertex_bytes_at(ptr, 16, VS_POS_FIXUP_SLOT));
     }
+    // Per-draw `VsDraw` uniform (point size state). Every vertex shader
+    // declares it, so it must be bound before the first draw of a pass; the
+    // API thread rebuilds the bytes only when a point render state changes
+    // and the dedup skips the bind when they match the last ones emitted.
+    let vs_draw = snap.vs_draw_bytes.unwrap_or(ScratchSlice::EMPTY);
+    let vs_draw_bytes = vs_draw.as_slice();
+    if vs_draw_bytes.is_empty() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "draw: VsDraw uniform not populated; binding the render-state defaults"
+        );
+        if enc.last_bound().vs_draw_changed(&*VS_DRAW_DEFAULT) {
+            let ptr = enc.alloc_scratch(&*VS_DRAW_DEFAULT);
+            enc.emit_command(Command::set_vertex_bytes_at(
+                ptr,
+                u32::try_from(VS_DRAW_BYTES).expect("32 fits u32"),
+                VS_DRAW_SLOT,
+            ));
+        }
+    } else if enc.last_bound().vs_draw_changed(vs_draw_bytes) {
+        let (p, n) = vs_draw.as_raw();
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_DRAW_SLOT));
+    }
     if !ps_const_bytes.is_empty() && enc.last_bound().ps_constants_changed(ps_const_bytes) {
         let (p, n) = ps_constants.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 15));
@@ -1786,6 +1881,36 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                         *base_vertex,
                         *index_count,
                     ),
+                    // A fan over the shared pattern reads `primitive_count + 2`
+                    // vertices from its start, like a non-indexed draw.
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::Fan {
+                            start_vertex,
+                            primitive_count,
+                        },
+                    ) => nonindexed_vb_range(
+                        b.offset,
+                        layout.stride,
+                        *start_vertex,
+                        primitive_count.saturating_add(2),
+                    ),
+                    // A generated index list knows exactly which vertices it
+                    // references, so the range is as tight as a non-indexed
+                    // draw's.
+                    (
+                        VertexStepFunction::PerVertex,
+                        IndexSource::Generated {
+                            min_vertex,
+                            max_vertex,
+                            ..
+                        },
+                    ) => nonindexed_vb_range(
+                        b.offset,
+                        layout.stride,
+                        *min_vertex,
+                        max_vertex - min_vertex + 1,
+                    ),
                     // `Up` indices only ever pair with `VertexSource::Up`,
                     // never a bound VB, so this arm is unreachable in
                     // practice; record no read range.
@@ -1844,6 +1969,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     #[cfg(debug_assertions)]
     enc.debug_assert_cache_in_sync();
     let t_draw = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BDraw));
+    // The generated-index fan is the slow path (per-draw rewrite plus a
+    // transient index buffer); the PERF grid counts it as a tripwire.
+    if matches!(index_source, IndexSource::Generated { .. }) {
+        enc.bump_fan_generated();
+    }
     let verts = match index_source {
         IndexSource::None {
             start_vertex,
@@ -1897,15 +2027,54 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             ));
             index_count
         }
+        IndexSource::Fan {
+            start_vertex,
+            primitive_count,
+        } => {
+            // The shared pattern is relative to the fan's first vertex;
+            // `start_vertex` becomes Metal's base vertex. The device routes
+            // only fans the pattern can address here, so the narrowing and
+            // the buffer are expected to succeed; both failures drop the
+            // draw loudly rather than draw the wrong triangles.
+            let Ok(base_vertex) = i32::try_from(start_vertex) else {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "draw dropped: triangle fan start vertex {start_vertex} exceeds the base vertex range");
+                return;
+            };
+            let buffer_handle = enc.fan_index_buffer(primitive_count);
+            if buffer_handle == 0 {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "draw dropped: the shared triangle fan index buffer could not be created");
+                return;
+            }
+            let index_count = primitive_count * 3;
+            enc.emit_command(Command::draw_indexed_primitives(
+                metal_prim,
+                index_count,
+                IndexType::UInt16,
+                buffer_handle,
+                0,
+                base_vertex,
+                instances,
+            ));
+            index_count
+        }
         IndexSource::Up {
             bytes,
             index_count,
             index_type,
+        }
+        | IndexSource::Generated {
+            bytes,
+            index_count,
+            index_type,
+            ..
         } => {
             // Inline index stream: stage the bytes in the per-frame scratch
             // arena and let the unix side wrap them in a transient MTLBuffer
-            // (Metal has no inline-index draw form). The paired vertices were
-            // already bound above via `VertexSource::Up`.
+            // (Metal has no inline-index draw form). The vertices were
+            // already bound above: `VertexSource::Up` for `Up` indices, the
+            // application's buffers for a `Generated` list.
             let scratch_ptr = enc.alloc_scratch(&bytes);
             let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             enc.emit_command(Command::draw_indexed_primitives_up(

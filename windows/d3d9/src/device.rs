@@ -38,24 +38,26 @@ use mtld3d_types::{
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
     D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
-    D3DRS_CLIPPING, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1,
-    D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN,
-    D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
-    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
-    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
-    D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE,
-    D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE,
-    D3DRS_SCISSORTESTENABLE, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE,
-    D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND,
-    D3DRS_SRCBLENDALPHA, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL,
-    D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
-    D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR,
-    D3DRS_TWOSIDEDSTENCILMODE, D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
-    D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
+    D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
+    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
+    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR,
+    D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE,
+    D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
+    D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS,
+    D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
+    D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
+    D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
+    D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
+    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_STENCILWRITEMASK,
+    D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR, D3DRS_TWOSIDEDSTENCILMODE,
+    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY,
     D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
     TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
@@ -239,12 +241,13 @@ static DIRECT3D_DEVICE9_VTBL: IDirect3DDevice9Vtbl = IDirect3DDevice9Vtbl {
     create_query: device_create_query,
 };
 
-/// Number of user-clip-plane storage slots.
+/// Number of user-clip-plane storage slots: `D3DCAPS9::MaxUserClipPlanes`.
 ///
-/// D3D9 defines `D3DMAXUSERCLIPPLANES = 32`; the conformance suite probes
-/// indices across `0..2*32`, so the store is sized to cover the full probed
-/// range with every index addressable.
-const CLIP_PLANE_SLOTS: usize = 64;
+/// D3D9 aliases every index at or past `MaxUserClipPlanes - 1` onto the last
+/// slot, for `SetClipPlane` and `GetClipPlane` alike (Wine's
+/// `test_clip_planes_limits` probes `0..2*D3DMAXUSERCLIPPLANES`), so the store
+/// is exactly the planes the GPU can apply.
+const CLIP_PLANE_SLOTS: usize = mtld3d_core::vs_draw::MAX_CLIP_PLANES;
 
 // ── DeviceInner — non-repr(C) state behind the inner pointer ──
 
@@ -483,10 +486,12 @@ pub struct DeviceInner {
     viewport: D3DVIEWPORT9,
     /// User clip planes set by `SetClipPlane`, served back by `GetClipPlane`.
     ///
-    /// CPU round-trip only — GPU application is a no-op (the
-    /// `D3DRS_CLIPPLANEENABLE` render state is stored but not consumed), so this
-    /// has no rendering effect. The index is clamped into range, so an
-    /// out-of-range plane aliases the last slot instead of being rejected.
+    /// The first `vs_draw::MAX_CLIP_PLANES` slots reach the GPU through the
+    /// per-draw `VsDraw` uniform whenever `D3DRS_CLIPPLANEENABLE` names them
+    /// (and `D3DRS_CLIPPING` is on); the rest are a CPU round-trip for the
+    /// conformance suite's out-of-range probes. The index is clamped into
+    /// range, so an out-of-range plane aliases the last slot instead of
+    /// being rejected.
     clip_planes: [[f32; 4]; CLIP_PLANE_SLOTS],
 
     // Submodule-owned state. Each group's fields are private to its own
@@ -641,11 +646,12 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
             .union(SnapshotDirty::VS_CONST),
         D3DRS_TEXTUREFACTOR => rs.union(SnapshotDirty::PS_CONST),
         // FLAT vs GOURAUD flips the PS `[[flat]]` varying qualifier (VariantKey
-        // flat_shade), and SRGBWRITEENABLE toggles the in-shader linear→sRGB OETF
-        // (VariantKey srgb_write); both rebuild the PS source + variant key.
+        // flat_shade), SRGBWRITEENABLE toggles the in-shader linear→sRGB OETF
+        // (VariantKey srgb_write) and POINTSPRITEENABLE flips
+        // VariantFlags::POINT_SPRITE; all rebuild the PS source + variant key.
         // (SRGBWRITEENABLE also retains its RS bit elsewhere, keeping the
         // pipeline's SRGB_WRITE flag current.)
-        D3DRS_SHADEMODE | D3DRS_SRGBWRITEENABLE => rs
+        D3DRS_SHADEMODE | D3DRS_SRGBWRITEENABLE | D3DRS_POINTSPRITEENABLE => rs
             .union(SnapshotDirty::VARIANT)
             .union(SnapshotDirty::PS_SOURCE),
         D3DRS_LIGHTING
@@ -663,9 +669,21 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
             .union(SnapshotDirty::VS_SOURCE)
             .union(SnapshotDirty::VS_CONST)
             .union(SnapshotDirty::PS_SOURCE),
-        // Key-only: flips FfVsFlags::LOCAL_VIEWER (specular view-vector
-        // model); no constant section reads it.
-        D3DRS_LOCALVIEWER => rs.union(SnapshotDirty::VS_SOURCE),
+        // Key-only: LOCALVIEWER flips FfVsFlags::LOCAL_VIEWER (specular
+        // view-vector model) and POINTSCALEENABLE flips
+        // FfVsFlags::POINT_SCALE (eye-distance attenuation); no constant
+        // section reads either.
+        D3DRS_LOCALVIEWER | D3DRS_POINTSCALEENABLE => rs.union(SnapshotDirty::VS_SOURCE),
+        // The point size, its clamp and the scale factors travel in the
+        // per-draw VsDraw uniform every vertex shader reads.
+        D3DRS_POINTSIZE | D3DRS_POINTSIZE_MIN | D3DRS_POINTSIZE_MAX | D3DRS_POINTSCALE_A
+        | D3DRS_POINTSCALE_B | D3DRS_POINTSCALE_C => rs.union(SnapshotDirty::VS_DRAW),
+        // The enabled-plane set repacks the VsDraw clip rows and its count
+        // keys both vertex-shader sources (the programmable side is added
+        // past `ff_aware_mask` by the SetRenderState thunk).
+        D3DRS_CLIPPLANEENABLE | D3DRS_CLIPPING => rs
+            .union(SnapshotDirty::VS_DRAW)
+            .union(SnapshotDirty::VS_SOURCE),
         _ => rs,
     }
 }
@@ -712,6 +730,11 @@ bitflags::bitflags! {
         /// `vs_constants_i`, consumed by a VS reading a dynamic (non-`defi`)
         /// integer constant.
         const VS_CONST_I  = 1 << 13;
+        /// Per-draw `VsDraw` uniform bytes (point size state).
+        ///
+        /// `mtld3d_core::vs_draw::build_vs_draw_bytes` over the point render
+        /// states, bound for every draw.
+        const VS_DRAW     = 1 << 14;
     }
 }
 
@@ -794,12 +817,19 @@ impl DeviceInner {
 
     /// Store a user clip plane set via `SetClipPlane`.
     ///
-    /// CPU round-trip only — see the `clip_planes` field doc. The index is
-    /// clamped into range so an out-of-range plane aliases the last slot
-    /// rather than panicking.
+    /// The first `vs_draw::MAX_CLIP_PLANES` feed the per-draw `VsDraw`
+    /// uniform when `D3DRS_CLIPPLANEENABLE` names them, so the uniform is
+    /// marked for a rebuild. The index is clamped into range so an
+    /// out-of-range plane aliases the last slot rather than panicking.
     pub fn set_clip_plane(&mut self, index: u32, plane: [f32; 4]) {
         let slot = (index as usize).min(CLIP_PLANE_SLOTS - 1);
         self.clip_planes[slot] = plane;
+        self.mark_snapshot_dirty(SnapshotDirty::VS_DRAW);
+    }
+
+    /// Every stored user clip plane, by index.
+    pub const fn clip_planes(&self) -> &[[f32; 4]; CLIP_PLANE_SLOTS] {
+        &self.clip_planes
     }
 
     /// Read back a user clip plane for `GetClipPlane`.
@@ -6968,6 +6998,11 @@ extern "system" fn device_set_transform(
     {
         mask |= SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE;
     }
+    // The fixed-function clip planes walk back from eye space through the
+    // inverse view the VsDraw uniform carries.
+    if state == mtld3d_types::D3DTS_VIEW {
+        mask |= SnapshotDirty::VS_DRAW;
+    }
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -7195,7 +7230,15 @@ extern "system" fn device_set_clip_plane(this: *mut c_void, index: u32, plane: *
     // SAFETY: `plane` is non-null (checked) and per the D3D9 ABI points to the
     // 4 readable f32 plane-equation coefficients (A, B, C, D).
     let coeffs = unsafe { *plane.cast::<[f32; 4]>() };
-    obj.inner().set_clip_plane(index, coeffs);
+    let dev = obj.inner();
+    if let Some(rec) = dev.recording_state_block_mut() {
+        rec.record(StateOp::ClipPlane {
+            index,
+            plane: coeffs,
+        });
+        return D3D_OK;
+    }
+    dev.set_clip_plane(index, coeffs);
     0 // S_OK
 }
 
@@ -7233,7 +7276,12 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
     // value yields a byte-identical snapshot, so skip the dirty mark.
     let changed = dev.set_render_state(state as usize, value);
     if changed {
-        let mask = dev.ff_aware_mask(rs_dirty_mask(state));
+        let mut mask = dev.ff_aware_mask(rs_dirty_mask(state));
+        // The user clip plane count is a key input of the programmable VS as
+        // well, which `ff_aware_mask` would otherwise strip.
+        if matches!(state, D3DRS_CLIPPLANEENABLE | D3DRS_CLIPPING) {
+            mask |= SnapshotDirty::VS_SOURCE;
+        }
         dev.mark_snapshot_dirty(mask);
     }
     dev.perf_mut()
@@ -7780,6 +7828,30 @@ extern "system" fn device_draw_primitive(
     if !has_vertex_layout_source(dev) {
         return D3DERR_INVALIDCALL;
     }
+    // Triangle fan has no Metal primitive: rewrite it as a triangle-list index
+    // stream over the bound streams. Kept off the (non-fan) hot path below.
+    if primitive_type == D3DPT_TRIANGLEFAN {
+        if primitive_count == 0 {
+            return D3DERR_INVALIDCALL;
+        }
+        // The encoder's shared 16-bit pattern covers every fan a 16-bit index
+        // can address and costs nothing per draw; anything longer, or a start
+        // vertex past the base-vertex range, gets a generated 32-bit list.
+        let index_source = if primitive_count <= convert::FAN_PATTERN_MAX_TRIANGLES
+            && i32::try_from(start_vertex).is_ok()
+        {
+            IndexSource::Fan {
+                start_vertex,
+                primitive_count,
+            }
+        } else {
+            let Some(fan) = convert::triangle_fan_indices(start_vertex, primitive_count) else {
+                return D3DERR_INVALIDCALL;
+            };
+            generated_fan_source(fan, primitive_count)
+        };
+        return draw_bound_triangle_fan(&obj, index_source, D3DERR_INVALIDCALL);
+    }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;
     };
@@ -7810,6 +7882,104 @@ extern "system" fn device_draw_primitive(
     D3D_OK
 }
 
+/// The `IndexSource` for a fan rewritten into an explicit index list.
+fn generated_fan_source(fan: convert::FanIndices, primitive_count: u32) -> IndexSource {
+    IndexSource::Generated {
+        bytes: fan.bytes,
+        index_count: primitive_count * 3,
+        index_type: fan.index_type,
+        min_vertex: fan.min_vertex,
+        max_vertex: fan.max_vertex,
+    }
+}
+
+/// Emit a bound-stream triangle fan as a triangle-list index draw.
+///
+/// `DrawPrimitive` and `DrawIndexedPrimitive` hand their fans here as an
+/// `IndexSource::Fan` (the encoder's shared pattern) or `IndexSource::Generated`
+/// (an explicit list); the vertices stay the bound streams, snapshotted
+/// exactly as for any other bound draw. `no_vertex_buffer_hr` is what the
+/// caller returns when no named stream has a buffer (the two entry points
+/// differ there, see `device_draw_indexed_primitive`).
+fn draw_bound_triangle_fan(
+    obj: &Direct3DDevice9,
+    index_source: IndexSource,
+    no_vertex_buffer_hr: i32,
+) -> i32 {
+    // Flush any bound buffer that's drawn while still mapped, before the draw
+    // snapshot reads it.
+    flush_mapped_bound_buffers(obj.inner());
+    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
+    let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
+    let Some(vertex_source) = snapshot_bound_vertex_source(obj.inner()) else {
+        warn!(target: LOG_TARGET, "triangle fan: no vertex buffer bound");
+        return no_vertex_buffer_hr;
+    };
+    emit_snapshot_deltas(obj);
+    drop(snap);
+    let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
+    obj.inner().push_op_inline(Op::Draw(DrawOp {
+        metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
+        vertex_source,
+        index_source,
+    }));
+    D3D_OK
+}
+
+/// Rewrite the fan a `DrawIndexedPrimitive` addresses in the bound index buffer.
+///
+/// Reads the application's indices straight from the buffer's CPU-side backing,
+/// which is current under both map modes (the `Direct` box is the GPU memory
+/// itself, the `Staged` box is the copy every Lock writes), so no GPU round
+/// trip is needed. `None`, with a warn, when nothing is bound, the format is
+/// unknown, or the draw reads past the buffer.
+fn bound_index_fan(
+    dev: &DeviceInner,
+    start_index: u32,
+    base_vertex: i32,
+    primitive_count: u32,
+) -> Option<convert::FanIndices> {
+    let ptr = dev.bound_buffers().index_buffer();
+    if ptr.is_null() {
+        warn!(target: LOG_TARGET, "DrawIndexedPrimitive: no index buffer bound");
+        return None;
+    }
+    // SAFETY: `ptr` is non-null (checked above) and points to a live
+    // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
+    let inner = unsafe { &*ptr }.inner();
+    let index_size: u64 = match inner.format() {
+        D3DFMT_INDEX16 => 2,
+        D3DFMT_INDEX32 => 4,
+        other => {
+            warn!(
+                target: LOG_TARGET,
+                "DrawIndexedPrimitive: unsupported index format {other}"
+            );
+            return None;
+        }
+    };
+    let first = u64::from(start_index) * index_size;
+    let len = (u64::from(primitive_count) + 2) * index_size;
+    if first + len > inner.current_backing_len() {
+        warn!(
+            target: LOG_TARGET,
+            "DrawIndexedPrimitive: triangle fan reads past the index buffer (start {start_index}, {primitive_count} primitives)"
+        );
+        return None;
+    }
+    let base = usize::try_from(inner.current_backing_ptr() + first).ok()?;
+    let len = usize::try_from(len).ok()?;
+    // SAFETY: `[first, first + len)` lies inside the live backing box (checked
+    // above); the API thread owns CPU access to it while the buffer is bound.
+    let src = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+    convert::triangle_fan_indices_from(
+        src,
+        usize::try_from(index_size).ok()?,
+        base_vertex,
+        primitive_count,
+    )
+}
+
 extern "system" fn device_draw_indexed_primitive(
     this: *mut c_void,
     primitive_type: u32,
@@ -7827,6 +7997,20 @@ extern "system" fn device_draw_indexed_primitive(
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
         return D3DERR_INVALIDCALL;
+    }
+    // Triangle fan has no Metal primitive: rewrite the addressed indices as a
+    // triangle list over the bound streams. Kept off the (non-fan) hot path.
+    if primitive_type == D3DPT_TRIANGLEFAN {
+        if primitive_count == 0 {
+            return D3DERR_INVALIDCALL;
+        }
+        let Some(fan) = bound_index_fan(dev, start_index, base_vertex_index, primitive_count)
+        else {
+            return D3DERR_INVALIDCALL;
+        };
+        // A valid declaration with no stream bound is S_OK for indexed draws,
+        // same as the non-fan path below.
+        return draw_bound_triangle_fan(&obj, generated_fan_source(fan, primitive_count), D3D_OK);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;
@@ -8439,6 +8623,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 uses_rel_const: vs_obj.uses_rel_const(),
                 provided_input_mask: dev.cached_vs_provided_mask,
                 uses_int_const: vs_obj.uses_int_const(),
+                clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
             })
         }
     } else {
@@ -8639,6 +8824,22 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // Per-draw VsDraw uniform (point size, inverse view, clip planes), read
+    // by every vertex shader.
+    let vs_draw_buf = if dirty.contains(SnapshotDirty::VS_DRAW) {
+        let view = dev
+            .ff_state()
+            .transform(mtld3d_types::D3DTS_VIEW)
+            .copied()
+            .unwrap_or(D3DMATRIX::IDENTITY);
+        Some(mtld3d_core::vs_draw::build_vs_draw_bytes(
+            rs,
+            &view,
+            dev.clip_planes(),
+        ))
+    } else {
+        None
+    };
     // Bump-environment matrix bytes (PS slot 12). Built only when a bump TSS
     // state changed (rare); the slot is bound at draw time only for a PS that
     // actually uses texbem/texbeml/bem.
@@ -8691,6 +8892,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     if let Some(buf) = vs_int_const_buf {
         dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = vs_draw_buf {
+        dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     drop(consts_timer);
     // ── END consts_timer SCOPE ──
@@ -10415,15 +10619,27 @@ const fn rs_classify(index: u32) -> RsClass {
         // core/src/ff_state.rs::resolve_vertex_blend_count.
         | D3DRS_VERTEXBLEND
         | D3DRS_INDEXEDVERTEXBLENDENABLE
-        // POINTSIZE_MIN / POINTSIZE_MAX are no-ops under the current
-        // cap (caps.rs::max_point_size = 1.0; no POINTSPRITE / POINTSCALE
-        // support). Intentionally silenced.
+        // POINTSIZE / POINTSIZE_MIN / POINTSIZE_MAX / POINTSCALE_A..C ride
+        // the per-draw VsDraw uniform (core/src/vs_draw.rs) that every vertex
+        // shader clamps `[[point_size]]` from; POINTSCALEENABLE is the
+        // FfVsFlags::POINT_SCALE key bit; POINTSPRITEENABLE is the
+        // VariantFlags::POINT_SPRITE PS variant that samples
+        // `[[point_coord]]`.
+        | D3DRS_POINTSIZE
         | D3DRS_POINTSIZE_MIN
         | D3DRS_POINTSIZE_MAX
-        // CLIPPING is a driver-side hint for frustum clipping — Metal
-        // always clips to the viewport, so disabling this state on our
-        // side is a no-op by construction, not a missing feature.
+        | D3DRS_POINTSCALE_A
+        | D3DRS_POINTSCALE_B
+        | D3DRS_POINTSCALE_C
+        | D3DRS_POINTSCALEENABLE
+        | D3DRS_POINTSPRITEENABLE
+        // CLIPPING is the master clipping switch: it gates the user clip
+        // planes (`vs_draw::clip_plane_count`); its frustum half is a no-op, Metal always
+        // clips to the viewport. CLIPPLANEENABLE selects which of the
+        // `SetClipPlane` planes the VsDraw uniform packs and keys the
+        // `[[clip_distance]]` lane count of both vertex-shader sources.
         | D3DRS_CLIPPING
+        | D3DRS_CLIPPLANEENABLE
         // BLENDFACTOR feeds the per-encoder constant blend color via
         // `Command::set_blend_color`, emitted in `emit_draw` whenever
         // the value differs from the default opaque white.

@@ -24,7 +24,7 @@ use std::{
     fmt::Write,
 };
 
-use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 
 use super::{
     ir::{
@@ -65,6 +65,16 @@ bitflags::bitflags! {
         /// Folded into the PS cache key so sRGB-write and plain draws get
         /// distinct libraries.
         const SRGB_WRITE = 1 << 2;
+        /// `D3DRS_POINTSPRITEENABLE != 0` on a point-list draw.
+        ///
+        /// When set, the PS takes `[[point_coord]]` and substitutes it for
+        /// every texture-coordinate varying before the body runs, which is
+        /// what D3D9 does for point sprites: each point is textured as a whole
+        /// quad regardless of the vertex's own coordinates. The API thread
+        /// sets it from the render state and `emit_draw` clears it for any
+        /// primitive other than points, so triangle draws keep their
+        /// libraries. Folded into the PS cache key.
+        const POINT_SPRITE = 1 << 3;
     }
 }
 
@@ -169,7 +179,7 @@ pub const DEFAULT_PS_ENTRY: &str = "mtld3d_ps";
 ///
 /// See [`emit_vs_programmable_named`].
 pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
-    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX)
+    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX, 0)
 }
 
 /// Emit MSL for a pixel shader using the default `mtld3d_ps` entry name.
@@ -193,6 +203,7 @@ pub fn emit_vs_programmable_named(
     vs: &DxsoProgram,
     entry: &str,
     provided_mask: u16,
+    clip_plane_count: u8,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -201,9 +212,10 @@ pub fn emit_vs_programmable_named(
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs, provided_mask);
-    emit_varyings(&mut out, false);
+    emit_varyings(&mut out, false, clip_plane_count);
+    w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
-    emit_vs_function(&mut out, vs, entry, provided_mask)?;
+    emit_vs_function(&mut out, vs, entry, provided_mask, clip_plane_count)?;
     Ok(out)
 }
 
@@ -264,7 +276,11 @@ pub fn emit_ps_programmable_named(
     let mut out = String::new();
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
-    emit_varyings(&mut out, variant.flags.contains(VariantFlags::FLAT_SHADE));
+    emit_varyings(
+        &mut out,
+        variant.flags.contains(VariantFlags::FLAT_SHADE),
+        0,
+    );
     emit_const_rel_helper(&mut out, ps);
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         emit_srgb_write_helper(&mut out);
@@ -332,7 +348,7 @@ fn emit_vertex_in(out: &mut String, vs: &DxsoProgram, provided_mask: u16) {
 // return; Metal's pipeline validation doesn't complain, and unused inputs get
 // dead-code-eliminated by the MSL compiler.
 
-fn emit_varyings(out: &mut String, flat: bool) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     w(out, "struct Varyings {\n");
     // `invariant` — the analog of an `Invariant` decoration on a SPIR-V
     // `gl_Position` output — keeps the clip-space position bit-stable WITHIN a
@@ -372,6 +388,18 @@ fn emit_varyings(out: &mut String, flat: bool) {
     // into fragment input. Always-present so VS and PS struct layouts
     // stay aligned (FF + programmable mix-and-match).
     w(out, "    float point_size [[point_size]];\n");
+    // User clip planes: one `[[clip_distance]]` lane per enabled plane, a
+    // VS-only output the rasterizer consumes (a fragment with any negative
+    // lane is discarded). Metal rejects the attribute on a fragment input,
+    // so the PS struct is emitted with `clip_planes == 0`; Metal links the
+    // two structs by member name, so the VS-side extra member is fine.
+    // MSL puts the attribute between the name and the array dimension.
+    if clip_planes > 0 {
+        let _ = writeln!(
+            out,
+            "    float clip_distance [[clip_distance]] [{clip_planes}];"
+        );
+    }
     w(out, "};\n\n");
 }
 
@@ -382,6 +410,7 @@ fn emit_vs_function(
     vs: &DxsoProgram,
     entry: &str,
     provided_mask: u16,
+    clip_plane_count: u8,
 ) -> Result<(), EmitError> {
     let _ = writeln!(out, "vertex Varyings {entry}(");
     w(out, "    VertexIn in [[stage_in]],\n");
@@ -398,6 +427,13 @@ fn emit_vs_function(
     let _ = write!(
         out,
         ",\n    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+    );
+    // Per-draw point state (`crate::vs_draw`): the `D3DRS_POINTSIZE` default
+    // for a shader that never writes `oPts`, and the `POINTSIZE_MIN/MAX`
+    // clamp applied to whichever size wins.
+    let _ = write!(
+        out,
+        ",\n    constant VsDraw &vs_draw [[buffer({VS_DRAW_SLOT})]]"
     );
     // A dynamic integer constant (typically a `loop aL, iN` / `rep iN` counter
     // fed by SetVertexShaderConstantI) reads the runtime int4 buffer.
@@ -437,10 +473,13 @@ fn emit_vs_function(
     w(out, "    out.fog = float4(1.0);\n");
     // VS oPts / `dcl_psize` writes route through `_psize_storage` so
     // `store_dst`'s write_mask path applies cleanly even though the
-    // Varyings field itself is scalar. Default 1.0 mirrors D3D9 spec
-    // for point primitives without an explicit size; extracted to
-    // `out.point_size` at return.
-    w(out, "    float4 _psize_storage = float4(1.0);\n");
+    // Varyings field itself is scalar. Seeded with `D3DRS_POINTSIZE`, which
+    // is the size D3D9 gives a point whose vertex shader never writes
+    // `oPts`; extracted (clamped) to `out.point_size` at return.
+    w(
+        out,
+        "    float4 _psize_storage = float4(vs_draw.point.x);\n",
+    );
     // Discard sink for RastOut indices we don't route to a varying.
     // Writing to this local instead of `out.position` keeps the
     // position computation from being clobbered on the following line.
@@ -504,6 +543,16 @@ fn emit_vs_function(
     if !vs_writes_fog(vs, vs_output_map.as_ref()) {
         w(out, "    out.fog = float4(out.color1.w);\n");
     }
+    // User clip planes are clip-space for the programmable pipeline: one
+    // distance per enabled plane against the shader's own `oPos`, taken
+    // before the half-pixel fixup below so the plane sees the position the
+    // application computed, which is the space D3D9 defines the planes in.
+    for i in 0..clip_plane_count {
+        let _ = writeln!(
+            out,
+            "    out.clip_distance[{i}] = dot(out.position, vs_draw.clip[{i}]);"
+        );
+    }
     // Half-pixel rasterization fixup (see the buffer-13 `pos_fixup` arg): shift
     // the clip-space position half a pixel right (+x) and down (−y in Metal's
     // +y-up NDC) so on-boundary geometry matches the D3D9 reference.
@@ -514,7 +563,12 @@ fn emit_vs_function(
     w(out, "    out.position.y += pos_fixup.y * out.position.w;\n");
     // NDC depth for the table-fog Z source (see the Varyings decl).
     w(out, "    out.fog_z = out.position.z / out.position.w;\n");
-    w(out, "    out.point_size = _psize_storage.x;\n");
+    // `D3DRS_POINTSIZE_MIN/MAX` clamp the final size whether it came from
+    // the shader (`oPts` / `dcl_psize`) or the render-state default.
+    w(
+        out,
+        "    out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);\n",
+    );
     w(out, "    return out;\n");
     w(out, "}\n");
     Ok(())
@@ -598,6 +652,25 @@ fn vs_writes_fog(vs: &DxsoProgram, output_map: Option<&BTreeMap<(RegKind, u16), 
 }
 
 // ── PS function ──
+
+/// Redirect every texture-coordinate varying at the point coordinate.
+///
+/// D3D9 point sprites (`D3DRS_POINTSPRITEENABLE`) texture each point as a
+/// full quad: the rasterizer replaces all eight texture-coordinate sets with
+/// the fragment's position inside the point, `(0,0)` at the top left and
+/// `(1,1)` at the bottom right, which is also Metal's `[[point_coord]]`
+/// convention. The body keeps reading `in.texcoordN`, so the substitution
+/// happens on a local copy of the stage input. Shared by the FF and DXSO
+/// pixel-shader emitters.
+pub fn write_point_sprite_prologue(out: &mut String) {
+    w(out, "    Varyings in = in_stage;\n");
+    for i in 0..8 {
+        let _ = writeln!(
+            out,
+            "    in.texcoord{i} = float4(point_coord.x, point_coord.y, 0.0, 0.0);"
+        );
+    }
+}
 
 /// Declared PS sampler slots and their texture dimensionality.
 ///
@@ -764,7 +837,16 @@ fn emit_ps_function(
     } else {
         let _ = writeln!(out, "fragment float4 {entry}(");
     }
-    w(out, "    Varyings in [[stage_in]],\n");
+    let point_sprite = variant.flags.contains(VariantFlags::POINT_SPRITE);
+    if point_sprite {
+        // Point sprite: the varyings arrive under another name so the body's
+        // `in.texcoordN` reads can be redirected at the point coordinate
+        // through a local copy (see the prologue below).
+        w(out, "    Varyings in_stage [[stage_in]],\n");
+        w(out, "    float2 point_coord [[point_coord]],\n");
+    } else {
+        w(out, "    Varyings in [[stage_in]],\n");
+    }
     w(out, "    constant float4 *ps_c [[buffer(15)]]");
     let alpha_test_active = variant.alpha_func != 0 && variant.alpha_func != 8;
     if alpha_test_active {
@@ -826,6 +908,9 @@ fn emit_ps_function(
         w(out, ",\n    bool v_face_in [[front_facing]]");
     }
     w(out, "\n) {\n");
+    if point_sprite {
+        write_point_sprite_prologue(out);
+    }
     w(out, "    float4 r[32];\n");
     // SM1 pixel shaders: `tN` (RegKind::Addr) is a read-write register that
     // holds the iterated texture coordinate AND receives `tex`/`texcoord`/

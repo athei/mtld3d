@@ -83,13 +83,6 @@ const PIXEL_SHADER_1X_MAX_VALUE: f32 = 65504.0;
 /// `D3DCAPS9` flag.
 const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 
-/// Point size the caps diagnostic raises `MaxPointSize` to.
-///
-/// Large enough that a game which gates its point-sprite path on the cap
-/// takes it, so `D3DPT_POINTLIST` draws reach the `d3d_to_metal_primitive`
-/// warn instead of being skipped upstream.
-const ADVERTISE_ALL_MAX_POINT_SIZE: f32 = 64.0;
-
 /// Driver-level caps: resource management, dynamic textures, gamma, mip generation.
 const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::DYNAMICTEXTURES)
@@ -265,10 +258,11 @@ const LINE_DEFAULT: LineCaps = LineCaps::TEXTURE
     .union(LineCaps::BLEND)
     .union(LineCaps::ALPHACMP);
 
-/// FVF caps: the texture-coordinate-set count, with no flag bits.
+/// FVF caps: the texture-coordinate-set count plus `PSIZE`.
 ///
-/// `PSIZE` stays off until the FVF decoder handles a point-size element.
-const FVF_DEFAULT: FvfCaps = FvfCaps::texcoord_sets(FF_TEXTURE_STAGES);
+/// The fixed-function vertex shader reads a `D3DFVF_PSIZE` element as the
+/// per-vertex point size (`dxso::ff::emit_point_size`).
+const FVF_DEFAULT: FvfCaps = FvfCaps::texcoord_sets(FF_TEXTURE_STAGES).union(FvfCaps::PSIZE);
 
 /// Vertex-processing caps.
 ///
@@ -442,6 +436,11 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.dev_caps2 = DEV_CAPS2_DEFAULT.bits();
     // One adapter, which is its own group of one.
     caps.number_of_adapters_in_group = 1;
+    // User clip planes: the vertex shaders emit one `[[clip_distance]]` lane
+    // per enabled plane from the `VsDraw` uniform (`crate::vs_draw`), whose
+    // `MAX_CLIP_PLANES` this must match (pinned by a unit test; a const fn
+    // cannot convert the usize).
+    caps.max_user_clip_planes = 6;
 }
 
 /// Bring-up diagnostic: over-advertise caps only where the fallout would show up in the log.
@@ -474,18 +473,13 @@ fn apply_advertise_all(caps: &mut D3DCAPS9) {
     caps.dev_caps2 |= DevCaps2::all().bits();
     caps.line_caps |= LineCaps::all().bits();
     caps.texture_op_caps |= TexOpCaps::all().bits();
-    // Field-shape (non-bitmask) raises. Each has detection wired upstream
-    // so the game's attempts at the path land as warns:
-    //  - num_simultaneous_rts: already the spec maximum on the default path,
-    //    so the raise is a no-op kept for symmetry.
-    //  - max_point_size: D3DPT_POINTLIST draws fire a log_once_warn in
-    //    d3d_to_metal_primitive (Metal still renders 1-pixel points).
-    // `max_vertex_blend_matrices` needs no raise: the truthful floor in
-    // `fill_default` is already the spec maximum.
+    // Field-shape (non-bitmask) raise: num_simultaneous_rts is already the
+    // spec maximum on the default path, so this is a no-op kept for symmetry.
+    // `max_vertex_blend_matrices` and `max_point_size` need no raise: the
+    // truthful values in `fill_default` are already what the path supports.
     caps.num_simultaneous_rts = caps
         .num_simultaneous_rts
         .max(D3D_MAX_SIMULTANEOUS_RENDERTARGETS);
-    caps.max_point_size = caps.max_point_size.max(ADVERTISE_ALL_MAX_POINT_SIZE);
 }
 
 #[cfg(test)]
@@ -506,6 +500,18 @@ mod tests {
         let mut caps: D3DCAPS9 = unsafe { core::mem::zeroed() };
         fill_default(&mut caps);
         caps
+    }
+
+    #[test]
+    fn user_clip_planes_match_the_uniform_capacity() {
+        // 3DMark05 requires at least one; the uniform carries six, the
+        // D3D9-era hardware figure, one `[[clip_distance]]` lane each.
+        let caps = filled();
+        assert_eq!(
+            usize::try_from(caps.max_user_clip_planes).expect("fits"),
+            crate::vs_draw::MAX_CLIP_PLANES
+        );
+        assert!(caps.max_user_clip_planes >= 1);
     }
 
     #[test]
@@ -536,7 +542,8 @@ mod tests {
             | PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING
             | PrimitiveMiscCaps::POSTBLENDSRGBCONVERT;
         assert_eq!(filled().primitive_misc_caps, expected.bits());
-        // CLIPPLANESCALEDPOINTS is meaningless given max_point_size = 1.0.
+        // CLIPPLANESCALEDPOINTS stays off: scaled points are clipped as
+        // points, not as the quads they rasterize to.
         assert_eq!(
             filled().primitive_misc_caps & PrimitiveMiscCaps::CLIPPLANESCALEDPOINTS.bits(),
             0
@@ -698,15 +705,32 @@ mod tests {
     }
 
     #[test]
-    fn fvf_caps_carry_a_texcoord_count_not_flags() {
-        // The low 16 bits of FVFCaps are a count, not a bitmask. PSIZE stays
-        // off until the FVF decoder handles a point-size element.
+    fn fvf_caps_carry_a_texcoord_count_and_psize() {
+        // The low 16 bits of FVFCaps are a count, not a bitmask; PSIZE is the
+        // one flag bit, backed by the FF VS reading the per-vertex size.
         let caps = filled();
         assert_eq!(
             caps.fvf_caps & FvfCaps::TEXCOORDCOUNTMASK.bits(),
             FF_TEXTURE_STAGES
         );
-        assert_eq!(caps.fvf_caps & FvfCaps::PSIZE.bits(), 0);
+        assert_ne!(caps.fvf_caps & FvfCaps::PSIZE.bits(), 0);
+    }
+
+    #[test]
+    fn point_size_cap_is_the_render_state_default() {
+        // D3D9 defines the D3DRS_POINTSIZE_MAX default as MaxPointSize; both
+        // read mtld3d_types::MAX_POINT_SIZE, and 3DMark05 requires >= 64.
+        let caps = filled();
+        assert_eq!(
+            caps.max_point_size.to_bits(),
+            mtld3d_types::MAX_POINT_SIZE.to_bits()
+        );
+        assert!(caps.max_point_size >= 64.0);
+        let defaults = mtld3d_types::render_state_defaults();
+        assert_eq!(
+            defaults[mtld3d_types::D3DRS_POINTSIZE_MAX as usize],
+            caps.max_point_size.to_bits()
+        );
     }
 
     #[test]
@@ -898,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn advertise_all_raises_mrt_stencil_point() {
+    fn advertise_all_raises_mrt_and_stencil() {
         let caps = advertised();
         assert!(
             caps.num_simultaneous_rts >= mtld3d_types::D3D_MAX_SIMULTANEOUS_RENDERTARGETS,
@@ -909,9 +933,10 @@ mod tests {
             StencilCaps::all().contains(StencilCaps::KEEP | StencilCaps::TWOSIDED),
             "stencil mask must span the single-sided ops and the two-sided bit"
         );
-        assert!(
-            caps.max_point_size >= super::ADVERTISE_ALL_MAX_POINT_SIZE,
-            "point-size raise"
+        // max_point_size is already truthful in fill_default; no raise.
+        assert_eq!(
+            caps.max_point_size.to_bits(),
+            filled().max_point_size.to_bits()
         );
         // vertex_blend_matrices stays at the truthful floor from fill_default.
         assert_eq!(

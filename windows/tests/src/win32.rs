@@ -56,6 +56,41 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleA(name: *const c_char) -> usize;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+}
+
+static FAILURE_EXIT_HOOK: Once = Once::new();
+
+/// Exit code a test process ends with once an assertion has failed.
+///
+/// The value libtest itself exits with after a failed run.
+const TEST_FAILURE_EXIT_CODE: u32 = 101;
+
+/// Make a failed assertion end the test process with a failing exit code.
+///
+/// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
+/// once a device has been created (it cannot survive snmalloc's thread-local
+/// teardown on Wine's 1 MB main-thread stack), and that `TerminateProcess`
+/// exits with code 0 whatever libtest was exiting with, so nextest saw a
+/// failing test binary as passing. The hook keeps libtest's own report (the
+/// default hook prints the assertion first) and then terminates with
+/// libtest's failure code right away, before the detach path can overwrite
+/// it. One test per process under nextest, so nothing after the failure is
+/// lost.
+pub fn install_failure_exit_hook() {
+    FAILURE_EXIT_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for
+            // the current process.
+            let process = unsafe { GetCurrentProcess() };
+            // SAFETY: the current process's pseudo-handle; the documented
+            // self-terminate form.
+            unsafe { TerminateProcess(process, TEST_FAILURE_EXIT_CODE) };
+        }));
+    });
 }
 
 #[repr(C)]

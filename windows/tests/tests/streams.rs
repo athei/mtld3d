@@ -285,6 +285,9 @@ impl InstancedScene {
             "red constant"
         );
 
+        // Bottom-left, top-left, bottom-right, top-right: vertices 0, 1, 2
+        // and 2, 1, 3 both wind clockwise on screen, which the default
+        // `D3DCULL_CCW` keeps.
         let quad = [
             PosVertex {
                 x: -0.1,
@@ -292,13 +295,13 @@ impl InstancedScene {
                 z: 0.5,
             },
             PosVertex {
-                x: 0.1,
-                y: -0.1,
+                x: -0.1,
+                y: 0.1,
                 z: 0.5,
             },
             PosVertex {
-                x: -0.1,
-                y: 0.1,
+                x: 0.1,
+                y: -0.1,
                 z: 0.5,
             },
             PosVertex {

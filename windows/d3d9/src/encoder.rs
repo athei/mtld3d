@@ -15,6 +15,7 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
     buffer_rename::BufferMapMode,
+    convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, TextureType, VariantKey,
@@ -52,8 +53,9 @@ use mtld3d_shared::{
     NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
     TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
-        BufferKind, ClearQuadFlags, DestroyKind, LoadAction, PixelFormat, PrimitiveType, StageTag,
-        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
+        BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
+        StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage,
+        VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -818,11 +820,13 @@ pub struct FrameEncoder {
     ///
     /// `FxHash` + exact `Eq`, probed by borrow — no per-draw content hash,
     /// no clone. One pair of maps per stage; VS keys exclude `variant`
-    /// (variants share one `MTLLibrary`), PS keys fold it in. The Xxh3
+    /// (variants share one `MTLLibrary`) but carry the user clip plane count
+    /// (a programmable VS compiles one library per count), PS keys fold the
+    /// variant in. The Xxh3
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
     /// (warm-load) and address the on-disk cache.
     ff_vs_libs: FxHashMap<FfVsKey, StageLibHandles>,
-    prog_vs_libs: FxHashMap<(ProgramId, u16), StageLibHandles>,
+    prog_vs_libs: FxHashMap<(ProgramId, u16, u8), StageLibHandles>,
     ff_ps_libs: FxHashMap<FfPsKey, FxHashMap<VariantKey, StageLibHandles>>,
     prog_ps_libs: FxHashMap<(ProgramId, VariantKey), StageLibHandles>,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
@@ -848,6 +852,8 @@ pub struct FrameEncoder {
     /// `begin_frame`. See `PendingResourceRetention` for the producer
     /// list.
     pending_resource_retention: VecDeque<PendingResourceRetention>,
+    /// The shared triangle-fan index pattern every `IndexSource::Fan` draw binds.
+    fan_index_buffer: FanIndexBuffer,
     /// D3D9 occlusion-query state.
     ///
     /// Per-frame slot allocator, shared visibility-buffer pool,
@@ -1022,6 +1028,27 @@ struct BufferGpuState {
     last_submit_seq: u64,
 }
 
+/// The encoder's shared 16-bit triangle-fan index pattern.
+///
+/// `convert::fill_fan_pattern_u16` in a PE `PageBox` wrapped as an
+/// `MTLBuffer`, grown to the longest fan drawn so far. A grown-out pattern
+/// goes through `pending_resource_retention` like any other buffer: an
+/// earlier draw this frame may still reference it.
+struct FanIndexBuffer {
+    backing: Option<PageBox>,
+    handle: MetalHandle<MTLBufferKind>,
+    /// Triangles the pattern currently covers.
+    triangles: u32,
+}
+
+impl FanIndexBuffer {
+    const EMPTY: Self = Self {
+        backing: None,
+        handle: MetalHandle::NULL,
+        triangles: 0,
+    };
+}
+
 /// One deferred Metal-handle retention entry owned by the encoder thread.
 ///
 /// On drain: `destroy_resources_bulk(kind, &[handle])` if `handle != 0`,
@@ -1051,6 +1078,9 @@ struct BufferGpuState {
 ///    frame's submit. Destroying these synchronously races against
 ///    the in-flight blit replay on Intel/AMD (Bronze driver) where
 ///    Metal recycles the freed address as the wrong type.
+/// 7. `fan_index_buffer` growth: `Buffer` + the grown-out pattern's
+///    handle + `page_box`, `seq = current_submit_seq`, since a draw
+///    earlier this frame may still bind it.
 struct PendingResourceRetention {
     kind: DestroyKind,
     handle: u64,
@@ -1185,6 +1215,7 @@ impl FrameEncoder {
             sampler_resolve_memo: core::array::from_fn(|_| None),
             buffer_cache: FxHashMap::default(),
             pending_resource_retention: VecDeque::new(),
+            fan_index_buffer: FanIndexBuffer::EMPTY,
             visibility: VisibilityQueryState::new(),
             cache_writer: None,
             compile_burst: BurstTracker::new(),
@@ -2132,6 +2163,68 @@ impl FrameEncoder {
         let fresh = RetiredVisibilityBuffer::new(backing, handle, 0);
         self.visibility.install_current_buffer(fresh);
         true
+    }
+
+    /// The shared fan index buffer, covering at least `primitive_count` triangles.
+    ///
+    /// Grows geometrically (capped at the 16-bit pattern's reach) so a scene
+    /// of ever-longer fans allocates a logarithmic number of times. Returns
+    /// 0 when Metal refuses the allocation.
+    pub fn fan_index_buffer(&mut self, primitive_count: u32) -> u64 {
+        const FIRST_TRIANGLES: u32 = 256;
+        if !self.fan_index_buffer.handle.is_null()
+            && self.fan_index_buffer.triangles >= primitive_count
+        {
+            return self.fan_index_buffer.handle.raw();
+        }
+        let triangles = primitive_count
+            .max(self.fan_index_buffer.triangles.saturating_mul(2))
+            .clamp(FIRST_TRIANGLES, FAN_PATTERN_MAX_TRIANGLES);
+        let mut backing = PageBox::new_zeroed(fan_pattern_bytes(triangles));
+        fill_fan_pattern_u16(backing.as_mut_slice(), triangles);
+        let length = backing.len() as u64;
+        let desc = BufferCreateDesc {
+            backing_ptr: backing.as_mut_ptr() as u64,
+            length,
+            id: 0,
+            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            kind: BufferKind::VbIb,
+        };
+        let mut handle = MetalHandle::<MTLBufferKind>::NULL;
+        let status = self.batch_create_buffers(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut handle),
+        );
+        if status != 0 || handle.is_null() {
+            error!(
+                target: LOG_TARGET,
+                "fan_index_buffer: CreateBuffer failed (triangles={triangles}, status={status:#x})"
+            );
+            return 0;
+        }
+        // The pattern was written by the CPU before the wrap; on managed
+        // storage the GPU has to be told (no-op on UMA).
+        self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, length);
+        let grown_out = core::mem::replace(
+            &mut self.fan_index_buffer,
+            FanIndexBuffer {
+                backing: Some(backing),
+                handle,
+                triangles,
+            },
+        );
+        if !grown_out.handle.is_null() {
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Buffer,
+                    handle: grown_out.handle.raw(),
+                    page_box: grown_out.backing,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: false,
+                });
+        }
+        handle.raw()
     }
 
     fn mark_visibility_exhausted(&mut self) {
@@ -3128,6 +3221,15 @@ impl FrameEncoder {
                 .emit_command(Command::set_stencil_reference(value));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
+        // The quad is one counter-clockwise triangle, back-facing under
+        // Metal's default clockwise front face, so the cull mode the last
+        // draw left behind (D3D's default CULL_CCW is cull-back) would drop
+        // it whole. Go through the dedup cache so the next draw re-emits
+        // its own mode.
+        if self.last_bound.cull_mode_changed(CullMode::None) {
+            self.pass_state
+                .emit_command(Command::set_cull_mode(CullMode::None));
+        }
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
@@ -3228,6 +3330,15 @@ impl FrameEncoder {
                 .emit_command(Command::set_depth_stencil_state(depth_state));
         }
         self.emit_scissor_rect_resolved((vx, vy, vw, vh));
+        // The quad is one counter-clockwise triangle, back-facing under
+        // Metal's default clockwise front face, so the cull mode the last
+        // draw left behind (D3D's default CULL_CCW is cull-back) would drop
+        // it whole. Go through the dedup cache so the next draw re-emits
+        // its own mode.
+        if self.last_bound.cull_mode_changed(CullMode::None) {
+            self.pass_state
+                .emit_command(Command::set_cull_mode(CullMode::None));
+        }
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
@@ -3630,9 +3741,13 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
-                if let Some(&handles) = self.prog_vs_libs.get(&(*vs_id, *provided_input_mask)) {
+                if let Some(&handles) =
+                    self.prog_vs_libs
+                        .get(&(*vs_id, *provided_input_mask, *clip_plane_count))
+                {
                     return Some(handles);
                 }
             }
@@ -3645,10 +3760,11 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
                 self.prog_vs_libs
-                    .insert((*vs_id, *provided_input_mask), handles);
+                    .insert((*vs_id, *provided_input_mask, *clip_plane_count), handles);
             }
         }
         Some(handles)
@@ -3679,6 +3795,7 @@ impl FrameEncoder {
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
+                clip_plane_count,
                 ..
             } => {
                 let Some(program) = self.program_cache.get(vs_id) else {
@@ -3686,14 +3803,18 @@ impl FrameEncoder {
                     return None;
                 };
                 let bucket = CompileBucket::from_sm_major(program.major);
-                let msl =
-                    match emit_vs_programmable_named(program, &entry_name, *provided_input_mask) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
-                            return None;
-                        }
-                    };
+                let msl = match emit_vs_programmable_named(
+                    program,
+                    &entry_name,
+                    *provided_input_mask,
+                    *clip_plane_count,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
+                        return None;
+                    }
+                };
                 (msl, bucket)
             }
             VsSource::FixedFunction { key, .. } => {
@@ -3925,6 +4046,19 @@ impl FrameEncoder {
                 index_type,
                 ..
             } => format!("ib=UP idx={index_count} {index_type:?}"),
+            IndexSource::Fan {
+                start_vertex,
+                primitive_count,
+            } => format!("ib=fan-pattern tris={primitive_count} verts@{start_vertex}"),
+            IndexSource::Generated {
+                index_count,
+                index_type,
+                min_vertex,
+                max_vertex,
+                ..
+            } => {
+                format!("ib=fan idx={index_count} {index_type:?} verts={min_vertex}..={max_vertex}")
+            }
         };
         trace!(
             target: DRAW_TRACE_TARGET,
@@ -3942,6 +4076,11 @@ impl FrameEncoder {
     /// `PairShaderId`s — including their `disk_key` content hash — are built
     /// *after* the gate from the sources, so the hot path pays nothing (this
     /// is no longer on the per-draw cache lookup path).
+    /// Count a triangle-fan draw that took the generated-index slow path.
+    pub const fn bump_fan_generated(&mut self) {
+        self.perf.bump_fan_generated();
+    }
+
     pub fn bump_pair_stats(
         &mut self,
         shaders: ShaderRef,
@@ -5494,6 +5633,13 @@ impl FrameEncoder {
             }
             held.pageboxes.push(page_box);
         }
+        let fan = core::mem::replace(&mut self.fan_index_buffer, FanIndexBuffer::EMPTY);
+        if !fan.handle.is_null() {
+            buffers.push(fan.handle.raw());
+        }
+        if let Some(page_box) = fan.backing {
+            held.pageboxes.push(page_box);
+        }
         self.wait_for_gpu_idle();
         held
     }
@@ -6968,11 +7114,16 @@ fn shader_source_tag_vs(source: &VsSource) -> String {
         VsSource::Programmable {
             vs_id,
             provided_input_mask,
+            clip_plane_count,
             ..
         } => {
             format!(
                 "prog {:#x}",
-                draw::vs_source_disk_key_programmable(*vs_id, *provided_input_mask)
+                draw::vs_source_disk_key_programmable(
+                    *vs_id,
+                    *provided_input_mask,
+                    *clip_plane_count
+                )
             )
         }
         VsSource::FixedFunction { key, .. } => {

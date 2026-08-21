@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **4 `real` · 93 `expected` ·
+re-checked before retagging. Headline: **4 `real` · 91 `expected` ·
 2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -537,15 +537,6 @@ fetch4-off/format-absent result (accepted by the test only under broken()).
 15668/15824/15829 counts wobble with display environment, hence `ceiling` —
 keep the higher pin (a count-down is tolerated; a low pin makes the flutter-back a false
 regression).
-
-### visual.c/clip_planes
-Sites: 16129=expected 16131=expected
-
-The test applies FF clip planes without branching on MaxUserClipPlanes (we
-report 0). SetClipPlane/GetClipPlane are a CPU round-trip store with no GPU
-application, consistent with the zero cap: a conformant app would not use
-clip planes on this device. Deliberate scope decision. Becomes `real` the
-moment a target title needs user clip planes.
 
 ### visual.c/fp_special_test
 Sites: 16433=expected

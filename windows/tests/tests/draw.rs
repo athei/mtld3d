@@ -5,9 +5,10 @@
 
 use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex};
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DPOOL_DEFAULT,
-    D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
-    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
+    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
+    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING,
+    D3DUSAGE_WRITEONLY,
 };
 
 const MAGENTA: u32 = 0xFFFF_00FF;
@@ -193,6 +194,154 @@ fn triangle_fan_draws_as_triangle_list() {
         h.read_pixel(10, 10),
         BLACK,
         "corner is outside the fan diamond",
+    );
+}
+
+/// The fan diamond `triangle_fan_draws_as_triangle_list` draws, as a slice.
+fn fan_diamond() -> [PosColorVertex; 4] {
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    [v(0.0, 0.6), v(0.6, 0.0), v(0.0, -0.6), v(-0.6, 0.0)]
+}
+
+#[test]
+fn bound_triangle_fan_draws_from_a_vertex_buffer() {
+    // `DrawPrimitive(D3DPT_TRIANGLEFAN)` over a bound vertex buffer: the fan
+    // is rewritten as a triangle-list index stream at draw time, so the
+    // diamond renders exactly like the UP form. The fan starts past two
+    // padding vertices to prove `StartVertex` is honoured.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let pad = PosColorVertex {
+        x: 0.9,
+        y: 0.9,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    let mut verts = vec![pad, pad];
+    verts.extend_from_slice(&fan_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLEFAN, 2, 2),
+            0,
+            "bound TRIANGLEFAN draws",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside the fan");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+    assert_eq!(
+        h.read_pixel(600, 20),
+        BLACK,
+        "the padding vertices before StartVertex are not part of the fan",
+    );
+}
+
+#[test]
+fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
+    // Bound `DrawPrimitive` fans share one index pattern buffer that starts
+    // at 256 triangles and grows on demand. A short fan and then a 300
+    // triangle fan in the same frame make it grow while the short fan's draw
+    // still references the first buffer; both must render.
+    const RIM: u16 = 300;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = fan_diamond().to_vec();
+    let diamond_len = u32::try_from(verts.len()).expect("count fits u32");
+    // A disc of radius 0.8: the centre, then the rim clockwise on screen
+    // (decreasing angle) so the default cull keeps every triangle, closed by
+    // repeating the first rim vertex.
+    verts.push(PosColorVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.5,
+        color: GREEN,
+    });
+    for k in 0..=RIM {
+        let angle = core::f32::consts::FRAC_PI_2
+            - f32::from(k % RIM) * core::f32::consts::TAU / f32::from(RIM);
+        verts.push(PosColorVertex {
+            x: 0.8 * angle.cos(),
+            y: 0.8 * angle.sin(),
+            z: 0.5,
+            color: GREEN,
+        });
+    }
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    let rim = u32::from(RIM);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLEFAN, 0, 2), 0, "short fan");
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLEFAN, diamond_len, rim),
+            0,
+            "300 triangle fan",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside both fans");
+    // (0.5, 0.5) in clip space: outside the diamond, inside the disc.
+    assert_eq!(h.read_pixel(480, 120), GREEN, "the long fan's rim renders");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the disc");
+}
+
+#[test]
+fn bound_indexed_triangle_fan_honours_base_vertex_and_start_index() {
+    // `DrawIndexedPrimitive(D3DPT_TRIANGLEFAN)`: the fan's indices are read
+    // from the bound 16-bit index buffer at `StartIndex`, the base vertex is
+    // folded in, and the result draws as a triangle list. The index buffer
+    // lists the diamond in reverse so the draw proves the app's indices are
+    // used rather than a sequential range.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let pad = PosColorVertex {
+        x: 0.9,
+        y: 0.9,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    let mut verts = vec![pad, pad, pad];
+    verts.extend_from_slice(&fan_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    // Two unused leading indices, then the diamond relative to base vertex 3,
+    // wound the other way round from the UP test so a sequential range could
+    // not pass by accident; that reversal flips the facing, so culling is off.
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "cull off"
+    );
+    let indices: [u16; 6] = [0, 0, 3, 2, 1, 0];
+    let ib = h.create_index_buffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&indices);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 3, 0, 4, 2, 2),
+            0,
+            "bound indexed TRIANGLEFAN draws",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside the fan");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+    assert_eq!(
+        h.read_pixel(600, 20),
+        BLACK,
+        "the padding vertices below the base vertex are not part of the fan",
     );
 }
 

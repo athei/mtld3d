@@ -20,7 +20,7 @@
 use core::ffi::c_void;
 
 use log::warn;
-use mtld3d_core::ff_state::FfStateSnapshot;
+use mtld3d_core::{ff_state::FfStateSnapshot, vs_draw::MAX_CLIP_PLANES};
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
     D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
@@ -87,6 +87,10 @@ pub enum StateOp {
     },
     Viewport(D3DVIEWPORT9),
     ScissorRect([u32; 4]),
+    ClipPlane {
+        index: u32,
+        plane: [f32; 4],
+    },
     Fvf(u32),
     Texture {
         stage: u32,
@@ -214,6 +218,9 @@ impl RecordingStateBlock {
                 }
                 StateOp::ScissorRect(r) => {
                     *r = dev.scissor_rect();
+                }
+                StateOp::ClipPlane { index, plane } => {
+                    *plane = dev.clip_plane(*index);
                 }
                 StateOp::Fvf(fvf) => {
                     *fvf = dev.fvf_field();
@@ -367,6 +374,9 @@ impl RecordingStateBlock {
                 }
                 StateOp::ScissorRect(r) => {
                     dev.set_scissor_rect(*r);
+                }
+                StateOp::ClipPlane { index, plane } => {
+                    dev.set_clip_plane(*index, *plane);
                 }
                 StateOp::Fvf(fvf) => {
                     dev.set_fvf_field(*fvf);
@@ -544,6 +554,11 @@ struct StateSnapshot {
     /// stream sources and frequencies belong to neither the vertex nor the
     /// pixel state group.
     streams: [StreamSnapshot; MAX_STREAMS as usize],
+    /// The user clip planes the GPU can apply.
+    ///
+    /// Restored by `D3DSBT_ALL` only, like the streams: D3D9 puts them in
+    /// neither the vertex nor the pixel state group.
+    clip_planes: [[f32; 4]; MAX_CLIP_PLANES],
     vs_constants: Box<[[f32; 4]; 256]>,
     ps_constants: Box<[[f32; 4]; 256]>,
     vs_constants_i: Box<[[i32; 4]; INT_CONSTANT_ROWS]>,
@@ -603,6 +618,9 @@ impl StateSnapshot {
             bound_vertex_decl,
             bound_index_buffer,
             streams,
+            clip_planes: core::array::from_fn(|i| {
+                dev.clip_plane(u32::try_from(i).expect("six planes fit u32"))
+            }),
             vs_constants: Box::new(dev.shader_bindings().vs_constants_copy()),
             ps_constants: Box::new(dev.shader_bindings().ps_constants_copy()),
             vs_constants_i: Box::new(dev.shader_bindings().vs_constants_i_copy()),
@@ -686,6 +704,9 @@ impl StateSnapshot {
             for (s, stream) in self.streams.iter().enumerate() {
                 bound.restore_stream(s, stream.vb.raw(), stream.offset, stream.stride);
                 bound.set_stream_freq(s, stream.freq);
+            }
+            for (i, plane) in self.clip_planes.iter().enumerate() {
+                dev.set_clip_plane(u32::try_from(i).expect("six planes fit u32"), *plane);
             }
         }
 

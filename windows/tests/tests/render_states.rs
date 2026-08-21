@@ -5,12 +5,12 @@
 use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8};
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
-    D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE,
-    D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND,
-    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_STENCILENABLE,
-    D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DSTENCILOP_KEEP,
-    D3DSTENCILOP_REPLACE, render_state_defaults,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCULL_CCW, D3DCULL_CW,
+    D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST,
+    D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE,
+    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND,
+    D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
+    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, render_state_defaults,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -504,5 +504,38 @@ fn stencil_clear_on_a_depth_only_surface_succeeds() {
         h.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0x7F),
         0,
         "combined depth+stencil clear"
+    );
+}
+
+/// A Clear issued after a draw, before any Present, must paint the whole target.
+///
+/// Inside a pass with draws the clear becomes a full-screen quad, and that
+/// quad is drawn under whatever cull mode the previous draw left; D3D's
+/// default `CULL_CCW` used to cull it whole, so the second scene rendered over
+/// the first one's leftovers instead of the clear colour (the reason a
+/// conformance point-size probe's background came out black).
+#[test]
+fn clear_after_a_draw_in_the_same_pass_is_not_culled() {
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let small = centered_triangle(GREEN);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene (first scene)");
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small), 0);
+    assert_eq!(h.end_scene(), 0, "EndScene (first scene)");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        0,
+        "Clear between the scenes"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small), 0);
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.read_pixel(320, 240), GREEN, "triangle at the centre");
+    assert_eq!(h.read_pixel(72, 64), BLUE, "background is the clear colour");
+    assert_eq!(
+        h.read_pixel(600, 400),
+        BLUE,
+        "background is the clear colour"
     );
 }
