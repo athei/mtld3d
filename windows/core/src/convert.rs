@@ -70,6 +70,26 @@ pub fn d3dcolor_to_rgba_f32(color: u32) -> [f32; 4] {
     ]
 }
 
+/// Apply the sRGB transfer function to the colour lanes of a normalised RGBA value.
+///
+/// `Clear` under `D3DRS_SRGBWRITEENABLE` stores the clear colour encoded
+/// exactly as a draw would store its pixel-shader output: the same OETF the
+/// pixel shader applies (`c <= 0.0031308 ? 12.92 c : 1.055 c^(1/2.4) - 0.055`),
+/// colour lanes only, alpha untouched. Lanes outside `[0, 1]` are clamped
+/// first, as the render target would clamp them.
+#[must_use]
+pub fn linear_to_srgb_rgba(rgba: [f32; 4]) -> [f32; 4] {
+    let encode = |c: f32| {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.003_130_8 {
+            12.92 * c
+        } else {
+            c.powf(1.0 / 2.4).mul_add(1.055, -0.055)
+        }
+    };
+    [encode(rgba[0]), encode(rgba[1]), encode(rgba[2]), rgba[3]]
+}
+
 /// Encode a D3DCOLOR into one pixel's destination-format bytes for `ColorFill`.
 ///
 /// Returns `None` for formats whose fill encoding isn't implemented yet (the
@@ -1042,6 +1062,25 @@ mod tests {
         assert_eq!(rgba[1].to_bits(), (f32::from(0x20u8) / 255.0).to_bits());
         assert_eq!(rgba[2].to_bits(), (f32::from(0x10u8) / 255.0).to_bits());
         assert_eq!(rgba[3].to_bits(), (f32::from(0x80u8) / 255.0).to_bits());
+    }
+
+    #[test]
+    fn linear_to_srgb_encodes_colour_lanes_only() {
+        // 0x7f linear stores as 0xbb once sRGB-encoded; alpha passes through.
+        let rgba = linear_to_srgb_rgba(d3dcolor_to_rgba_f32(0x407f_7f7f));
+        // The stored byte, as the exactly representable float it rounds to.
+        let to_byte = |v: f32| (v * 255.0).round().to_bits();
+        let byte = |b: u8| f32::from(b).to_bits();
+        assert_eq!(to_byte(rgba[0]), byte(0xbb));
+        assert_eq!(to_byte(rgba[1]), byte(0xbb));
+        assert_eq!(to_byte(rgba[2]), byte(0xbb));
+        assert_eq!(rgba[3].to_bits(), (f32::from(0x40u8) / 255.0).to_bits());
+        // The end points map onto themselves (to within a ulp at white), and
+        // an over-range lane clamps before encoding.
+        let ends = linear_to_srgb_rgba([0.0, 1.0, 2.0, 1.0]);
+        assert_eq!(ends[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(to_byte(ends[1]), byte(0xff));
+        assert_eq!(to_byte(ends[2]), byte(0xff));
     }
 
     #[test]

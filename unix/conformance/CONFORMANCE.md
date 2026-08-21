@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **17 `real` · 70 `expected` ·
+re-checked before retagging. Headline: **15 `real` · 70 `expected` ·
 1 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -231,7 +231,7 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (8 distinct defects behind the 14 sites)
+### The `real` backlog (7 distinct defects behind the 12 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
@@ -239,7 +239,6 @@ walk further):
 | TestCooperativeLevel: no DEVICENOTRESET latch after a failed Reset | test_reset | 1 |
 | IDirect3DVolume9::GetContainer does not return the parent volume texture | test_volume_get_container | 2 |
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
-| Clears ignore D3DRS_SRGBWRITEENABLE (draw path honors it) | clear_test | 2 |
 | ProcessVertices is an INVALIDCALL stub | test_sysmem_draw | 2 |
 | Depth→depth StretchRect is an S_OK no-op | depth_blit_test | 1 |
 | CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
@@ -400,16 +399,6 @@ sub-object, so the query fails. Reachable only now that VOLUMEMAP is
 advertised; intend-to-fix alongside the volume sub-object work.
 
 ### visual.c clusters
-
-### visual.c/clear_test
-Sites: 1473=real 1525=real
-
-With D3DRS_SRGBWRITEENABLE on, Clear(0x7f7f7f7f) must produce the
-sRGB-encoded 0xbbbbbb (asserted unconditionally; the CheckDeviceFormat
-probe above feeds only a trace). Our draw pipelines honor sRGB write, but
-the clear paths (loadAction fold and clear-quad) never consume it — we
-output raw 0x7f. Same root for both: 1473 backbuffer, 1525 offscreen RT.
-(Previously and inconsistently tagged caps/expected.)
 
 ### visual.c/z_range_test
 Sites: 3887=expected 3889=expected 3891=expected 3894=expected

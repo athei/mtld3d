@@ -83,8 +83,6 @@
   device.c:6210 count=1
   device.c:6211 count=1
 [i686/visual] crash=0
-  visual.c:1473 count=1
-  visual.c:1525 count=1
   visual.c:3887 count=1
   visual.c:3889 count=1
   visual.c:3891 count=1
@@ -197,8 +195,6 @@
   device.c:6210 count=1
   device.c:6211 count=1
 [x86_64/visual] crash=0
-  visual.c:1473 count=1
-  visual.c:1525 count=1
   visual.c:3887 count=1
   visual.c:3889 count=1
   visual.c:3891 count=1

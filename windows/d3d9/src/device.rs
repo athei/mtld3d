@@ -6737,7 +6737,14 @@ extern "system" fn device_clear(
     if flags & D3DCLEAR_TARGET != 0 {
         // D3DCOLOR is ARGB; unpack to normalized float bits so the encoder
         // can fold them into a Metal `MTLLoadAction::Clear` at pass-begin.
-        let rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
+        // D3DRS_SRGBWRITEENABLE applies to the clear colour exactly as it
+        // applies to a draw's output: the draw path encodes in the pixel
+        // shader, so the clear colour is encoded here before it reaches the
+        // load action or the clear quad.
+        let mut rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
+        if dev.render_state(D3DRS_SRGBWRITEENABLE as usize) != 0 {
+            rgba = mtld3d_core::convert::linear_to_srgb_rgba(rgba);
+        }
         let r_bits = f32::to_bits(rgba[0]);
         let g_bits = f32::to_bits(rgba[1]);
         let b_bits = f32::to_bits(rgba[2]);
