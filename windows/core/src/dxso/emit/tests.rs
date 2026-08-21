@@ -10,13 +10,10 @@
 use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 
 use super::{
-    emit::{
-        VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
-        emit_vs_programmable_named,
-    },
-    ir::TextureType,
-    parser::parse,
+    VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
+    emit_vs_programmable_named,
 };
+use crate::dxso::{ir::TextureType, parser::parse};
 
 const VS_HEADER: u32 = 0xFFFE_0200;
 const PS_HEADER: u32 = 0xFFFF_0200;
@@ -1492,7 +1489,7 @@ fn ps_sampler_index_8_emits_slot_8_binding_and_compiles() {
 
 #[test]
 fn fog_msl_compiles_under_metal() {
-    use super::ff::{FfPsKey, FfStage, emit_ps_ff};
+    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff};
     // Every fog blend shape through a real Metal compile: `precise::exp`,
     // the `in.position` fragcoord read, and the two-row `fog_data` binding
     // must all be valid MSL on both the FF and programmable PS emitters.
@@ -2786,7 +2783,7 @@ fn dp3_emits_plain_dot() {
 
 #[test]
 fn vertex_blend_msl_compiles_under_metal() {
-    use super::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // Exercise the three blend shapes through a real Metal compile so the
     // emitted code is syntactically and semantically valid MSL — same
     // discipline as `every_emitted_msl_compiles_under_metal` for the SM3
@@ -2831,7 +2828,7 @@ fn vertex_blend_msl_compiles_under_metal() {
 
 #[test]
 fn ff_vs_lit_specular_msl_compiles_under_metal() {
-    use super::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // Lit + specular + one directional, one point, and one spot light,
     // through a real Metal compile — covers the Blinn-Phong block, the
     // per-light specular-row reads, and the spot cone factor.
@@ -2863,7 +2860,7 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
 
 #[test]
 fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
-    use super::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
+    use crate::dxso::ff::{FfVsFlags, FfVsKey, emit_vs_ff};
     // Two enabled planes: the VS-only Varyings member carries two lanes (MSL
     // wants the attribute between the name and the dimension), the world
     // position comes back through the inverse view, and one distance is
@@ -2954,7 +2951,7 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
 
 #[test]
 fn ff_ps_specular_add_msl_compiles_under_metal() {
-    use super::ff::{FfPsKey, FfStage, emit_ps_ff};
+    use crate::dxso::ff::{FfPsKey, FfStage, emit_ps_ff};
     // End-of-cascade specular add plus a D3DTA_SPECULAR stage argument,
     // through a real Metal compile.
     let mut stages = [FfStage {

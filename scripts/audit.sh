@@ -92,6 +92,19 @@ doc_shape() {
     ' "$@"
 }
 
+# A `#[cfg(...test...)]` attribute directly above a braced `mod ... {` is an
+# inline test module. Tests belong in `<stem>/tests.rs` so that editing one
+# stops producing a diff against the production file it tests.
+inline_tests() {
+    awk '
+        FNR == 1 { attr = -1 }
+        /^#\[cfg\(.*test.*\)\]/ { attr = FNR; next }
+        attr == FNR - 1 && /^mod [A-Za-z_][A-Za-z0-9_]* \{/ {
+            printf "%s:%d: %s\n", FILENAME, FNR, $0
+        }
+    ' "$@"
+}
+
 # Every type deriving Clone and/or Copy, as `path Type Derives`. The committed
 # inventory is diffed against this, so a speculative derive cannot slip in
 # unnoticed: adding one means consciously recording it.
@@ -186,6 +199,11 @@ case "${1:-}" in
     findings=$(doc_shape "$file")
     [ -z "$findings" ] || report 'Doc comments' 'doc-comment shape' "$findings"
 
+    findings=$(inline_tests "$file")
+    [ -z "$findings" ] || report 'Unit tests live in <stem>/tests.rs' \
+        "inline test module: declare it as 'mod tests;' and move the body to $(dirname "$file")/$(basename "$file" .rs)/tests.rs" \
+        "$findings"
+
     banned 'pub\(crate\)' 'No pub(crate) — use module hierarchy' \
         'pub(crate) visibility' "$file"
     banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
@@ -219,6 +237,13 @@ findings=$(doc_shape "$@")
 if [ -n "$findings" ]; then
     report 'Doc comments' \
         "doc-comment shape: $(printf '%s\n' "$findings" | wc -l | tr -d ' ') findings" \
+        "$findings"
+fi
+
+findings=$(inline_tests "$@")
+if [ -n "$findings" ]; then
+    report 'Unit tests live in <stem>/tests.rs' \
+        "inline test module: declare it as 'mod tests;' and move the body to <stem>/tests.rs" \
         "$findings"
 fi
 

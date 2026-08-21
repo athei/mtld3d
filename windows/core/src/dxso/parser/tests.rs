@@ -4,13 +4,13 @@
 //! constants, swizzles, modifiers) and the error paths (unsupported
 //! versions, control flow, truncation).
 
-use super::{
+use super::parse;
+use crate::dxso::{
     ir::{
         DeclUsage, Declaration, DstMods, DxsoError, RegKind, ShaderType, SrcModifier, Swizzle,
         WriteMask,
     },
     opcode::Opcode,
-    parser::parse,
 };
 
 const VS_HEADER: u32 = 0xFFFE_0200;

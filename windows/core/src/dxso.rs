@@ -34,10 +34,3 @@ pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,
 };
 pub use parser::parse;
-
-#[cfg(test)]
-mod emit_tests;
-#[cfg(test)]
-mod ff_tests;
-#[cfg(test)]
-mod parser_tests;

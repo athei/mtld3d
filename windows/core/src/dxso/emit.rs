@@ -2697,3 +2697,6 @@ fn fmt_float(v: f32) -> String {
         format!("{s}.0")
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -8,7 +8,7 @@ unix/shared/src/commands.rs Command Clone,Copy
 unix/shared/src/commands.rs CommandType Clone,Copy,Debug,PartialEq,Eq,FromRepr
 unix/shared/src/commands.rs CopyBufferToTextureInfo Clone,Copy
 unix/shared/src/commands.rs NullTextureKind Clone,Copy,Debug,PartialEq,Eq,FromRepr
-unix/shared/src/ffi_boundary.rs Point Copy,Clone,Debug,PartialEq,Eq
+unix/shared/src/ffi_boundary/tests.rs Point Copy,Clone,Debug,PartialEq,Eq
 unix/shared/src/lib.rs Thunks Clone,Copy,EnumCount,VariantArray
 unix/shared/src/mtl.rs AddressMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BlendFactor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
