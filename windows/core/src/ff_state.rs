@@ -591,12 +591,12 @@ impl FfState {
         let bit = 1u8 << index;
         // D3D9: `LightEnable` on an undefined slot first creates a light with
         // the default directional parameters (white diffuse, direction +Z), so
-        // a subsequent `GetLight` reports those defaults. Only the FF lighting
-        // contribution (gated by `light_set_mask`) still requires an explicit
-        // `SetLight`, so this does not change rendering for enable-only lights.
+        // a subsequent `GetLight` reports those defaults AND the light lights
+        // the scene exactly as an explicit `SetLight` of the same parameters
+        // would. Route through `set_light` so the type masks that gate the FF
+        // contribution track the materialized light.
         if self.light_defined_mask & bit == 0 {
-            self.light_defined_mask |= bit;
-            self.lights[index] = Self::enable_default_light();
+            self.set_light(index, &Self::enable_default_light());
         }
         if enabled {
             self.light_enabled |= bit;
@@ -612,7 +612,7 @@ impl FfState {
 
     /// The light D3D9 materializes when `LightEnable` targets a slot with no `SetLight`.
     ///
-    /// White diffuse over the otherwise-zeroed `D3DLIGHT9` default.
+    /// White diffuse over the `D3DLIGHT9` default (directional, direction +Z).
     fn enable_default_light() -> D3DLIGHT9 {
         D3DLIGHT9 {
             diffuse: D3DCOLORVALUE {
@@ -2588,7 +2588,11 @@ mod tests {
         assert!(state.light_defined(4));
         assert_eq!(state.light(4).type_, D3DLIGHT_DIRECTIONAL);
         assert_eq!(state.light(4).diffuse.r.to_bits(), 1.0f32.to_bits());
-        // Enable-only does not feed FF lighting (no explicit SetLight).
+        // The materialized default light contributes like an explicit
+        // SetLight would: an enable-only light lights the scene.
+        assert_eq!(state.light_active_mask(), 1 << 4);
+        assert_eq!(state.light_directional_mask(), 1 << 4);
+        state.set_light_enabled(4, false);
         assert_eq!(state.light_active_mask(), 0);
 
         // SetLight defines a slot regardless of light type.

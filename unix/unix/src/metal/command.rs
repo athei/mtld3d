@@ -1256,7 +1256,7 @@ fn encode_leading_blits(
                         },
                         &dst,
                         0,
-                        cmd.mip_level as usize,
+                        cmd.dst_mip_level as usize,
                         MTLOrigin { x: dst_x, y: dst_y, z: 0 },
                     );
                 }

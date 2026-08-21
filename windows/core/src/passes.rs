@@ -2423,6 +2423,53 @@ impl PassState {
         self.current_color_format
     }
 
+    /// Open (or reuse) the pass for a depth/stencil `Clear` with explicit `pRects` sub-regions.
+    ///
+    /// The depth/stencil mirror of [`Self::begin_region_color_clear`]: a
+    /// rect-clear can never fold into a whole-attachment `loadAction =
+    /// Clear`, so a freshly opened pass loads both planes unless a pending
+    /// whole-attachment clear is due to land under the rect quads (which
+    /// `ensure_pass_open` has just turned into the load action, and which
+    /// must stay). A pass that was already open keeps its committed load
+    /// actions. The caller then paints one scissored clear-quad per clipped
+    /// rect. Returns whether the pass carries a colour attachment and its
+    /// format, which the quad pipeline key needs; `None` when no
+    /// depth-stencil is bound (nothing to clear).
+    pub fn begin_region_depth_stencil_clear(&mut self) -> Option<(bool, PixelFormat)> {
+        if self.current_depth_texture.is_null() {
+            return None;
+        }
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("region_depth_clear_vis");
+        }
+        let was_closed = self.current_pass_closed();
+        let had_pending_depth = self.pending_depth_clear.is_some();
+        let had_pending_stencil = self.pending_stencil_clear.is_some();
+        self.ensure_pass_open();
+        if was_closed && let Some(pass) = self.passes.last_mut() {
+            if !had_pending_depth
+                && matches!(
+                    pass.depth_load,
+                    DepthLoad::Clear { .. } | DepthLoad::DontCare
+                )
+            {
+                pass.depth_load = DepthLoad::Load;
+            }
+            if !had_pending_stencil
+                && matches!(
+                    pass.stencil_load,
+                    StencilLoad::Clear { .. } | StencilLoad::DontCare
+                )
+            {
+                pass.stencil_load = StencilLoad::Load;
+            }
+        }
+        Some((
+            !self.current_color_texture.is_null(),
+            self.current_color_format,
+        ))
+    }
+
     /// Apply a depth clear.
     ///
     /// Mirrors `clear_color` semantics for the depth attachment's load
@@ -2992,7 +3039,21 @@ impl PassState {
         if !ENABLE_NO_COLOR_PASS_FOR_DRAWS {
             return;
         }
-        for pass in &mut self.passes {
+        // Colour textures a later pass that keeps its colour attachment opens
+        // with `Load`: a colour clear-quad in an earlier pass is content they
+        // observe. Walked in reverse so a later pass that is itself stripped
+        // never counts as an observer.
+        let mut loaded_later: FxHashSet<MetalHandle<MTLTextureKind>> =
+            FxHashSet::with_capacity_and_hasher(4, FxBuildHasher);
+        for i in (0..self.passes.len()).rev() {
+            let pass = &self.passes[i];
+            let record_loads = |loaded_later: &mut FxHashSet<MetalHandle<MTLTextureKind>>| {
+                for attachment in pass.bound_color_attachments().iter() {
+                    if matches!(pass.color_load_of(attachment.slot), ColorLoad::Load) {
+                        loaded_later.insert(attachment.texture);
+                    }
+                }
+            };
             if pass.color_writes_observed
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
@@ -3003,6 +3064,7 @@ impl PassState {
                 // clear; a later Load pass would then read black.
                 || matches!(pass.color_load, ColorLoad::Clear { .. })
             {
+                record_loads(&mut loaded_later);
                 continue;
             }
             // Local copy so we can mutate `pass.commands` below while
@@ -3019,6 +3081,7 @@ impl PassState {
                         || c.cmd == CommandType::DrawIndexedPrimitives as u32)
             });
             if !has_real_draw {
+                record_loads(&mut loaded_later);
                 continue;
             }
             // Confirm every non-clear-quad SetPSO has a no-color sibling
@@ -3032,8 +3095,32 @@ impl PassState {
             if !all_resolvable {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "strip_color_from_no_color_draw_passes: side-map miss → keeping color attachment");
+                record_loads(&mut loaded_later);
                 continue;
             }
+            // The mask-0 draws write no colour, so dropping the attachment
+            // loses nothing of theirs. A colour clear-quad does write: it can
+            // only go when no one observes the colour texture afterwards. The
+            // back buffer is presented, a texture read back or sampled is
+            // seen, a later blit or sampler read sees it, and a later pass
+            // that keeps its colour attachment and loads it sees it (the
+            // cross-pass colour clear of a later frame region, for one).
+            if !cq_ranges.is_empty() {
+                let observed_later = pass.bound_color_attachments().iter().any(|attachment| {
+                    let tex = attachment.texture;
+                    tex == self.backbuffer_texture
+                        || self.seen_sampled_textures.contains(&tex)
+                        || loaded_later.contains(&tex)
+                        || self.passes[i + 1..]
+                            .iter()
+                            .any(|later| pass_reads_texture(later, tex))
+                });
+                if observed_later {
+                    record_loads(&mut loaded_later);
+                    continue;
+                }
+            }
+            let pass = &mut self.passes[i];
             // Rewrite non-clear-quad SetPSO handles to the no-color
             // variant. Clear-quad SetPSOs are about to be removed
             // wholesale, so leave them alone here.
@@ -4603,6 +4690,40 @@ mod tests {
             s.passes()[0].color_load(),
             ColorLoad::Clear { .. }
         ));
+    }
+
+    #[test]
+    fn region_depth_clear_as_first_touch_loads_instead_of_dontcare() {
+        // The depth mirror of `region_clear_as_first_touch_loads_instead_of_
+        // dontcare`: the rect quads cover only the rects, so the pass opens
+        // with `Load` on both planes.
+        let mut s = fresh();
+        let target = s.begin_region_depth_stencil_clear();
+        assert!(target.is_some());
+        assert_eq!(s.passes()[0].depth_load(), DepthLoad::Load);
+        assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
+    }
+
+    #[test]
+    fn region_depth_clear_after_pending_full_clear_keeps_the_clear() {
+        // `Clear(NULL, 1.0)` then `Clear(rects, 0.0)`: the pending whole-
+        // attachment depth clear lands under the rect quads.
+        let mut s = fresh();
+        let z = f32::to_bits(1.0);
+        s.clear_depth(z);
+        s.begin_region_depth_stencil_clear();
+        assert!(matches!(
+            s.passes()[0].depth_load(),
+            DepthLoad::Clear { value } if value == z
+        ));
+    }
+
+    #[test]
+    fn region_depth_clear_without_depth_attachment_is_noop() {
+        let mut s = fresh();
+        s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+        assert!(s.begin_region_depth_stencil_clear().is_none());
+        assert!(s.passes().is_empty());
     }
 
     #[test]
@@ -6462,6 +6583,72 @@ mod tests {
     }
 
     #[test]
+    fn rule_h_keeps_back_buffer_color_clear_quad_beside_zero_mask_draws() {
+        const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
+        // A cross-pass colour clear-quad on the back buffer shares a pass with
+        // a zero-mask draw (a depth clear-quad, say). The back buffer is
+        // presented, so the clear is observable and the pass keeps its colour.
+        let mut s = fresh();
+        let start = s.open_color_clear_quad_block();
+        s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+        s.note_draw_color_write_mask(0);
+        s.emit_command(set_pso(PSO_WITH));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        let mut alt = FxHashMap::default();
+        alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+        s.strip_color_from_no_color_draw_passes(&alt);
+        let pass = &s.passes()[0];
+        assert_eq!(pass.color_texture(), backbuffer(), "colour kept");
+        assert_eq!(pass.color_clear_quad_ranges().len(), 1);
+    }
+
+    #[test]
+    fn rule_h_keeps_color_clear_quad_a_later_pass_loads() {
+        const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
+        // Pass 0 clears an offscreen target with a colour clear-quad beside
+        // zero-mask draws; pass 1 reattaches the target with `Load` and draws
+        // colour, so it observes the clear. Pass 0 keeps its colour; a third
+        // pass of pure zero-mask draws on the target, loading it but stripped
+        // itself, is not an observer.
+        let mut s = fresh();
+        let atlas = tex(0x3000);
+        s.set_color_render_target(atlas, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        let start = s.open_color_clear_quad_block();
+        s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+        s.note_draw_color_write_mask(0);
+        s.emit_command(set_pso(PSO_WITH));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.note_draw_color_write_mask(0xF);
+        s.emit_command(set_pso(PSO_WITH));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.note_draw_color_write_mask(0);
+        s.emit_command(set_pso(PSO_WITH));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        let mut alt = FxHashMap::default();
+        alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+        s.strip_color_from_no_color_draw_passes(&alt);
+        assert_eq!(s.passes()[0].color_texture(), atlas, "observed clear kept");
+        assert_eq!(
+            s.passes()[1].color_texture(),
+            atlas,
+            "colour-writing pass kept"
+        );
+        assert_eq!(
+            s.passes()[2].color_texture(),
+            MetalHandle::NULL,
+            "trailing zero-mask pass stripped"
+        );
+    }
+
+    #[test]
     fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad() {
         const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
         // Cascade caster pass shape: WoW issued mid-pass `Clear` on
@@ -6470,8 +6657,10 @@ mod tests {
         // of the pass is zero-mask caster draws. Rule H must strip
         // the color attachment AND drain the clear-quad's commands so
         // the resulting depth-only descriptor doesn't try to bind a
-        // color-output clear-quad pipeline.
+        // color-output clear-quad pipeline. The atlas is a texture of its
+        // own that nothing later in the frame observes.
         let mut s = fresh();
+        s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         // Color clear-quad block — 6 commands, none of which should
         // tag `color_writes_observed`.
         let start = s.open_color_clear_quad_block();

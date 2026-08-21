@@ -60,6 +60,22 @@ pub const IID_IDIRECT3DCUBETEXTURE9: Guid = Guid {
     data4: [0x92, 0x23, 0x93, 0xD6, 0x52, 0xAB, 0xA9, 0x3F],
 };
 
+/// `IID_IDirect3DVolumeTexture9`: `{2518526C-E789-4111-A7B9-47EF328D13E6}`.
+pub const IID_IDIRECT3DVOLUMETEXTURE9: Guid = Guid {
+    data1: 0x2518_526C,
+    data2: 0xE789,
+    data3: 0x4111,
+    data4: [0xA7, 0xB9, 0x47, 0xEF, 0x32, 0x8D, 0x13, 0xE6],
+};
+
+/// `IID_IDirect3DVolume9`: `{24F416E6-1F67-4AA7-B88E-D33F6F3128A1}`.
+pub const IID_IDIRECT3DVOLUME9: Guid = Guid {
+    data1: 0x24F4_16E6,
+    data2: 0x1F67,
+    data3: 0x4AA7,
+    data4: [0xB8, 0x8E, 0xD3, 0x3F, 0x6F, 0x31, 0x28, 0xA1],
+};
+
 /// `SetPrivateData` flag: the data pointer is an `IUnknown*`.
 ///
 /// The runtime `AddRef`s on store and `Release`s on overwrite/free/destroy.

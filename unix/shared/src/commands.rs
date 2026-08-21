@@ -547,6 +547,14 @@ pub struct BlitCommand {
     ///
     /// Unused (0) for the other command types.
     pub bytes_per_image: u32,
+    /// Destination mip level for `CopyTextureToTexture`.
+    ///
+    /// `mip_level` is the source level; a texture-to-texture copy may land on a
+    /// different level of the destination. Unused (0) for the other command
+    /// types.
+    pub dst_mip_level: u32,
+    /// Explicit tail padding to the 8-byte stride.
+    pub pad0: u32,
 }
 
 /// Inputs for `BlitCommand::copy_buffer_to_texture`.
@@ -603,6 +611,8 @@ impl BlitCommand {
             byte_size: 0,
             depth: info.depth,
             bytes_per_image: info.bytes_per_image,
+            dst_mip_level: 0,
+            pad0: 0,
         }
     }
 
@@ -635,6 +645,8 @@ impl BlitCommand {
             byte_size: 0,
             depth: 0,
             bytes_per_image: 0,
+            dst_mip_level: mip_level,
+            pad0: 0,
         }
     }
 
@@ -642,7 +654,7 @@ impl BlitCommand {
     ///
     /// `blit.copyFromTexture(src, sourceSlice: 0, level: mip, origin:
     /// (src_x, src_y, 0), size: (w, h, 1), toTexture: dst, destSlice: 0,
-    /// level: mip, origin: (dst_x, dst_y, 0))`. Used by
+    /// level: dst_mip, origin: (dst_x, dst_y, 0))`. Used by
     /// `IDirect3DDevice9::StretchRect` for 1:1 same-format copies
     /// between two textures (scaling is not supported).
     #[must_use]
@@ -662,6 +674,8 @@ impl BlitCommand {
             byte_size: 0,
             depth: 0,
             bytes_per_image: 0,
+            dst_mip_level: info.dst_mip_level,
+            pad0: 0,
         }
     }
 
@@ -687,6 +701,8 @@ impl BlitCommand {
             byte_size: info.byte_size,
             depth: 0,
             bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
         }
     }
 
@@ -712,6 +728,8 @@ impl BlitCommand {
             byte_size: length,
             depth: 0,
             bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
         }
     }
 
@@ -739,6 +757,8 @@ impl BlitCommand {
             byte_size: 0,
             depth: 0,
             bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
         }
     }
 }
@@ -759,7 +779,10 @@ pub struct CopyBufferToBufferInfo {
 pub struct CopyTextureSubRectInfo {
     pub src_texture: u64,
     pub dst_texture: u64,
+    /// Source mip level.
     pub mip_level: u32,
+    /// Destination mip level.
+    pub dst_mip_level: u32,
     pub src_origin_x: u32,
     pub src_origin_y: u32,
     pub dst_origin_x: u32,
@@ -877,8 +900,8 @@ mod tests {
         // 4 cmd + 4 mip_level + 8 src_handle + 8 dst_handle + 8
         // src_offset + 8 bytes_per_row + 4 origin_x + 4 origin_y +
         // 4 region_w + 4 region_h + 8 dst_offset + 8 byte_size +
-        // 4 depth + 4 bytes_per_image = 80
-        assert_eq!(core::mem::size_of::<BlitCommand>(), 80);
+        // 4 depth + 4 bytes_per_image + 4 dst_mip_level + 4 pad0 = 88
+        assert_eq!(core::mem::size_of::<BlitCommand>(), 88);
     }
 
     #[test]
@@ -946,7 +969,7 @@ mod tests {
             bytes_per_image: 64,
         });
         assert_eq!(cmd.dst_offset, 5);
-        assert_eq!(core::mem::size_of_val(&cmd), 80);
+        assert_eq!(core::mem::size_of_val(&cmd), 88);
     }
 
     #[test]
@@ -1019,6 +1042,7 @@ mod tests {
             src_texture: 0xAAAA,
             dst_texture: 0xBBBB,
             mip_level: 2,
+            dst_mip_level: 1,
             src_origin_x: 16,
             src_origin_y: 32,
             dst_origin_x: 100,
@@ -1030,6 +1054,7 @@ mod tests {
         assert_eq!(cmd.src_handle, 0xAAAA);
         assert_eq!(cmd.dst_handle, 0xBBBB);
         assert_eq!(cmd.mip_level, 2);
+        assert_eq!(cmd.dst_mip_level, 1);
         assert_eq!(cmd.origin_x, 16);
         assert_eq!(cmd.origin_y, 32);
         assert_eq!(cmd.region_w, 64);

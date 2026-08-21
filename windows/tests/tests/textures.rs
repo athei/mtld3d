@@ -7,10 +7,10 @@ use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -316,6 +316,58 @@ fn cube_textures_create_in_all_pools() {
         0,
         "CreateVolumeTexture succeeds",
     );
+}
+
+#[test]
+fn volume_texture_pool_usage_and_lock_rules() {
+    // DYNAMIC is a DEFAULT/SYSTEMMEM-pool property; a DEFAULT-pool volume is
+    // lockable only when DYNAMIC; the other pools always lock.
+    let h = Harness::new();
+    for (pool, usage, create_hr, lock_hr) in [
+        (D3DPOOL_DEFAULT, 0, 0, D3DERR_INVALIDCALL),
+        (D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, 0, 0),
+        (D3DPOOL_SYSTEMMEM, 0, 0, 0),
+        (D3DPOOL_SYSTEMMEM, D3DUSAGE_DYNAMIC, 0, 0),
+        (D3DPOOL_MANAGED, 0, 0, 0),
+        (D3DPOOL_MANAGED, D3DUSAGE_DYNAMIC, D3DERR_INVALIDCALL, 0),
+        (D3DPOOL_SCRATCH, 0, 0, 0),
+        (D3DPOOL_SCRATCH, D3DUSAGE_DYNAMIC, D3DERR_INVALIDCALL, 0),
+    ] {
+        let (hr, texture) = h.try_create_volume_texture([4, 4, 4], 1, usage, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(hr, create_hr, "create pool={pool} usage={usage:#x}");
+        let Some(texture) = texture else {
+            continue;
+        };
+        let (hr, bits_null) = texture.lock_box_probe(0, 0);
+        assert_eq!(hr, lock_hr, "lock pool={pool} usage={usage:#x}");
+        if lock_hr == 0 {
+            assert!(!bits_null, "a successful lock hands out a pointer");
+            assert_eq!(texture.unlock_box(0), 0, "unlock pool={pool}");
+        } else {
+            assert!(bits_null, "a rejected lock leaves pBits null");
+        }
+    }
+}
+
+#[test]
+fn volume_texture_level_desc_walks_the_chain() {
+    let h = Harness::new();
+    let (hr, texture) =
+        h.try_create_volume_texture([2, 4, 8], 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0);
+    let texture = texture.expect("volume texture");
+    let (hr, desc) = texture.level_desc(0);
+    assert_eq!(hr, 0, "GetLevelDesc(0)");
+    assert_eq!(desc.resource_type, D3DRTYPE_VOLUME);
+    assert_eq!((desc.width, desc.height, desc.depth), (2, 4, 8));
+    assert_eq!(desc.format, D3DFMT_A8R8G8B8);
+    assert_eq!(desc.pool, D3DPOOL_SYSTEMMEM);
+    assert_eq!(desc.usage, 0);
+    let (hr, desc) = texture.level_desc(2);
+    assert_eq!(hr, 0, "GetLevelDesc(2)");
+    assert_eq!((desc.width, desc.height, desc.depth), (1, 1, 2));
+    let (hr, _) = texture.level_desc(4);
+    assert_eq!(hr, D3DERR_INVALIDCALL, "level past the chain");
 }
 
 #[test]

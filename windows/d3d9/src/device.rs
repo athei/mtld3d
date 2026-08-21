@@ -1,7 +1,7 @@
 use core::{ffi::c_void, mem::MaybeUninit, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use log::{debug, error, info, trace, warn};
@@ -276,6 +276,12 @@ bitflags::bitflags! {
         /// `EndScene` without an open scene both return `D3DERR_INVALIDCALL`.
         /// Rendering does not otherwise depend on scene state.
         const IN_SCENE = 1 << 1;
+        /// Set by a `Reset` that failed after validating its parameters.
+        ///
+        /// `TestCooperativeLevel` reports `D3DERR_DEVICENOTRESET` until a
+        /// later `Reset` succeeds, which is how an app learns it must retry
+        /// (after releasing the `D3DPOOL_DEFAULT` resources that blocked it).
+        const NOT_RESET = 1 << 2;
     }
 }
 
@@ -414,6 +420,13 @@ pub struct DeviceInner {
     /// `VRAM_BUDGET - this`, so the value visibly decreases as the app
     /// allocates GPU resources.
     vram_bytes_used: Arc<AtomicU64>,
+    /// Number of `D3DPOOL_DEFAULT` resources and implicit surfaces the app holds a reference to.
+    ///
+    /// Maintained by the COM engine on each such object's public 0↔1
+    /// refcount edge (`ComChild::blocks_reset_while_referenced`); the
+    /// device's own bind slots never count. `Reset` fails with
+    /// `D3DERR_INVALIDCALL` while it is non-zero, as D3D9 requires.
+    outstanding_reset_blockers: AtomicU32,
     /// Monotonic submit seq.
     ///
     /// Each `present()` bumps this before stamping it onto the outgoing
@@ -2159,6 +2172,7 @@ impl Direct3DDevice9 {
             upload_coherent_seq,
             vbib_retained_bytes,
             vram_bytes_used: Arc::new(AtomicU64::new(0)),
+            outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.
             current_seq: 1,
             perf: ApiPerfState::new(),
@@ -2803,6 +2817,29 @@ pub fn device_wrapper_add_ref(wrapper: *mut c_void) {
     unsafe { (*wrapper.cast::<Direct3DDevice9>()).add_ref_self() };
 }
 
+/// Record that the app acquired (`true`) or dropped (`false`) its reference to a `Reset` blocker.
+///
+/// Fired by the COM engine on the public 0↔1 edge of a child whose
+/// `blocks_reset_while_referenced` is set; `wrapper` is that child's
+/// forwarding device (null when the child has none, a no-op).
+pub fn device_wrapper_note_reset_blocker(wrapper: *mut c_void, acquired: bool) {
+    if wrapper.is_null() {
+        return;
+    }
+    // SAFETY: `wrapper` is the live `Direct3DDevice9` that owns the forwarding
+    // child; the counter is atomic, so a shared borrow suffices.
+    let counter = unsafe {
+        &(*wrapper.cast::<Direct3DDevice9>())
+            .inner()
+            .outstanding_reset_blockers
+    };
+    if acquired {
+        counter.fetch_add(1, Ordering::AcqRel);
+    } else {
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Forward an implicit child object's `Release` to its owning device wrapper.
 ///
 /// Fires on the child's 1→0 transition. Counterpart to
@@ -2834,7 +2871,16 @@ struct ParentIUnknownVtbl {
 
 extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    0 // S_OK
+    // The device is never lost (no exclusive mode is ever taken), so the only
+    // non-OK answer is the latch a failed `Reset` leaves behind.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let not_reset = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        .is_some_and(|obj| obj.inner().flags.contains(DeviceFlags::NOT_RESET));
+    if not_reset {
+        mtld3d_types::D3DERR_DEVICENOTRESET
+    } else {
+        D3D_OK
+    }
 }
 
 extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
@@ -3094,6 +3140,20 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return D3DERR_INVALIDCALL;
+    }
+    // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
+    // resource or an implicit surface: those are backed by the device memory
+    // the Reset recreates, and D3D9 makes the app release them first. The
+    // device's own bindings do not count (they are reset below on success).
+    let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
+    if blockers != 0 {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset — {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still referenced",
+        );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
     // Window transition first, then size against the window it produced: a
@@ -3124,6 +3184,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}, fmt={}) — zero-dim present params",
             pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
         );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
 
@@ -3156,6 +3217,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp) {
+            dev.flags.insert(DeviceFlags::NOT_RESET);
             return hr;
         }
     } else {
@@ -3170,6 +3232,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
+            dev.flags.insert(DeviceFlags::NOT_RESET);
             return hr;
         }
         debug!(
@@ -3193,6 +3256,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // 7. Reset device state to D3D9 defaults. Cursor + silent-write
     //    warn latches survive (per-spec / process-lifetime telemetry).
     dev.reset_to_defaults();
+    dev.flags.remove(DeviceFlags::NOT_RESET);
 
     // 8. Reseed `current_frame` so it carries the new backbuffer/depth
     //    handles. The post-flush frame still referenced the destroyed
@@ -3986,6 +4050,12 @@ extern "system" fn device_create_volume_texture(
             | D3DUSAGE_AUTOGENMIPMAP)
         != 0
     {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
+    // D3DUSAGE_DYNAMIC is a DEFAULT/SYSTEMMEM-pool property: the managed pool
+    // and the scratch pool reject it.
+    if usage & D3DUSAGE_DYNAMIC != 0 && matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SCRATCH) {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -5204,12 +5274,27 @@ extern "system" fn device_stretch_rect(
             );
             return D3DERR_INVALIDCALL;
         }
-        // The HR contract (a valid full-surface depth→depth StretchRect succeeds)
-        // is honoured, but the actual GPU depth copy is a no-op here: a raw
-        // copyFromTexture between the two Private depth textures does not survive
-        // to the conformance depth read-back on this backend (the bound-DS pass
-        // reloads/clears the attachment), so emitting it produces a WRONG result.
-        // WoW does not StretchRect depth surfaces, so the no-op is inert.
+        // Same-format Private→Private depth copy on the 1:1 blit path. The
+        // blit is entered into the load/store model like a colour copy: the
+        // source counts as read (its last pass keeps its depth store) and the
+        // destination counts as blit-written (its next pass loads rather than
+        // discards), and a clear still waiting for a pass on either endpoint
+        // is materialized before the copy.
+        let mip_level = src_info.mip_level;
+        dev.push_op(Box::new(move |enc| {
+            emit_stretch_rect_blit(
+                enc,
+                &src_info,
+                &dst_info,
+                &StretchBlitParams {
+                    src_region,
+                    dst_region,
+                    mip_level,
+                    render_quad: false,
+                    filter,
+                },
+            );
+        }));
         return D3D_OK;
     }
 
@@ -5686,6 +5771,7 @@ fn emit_stretch_rect_blit(
                 src_texture: src_handle,
                 dst_texture: dst_handle,
                 mip_level,
+                dst_mip_level: dst_info.mip_level,
                 src_origin_x: src_region.x,
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
@@ -5721,11 +5807,13 @@ fn emit_stretch_rect_blit(
                 handle: src_handle,
                 rect: src_region,
                 dims: src_dims,
+                mip: src_info.mip_level,
             },
             &BlitSide {
                 handle: dst_handle,
                 rect: dst_region,
                 dims: dst_dims,
+                mip: dst_info.mip_level,
             },
             dst_format,
             filter,
@@ -5744,6 +5832,7 @@ fn emit_stretch_rect_blit(
             src_texture: src_handle,
             dst_texture: dst_handle,
             mip_level,
+            dst_mip_level: dst_info.mip_level,
             src_origin_x: src_region.x,
             src_origin_y: src_region.y,
             dst_origin_x: dst_region.x,
@@ -6734,90 +6823,114 @@ extern "system" fn device_clear(
         return D3DERR_INVALIDCALL;
     }
 
+    // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
+    // region is additionally clipped to the (non-degenerate) device scissor
+    // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
+    // `scissor_rect()` is stored as [x, y, width, height]; convert to the
+    // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
+    let s = dev.scissor_rect(); // [x, y, width, height]
+    let scissor_on =
+        dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
+    let scissor = (
+        s[0].cast_signed(),
+        s[1].cast_signed(),
+        s[0].saturating_add(s[2]).cast_signed(),
+        s[1].saturating_add(s[3]).cast_signed(),
+    );
+
+    // D3D9 Clear's pRects/Count semantics, shared by every plane:
+    //  - pRects == NULL  → clear the whole target (Count ignored). With the
+    //    scissor on, whole target ∩ scissor == the scissor rect.
+    //  - pRects != NULL, Count == 0 → clear NOTHING (a no-op).
+    //  - pRects != NULL, Count >  0 → clear each rect (∩ scissor if on).
+    // `None` is the whole target; `Some` is an explicit list, already clipped
+    // to the scissor and possibly empty.
+    let regions: Option<Vec<(i32, i32, i32, i32)>> = if rects.is_null() {
+        scissor_on.then(|| vec![scissor])
+    } else {
+        let mut list = if count > 0 {
+            clear_target_rects(count, rects)
+        } else {
+            Vec::new()
+        };
+        if scissor_on {
+            list.retain_mut(|r| {
+                intersect_d3d_rects(*r, scissor).is_some_and(|clipped| {
+                    *r = clipped;
+                    true
+                })
+            });
+        }
+        Some(list)
+    };
+
     if flags & D3DCLEAR_TARGET != 0 {
         // D3DCOLOR is ARGB; unpack to normalized float bits so the encoder
         // can fold them into a Metal `MTLLoadAction::Clear` at pass-begin.
-        let rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
+        // D3DRS_SRGBWRITEENABLE applies to the clear colour exactly as it
+        // applies to a draw's output: the draw path encodes in the pixel
+        // shader, so the clear colour is encoded here before it reaches the
+        // load action or the clear quad.
+        let mut rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
+        if dev.render_state(D3DRS_SRGBWRITEENABLE as usize) != 0 {
+            rgba = mtld3d_core::convert::linear_to_srgb_rgba(rgba);
+        }
         let r_bits = f32::to_bits(rgba[0]);
         let g_bits = f32::to_bits(rgba[1]);
         let b_bits = f32::to_bits(rgba[2]);
         let a_bits = f32::to_bits(rgba[3]);
 
-        // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
-        // region is additionally clipped to the (non-degenerate) device scissor
-        // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
-        // `scissor_rect()` is stored as [x, y, width, height]; convert to the
-        // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
-        let s = dev.scissor_rect(); // [x, y, width, height]
-        let scissor_on =
-            dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
-        let scissor = (
-            s[0].cast_signed(),
-            s[1].cast_signed(),
-            s[0].saturating_add(s[2]).cast_signed(),
-            s[1].saturating_add(s[3]).cast_signed(),
-        );
-
-        // D3D9 Clear's pRects/Count semantics:
-        //  - pRects == NULL  → clear the whole target (Count ignored). With the
-        //    scissor on, whole target ∩ scissor == the scissor rect.
-        //  - pRects != NULL, Count == 0 → clear NOTHING (a no-op).
-        //  - pRects != NULL, Count >  0 → clear each rect (∩ scissor if on).
         // A combined TARGET|ZBUFFER clear keeps both attachments on the fold
         // path (whole-attachment loadAction); only a colour-ONLY Clear(NULL)
         // honours viewport bounding via a scissored clear-quad, so the depth
         // side is never forced onto the (state-sensitive) clear-quad path.
         let color_only = flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) == 0;
-        if rects.is_null() {
-            if scissor_on {
-                let rects = vec![scissor];
+        match &regions {
+            None if color_only => dev.push_op(Box::new(move |enc| {
+                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
+            })),
+            None => dev.push_op(Box::new(move |enc| {
+                enc.clear_color(r_bits, g_bits, b_bits, a_bits);
+            })),
+            Some(list) if list.is_empty() => {}
+            Some(list) => {
+                let rects = list.clone();
                 dev.push_op(Box::new(move |enc| {
                     enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, &rects);
                 }));
-            } else if color_only {
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
-                }));
-            } else {
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_color(r_bits, g_bits, b_bits, a_bits);
-                }));
             }
-        } else if count > 0 {
-            let mut rects = clear_target_rects(count, rects);
-            if scissor_on {
-                rects.retain_mut(|r| {
-                    intersect_d3d_rects(*r, scissor).is_some_and(|clipped| {
-                        *r = clipped;
-                        true
-                    })
-                });
-            }
-            dev.push_op(Box::new(move |enc| {
-                enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, &rects);
-            }));
         }
     }
 
     let z_bits = f32::to_bits(z);
     // D3D9 passes the stencil clear as a DWORD; the attachment is 8-bit.
     let stencil = stencil & mtld3d_core::depth_stencil_state::STENCIL_MASK_BITS;
-    let clear_z = flags & D3DCLEAR_ZBUFFER != 0;
-    let clear_s = flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil();
-    match (clear_z, clear_s) {
+    let depth_plane = (flags & D3DCLEAR_ZBUFFER != 0).then_some(z_bits);
+    let stencil_plane =
+        (flags & D3DCLEAR_STENCIL != 0 && dev.depth_stencil_has_stencil()).then_some(stencil);
+    match (regions, depth_plane, stencil_plane) {
+        (_, None, None) => {}
+        // Explicit regions (or the scissor) bound the depth/stencil clear
+        // exactly as they bound the colour clear: one scissored quad per rect.
+        (Some(list), depth, stencil) => {
+            if !list.is_empty() {
+                dev.push_op(Box::new(move |enc| {
+                    enc.clear_depth_stencil_rects(depth, stencil, &list);
+                }));
+            }
+        }
         // Both planes in one op so a mid-frame clear paints one quad:
         // shadow-volume renderers clear depth and stencil together between
         // lights.
-        (true, true) => dev.push_op(Box::new(move |enc| {
+        (None, Some(z_bits), Some(stencil)) => dev.push_op(Box::new(move |enc| {
             enc.clear_depth_stencil(z_bits, stencil);
         })),
-        (true, false) => dev.push_op(Box::new(move |enc| {
+        (None, Some(z_bits), None) => dev.push_op(Box::new(move |enc| {
             enc.clear_depth(z_bits);
         })),
-        (false, true) => dev.push_op(Box::new(move |enc| {
+        (None, None, Some(stencil)) => dev.push_op(Box::new(move |enc| {
             enc.clear_stencil(stencil);
         })),
-        (false, false) => {}
     }
 
     0 // S_OK
@@ -8899,16 +9012,98 @@ extern "system" fn device_draw_indexed_primitive_up(
 
 extern "system" fn device_process_vertices(
     this: *mut c_void,
-    _src_start: u32,
-    _dst_index: u32,
-    _count: u32,
-    _dst_buffer: *mut c_void,
-    _decl: *mut c_void,
+    src_start: u32,
+    dst_index: u32,
+    count: u32,
+    dst_buffer: *mut c_void,
+    decl: *mut c_void,
     _flags: u32,
 ) -> i32 {
+    use crate::vertex_buffer::Direct3DVertexBuffer9;
+
     let _timer = device_timer(this, DeviceSubCategory::Draws);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::ProcessVertices → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    if dst_buffer.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // A vertex declaration source (as opposed to the current FVF) is not
+    // implemented; software vertex processing is a conformance-only path.
+    if !decl.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices with an explicit vertex declaration is unimplemented → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let dev = obj.inner();
+
+    // The source is stream 0 read through the device's current FVF.
+    let src_vb = dev.bound_buffers().stream_vertex_buffer(0);
+    if src_vb.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices with no stream-0 vertex buffer bound → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let src_fvf = dev.fvf_field();
+    let src_stream_offset = dev.bound_buffers().stream_offset(0);
+    let src_stride = dev.bound_buffers().stream_stride(0);
+    let wvp = dev.ff_state().world_view_projection();
+    let viewport = dev.viewport();
+
+    // SAFETY: `src_vb` is a live bound `Direct3DVertexBuffer9` (non-null
+    // checked); the bound-slot reference keeps it alive for this call.
+    let src_inner = unsafe { (*src_vb).inner() };
+    let src_bytes = src_inner.backing();
+    let first = (src_stream_offset + src_start.saturating_mul(src_stride)) as usize;
+    if first > src_bytes.len() {
+        return D3DERR_INVALIDCALL;
+    }
+
+    // SAFETY: `dst_buffer` is a live `Direct3DVertexBuffer9*` per the D3D9 ABI;
+    // it is distinct from `src_vb` (the source is a bound stream, the
+    // destination a caller-owned buffer) so the two borrows do not alias.
+    let dst_obj = unsafe { &mut *dst_buffer.cast::<Direct3DVertexBuffer9>() };
+    let dst_fvf = dst_obj.inner().fvf();
+
+    let processed = mtld3d_core::process_vertices::process_vertices(
+        &mtld3d_core::process_vertices::ProcessVerticesRequest {
+            src: &src_bytes[first..],
+            src_stride,
+            src_fvf,
+            dst_fvf,
+            count,
+            wvp,
+            viewport,
+        },
+    );
+    let Some(processed) = processed else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices: destination FVF {dst_fvf:#x} has no transformed position or the \
+             source is too short → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    if mtld3d_core::process_vertices::dst_wants_shaded_output(dst_fvf)
+        && dev.render_state(D3DRS_LIGHTING as usize) != 0
+    {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices does not run software lighting; the destination colour is the \
+             source colour passed through"
+        );
+    }
+    let (_, dst_stride) = mtld3d_core::convert::fvf_to_elements(dst_fvf);
+    let dst_offset = (dst_index.saturating_mul(dst_stride)) as usize;
+    dst_obj
+        .inner_mut()
+        .write_processed(dst_offset, &processed, dev);
+    D3D_OK
 }
 
 extern "system" fn device_create_vertex_declaration(

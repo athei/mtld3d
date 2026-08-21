@@ -370,8 +370,30 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
     emit_varyings(&mut out, false);
+    if vs_key.lighting_enabled() && vs_key.has_normal() {
+        emit_normal_matrix_helpers(&mut out);
+    }
     emit_vs(&mut out, vs_key, entry);
     out
+}
+
+/// Emit the generalised cross product the lit FF VS builds its normal matrix from.
+///
+/// `mtld3d_cross4(u, v, w)` is the 4-vector `x` with `dot(x, t) ==
+/// det(float4x4(u, v, w, t))` for every `t` (the columns in that order), so it
+/// is orthogonal to `u`, `v` and `w`. Rows of the adjugate of a 4x4 matrix are
+/// these products of its columns, which is how the VS gets the upper-left 3x3
+/// block of `inverse(WV)` without a matrix inverse (Metal has none).
+fn emit_normal_matrix_helpers(out: &mut String) {
+    out.push_str("static inline float mtld3d_det3(float3 a, float3 b, float3 c) {\n");
+    out.push_str("    return dot(a, cross(b, c));\n");
+    out.push_str("}\n\n");
+    out.push_str("static inline float4 mtld3d_cross4(float4 u, float4 v, float4 w) {\n");
+    out.push_str("    return float4(-mtld3d_det3(u.yzw, v.yzw, w.yzw),\n");
+    out.push_str("                   mtld3d_det3(u.xzw, v.xzw, w.xzw),\n");
+    out.push_str("                  -mtld3d_det3(u.xyw, v.xyw, w.xyw),\n");
+    out.push_str("                   mtld3d_det3(u.xyz, v.xyz, w.xyz));\n");
+    out.push_str("}\n\n");
 }
 
 #[must_use]
@@ -847,29 +869,29 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             // including translation.
             out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
             if has_n {
-                // The eye normal is transformed by the D3D9 normal matrix so a
-                // non-orthonormal world (scale/shear) scales the normal magnitude
-                // correctly. `vs_c[0..2].xyz` are the WV columns (rows of
-                // transpose(WV)); the cofactor cross-products of THOSE vectors over
-                // the determinant form the normal matrix — for a pure rotation R it
-                // reduces to R·n (the same direction the old normalize(WV·n) gave),
-                // and for a uniform scale s to R·n / s. Feeding the transposed
-                // components (vs_c[0].x, vs_c[1].x, …) instead would transpose the
-                // matrix and apply the inverse rotation, making lighting swim as the
-                // camera turns. Computed inline to avoid a separate constant slot.
-                // D3D9 only renormalizes when D3DRS_NORMALIZENORMALS is set, so an
-                // un-renormalized non-unit model normal otherwise scales the lighting.
-                out.push_str("    float3 wvr0 = vs_c[0].xyz;\n");
-                out.push_str("    float3 wvr1 = vs_c[1].xyz;\n");
-                out.push_str("    float3 wvr2 = vs_c[2].xyz;\n");
-                out.push_str("    float3 ncof0 = cross(wvr1, wvr2);\n");
-                out.push_str("    float3 ncof1 = cross(wvr2, wvr0);\n");
-                out.push_str("    float3 ncof2 = cross(wvr0, wvr1);\n");
-                out.push_str("    float nwvdet = dot(wvr0, ncof0);\n");
-                // normal matrix has rows cof_i / det ⇒ (N × n)_i = dot(cof_i, n) / det.
+                // The eye normal is the model normal (a column vector) times
+                // the D3D9 normal matrix: the upper-left 3x3 block of
+                // inverse(WV). For an affine WV that is the inverse of its
+                // own 3x3 block, so a pure rotation R gives R·n (the direction
+                // the position transform gives), a uniform scale s gives
+                // R·n / s, and shear is handled. The block is taken from the
+                // FULL 4x4 inverse because a projective WV (a non-trivial
+                // fourth column) changes it; `vs_c[0..3]` are the columns of
+                // WV (the rows of transpose(WV)), and row i of adj(WV) is the
+                // generalised cross product of the other three columns, with
+                // the sign of the cyclic permutation that brings column i to
+                // the front. Computed inline to avoid a separate constant
+                // slot. A singular WV has no inverse and is used unchanged,
+                // as the fixed-function pipeline does. D3D9 only renormalizes
+                // when D3DRS_NORMALIZENORMALS is set, so an un-renormalized
+                // non-unit model normal otherwise scales the lighting.
+                out.push_str("    float4 nadj0 = -mtld3d_cross4(vs_c[1], vs_c[2], vs_c[3]);\n");
+                out.push_str("    float4 nadj1 = mtld3d_cross4(vs_c[2], vs_c[3], vs_c[0]);\n");
+                out.push_str("    float4 nadj2 = -mtld3d_cross4(vs_c[3], vs_c[0], vs_c[1]);\n");
+                out.push_str("    float nwvdet = dot(nadj0, vs_c[0]);\n");
                 out.push_str("    float3 n = (abs(nwvdet) > 1e-12)\n");
-                out.push_str("        ? float3(dot(ncof0, in.v1.xyz), dot(ncof1, in.v1.xyz), dot(ncof2, in.v1.xyz)) / nwvdet\n");
-                out.push_str("        : float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz));\n");
+                out.push_str("        ? float3(dot(nadj0.xyz, in.v1.xyz), dot(nadj1.xyz, in.v1.xyz), dot(nadj2.xyz, in.v1.xyz)) / nwvdet\n");
+                out.push_str("        : float3(dot(float3(vs_c[0].x, vs_c[1].x, vs_c[2].x), in.v1.xyz), dot(float3(vs_c[0].y, vs_c[1].y, vs_c[2].y), in.v1.xyz), dot(float3(vs_c[0].z, vs_c[1].z, vs_c[2].z), in.v1.xyz));\n");
                 if vs.normalize_normals() {
                     out.push_str("    n = normalize(n);\n");
                 }

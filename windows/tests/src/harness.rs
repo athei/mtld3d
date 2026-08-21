@@ -18,7 +18,7 @@ use crate::{
     ffi::Direct3DCreate9,
     resource::{
         CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, Texture, VertexBuffer,
-        VertexDeclaration, VertexShader,
+        VertexDeclaration, VertexShader, VolumeTexture,
     },
     vtbl::deref_vtbl,
     win32,
@@ -367,6 +367,35 @@ impl Harness {
         // SAFETY: vtable thunk; null rect array clears the whole target.
         unsafe {
             (self.dev_vtbl().clear)(self.device, 0, core::ptr::null(), flags, color, z, stencil)
+        }
+    }
+
+    /// `Clear` with explicit flags / colour / depth / stencil restricted to `pRects`.
+    ///
+    /// # Panics
+    ///
+    /// If `rects` holds more than `u32::MAX` entries, which no test writes.
+    pub fn clear_rects(
+        &self,
+        flags: u32,
+        color: u32,
+        z: f32,
+        stencil: u32,
+        rects: &[D3DRECT],
+    ) -> i32 {
+        let count = u32::try_from(rects.len()).expect("test rect count fits u32");
+        // SAFETY: vtable thunk; `rects` is a live slice of `count` D3DRECTs,
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().clear)(
+                self.device,
+                count,
+                rects.as_ptr().cast(),
+                flags,
+                color,
+                z,
+                stencil,
+            )
         }
     }
 
@@ -836,9 +865,9 @@ impl Harness {
         unsafe { (self.dev_vtbl().set_indices)(self.device, ib.as_ptr()) }
     }
 
-    /// `ProcessVertices` (a documented stub today). Returns the hr.
+    /// `ProcessVertices` with a null destination — the argument-validation path.
     pub fn process_vertices_hr(&self) -> i32 {
-        // SAFETY: vtable thunk; the stub ignores its (null) buffer/decl args.
+        // SAFETY: vtable thunk; a null destination is the rejection this checks.
         unsafe {
             (self.dev_vtbl().process_vertices)(
                 self.device,
@@ -846,6 +875,29 @@ impl Harness {
                 0,
                 0,
                 core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// `ProcessVertices(src_start, dst_index, count, dst_vb, NULL, 0)`. Returns the hr.
+    pub fn process_vertices(
+        &self,
+        src_start: u32,
+        dst_index: u32,
+        count: u32,
+        dst_vb: &VertexBuffer<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `dst_vb` is a live buffer, the declaration is
+        // NULL (the current-FVF path).
+        unsafe {
+            (self.dev_vtbl().process_vertices)(
+                self.device,
+                src_start,
+                dst_index,
+                count,
+                dst_vb.as_ptr(),
                 core::ptr::null_mut(),
                 0,
             )
@@ -1030,9 +1082,22 @@ impl Harness {
         format: u32,
         pool: u32,
     ) -> i32 {
+        self.try_create_volume_texture(extent, levels, usage, format, pool)
+            .0
+    }
+
+    /// `CreateVolumeTexture` returning the hr and the texture when it succeeded.
+    pub fn try_create_volume_texture(
+        &self,
+        extent: [u32; 3],
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, Option<VolumeTexture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
-        unsafe {
+        let hr = unsafe {
             (self.dev_vtbl().create_volume_texture)(
                 self.device,
                 extent[0],
@@ -1045,7 +1110,9 @@ impl Harness {
                 &raw mut out,
                 core::ptr::null_mut(),
             )
-        }
+        };
+        let texture = (hr == 0 && !out.is_null()).then(|| VolumeTexture::from_raw(out));
+        (hr, texture)
     }
 
     /// `CreateVertexBuffer`, asserting success.

@@ -83,9 +83,12 @@ vertex BlitVsOut mtld3d_blit_vs(
 fragment float4 mtld3d_blit_ps(
     BlitVsOut in [[stage_in]],
     texture2d<float> src [[texture(0)]],
-    sampler samp [[sampler(0)]]
+    sampler samp [[sampler(0)]],
+    constant float4 &src_level [[buffer(0)]]
 ) {
-    return src.sample(samp, in.texcoord);
+    // The source is one mip level of its texture; the sampler's point mip
+    // filter makes the explicit level exact.
+    return src.sample(samp, in.texcoord, level(src_level.x));
 }
 ";
 

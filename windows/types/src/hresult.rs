@@ -17,6 +17,8 @@ pub const D3DERR_INVALIDCALL: i32 = 0x8876_086C_u32.cast_signed();
 pub const D3DERR_NOTAVAILABLE: i32 = 0x8876_086A_u32.cast_signed();
 pub const D3DERR_MOREDATA: i32 = 0x8876_0867_u32.cast_signed();
 pub const D3DERR_NOTFOUND: i32 = 0x8876_0866_u32.cast_signed();
+/// `D3DERR_DEVICENOTRESET`: a failed `Reset` must be retried before rendering resumes.
+pub const D3DERR_DEVICENOTRESET: i32 = 0x8876_0869_u32.cast_signed();
 /// `D3DOK_NOAUTOGEN` — a *success* code (`SUCCEEDED` is true).
 ///
 /// The format is valid but cannot auto-generate mipmaps because it is not

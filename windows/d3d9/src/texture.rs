@@ -21,7 +21,8 @@ use mtld3d_types::{
     D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
     D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl,
     IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9,
-    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IUNKNOWN,
+    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DVOLUME9,
+    IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
@@ -1956,6 +1957,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     fn refcount_mut(&mut self) -> &mut u32 {
         &mut self.refcount
     }
+    fn blocks_reset_while_referenced(&self) -> bool {
+        self.inner().is_default_pool()
+    }
     fn private_refcount(&self) -> u32 {
         self.private_refcount
     }
@@ -2919,13 +2923,32 @@ const extern "system" fn volume_get_type(_this: *mut c_void) -> u32 {
     D3DRTYPE_VOLUMETEXTURE
 }
 
-extern "system" fn volume_get_level_desc(
-    _this: *mut c_void,
-    _level: u32,
-    _desc: *mut c_void,
-) -> i32 {
-    mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DVolumeTexture9::GetLevelDesc → INVALIDCALL");
-    D3DERR_INVALIDCALL
+extern "system" fn volume_get_level_desc(this: *mut c_void, level: u32, desc: *mut c_void) -> i32 {
+    if desc.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; volume-texture layout matches `Direct3DTexture9`,
+    // so the cast reads the shared `inner` correctly.
+    let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let inner = obj.inner();
+    let lvl = level as usize;
+    if lvl >= inner.levels as usize {
+        return D3DERR_INVALIDCALL;
+    }
+    let volume_desc = D3DVOLUME_DESC {
+        format: inner.d3d_format,
+        resource_type: D3DRTYPE_VOLUME,
+        usage: inner.d3d_usage,
+        pool: inner.d3d_pool,
+        width: inner.mip_width(lvl),
+        height: inner.mip_height(lvl),
+        depth: (inner.depth >> level).max(1),
+    };
+    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI.
+    unsafe { desc.cast::<D3DVOLUME_DESC>().write(volume_desc) };
+    D3D_OK
 }
 
 extern "system" fn volume_get_volume_level(
@@ -2987,6 +3010,16 @@ extern "system" fn volume_lock_box(
     if locked_box.is_null() {
         return D3DERR_INVALIDCALL;
     }
+    // A rejected lock hands back a null `pBits` (the caller may have seeded
+    // the struct with garbage); the success path overwrites this.
+    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
+    unsafe {
+        locked_box.write(D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        });
+    }
     // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`, so the
     // cast reads the shared `inner` correctly. InPtrMut so we can record the
     // per-level lock state so a double LockBox is rejected.
@@ -3000,6 +3033,11 @@ extern "system" fn volume_lock_box(
     }
     // Re-locking an already-mapped level is INVALIDCALL.
     if inner.locked[lvl] {
+        return D3DERR_INVALIDCALL;
+    }
+    // A DEFAULT-pool volume is CPU-accessible only when it is DYNAMIC; the
+    // same rule every 2D DEFAULT-pool texture lock applies.
+    if inner.d3d_pool == D3DPOOL_DEFAULT && inner.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
         return D3DERR_INVALIDCALL;
     }
     let Some((ptr, row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
@@ -3194,10 +3232,21 @@ impl Direct3DVolume9 {
 }
 
 extern "system" fn volume9_query_interface(
-    _this: *mut c_void,
-    _riid: *const Guid,
+    this: *mut c_void,
+    riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    // A volume is an `IUnknown` and an `IDirect3DVolume9`, nothing else: it is
+    // not a resource (the parent texture is).
+    // SAFETY: `riid` is the caller's read-only GUID pointer.
+    let accepted = (unsafe { InPtr::<Guid>::opt(riid.cast()) })
+        .is_some_and(|iid| matches!(*iid, IID_IUNKNOWN | IID_IDIRECT3DVOLUME9));
+    if accepted && !ppv.is_null() {
+        // SAFETY: validated writable out pointer.
+        unsafe { *ppv = this };
+        volume9_add_ref(this);
+        return D3D_OK;
+    }
     null_out(ppv);
     E_NOINTERFACE
 }
@@ -3257,12 +3306,41 @@ const extern "system" fn volume9_free_private_data(_this: *mut c_void, _guid: *c
 }
 
 extern "system" fn volume9_get_container(
-    _this: *mut c_void,
-    _riid: *const Guid,
+    this: *mut c_void,
+    riid: *const Guid,
     container: *mut *mut c_void,
 ) -> i32 {
-    null_out(container);
-    E_NOINTERFACE
+    if container.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is the live wrapper.
+    let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
+        null_out(container);
+        return D3DERR_INVALIDCALL;
+    };
+    // `GetContainer` is `QueryInterface` against the parent volume texture,
+    // so it answers the texture's own interface IIDs with an owned reference
+    // and `E_NOINTERFACE` for anything else (a volume is not its own
+    // container).
+    // SAFETY: `riid` is a *const Guid per the QueryInterface ABI.
+    let matches_texture = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).is_some_and(|g| {
+        let g = *g;
+        g == IID_IUNKNOWN
+            || g == IID_IDIRECT3DRESOURCE9
+            || g == IID_IDIRECT3DBASETEXTURE9
+            || g == IID_IDIRECT3DVOLUMETEXTURE9
+    });
+    if !matches_texture {
+        null_out(container);
+        return E_NOINTERFACE;
+    }
+    // `parent_texture` is the live owning `Direct3DVolumeTexture9`, kept alive
+    // by the reference this volume forwards; the returned reference is the
+    // caller's to release.
+    texture_add_ref(obj.parent_texture);
+    // SAFETY: `container` is non-null (checked) and a writable out-pointer.
+    unsafe { *container = obj.parent_texture };
+    D3D_OK
 }
 
 extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC) -> i32 {

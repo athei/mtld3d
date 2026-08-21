@@ -1227,6 +1227,16 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
         // only at device teardown (see `ImplicitKind`).
         self.inner().implicit_kind == ImplicitKind::None
     }
+    fn blocks_reset_while_referenced(&self) -> bool {
+        // The implicit surfaces, and the standalone `D3DPOOL_DEFAULT` ones
+        // (`CreateRenderTarget` / `CreateDepthStencilSurface`). A texture
+        // sub-surface forwards its public count to the texture, which counts
+        // itself; an owned offscreen-plain surface is counted through the
+        // internal texture it keeps alive.
+        let inner = self.inner();
+        inner.implicit_kind != ImplicitKind::None
+            || (inner.parent_texture.is_null() && inner.standalone_pool == D3DPOOL_DEFAULT)
+    }
     unsafe fn finalize(this: *mut Self) {
         // SAFETY: forwarded from the engine — both counters are zero and the
         // surface is standalone (`finalizes_on_zero()` true).

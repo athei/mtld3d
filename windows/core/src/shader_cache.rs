@@ -225,7 +225,11 @@ use crate::shader_compile_stats::CompileBucket;
 /// programmable PS declares `oC0..oC3` locals and returns a `PsOut` struct
 /// with one `[[color(i)]]` member per exported target, changing the key hash
 /// of every pixel shader and the MSL of any that writes `oC1` or above.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 58;
+///
+/// `59` derives the lit FF vertex shader's normal matrix from the full 4x4
+/// inverse of the world-view matrix (a projective fourth column changes the
+/// normal), changing the MSL of every lit FF vertex shader with a normal.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 59;
 
 /// File magic.
 ///
