@@ -525,22 +525,33 @@ impl TextureInner {
         let (src_col0, src_row0) = ((rx / bw) as usize, (ry / bh) as usize);
         let (dst_col0, dst_row0) = ((dx / bw) as usize, (dy / bh) as usize);
         let copy_bytes = rblock_cols * block_bytes;
-        for br in 0..rblock_rows {
-            let s_off = (src_row0 + br) * src_pitch + src_col0 * block_bytes;
-            let d_off = (dst_row0 + br) * dst_pitch + dst_col0 * block_bytes;
-            if s_off + copy_bytes > src_box.logical_len()
-                || d_off + copy_bytes > dst_box.logical_len()
-            {
-                return false;
-            }
-            // SAFETY: `s_off + copy_bytes <= src_box.logical_len()` (checked).
-            let src_ptr = unsafe { src_box.as_ptr().add(s_off) };
-            // SAFETY: `d_off + copy_bytes <= dst_box.logical_len()` (checked).
-            let dst_ptr = unsafe { dst_box.as_ptr().cast_mut().add(d_off) };
-            // SAFETY: both ranges are in-bounds (above) and `src`/`self` are
-            // distinct textures with disjoint PageBox allocations.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
+        // A volume level is `depth` slices of `block_rows * pitch` bytes laid
+        // out back to back (`lock_box` reports that slice pitch); a 2D or cube
+        // level is the single-slice case. The rectangle applies to every
+        // slice the two levels share.
+        let src_slice = src_pitch * (sh.div_ceil(bh) as usize);
+        let dst_slice = dst_pitch * (self.mip_height(dst_level).div_ceil(bh) as usize);
+        let depth = (src.depth >> src_level)
+            .max(1)
+            .min((self.depth >> dst_level).max(1)) as usize;
+        for z in 0..depth {
+            for br in 0..rblock_rows {
+                let s_off = z * src_slice + (src_row0 + br) * src_pitch + src_col0 * block_bytes;
+                let d_off = z * dst_slice + (dst_row0 + br) * dst_pitch + dst_col0 * block_bytes;
+                if s_off + copy_bytes > src_box.logical_len()
+                    || d_off + copy_bytes > dst_box.logical_len()
+                {
+                    return false;
+                }
+                // SAFETY: `s_off + copy_bytes <= src_box.logical_len()` (checked).
+                let src_ptr = unsafe { src_box.as_ptr().add(s_off) };
+                // SAFETY: `d_off + copy_bytes <= dst_box.logical_len()` (checked).
+                let dst_ptr = unsafe { dst_box.as_ptr().cast_mut().add(d_off) };
+                // SAFETY: both ranges are in-bounds (above) and `src`/`self` are
+                // distinct textures with disjoint PageBox allocations.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
+                }
             }
         }
         self.mark_mip_dirty(dst_level);
@@ -3161,6 +3172,12 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
         // A read-only lock wrote nothing, so there is nothing to upload.
         return D3D_OK;
     }
+    // The written level is now an `UpdateTexture` source: a SYSTEMMEM volume
+    // filled through LockBox and pushed into a DEFAULT-pool twin is the
+    // standard way an engine uploads a colour-grading LUT, and UpdateTexture
+    // copies only levels marked here. Volumes track dirtiness per whole
+    // level (no sub-box), so the mark is the full mip.
+    inner.mark_update_dirty(lvl, None);
     // Lazy box→3D upload, mirroring the 2D `texture_unlock_rect` path: mark the
     // level dirty so the next bind-time `flush_dirty_mips` dispatches
     // `schedule_upload` (the volume variant), which routes the whole staging
@@ -3182,7 +3199,16 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
     D3D_OK
 }
 
-const extern "system" fn volume_add_dirty_box(_this: *mut c_void, _box: *const c_void) -> i32 {
+extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) -> i32 {
+    // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // Same contract as `texture_add_dirty_rect`: a hint that the CPU bytes
+    // changed, consumed by the next UpdateTexture from this volume. It never
+    // schedules a GPU upload (the staging may not carry Lock-written bytes).
+    // Volumes track the whole level, so the box itself is not recorded.
+    obj.inner_mut().mark_update_dirty(0, None);
     D3D_OK
 }
 

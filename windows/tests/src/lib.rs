@@ -23,5 +23,6 @@ pub use resource::{
 };
 pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
+    VolumeVertex,
 };
 pub use win32::{Rect, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, set_window_pos};

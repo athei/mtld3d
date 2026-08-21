@@ -4850,7 +4850,8 @@ extern "system" fn device_update_texture(
         return D3DERR_INVALIDCALL;
     }
     // All texture interfaces share this wrapper layout. The type flag below
-    // selects the cube path; volume updates remain unsupported.
+    // selects the cube path; volumes take the plain path, whose staging copy
+    // walks every depth slice of a level.
     let src_parent = src.cast::<crate::texture::Direct3DTexture9>();
     let dst_parent = dst.cast::<crate::texture::Direct3DTexture9>();
     if std::ptr::eq(src_parent.cast_const(), dst_parent.cast_const()) {
