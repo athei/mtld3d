@@ -6,12 +6,13 @@ use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
     D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+    D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -1580,4 +1581,119 @@ fn depth_survives_a_mid_frame_readback_flush() {
         GREEN,
         "the far group failed depth against the primed near depth that survived the flush",
     );
+}
+
+/// Assert each RGB channel of `got` is within `tolerance` of `expected` (alpha ignored).
+fn assert_rgb_close(got: u32, expected: u32, tolerance: i32, context: &str) {
+    let channel = |c: u32, shift: u32| i32::try_from((c >> shift) & 0xff).unwrap_or(0);
+    let close = [16, 8, 0]
+        .iter()
+        .all(|&shift| (channel(got, shift) - channel(expected, shift)).abs() <= tolerance);
+    assert!(
+        close,
+        "{context}: got {got:#010x}, expected {expected:#08x} (tolerance {tolerance})"
+    );
+}
+
+#[test]
+fn stretch_rect_decodes_packed_yuv_into_the_backbuffer() {
+    // A 4x1 DEFAULT offscreen-plain YUV surface holding the macropixel under
+    // test plus a neutral filler, StretchRect'd with POINT onto the 640x480
+    // backbuffer (a scaling blit, so the render quad does the decode). The
+    // left half of the target shows pixel 0, the right half pixel 1. Expected
+    // colours are the reference values desktop drivers produce for these
+    // macropixels; drivers disagree on the exact Y'CbCr convention, hence the
+    // tolerance of 18.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let cases: [(u32, &str, u32, u32, u32); 8] = [
+        (D3DFMT_UYVY, "UYVY", 0x4cff_4c54, 0x00ff_0000, 0x00ff_0000),
+        (D3DFMT_UYVY, "UYVY", 0x0080_0080, 0x0000_0000, 0x0000_0000),
+        (D3DFMT_UYVY, "UYVY", 0xff80_ff80, 0x00ff_ffff, 0x00ff_ffff),
+        (D3DFMT_UYVY, "UYVY", 0xff00_0000, 0x0000_8700, 0x004b_ff1c),
+        (D3DFMT_YUY2, "YUY2", 0x4cff_4c54, 0x000b_8b00, 0x00b6_ffa3),
+        (D3DFMT_YUY2, "YUY2", 0x0080_0080, 0x0000_ff00, 0x0000_ff00),
+        (D3DFMT_YUY2, "YUY2", 0xff80_ff80, 0x00ff_00ff, 0x00ff_00ff),
+        (D3DFMT_YUY2, "YUY2", 0x1c6b_1cff, 0x006d_ff45, 0x0000_d500),
+    ];
+    for (format, name, input, left, right) in cases {
+        let surface = h.create_offscreen_plain_surface(4, 1, format, D3DPOOL_DEFAULT);
+        {
+            let mut locked = surface.lock_rect(0);
+            locked.write(&[input, 0x0080_0080u32]);
+        }
+        assert_eq!(
+            h.clear_target(BLACK),
+            0,
+            "clear before {name} {input:#010x}"
+        );
+        assert_eq!(
+            h.stretch_rect(&surface, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "StretchRect {name} {input:#010x} onto the backbuffer"
+        );
+        assert_rgb_close(
+            h.read_pixel(1, 240),
+            left,
+            18,
+            &format!("{name} {input:#010x} pixel 0"),
+        );
+        assert_rgb_close(
+            h.read_pixel(318, 240),
+            right,
+            18,
+            &format!("{name} {input:#010x} pixel 1"),
+        );
+    }
+}
+
+#[test]
+fn stretch_rect_decodes_packed_yuv_into_an_offscreen_plain_surface() {
+    // A 1:1 YUV -> X8R8G8B8 copy into an offscreen-plain destination has no
+    // GPU path (the 1:1 blit cannot convert and the quad needs a render
+    // target), so the CPU converter decodes the macropixels; a later lock of
+    // the destination reads the converted pixels.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_UYVY, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        // Pixels 0/1: red; pixels 2/3: white.
+        locked.write(&[0x4cff_4c54u32, 0xff80_ff80]);
+    }
+    let dst = h.create_offscreen_plain_surface(4, 1, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 UYVY -> X8R8G8B8 into an offscreen-plain surface"
+    );
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    let px = locked.as_u32(4);
+    assert_rgb_close(px[0], 0x00ff_0000, 18, "pixel 0");
+    assert_rgb_close(px[1], 0x00ff_0000, 18, "pixel 1");
+    assert_rgb_close(px[2], 0x00ff_ffff, 18, "pixel 2");
+    assert_rgb_close(px[3], 0x00ff_ffff, 18, "pixel 3");
+}
+
+#[test]
+fn stretch_rect_converts_r5g6b5_into_x8r8g8b8() {
+    // CheckDeviceFormatConversion(R5G6B5, X8R8G8B8) answers S_OK; the scaling
+    // render quad is the path that makes it true. Each 16-bit source pixel
+    // covers a 160-pixel band of the backbuffer.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        locked.write(&[0xf800u16, 0x07e0, 0x001f, 0xffff]);
+    }
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&src, &bb, D3DTEXF_POINT),
+        D3D_OK,
+        "R5G6B5 -> X8R8G8B8 scaling StretchRect"
+    );
+    assert_eq!(h.read_pixel(80, 240), RED, "pixel 0 is red");
+    assert_eq!(h.read_pixel(240, 240), GREEN, "pixel 1 is green");
+    assert_eq!(h.read_pixel(400, 240), BLUE, "pixel 2 is blue");
+    assert_eq!(h.read_pixel(560, 240), WHITE, "pixel 3 is white");
 }

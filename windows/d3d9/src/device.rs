@@ -5819,9 +5819,10 @@ fn emit_stretch_rect_blit(
         // Render-quad path (a size change and/or a format conversion): render
         // the source onto a quad covering the destination rect. The
         // destination's Metal colour format keys the blit pipeline and the pass
-        // colour attachment; the source is sampled in its own format, so this
-        // path also converts a cross-format pair. `device_stretch_rect`
-        // guarantees the destination is a render target here.
+        // colour attachment; the source is sampled in its own format (a packed
+        // YUV source is decoded to RGB by the fragment function), so this path
+        // also converts a cross-format pair. `device_stretch_rect` guarantees
+        // the destination is a render target here.
         let Some(dst_format) =
             mtld3d_core::format::map_d3d_format(dst_info.format).map(|m| m.metal_pixel_format())
         else {
@@ -5846,6 +5847,7 @@ fn emit_stretch_rect_blit(
                 mip: dst_info.mip_level,
             },
             dst_format,
+            mtld3d_core::stretch_rect::blit_decode(src_info.format),
             filter,
         );
         if dst_info.autogen_texture_id.is_some() {
