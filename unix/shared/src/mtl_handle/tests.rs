@@ -10,9 +10,7 @@ use super::*;
 const _: () = {
     assert!(core::mem::size_of::<MetalHandle<MTLDeviceKind>>() == core::mem::size_of::<u64>());
     assert!(core::mem::size_of::<MetalHandle<MTLTextureKind>>() == core::mem::size_of::<u64>());
-    assert!(
-        core::mem::align_of::<MetalHandle<MTLDeviceKind>>() == core::mem::align_of::<u64>()
-    );
+    assert!(core::mem::align_of::<MetalHandle<MTLDeviceKind>>() == core::mem::align_of::<u64>());
 };
 
 #[test]

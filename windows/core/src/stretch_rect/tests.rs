@@ -5,6 +5,13 @@
 //! that is empty after clamping reports `None` so the caller can fail the call. A
 //! separate check keeps every `RejectReason` key distinct, which is what makes the
 //! once-per-reason warn fire once per reason rather than collapsing to a single line.
+//!
+//! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
+//! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
+//! against reference samples in both the full-range and reduced-range conventions, and
+//! the macropixel byte order that separates `YUY2` from `UYVY`. The conversion has a
+//! float twin in the blit shader, so a change here that is not mirrored there shows up
+//! as a colour shift no other test would catch.
 
 use super::*;
 

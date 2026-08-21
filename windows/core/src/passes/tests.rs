@@ -282,32 +282,11 @@ fn set_render_target_same_handle_no_break() {
 fn set_render_target_subresource_breaks_on_slice_or_level_change() {
     let rt = tex(0x3000);
     let mut s = fresh();
-    s.set_color_render_target_subresource(
-        rt,
-        256,
-        256,
-        RT_FORMAT,
-        RenderScale::IDENTITY,
-        (0, 0),
-    );
+    s.set_color_render_target_subresource(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY, (0, 0));
     s.emit_command(dummy_draw());
-    s.set_color_render_target_subresource(
-        rt,
-        256,
-        256,
-        RT_FORMAT,
-        RenderScale::IDENTITY,
-        (1, 0),
-    );
+    s.set_color_render_target_subresource(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY, (1, 0));
     s.emit_command(dummy_draw());
-    s.set_color_render_target_subresource(
-        rt,
-        128,
-        128,
-        RT_FORMAT,
-        RenderScale::IDENTITY,
-        (1, 1),
-    );
+    s.set_color_render_target_subresource(rt, 128, 128, RT_FORMAT, RenderScale::IDENTITY, (1, 1));
     s.emit_command(dummy_draw());
 
     assert_eq!(s.passes().len(), 3);
@@ -3172,10 +3151,7 @@ fn mid_frame_flush_keeps_every_colour_store() {
 
 // ── Blits in the read/write model ─────────────────────────────
 
-fn copy_blit(
-    src: MetalHandle<MTLTextureKind>,
-    dst: MetalHandle<MTLTextureKind>,
-) -> BlitCommand {
+fn copy_blit(src: MetalHandle<MTLTextureKind>, dst: MetalHandle<MTLTextureKind>) -> BlitCommand {
     BlitCommand::copy_texture_to_texture_full_mip(src.raw(), dst.raw(), 0, 64, 64)
 }
 

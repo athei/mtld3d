@@ -51,8 +51,7 @@ fn identity_transform_maps_to_screen_coordinates() {
     assert_eq!(out.len(), 4 * 16);
     for (i, p) in quad.iter().enumerate() {
         let base = i * 16;
-        let read =
-            |o: usize| f32::from_le_bytes(out[base + o..base + o + 4].try_into().unwrap());
+        let read = |o: usize| f32::from_le_bytes(out[base + o..base + o + 4].try_into().unwrap());
         assert!((read(0) - p[0].mul_add(320.0, 320.0)).abs() < 1e-3, "x {i}");
         assert!(
             (read(4) - (-p[1]).mul_add(240.0, 240.0)).abs() < 1e-3,

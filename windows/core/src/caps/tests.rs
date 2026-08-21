@@ -171,9 +171,8 @@ fn compare_caps_advertise_every_function() {
 
 #[test]
 fn shade_caps_matches_implementation() {
-    let expected = ShadeCaps::COLORGOURAUDRGB
-        | ShadeCaps::SPECULARGOURAUDRGB
-        | ShadeCaps::ALPHAGOURAUDBLEND;
+    let expected =
+        ShadeCaps::COLORGOURAUDRGB | ShadeCaps::SPECULARGOURAUDRGB | ShadeCaps::ALPHAGOURAUDBLEND;
     assert_eq!(filled().shade_caps, expected.bits());
 }
 

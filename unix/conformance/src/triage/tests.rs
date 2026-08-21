@@ -19,8 +19,8 @@ use crate::model::{Baseline, Site};
 #[test]
 fn conformance_md_covers_exactly_the_baseline_sites() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let baseline_text = std::fs::read_to_string(dir.join("baseline.txt"))
-        .expect("baseline.txt must be readable");
+    let baseline_text =
+        std::fs::read_to_string(dir.join("baseline.txt")).expect("baseline.txt must be readable");
     let baseline = Baseline::from_text(&baseline_text).expect("baseline.txt must parse");
     let doc = load(dir).expect("CONFORMANCE.md Sites: lines must parse");
 
