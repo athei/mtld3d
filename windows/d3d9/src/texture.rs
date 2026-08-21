@@ -630,9 +630,11 @@ impl TextureInner {
     /// this texture's D3D format. This is the cross-format `StretchRect` path
     /// into an offscreen-plain destination: neither GPU path serves it — the
     /// 1:1 blit can't convert and the render-quad conversion needs a
-    /// render-target destination — so the conversion runs on the CPU. Only the
-    /// simple uncompressed RGB formats R5G6B5 / X8R8G8B8 / A8R8G8B8 are
-    /// handled; returns false for any other pair (caller falls back to a
+    /// render-target destination — so the conversion runs on the CPU. Sources
+    /// are the simple uncompressed RGB formats R5G6B5 / X8R8G8B8 / A8R8G8B8
+    /// plus the packed YUV formats YUY2 / UYVY (decoded per macropixel, the
+    /// CPU twin of the render quad's decode); destinations are the RGB three.
+    /// Returns false for any other pair (caller falls back to a
     /// best-effort no-op) or an out-of-bounds region. Same-size only
     /// (`src_rect` extent equals the destination extent) — the caller rejects
     /// scaling upstream. Marks `dst_level` dirty on success so a later
@@ -646,7 +648,8 @@ impl TextureInner {
         dst_point: (i32, i32),
     ) -> bool {
         let (src_fmt, dst_fmt) = (src.d3d_format, self.d3d_format);
-        if !is_convertible_rgb(src_fmt) || !is_convertible_rgb(dst_fmt) {
+        let yuv_src = mtld3d_core::stretch_rect::is_packed_yuv(src_fmt);
+        if !(is_convertible_rgb(src_fmt) || yuv_src) || !is_convertible_rgb(dst_fmt) {
             return false;
         }
         let (Some(dst_box), Some(src_box)) =
@@ -686,18 +689,45 @@ impl TextureInner {
             let s_row = (ry + row) as usize * src_pitch;
             let d_row = (dy + row) as usize * dst_pitch;
             for col in 0..rw {
-                let s_off = s_row + (rx + col) as usize * src_bpp;
+                let sx = (rx + col) as usize;
                 let d_off = d_row + (dx + col) as usize * dst_bpp;
-                if s_off + src_bpp > src_len || d_off + dst_bpp > dst_len {
+                if d_off + dst_bpp > dst_len {
                     return false;
                 }
-                // SAFETY: `s_off + src_bpp <= src_len` (checked), so this stays
-                // in-bounds of the source PageBox allocation.
-                let src_ptr = unsafe { src_base.add(s_off) };
-                // SAFETY: `src_bpp` bytes from `src_ptr`; `src`/`self` are distinct
-                // textures with disjoint PageBox allocations.
-                let px = unsafe { std::slice::from_raw_parts(src_ptr, src_bpp) };
-                let rgba = decode_rgb_pixel(src_fmt, px);
+                let rgba = if yuv_src {
+                    // Packed 4:2:2: the pixel's macropixel is the 4 bytes at
+                    // the even column; its parity picks the luma sample.
+                    let s_off = s_row + (sx & !1) * 2;
+                    if s_off + 4 > src_len {
+                        return false;
+                    }
+                    // SAFETY: `s_off + 4 <= src_len` (checked), so this stays
+                    // in-bounds of the source PageBox allocation.
+                    let src_ptr = unsafe { src_base.add(s_off) };
+                    // SAFETY: 4 bytes from `src_ptr`; `src`/`self` are distinct
+                    // textures with disjoint PageBox allocations.
+                    let mp = unsafe { std::slice::from_raw_parts(src_ptr, 4) };
+                    let Some((r, g, b)) = mtld3d_core::stretch_rect::decode_packed_yuv(
+                        src_fmt,
+                        [mp[0], mp[1], mp[2], mp[3]],
+                        sx & 1 == 1,
+                    ) else {
+                        return false;
+                    };
+                    (r, g, b, 0xff)
+                } else {
+                    let s_off = s_row + sx * src_bpp;
+                    if s_off + src_bpp > src_len {
+                        return false;
+                    }
+                    // SAFETY: `s_off + src_bpp <= src_len` (checked), so this stays
+                    // in-bounds of the source PageBox allocation.
+                    let src_ptr = unsafe { src_base.add(s_off) };
+                    // SAFETY: `src_bpp` bytes from `src_ptr`; `src`/`self` are distinct
+                    // textures with disjoint PageBox allocations.
+                    let px = unsafe { std::slice::from_raw_parts(src_ptr, src_bpp) };
+                    decode_rgb_pixel(src_fmt, px)
+                };
                 // SAFETY: `d_off + dst_bpp <= dst_len` (checked); in-bounds of dst.
                 let dst_ptr = unsafe { dst_base.add(d_off) };
                 // SAFETY: `dst_bpp` bytes from `dst_ptr`; disjoint from `src` as above.

@@ -229,16 +229,39 @@ const fn is_32bit_rgb(fmt: u32) -> bool {
     matches!(fmt, D3DFMT_X8R8G8B8 | D3DFMT_A8R8G8B8)
 }
 
-/// Whether a backbuffer of `src` can be presented to a `dst` display format.
+/// Whether a fullscreen backbuffer of `src` can be presented to a `dst` display format.
 ///
-/// The same format, or another member of the same 32-bit colour family.
-///
-/// This also gates `CheckDeviceFormatConversion`: broadening it there is NOT
-/// safe — windowed `CheckDeviceType` must agree with
-/// `CheckDeviceFormatConversion`, and the YUV→RGB blit path keys off it, so
-/// advertising a conversion the backend does not perform renders garbage.
+/// The same format, or another member of the same 32-bit colour family. This
+/// is the fullscreen rule only: the spec allows no present-time conversion
+/// there, the display and backbuffer formats must match ignoring alpha.
+/// Windowed mode goes through [`is_format_conversion_supported`] instead.
 const fn is_present_compatible(src: u32, dst: u32) -> bool {
     src == dst || (is_32bit_rgb(src) && is_32bit_rgb(dst))
+}
+
+/// Formats `StretchRect` can read as the source of a format conversion.
+///
+/// The render-quad path samples any colour format the device can render and
+/// decodes the two packed 4:2:2 YUV formats (`YUY2` / `UYVY`) in its fragment
+/// function; the offscreen-plain CPU converter covers the same set.
+const fn is_conversion_source(fmt: u32) -> bool {
+    is_render_target_format(fmt) || matches!(fmt, D3DFMT_YUY2 | D3DFMT_UYVY)
+}
+
+/// `CheckDeviceFormatConversion`: whether `StretchRect` converts `src` into `dst`.
+///
+/// A format always converts to itself (the identity rows hold for any code,
+/// mapped or not). Otherwise the source must be something the blit can read
+/// ([`is_conversion_source`]) and the destination a renderable colour format
+/// (`is_render_target_format`), which is what the render-quad writes into.
+/// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
+/// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
+/// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
+const fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
+    if src == dst {
+        return true;
+    }
+    is_conversion_source(src) && is_render_target_format(dst)
 }
 
 // Formats the texture pool can sample or receive uploads in.
@@ -562,10 +585,18 @@ extern "system" fn d3d9_check_device_type(
         bb_format
     };
     // The backbuffer must be a renderable colour surface, and presentable to
-    // the display format: in windowed mode via a supported present conversion;
-    // in fullscreen it must match the display format's colour family directly.
+    // the display format: in windowed mode via a supported format conversion
+    // (the same predicate `CheckDeviceFormatConversion` answers with, so the
+    // two agree for every pair); in fullscreen it must match the display
+    // format's colour family directly. A 16-bit windowed backbuffer is
+    // therefore advertised; `CreateDevice` substitutes the BGRA8 layer format
+    // for it (`warn_unsupported_backbuffer_format`).
     let presentable = is_render_target_format(effective_bb)
-        && is_present_compatible(effective_bb, adapter_format);
+        && if windowed != 0 {
+            is_format_conversion_supported(effective_bb, adapter_format)
+        } else {
+            is_present_compatible(effective_bb, adapter_format)
+        };
     if !presentable {
         trace!(
             target: LOG_TARGET,
@@ -749,7 +780,7 @@ extern "system" fn d3d9_check_device_format_conversion(
 ) -> i32 {
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
-        || !is_present_compatible(source_format, target_format)
+        || !is_format_conversion_supported(source_format, target_format)
     {
         trace!(
             target: LOG_TARGET,
@@ -1240,9 +1271,12 @@ fn spawn_encoder_and_prewarm(
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
 ///
 /// See `format::BACKBUFFER_PIXEL_FORMAT`. That matches `D3DFMT_A8R8G8B8` /
-/// `D3DFMT_X8R8G8B8` byte-for-byte, which is all `WoW` requests. Any other
-/// admitted display format (e.g. `R5G6B5`) is silently substituted; warn once
-/// so a future game's mismatch shows up.
+/// `D3DFMT_X8R8G8B8` byte-for-byte, which is all `WoW` requests. Windowed
+/// `CheckDeviceType` advertises the 16-bit backbuffer formats too (it answers
+/// with the `StretchRect` conversion predicate, as the runtime requires), and
+/// such a request is substituted by decision rather than plumbed: the layer
+/// cannot take a 16-bit drawable, so a real 16-bit backbuffer would need a
+/// conversion pass on every present. Warn once so a game that asked shows up.
 fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

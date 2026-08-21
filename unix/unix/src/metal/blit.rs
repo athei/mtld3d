@@ -50,7 +50,9 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// Fragment stage `mtld3d_blit_ps` samples the bound source texture (fragment
 /// texture slot 0) with the bound sampler (slot 0) at `texcoord` and returns
 /// the colour. The PE side chooses a POINT or LINEAR sampler from the D3D9
-/// filter.
+/// filter. Its `float4` uniform carries the source mip level in `.x` and the
+/// source decode in `.y`: a packed YUV source (`YUY2` / `UYVY`, backed by an
+/// RG8 texture) is fetched per macropixel and converted to RGB, unfiltered.
 const BLIT_MSL: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -86,9 +88,38 @@ fragment float4 mtld3d_blit_ps(
     sampler samp [[sampler(0)]],
     constant float4 &src_level [[buffer(0)]]
 ) {
-    // The source is one mip level of its texture; the sampler's point mip
-    // filter makes the explicit level exact.
-    return src.sample(samp, in.texcoord, level(src_level.x));
+    // src_level.x is the source mip level (the sampler's point mip filter
+    // makes the explicit level exact); src_level.y is the source decode,
+    // 0 = sample as-is, 1 = YUY2, 2 = UYVY (mtld3d_core BlitDecode).
+    uint decode = uint(src_level.y);
+    if (decode == 0u) {
+        return src.sample(samp, in.texcoord, level(src_level.x));
+    }
+    // Packed 4:2:2 YUV backed by an RG8 texture: one texel per pixel, the
+    // even/odd texel pair is one macropixel. YUY2 texels are (Y0,U) (Y1,V),
+    // UYVY texels are (U,Y0) (V,Y1). Luma comes from the pixel's own texel,
+    // chroma from its pair, all fetched unfiltered: a linear sample across
+    // the pair would mix U into V.
+    uint lvl = uint(src_level.x);
+    float2 size = float2(max(src.get_width(lvl), 1u), max(src.get_height(lvl), 1u));
+    uint2 texel = uint2(clamp(in.texcoord * size, float2(0.0), size - 1.0));
+    uint even_x = texel.x & ~1u;
+    uint odd_x = min(even_x + 1u, uint(size.x) - 1u);
+    float2 own = src.read(texel, lvl).rg;
+    float2 even = src.read(uint2(even_x, texel.y), lvl).rg;
+    float2 odd = src.read(uint2(odd_x, texel.y), lvl).rg;
+    bool yuy2 = decode == 1u;
+    float y = yuy2 ? own.r : own.g;
+    float u = yuy2 ? even.g : even.r;
+    float v = yuy2 ? odd.g : odd.r;
+    // Reduced-range Y'CbCr to RGB (BT.601 coefficients, luma scaled from
+    // [16, 235], chroma centred on 128); the CPU twin is
+    // mtld3d_core::stretch_rect::yuv_to_rgb8, keep them in step.
+    float l = (y - 0.063) * 1.164;
+    float cu = u - 0.5;
+    float cv = v - 0.5;
+    float3 rgb = float3(l + 1.596 * cv, l - 0.392 * cu - 0.813 * cv, l + 2.017 * cu);
+    return float4(saturate(rgb), 1.0);
 }
 ";
 

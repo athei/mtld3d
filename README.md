@@ -72,7 +72,7 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Resources**: DXT1–5 and ATI1 compressed textures, the common uncompressed
   integer and float formats, cube and volume textures, mipmap auto-generation,
   managed-pool dirty-region uploads, StretchRect (including cross-format blits
-  via a conversion pass), GetDC read-back.
+  via a conversion pass and YUY2/UYVY to RGB decoding), GetDC read-back.
 - **Depth**: sampleable depth textures (INTZ, DF16, DF24) with hardware
   shadow-compare PCF, depth bias and slope-scale bias, depth clamp for
   pre-transformed geometry.
@@ -105,8 +105,6 @@ own fallback paths instead of breaking:
 - **Non-solid fill modes** (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
   as the spec allows.
-- **YUV conversion**: YUY2/UYVY surfaces can be created and locked, but no
-  YUV→RGB blit is performed.
 - Depth→depth StretchRect.
 
 ### Faster than conformant

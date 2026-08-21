@@ -126,7 +126,6 @@
   visual.c:25148 count=1
   visual.c:27550 count=5
   visual.c:27902 count=2
-  visual.c:28024 count=3
 [i686/stateblock] crash=0
 [i686/d3d9ex] crash=0
   d3d9ex.c:5184 count=1
@@ -248,7 +247,6 @@
   visual.c:25148 count=1
   visual.c:27550 count=5
   visual.c:27902 count=2
-  visual.c:28024 count=3
 [x86_64/stateblock] crash=0
 [x86_64/d3d9ex] crash=0
   d3d9ex.c:5184 count=1

@@ -166,7 +166,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **4 `real` · 91 `expected` ·
+re-checked before retagging. Headline: **2 `real` · 91 `expected` ·
 2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
@@ -231,12 +231,11 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (2 distinct defects behind the 3 sites)
+### The `real` backlog (1 distinct defect behind the 2 sites)
 
 | defect | cluster(s) | sites |
 |---|---|---:|
 | Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
-| CheckDeviceFormatConversion reuses the present predicate; wrong for R5G6B5→X8R8G8B8 | test_format_conversion | 1 |
 
 The `device` subtest used to die silently inside test_volume_get_container
 (a `GetContainer` that answered E_NOINTERFACE with a null container, which
@@ -607,20 +606,6 @@ Sites: 27902=expected
 FLOAT→unorm rounding at exactly .5: Metal rounds 76.5 up (77), refrast
 truncates (76). A ±1 GPU rounding-convention difference with no cap branch;
 mimicking refrast exactly is not feasible or desirable.
-
-### visual.c/test_format_conversion
-Sites: 28024=real
-
-Three rows fail, all expecting S_OK from CheckDeviceFormatConversion:
-R5G6B5→X8R8G8B8 (no escape — every real driver converts this, and our own
-StretchRect render-quad path CAN, so our NOTAVAILABLE is a false report =
-the real component) plus YUY2→X8R8G8B8/R5G6B5 (broken_warp rows — our
-NOTAVAILABLE is the honest answer for a device without YUV conversion; the
-runner ignores broken()). Mixed line ⇒ real. The fix is the dedicated
-conversion predicate (decoupled from `is_present_compatible`); note the
-known coupling: test_display_formats asserts CheckDeviceType(windowed)
-agrees, and the YUV blit tests gate on this predicate — change all three
-consistently.
 
 ### stateblock.c clusters
 

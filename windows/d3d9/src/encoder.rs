@@ -2937,8 +2937,10 @@ impl FrameEncoder {
     /// `src_dims` / `dst_dims` are the source / destination mip-level pixel
     /// dimensions; `src_rect` / `dst_rect` are the (already-clamped) sub-rects.
     /// `dst_format` is the destination's Metal colour format (drives the
-    /// pipeline cache + the pass colour attachment); `filter` is the D3D9
-    /// `D3DTEXF_*` value (POINT / LINEAR).
+    /// pipeline cache + the pass colour attachment); `decode` is the
+    /// source-side decode the fragment function applies (as-is, or one of the
+    /// packed YUV formats, which it converts to RGB while sampling); `filter`
+    /// is the D3D9 `D3DTEXF_*` value (POINT / LINEAR).
     ///
     /// The destination pass opens with `loadAction = Load` (or `DontCare` when
     /// the dst rect covers the whole attachment — both correct, the quad
@@ -2953,6 +2955,7 @@ impl FrameEncoder {
         src: &BlitSide,
         dst: &BlitSide,
         dst_format: PixelFormat,
+        decode: mtld3d_core::stretch_rect::BlitDecode,
         filter: u32,
     ) {
         let &BlitSide {
@@ -3005,9 +3008,12 @@ impl FrameEncoder {
         }
         let xform_ptr = self.scratch.alloc(&xform);
         // The source level, as the float the blit PS passes to `level()`; mip
-        // counts are tiny, so the conversion is exact.
+        // counts are tiny, so the conversion is exact. `.y` carries the source
+        // decode (0 = sample as-is, 1 = YUY2, 2 = UYVY) so one pipeline per
+        // destination format serves every source format.
         let mut src_level = [0u8; 16];
         src_level[..4].copy_from_slice(&to_f(src_mip).to_le_bytes());
+        src_level[4..8].copy_from_slice(&decode.uniform().to_le_bytes());
         let src_level_ptr = self.scratch.alloc(&src_level);
 
         // Save the device's current attachments + viewport so the one-off
