@@ -153,12 +153,6 @@ export WINEDLLOVERRIDES = mscoree,mshtml=
 export WINEDEBUG=+msync
 export WINEMSYNC=1
 
-# The prefix the test and conformance legs run in, which is also where the
-# `mtld3d` builtin's placeholder has to be installed. Not `?=`: an exported but
-# empty WINEPREFIX (a common shell profile shape) counts as defined and would
-# leave the path rooted at `/`.
-WINEPREFIX_DIR := $(if $(WINEPREFIX),$(WINEPREFIX),$(HOME)/.wine)
-
 # Quiet locally, echoing under CI: a CI log is read after the fact by someone
 # who cannot re-run the command, so the command line is the most useful thing
 # in it. GitHub Actions (and every other runner) sets CI.
@@ -201,7 +195,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle configure-test-prefix prefix-marker-i686 prefix-marker-x86_64 \
+	bundle configure-test-prefix \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -226,11 +220,14 @@ unix: unix-x64 unix-arm64
 # output can also be loaded as a native override in Wine distributions we don't
 # control (CrossOver).
 #
-# The "fake DLL" placeholder is the prefix marker for the custom mtld3d builtin
-# name. It ships into lib/wine, and a prefix-setup step must copy it into the
-# target prefix's syswow64/system32, since Wine finds builtins by name in the
-# prefix, not lib/wine (`d3d9` gets its placeholder from wineboot, but custom
-# names don't), which the prefix-marker targets below do.
+# The "fake DLL" placeholder is a prefix marker for the mtld3d builtin name,
+# since Wine resolves a builtin by finding a marker for that NAME in the
+# prefix's system directories before it loads the real module out of lib/wine.
+# `install` does not need one and does not ship one: wineboot stamps a marker
+# for every builtin it finds in lib/wine when it creates a prefix, and the
+# install targets run first. Only `bundle` carries it, under prefix-markers/
+# rather than wine/, for the case where that ordering does not hold: an
+# existing prefix, or a Wine installation we do not control.
 windows-i686:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_i386) $(FRAME_POINTERS)
 	$(WINEBUILD) --builtin $(OUT_i386)/mtld3d.dll
@@ -272,7 +269,6 @@ install: install-windows-i686 install-windows-x86_64 install-unix-x64 install-un
 install-windows-i686: windows-i686
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
-		cp $(OUT_i386)/mtld3d.fake.dll                     $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
 		$(WINEBUILD) --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
 	done
@@ -280,7 +276,6 @@ install-windows-i686: windows-i686
 install-windows-x86_64: windows-x86_64
 	for dir in $(INSTALL_DIRS); do \
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
-		cp $(OUT_x64)/mtld3d.fake.dll                      $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
 		$(WINEBUILD) --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
 	done
@@ -323,12 +318,19 @@ bundle: all
 	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)
 	mkdir -p $(BUNDLE_STAGE)/native/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/native/x86_64-windows
+	mkdir -p $(BUNDLE_STAGE)/prefix-markers/syswow64
+	mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32
 	cp $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
-	cp $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/wine/i386-windows/
 	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/wine/i386-windows/
 	cp $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
-	cp $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/wine/x86_64-windows/
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
+	# Markers live outside wine/, and already carry the name they need in the
+	# prefix, so both routes are a plain copy into the matching system dir with
+	# no rename. Keeping them out of wine/ is what stops `cp -R wine/*` from
+	# dragging them onto the builtin search path, where wineboot would stamp a
+	# second, useless marker under the name "mtld3d.fake.dll".
+	cp $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/prefix-markers/syswow64/mtld3d.dll
+	cp $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
 	cp $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
@@ -338,7 +340,7 @@ bundle: all
 	cp $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
 	cp $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
 	cp $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
-	tar -cJf $(BUNDLE_OUT) -C $(BUNDLE_STAGE) wine native mtld3d.conf INSTALL.md LICENSE
+	tar -cJf $(BUNDLE_OUT) -C $(BUNDLE_STAGE) wine native prefix-markers mtld3d.conf INSTALL.md LICENSE
 	# The symbols for exactly these binaries, as a second archive. Laid out by
 	# arch alone, with no wine/native split: debug info has no install route, and
 	# the two d3d9.dll flavors are one binary with one `.pdb`.
@@ -377,6 +379,11 @@ MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE)
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
 
+# Every leg that needs a prefix depends on `install-windows-*` first, so
+# `mtld3d.dll` is already in lib/wine when wineboot creates the prefix and
+# wine.inf's `11,,*` wildcard stamps its marker along with every other builtin.
+# A prefix that predates the install does not get one and cannot load mtld3d;
+# `wineboot -u`, or deleting it and re-running, fixes that.
 configure-test-prefix:
 	# Keep automated tests non-interactive and independent of mutable prefix
 	# display settings. EmulateModeset prevents physical host mode changes;
@@ -395,19 +402,6 @@ configure-test-prefix:
 	-$(WINESERVER) -p >/dev/null 2>&1
 	-$(WINE) wineboot >/dev/null 2>&1
 
-# Install the prefix marker for the custom `mtld3d` builtin name, one per arch.
-# Wine resolves a builtin by finding a fake-DLL marker for that NAME in the
-# prefix's system directories and only then loads the real module out of
-# lib/wine; wineboot writes markers only for names it knows from wine.inf, so
-# without this our d3d9.dll cannot reach its own unix half and every test fails
-# to create a device. Idempotent, so it also self-heals a prefix that wineboot
-# has since wiped. Same copy INSTALL.md documents for end users.
-prefix-marker-i686: install-windows-i686
-	cp $(OUT_i386)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/syswow64/mtld3d.dll
-
-prefix-marker-x86_64: install-windows-x86_64
-	cp $(OUT_x64)/mtld3d.fake.dll $(WINEPREFIX_DIR)/drive_c/windows/system32/mtld3d.dll
-
 test: test-unit test-e2e-i686 test-e2e-x86_64
 
 # Host-native unit tests, built for this machine's native arch (no Rosetta).
@@ -422,12 +416,12 @@ test-unit:
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
-	$(MAKE) configure-test-prefix prefix-marker-i686
+	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
 		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386)
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
-	$(MAKE) configure-test-prefix prefix-marker-x86_64
+	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
 		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64)
 
@@ -447,7 +441,7 @@ CONFORMANCE_RUN = cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p m
 # so a bundle that predates the published test binaries says so, rather than
 # failing four times inside the runner.
 define conformance_leg
-	$(MAKE) configure-test-prefix prefix-marker-$(1)
+	$(MAKE) configure-test-prefix
 	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
 	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2)
 endef

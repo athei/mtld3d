@@ -12,8 +12,7 @@ wine/                       lib/wine-shaped tree, every PE builtin-marked
   i386-windows/
     d3d9.dll                Direct3D 9 implementation (builtin-marked)
     mtld3d.dll              PE half of the unix-call bridge (builtin-marked)
-    mtld3d.fake.dll         prefix marker for the custom builtin name
-  x86_64-windows/           the same three files, 64-bit
+  x86_64-windows/           the same two files, 64-bit
   x86_64-unix/
     mtld3d.so               Metal-side unix library
   aarch64-unix/
@@ -21,6 +20,9 @@ wine/                       lib/wine-shaped tree, every PE builtin-marked
 native/                     unmarked d3d9.dll for the DLL-override route
   i386-windows/d3d9.dll
   x86_64-windows/d3d9.dll
+prefix-markers/             for a prefix wineboot never stamped (see below)
+  syswow64/mtld3d.dll       stub, copy into the prefix dir of the same name
+  system32/mtld3d.dll       stub, 64-bit
 mtld3d.conf                 sample configuration, self-documenting
 INSTALL.md                  this file
 LICENSE
@@ -44,10 +46,26 @@ is x86 in either case.
 
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
-builtin, so there is no native variant of it. And because Wine resolves
-builtin *names* through the prefix's system directories (wineboot stamps
-placeholders there for the names it knows — `mtld3d` is not one of them),
-every prefix needs the `mtld3d.fake.dll` markers copied in once.
+builtin, so there is no native variant of it. And Wine resolves builtin
+*names* through the prefix's system directories, not through `lib/wine`: a
+builtin only loads if a marker for its name is already sitting in `system32`
+or `syswow64`.
+
+`wineboot` writes those markers when it creates a prefix, one for every
+builtin it finds in `lib/wine` at that moment. Custom names are not special
+here; `mtld3d` gets a marker for free as long as it was installed **before**
+the prefix was created.
+
+Installing by hand is usually the other case: the prefix already exists, so it
+never saw `mtld3d`. That is what `prefix-markers/` is for. The two directories
+are named after their destination and the stubs already carry the right name,
+so each is a plain copy with no rename. `wineboot -u` would do the same job at
+the cost of a full prefix update. Nothing in `prefix-markers/` ever belongs in
+`lib/wine`.
+
+The CrossOver route below always needs them. There `mtld3d` reaches Wine
+through the bottle's DLL search path and never enters CrossOver's own
+`lib/wine`, so no `wineboot` will ever stamp a marker for it.
 
 ## Requirements
 
@@ -93,10 +111,10 @@ tar -xf mtld3d.tar.xz
 # Replaces lib/wine's d3d9.dll and adds the mtld3d builtin pair.
 cp -R wine/* "$WINE/lib/wine/"
 
-# One-time prefix markers for the custom builtin name (d3d9 needs none —
-# wineboot stamps its placeholder into every prefix).
-cp wine/i386-windows/mtld3d.fake.dll   "$WINEPREFIX/drive_c/windows/syswow64/mtld3d.dll"
-cp wine/x86_64-windows/mtld3d.fake.dll "$WINEPREFIX/drive_c/windows/system32/mtld3d.dll"
+# One-time prefix markers, only needed because this prefix already existed.
+# Skip both lines if the prefix is created after the copy above.
+cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"
+cp prefix-markers/system32/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
 
 # Optional: runtime configuration next to the game executable.
 cp mtld3d.conf "/path/to/MyGame/"
@@ -117,8 +135,8 @@ cp wine/x86_64-unix/mtld3d.so     "$WINE/lib/wine/x86_64-unix/"    # x86_64 Wine
 #cp wine/aarch64-unix/mtld3d.so   "$WINE/lib/wine/aarch64-unix/"   # arm64 Wine
 
 # One-time prefix markers, as in the builtin route.
-cp wine/i386-windows/mtld3d.fake.dll   "$WINEPREFIX/drive_c/windows/syswow64/mtld3d.dll"
-cp wine/x86_64-windows/mtld3d.fake.dll "$WINEPREFIX/drive_c/windows/system32/mtld3d.dll"
+cp prefix-markers/syswow64/mtld3d.dll "$WINEPREFIX/drive_c/windows/syswow64/"
+cp prefix-markers/system32/mtld3d.dll "$WINEPREFIX/drive_c/windows/system32/"
 
 # Native d3d9.dll next to the game executable — pick the game's arch.
 cp native/i386-windows/d3d9.dll "/path/to/MyGame/"     # 32-bit game
@@ -157,8 +175,8 @@ cp -R wine "$BOTTLE/mtld3d"
 
 # Prefix markers so Wine resolves the custom builtin name (Wine looks
 # builtin names up in the prefix's system dirs, not on the search path).
-cp "$BOTTLE/mtld3d/i386-windows/mtld3d.fake.dll"   "$BOTTLE/drive_c/windows/syswow64/mtld3d.dll"
-cp "$BOTTLE/mtld3d/x86_64-windows/mtld3d.fake.dll" "$BOTTLE/drive_c/windows/system32/mtld3d.dll"
+cp prefix-markers/syswow64/mtld3d.dll "$BOTTLE/drive_c/windows/syswow64/"
+cp prefix-markers/system32/mtld3d.dll "$BOTTLE/drive_c/windows/system32/"
 
 # Native d3d9.dll next to the game executable — pick the game's arch.
 cp native/i386-windows/d3d9.dll "$GAME_DIR/"     # 32-bit game
