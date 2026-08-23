@@ -9,7 +9,7 @@ use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
     D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
-    D3DVOLUME_DESC, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
+    D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
     IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl,
     IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
     IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl,
@@ -20,6 +20,44 @@ use crate::{
     check::{expect_created, expect_ok},
     vtbl::deref_vtbl,
 };
+
+// ── Private data ──
+
+/// `SetPrivateData(guid, blob, len, 0)` through a resource's own thunk.
+fn set_private_data(
+    set: unsafe extern "system" fn(*mut c_void, *const Guid, *const c_void, u32, u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    blob: &[u8],
+) -> i32 {
+    let len = u32::try_from(blob.len()).expect("blob fits u32");
+    // SAFETY: vtable thunk; `blob` is readable for `len`.
+    unsafe {
+        set(
+            this,
+            &raw const *guid,
+            blob.as_ptr().cast::<c_void>(),
+            len,
+            0,
+        )
+    }
+}
+
+/// `GetPrivateData(guid, out, &mut size)`; a null `out` asks for the size alone.
+fn get_private_data(
+    get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void, *mut u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    out: Option<&mut [u8]>,
+) -> (i32, u32) {
+    let (ptr, mut size) = out.map_or((core::ptr::null_mut(), 0), |b| {
+        let len = u32::try_from(b.len()).expect("buffer fits u32");
+        (b.as_mut_ptr().cast::<c_void>(), len)
+    });
+    // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
+    let hr = unsafe { get(this, &raw const *guid, ptr, &raw mut size) };
+    (hr, size)
+}
 
 // ── Volume texture ──
 
@@ -633,52 +671,72 @@ impl VertexBuffer<'_> {
     }
 
     /// `SetPrivateData(guid, blob, len, 0)`.
-    ///
-    /// # Panics
-    /// If `blob` is longer than `u32::MAX`.
     #[must_use]
-    pub fn set_private_data_hr(&self, guid: &mtld3d_types::Guid, blob: &[u8]) -> i32 {
-        let len = u32::try_from(blob.len()).expect("blob fits u32");
-        // SAFETY: vtable thunk; `blob` is readable for `len`.
-        unsafe {
-            (self.vtbl().set_private_data)(
-                self.ptr,
-                &raw const *guid,
-                blob.as_ptr().cast::<c_void>(),
-                len,
-                0,
-            )
-        }
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
     }
 
     /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
     ///
     /// A null `out` asks for the size alone.
-    ///
-    /// # Panics
-    /// If `out` is longer than `u32::MAX`.
     #[must_use]
-    pub fn get_private_data(
-        &self,
-        guid: &mtld3d_types::Guid,
-        out: Option<&mut [u8]>,
-    ) -> (i32, u32) {
-        let (ptr, mut size) = out.map_or((core::ptr::null_mut(), 0), |b| {
-            let len = u32::try_from(b.len()).expect("buffer fits u32");
-            (b.as_mut_ptr().cast::<c_void>(), len)
-        });
-        // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
-        let hr = unsafe {
-            (self.vtbl().get_private_data)(self.ptr, &raw const *guid, ptr, &raw mut size)
-        };
-        (hr, size)
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
     }
 
     /// `FreePrivateData(guid)`.
     #[must_use]
-    pub fn free_private_data_hr(&self, guid: &mtld3d_types::Guid) -> i32 {
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the resource dies.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, and `punk` is a live COM object.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
+    }
+
+    /// `GetPrivateData` for a stored `IUnknown`.
+    ///
+    /// Returns the hr, the pointer it wrote, and the size it reported.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn get_private_data_unknown(&self, guid: &Guid) -> (i32, *mut c_void, u32) {
+        let mut punk: *mut c_void = core::ptr::null_mut();
+        let mut size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; `&mut punk` is a writable pointer slot of the
+        // width `size` names.
+        let hr = unsafe {
+            (self.vtbl().get_private_data)(
+                self.ptr,
+                &raw const *guid,
+                (&raw mut punk).cast::<c_void>(),
+                &raw mut size,
+            )
+        };
+        (hr, punk, size)
     }
 
     /// The raw COM `this` pointer (for `SetStreamSource`).
@@ -776,50 +834,22 @@ impl IndexBuffer<'_> {
     }
 
     /// `SetPrivateData(guid, blob, len, 0)`.
-    ///
-    /// # Panics
-    /// If `blob` is longer than `u32::MAX`.
     #[must_use]
-    pub fn set_private_data_hr(&self, guid: &mtld3d_types::Guid, blob: &[u8]) -> i32 {
-        let len = u32::try_from(blob.len()).expect("blob fits u32");
-        // SAFETY: vtable thunk; `blob` is readable for `len`.
-        unsafe {
-            (self.vtbl().set_private_data)(
-                self.ptr,
-                &raw const *guid,
-                blob.as_ptr().cast::<c_void>(),
-                len,
-                0,
-            )
-        }
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
     }
 
     /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
     ///
     /// A null `out` asks for the size alone.
-    ///
-    /// # Panics
-    /// If `out` is longer than `u32::MAX`.
     #[must_use]
-    pub fn get_private_data(
-        &self,
-        guid: &mtld3d_types::Guid,
-        out: Option<&mut [u8]>,
-    ) -> (i32, u32) {
-        let (ptr, mut size) = out.map_or((core::ptr::null_mut(), 0), |b| {
-            let len = u32::try_from(b.len()).expect("buffer fits u32");
-            (b.as_mut_ptr().cast::<c_void>(), len)
-        });
-        // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
-        let hr = unsafe {
-            (self.vtbl().get_private_data)(self.ptr, &raw const *guid, ptr, &raw mut size)
-        };
-        (hr, size)
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
     }
 
     /// `FreePrivateData(guid)`.
     #[must_use]
-    pub fn free_private_data_hr(&self, guid: &mtld3d_types::Guid) -> i32 {
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
     }

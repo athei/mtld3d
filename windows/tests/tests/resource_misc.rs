@@ -8,10 +8,13 @@ use core::ffi::c_void;
 use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
-    D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL,
-    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE,
+    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_INDEX16,
+    D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DQUERYTYPE_EVENT,
+    D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
 };
+
+/// `GetPrivateData` as a test reads it: the hr and the size it reported.
+type GetPrivateData<'a> = &'a dyn Fn(Option<&mut [u8]>) -> (i32, u32);
 
 /// `vs_2_0 { dcl_position v0; mov oPos, v0 }` and `ps_2_0 { mov oC0, c0 }`.
 ///
@@ -442,4 +445,186 @@ fn legacy_feature_stub_contracts() {
         D3DERR_INVALIDCALL,
         "SetDialogBoxMode stub"
     );
+}
+
+/// Assert the blob round trip on one resource.
+fn check_private_data(
+    label: &str,
+    blob: &[u8],
+    set: &dyn Fn(&[u8]) -> i32,
+    get: GetPrivateData<'_>,
+    free: &dyn Fn() -> i32,
+) {
+    assert_eq!(set(blob), D3D_OK, "{label}: SetPrivateData");
+
+    let (hr, size) = get(None);
+    assert_eq!(hr, D3D_OK, "{label}: size query");
+    assert_eq!(
+        size as usize,
+        blob.len(),
+        "{label}: the size query reports the stored length"
+    );
+
+    let mut out = vec![0u8; blob.len()];
+    let (hr, _) = get(Some(&mut out));
+    assert_eq!(hr, D3D_OK, "{label}: GetPrivateData");
+    assert_eq!(out, blob, "{label}: the blob comes back unchanged");
+
+    assert_eq!(free(), D3D_OK, "{label}: FreePrivateData");
+    assert_eq!(
+        get(None).0,
+        D3DERR_NOTFOUND,
+        "{label}: the key is unknown once freed, not merely unreadable"
+    );
+}
+
+/// Vertex and index buffers hold private data like every other resource.
+///
+/// The conformance corpus exercises private data on textures and surfaces
+/// only, so the buffers' own store is covered here: the blob survives a
+/// round-trip, the size query reports its length, and freeing it makes the
+/// key unknown again rather than leaving a stale copy behind.
+#[test]
+fn buffer_private_data_round_trips() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x1234_5678,
+        data2: 0x9abc,
+        data3: 0xdef0,
+        data4: [7; 8],
+    };
+    let blob = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    check_private_data(
+        "vertex buffer",
+        &blob,
+        &|b| vb.set_private_data_hr(&guid, b),
+        &|o| vb.get_private_data(&guid, o),
+        &|| vb.free_private_data_hr(&guid),
+    );
+
+    let ib = h.create_index_buffer(64, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    check_private_data(
+        "index buffer",
+        &blob,
+        &|b| ib.set_private_data_hr(&guid, b),
+        &|o| ib.get_private_data(&guid, o),
+        &|| ib.free_private_data_hr(&guid),
+    );
+}
+
+/// The `IUnknown` form of private data holds a real COM reference.
+///
+/// This is the store's one dangerous path: it `AddRef`s on store and must
+/// `Release` on overwrite, on free, and when the resource dies. A leak here
+/// keeps the pointed-at object alive forever, and a double release frees an
+/// object the application still holds. The device stands in for the
+/// application's object because its refcount is observable from a test.
+///
+/// One buffer kind is enough: both forward to the same store.
+#[test]
+fn buffer_private_data_holds_a_reference_to_a_stored_iunknown() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x2222_3333,
+        data2: 0x4444,
+        data3: 0x5555,
+        data4: [1; 8],
+    };
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+
+    // An unknown key is NOTFOUND, not an empty success, even for a pure size
+    // query: an application that reads before it writes must be able to tell
+    // the two apart.
+    assert_eq!(
+        vb.get_private_data(&guid, None).0,
+        D3DERR_NOTFOUND,
+        "GetPrivateData before any Set"
+    );
+    assert_eq!(
+        vb.free_private_data_hr(&guid),
+        D3DERR_NOTFOUND,
+        "FreePrivateData before any Set"
+    );
+
+    let before = h.device_refcount();
+    assert_eq!(
+        vb.set_private_data_unknown(&guid, h.device()),
+        D3D_OK,
+        "SetPrivateData(D3DSPD_IUNKNOWN)"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 1,
+        "the store took a reference of its own"
+    );
+
+    // Storing over the same key releases what was there.
+    assert_eq!(
+        vb.set_private_data_unknown(&guid, h.device()),
+        D3D_OK,
+        "SetPrivateData over an existing key"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 1,
+        "the overwrite released the previous reference"
+    );
+
+    // Reading one out hands the caller a reference of its own.
+    let (hr, punk, size) = vb.get_private_data_unknown(&guid);
+    assert_eq!(hr, D3D_OK, "GetPrivateData(IUnknown)");
+    assert_eq!(punk, h.device(), "the pointer that was stored");
+    assert_eq!(
+        size as usize,
+        size_of::<*mut c_void>(),
+        "an IUnknown entry reports pointer width"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 2,
+        "Get takes a reference for the caller"
+    );
+    // SAFETY: `punk` is the reference `GetPrivateData` just handed out.
+    unsafe { h.release_device_ref(punk) };
+
+    assert_eq!(vb.free_private_data_hr(&guid), D3D_OK, "FreePrivateData");
+    assert_eq!(
+        h.device_refcount(),
+        before,
+        "freeing the key released the store's reference"
+    );
+}
+
+/// A buffer too small to hold the blob reports the size it needs.
+///
+/// Applications size their buffer from this call, so returning success with a
+/// truncated copy would corrupt whatever they store.
+#[test]
+fn buffer_private_data_reports_the_size_it_needs() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x6666_7777,
+        data2: 0x8888,
+        data3: 0x9999,
+        data4: [2; 8],
+    };
+    let blob = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(
+        vb.set_private_data_hr(&guid, &blob),
+        D3D_OK,
+        "SetPrivateData"
+    );
+
+    let mut small = [0u8; 4];
+    let (hr, size) = vb.get_private_data(&guid, Some(&mut small));
+    assert_eq!(hr, D3DERR_MOREDATA, "an undersized buffer is MOREDATA");
+    assert_eq!(
+        size as usize,
+        blob.len(),
+        "the call reports the size the blob needs"
+    );
+    assert_eq!(small, [0u8; 4], "a rejected read writes nothing");
 }
