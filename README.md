@@ -142,11 +142,10 @@ and no game depends on them:
   focus-window subclassing, no synthesized activation messages. Presentation is
   a composited Metal layer, so a lost display is never a lost device.
 - **Software paths**: no reference or software rasterizer, no software vertex
-  processing, no ProcessVertices, no RegisterSoftwareDevice. HAL on the default
-  Metal device is the only device type; multi-adapter setups are not
-  enumerated.
-- **Clip-plane application**: SetClipPlane state round-trips but planes are not
-  applied on the GPU.
+  processing, no RegisterSoftwareDevice. HAL on the default Metal device is the
+  only device type; multi-adapter setups are not enumerated. ProcessVertices
+  transforms through the current FVF; an explicit vertex-declaration source is
+  rejected.
 - **Legacy remnants**: N-patch/RT-patch tessellation, vertex tweening,
   palettized textures, gamma ramp. Dead features in real-world content,
   accepted or rejected per spec but non-functional.

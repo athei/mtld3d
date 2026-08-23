@@ -227,7 +227,8 @@ fn validate_device_succeeds_and_clip_plane_round_trips() {
     // validates pipeline state at PSO-creation time, so every state we accept
     // renders in one pass.
     assert_eq!(h.validate_device_hr(), 0, "ValidateDevice → S_OK");
-    // SetClipPlane/GetClipPlane are a CPU state round-trip (no GPU application).
+    // `SetClipPlane`/`GetClipPlane` round-trip here; that the planes reach
+    // the GPU is `clip_planes.rs`'s job.
     // An unset plane reads back zero; a set plane reads back exactly.
     assert_eq!(
         h.get_clip_plane(0),
