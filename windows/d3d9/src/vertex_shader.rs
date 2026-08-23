@@ -4,10 +4,7 @@ use mtld3d_core::{convert::InputSemantic, ids::ProgramId};
 use mtld3d_shared::InPtr;
 use mtld3d_types::{Guid, IDirect3DVertexShader9Vtbl};
 
-use super::{
-    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, com_ref::ComUnknown,
-    device::DeviceInner,
-};
+use super::{D3DERR_INVALIDCALL, E_NOINTERFACE, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_VERTEX_SHADER9_VTBL: IDirect3DVertexShader9Vtbl = IDirect3DVertexShader9Vtbl {
     query_interface: vs_query_interface,
@@ -42,6 +39,7 @@ impl Direct3DVertexShader9 {
         uses_rel_const: bool,
         uses_int_const: bool,
         input_semantics: Vec<InputSemantic>,
+        bytecode: Box<[u32]>,
     ) -> Self {
         let mut flags = VsConstUsage::empty();
         flags.set(VsConstUsage::USES_REL_CONST, uses_rel_const);
@@ -52,6 +50,7 @@ impl Direct3DVertexShader9 {
             max_const_used,
             flags,
             input_semantics,
+            bytecode,
         }));
         Self {
             vtbl: &raw const DIRECT3D_VERTEX_SHADER9_VTBL,
@@ -132,6 +131,11 @@ struct VertexShaderInner {
     max_const_used: u32,
     flags: VsConstUsage,
     input_semantics: Vec<InputSemantic>,
+    /// The token stream the app passed to `CreateVertexShader`.
+    ///
+    /// Kept verbatim so `GetFunction` can hand it back. Nothing else reads
+    /// it: the translation works from the parsed `DxsoProgram`.
+    bytecode: Box<[u32]>,
 }
 
 #[inline]
@@ -243,10 +247,14 @@ extern "system" fn vs_get_device(this: *mut c_void, _device: *mut *mut c_void) -
 
 extern "system" fn vs_get_function(
     this: *mut c_void,
-    _data: *mut c_void,
-    _size_of_data: *mut u32,
+    data: *mut c_void,
+    size_of_data: *mut u32,
 ) -> i32 {
     let _timer = vs_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DVertexShader9::GetFunction → NOTAVAILABLE");
-    D3DERR_NOTAVAILABLE
+    // SAFETY: vtable thunk; `this` is *mut Direct3DVertexShader9 per IDirect3DVertexShader9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DVertexShader9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `size_of_data`/`data` are the caller's out-params per the ABI.
+    unsafe { crate::com_ref::com_get_function(obj.inner().bytecode.as_ref(), data, size_of_data) }
 }

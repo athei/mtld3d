@@ -676,6 +676,22 @@ impl VertexShader<'_> {
     pub const fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live vertex shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
+    }
 }
 
 impl Drop for VertexShader<'_> {
@@ -705,6 +721,22 @@ impl PixelShader<'_> {
     #[must_use]
     pub const fn as_ptr(&self) -> *mut c_void {
         self.ptr
+    }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live pixel shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
     }
 }
 

@@ -3,6 +3,8 @@
 //! Bound and driven with a pixel-shader constant, verified by the rendered
 //! colour.
 
+use core::ffi::c_void;
+
 use mtld3d_tests::{Harness, PosVertex};
 use mtld3d_types::{D3DERR_INVALIDCALL, D3DFVF_XYZ, D3DPT_TRIANGLELIST};
 
@@ -24,6 +26,32 @@ const PS_BC: [u32; 5] = [
     (1) | (2 << 24),
     (1 << 11) | (0xF << 16),
     (2 << 28) | (0xE4 << 16),
+    0x0000_FFFF,
+];
+
+/// `vs_1_1`: `def c0, 1, 0, 0, 0; dcl_position v0; mov oPos, v0;`
+///
+/// SM1 carries no instruction-length field, so a walker that reads one steps
+/// into this shader's immediates and takes the exponent bits of `1.0f` as a
+/// token count. The `def` is what makes this stream worth keeping: its four
+/// literal words are the ones a length-field walk misreads.
+const VS1_DEF_BC: [u32; 14] = [
+    0xFFFE_0101,
+    // def c0, 1.0, 0.0, 0.0, 0.0
+    0x0000_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    // dcl_position v0
+    0x0000_001F,
+    0x8000_0000,
+    0x900F_0000,
+    // mov oPos, v0
+    0x0000_0001,
+    0xC00F_0000,
+    0x90E4_0000,
     0x0000_FFFF,
 ];
 
@@ -290,4 +318,77 @@ fn float_shader_constants_round_trip() {
     let (hr, ps_f) = h.get_pixel_shader_constant_f(0, 1);
     assert_eq!(hr, 0, "PS const F get");
     assert_eq!(ps_f, [0.5, 0.25, 0.0, 1.0], "PS const F round-trip");
+}
+
+/// Assert the whole `GetFunction` contract for one shader.
+fn check_get_function(label: &str, bc: &[u32], get: &dyn Fn(*mut c_void, *mut u32) -> i32) {
+    let want = u32::try_from(core::mem::size_of_val(bc)).expect("bytecode fits u32");
+
+    // Size query: a null buffer reports the byte length.
+    let mut size = 0u32;
+    assert_eq!(
+        get(core::ptr::null_mut(), &raw mut size),
+        0,
+        "{label}: size query"
+    );
+    assert_eq!(size, want, "{label}: reported size");
+
+    // Copy: the tokens come back byte for byte.
+    let mut buf = vec![0u32; bc.len()];
+    let mut size = want;
+    assert_eq!(
+        get(buf.as_mut_ptr().cast(), &raw mut size),
+        0,
+        "{label}: copy"
+    );
+    assert_eq!(buf, bc, "{label}: bytecode round-trip");
+    assert_eq!(
+        size, want,
+        "{label}: the caller's size is left as it passed it"
+    );
+
+    // A buffer one byte short is rejected rather than truncated into, and the
+    // size the caller passed in is left as it was: the size query is the only
+    // form that writes it.
+    let mut short = want - 1;
+    assert_eq!(
+        get(buf.as_mut_ptr().cast(), &raw mut short),
+        D3DERR_INVALIDCALL,
+        "{label}: undersized buffer"
+    );
+    assert_eq!(
+        short,
+        want - 1,
+        "{label}: a rejected copy leaves the caller's size as it was"
+    );
+
+    // The size slot is where the length goes in and out, so there is no call
+    // without one.
+    assert_eq!(
+        get(core::ptr::null_mut(), core::ptr::null_mut()),
+        D3DERR_INVALIDCALL,
+        "{label}: null size out-param"
+    );
+}
+
+/// `GetFunction` hands back the exact token stream the shader was created from.
+///
+/// Nothing in the conformance corpus calls it, so this test is the only thing
+/// standing between the round-trip and a regression. An app that reads its own
+/// bytecode back does not check the HRESULT first: it sizes a buffer from the
+/// query and copies into it, so a failure here surfaces as a null dereference
+/// inside the app rather than as a D3D error.
+#[test]
+fn get_function_round_trips_the_bytecode() {
+    let h = Harness::new();
+
+    for (label, bc) in [("vs_2_0", &VS_BC[..]), ("vs_1_1 with def", &VS1_DEF_BC[..])] {
+        let vs = h.create_vertex_shader(bc);
+        // SAFETY: every call passes either null or a buffer of the size it names.
+        check_get_function(label, bc, &|d, s| unsafe { vs.get_function(d, s) });
+    }
+
+    let ps = h.create_pixel_shader(&PS_BC);
+    // SAFETY: every call passes either null or a buffer of the size it names.
+    check_get_function("ps_2_0", &PS_BC, &|d, s| unsafe { ps.get_function(d, s) });
 }

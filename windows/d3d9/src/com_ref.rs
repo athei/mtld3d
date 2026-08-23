@@ -28,6 +28,7 @@
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
 use mtld3d_shared::VtableThis;
+use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
 
 use crate::device::{
     device_wrapper_add_ref, device_wrapper_note_reset_blocker, device_wrapper_release,
@@ -282,6 +283,50 @@ pub unsafe trait ComChild: Sized {
     /// `this` is a live wrapper with both counters at zero; the caller must not
     /// access it afterwards.
     unsafe fn finalize(this: *mut Self);
+}
+
+// ── Shader bytecode read-back ──
+//
+// Not part of the refcount engine above: no COM object, no vtable, no
+// `ComChild`. It lives here because both shader wrappers answer `GetFunction`
+// from a token stream and nothing else does.
+
+/// `GetFunction` for the two shader objects.
+///
+/// Hands the app back the token stream it created the shader from.
+/// `pSizeOfData` is required and is both in and out; `pData` is optional, and
+/// a null one asks for the size alone, so a caller can size its buffer and ask
+/// again. On the copy path `*pSizeOfData` is left exactly as the caller set
+/// it: the value is the buffer's size going in, apps do not expect it back
+/// changed, and one that reads it afterwards would see its own number.
+///
+/// # Safety
+/// `data` and `size_of_data` are the caller's out-params per the D3D9 ABI:
+/// `size_of_data` is either null or points to a writable `u32`, and a non-null `data` points to
+/// at least `*size_of_data` writable bytes.
+pub unsafe fn com_get_function(bytecode: &[u32], data: *mut c_void, size_of_data: *mut u32) -> i32 {
+    if size_of_data.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    let need = core::mem::size_of_val(bytecode);
+    let Ok(need_u32) = u32::try_from(need) else {
+        return D3DERR_INVALIDCALL;
+    };
+    if data.is_null() {
+        // SAFETY: non-null (checked) and writable per the ABI.
+        unsafe { *size_of_data = need_u32 };
+        return D3D_OK;
+    }
+    // SAFETY: non-null (checked) and readable per the ABI.
+    if unsafe { *size_of_data } < need_u32 {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: the caller's buffer holds at least `need` bytes per the check
+    // above, and the token stream is a live `[u32]` for the length copied.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytecode.as_ptr().cast::<u8>(), data.cast::<u8>(), need);
+    }
+    D3D_OK
 }
 
 /// `IUnknown::AddRef` for a [`ComChild`]: bump the public refcount.

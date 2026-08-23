@@ -9694,9 +9694,9 @@ extern "system" fn device_create_vertex_shader(
     // a bound vertex declaration's elements → `[[attribute(N)]]` indices
     // without a trip to the encoder thread.
     let input_semantics = extract_input_semantics(&program);
-    // `bytecode` drops at end of function scope; the parsed program moves
-    // into an op bound for the encoder's program cache, and the wrapper
-    // only records identity bits.
+    // The parsed program moves into an op bound for the encoder's program
+    // cache; the token stream itself moves into the wrapper, which answers
+    // `GetFunction` from it.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -9711,6 +9711,7 @@ extern "system" fn device_create_vertex_shader(
         uses_rel_const,
         uses_int_const,
         input_semantics,
+        bytecode.into_boxed_slice(),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
@@ -10268,6 +10269,7 @@ extern "system" fn device_create_pixel_shader(
         max_const_used,
         uses_bump_env,
         color_out_mask,
+        bytecode.into_boxed_slice(),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.

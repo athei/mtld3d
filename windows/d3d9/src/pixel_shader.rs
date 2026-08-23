@@ -4,10 +4,7 @@ use mtld3d_core::ids::ProgramId;
 use mtld3d_shared::InPtr;
 use mtld3d_types::{Guid, IDirect3DPixelShader9Vtbl};
 
-use super::{
-    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, com_ref::ComUnknown,
-    device::DeviceInner,
-};
+use super::{D3DERR_INVALIDCALL, E_NOINTERFACE, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_PIXEL_SHADER9_VTBL: IDirect3DPixelShader9Vtbl = IDirect3DPixelShader9Vtbl {
     query_interface: ps_query_interface,
@@ -36,6 +33,7 @@ impl Direct3DPixelShader9 {
         max_const_used: u32,
         uses_bump_env: bool,
         color_out_mask: u8,
+        bytecode: Box<[u32]>,
     ) -> Self {
         let inner = Box::into_raw(Box::new(PixelShaderInner {
             device_inner,
@@ -43,6 +41,7 @@ impl Direct3DPixelShader9 {
             max_const_used,
             uses_bump_env,
             color_out_mask,
+            bytecode,
         }));
         Self {
             vtbl: &raw const DIRECT3D_PIXEL_SHADER9_VTBL,
@@ -89,6 +88,11 @@ struct PixelShaderInner {
     max_const_used: u32,
     uses_bump_env: bool,
     color_out_mask: u8,
+    /// The token stream the app passed to `CreatePixelShader`.
+    ///
+    /// Kept verbatim so `GetFunction` can hand it back. Nothing else reads
+    /// it: the translation works from the parsed `DxsoProgram`.
+    bytecode: Box<[u32]>,
 }
 
 #[inline]
@@ -199,10 +203,14 @@ extern "system" fn ps_get_device(this: *mut c_void, _device: *mut *mut c_void) -
 
 extern "system" fn ps_get_function(
     this: *mut c_void,
-    _data: *mut c_void,
-    _size_of_data: *mut u32,
+    data: *mut c_void,
+    size_of_data: *mut u32,
 ) -> i32 {
     let _timer = ps_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DPixelShader9::GetFunction → NOTAVAILABLE");
-    D3DERR_NOTAVAILABLE
+    // SAFETY: vtable thunk; `this` is *mut Direct3DPixelShader9 per IDirect3DPixelShader9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DPixelShader9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `size_of_data`/`data` are the caller's out-params per the ABI.
+    unsafe { crate::com_ref::com_get_function(obj.inner().bytecode.as_ref(), data, size_of_data) }
 }
