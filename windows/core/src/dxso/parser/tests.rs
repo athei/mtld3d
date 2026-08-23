@@ -4,7 +4,7 @@
 //! constants, swizzles, modifiers) and the error paths (unsupported
 //! versions, control flow, truncation).
 
-use super::parse;
+use super::{operand_token_count, parse};
 use crate::dxso::{
     ir::{
         DeclUsage, Declaration, DstMods, DxsoError, RegKind, ShaderType, SrcModifier, Swizzle,
@@ -25,11 +25,16 @@ const TYPE_INPUT: u32 = 1;
 const TYPE_CONST: u32 = 2;
 const TYPE_ADDR: u32 = 3;
 const TYPE_RASTOUT: u32 = 4;
+const TYPE_CONSTINT: u32 = 7;
 const TYPE_COLOROUT: u32 = 8;
 const TYPE_OUTPUT: u32 = 11;
+const TYPE_CONSTBOOL: u32 = 14;
 
+const OP_NOP: u16 = 0;
 const OP_MOV: u16 = 1;
 const OP_DCL: u16 = 31;
+const OP_DEFB: u16 = 47;
+const OP_DEFI: u16 = 48;
 const OP_DEF: u16 = 81;
 const OP_CALL: u16 = 25;
 const OP_IF: u16 = 40;
@@ -679,5 +684,122 @@ fn ps_position_index_0_is_rejected() {
     assert!(
         prog.has_invalid_pixel_input_decl(),
         "the ps_3_0 dcl_position0 input must be rejected"
+    );
+}
+
+/// Counting an SM1 operand run: bit 31 marks every register token.
+///
+/// The shader models split here. SM2.0 carries the run length in the opcode
+/// token, SM1.x carries it nowhere, and reading the SM2 field off an SM1
+/// stream lands on whatever the instruction's own operands happen to encode.
+#[test]
+fn sm1_operand_runs_are_counted_by_the_continuation_bit() {
+    let count = |bc: &[u32], major| operand_token_count(major, bc[0], |n| bc.get(1 + n).copied());
+
+    // vs_1_1 { mov oPos, v0 }: a destination and a source, neither declared
+    // in the opcode token.
+    let mov = [
+        opcode_token(OP_MOV, 0),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    assert_eq!(count(&mov, 1), 2, "mov: dst + src");
+    // The same instruction under SM2 rules reads the run length from the
+    // opcode token, so the two paths agree only when it is populated.
+    assert_eq!(count(&mov, 2), 0, "SM2 reads the field, which mov leaves 0");
+    assert_eq!(
+        count(&[opcode_token(OP_MOV, 2), mov[1], mov[2], END_TOKEN], 2),
+        2,
+        "SM2 mov with the field set"
+    );
+
+    // A zero-operand instruction is followed by another opcode token, whose
+    // bit 31 is clear, so the scan stops without consuming it.
+    assert_eq!(
+        count(&[opcode_token(OP_NOP, 0), opcode_token(OP_MOV, 0)], 1),
+        0,
+        "nop takes no operands"
+    );
+
+    // `dcl` is specially formatted, but its usage token is a register token
+    // like any other and carries the bit.
+    assert_eq!(
+        count(
+            &[
+                opcode_token(OP_DCL, 0),
+                0x8000_0000,
+                dst_token(TYPE_INPUT, 0, 0xF, false),
+            ],
+            1
+        ),
+        2,
+        "dcl: usage + dst"
+    );
+
+    // A truncated stream ends the run rather than reading past it.
+    assert_eq!(
+        count(
+            &[opcode_token(OP_MOV, 0), dst_token(TYPE_TEMP, 0, 0xF, false)],
+            1
+        ),
+        1,
+        "the run stops at the end of the stream"
+    );
+}
+
+/// The constant definitions are counted by opcode, not by scanning.
+///
+/// Their immediates are literal values: the top bit is part of the number, so
+/// a scan reads a negative float as another operand and a positive one as the
+/// end of the run. Either way the walk desynchronizes, and where it lands is
+/// decided by bits the shader author chose for unrelated reasons.
+#[test]
+fn sm1_constant_definitions_are_counted_by_opcode() {
+    let count = |bc: &[u32]| operand_token_count(1, bc[0], |n| bc.get(1 + n).copied());
+
+    let def = |imm: [u32; 4]| {
+        let mut bc = vec![
+            opcode_token(OP_DEF, 0),
+            dst_token(TYPE_CONST, 0, 0xF, false),
+        ];
+        bc.extend_from_slice(&imm);
+        bc.push(END_TOKEN);
+        bc
+    };
+    // 1.0 clears the top bit and -1.0 sets it; both are five tokens.
+    assert_eq!(count(&def([0x3F80_0000; 4])), 5, "def c0, 1, 1, 1, 1");
+    assert_eq!(count(&def([0xBF80_0000; 4])), 5, "def c0, -1, -1, -1, -1");
+    // An immediate whose low half reads as a comment opcode: a walker that
+    // took this for an instruction would skip its "payload" and run off the
+    // end of the shader.
+    assert_eq!(
+        count(&def([0x3F80_FFFE; 4])),
+        5,
+        "def c0 with a comment-like immediate"
+    );
+
+    assert_eq!(
+        count(&[
+            opcode_token(OP_DEFI, 0),
+            dst_token(TYPE_CONSTINT, 0, 0xF, false),
+            1,
+            2,
+            3,
+            4,
+            END_TOKEN,
+        ]),
+        5,
+        "defi: dst + four integers"
+    );
+    assert_eq!(
+        count(&[
+            opcode_token(OP_DEFB, 0),
+            dst_token(TYPE_CONSTBOOL, 0, 0xF, false),
+            1,
+            END_TOKEN,
+        ]),
+        2,
+        "defb: dst + one bool"
     );
 }
