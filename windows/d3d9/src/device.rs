@@ -2262,7 +2262,7 @@ impl Direct3DDevice9 {
         self.inner
     }
 
-    /// COM `AddRef` used when a child resource's `GetDevice` hands this device back to the caller.
+    /// COM `AddRef` on the device wrapper, taken on a child object's behalf.
     ///
     /// Bumps the wrapper refcount directly — D3D9 objects are
     /// single-threaded, so this matches `device_add_ref`'s effect without
@@ -2830,14 +2830,15 @@ pub fn device_wrapper_from(inner: *mut DeviceInner) -> *mut c_void {
     unsafe { (*inner).device_wrapper() }
 }
 
-/// Forward an implicit child object's `AddRef` to its owning device wrapper.
+/// Take one reference on a device wrapper on behalf of a child object.
 ///
-/// The implicit swapchain and the implicit render-target / depth-stencil
-/// surfaces are device-owned: each holds exactly one reference on the device
-/// while its own public refcount is non-zero — acquired here on the child's
-/// 0→1 transition (the child forwards a reference to its parent device).
-/// `wrapper` is the `Direct3DDevice9`* from [`DeviceInner::device_wrapper`]; a
-/// null wrapper (device not yet stamped) is a no-op.
+/// Two callers. The implicit swapchain and the implicit render-target /
+/// depth-stencil surfaces are device-owned: each holds exactly one reference
+/// on the device while its own public refcount is non-zero, acquired here on
+/// the child's 0→1 transition. `GetDevice` takes one as well, on behalf of the
+/// application, which releases it. `wrapper` is the `Direct3DDevice9`* from
+/// [`DeviceInner::device_wrapper`]; a null wrapper (device not yet stamped) is
+/// a no-op.
 pub fn device_wrapper_add_ref(wrapper: *mut c_void) {
     if wrapper.is_null() {
         return;

@@ -29,7 +29,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `mrt.rs` | Multiple render targets: `ps_3_0` writing `oC0`/`oC1` into two bound targets; `Clear` reaching every bound target and an unwritten target keeping its contents; `D3DRS_COLORWRITEENABLE1` masking slot 1 alone; the slot contract (four slots, slot 0 never null, `NOTFOUND` on an unbound slot, `SetRenderTarget(1, NULL)`); `Reset` unbinding slots 1..3; a target sized unlike slot 0 cleared but left out of draws; a mid-pass `Clear` and a rect `Clear` reaching both targets through the in-pass quad; the MRT caps bits. |
 | `state_block.rs` | Capture/Apply (ALL); VERTEXSTATE restores FVF; PIXELSTATE restores sampler; Begin/EndStateBlock recording. |
 | `query.rs` | EVENT fence; OCCLUSION sample count; TIMESTAMP contract. |
-| `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice`/`SetClipPlane` stubs; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
+| `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice` answering with the creating device from every wrapper it was a stub on (both buffers, the 2D, cube and volume textures in the pools that do and do not pin the device, a volume level, a texture's own surface and a standalone render target, both shaders, the declaration, the state block and the query), each releasing the reference it was handed and checking the device count back to its pre-call value; a null `this` and a null out-pointer answered rather than faulted; `SetClipPlane`/`GetClipPlane` round trip; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
 | `unload.rs` | `LoadLibrary` → `Direct3DCreate9` → `Release` → `FreeLibrary`, then a continuable exception raised with a resuming handler appended at the end of the chain: proves the unloaded image left no vectored exception handler behind (no harness: its `raw-dylib` import would keep the module mapped). |
 
 ## Documented limitations / stubs pinned by tests
@@ -51,10 +51,8 @@ contract so a future implementation flips a known assertion.
   `D3DPOOL_SYSTEMMEM` only (DEFAULT/MANAGED rejected); `GetRenderTargetData` /
   `GetFrontBufferData` read a backbuffer / standalone-color RT back into a
   SYSTEMMEM surface (texture-backed RT sources not yet resolved).
-- **Resources:** `GetDevice` is implemented on surfaces but still stubbed on the
-  other resource types (VB/IB/textures/shaders/queries). `SetClipPlane` is a
-  stub; `ValidateDevice` returns S_OK (single-pass valid); `SetGammaRamp` is a
-  no-op.
+- **Resources:** `ValidateDevice` returns S_OK (single-pass valid);
+  `SetGammaRamp` is a no-op.
 - **Legacy:** `SetPrivateData`, `SetPaletteEntries`, `GetRasterStatus`,
   `GetClipStatus`, `SetDialogBoxMode`.
 

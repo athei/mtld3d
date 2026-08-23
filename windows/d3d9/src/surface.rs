@@ -15,12 +15,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET,
-    com_ref::ComUnknown,
-    device::{DeviceInner, Direct3DDevice9},
-    null_out,
-    private_data::PrivateDataStore,
-    texture::Direct3DTexture9,
+    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
+    device::DeviceInner, null_out, private_data::PrivateDataStore, texture::Direct3DTexture9,
     unix_call::unix_call,
 };
 
@@ -1222,6 +1218,25 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
         // forwards one device reference for its public lifetime.
         inner.device_wrapper()
     }
+    fn owning_device(&self) -> *mut c_void {
+        let inner = self.inner();
+        // A surface that belongs to a texture answers through that texture
+        // rather than from its own copy of the pointer. The texture is what
+        // the device detaches at teardown, and a MANAGED one is not pinned by
+        // the surfaces handed out of it, so its own copy can outlive the
+        // device it names.
+        if !inner.parent_texture.is_null() {
+            // SAFETY: `parent_texture` is live for as long as a public
+            // reference to this surface is, which is what reaching this thunk
+            // requires: the surface's public count holds one reference on the
+            // container, and an owned parent is released only in this
+            // surface's finalize.
+            return unsafe { (*inner.parent_texture).owning_device() };
+        }
+        // Standalone surface: it pins the device for its public lifetime, so
+        // its own pointer cannot go stale under it.
+        inner.device_wrapper()
+    }
     fn finalizes_on_zero(&self) -> bool {
         // Implicit surfaces are never freed by `Release` — they are destroyed
         // only at device teardown (see `ImplicitKind`).
@@ -1249,35 +1264,8 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
 extern "system" fn surface_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
     let _timer = surf_timer(this);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetDevice()");
-    if device.is_null() {
-        return D3DERR_INVALIDCALL;
-    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }) else {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    };
-    let dev_inner = obj.inner().device_inner;
-    if dev_inner.is_null() {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    }
-    // SAFETY: `dev_inner` is the live `DeviceInner` that created this surface;
-    // the device outlives its child resources per D3D9 lifetime rules.
-    let wrapper = unsafe { (*dev_inner).device_wrapper() };
-    if wrapper.is_null() {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    }
-    // AddRef per COM — the caller owns one reference on return.
-    // SAFETY: `wrapper` is the live `Direct3DDevice9` COM object that owns
-    // `dev_inner`; D3D9 objects are single-threaded, so the transient
-    // exclusive borrow to bump the refcount is sound.
-    unsafe { (*wrapper.cast::<Direct3DDevice9>()).add_ref_self() };
-    // SAFETY: `device` is non-null (checked) and points to a writable
-    // `*mut c_void` slot per the D3D9 ABI.
-    unsafe { *device = wrapper };
-    D3D_OK
+    unsafe { crate::com_ref::com_get_device::<Direct3DSurface9>(this, device) }
 }
 
 extern "system" fn surface_set_private_data(

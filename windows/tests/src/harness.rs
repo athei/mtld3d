@@ -215,6 +215,24 @@ impl Harness {
         unsafe { (self.factory_vtbl().release)(self.d3d9) }
     }
 
+    /// Release a device reference a `GetDevice` handed out.
+    ///
+    /// Returns the count after the decrement, so a caller can check the
+    /// reference it was given is the one it gave back.
+    ///
+    /// # Safety
+    /// `device` is a reference obtained from a `GetDevice` on this harness's
+    /// device and not yet released.
+    ///
+    /// # Panics
+    /// If `device` is not this harness's device.
+    pub unsafe fn release_device_ref(&self, device: *mut c_void) -> u32 {
+        assert_eq!(device, self.device, "not this harness's device");
+        // SAFETY: balances the reference `GetDevice` took, per the contract
+        // above, so the device stays live.
+        unsafe { (self.dev_vtbl().release)(device) }
+    }
+
     /// The device's current public refcount.
     ///
     /// `AddRef` then `Release`, returning the post-decrement count — the

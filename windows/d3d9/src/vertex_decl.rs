@@ -205,7 +205,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DVertexDeclaration9 {
     fn private_refcount(&self) -> u32 {
         self.private_refcount
     }
-    fn device_forward_target(&self) -> *mut c_void {
+    fn owning_device(&self) -> *mut c_void {
         crate::device::device_wrapper_from(self.inner().device_inner)
     }
     unsafe fn finalize(this: *mut Self) {
@@ -216,9 +216,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DVertexDeclaration9 {
 
 extern "system" fn vd_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
     let _timer = vdecl_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DVertexDeclaration9::GetDevice → INVALIDCALL");
-    null_out(device);
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable thunk; `this` is *mut Direct3DVertexDeclaration9 per its
+    // ABI, and `device` is the caller's out-param.
+    unsafe { crate::com_ref::com_get_device::<Direct3DVertexDeclaration9>(this, device) }
 }
 
 extern "system" fn vd_get_declaration(
