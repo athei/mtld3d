@@ -9,15 +9,11 @@
 
 use core::ffi::c_void;
 
-use log::trace;
 use mtld3d_core::convert::pack_vertex_decl;
 use mtld3d_shared::InPtr;
 use mtld3d_types::{D3DVERTEXELEMENT9, Guid, IDirect3DVertexDeclaration9Vtbl};
 
-use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
-    device::DeviceInner, null_out,
-};
+use super::{D3D_OK, D3DERR_INVALIDCALL, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_VERTEX_DECLARATION9_VTBL: IDirect3DVertexDeclaration9Vtbl =
     IDirect3DVertexDeclaration9Vtbl {
@@ -129,11 +125,21 @@ extern "system" fn vd_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = vdecl_timer(this);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DVertexDeclaration9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DVERTEXDECLARATION9,
+            ],
+            vd_add_ref,
+            "IDirect3DVertexDeclaration9",
+        )
+    }
 }
 
 extern "system" fn vd_add_ref(this: *mut c_void) -> u32 {

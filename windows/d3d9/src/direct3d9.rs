@@ -5,7 +5,7 @@ use log::{error, info, trace, warn};
 use mtld3d_core::caps;
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
-    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
+    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
     mtl_handle::{MTLTextureKind, NSViewKind},
 };
@@ -22,11 +22,10 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, LOG_TARGET,
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
     fullscreen::Rect,
-    null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
 };
@@ -399,15 +398,22 @@ const fn has_srgb_read_decode(fmt: u32) -> bool {
 // ── IUnknown implementation (IDirect3D9) ──
 
 extern "system" fn d3d9_query_interface(
-    _this: *mut c_void,
+    this: *mut c_void,
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3D9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9],
+            d3d9_add_ref,
+            "IDirect3D9",
+        )
+    }
 }
 
 extern "system" fn d3d9_add_ref(this: *mut c_void) -> u32 {

@@ -65,7 +65,7 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOINTERFACE, E_NOTIMPL, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOTIMPL, LOG_TARGET,
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
@@ -2657,11 +2657,21 @@ extern "system" fn device_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DDevice9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DDEVICE9,
+            ],
+            device_add_ref,
+            "IDirect3DDevice9",
+        )
+    }
 }
 
 extern "system" fn device_add_ref(this: *mut c_void) -> u32 {

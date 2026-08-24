@@ -4,7 +4,7 @@ use mtld3d_core::ids::ProgramId;
 use mtld3d_shared::InPtr;
 use mtld3d_types::{Guid, IDirect3DPixelShader9Vtbl};
 
-use super::{D3DERR_INVALIDCALL, E_NOINTERFACE, com_ref::ComUnknown, device::DeviceInner};
+use super::{D3DERR_INVALIDCALL, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_PIXEL_SHADER9_VTBL: IDirect3DPixelShader9Vtbl = IDirect3DPixelShader9Vtbl {
     query_interface: ps_query_interface,
@@ -108,12 +108,25 @@ fn ps_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
 
 extern "system" fn ps_query_interface(
     this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = ps_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DPixelShader9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DPIXELSHADER9,
+            ],
+            ps_add_ref,
+            "IDirect3DPixelShader9",
+        )
+    }
 }
 
 extern "system" fn ps_add_ref(this: *mut c_void) -> u32 {

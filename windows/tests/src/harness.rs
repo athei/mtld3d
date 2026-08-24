@@ -259,6 +259,44 @@ impl Harness {
         unsafe { (self.dev_vtbl().query_interface)(self.device, &raw const guid, &raw mut out) }
     }
 
+    /// `IDirect3DDevice9::QueryInterface` for `iid`.
+    ///
+    /// Returns the hr, whether the interface handed back is the device object
+    /// itself, and the device's public refcount while that reference is held;
+    /// the reference is released again before returning.
+    pub fn device_query_interface(&self, iid: &Guid) -> (i32, bool, u32) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `iid` and `&mut out` are valid for the call.
+        let hr = unsafe { (self.dev_vtbl().query_interface)(self.device, iid, &raw mut out) };
+        if out.is_null() {
+            return (hr, false, self.device_refcount());
+        }
+        let same = out == self.device;
+        let held = self.device_refcount();
+        // SAFETY: releases the reference QueryInterface handed out; the device
+        // stays live through the harness's own reference.
+        unsafe { (self.dev_vtbl().release)(out) };
+        (hr, same, held)
+    }
+
+    /// `IDirect3D9::QueryInterface` for `iid`, shaped like [`Self::device_query_interface`].
+    pub fn factory_query_interface(&self, iid: &Guid) -> (i32, bool, u32) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `iid` and `&mut out` are valid for the call.
+        let hr = unsafe { (self.factory_vtbl().query_interface)(self.d3d9, iid, &raw mut out) };
+        if out.is_null() {
+            self.add_ref_factory();
+            return (hr, false, self.release_factory());
+        }
+        let same = out == self.d3d9;
+        self.add_ref_factory();
+        let held = self.release_factory();
+        // SAFETY: releases the reference QueryInterface handed out; the factory
+        // stays live through the harness's own reference.
+        unsafe { (self.factory_vtbl().release)(out) };
+        (hr, same, held)
+    }
+
     /// `GetAvailableTextureMem`.
     #[must_use]
     pub fn available_texture_mem(&self) -> u32 {

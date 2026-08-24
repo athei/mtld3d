@@ -19,7 +19,7 @@ use mtld3d_types::{
     D3DQUERYTYPE_TIMESTAMP, Guid, IDirect3DQuery9Vtbl,
 };
 
-use super::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, device::DeviceInner};
+use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, device::DeviceInner};
 
 pub static DIRECT3D_QUERY9_VTBL: IDirect3DQuery9Vtbl = IDirect3DQuery9Vtbl {
     query_interface: query_query_interface,
@@ -107,12 +107,25 @@ fn query_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
 
 extern "system" fn query_query_interface(
     this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = query_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DQuery9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DQUERY9,
+            ],
+            query_add_ref,
+            "IDirect3DQuery9",
+        )
+    }
 }
 
 extern "system" fn query_add_ref(this: *mut c_void) -> u32 {
