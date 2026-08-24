@@ -13,42 +13,49 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// F8: F11 is the macOS "show desktop" key and never reaches the game.
-const VK_F8: i32 = 0x77;
 const VK_F12: i32 = 0x7B;
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+/// The `D` key: Ctrl+Shift+D arms the one-frame draw-state dump.
+///
+/// A plain function key is a bad trigger on a Mac: F11 is the system's
+/// "show desktop" key, and others double as media keys.
+const VK_D: i32 = 0x44;
 
 static CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static F12_DOWN_LAST: AtomicBool = AtomicBool::new(false);
-/// F8 asked for a one-frame draw-state dump (`device::frame_dump`).
+/// Ctrl+Shift+D asked for a one-frame draw-state dump (`device::frame_dump`).
 static FRAME_DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static F8_DOWN_LAST: AtomicBool = AtomicBool::new(false);
+static DUMP_CHORD_DOWN_LAST: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
 
-/// Poll F12, set `CAPTURE_REQUESTED` on rising edge.
-///
-/// Idempotent across frames where the key is held down — only the press
-/// transition fires.
-pub fn poll() {
+fn key_down(vkey: i32) -> bool {
     // SAFETY: `GetAsyncKeyState` is a thread-safe Win32 syscall taking an
-    // `int vkey`; `VK_F12` is a valid virtual-key constant.
-    let down = unsafe { GetAsyncKeyState(VK_F12) }.cast_unsigned() & 0x8000 != 0;
+    // `int vkey`; every caller passes a valid virtual-key constant.
+    unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
+}
+
+/// Poll the trigger keys once per present, firing on the press transition.
+///
+/// Idempotent across frames where a key is held down.
+pub fn poll() {
+    let down = key_down(VK_F12);
     let was_down = F12_DOWN_LAST.swap(down, Ordering::Relaxed);
     if down && !was_down {
         CAPTURE_REQUESTED.store(true, Ordering::Release);
     }
-    // SAFETY: same syscall; `VK_F8` is a valid virtual-key constant.
-    let down = unsafe { GetAsyncKeyState(VK_F8) }.cast_unsigned() & 0x8000 != 0;
-    let was_down = F8_DOWN_LAST.swap(down, Ordering::Relaxed);
-    if down && !was_down {
+    let chord = key_down(VK_CONTROL) && key_down(VK_SHIFT) && key_down(VK_D);
+    let was_chord = DUMP_CHORD_DOWN_LAST.swap(chord, Ordering::Relaxed);
+    if chord && !was_chord {
         FRAME_DUMP_REQUESTED.store(true, Ordering::Release);
     }
 }
 
-/// Take the pending F8 request, if any; the next frame is then dumped.
+/// Take the pending Ctrl+Shift+D request, if any; the next frame is then dumped.
 pub fn take_frame_dump_request() -> bool {
     FRAME_DUMP_REQUESTED.swap(false, Ordering::AcqRel)
 }

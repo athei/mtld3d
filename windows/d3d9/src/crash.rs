@@ -68,6 +68,61 @@ static FOREIGN_REPORTS: AtomicU32 = AtomicU32::new(0);
 /// of those would otherwise cost a module lookup and a crumb dump.
 const FOREIGN_REPORT_LIMIT: u32 = 4;
 
+/// `MEMORY_BASIC_INFORMATION`, one region of the address space.
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+}
+
+const MEM_FREE: u32 = 0x1_0000;
+
+/// The largest free region of the address space in MiB.
+///
+/// Free space that no single allocation can use is what fails a DLL load
+/// or a game's streaming block long before the total runs out, so this is
+/// the number to read next to `avail_virtual_mib`. Walks every region
+/// once (a few thousand `VirtualQuery` calls).
+pub fn largest_free_region_mib() -> u64 {
+    let mut largest = 0usize;
+    let mut addr = 0usize;
+    loop {
+        let mut info = MemoryBasicInformation {
+            base_address: core::ptr::null_mut(),
+            allocation_base: core::ptr::null_mut(),
+            allocation_protect: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        };
+        // SAFETY: kernel32 export filling a struct of the size passed.
+        let got = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &raw mut info,
+                size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if got == 0 || info.region_size == 0 {
+            break;
+        }
+        if info.state == MEM_FREE {
+            largest = largest.max(info.region_size);
+        }
+        let Some(next) = addr.checked_add(info.region_size) else {
+            break;
+        };
+        addr = next;
+    }
+    (largest as u64) >> 20
+}
+
 /// `MEMORYSTATUSEX`; only the virtual-address-space fields are read.
 #[repr(C)]
 struct MemoryStatusEx {
@@ -127,6 +182,11 @@ unsafe extern "system" {
     fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
     fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
     fn GetStdHandle(handle: u32) -> *mut c_void;
     fn WriteFile(
         h_file: *mut c_void,
@@ -307,12 +367,14 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
     crumb::dump_recent(16);
 }
 
-/// Append ` avail_virtual=<MiB>` so a crash line carries the address-space state.
+/// Append the address-space state so a crash line carries it.
 fn push_avail_virtual(buf: &mut [u8], pos: &mut usize) {
     if let Some(mib) = avail_virtual_mib() {
         push(buf, pos, b" avail_virtual_mib=");
         push_hex(buf, pos, mib);
     }
+    push(buf, pos, b" largest_free_mib=");
+    push_hex(buf, pos, largest_free_region_mib());
 }
 
 fn fault_in_our_dll(addr: *mut c_void) -> bool {

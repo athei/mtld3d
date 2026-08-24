@@ -1,4 +1,4 @@
-//! One-frame per-draw state dump, armed by F8 (see `crate::capture`).
+//! One-frame per-draw state dump, armed by Ctrl+Shift+D (see `crate::capture`).
 //!
 //! The silent-write audit reports the states a game sets that we never
 //! read; it cannot tell whether a consumed state produced the pass the game
@@ -6,7 +6,7 @@
 //! depth-stencil bind, every clear and every draw with the states that
 //! decide pass shape (depth, stencil, blend, cull, colour mask, alpha test,
 //! bias), the bound shaders and the bound textures. It logs at info level,
-//! so a play session needs no environment change: press F8, read the log.
+//! so a play session needs no environment change: press Ctrl+Shift+D, read the log.
 
 use log::info;
 use mtld3d_types::{
@@ -43,7 +43,7 @@ impl FrameDump {
 }
 
 impl DeviceInner {
-    /// Close the dumped frame at `Present` and arm the next one if F8 asked.
+    /// Close the dumped frame at `Present` and arm the next one if the chord asked.
     pub fn frame_dump_present(&mut self, arm_next: bool) {
         if self.frame_dump.active {
             info!(
@@ -57,7 +57,7 @@ impl DeviceInner {
             draws: 0,
         };
         if arm_next {
-            info!(target: LOG_TARGET, "[dump] frame start (F8)");
+            info!(target: LOG_TARGET, "[dump] frame start (Ctrl+Shift+D)");
         }
     }
 

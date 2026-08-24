@@ -11,13 +11,19 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use log::warn;
+use log::{info, warn};
 
 use super::DeviceInner;
-use crate::{LOG_TARGET, crash::avail_virtual_mib};
+use crate::{
+    LOG_TARGET,
+    crash::{avail_virtual_mib, largest_free_region_mib},
+};
 
 /// Presents between two samples; the query is a syscall, this keeps it off the frame time.
 const SAMPLE_EVERY: u32 = 120;
+
+/// Samples between two unconditional log lines: a time series of the space at ~10 s.
+const REPORT_EVERY_SAMPLES: u32 = 10;
 
 /// Free-address-space thresholds, in MiB, each logged once when crossed downwards.
 const THRESHOLDS_MIB: [u64; 6] = [1536, 1024, 768, 512, 256, 128];
@@ -46,15 +52,26 @@ impl DeviceInner {
 
     /// Sample the free virtual address space and log threshold crossings.
     pub fn mem_watch_present(&self) {
-        if !PRESENTS
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(SAMPLE_EVERY)
-        {
+        let present = PRESENTS.fetch_add(1, Ordering::Relaxed);
+        if !present.is_multiple_of(SAMPLE_EVERY) {
             return;
         }
         let Some(avail) = avail_virtual_mib() else {
             return;
         };
+        if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES) {
+            let (texture_count, texture_bytes) = self.live_texture_footprint();
+            info!(
+                target: LOG_TARGET,
+                "address space: {avail} MiB free, largest free block {} MiB; mtld3d holds \
+                 {texture_count} textures with {} MiB of mip data ({} MiB default pool), \
+                 retained vertex/index buffers {} MiB",
+                largest_free_region_mib(),
+                texture_bytes >> 20,
+                self.vram_bytes_used.load(Ordering::Relaxed) >> 20,
+                self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20
+            );
+        }
         let mut next = NEXT_THRESHOLD.load(Ordering::Relaxed);
         while let Some(&threshold) = THRESHOLDS_MIB.get(usize::from(next))
             && avail < threshold

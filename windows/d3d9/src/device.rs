@@ -583,7 +583,7 @@ pub struct DeviceInner {
     /// every frame starts with `snapshot_dirty == all()` so every field is
     /// freshly populated before the cached state is composed.
     snapshot_cache: CurrentSnapshot,
-    /// The F8 one-frame draw-state dump, see `frame_dump`.
+    /// The Ctrl+Shift+D one-frame draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
@@ -1528,6 +1528,9 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self, new_frame: FrameData) {
+        // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
+        // the diagnostics that run once per frame poll from this point.
+        crate::capture::poll();
         let frame = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
@@ -1536,6 +1539,8 @@ impl DeviceInner {
         // when it drops at end of scope.
         let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         self.encoder.send_frame(frame);
+        self.frame_dump_present(crate::capture::take_frame_dump_request());
+        self.mem_watch_present();
     }
 
     pub const fn perf_mut(&mut self) -> &mut ApiPerfState {
@@ -3566,7 +3571,6 @@ extern "system" fn device_present(
     _dirty_region: *const c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Frame);
-    crate::capture::poll();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -3577,8 +3581,6 @@ extern "system" fn device_present(
     dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);
-    dev.frame_dump_present(crate::capture::take_frame_dump_request());
-    dev.mem_watch_present();
 
     0 // S_OK
 }
