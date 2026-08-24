@@ -675,6 +675,47 @@ fn update_texture_copies_every_volume_slice() {
 /// signed (+1,+1) reads as (1,1,1,1) → white. Confirms `V8U8`
 /// create/upload/sample works in isolation (a full FF-alpha +
 /// per-texel-bias `V8U8` setup is not covered here).
+/// A level from `GetVolumeLevel` locked and written reaches the texture.
+///
+/// The level shell forwards to the parent's per-level lock, so the write
+/// lands in the staging the texture uploads from; every slice samples back.
+#[test]
+fn volume_level_lock_box_writes_reach_the_texture() {
+    const SLICE_COLORS: [u32; 4] = [0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+    let h = Harness::new();
+    let (hr, tex) = h.try_create_volume_texture([2, 2, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0, "MANAGED volume");
+    let tex = tex.expect("volume texture");
+    let texels: Vec<u32> = SLICE_COLORS.iter().flat_map(|&color| [color; 4]).collect();
+    {
+        let (hr, level) = tex.get_volume_level(0);
+        assert_eq!(hr, 0, "GetVolumeLevel");
+        let level = level.expect("volume level");
+        let (hr, desc) = level.desc();
+        assert_eq!(hr, 0, "IDirect3DVolume9::GetDesc");
+        assert_eq!((desc.width, desc.height, desc.depth), (2, 2, 4));
+        assert_eq!(desc.pool, D3DPOOL_MANAGED);
+        level.write_u32(&texels);
+    }
+
+    assert_eq!(h.set_volume_texture(0, &tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    for (z, expected) in (0u8..).zip(SLICE_COLORS) {
+        let w = (f32::from(z) + 0.5) / 4.0;
+        assert_pixel_eq(
+            sample_volume_depth(&h, w),
+            expected,
+            &format!("volume slice {z} written through GetVolumeLevel"),
+        );
+    }
+}
+
 #[test]
 fn v8u8_signed_texture_samples_nonzero() {
     let h = Harness::new();

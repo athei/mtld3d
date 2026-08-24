@@ -3013,43 +3013,18 @@ extern "system" fn volume_get_volume_level(
     if volume.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // SAFETY: vtable thunk; volume-texture layout matches `Direct3DTexture9`,
-    // so the cast reads the shared `inner` correctly.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per the shared ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
         null_out(volume);
         return D3DERR_INVALIDCALL;
     };
-    let inner = obj.inner();
-    let lvl = level as usize;
-    // Reuse the texture's block-aware box pitches; `lock_box` returns None for
-    // an out-of-range level (and validates the per-level arrays below).
-    let Some((_, row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
+    if level >= obj.inner().levels {
         null_out(volume);
         return D3DERR_INVALIDCALL;
-    };
-    let depth = (inner.depth >> level).max(1);
-    let box_bytes = usize::try_from(slice_pitch)
-        .unwrap_or(0)
-        .saturating_mul(depth as usize);
-    let vol = Direct3DVolume9::new(
-        this,
-        VolumeInner {
-            width: inner.mip_widths[lvl],
-            height: inner.mip_heights[lvl],
-            depth,
-            format: inner.d3d_format,
-            usage: inner.d3d_usage,
-            pool: inner.d3d_pool,
-            row_pitch,
-            slice_pitch,
-            staging: new_uninit_page_box(box_bytes),
-        },
-    );
-    // The returned volume shares its parent texture's refcount, so take one
-    // parent reference now (D3D9: GetVolumeLevel increments the volume texture's
-    // refcount). Released via the volume's forwarding `Release`.
+    }
+    let vol = Direct3DVolume9::new(this, level);
     texture_add_ref(this);
-    // SAFETY: `volume` is a writable `*mut *mut c_void` out-param per the ABI.
+    // SAFETY: `volume` is non-null per the check above; the app owns the slot.
     unsafe { *volume = vol.cast::<c_void>() };
     D3D_OK
 }
@@ -3250,53 +3225,48 @@ static DIRECT3D_VOLUME9_VTBL: IDirect3DVolume9Vtbl = IDirect3DVolume9Vtbl {
     unlock_box: volume9_unlock_box,
 };
 
-struct VolumeInner {
-    width: u32,
-    height: u32,
-    depth: u32,
-    format: u32,
-    usage: u32,
-    pool: u32,
-    row_pitch: i32,
-    slice_pitch: i32,
-    staging: PageBox,
-}
-
 /// `IDirect3DVolume9` COM wrapper for a single volume-texture level.
 ///
+/// The shell owns no pixels: `LockBox`/`UnlockBox` go to the parent texture's
+/// per-level path, so a write through the level lands in the same staging the
+/// texture uploads from, and `GetDesc` reads the parent at call time.
+///
 /// D3D9 specifies that a volume level's refcount is **identical** to its parent
-/// volume texture's. So `AddRef`/`Release` forward to the parent texture
-/// — `GetVolumeLevel` takes one parent reference, and the wrapper shell is leaked
-/// (its lifetime is the parent texture's), like the cube-face surface shells.
-/// Forwarding (rather than an independent refcount) is load-bearing: an
-/// independent count would let the app's `Release(volumeTexture)` drop the
-/// texture to zero and free it while a `GetVolumeLevel` reference is still held,
-/// so the app's later `Release` double-frees the texture.
+/// volume texture's, so `AddRef`/`Release` forward there and report its count;
+/// `GetVolumeLevel` takes one parent reference on the app's behalf. Forwarding
+/// (rather than an independent count) is load-bearing: an independent count
+/// would let the app's `Release(volumeTexture)` free the texture while a level
+/// reference is still held. The shell keeps a private count of the references
+/// handed out on it only to know when to free itself.
 #[repr(C)]
 struct Direct3DVolume9 {
     vtbl: *const IDirect3DVolume9Vtbl,
+    /// References handed out on this shell; the shell is freed when it reaches zero.
+    refcount: u32,
     /// Parent `Direct3DVolumeTexture9` wrapper; `AddRef`/`Release` forward here.
     parent_texture: *mut c_void,
-    inner: *mut VolumeInner,
+    /// Mip level of the parent this shell addresses.
+    level: u32,
 }
 
 impl Direct3DVolume9 {
     /// `parent_texture` is the owning `Direct3DVolumeTexture9*`.
     ///
     /// The caller must have already taken the parent reference this volume
-    /// forwards.
-    fn new(parent_texture: *mut c_void, inner: VolumeInner) -> *mut Self {
+    /// forwards; the shell starts with one reference of its own.
+    fn new(parent_texture: *mut c_void, level: u32) -> *mut Self {
         Box::into_raw(Box::new(Self {
             vtbl: &raw const DIRECT3D_VOLUME9_VTBL,
+            refcount: 1,
             parent_texture,
-            inner: Box::into_raw(Box::new(inner)),
+            level,
         }))
     }
 
-    const fn inner(&self) -> &VolumeInner {
-        // SAFETY: `inner` is the `Self::new` allocation; the shell is leaked, so
-        // it stays live for the (leaked) wrapper's lifetime.
-        unsafe { &*self.inner }
+    fn parent(&self) -> &Direct3DTexture9 {
+        // SAFETY: the shell holds a forwarded reference on the parent for as
+        // long as it is alive, so the wrapper behind `parent_texture` is live.
+        unsafe { &*self.parent_texture.cast::<Direct3DTexture9>() }
     }
 }
 
@@ -3322,25 +3292,30 @@ extern "system" fn volume9_query_interface(
 
 extern "system" fn volume9_add_ref(this: *mut c_void) -> u32 {
     // SAFETY: IDirect3DVolume9 AddRef thunk; `this` is the live wrapper.
-    let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
         return 0;
     };
-    // The volume's refcount IS the parent texture's — forward and report it.
-    // `parent_texture` is the live owning `Direct3DVolumeTexture9`, kept alive by
-    // the reference this volume forwards.
+    obj.refcount += 1;
+    // Forward to the parent texture; its (shared) count is what D3D9 reports.
     texture_add_ref(obj.parent_texture)
 }
 
 extern "system" fn volume9_release(this: *mut c_void) -> u32 {
     // SAFETY: IDirect3DVolume9 Release thunk; `this` is the live wrapper.
-    let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
         return 0;
     };
     // Forward to the parent texture; its (shared) count is what D3D9 reports.
-    // The wrapper shell is intentionally leaked (its lifetime is the parent
-    // texture's), so there is no per-volume free here. `parent_texture` is the
-    // live owning `Direct3DVolumeTexture9`.
-    texture_release(obj.parent_texture)
+    // The shell is freed on its own last release, after the forward, since
+    // the parent pointer is not touched again.
+    let rc = texture_release(obj.parent_texture);
+    obj.refcount -= 1;
+    if obj.refcount == 0 {
+        // SAFETY: `this` is the `Box::into_raw` allocation of `Direct3DVolume9::new`
+        // and no reference to the shell remains.
+        drop(unsafe { Box::from_raw(this.cast::<Direct3DVolume9>()) });
+    }
+    rc
 }
 
 extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
@@ -3441,21 +3416,22 @@ extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC
     if desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // SAFETY: vtable thunk; `this` is the live wrapper.
+    // SAFETY: IDirect3DVolume9 GetDesc thunk; `this` is the live wrapper.
     let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let v = obj.inner();
-    // SAFETY: `desc` is a writable `D3DVOLUME_DESC` out-param per the ABI.
+    let inner = obj.parent().inner();
+    let lvl = obj.level as usize;
+    // SAFETY: `desc` is non-null per the check above; D3DVOLUME_DESC is plain data.
     unsafe {
         desc.write(D3DVOLUME_DESC {
-            format: v.format,
+            format: inner.d3d_format,
             resource_type: D3DRTYPE_VOLUME,
-            usage: v.usage,
-            pool: v.pool,
-            width: v.width,
-            height: v.height,
-            depth: v.depth,
+            usage: inner.d3d_usage,
+            pool: inner.d3d_pool,
+            width: inner.mip_widths[lvl],
+            height: inner.mip_heights[lvl],
+            depth: (inner.depth >> obj.level).max(1),
         });
     }
     D3D_OK
@@ -3464,48 +3440,26 @@ extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC
 extern "system" fn volume9_lock_box(
     this: *mut c_void,
     locked_box: *mut D3DLOCKED_BOX,
-    _box: *const c_void,
-    _flags: u32,
+    box_ptr: *const c_void,
+    flags: u32,
 ) -> i32 {
-    if locked_box.is_null() {
-        return D3DERR_INVALIDCALL;
-    }
-    // SAFETY: vtable thunk; `this` is the live wrapper.
+    // SAFETY: IDirect3DVolume9 LockBox thunk; `this` is the live wrapper.
     let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let inner_ptr = obj.inner;
-    // SAFETY: `inner_ptr` is the live `VolumeInner`; volumes are single-threaded,
-    // so the transient exclusive borrow taken to read the staging pointer is sound.
-    let inner = unsafe { &mut *inner_ptr };
-    let bits = inner.staging.as_mut_ptr().cast::<c_void>();
-    let row_pitch = inner.row_pitch;
-    let slice_pitch = inner.slice_pitch;
-    // SAFETY: `locked_box` is a writable `D3DLOCKED_BOX` out-param per the ABI.
-    unsafe {
-        locked_box.write(D3DLOCKED_BOX {
-            row_pitch,
-            slice_pitch,
-            bits,
-        });
-    }
-    D3D_OK
+    // The parent's per-level lock: same staging, same contention rules, same
+    // dirty marking on unlock, so a write through the level uploads exactly
+    // like one through `IDirect3DVolumeTexture9::LockBox`.
+    volume_lock_box(obj.parent_texture, obj.level, locked_box, box_ptr, flags)
 }
 
-const extern "system" fn volume9_unlock_box(_this: *mut c_void) -> i32 {
-    D3D_OK
+extern "system" fn volume9_unlock_box(this: *mut c_void) -> i32 {
+    // SAFETY: IDirect3DVolume9 UnlockBox thunk; `this` is the live wrapper.
+    let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    volume_unlock_box(obj.parent_texture, obj.level)
 }
-
-// ── IDirect3DCubeTexture9 (cube-map textures) ──
-//
-// `Direct3DCubeTexture9` shares the `#[repr(C)]` layout and `TextureInner`
-// backing of `Direct3DTexture9`, so the IUnknown / IDirect3DResource9 /
-// IDirect3DBaseTexture9 thunks are reused verbatim. Only `D3DPOOL_SCRATCH`
-// cube textures are created today: scratch resources are CPU-only and never
-// reach the device, so they must always be creatable even though no
-// `D3DPTEXTURECAPS_CUBEMAP` cap is advertised. No `MTLTexture` is warmed up —
-// the object is a creatable, releasable CPU shell; per-face lock/upload and
-// sampling are not wired yet (the cube-specific tail stubs them).
 
 static DIRECT3D_CUBE_TEXTURE9_VTBL: IDirect3DCubeTexture9Vtbl = IDirect3DCubeTexture9Vtbl {
     query_interface: texture_query_interface,
