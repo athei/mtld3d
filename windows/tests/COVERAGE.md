@@ -30,6 +30,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `state_block.rs` | Capture/Apply (ALL); VERTEXSTATE restores FVF; PIXELSTATE restores sampler; Begin/EndStateBlock recording. |
 | `query.rs` | EVENT fence; OCCLUSION sample count; TIMESTAMP contract. |
 | `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice`/`SetClipPlane` stubs; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
+| `d3dperf.rs` | The seven `D3DPERF_*` exports resolved by `GetProcAddress` the way an engine's d3d9 loader does (no harness, so a missing export is a test failure rather than a link error), and the no-profiler contract: `BeginEvent`/`EndEvent` report no nesting, `QueryRepeatFrame` is `FALSE`, `GetStatus` is `0`, the marker and option setters are no-ops. An in-game overlay SDK refuses to initialise when any is missing. |
 | `unload.rs` | `LoadLibrary` → `Direct3DCreate9` → `Release` → `FreeLibrary`, then a continuable exception raised with a resuming handler appended at the end of the chain: proves the unloaded image left no vectored exception handler behind (no harness: its `raw-dylib` import would keep the module mapped). |
 
 ## Documented limitations / stubs pinned by tests
