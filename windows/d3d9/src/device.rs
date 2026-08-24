@@ -7352,9 +7352,15 @@ extern "system" fn device_begin_state_block(this: *mut c_void) -> i32 {
     };
     let dev = obj.inner();
     if !dev.begin_state_block_recording() {
-        warn!(
+        // The rejection leaves the open recording alone, per the D3D9
+        // contract, so an application that begins a block and never ends it
+        // has every later `BeginStateBlock` rejected until the next `Reset`
+        // clears the recording. One misstep, not one per call: warn once.
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "BeginStateBlock called while another recording is in progress → INVALIDCALL"
+            "BeginStateBlock called while another recording is in progress → INVALIDCALL. \
+             A recording left open by an earlier BeginStateBlock rejects every later one \
+             until the next Reset."
         );
         return D3DERR_INVALIDCALL;
     }
@@ -7374,7 +7380,7 @@ extern "system" fn device_end_state_block(this: *mut c_void, sb: *mut *mut c_voi
     let obj = unsafe { &mut *obj_ptr };
     let dev = obj.inner();
     let Some(recording) = dev.end_state_block_recording() else {
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "EndStateBlock without matching BeginStateBlock → INVALIDCALL"
         );

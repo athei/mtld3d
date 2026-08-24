@@ -2,9 +2,9 @@
 
 use mtld3d_tests::Harness;
 use mtld3d_types::{
-    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DRS_ALPHABLENDENABLE,
-    D3DRS_LIGHTING, D3DSAMP_MINFILTER, D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE,
-    D3DTEXF_LINEAR, D3DTEXF_POINT,
+    D3D_OK, D3DERR_INVALIDCALL, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT9,
+    D3DRS_ALPHABLENDENABLE, D3DRS_LIGHTING, D3DSAMP_MINFILTER, D3DSBT_ALL, D3DSBT_PIXELSTATE,
+    D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT,
 };
 
 #[test]
@@ -163,6 +163,46 @@ fn light_enable_follows_vertex_pipeline_filter() {
     assert!(
         !hp.light_enabled(0),
         "PIXELSTATE leaves light-enable untouched"
+    );
+}
+
+/// A second `BeginStateBlock` is rejected and the open recording survives it.
+///
+/// Both halves matter. The rejection is what D3D9 specifies, and leaving the
+/// recording alone is what makes it sticky: an application that begins a block
+/// and never ends it has every later `BeginStateBlock` rejected, while the
+/// `EndStateBlock` that follows still closes the recording that was already
+/// open. A stray reset of the recording here would look like a fix and would
+/// silently hand the application a block it never recorded.
+#[test]
+fn begin_state_block_while_recording_is_rejected() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "start lit");
+    assert_eq!(h.begin_state_block(), D3D_OK, "first BeginStateBlock");
+    // Recorded before the rejection, so a recording that the rejection
+    // restarted would lose it and hand back an empty block.
+    assert_eq!(
+        h.set_render_state(D3DRS_LIGHTING, 0),
+        0,
+        "record LIGHTING=0"
+    );
+    assert_eq!(
+        h.begin_state_block(),
+        D3DERR_INVALIDCALL,
+        "BeginStateBlock while recording"
+    );
+
+    let sb = h.end_state_block();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "back to lit");
+    assert_eq!(
+        sb.apply(),
+        0,
+        "Apply the block the rejection did not disturb"
+    );
+    assert_eq!(
+        h.render_state(D3DRS_LIGHTING),
+        0,
+        "the state recorded before the rejected Begin is still in the block"
     );
 }
 
