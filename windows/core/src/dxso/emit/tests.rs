@@ -3733,3 +3733,42 @@ fn sm3_texcoord_index_above_seven_links_through_the_varyings() {
         "`dcl_texcoord8 o0` writes the matching varying:\n{vs_msl}"
     );
 }
+
+#[test]
+fn ps_writing_odepth_drops_the_export_without_a_depth_attachment() {
+    // ps_3_0 { dcl t0; mov oDepth, t0.x; mov oC0, t0; } against a pass with
+    // no depth attachment: the value is still computed, the return type stays
+    // a bare float4 and nothing binds `[[depth(any)]]`.
+    const TYPE_DEPTHOUT: u32 = 9;
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_DEPTHOUT, 0, 0x1, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let variant = VariantKey {
+        flags: VariantFlags::NO_DEPTH_ATTACHMENT,
+        ..VariantKey::default()
+    };
+    let ps_msl = emit_ps_programmable(&ps, variant).expect("emit PS3");
+    assert!(
+        !ps_msl.contains("[[depth(any)]]") && !ps_msl.contains("_ps_out.oDepth"),
+        "no depth export against a depth-less pass:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("fragment float4 mtld3d_ps("),
+        "a single colour output keeps the bare float4 return:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("_depth_storage"),
+        "the oDepth write still has a target:\n{ps_msl}"
+    );
+}

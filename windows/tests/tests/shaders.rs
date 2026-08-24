@@ -472,3 +472,50 @@ fn bool_shader_constant_drives_static_branch() {
         assert_eq!(h.read_pixel(320, 280), expected, "{what}");
     }
 }
+
+/// `ps_2_0`: `def c0, 1,0,0,1; mov oDepth, c0.x; mov oC0, c0;`
+const PS_DEPTH_WRITE_BC: [u32; 14] = [
+    0xFFFF_0200,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x9001_0800,
+    0xA000_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+/// A pixel shader writing `oDepth` still draws when no depth buffer is bound.
+///
+/// D3D9 discards the depth write in that case; the pipeline must not fail
+/// (Metal rejects a depth output against no depth attachment), so the draw
+/// lands and the colour output shows.
+#[test]
+fn depth_writing_ps_draws_without_a_depth_buffer() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_DEPTH_WRITE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind the depth buffer"
+    );
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "the colour output lands although the shader writes oDepth"
+    );
+}

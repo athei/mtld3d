@@ -77,6 +77,13 @@ bitflags::bitflags! {
         /// primitive other than points, so triangle draws keep their
         /// libraries. Folded into the PS cache key.
         const POINT_SPRITE = 1 << 3;
+        /// The render pass has no depth attachment.
+        ///
+        /// A PS writing `oDepth` computes the value but does not export it:
+        /// D3D9 discards the write, while Metal rejects a pipeline whose
+        /// fragment function declares a depth output against no depth
+        /// attachment. Folded into the PS cache key.
+        const NO_DEPTH_ATTACHMENT = 1 << 4;
     }
 }
 
@@ -821,6 +828,10 @@ fn emit_ps_function(
                 .as_ref()
                 .is_some_and(|d| d.reg.kind == RegKind::DepthOut)
     });
+    // The value is still computed (writes route through `_depth_storage`),
+    // but it only reaches `[[depth(any)]]` when the pass has a depth
+    // attachment: see `VariantFlags::NO_DEPTH_ATTACHMENT`.
+    let exports_depth = has_depth_out && !variant.flags.contains(VariantFlags::NO_DEPTH_ATTACHMENT);
     // Colour outputs. `written` is what the bytecode stores to; `exported` is
     // the subset the render pass can receive (bit 0 always). A bare `float4`
     // return covers the common single-output case; anything else returns a
@@ -830,7 +841,7 @@ fn emit_ps_function(
     let written_colors = ps.color_out_mask();
     let exported_colors = (written_colors & variant.color_out_mask) | 1;
     let color_local_count = 8 - written_colors.leading_zeros().min(7);
-    let returns_struct = has_depth_out || exported_colors != 1;
+    let returns_struct = exports_depth || exported_colors != 1;
     if returns_struct {
         w(out, "struct PsOut {\n");
         for i in 0..4u32 {
@@ -838,7 +849,7 @@ fn emit_ps_function(
                 let _ = writeln!(out, "    float4 oC{i} [[color({i})]];");
             }
         }
-        if has_depth_out {
+        if exports_depth {
             w(out, "    float oDepth [[depth(any)]];\n");
         }
         w(out, "};\n\n");
@@ -1056,7 +1067,7 @@ fn emit_ps_function(
                 let _ = writeln!(out, "    _ps_out.oC{i} = oC{i};");
             }
         }
-        if has_depth_out {
+        if exports_depth {
             w(out, "    _ps_out.oDepth = _depth_storage.x;\n");
         }
         w(out, "    return _ps_out;\n");

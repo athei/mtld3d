@@ -1229,6 +1229,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if metal_prim != PrimitiveType::Point {
         ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
     }
+    // A fragment function declaring a depth output against a pass with no
+    // depth attachment is a Metal pipeline error, so a programmable PS drops
+    // its depth export when no depth buffer is bound (D3D9 discards the
+    // write). The FF PS never writes depth and keeps the default key.
+    if matches!(ps, PsSource::Programmable { .. }) {
+        ps_variant.flags.set(
+            VariantFlags::NO_DEPTH_ATTACHMENT,
+            !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
+        );
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
