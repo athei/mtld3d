@@ -365,7 +365,10 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // at the same declaration index in `ff::emit_varyings` for FF↔programmable
     // stage-in linkage.
     w(out, "    float4 position1;\n");
-    for i in 0..8 {
+    // SM3 declares texture coordinates by usage index up to 15; sixteen slots
+    // keep every `dcl_texcoordN` linkable and stay well inside Metal's
+    // fragment-input budget.
+    for i in 0..16 {
         let _ = writeln!(out, "    float4 texcoord{i};");
     }
     // `[[flat]]` on the PS input takes diffuse/specular from the provoking

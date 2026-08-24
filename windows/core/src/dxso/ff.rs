@@ -526,7 +526,8 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // at the same declaration index (bare positional varying) for FF↔
     // programmable stage-in linkage. The FF VS never writes it.
     out.push_str("    float4 position1;\n");
-    for i in 0..8 {
+    // Sixteen slots, matching `dxso::emit::emit_varyings`.
+    for i in 0..16 {
         let _ = writeln!(out, "    float4 texcoord{i};");
     }
     // `[[flat]]` (D3DSHADE_FLAT) on the PS struct only — matches

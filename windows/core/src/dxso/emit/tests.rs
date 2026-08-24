@@ -3705,3 +3705,31 @@ fn dynamic_bool_constant_reads_the_runtime_vs_b_bitmask() {
         "`if b3` reads bit 3 of the bitmask:\n{vs_msl}"
     );
 }
+
+#[test]
+fn sm3_texcoord_index_above_seven_links_through_the_varyings() {
+    // vs_3_0 { dcl_position v0; dcl_texcoord8 o0; mov o0, v0; }
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 8),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("float4 texcoord8;") && vs_msl.contains("float4 texcoord15;"),
+        "the varyings carry every SM3 texcoord index:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("out.texcoord8"),
+        "`dcl_texcoord8 o0` writes the matching varying:\n{vs_msl}"
+    );
+}
