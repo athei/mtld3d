@@ -52,7 +52,14 @@ contract so a future implementation flips a known assertion.
   `GetFrontBufferData` read a backbuffer / standalone-color RT back into a
   SYSTEMMEM surface (texture-backed RT sources not yet resolved).
 - **Resources:** `ValidateDevice` returns S_OK (single-pass valid);
-  `SetGammaRamp` is a no-op.
+  `SetGammaRamp` is a no-op. Two `INVALIDCALL`s here are deliberate
+  divergences rather than gaps, both where D3D9 itself leaves no room to
+  fail: `GetDevice` answers `INVALIDCALL` once the creating device is gone,
+  which only the resources that do not pin it can reach (a MANAGED texture,
+  the CPU-only cube shell) and only after an application released a device
+  it still holds resources from; `GetFunction` answers `INVALIDCALL` for a
+  null `pSizeOfData`, the size slot being the call's only channel in both
+  directions, so there is nothing to answer without one.
 - **Legacy:** `IDirect3DVolume9::SetPrivateData` (accepted and discarded;
   `GetPrivateData` then reports `INVALIDCALL`), `SetPaletteEntries`,
   `GetRasterStatus`, `GetClipStatus`, `SetDialogBoxMode`.
