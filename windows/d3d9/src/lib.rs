@@ -35,7 +35,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use mtld3d_shared::{InitLoggerParams, identity};
+use mtld3d_shared::{InitLoggerParams, WriteLogParams, identity};
 // HRESULT codes live in `mtld3d_types` (shared with the integration-test
 // harness); re-exported under the crate root so every in-crate
 // `use super::{D3D_OK, …}` path stays valid.
@@ -213,7 +213,7 @@ pub const extern "system" fn d3dperf_get_status() -> u32 {
 // dispatcher — DLL load ordering is guaranteed by d3d9.dll's implicit
 // import of `mtld3d_unix_call` from mtld3d.dll.
 fn init_logger(instance: *mut c_void) {
-    mtld3d_shared::init_logger();
+    mtld3d_shared::init_logger_to(Box::new(UnixLogSink));
     log_identity(instance);
     // Latch the d3d9-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
     // from `RUST_LOG`. Per-cdylib because each cdylib has its own
@@ -229,6 +229,37 @@ fn init_logger(instance: *mut c_void) {
     crash::install(instance);
     let mut params = InitLoggerParams { reserved: 0 };
     unix_call(&mut params);
+}
+
+/// The PE-side logger's sink: every formatted line crosses to the unix side.
+///
+/// A game a launcher spawned often has no usable Windows standard handles,
+/// so `std::io::stderr` here would discard the line; the unix side writes it
+/// to the process's unix stderr, the stream wine's own debug output and the
+/// unix side's logger already use. The buffer stays alive for the call and
+/// the unix side never keeps it.
+struct UnixLogSink;
+
+impl std::io::Write for UnixLogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(len) = u32::try_from(buf.len()) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        let mut params = WriteLogParams {
+            ptr: buf.as_ptr() as usize as u64,
+            len,
+            pad0: 0,
+        };
+        if unix_call(&mut params) == 0 {
+            Ok(buf.len())
+        } else {
+            Err(std::io::ErrorKind::Other.into())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Name this build in the log, as the first line the logger emits.

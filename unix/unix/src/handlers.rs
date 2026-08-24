@@ -10,7 +10,7 @@ use mtld3d_shared::{
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
     GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
     StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WaitForGpuRetireParams, identity,
+    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
     mtl::DestroyKind,
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -49,6 +49,32 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
         // static.
         metal::declare_latency_critical_activity();
     });
+    STATUS_SUCCESS
+}
+
+/// `WriteLog`: the sink behind the PE-side logger.
+///
+/// Writes the formatted line to this process's unix stderr, the stream wine's
+/// own debug output uses, so d3d9.dll lines land next to the unix side's
+/// whatever Windows standard handles the process was started with (a game a
+/// launcher spawned often has none, and `std::io::stderr` on the PE side
+/// would discard the line).
+pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut WriteLogParams.
+    let Some(params) = (unsafe { InPtrMut::<WriteLogParams>::opt(args) }) else {
+        return -1;
+    };
+    if params.ptr == 0 || params.len == 0 {
+        return STATUS_SUCCESS;
+    }
+    // SAFETY: PE supplied `ptr`/`len` as a byte slice valid for the call
+    // duration; the pointer is non-zero per the check above.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(params.ptr as *const u8, params.len as usize) };
+    let mut stderr = std::io::stderr().lock();
+    if std::io::Write::write_all(&mut stderr, bytes).is_err() {
+        return STATUS_UNSUCCESSFUL;
+    }
     STATUS_SUCCESS
 }
 

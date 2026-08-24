@@ -11,6 +11,21 @@
 /// all three linkage units. `NO_COLOR=1` opts out — `env_logger` only reads
 /// it under `WriteStyle::Auto`, so we have to pre-resolve the choice here.
 pub fn init_logger() {
+    init(None);
+}
+
+/// Register `env_logger` writing every formatted line into `sink`.
+///
+/// The PE side uses this with a sink that crosses to the unix side: a game a
+/// launcher spawned often has no usable Windows standard handles, so the
+/// default stderr target would discard every line, while the unix side's
+/// stderr is the launcher's log regardless. Filter and style match
+/// [`init_logger`].
+pub fn init_logger_to(sink: Box<dyn std::io::Write + Send + 'static>) {
+    init(Some(sink));
+}
+
+fn init(sink: Option<Box<dyn std::io::Write + Send + 'static>>) {
     let user = std::env::var("RUST_LOG").ok();
     let filter = resolved_log_filter(user.as_deref());
     let style = if std::env::var_os("NO_COLOR").is_some() {
@@ -18,10 +33,12 @@ pub fn init_logger() {
     } else {
         env_logger::WriteStyle::Always
     };
-    let _ = env_logger::Builder::new()
-        .parse_filters(&filter)
-        .write_style(style)
-        .try_init();
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters(&filter).write_style(style);
+    if let Some(sink) = sink {
+        builder.target(env_logger::Target::Pipe(sink));
+    }
+    let _ = builder.try_init();
 }
 
 fn resolved_log_filter(user: Option<&str>) -> String {
