@@ -34,10 +34,13 @@ mod disabled {
 
     #[inline(always)]
     pub const fn dump_on_stall_edge(_stalled: bool) {}
+
+    #[inline(always)]
+    pub const fn set_write_sink(_sink: fn(&[u8])) {}
 }
 
 #[cfg(not(mtld3d_crumb))]
-pub use disabled::{dump_on_stall_edge, dump_recent, init, record};
+pub use disabled::{dump_on_stall_edge, dump_recent, init, record, set_write_sink};
 
 #[cfg(mtld3d_crumb)]
 mod enabled {
@@ -192,6 +195,15 @@ mod enabled {
     /// allocator, no locks. Tolerates torn writes on the most recent slot
     /// (skipped if `seq` doesn't match the expected position).
     #[inline]
+    /// Route every dump line through `sink` as well as stderr.
+    ///
+    /// The PE side installs its unix log thunk here: a launcher-spawned
+    /// game has no stderr handle, so a dump written only there is lost.
+    /// No-op on unix, where stderr is the log already.
+    pub fn set_write_sink(sink: fn(&[u8])) {
+        platform::set_write_sink(sink);
+    }
+
     pub fn dump_recent(n: usize) {
         let hdr = HEADER_PTR.load(Ordering::Acquire);
         let entries = ENTRIES_PTR.load(Ordering::Acquire);
@@ -288,6 +300,8 @@ mod enabled {
 
         use super::{Entry, FILE_SIZE, Header};
 
+        pub fn set_write_sink(_sink: fn(&[u8])) {}
+
         pub fn current_tid() -> u32 {
             // SAFETY: pthread_self is async-signal-safe.
             let tid = unsafe { libc::pthread_self() };
@@ -374,6 +388,13 @@ mod enabled {
         const INVALID_HANDLE_VALUE: *mut c_void = !0usize as *mut c_void;
         const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
+        /// Extra destination for dump lines, see `enabled::set_write_sink`.
+        static WRITE_SINK: std::sync::OnceLock<fn(&[u8])> = std::sync::OnceLock::new();
+
+        pub fn set_write_sink(sink: fn(&[u8])) {
+            let _ = WRITE_SINK.set(sink);
+        }
+
         unsafe extern "system" {
             fn CreateFileA(
                 lp_file_name: *const u8,
@@ -416,6 +437,9 @@ mod enabled {
         }
 
         pub fn write_str(bytes: &[u8]) {
+            if let Some(sink) = WRITE_SINK.get() {
+                sink(bytes);
+            }
             // SAFETY: kernel32 WriteFile on the std error handle. Wine
             // routes fd 2 and STD_ERROR_HANDLE to the same terminal.
             unsafe {
@@ -497,7 +521,7 @@ mod enabled {
 }
 
 #[cfg(mtld3d_crumb)]
-pub use enabled::{dump_on_stall_edge, dump_recent, init, record};
+pub use enabled::{dump_on_stall_edge, dump_recent, init, record, set_write_sink};
 
 /// Probe macro.
 ///

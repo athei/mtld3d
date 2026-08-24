@@ -75,6 +75,15 @@ pub fn start() {
     drop(spawned);
 }
 
+/// Hand `line` to the unix side right now, on the calling thread.
+///
+/// For the crash path only: a fault or panic handler cannot rely on the
+/// logging thread ever running again, so it thunks synchronously instead
+/// of queueing. Everything else goes through [`Sink`].
+pub fn write_raw(line: &[u8]) {
+    forward(line);
+}
+
 /// One formatted line across the boundary; the unix side writes it to stderr.
 fn forward(line: &[u8]) {
     let Ok(len) = u32::try_from(line.len()) else {

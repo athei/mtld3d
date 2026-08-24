@@ -231,6 +231,7 @@ fn init_logger(instance: *mut c_void) {
     // interleave by seq.
     mtld3d_shared::crumb::init();
     crash::install(instance);
+    mtld3d_shared::crumb::set_write_sink(log_sink::write_raw);
     let mut params = InitLoggerParams { reserved: 0 };
     unix_call(&mut params);
 }
@@ -246,7 +247,8 @@ fn log_identity(instance: *mut c_void) {
     let id = unsafe { identity::image_id(instance) };
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
-    log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded");
+    let base = instance as usize;
+    log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded at {base:#x}");
 }
 
 /// Null a COM `**out` parameter before returning a failing HRESULT.
