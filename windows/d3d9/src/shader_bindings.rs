@@ -205,6 +205,19 @@ impl ShaderBindings {
         self.vs_constants_b
     }
 
+    /// The VS boolean-constant file as a bitmask: bit N set ⇔ `bN` is TRUE.
+    ///
+    /// Bound as the shader's `vs_b` uniform (vertex slot 26).
+    pub fn vs_constants_b_bits(&self) -> u32 {
+        let mut bits = 0u32;
+        for (i, &v) in self.vs_constants_b.iter().enumerate() {
+            if v != 0 {
+                bits |= 1u32 << i;
+            }
+        }
+        bits
+    }
+
     pub const fn ps_constants_i_copy(&self) -> [[i32; 4]; INT_CONSTANT_ROWS] {
         self.ps_constants_i
     }

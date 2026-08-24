@@ -736,6 +736,11 @@ bitflags::bitflags! {
         /// `mtld3d_core::vs_draw::build_vs_draw_bytes` over the point render
         /// states, bound for every draw.
         const VS_DRAW     = 1 << 14;
+        /// VS boolean-constant bitmask (vertex slot 26).
+        ///
+        /// `vs_constants_b`, consumed by a VS reading a dynamic (non-`defb`)
+        /// boolean constant.
+        const VS_CONST_B  = 1 << 15;
     }
 }
 
@@ -8660,6 +8665,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 uses_rel_const: vs_obj.uses_rel_const(),
                 provided_input_mask: dev.cached_vs_provided_mask,
                 uses_int_const: vs_obj.uses_int_const(),
+                uses_bool_const: vs_obj.uses_bool_const(),
                 clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
             })
         }
@@ -8894,6 +8900,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // VS boolean-constant bitmask (vertex slot 26), same lifecycle as the
+    // integer file above.
+    let vs_bool_const_buf = if dirty.contains(SnapshotDirty::VS_CONST_B) {
+        Some(dev.shader_bindings().vs_constants_b_bits().to_ne_bytes())
+    } else {
+        None
+    };
 
     // Phase 2: take scratch + bump dirty pieces + update cache. The
     // const payloads above are fixed stack buffers built in Phase 1, so
@@ -8929,6 +8942,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     if let Some(buf) = vs_int_const_buf {
         dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = vs_bool_const_buf {
+        dev.snapshot_cache.vs_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     if let Some(buf) = vs_draw_buf {
         dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
@@ -9721,8 +9737,19 @@ extern "system" fn device_create_vertex_shader(
         return D3DERR_INVALIDCALL;
     }
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
-    let uses_rel_const = program.uses_relative_const_addressing();
-    let uses_int_const = program.uses_dynamic_int_constants();
+    let mut const_usage = crate::vertex_shader::VsConstUsage::empty();
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_REL_CONST,
+        program.uses_relative_const_addressing(),
+    );
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_INT_CONST,
+        program.uses_dynamic_int_constants(),
+    );
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_BOOL_CONST,
+        program.uses_dynamic_bool_constants(),
+    );
     // Extract the input-register semantics so `snapshot_shared` can resolve
     // a bound vertex declaration's elements → `[[attribute(N)]]` indices
     // without a trip to the encoder thread.
@@ -9741,8 +9768,7 @@ extern "system" fn device_create_vertex_shader(
         obj.inner_ptr(),
         shader_id,
         max_const_used,
-        uses_rel_const,
-        uses_int_const,
+        const_usage,
         input_semantics,
         bytecode.into_boxed_slice(),
     );
@@ -9968,7 +9994,7 @@ extern "system" fn device_set_vertex_shader_constant_i(
     }
     // A VS reading a dynamic integer constant (a `loop`/`rep` counter) consumes
     // these via the `vs_i` buffer (vertex slot 14), captured into the snapshot
-    // on change. Boolean constants remain store-only (no shader consumer yet).
+    // on change. Boolean constants take the same route as a bitmask.
     let changed = dev
         .shader_bindings_mut()
         .write_vs_constants_i(start_register, slice);
@@ -10027,9 +10053,15 @@ extern "system" fn device_set_vertex_shader_constant_b(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
+    // A VS reading a dynamic boolean constant (a static `if b0`) consumes
+    // these as the `vs_b` bitmask (vertex slot 26), captured into the
+    // snapshot on change.
+    let changed = dev
+        .shader_bindings_mut()
         .write_vs_constants_b(start_register, slice);
+    if changed {
+        dev.mark_snapshot_dirty(SnapshotDirty::VS_CONST_B);
+    }
     0
 }
 

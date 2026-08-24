@@ -400,6 +400,12 @@ pub const VS_POS_FIXUP_SLOT: u32 = 28;
 /// Vertex-stage buffer slot of the runtime integer constant table (`vs_i`).
 pub const VS_INT_CONST_SLOT: u32 = 29;
 
+/// Vertex-stage buffer slot of the runtime boolean constant bitmask (`vs_b`).
+///
+/// One `uint`: bit N is `bN`. Bound only for a VS that reads a boolean
+/// constant no `defb` defines.
+pub const VS_BOOL_CONST_SLOT: u32 = 26;
+
 /// Vertex-stage buffer slot of the float constant table (`vs_c`).
 pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 
@@ -415,6 +421,7 @@ const _: () = {
     assert!(VS_DRAW_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_POS_FIXUP_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_BOOL_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };

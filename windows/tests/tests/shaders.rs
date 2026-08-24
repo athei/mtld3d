@@ -392,3 +392,83 @@ fn get_function_round_trips_the_bytecode() {
     // SAFETY: every call passes either null or a buffer of the size it names.
     check_get_function("ps_2_0", &PS_BC, &|d, s| unsafe { ps.get_function(d, s) });
 }
+
+/// `vs_2_0`: `if b0` picks red, else green, for the diffuse output.
+///
+/// `dcl_position v0; def c0, 1,0,0,1; def c1, 0,1,0,1; mov oPos, v0;
+/// if b0 mov oD0, c0 else mov oD0, c1 endif`
+const VS_BOOL_BRANCH_BC: [u32; 30] = [
+    0xFFFE_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// `ps_2_0`: `dcl v0; mov oC0, v0;` (the interpolated diffuse).
+const PS_DIFFUSE_BC: [u32; 8] = [
+    0xFFFF_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0x90E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the vertex shader.
+///
+/// The branch's condition is `b0`, set through `SetVertexShaderConstantB`:
+/// TRUE takes the red arm, FALSE the green one, and the change reaches the
+/// draw without a shader rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BOOL_BRANCH_BC);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_vertex_shader_constant_b(0, &[value]),
+            0,
+            "SetVertexShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}

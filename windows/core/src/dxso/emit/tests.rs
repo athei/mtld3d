@@ -3632,3 +3632,76 @@ fn declared_ps_samplers_reads_the_sampler_dimension() {
         );
     }
 }
+
+const TYPE_CONSTBOOL: u32 = 14;
+const OP_DEFB: u16 = 47;
+
+#[test]
+fn defb_emits_bool_local() {
+    // vs_3_0 { defb b0, true; dcl_position v0; if b0 mov oT0, v0 endif }
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DEFB, 2),
+        dst_token(TYPE_CONSTBOOL, 0, 0xF, false),
+        1u32,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(
+        !vs.uses_dynamic_bool_constants(),
+        "a defb-defined bool is not dynamic"
+    );
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("bool b0 = true;"),
+        "defb must emit a `bool bN` local:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("if ((float4(float(b0))).x != 0.0)"),
+        "`if b0` must test the local:\n{vs_msl}"
+    );
+    assert!(
+        !vs_msl.contains("vs_b"),
+        "no runtime bitmask uniform for a defb-only shader:\n{vs_msl}"
+    );
+}
+
+#[test]
+fn dynamic_bool_constant_reads_the_runtime_vs_b_bitmask() {
+    // vs_3_0 { dcl_position v0; if b3 mov oT0, v0 endif }
+    // b3 has NO `defb`: it is fed by SetVertexShaderConstantB, so the branch
+    // must read bit 3 of the `vs_b` uniform.
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 3, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(vs.uses_dynamic_bool_constants());
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("constant uint &vs_b [[buffer(26)]]"),
+        "a dynamic bool declares the bitmask uniform:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("(vs_b >> 3u) & 1u"),
+        "`if b3` reads bit 3 of the bitmask:\n{vs_msl}"
+    );
+}

@@ -36,14 +36,10 @@ impl Direct3DVertexShader9 {
         device_inner: *mut DeviceInner,
         shader_id: ProgramId,
         max_const_used: u32,
-        uses_rel_const: bool,
-        uses_int_const: bool,
+        flags: VsConstUsage,
         input_semantics: Vec<InputSemantic>,
         bytecode: Box<[u32]>,
     ) -> Self {
-        let mut flags = VsConstUsage::empty();
-        flags.set(VsConstUsage::USES_REL_CONST, uses_rel_const);
-        flags.set(VsConstUsage::USES_INT_CONST, uses_int_const);
         let inner = Box::into_raw(Box::new(VertexShaderInner {
             device_inner,
             shader_id,
@@ -93,6 +89,10 @@ impl Direct3DVertexShader9 {
         self.inner().flags.contains(VsConstUsage::USES_INT_CONST)
     }
 
+    pub fn uses_bool_const(&self) -> bool {
+        self.inner().flags.contains(VsConstUsage::USES_BOOL_CONST)
+    }
+
     pub fn input_semantics(&self) -> &[InputSemantic] {
         &self.inner().input_semantics
     }
@@ -122,6 +122,12 @@ bitflags::bitflags! {
         /// `SetVertexShaderConstantI`; such draws upload + bind the
         /// integer-constant buffer (vertex slot 14).
         const USES_INT_CONST = 1 << 1;
+        /// Reads a *dynamic* boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically the condition of a static `if` fed by
+        /// `SetVertexShaderConstantB`; such draws bind the boolean-constant
+        /// bitmask (vertex slot 26).
+        const USES_BOOL_CONST = 1 << 2;
     }
 }
 

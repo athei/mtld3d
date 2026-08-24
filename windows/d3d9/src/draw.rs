@@ -28,8 +28,8 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PrimitiveType, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
-        VS_POS_FIXUP_SLOT, VertexStepFunction,
+        IndexType, PrimitiveType, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+        VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
 use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
@@ -611,6 +611,11 @@ pub struct CurrentSnapshot {
     /// Bound only for a VS that reads a dynamic integer constant
     /// (`VsSource::Programmable::uses_int_const`).
     pub vs_int_const_bytes: Option<ScratchSlice>,
+    /// VS boolean-constant bitmask (vertex slot 26).
+    ///
+    /// Bound only for a VS that reads a dynamic boolean constant
+    /// (`VsSource::Programmable::uses_bool_const`).
+    pub vs_bool_const_bytes: Option<ScratchSlice>,
     /// Per-draw `VsDraw` uniform (`mtld3d_core::vs_draw`): point size state.
     ///
     /// Every vertex shader reads it, so it is bound for every draw and
@@ -637,6 +642,7 @@ impl CurrentSnapshot {
         fog_color_bytes: None,
         bump_env_bytes: None,
         vs_int_const_bytes: None,
+        vs_bool_const_bytes: None,
         vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
     };
@@ -815,6 +821,11 @@ pub enum VsSource {
         /// 14. False for the vast majority of shaders, which then pay no
         /// slot-14 bind.
         uses_int_const: bool,
+        /// Whether the VS reads a dynamic boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically a static `if` condition fed by
+        /// `SetVertexShaderConstantB`; the bitmask goes to vertex slot 26.
+        uses_bool_const: bool,
         /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
         ///
         /// Folds into the VS library + disk keys: the shader declares one
@@ -1273,6 +1284,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     );
     let vs_int_const_slice = if vs_uses_int_const {
         snap.vs_int_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
+    // VS boolean constants (vertex slot 26), gated the same way.
+    let vs_uses_bool_const = matches!(
+        vs,
+        VsSource::Programmable {
+            uses_bool_const: true,
+            ..
+        }
+    );
+    let vs_bool_const_slice = if vs_uses_bool_const {
+        snap.vs_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
         ScratchSlice::EMPTY
     };
@@ -1805,6 +1829,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if !vs_int_const_slice.as_slice().is_empty() {
         let (p, n) = vs_int_const_slice.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_INT_CONST_SLOT));
+    }
+    // VS boolean constants: a 4-byte bitmask, same rare-draw policy.
+    if !vs_bool_const_slice.as_slice().is_empty() {
+        let (p, n) = vs_bool_const_slice.as_raw();
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_BOOL_CONST_SLOT));
     }
     drop(t_cbind);
 

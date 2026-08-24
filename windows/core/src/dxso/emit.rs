@@ -24,7 +24,9 @@ use std::{
     fmt::Write,
 };
 
-use mtld3d_shared::mtl::{VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{
+    VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+};
 
 use super::{
     ir::{
@@ -443,6 +445,15 @@ fn emit_vs_function(
             ",\n    constant int4 *vs_i [[buffer({VS_INT_CONST_SLOT})]]"
         );
     }
+    // A dynamic boolean constant (a `bN` no `defb` defines, fed by
+    // SetVertexShaderConstantB, typically the condition of a static `if`)
+    // reads bit N of the runtime bitmask.
+    if vs.uses_dynamic_bool_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant uint &vs_b [[buffer({VS_BOOL_CONST_SLOT})]]"
+        );
+    }
     w(out, "\n) {\n");
     w(out, "    float4 r[32];\n");
     // D3D9 address register `a0`. SM2 has exactly one int4 a0; the emitter
@@ -509,19 +520,26 @@ fn emit_vs_function(
         );
     }
 
+    for def in &vs.def_bool_constants {
+        let _ = writeln!(out, "    bool b{} = {};", def.reg.index, def.value);
+    }
+
     let def_consts: BTreeSet<u16> = vs.def_constants.iter().map(|d| d.reg.index).collect();
     let def_int_consts: BTreeSet<u16> = vs.def_int_constants.iter().map(|d| d.reg.index).collect();
+    let def_bool_consts: BTreeSet<u16> =
+        vs.def_bool_constants.iter().map(|d| d.reg.index).collect();
     let vs_output_map = build_vs_output_map(vs);
     let subs = (!vs.subroutines.is_empty()).then_some(&vs.subroutines);
-    let ctx = EmitContext::vs(
-        vs.major,
-        vs.minor,
-        &def_consts,
-        &def_int_consts,
-        vs_output_map.as_ref(),
-        subs,
-        provided_mask,
-    );
+    let ctx = EmitContext::vs(&VsInit {
+        major: vs.major,
+        minor: vs.minor,
+        def_consts: &def_consts,
+        def_int_consts: &def_int_consts,
+        def_bool_consts: &def_bool_consts,
+        vs_output_map: vs_output_map.as_ref(),
+        subroutines: subs,
+        vs_provided_mask: provided_mask,
+    });
     for inst in &vs.instructions {
         translate_instruction(out, inst, &ctx)?;
     }
@@ -973,8 +991,14 @@ fn emit_ps_function(
         );
     }
 
+    for def in &ps.def_bool_constants {
+        let _ = writeln!(out, "    bool b{} = {};", def.reg.index, def.value);
+    }
+
     let def_consts: BTreeSet<u16> = ps.def_constants.iter().map(|d| d.reg.index).collect();
     let def_int_consts: BTreeSet<u16> = ps.def_int_constants.iter().map(|d| d.reg.index).collect();
+    let def_bool_consts: BTreeSet<u16> =
+        ps.def_bool_constants.iter().map(|d| d.reg.index).collect();
     let subs = (!ps.subroutines.is_empty()).then_some(&ps.subroutines);
     let ctx = EmitContext::ps(&PsInit {
         major: ps.major,
@@ -986,6 +1010,7 @@ fn emit_ps_function(
         tt_projected_mask: variant.tt_projected_mask,
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
+        def_bool_consts: &def_bool_consts,
         has_vpos,
         has_vface,
         has_depth_out,
@@ -1245,6 +1270,11 @@ struct EmitContext<'a> {
     /// A `ConstInt` read NOT in this set is a *dynamic* integer constant: in a
     /// VS it reads the runtime `vs_i` buffer (slot 14).
     def_int_consts: &'a BTreeSet<u16>,
+    /// Bool-const indices defined by a `defb` instruction (baked into MSL as `bool bN` locals).
+    ///
+    /// A `ConstBool` read NOT in this set is a *dynamic* boolean constant: in
+    /// a VS it reads a bit of the runtime `vs_b` bitmask.
+    def_bool_consts: &'a BTreeSet<u16>,
     /// VS only: bit `i` set ⇒ input register `vi` is provided by the vertex declaration.
     ///
     /// A clear bit means the declaration omits that attribute, so the VS reads
@@ -1267,38 +1297,44 @@ struct PsInit<'a> {
     tt_projected_mask: u8,
     def_consts: &'a BTreeSet<u16>,
     def_int_consts: &'a BTreeSet<u16>,
+    def_bool_consts: &'a BTreeSet<u16>,
     has_vpos: bool,
     has_vface: bool,
     has_depth_out: bool,
     subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
 }
 
+/// Init bundle for `EmitContext::vs`, the VS-specific subset of `EmitContext`.
+struct VsInit<'a> {
+    major: u8,
+    minor: u8,
+    def_consts: &'a BTreeSet<u16>,
+    def_int_consts: &'a BTreeSet<u16>,
+    def_bool_consts: &'a BTreeSet<u16>,
+    vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
+    subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
+    vs_provided_mask: u16,
+}
+
 impl<'a> EmitContext<'a> {
-    const fn vs(
-        major: u8,
-        minor: u8,
-        def_consts: &'a BTreeSet<u16>,
-        def_int_consts: &'a BTreeSet<u16>,
-        vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
-        subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
-        vs_provided_mask: u16,
-    ) -> Self {
+    const fn vs(init: &VsInit<'a>) -> Self {
         Self {
             flags: EmitContextFlags::IS_VERTEX,
-            shader_major: major,
-            shader_minor: minor,
+            shader_major: init.major,
+            shader_minor: init.minor,
             ps_input_map: None,
             ps_samplers: None,
             ps_depth_sampler_mask: 0,
             ps_depth_fetch_mask: 0,
             ps_tt_projected_mask: 0,
-            vs_output_map,
-            def_consts,
-            def_int_consts,
-            vs_provided_mask,
+            vs_output_map: init.vs_output_map,
+            def_consts: init.def_consts,
+            def_int_consts: init.def_int_consts,
+            def_bool_consts: init.def_bool_consts,
+            vs_provided_mask: init.vs_provided_mask,
             loop_stack: RefCell::new(Vec::new()),
             loop_al_count: RefCell::new(0),
-            subroutines,
+            subroutines: init.subroutines,
             expansion_stack: RefCell::new(Vec::new()),
         }
     }
@@ -1320,6 +1356,7 @@ impl<'a> EmitContext<'a> {
             vs_output_map: None,
             def_consts: init.def_consts,
             def_int_consts: init.def_int_consts,
+            def_bool_consts: init.def_bool_consts,
             vs_provided_mask: u16::MAX,
             loop_stack: RefCell::new(Vec::new()),
             loop_al_count: RefCell::new(0),
@@ -2316,6 +2353,22 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
                 format!("float4(vs_i[{}])", reg.index)
             } else {
                 format!("float4(i{})", reg.index)
+            }
+        }
+        // `bN` boolean-constant reads. A `defb`-declared constant is a baked
+        // `bool bN` local; a dynamic one (fed by SetVertexShaderConstantB) in
+        // a VS reads bit N of the runtime `vs_b` bitmask. Both widen to
+        // float4 so `if`'s `.x != 0.0` test and the `!` modifier apply
+        // unchanged.
+        RegKind::ConstBool => {
+            if ctx.def_bool_consts.contains(&reg.index) {
+                format!("float4(float(b{}))", reg.index)
+            } else if ctx.is_vertex() {
+                format!("float4(float((vs_b >> {}u) & 1u))", reg.index)
+            } else {
+                return Err(EmitError::UnsupportedRegisterKind(
+                    "ConstBool: dynamic boolean constant in a pixel shader".into(),
+                ));
             }
         }
         // Label register reads only land here as the operand of
