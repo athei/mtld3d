@@ -123,6 +123,114 @@ pub fn largest_free_region_mib() -> u64 {
     (largest as u64) >> 20
 }
 
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_IMAGE: u32 = 0x100_0000;
+const MEM_MAPPED: u32 = 0x4_0000;
+
+/// A summary of the address space: region counts by state and the largest regions.
+///
+/// One line of text for the log, built when the largest free block has
+/// collapsed, so the log names who owns the space (image, mapped file,
+/// private commit, private reserve) and where the biggest holes are.
+pub fn address_space_map() -> String {
+    let mut regions: Vec<(usize, usize, u32, u32)> = Vec::new();
+    let mut addr = 0usize;
+    loop {
+        let mut info = MemoryBasicInformation {
+            base_address: core::ptr::null_mut(),
+            allocation_base: core::ptr::null_mut(),
+            allocation_protect: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        };
+        // SAFETY: kernel32 export filling a struct of the size passed.
+        let got = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &raw mut info,
+                size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if got == 0 || info.region_size == 0 {
+            break;
+        }
+        regions.push((addr, info.region_size, info.state, info.kind));
+        let Some(next) = addr.checked_add(info.region_size) else {
+            break;
+        };
+        addr = next;
+    }
+    let mut free = 0usize;
+    let mut committed = 0usize;
+    let mut reserved = 0usize;
+    let mut image = 0usize;
+    let mut mapped = 0usize;
+    let mut free_holes = 0usize;
+    let mut used_regions = 0usize;
+    for &(_, size, state, kind) in &regions {
+        if state == MEM_FREE {
+            free += size;
+            free_holes += 1;
+            continue;
+        }
+        used_regions += 1;
+        if kind == MEM_IMAGE {
+            image += size;
+        } else if kind == MEM_MAPPED {
+            mapped += size;
+        } else if state == MEM_COMMIT {
+            committed += size;
+        } else if state == MEM_RESERVE {
+            reserved += size;
+        }
+    }
+    let mut out = format!(
+        "regions used={used_regions} free_holes={free_holes}; MiB: free={} image={} mapped={} \
+         private_commit={} private_reserve={}; largest used:",
+        free >> 20,
+        image >> 20,
+        mapped >> 20,
+        committed >> 20,
+        reserved >> 20
+    );
+    let mut used: Vec<_> = regions
+        .iter()
+        .filter(|r| r.2 != MEM_FREE)
+        .copied()
+        .collect();
+    used.sort_by_key(|r| core::cmp::Reverse(r.1));
+    for (base, size, state, kind) in used.into_iter().take(12) {
+        let what = if kind == MEM_IMAGE {
+            "image"
+        } else if kind == MEM_MAPPED {
+            "mapped"
+        } else if state == MEM_COMMIT {
+            "commit"
+        } else {
+            "reserve"
+        };
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(" {base:#010x}+{}M({what})", size >> 20),
+        );
+    }
+    let mut holes: Vec<_> = regions
+        .iter()
+        .filter(|r| r.2 == MEM_FREE)
+        .copied()
+        .collect();
+    holes.sort_by_key(|r| core::cmp::Reverse(r.1));
+    out.push_str("; largest holes:");
+    for (base, size, _, _) in holes.into_iter().take(6) {
+        let _ =
+            core::fmt::Write::write_fmt(&mut out, format_args!(" {base:#010x}+{}M", size >> 20));
+    }
+    out
+}
+
 /// `MEMORYSTATUSEX`; only the virtual-address-space fields are read.
 #[repr(C)]
 struct MemoryStatusEx {

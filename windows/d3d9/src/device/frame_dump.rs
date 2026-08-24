@@ -21,7 +21,7 @@ use mtld3d_types::{
     D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
 };
 
-use super::{DeviceInner, RtBinding};
+use super::{DepthBinding, DeviceInner, RtBinding};
 use crate::{
     LOG_TARGET,
     draw::{PsSource, VsSource},
@@ -97,6 +97,13 @@ impl DeviceInner {
             ),
             None => String::from("none"),
         };
+        let ds = match &self.last_depth_binding {
+            Some((DepthBinding::Lazy(info, level), _, _)) => {
+                format!("{:?} level={level}", info.texture_id)
+            }
+            Some((DepthBinding::Eager(_), _, _)) => String::from("default"),
+            Some((DepthBinding::None, _, _)) | None => String::from("none"),
+        };
         let vs = self.snapshot_cache.vs.map_or_else(
             || String::from("none"),
             |p| match p.as_ref() {
@@ -150,7 +157,7 @@ impl DeviceInner {
 
         info!(
             target: LOG_TARGET,
-            "[dump] draw {seq}: rt={rt} ds={:#x} vs={vs} ps={ps} \
+            "[dump] draw {seq}: rt={rt} ds={ds}/{:#x} vs={vs} ps={ps} \
              z=[{},{},{}] blend=[{},{},{},{} sep={} {},{},{}] cull={} cw=[{:#x},{:#x},{:#x},{:#x}] \
              alpha=[{},{},{}] stencil=[{},{},{:#x},{:#x},{:#x} {},{},{} two={} ccw={},{},{},{}] \
              bias=[{:#x},{:#x}] scissor={} tex=[{}]",

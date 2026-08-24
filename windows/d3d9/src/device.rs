@@ -1318,18 +1318,36 @@ impl DeviceInner {
         depth_has_stencil: bool,
     ) {
         self.push_op(Box::new(move |enc| {
-            let (depth_texture, level) = match binding {
-                DepthBinding::None => (MetalHandle::NULL, 0),
-                DepthBinding::Eager(h) => (h, 0),
+            let (depth_texture, level, desc) = match binding {
+                DepthBinding::None => (
+                    MetalHandle::NULL,
+                    0,
+                    (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
+                ),
+                DepthBinding::Eager(h) => {
+                    let (w, hgt) = enc.backbuffer_size();
+                    let format = if depth_has_stencil {
+                        mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8
+                    } else {
+                        mtld3d_shared::mtl::PixelFormat::Depth32Float
+                    };
+                    (h, 0, (w, hgt, format))
+                }
                 DepthBinding::Lazy(info, level) => {
                     // SAFETY: `get_or_create_texture` returns a Metal texture
                     // handle from the typed `texture_cache` via `.raw()`.
                     let handle = unsafe {
                         MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
                     };
-                    (handle, level)
+                    let desc = (
+                        (info.width >> level).max(1),
+                        (info.height >> level).max(1),
+                        info.pixel_format,
+                    );
+                    (handle, level, desc)
                 }
             };
+            enc.set_depth_attachment_desc(desc.0, desc.1, desc.2);
             enc.set_depth_stencil_attachment_level(
                 depth_texture,
                 level,

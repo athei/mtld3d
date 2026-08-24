@@ -9,15 +9,19 @@
 //! of the pools mtld3d itself holds, so the log says how close the process
 //! was and who owned the space.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use log::{info, warn};
 
 use super::DeviceInner;
 use crate::{
     LOG_TARGET,
-    crash::{avail_virtual_mib, largest_free_region_mib},
+    crash::{address_space_map, avail_virtual_mib, largest_free_region_mib},
 };
+
+/// Largest-free-block size below which the one-shot region map is logged.
+const MAP_BELOW_MIB: u64 = 512;
+static MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Presents between two samples; the query is a syscall, this keeps it off the frame time.
 const SAMPLE_EVERY: u32 = 120;
@@ -61,16 +65,19 @@ impl DeviceInner {
         };
         if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES) {
             let (texture_count, texture_bytes) = self.live_texture_footprint();
+            let largest = largest_free_region_mib();
             info!(
                 target: LOG_TARGET,
-                "address space: {avail} MiB free, largest free block {} MiB; mtld3d holds \
+                "address space: {avail} MiB free, largest free block {largest} MiB; mtld3d holds \
                  {texture_count} textures with {} MiB of mip data ({} MiB default pool), \
                  retained vertex/index buffers {} MiB",
-                largest_free_region_mib(),
                 texture_bytes >> 20,
                 self.vram_bytes_used.load(Ordering::Relaxed) >> 20,
                 self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20
             );
+            if largest < MAP_BELOW_MIB && !MAP_LOGGED.swap(true, Ordering::Relaxed) {
+                warn!(target: LOG_TARGET, "address space map: {}", address_space_map());
+            }
         }
         let mut next = NEXT_THRESHOLD.load(Ordering::Relaxed);
         while let Some(&threshold) = THRESHOLDS_MIB.get(usize::from(next))

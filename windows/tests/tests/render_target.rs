@@ -673,6 +673,116 @@ fn stretch_rect_accepts_one_to_one_same_format() {
     );
 }
 
+/// Sampling the INTZ texture that is still the bound depth attachment.
+///
+/// A deferred renderer keeps its scene depth bound for the depth test while
+/// its light-volume draws sample it to reconstruct positions. Metal forbids
+/// reading an attachment of the running pass, so the encoder copies the
+/// attachment before such a draw and binds the copy: the sampled value is
+/// the depth written earlier (0.5), not garbage.
+#[test]
+fn intz_depth_sampled_while_bound_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind INTZ as depth"
+    );
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    // The INTZ texture stays bound as the depth attachment: depth test on,
+    // depth write off, and the same texture sampled through stage 0.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw with the attachment still bound"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (96..=160).contains(&center.r)
+            && (96..=160).contains(&center.g)
+            && (96..=160).contains(&center.b),
+        "the depth written by the occluder (0.5) samples back as mid-gray, got {center:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
 #[test]
 fn intz_depth_sample_via_fixed_function() {
     // The cascade-shadow plumbing under the fixed-function pixel pipeline: an

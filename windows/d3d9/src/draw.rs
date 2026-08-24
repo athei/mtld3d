@@ -1372,6 +1372,24 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     for (stage, b) in stage_bindings.iter() {
         stage_texture_handles[stage as usize] = enc.get_texture_handle_by_id(b.texture_id);
     }
+    // A draw that samples the bound depth attachment reads a copy of it: Metal
+    // forbids reading an attachment of the running pass. D3D9 permits the
+    // bind (scene depth as both depth test and position source) with the
+    // values as of the last write, which is what the copy holds.
+    let depth_attachment = enc.current_depth_texture();
+    if !depth_attachment.is_null() && stage_texture_handles.contains(&depth_attachment.raw()) {
+        let snapshot = enc.depth_snapshot_for_sampling();
+        if snapshot != 0 {
+            for handle in &mut stage_texture_handles {
+                if *handle == depth_attachment.raw() {
+                    *handle = snapshot;
+                }
+            }
+        }
+    }
+    if !depth_attachment.is_null() && render_state.depth_enable() && render_state.depth_write() {
+        enc.bump_depth_write_epoch();
+    }
     drop(t_lookup);
 
     // 2. Resolve the VS and PS libraries independently. The encoder owns
