@@ -5,6 +5,9 @@ use std::sync::{
 };
 
 use log::{debug, error, info, trace, warn};
+
+mod frame_dump;
+mod mem_watch;
 use mtld3d_core::{
     caps,
     convert::{
@@ -580,6 +583,8 @@ pub struct DeviceInner {
     /// every frame starts with `snapshot_dirty == all()` so every field is
     /// freshly populated before the cached state is composed.
     snapshot_cache: CurrentSnapshot,
+    /// The F8 one-frame draw-state dump, see `frame_dump`.
+    frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
     /// Input to FF VS/PS key construction; not part of `CurrentSnapshot` (the
@@ -2256,6 +2261,7 @@ impl Direct3DDevice9 {
             live_textures: Mutex::new(Vec::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: CurrentSnapshot::EMPTY,
+            frame_dump: frame_dump::FrameDump::IDLE,
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
@@ -3571,6 +3577,8 @@ extern "system" fn device_present(
     dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);
+    dev.frame_dump_present(crate::capture::take_frame_dump_request());
+    dev.mem_watch_present();
 
     0 // S_OK
 }
@@ -6394,6 +6402,9 @@ extern "system" fn device_set_render_target(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!("SetRenderTarget({index}, {surface:?})"));
+    }
 
     if surface.is_null() {
         if slot == 0 {
@@ -6652,6 +6663,9 @@ extern "system" fn device_set_depth_stencil_surface(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!("SetDepthStencilSurface({surface:?})"));
+    }
     let surf = surface.cast::<Direct3DSurface9>();
     // A non-NULL depth-stencil surface must report D3DUSAGE_DEPTHSTENCIL; NULL
     // unbinds the depth buffer. GetDesc reports the true usage (the parent
@@ -6905,6 +6919,11 @@ extern "system" fn device_clear(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "clear flags={flags:#x} color={color:#010x} z={z} stencil={stencil} rects={count}"
+        ));
+    }
 
     // Clearing depth or stencil with no depth-stencil attachment bound is
     // invalid: a prior `SetDepthStencilSurface(NULL)` leaves no surface to
@@ -9076,6 +9095,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let snap_nn = NonNull::new(snap_ptr).expect("ScratchArena returned non-null");
     dev.push_op_inline(Op::SetCurrentSnapshot(CurrentSnapshotPtr(snap_nn)));
     dev.snapshot_dirty = SnapshotDirty::empty();
+    if dev.frame_dump.active {
+        dev.frame_dump_draw();
+    }
     drop(bumps_timer);
 }
 

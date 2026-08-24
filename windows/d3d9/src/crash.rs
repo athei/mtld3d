@@ -68,6 +68,41 @@ static FOREIGN_REPORTS: AtomicU32 = AtomicU32::new(0);
 /// of those would otherwise cost a module lookup and a crumb dump.
 const FOREIGN_REPORT_LIMIT: u32 = 4;
 
+/// `MEMORYSTATUSEX`; only the virtual-address-space fields are read.
+#[repr(C)]
+struct MemoryStatusEx {
+    length: u32,
+    memory_load: u32,
+    total_phys: u64,
+    avail_phys: u64,
+    total_page_file: u64,
+    avail_page_file: u64,
+    total_virtual: u64,
+    avail_virtual: u64,
+    avail_extended_virtual: u64,
+}
+
+/// Free virtual address space of this process in MiB, if the query works.
+///
+/// The number that matters for a 32-bit game: when it reaches zero,
+/// allocations fail and the game follows a garbage pointer soon after.
+pub fn avail_virtual_mib() -> Option<u64> {
+    let mut status = MemoryStatusEx {
+        length: u32::try_from(size_of::<MemoryStatusEx>()).expect("64-byte struct"),
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: kernel32 export filling the struct whose `length` names its size.
+    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+    (ok != 0).then_some(status.avail_virtual >> 20)
+}
+
 #[repr(C)]
 struct ExceptionRecord {
     code: u32,
@@ -91,6 +126,7 @@ unsafe extern "system" {
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
+    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
     fn GetStdHandle(handle: u32) -> *mut c_void;
     fn WriteFile(
         h_file: *mut c_void,
@@ -265,9 +301,18 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
         push(&mut buf, &mut pos, b" base=");
         push_hex(&mut buf, &mut pos, module as usize as u64);
     }
+    push_avail_virtual(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     write_stderr(&buf[..pos]);
     crumb::dump_recent(16);
+}
+
+/// Append ` avail_virtual=<MiB>` so a crash line carries the address-space state.
+fn push_avail_virtual(buf: &mut [u8], pos: &mut usize) {
+    if let Some(mib) = avail_virtual_mib() {
+        push(buf, pos, b" avail_virtual_mib=");
+        push_hex(buf, pos, mib);
+    }
 }
 
 fn fault_in_our_dll(addr: *mut c_void) -> bool {
@@ -298,6 +343,7 @@ fn emit_fatal(code: u32, addr: *mut c_void) {
     push_hex(&mut buf, &mut pos, u64::from(code));
     push(&mut buf, &mut pos, b" addr=");
     push_hex(&mut buf, &mut pos, addr as usize as u64);
+    push_avail_virtual(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     write_stderr(&buf[..pos]);
 }
