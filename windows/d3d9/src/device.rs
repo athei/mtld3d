@@ -741,6 +741,16 @@ bitflags::bitflags! {
         /// `vs_constants_b`, consumed by a VS reading a dynamic (non-`defb`)
         /// boolean constant.
         const VS_CONST_B  = 1 << 15;
+        /// PS integer-constant file bytes (fragment slot 11).
+        ///
+        /// `ps_constants_i`, consumed by a PS reading a dynamic (non-`defi`)
+        /// integer constant.
+        const PS_CONST_I  = 1 << 16;
+        /// PS boolean-constant bitmask (fragment slot 10).
+        ///
+        /// `ps_constants_b`, consumed by a PS reading a dynamic (non-`defb`)
+        /// boolean constant.
+        const PS_CONST_B  = 1 << 17;
     }
 }
 
@@ -8699,6 +8709,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 ps_id: ps_obj.shader_id(),
                 max_const_used: clamp_const_rows(ps_obj.max_const_used()),
                 uses_bump_env: ps_obj.uses_bump_env(),
+                uses_int_const: ps_obj.uses_int_const(),
+                uses_bool_const: ps_obj.uses_bool_const(),
                 color_out_mask: ps_obj.color_out_mask(),
             })
         }
@@ -8921,6 +8933,18 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // PS integer / boolean constant files (fragment slots 11 / 10), the
+    // fragment-side twins with the same lifecycle.
+    let ps_int_const_buf = if dirty.contains(SnapshotDirty::PS_CONST_I) {
+        Some(dev.shader_bindings().ps_constants_i_bytes())
+    } else {
+        None
+    };
+    let ps_bool_const_buf = if dirty.contains(SnapshotDirty::PS_CONST_B) {
+        Some(dev.shader_bindings().ps_constants_b_bits().to_ne_bytes())
+    } else {
+        None
+    };
 
     // Phase 2: take scratch + bump dirty pieces + update cache. The
     // const payloads above are fixed stack buffers built in Phase 1, so
@@ -8959,6 +8983,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     if let Some(buf) = vs_bool_const_buf {
         dev.snapshot_cache.vs_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = ps_int_const_buf {
+        dev.snapshot_cache.ps_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = ps_bool_const_buf {
+        dev.snapshot_cache.ps_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     if let Some(buf) = vs_draw_buf {
         dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
@@ -10333,7 +10363,19 @@ extern "system" fn device_create_pixel_shader(
         return D3DERR_INVALIDCALL;
     }
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
-    let uses_bump_env = program.uses_bump_env();
+    let mut usage = crate::pixel_shader::PsUsage::empty();
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_BUMP_ENV,
+        program.uses_bump_env(),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_INT_CONST,
+        program.uses_dynamic_int_constants(),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_BOOL_CONST,
+        program.uses_dynamic_bool_constants(),
+    );
     let color_out_mask = program.color_out_mask();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
@@ -10346,7 +10388,7 @@ extern "system" fn device_create_pixel_shader(
         obj.inner_ptr(),
         shader_id,
         max_const_used,
-        uses_bump_env,
+        usage,
         color_out_mask,
         bytecode.into_boxed_slice(),
     );
@@ -10502,9 +10544,12 @@ extern "system" fn device_set_pixel_shader_constant_i(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
-        .write_ps_constants_i(start_register, slice);
+    if dev
+        .shader_bindings_mut()
+        .write_ps_constants_i(start_register, slice)
+    {
+        dev.mark_snapshot_dirty(SnapshotDirty::PS_CONST_I);
+    }
     0
 }
 
@@ -10557,9 +10602,12 @@ extern "system" fn device_set_pixel_shader_constant_b(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
-        .write_ps_constants_b(start_register, slice);
+    if dev
+        .shader_bindings_mut()
+        .write_ps_constants_b(start_register, slice)
+    {
+        dev.mark_snapshot_dirty(SnapshotDirty::PS_CONST_B);
+    }
     0
 }
 

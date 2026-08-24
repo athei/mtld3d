@@ -31,7 +31,7 @@ impl Direct3DPixelShader9 {
         device_inner: *mut DeviceInner,
         shader_id: ProgramId,
         max_const_used: u32,
-        uses_bump_env: bool,
+        flags: PsUsage,
         color_out_mask: u8,
         bytecode: Box<[u32]>,
     ) -> Self {
@@ -39,7 +39,7 @@ impl Direct3DPixelShader9 {
             device_inner,
             shader_id,
             max_const_used,
-            uses_bump_env,
+            flags,
             color_out_mask,
             bytecode,
         }));
@@ -66,7 +66,15 @@ impl Direct3DPixelShader9 {
     }
 
     pub fn uses_bump_env(&self) -> bool {
-        self.inner().uses_bump_env
+        self.inner().flags.contains(PsUsage::USES_BUMP_ENV)
+    }
+
+    pub fn uses_int_const(&self) -> bool {
+        self.inner().flags.contains(PsUsage::USES_INT_CONST)
+    }
+
+    pub fn uses_bool_const(&self) -> bool {
+        self.inner().flags.contains(PsUsage::USES_BOOL_CONST)
     }
 
     /// Bit `i` set ⇒ the bytecode writes `oCi` (see `DxsoProgram::color_out_mask`).
@@ -82,11 +90,37 @@ impl Direct3DPixelShader9 {
     }
 }
 
+bitflags::bitflags! {
+    /// What a compiled PS pulls in beyond its float constants.
+    ///
+    /// Gates the per-draw fragment uniform binds.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct PsUsage: u8 {
+        /// Uses an SM1 bump-environment op (`texbem`/`texbeml`/`bem`).
+        ///
+        /// Such draws bind the per-stage bump matrix + luminance uniform
+        /// (fragment slot 12).
+        const USES_BUMP_ENV = 1 << 0;
+        /// Reads a *dynamic* integer constant.
+        ///
+        /// A non-`defi` `iN`, typically a `rep`/`loop` counter fed by
+        /// `SetPixelShaderConstantI`; such draws bind the integer-constant
+        /// file (fragment slot 11).
+        const USES_INT_CONST = 1 << 1;
+        /// Reads a *dynamic* boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically the condition of a static `if` fed
+        /// by `SetPixelShaderConstantB`; such draws bind the boolean-constant
+        /// bitmask (fragment slot 10).
+        const USES_BOOL_CONST = 1 << 2;
+    }
+}
+
 struct PixelShaderInner {
     device_inner: *mut DeviceInner,
     shader_id: ProgramId,
     max_const_used: u32,
-    uses_bump_env: bool,
+    flags: PsUsage,
     color_out_mask: u8,
     /// The token stream the app passed to `CreatePixelShader`.
     ///

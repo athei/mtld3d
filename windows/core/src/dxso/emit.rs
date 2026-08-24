@@ -25,7 +25,8 @@ use std::{
 };
 
 use mtld3d_shared::mtl::{
-    VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+    VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
@@ -889,6 +890,21 @@ fn emit_ps_function(
     }
     if has_bump_env {
         w(out, ",\n    constant float4 *bump_env [[buffer(12)]]");
+    }
+    // Dynamic integer / boolean constants (a non-`defi` `iN` / non-`defb`
+    // `bN`, fed by SetPixelShaderConstantI/B) read the runtime files, the
+    // fragment-side twins of `vs_i` / `vs_b`.
+    if ps.uses_dynamic_int_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant int4 *ps_i [[buffer({PS_INT_CONST_SLOT})]]"
+        );
+    }
+    if ps.uses_dynamic_bool_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant uint &ps_b [[buffer({PS_BOOL_CONST_SLOT})]]"
+        );
     }
     for (idx, ty) in &samplers {
         // Depth-format binding (sampleable shadow map): the texture
@@ -2359,19 +2375,21 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
             |idx| format!("float4(aL_{idx})"),
         ),
         // `iN` integer-constant reads. A `defi`-declared constant is a baked
-        // `int4 iN` local; a dynamic one (fed by SetVertexShaderConstantI) in a
-        // VS reads the runtime `vs_i` buffer (slot 14). Cast to float4 so the
+        // `int4 iN` local; a dynamic one (fed by Set*ShaderConstantI) reads
+        // the stage's runtime file (`vs_i` / `ps_i`). Cast to float4 so the
         // standard swizzle / modifier pipeline applies.
         RegKind::ConstInt => {
-            if ctx.is_vertex() && !ctx.def_int_consts.contains(&reg.index) {
+            if ctx.def_int_consts.contains(&reg.index) {
+                format!("float4(i{})", reg.index)
+            } else if ctx.is_vertex() {
                 format!("float4(vs_i[{}])", reg.index)
             } else {
-                format!("float4(i{})", reg.index)
+                format!("float4(ps_i[{}])", reg.index)
             }
         }
         // `bN` boolean-constant reads. A `defb`-declared constant is a baked
-        // `bool bN` local; a dynamic one (fed by SetVertexShaderConstantB) in
-        // a VS reads bit N of the runtime `vs_b` bitmask. Both widen to
+        // `bool bN` local; a dynamic one (fed by Set*ShaderConstantB) reads
+        // bit N of the stage's runtime bitmask (`vs_b` / `ps_b`). Both widen to
         // float4 so `if`'s `.x != 0.0` test and the `!` modifier apply
         // unchanged.
         RegKind::ConstBool => {
@@ -2380,9 +2398,7 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
             } else if ctx.is_vertex() {
                 format!("float4(float((vs_b >> {}u) & 1u))", reg.index)
             } else {
-                return Err(EmitError::UnsupportedRegisterKind(
-                    "ConstBool: dynamic boolean constant in a pixel shader".into(),
-                ));
+                format!("float4(float((ps_b >> {}u) & 1u))", reg.index)
             }
         }
         // Label register reads only land here as the operand of

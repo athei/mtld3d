@@ -428,6 +428,19 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
 
+/// Fragment-stage buffer slot of the runtime integer constant table (`ps_i`).
+///
+/// The fragment uniforms count down from 15 (`ps_c`, alpha ref, fog, bump
+/// env at 15..12); the two constant files sit below them. Bound only for a
+/// PS that reads an integer constant no `defi` defines.
+pub const PS_INT_CONST_SLOT: u32 = 11;
+
+/// Fragment-stage buffer slot of the runtime boolean constant bitmask (`ps_b`).
+///
+/// One `uint`: bit N is `bN`. Bound only for a PS that reads a boolean
+/// constant no `defb` defines.
+pub const PS_BOOL_CONST_SLOT: u32 = 10;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

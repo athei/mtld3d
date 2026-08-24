@@ -473,6 +473,134 @@ fn bool_shader_constant_drives_static_branch() {
     }
 }
 
+/// `ps_3_0`: `if b0` picks red, else green, for the colour output.
+///
+/// `def c0, 1,0,0,1; def c1, 0,1,0,1; if b0 mov oC0, c0 else mov oC0, c1 endif`
+const PS_BOOL_BRANCH_BC: [u32; 24] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the pixel shader.
+///
+/// The fragment twin of the vertex-shader test above: `b0` comes from
+/// `SetPixelShaderConstantB`, TRUE paints red, FALSE green, no rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BOOL_BRANCH_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_b(0, &[value]),
+            0,
+            "SetPixelShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_3_0`: `rep i0` adds a quarter of red per iteration.
+///
+/// `def c0, 0.25,0,0,0; def c1, 0,0,0,1; mov r0, c1; rep i0; add r0, r0, c0;
+/// endrep; mov oC0, r0`
+const PS_INT_LOOP_BC: [u32; 27] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3E80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x800F_0000,
+    0xA0E4_0001,
+    0x0100_0026,
+    0xF0E4_0000,
+    0x0300_0002,
+    0x800F_0000,
+    0x80E4_0000,
+    0xA0E4_0000,
+    0x0000_0027,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic integer constant drives a `rep` loop count in the pixel shader.
+///
+/// `i0.x` comes from `SetPixelShaderConstantI`: four iterations reach full
+/// red, zero iterations leave the black start value, no rebind in between.
+#[test]
+fn int_shader_constant_drives_loop_count_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_INT_LOOP_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (count, expected, what) in [
+        (4, 0xFFFF_0000, "i0 = 4 iterations add up to full red"),
+        (
+            0,
+            0xFF00_0000,
+            "i0 = 0 iterations keep the black start value",
+        ),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_i(0, &[count, 0, 0, 0]),
+            0,
+            "SetPixelShaderConstantI"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
 /// `ps_2_0`: `def c0, 1,0,0,1; mov oDepth, c0.x; mov oC0, c0;`
 const PS_DEPTH_WRITE_BC: [u32; 14] = [
     0xFFFF_0200,

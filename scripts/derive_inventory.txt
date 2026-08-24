@@ -167,6 +167,7 @@ windows/d3d9/src/encoder.rs SubmitMode Clone,Copy,PartialEq,Eq
 windows/d3d9/src/encoder.rs TextureInfo Clone
 windows/d3d9/src/encoder.rs VbibWarmupEntry Clone,Copy
 windows/d3d9/src/fullscreen.rs Rect Clone,Copy
+windows/d3d9/src/pixel_shader.rs PsUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/surface.rs GdiDc Clone,Copy
 windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq

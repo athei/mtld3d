@@ -28,8 +28,9 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PrimitiveType, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-        VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
+        IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PrimitiveType, VS_BOOL_CONST_SLOT,
+        VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+        VertexStepFunction,
     },
 };
 use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
@@ -616,6 +617,16 @@ pub struct CurrentSnapshot {
     /// Bound only for a VS that reads a dynamic boolean constant
     /// (`VsSource::Programmable::uses_bool_const`).
     pub vs_bool_const_bytes: Option<ScratchSlice>,
+    /// PS integer-constant file (fragment slot 11).
+    ///
+    /// Bound only for a PS that reads a dynamic integer constant
+    /// (`PsSource::Programmable::uses_int_const`).
+    pub ps_int_const_bytes: Option<ScratchSlice>,
+    /// PS boolean-constant bitmask (fragment slot 10).
+    ///
+    /// Bound only for a PS that reads a dynamic boolean constant
+    /// (`PsSource::Programmable::uses_bool_const`).
+    pub ps_bool_const_bytes: Option<ScratchSlice>,
     /// Per-draw `VsDraw` uniform (`mtld3d_core::vs_draw`): point size state.
     ///
     /// Every vertex shader reads it, so it is bound for every draw and
@@ -643,6 +654,8 @@ impl CurrentSnapshot {
         bump_env_bytes: None,
         vs_int_const_bytes: None,
         vs_bool_const_bytes: None,
+        ps_int_const_bytes: None,
+        ps_bool_const_bytes: None,
         vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
     };
@@ -905,6 +918,16 @@ pub enum PsSource {
         /// The per-stage uniform goes to PS slot 12. False for the vast
         /// majority of shaders, which then pay no slot-12 bind.
         uses_bump_env: bool,
+        /// Whether the PS reads a dynamic integer constant.
+        ///
+        /// A non-`defi` `iN`, typically a `rep`/`loop` counter fed by
+        /// `SetPixelShaderConstantI`; the file goes to fragment slot 11.
+        uses_int_const: bool,
+        /// Whether the PS reads a dynamic boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically a static `if` condition fed by
+        /// `SetPixelShaderConstantB`; the bitmask goes to fragment slot 10.
+        uses_bool_const: bool,
         /// Bit `i` set ⇒ the bytecode writes `oCi`.
         ///
         /// Feeds the pipeline key so a render target the shader never
@@ -1307,6 +1330,32 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     );
     let vs_bool_const_slice = if vs_uses_bool_const {
         snap.vs_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
+    // PS integer / boolean constants (fragment slots 11 / 10), gated by the
+    // bound PS the same way.
+    let ps_uses_int_const = matches!(
+        ps,
+        PsSource::Programmable {
+            uses_int_const: true,
+            ..
+        }
+    );
+    let ps_int_const_slice = if ps_uses_int_const {
+        snap.ps_int_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
+    let ps_uses_bool_const = matches!(
+        ps,
+        PsSource::Programmable {
+            uses_bool_const: true,
+            ..
+        }
+    );
+    let ps_bool_const_slice = if ps_uses_bool_const {
+        snap.ps_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
         ScratchSlice::EMPTY
     };
@@ -1844,6 +1893,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if !vs_bool_const_slice.as_slice().is_empty() {
         let (p, n) = vs_bool_const_slice.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_BOOL_CONST_SLOT));
+    }
+    // PS integer / boolean constants: the fragment-side twins, same policy.
+    if !ps_int_const_slice.as_slice().is_empty() {
+        let (p, n) = ps_int_const_slice.as_raw();
+        enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_INT_CONST_SLOT));
+    }
+    if !ps_bool_const_slice.as_slice().is_empty() {
+        let (p, n) = ps_bool_const_slice.as_raw();
+        enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_BOOL_CONST_SLOT));
     }
     drop(t_cbind);
 
