@@ -152,6 +152,60 @@ pub extern "system" fn direct3d_shader_validator_create9() -> *mut c_void {
     shader_validator::create()
 }
 
+// The `D3DPERF_*` family: PIX event markers a game emits around its draw
+// groups. Without a profiler attached the real d3d9.dll does nothing and
+// reports no nesting, no repeat-frame request and no attached tool, which is
+// the complete behaviour here too. They are exported because engines resolve
+// the whole family by name in one table and treat a missing entry as a broken
+// d3d9.dll: an in-game overlay SDK refuses to initialise when any of them
+// resolves to null, even though the game itself renders fine.
+
+/// `D3DPERF_BeginEvent`: opens a PIX event; returns the nesting level.
+///
+/// Logged once so a game that emits PIX markers is visible in triage; the
+/// markers are not forwarded to a Metal capture.
+#[unsafe(export_name = "D3DPERF_BeginEvent")]
+pub extern "system" fn d3dperf_begin_event(_color: u32, _name: *const u16) -> i32 {
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "D3DPERF_BeginEvent: PIX event markers not forwarded (no profiler)"
+    );
+    0
+}
+
+/// `D3DPERF_EndEvent`: closes a PIX event; returns the nesting level.
+#[unsafe(export_name = "D3DPERF_EndEvent")]
+#[must_use]
+pub const extern "system" fn d3dperf_end_event() -> i32 {
+    0
+}
+
+/// `D3DPERF_SetMarker`: a single PIX marker, not forwarded.
+#[unsafe(export_name = "D3DPERF_SetMarker")]
+pub const extern "system" fn d3dperf_set_marker(_color: u32, _name: *const u16) {}
+
+/// `D3DPERF_SetRegion`: a PIX region marker, not forwarded.
+#[unsafe(export_name = "D3DPERF_SetRegion")]
+pub const extern "system" fn d3dperf_set_region(_color: u32, _name: *const u16) {}
+
+/// `D3DPERF_QueryRepeatFrame`: `FALSE`, no profiler asks for a frame replay.
+#[unsafe(export_name = "D3DPERF_QueryRepeatFrame")]
+#[must_use]
+pub const extern "system" fn d3dperf_query_repeat_frame() -> i32 {
+    0
+}
+
+/// `D3DPERF_SetOptions`: profiler permission flags, nothing to apply them to.
+#[unsafe(export_name = "D3DPERF_SetOptions")]
+pub const extern "system" fn d3dperf_set_options(_options: u32) {}
+
+/// `D3DPERF_GetStatus`: `0`, no profiler attached.
+#[unsafe(export_name = "D3DPERF_GetStatus")]
+#[must_use]
+pub const extern "system" fn d3dperf_get_status() -> u32 {
+    0
+}
+
 // Wires up the PE-side `env_logger` for this cdylib, then fires a
 // one-shot `InitLogger` thunk so the unix .so registers its own
 // (each cdylib has its own `log` crate statics). Runs from DllMain
