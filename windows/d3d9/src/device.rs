@@ -57,8 +57,8 @@ use mtld3d_types::{
     D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTSS_BUMPENVLOFFSET,
     D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
+    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY,
     D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
     TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
@@ -10814,6 +10814,11 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
     if usage & D3DUSAGE_NONSECURE != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Create{kind}: D3DUSAGE_NONSECURE set but non-secure hint ignored");
     }
+    // D3DUSAGE_DMAP marks a displacement map for the N-patch tessellator,
+    // which no modern driver runs either; the texture is an ordinary texture.
+    if usage & D3DUSAGE_DMAP != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Create{kind}: D3DUSAGE_DMAP set but displacement mapping not implemented");
+    }
 
     // Surface any remaining unknown bits (beyond the union of honored + warned).
     let known = D3DUSAGE_RENDERTARGET
@@ -10826,7 +10831,8 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
         | D3DUSAGE_NPATCHES
         | D3DUSAGE_DYNAMIC
         | D3DUSAGE_AUTOGENMIPMAP
-        | D3DUSAGE_NONSECURE;
+        | D3DUSAGE_NONSECURE
+        | D3DUSAGE_DMAP;
     let unknown = usage & !known;
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
