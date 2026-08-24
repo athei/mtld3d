@@ -20,6 +20,57 @@ use super::{
     opcode::Opcode,
 };
 
+/// How many tokens follow an opcode token as its operands.
+///
+/// SM2.0 introduced the instruction-length field in bits 24-27 of the opcode
+/// token. SM1.x (`vs_1_1` / `ps_1_0`..`ps_1_4`) leaves those bits zero and
+/// carries no length anywhere, so its operand run has to be counted instead:
+/// every dst/src register token — including a relative-address extension
+/// token — sets bit 31, while the next opcode token and the END token clear
+/// it.
+///
+/// Reading the SM2+ field on an SM1 stream walks into a parameter or immediate
+/// token and takes its bits 24-27 as a count, which runs off the instruction
+/// and, in a walker that has no slice to bound it, off the buffer. Anything
+/// stepping a token stream needs this, not just the parser: `peek(n)` returns
+/// the token `n` places after the opcode, or `None` past the end.
+///
+/// The constant definitions are the exception the scan cannot see: `def` and
+/// `defi` carry a destination plus four immediate words, and `defb` one, and an
+/// immediate is a literal value whose top bit means nothing. Their operand
+/// counts are fixed by the opcode instead.
+///
+/// The two terminators are the caller's business: a comment carries its own
+/// payload length in bits 16-30 and END ends the stream, so neither has an
+/// operand run to count and both must be dispatched before this is called.
+#[must_use]
+pub fn operand_token_count(
+    major: u8,
+    opcode_token: u32,
+    mut peek: impl FnMut(usize) -> Option<u32>,
+) -> usize {
+    debug_assert!(
+        !matches!(
+            Opcode::from_u16((opcode_token & 0xFFFF) as u16),
+            Some(Opcode::Comment | Opcode::End)
+        ),
+        "comment and END tokens carry no operand run"
+    );
+    if major >= 2 {
+        return ((opcode_token >> 24) & 0xF) as usize;
+    }
+    match Opcode::from_u16((opcode_token & 0xFFFF) as u16) {
+        Some(Opcode::Def | Opcode::DefI) => return 5,
+        Some(Opcode::DefB) => return 2,
+        _ => {}
+    }
+    let mut n = 0;
+    while peek(n).is_some_and(|t| t & 0x8000_0000 != 0) {
+        n += 1;
+    }
+    n
+}
+
 /// Parse DXSO bytecode into a [`DxsoProgram`] IR.
 ///
 /// # Errors
@@ -175,25 +226,8 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
                 current_label = None;
             }
             _ => {
-                // SM2.0 introduced the instruction-length field in bits 24-27
-                // of the opcode token. SM1.x (vs_1_1 / ps_1_0..1_4) leaves
-                // those bits zero, so for SM1 the operand count must instead be
-                // derived from the parameter-token continuation flag: every
-                // dst/src register token — including a relative-address
-                // extension token — sets bit 31, while the next opcode token
-                // and the END token clear it. Count that run for SM1; read the
-                // length field directly for SM2+. (Without this, SM1
-                // instructions parse with zero operands and the emitter indexes
-                // an empty source list.)
-                let token_count = if major >= 2 {
-                    ((token >> 24) & 0xF) as usize
-                } else {
-                    let mut n = 0;
-                    while bytecode.get(pos + n).is_some_and(|t| t & 0x8000_0000 != 0) {
-                        n += 1;
-                    }
-                    n
-                };
+                let token_count =
+                    operand_token_count(major, token, |n| bytecode.get(pos + n).copied());
                 let predicated = (token & (1 << 28)) != 0;
                 // D3D9 packs the comparison-function selector for
                 // ifc / breakc / setp into bits 16-23 of the

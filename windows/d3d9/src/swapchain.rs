@@ -14,7 +14,7 @@ use mtld3d_shared::{InPtr, OutPtr};
 use mtld3d_types::{D3DDISPLAYMODE, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl};
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, device::DeviceInner};
-use crate::{device::Direct3DDevice9, null_out, surface::Direct3DSurface9};
+use crate::surface::Direct3DSurface9;
 
 pub static DIRECT3D_SWAPCHAIN9_VTBL: IDirect3DSwapChain9Vtbl = IDirect3DSwapChain9Vtbl {
     query_interface: swapchain_query_interface,
@@ -198,7 +198,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
     fn refcount_mut(&mut self) -> &mut u32 {
         &mut self.refcount
     }
-    fn device_forward_target(&self) -> *mut c_void {
+    fn owning_device(&self) -> *mut c_void {
         // Both the device-owned implicit swapchain (forwards on its 0→1 edge)
         // and an app-owned additional swapchain (registered at creation, forwards
         // its release at teardown) hold one reference on the device.
@@ -332,34 +332,8 @@ extern "system" fn swapchain_get_display_mode(this: *mut c_void, mode: *mut c_vo
 }
 
 extern "system" fn swapchain_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
-    if device.is_null() {
-        return D3DERR_INVALIDCALL;
-    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    };
-    let device_inner = obj.inner().device_inner;
-    if device_inner.is_null() {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    }
-    // SAFETY: `device_inner` is the live owning device (see `SwapChainInner`).
-    let wrapper = unsafe { (*device_inner).device_wrapper() };
-    if wrapper.is_null() {
-        null_out(device);
-        return D3DERR_INVALIDCALL;
-    }
-    // AddRef per COM — the caller owns one reference on return.
-    // SAFETY: `wrapper` is the live `Direct3DDevice9` that owns `device_inner`;
-    // D3D9 objects are single-threaded, so the transient exclusive borrow to
-    // bump the refcount is sound.
-    unsafe { (*wrapper.cast::<Direct3DDevice9>()).add_ref_self() };
-    // SAFETY: `device` is non-null (checked) and points to a writable
-    // `*mut c_void` slot per the D3D9 ABI.
-    unsafe { *device = wrapper };
-    D3D_OK
+    unsafe { crate::com_ref::com_get_device::<Direct3DSwapChain9>(this, device) }
 }
 
 extern "system" fn swapchain_get_present_parameters(

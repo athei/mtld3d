@@ -9,16 +9,55 @@ use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
     D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
-    D3DVOLUME_DESC, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
+    D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
     IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl,
     IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
-    IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl,
+    IDirect3DVolumeTexture9Vtbl,
 };
 
 use crate::{
     check::{expect_created, expect_ok},
     vtbl::deref_vtbl,
 };
+
+// ── Private data ──
+
+/// `SetPrivateData(guid, blob, len, 0)` through a resource's own thunk.
+fn set_private_data(
+    set: unsafe extern "system" fn(*mut c_void, *const Guid, *const c_void, u32, u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    blob: &[u8],
+) -> i32 {
+    let len = u32::try_from(blob.len()).expect("blob fits u32");
+    // SAFETY: vtable thunk; `blob` is readable for `len`.
+    unsafe {
+        set(
+            this,
+            &raw const *guid,
+            blob.as_ptr().cast::<c_void>(),
+            len,
+            0,
+        )
+    }
+}
+
+/// `GetPrivateData(guid, out, &mut size)`; a null `out` asks for the size alone.
+fn get_private_data(
+    get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void, *mut u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    out: Option<&mut [u8]>,
+) -> (i32, u32) {
+    let (ptr, mut size) = out.map_or((core::ptr::null_mut(), 0), |b| {
+        let len = u32::try_from(b.len()).expect("buffer fits u32");
+        (b.as_mut_ptr().cast::<c_void>(), len)
+    });
+    // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
+    let hr = unsafe { get(this, &raw const *guid, ptr, &raw mut size) };
+    (hr, size)
+}
 
 // ── Volume texture ──
 
@@ -34,6 +73,17 @@ impl VolumeTexture<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     fn vtbl(&self) -> &'static IDirect3DVolumeTexture9Vtbl {
@@ -141,9 +191,58 @@ impl VolumeTexture<'_> {
         }
         expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
     }
+
+    /// `GetVolumeLevel`, handing back the sub-resource it wrote.
+    #[must_use]
+    pub fn get_volume_level(&self, level: u32) -> (i32, Option<Volume<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_volume_level)(self.ptr, level, &raw mut out) };
+        (hr, (!out.is_null()).then(|| Volume::from_raw(out)))
+    }
 }
 
 impl Drop for VolumeTexture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Volume ──
+
+/// An `IDirect3DVolume9`, a level of a volume texture.
+pub struct Volume<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl Volume<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DVolume9Vtbl {
+        // SAFETY: `self.ptr` is a live volume for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DVolume9Vtbl>(self.ptr) }
+    }
+}
+
+impl Drop for Volume<'_> {
     fn drop(&mut self) {
         // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
         unsafe { (self.vtbl().release)(self.ptr) };
@@ -303,12 +402,15 @@ impl<'h> Texture<'h> {
         }
     }
 
-    /// `GetDevice` (a documented stub today). Returns the hr.
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
     #[must_use]
-    pub fn get_device_hr(&self) -> i32 {
+    pub fn get_device(&self) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `&mut out` is writable.
-        unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) }
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     /// `PreLoad` — a no-op that must not crash.
@@ -353,6 +455,17 @@ impl CubeTexture<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     /// The raw COM pointer used for base-texture binding.
@@ -445,6 +558,17 @@ impl Surface<'_> {
         }
     }
 
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
     /// The raw COM `this` pointer (for `SetRenderTarget` etc.).
     #[must_use]
     pub const fn as_ptr(&self) -> *mut c_void {
@@ -519,6 +643,100 @@ impl VertexBuffer<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `GetDevice` through this buffer's vtable, on a caller-chosen `this`.
+    ///
+    /// A null `this` and a null out-param are contract cases: the thunk
+    /// answers rather than faulting, which a wrapper method cannot express.
+    ///
+    /// # Safety
+    /// `this` is null or a live vertex buffer; `device` is null or a writable
+    /// `*mut c_void` slot.
+    #[must_use]
+    pub unsafe fn get_device_raw(&self, this: *mut c_void, device: *mut *mut c_void) -> i32 {
+        // SAFETY: vtable thunk; the caller states what `this` and `device` are.
+        unsafe { (self.vtbl().get_device)(this, device) }
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the resource dies.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, and `punk` is a live COM object.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
+    }
+
+    /// `GetPrivateData` for a stored `IUnknown`.
+    ///
+    /// Returns the hr, the pointer it wrote, and the size it reported.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn get_private_data_unknown(&self, guid: &Guid) -> (i32, *mut c_void, u32) {
+        let mut punk: *mut c_void = core::ptr::null_mut();
+        let mut size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; `&mut punk` is a writable pointer slot of the
+        // width `size` names.
+        let hr = unsafe {
+            (self.vtbl().get_private_data)(
+                self.ptr,
+                &raw const *guid,
+                (&raw mut punk).cast::<c_void>(),
+                &raw mut size,
+            )
+        };
+        (hr, punk, size)
     }
 
     /// The raw COM `this` pointer (for `SetStreamSource`).
@@ -604,6 +822,38 @@ impl IndexBuffer<'_> {
         }
     }
 
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
     /// The raw COM `this` pointer (for `SetIndices`).
     #[must_use]
     pub const fn as_ptr(&self) -> *mut c_void {
@@ -671,10 +921,39 @@ impl VertexShader<'_> {
         }
     }
 
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live vertex shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
     /// The raw COM `this` pointer (for `SetVertexShader`).
     #[must_use]
     pub const fn as_ptr(&self) -> *mut c_void {
         self.ptr
+    }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live vertex shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
     }
 }
 
@@ -701,10 +980,39 @@ impl PixelShader<'_> {
         }
     }
 
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live pixel shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
     /// The raw COM `this` pointer (for `SetPixelShader`).
     #[must_use]
     pub const fn as_ptr(&self) -> *mut c_void {
         self.ptr
+    }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live pixel shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
     }
 }
 
@@ -731,6 +1039,17 @@ impl StateBlock<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     fn vtbl(&self) -> &'static IDirect3DStateBlock9Vtbl {
@@ -774,6 +1093,17 @@ impl Query<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     fn vtbl(&self) -> &'static IDirect3DQuery9Vtbl {
@@ -835,6 +1165,19 @@ impl VertexDeclaration<'_> {
             ptr,
             _marker: PhantomData,
         }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live vertex declaration.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexDeclaration9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
     }
 
     /// The raw COM `this` pointer (for `SetVertexDeclaration`).

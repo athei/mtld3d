@@ -22,14 +22,14 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `textures.rs` | Lock/sample A8R8G8B8/X8R8G8B8/R5G6B5/A1R5G5B5/A4R4G4B4/L8; DXT1 block decode; mip chain levels/dims; AUTOGENMIPMAP; SetLOD no-op; cube creation in all pools; CPU-only extension-format cubes; managed DXT face isolation; cube face upload, sampling, state blocks, render targets, and AUTOGENMIPMAP; volume creates; `UpdateTexture` between volumes copies every slice (sampled per slice centre through the fixed-function 3D texcoord path). |
 | `samplers.rs` | State round-trip; CLAMP≠WRAP past the unit square; POINT≠LINEAR; BORDER → Metal black preset (pinned). |
 | `texture_stages.rs` | COLOROP round-trip; MODULATE/ADD/SELECTARG2; TFACTOR arg source; sampling a locked A16B16G16R16F texture. |
-| `shaders.rs` | hand-assembled VS/PS; PS-constant colour; VS-constant translation; float-constant setters (in-range accept + out-of-range/`-1` → `INVALIDCALL`); integer/bool + Get*Constant* stubs. |
+| `shaders.rs` | hand-assembled VS/PS; PS-constant colour; VS-constant translation; float-constant setters (in-range accept + out-of-range/`-1` → `INVALIDCALL`); integer/bool + Get*Constant* stubs; `GetFunction` returning the creating bytecode (size query, round trip, undersized buffer, null size pointer) for both shader kinds and for a shader-model 1 program. |
 | `vertex_decl.rs` | `CreateVertexDeclaration` drives an FF draw; `GetVertexDeclaration` round-trip; a two-stream declaration through the FF pipeline; a declared stream with nothing bound reads zeros (bound and UP draws). |
 | `transforms_ff.rs` | Set/Get/MultiplyTransform; FF diffuse passthrough; alpha test; Set/Get material + light + LightEnable. |
 | `render_target.rs` | Render-to-texture + sample; A16B16G16R16F render target create and draw/readback round trip; depth occlusion; auto depth-stencil Get/Set; CreateDepthStencilSurface; backbuffer desc; StretchRect 1:1 accept; StretchRect format conversion (R5G6B5 into X8R8G8B8 through the scaling render quad, YUY2/UYVY decode into the backbuffer and, on the CPU path, into an offscreen-plain surface); INTZ sampleable-depth dual-use (render-as-depth → sample) via both the FF and a programmable PS; `GetRenderTargetData` read-back into a SYSTEMMEM offscreen surface (`Surface::GetDevice` + `CreateOffscreenPlainSurface` + `LockRect`, pixels matched against the private export); surface-op contracts (ColorFill/CreateRenderTarget stubs, DEFAULT-pool rejection). |
 | `mrt.rs` | Multiple render targets: `ps_3_0` writing `oC0`/`oC1` into two bound targets; `Clear` reaching every bound target and an unwritten target keeping its contents; `D3DRS_COLORWRITEENABLE1` masking slot 1 alone; the slot contract (four slots, slot 0 never null, `NOTFOUND` on an unbound slot, `SetRenderTarget(1, NULL)`); `Reset` unbinding slots 1..3; a target sized unlike slot 0 cleared but left out of draws; a mid-pass `Clear` and a rect `Clear` reaching both targets through the in-pass quad; the MRT caps bits. |
 | `state_block.rs` | Capture/Apply (ALL); VERTEXSTATE restores FVF; PIXELSTATE restores sampler; Begin/EndStateBlock recording. |
 | `query.rs` | EVENT fence; OCCLUSION sample count; TIMESTAMP contract. |
-| `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice`/`SetClipPlane` stubs; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
+| `resource_misc.rs` | Factory refcount; `QueryInterface` → E_NOINTERFACE; `GetType`; no-op PreLoad/SetPriority; `GetAvailableTextureMem`; `EvictManagedResources`; `GetDevice` answering with the creating device from every wrapper it was a stub on (both buffers, the 2D, cube and volume textures in the pools that do and do not pin the device, a volume level, a texture's own surface and a standalone render target, both shaders, the declaration, the state block and the query), each releasing the reference it was handed and checking the device count back to its pre-call value; a null `this` and a null out-pointer answered rather than faulted; the private-data round trip (store, size query, read back, free) on both buffer kinds, the `IUnknown` form's reference lifecycle, and `D3DERR_MOREDATA` on an undersized read; `SetClipPlane`/`GetClipPlane` round trip; `ValidateDevice` → S_OK (single-pass valid); `SetGammaRamp` no-op. |
 | `unload.rs` | `LoadLibrary` → `Direct3DCreate9` → `Release` → `FreeLibrary`, then a continuable exception raised with a resuming handler appended at the end of the chain: proves the unloaded image left no vectored exception handler behind (no harness: its `raw-dylib` import would keep the module mapped). |
 
 ## Documented limitations / stubs pinned by tests
@@ -51,12 +51,18 @@ contract so a future implementation flips a known assertion.
   `D3DPOOL_SYSTEMMEM` only (DEFAULT/MANAGED rejected); `GetRenderTargetData` /
   `GetFrontBufferData` read a backbuffer / standalone-color RT back into a
   SYSTEMMEM surface (texture-backed RT sources not yet resolved).
-- **Resources:** `GetDevice` is implemented on surfaces but still stubbed on the
-  other resource types (VB/IB/textures/shaders/queries). `SetClipPlane` is a
-  stub; `ValidateDevice` returns S_OK (single-pass valid); `SetGammaRamp` is a
-  no-op.
-- **Legacy:** `SetPrivateData`, `SetPaletteEntries`, `GetRasterStatus`,
-  `GetClipStatus`, `SetDialogBoxMode`.
+- **Resources:** `ValidateDevice` returns S_OK (single-pass valid);
+  `SetGammaRamp` is a no-op. Two `INVALIDCALL`s here are deliberate
+  divergences rather than gaps, both where D3D9 itself leaves no room to
+  fail: `GetDevice` answers `INVALIDCALL` once the creating device is gone,
+  which only the resources that do not pin it can reach (a MANAGED texture,
+  the CPU-only cube shell) and only after an application released a device
+  it still holds resources from; `GetFunction` answers `INVALIDCALL` for a
+  null `pSizeOfData`, the size slot being the call's only channel in both
+  directions, so there is nothing to answer without one.
+- **Legacy:** `IDirect3DVolume9::SetPrivateData` (accepted and discarded;
+  `GetPrivateData` then reports `INVALIDCALL`), `SetPaletteEntries`,
+  `GetRasterStatus`, `GetClipStatus`, `SetDialogBoxMode`.
 
 INTZ sampleable-depth (cascade shadows): covered synthetically — the depth
 texture is rendered into, then sampled in a later pass (depth unbound first so it

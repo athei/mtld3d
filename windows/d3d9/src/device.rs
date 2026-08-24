@@ -11,6 +11,7 @@ use mtld3d_core::{
         self, FfVsLayout, InputSemantic, d3d_to_metal_primitive, fvf_to_elements,
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
     },
+    dxso::operand_token_count,
     ff_state::{FfState, FfVsDirty},
     format::{FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, map_d3d_format},
     ids::{BufferId, ProgramId, TextureId},
@@ -2261,7 +2262,7 @@ impl Direct3DDevice9 {
         self.inner
     }
 
-    /// COM `AddRef` used when a child resource's `GetDevice` hands this device back to the caller.
+    /// COM `AddRef` on the device wrapper, taken on a child object's behalf.
     ///
     /// Bumps the wrapper refcount directly — D3D9 objects are
     /// single-threaded, so this matches `device_add_ref`'s effect without
@@ -2829,14 +2830,15 @@ pub fn device_wrapper_from(inner: *mut DeviceInner) -> *mut c_void {
     unsafe { (*inner).device_wrapper() }
 }
 
-/// Forward an implicit child object's `AddRef` to its owning device wrapper.
+/// Take one reference on a device wrapper on behalf of a child object.
 ///
-/// The implicit swapchain and the implicit render-target / depth-stencil
-/// surfaces are device-owned: each holds exactly one reference on the device
-/// while its own public refcount is non-zero — acquired here on the child's
-/// 0→1 transition (the child forwards a reference to its parent device).
-/// `wrapper` is the `Direct3DDevice9`* from [`DeviceInner::device_wrapper`]; a
-/// null wrapper (device not yet stamped) is a no-op.
+/// Two callers. The implicit swapchain and the implicit render-target /
+/// depth-stencil surfaces are device-owned: each holds exactly one reference
+/// on the device while its own public refcount is non-zero, acquired here on
+/// the child's 0→1 transition. `GetDevice` takes one as well, on behalf of the
+/// application, which releases it. `wrapper` is the `Direct3DDevice9`* from
+/// [`DeviceInner::device_wrapper`]; a null wrapper (device not yet stamped) is
+/// a no-op.
 pub fn device_wrapper_add_ref(wrapper: *mut c_void) {
     if wrapper.is_null() {
         return;
@@ -9545,10 +9547,32 @@ extern "system" fn device_get_fvf(this: *mut c_void, fvf: *mut u32) -> i32 {
 
 /// Read a DXSO token stream from a caller-supplied pointer until the End opcode (0x0000FFFF).
 ///
-/// Handles comment payloads and instruction token
-/// counts so payload bytes that happen to equal 0xFFFF aren't misread as End.
+/// Skips comment payloads and each instruction's operand run, so a payload or
+/// immediate word that happens to equal 0xFFFF is not misread as End. The
+/// operand run is counted the way the model requires, which for SM1 is not a
+/// field but a scan: see [`operand_token_count`]. Getting that wrong here does
+/// not merely mis-measure, it walks past the End token and keeps reading
+/// whatever follows the shader in the caller's address space.
+///
+/// The version word is validated rather than skipped: the walk cannot pick its
+/// counting rule without the model, and a stream whose first token is not a
+/// VS/PS version word has no length to find.
 fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
     const MAX_TOKENS: usize = 65536;
+    // SAFETY: both callers reject a null `pFunction` before reaching here, and
+    // a non-null token stream is at least its version word.
+    let version = unsafe { *ptr };
+    match (version >> 16) & 0xFFFF {
+        0xFFFE | 0xFFFF => {}
+        _ => {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "shader creation: first token 0x{version:08X} is not a vertex or pixel shader version word → INVALIDCALL"
+            );
+            return None;
+        }
+    }
+    let major = ((version >> 8) & 0xFF) as u8;
     let mut len = 1; // version token
     loop {
         if len >= MAX_TOKENS {
@@ -9568,8 +9592,17 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
             let payload = ((tok >> 16) & 0x7FFF) as usize;
             len += payload;
         } else {
-            let count = ((tok >> 24) & 0xF) as usize;
-            len += count;
+            len += operand_token_count(major, tok, |n| {
+                if len + n >= MAX_TOKENS {
+                    return None;
+                }
+                // SAFETY: same stream as the read above, under the same
+                // `MAX_TOKENS` bound.
+                let peek_ptr = unsafe { ptr.add(len + n) };
+                // SAFETY: the bound above keeps `len + n` inside the same
+                // stream the loop is already reading.
+                Some(unsafe { *peek_ptr })
+            });
         }
     }
     // SAFETY: `ptr` is the caller-supplied DXSO token stream; the
@@ -9662,9 +9695,9 @@ extern "system" fn device_create_vertex_shader(
     // a bound vertex declaration's elements → `[[attribute(N)]]` indices
     // without a trip to the encoder thread.
     let input_semantics = extract_input_semantics(&program);
-    // `bytecode` drops at end of function scope; the parsed program moves
-    // into an op bound for the encoder's program cache, and the wrapper
-    // only records identity bits.
+    // The parsed program moves into an op bound for the encoder's program
+    // cache; the token stream itself moves into the wrapper, which answers
+    // `GetFunction` from it.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -9679,6 +9712,7 @@ extern "system" fn device_create_vertex_shader(
         uses_rel_const,
         uses_int_const,
         input_semantics,
+        bytecode.into_boxed_slice(),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
@@ -10236,6 +10270,7 @@ extern "system" fn device_create_pixel_shader(
         max_const_used,
         uses_bump_env,
         color_out_mask,
+        bytecode.into_boxed_slice(),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.

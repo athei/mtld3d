@@ -33,4 +33,4 @@ pub use ff::{
 pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,
 };
-pub use parser::parse;
+pub use parser::{operand_token_count, parse};

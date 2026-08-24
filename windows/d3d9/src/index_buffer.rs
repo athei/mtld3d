@@ -23,7 +23,7 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
-    device::DeviceInner, null_out,
+    device::DeviceInner, null_out, private_data::PrivateDataStore,
 };
 
 static DIRECT3D_INDEX_BUFFER9_VTBL: IDirect3DIndexBuffer9Vtbl = IDirect3DIndexBuffer9Vtbl {
@@ -62,6 +62,10 @@ pub struct IndexBufferInner {
     usage: u32,
     format: u32,
     pool: u32,
+    /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
+    ///
+    /// Any stored `IUnknown` is released when this `IndexBufferInner` drops.
+    private_data: PrivateDataStore,
     /// `Direct` (zero-copy) vs `Staged` (separate device buffer + dirty-range upload).
     ///
     /// Decided once at creation from `usage`/`pool`.
@@ -145,6 +149,7 @@ impl Direct3DIndexBuffer9 {
             usage: info.usage,
             format: info.format,
             pool: info.pool,
+            private_data: PrivateDataStore::default(),
             map_mode: classify_map_mode(info.usage, info.pool),
             dirty: DirtyRange::empty(),
             current_box,
@@ -291,7 +296,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DIndexBuffer9 {
     fn private_refcount(&self) -> u32 {
         self.private_refcount
     }
-    fn device_forward_target(&self) -> *mut c_void {
+    fn owning_device(&self) -> *mut c_void {
         crate::device::device_wrapper_from(self.inner().device_inner)
     }
     unsafe fn finalize(this: *mut Self) {
@@ -304,38 +309,64 @@ unsafe impl crate::com_ref::ComChild for Direct3DIndexBuffer9 {
 
 extern "system" fn ib_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DIndexBuffer9::GetDevice → INVALIDCALL");
-    null_out(device);
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per its ABI, and `device` is
+    // the caller's out-param.
+    unsafe { crate::com_ref::com_get_device::<Direct3DIndexBuffer9>(this, device) }
 }
 
 extern "system" fn ib_set_private_data(
     this: *mut c_void,
-    _guid: *const Guid,
-    _data: *const c_void,
-    _size: u32,
-    _flags: u32,
+    guid: *const Guid,
+    data: *const c_void,
+    size: u32,
+    flags: u32,
 ) -> i32 {
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DIndexBuffer9::SetPrivateData → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DIndexBuffer9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let store = &mut obj.inner_mut().private_data;
+    // SAFETY: `data`/`size`/`flags` are the caller-supplied payload per the
+    // D3D9 ABI; `set` validates them.
+    unsafe { store.set(&guid, data, size, flags) }
 }
 
 extern "system" fn ib_get_private_data(
     this: *mut c_void,
-    _guid: *const Guid,
-    _data: *mut c_void,
-    _size: *mut u32,
+    guid: *const Guid,
+    data: *mut c_void,
+    size: *mut u32,
 ) -> i32 {
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DIndexBuffer9::GetPrivateData → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DIndexBuffer9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `data`/`size` are the caller-owned out buffer + size slot per
+    // the D3D9 ABI; the store validates the size before any copy.
+    unsafe { obj.inner().private_data.get(&guid, data, size) }
 }
 
-extern "system" fn ib_free_private_data(this: *mut c_void, _guid: *const Guid) -> i32 {
+extern "system" fn ib_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DIndexBuffer9::FreePrivateData → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DIndexBuffer9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    obj.inner_mut().private_data.free(&guid)
 }
 
 extern "system" fn ib_set_priority(this: *mut c_void, _priority: u32) -> u32 {

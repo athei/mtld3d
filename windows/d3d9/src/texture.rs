@@ -2020,6 +2020,17 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
         {
             return core::ptr::null_mut();
         }
+        self.owning_device()
+    }
+    fn owning_device(&self) -> *mut c_void {
+        // Every pool answers here, including the managed and cube-shell cases
+        // the forwarding target excludes: those opt out of pinning the device,
+        // not out of having one. Null only once the device is gone, which
+        // `detach_from_device` zeroes at teardown.
+        let inner = self.inner();
+        if inner.device_inner == 0 {
+            return core::ptr::null_mut();
+        }
         DeviceInner::from_ptr(inner.device_inner).device_wrapper()
     }
     unsafe fn finalize(this: *mut Self) {
@@ -2028,13 +2039,15 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     }
 }
 
-// ── IDirect3DResource9 stubs ──
+// ── IDirect3DResource9 ──
 
 extern "system" fn texture_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
     let _timer = tex_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DTexture9::GetDevice → INVALIDCALL");
-    null_out(device);
-    D3DERR_INVALIDCALL
+    // SAFETY: IDirect3DTexture9 / IDirect3DVolumeTexture9 / IDirect3DCubeTexture9
+    // GetDevice thunk: all three vtables share it, and their wrappers share a
+    // layout, as the refcount thunks above already rely on. `device` is the
+    // caller's out-param.
+    unsafe { crate::com_ref::com_get_device::<Direct3DTexture9>(this, device) }
 }
 
 extern "system" fn texture_set_private_data(
@@ -3330,12 +3343,37 @@ extern "system" fn volume9_release(this: *mut c_void) -> u32 {
     texture_release(obj.parent_texture)
 }
 
-extern "system" fn volume9_get_device(_this: *mut c_void, device: *mut *mut c_void) -> i32 {
-    // A leaf shell holds no device reference; GetDevice is unused by the
-    // conformance path and games resolve the device from the parent texture.
-    mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DVolume9::GetDevice → INVALIDCALL");
-    null_out(device);
-    D3DERR_INVALIDCALL
+extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    // The shell holds no device of its own, but it does hold the volume
+    // texture that owns it, and that is the same device: a sub-resource and
+    // its container cannot come from different ones.
+    if device.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DVolume9 per IDirect3DVolume9 ABI.
+    let parent = (unsafe { InPtr::<Direct3DVolume9>::opt(this) })
+        .map_or(core::ptr::null_mut(), |v| v.parent_texture);
+    if parent.is_null() {
+        null_out(device);
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: `parent` is the live owning `Direct3DVolumeTexture9` this shell
+    // forwards its refcount to.
+    let dev_inner = (unsafe { InPtr::<Direct3DVolumeTexture9>::opt(parent) })
+        .map_or(0, |t| t.inner().device_inner);
+    let wrapper = if dev_inner == 0 {
+        core::ptr::null_mut()
+    } else {
+        DeviceInner::from_ptr(dev_inner).device_wrapper()
+    };
+    if wrapper.is_null() {
+        null_out(device);
+        return D3DERR_INVALIDCALL;
+    }
+    crate::device::device_wrapper_add_ref(wrapper);
+    // SAFETY: non-null (checked at entry) and writable per the ABI.
+    unsafe { *device = wrapper };
+    D3D_OK
 }
 
 const extern "system" fn volume9_set_private_data(

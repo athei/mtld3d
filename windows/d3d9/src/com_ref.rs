@@ -27,7 +27,8 @@
 
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
-use mtld3d_shared::VtableThis;
+use mtld3d_shared::{InPtr, VtableThis};
+use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
 
 use crate::device::{
     device_wrapper_add_ref, device_wrapper_note_reset_blocker, device_wrapper_release,
@@ -231,7 +232,12 @@ impl<T: ComUnknown, K: Ownership> Drop for CachedComPtr<T, K> {
 /// [`finalize`](Self::finalize) that frees the wrapper exactly once when both
 /// counters reach zero. [`device_forward_target`](Self::device_forward_target)
 /// must name the owning device iff this object forwards its public refcount to
-/// it (so every forwarded `AddRef` is balanced by a forwarded `Release`).
+/// it (so every forwarded `AddRef` is balanced by a forwarded `Release`), and
+/// [`owning_device`](Self::owning_device) must name the device this object was
+/// created from, and null once that device is gone for a type that does not
+/// pin it: the engine takes a reference on whatever it returns and hands it to
+/// the application. A type that pins its device answers unconditionally, since
+/// the device cannot go while this object holds a reference on it.
 pub unsafe trait ComChild: Sized {
     /// The wrapper's public `IUnknown` refcount field.
     fn refcount_mut(&mut self) -> &mut u32;
@@ -245,11 +251,20 @@ pub unsafe trait ComChild: Sized {
         0
     }
 
+    /// The device that created this object, and what `GetDevice` answers.
+    ///
+    /// Every child names one, so there is no default: a `Direct3DDevice9`*, or
+    /// null only once that device is gone.
+    fn owning_device(&self) -> *mut c_void;
+
     /// The owning device wrapper this object forwards its public 0↔1 transitions to.
     ///
-    /// A `Direct3DDevice9`*, or null to not forward (the default).
+    /// The creating device, which is the answer wherever a public reference
+    /// keeps that device alive. A type that deliberately does not pin its
+    /// device overrides this and returns null for the cases that opt out;
+    /// having a device and pinning one are separate questions.
     fn device_forward_target(&self) -> *mut c_void {
-        null_mut()
+        self.owning_device()
     }
 
     /// Whether a public 1→0 transition finalizes (frees) the wrapper now.
@@ -282,6 +297,82 @@ pub unsafe trait ComChild: Sized {
     /// `this` is a live wrapper with both counters at zero; the caller must not
     /// access it afterwards.
     unsafe fn finalize(this: *mut Self);
+}
+
+/// `GetDevice` for any [`ComChild`] that names an owning device.
+///
+/// Every child object knows the device it was created from, so the answer is
+/// always available; the call fails only for a caller that passed no
+/// out-param, or for a child whose device has already gone. The returned
+/// pointer carries one reference of its own, which the caller releases.
+///
+/// # Safety
+/// `this` is a `*mut T` from a `T` vtable thunk, and `device` is the caller's
+/// out-param: either null or a writable `*mut c_void` slot. A null `this` is
+/// filtered rather than fatal, unlike the `IUnknown` thunks, where `VtableThis`
+/// crashes on purpose so that a refcount miscount surfaces where it happened.
+pub unsafe fn com_get_device<T: ComChild>(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    if device.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is `*mut T` per the object's ABI.
+    let Some(obj) = (unsafe { InPtr::<T>::opt(this) }) else {
+        crate::null_out(device);
+        return D3DERR_INVALIDCALL;
+    };
+    let wrapper = obj.owning_device();
+    if wrapper.is_null() {
+        crate::null_out(device);
+        return D3DERR_INVALIDCALL;
+    }
+    device_wrapper_add_ref(wrapper);
+    // SAFETY: non-null (checked) and writable per the ABI.
+    unsafe { *device = wrapper };
+    D3D_OK
+}
+
+// ── Shader bytecode read-back ──
+//
+// Not part of the refcount engine above: no COM object, no vtable, no
+// `ComChild`. It lives here because both shader wrappers answer `GetFunction`
+// from a token stream and nothing else does.
+
+/// `GetFunction` for the two shader objects.
+///
+/// Hands the app back the token stream it created the shader from.
+/// `pSizeOfData` is required and is both in and out; `pData` is optional, and
+/// a null one asks for the size alone, so a caller can size its buffer and ask
+/// again. On the copy path `*pSizeOfData` is left exactly as the caller set
+/// it: the value is the buffer's size going in, apps do not expect it back
+/// changed, and one that reads it afterwards would see its own number.
+///
+/// # Safety
+/// `data` and `size_of_data` are the caller's out-params per the D3D9 ABI:
+/// `size_of_data` is either null or points to a writable `u32`, and a non-null `data` points to
+/// at least `*size_of_data` writable bytes.
+pub unsafe fn com_get_function(bytecode: &[u32], data: *mut c_void, size_of_data: *mut u32) -> i32 {
+    if size_of_data.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    let need = core::mem::size_of_val(bytecode);
+    let Ok(need_u32) = u32::try_from(need) else {
+        return D3DERR_INVALIDCALL;
+    };
+    if data.is_null() {
+        // SAFETY: non-null (checked) and writable per the ABI.
+        unsafe { *size_of_data = need_u32 };
+        return D3D_OK;
+    }
+    // SAFETY: non-null (checked) and readable per the ABI.
+    if unsafe { *size_of_data } < need_u32 {
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: the caller's buffer holds at least `need` bytes per the check
+    // above, and the token stream is a live `[u32]` for the length copied.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytecode.as_ptr().cast::<u8>(), data.cast::<u8>(), need);
+    }
+    D3D_OK
 }
 
 /// `IUnknown::AddRef` for a [`ComChild`]: bump the public refcount.
