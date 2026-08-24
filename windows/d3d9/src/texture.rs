@@ -1,7 +1,6 @@
 use core::ffi::c_void;
 use std::sync::{Arc, atomic::Ordering};
 
-use log::trace;
 use mtld3d_core::{
     dirty_rect::DirtyRect,
     ids::TextureId,
@@ -21,7 +20,7 @@ use mtld3d_types::{
     D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
     D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl,
     IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9,
-    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DVOLUME9,
+    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
     IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
@@ -1873,32 +1872,33 @@ extern "system" fn texture_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = tex_timer(this);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DTexture9::QueryInterface(riid_lo={riid_lo:#010x})");
+    // The leaf interface follows the wrapper's kind; the 2D, cube and volume
+    // textures share this vtable slot.
     // SAFETY: vtable `this` is the live texture wrapper for this call.
-    let is_cube =
-        (unsafe { InPtr::<Direct3DTexture9>::opt(this) }).is_some_and(|obj| obj.is_cube());
-    // SAFETY: `riid` is the caller's read-only GUID pointer.
-    let accepted = is_cube
-        && (unsafe { InPtr::<Guid>::opt(riid.cast()) }).is_some_and(|iid| {
-            matches!(
-                *iid,
-                IID_IUNKNOWN
-                    | IID_IDIRECT3DRESOURCE9
-                    | IID_IDIRECT3DBASETEXTURE9
-                    | IID_IDIRECT3DCUBETEXTURE9
-            )
-        });
-    if accepted && !ppv.is_null() {
-        // SAFETY: validated writable out pointer and live COM wrapper.
-        unsafe { *ppv = this };
-        // SAFETY: `this` is the live cube wrapper for this vtable call.
-        unsafe { crate::com_ref::com_add_ref::<Direct3DTexture9>(this) };
-        return D3D_OK;
+    let kind =
+        unsafe { InPtr::<Direct3DTexture9>::opt(this) }.map(|obj| (obj.is_cube(), obj.is_volume()));
+    let (leaf, name) = match kind {
+        Some((true, _)) => (IID_IDIRECT3DCUBETEXTURE9, "IDirect3DCubeTexture9"),
+        Some((false, true)) => (IID_IDIRECT3DVOLUMETEXTURE9, "IDirect3DVolumeTexture9"),
+        _ => (IID_IDIRECT3DTEXTURE9, "IDirect3DTexture9"),
+    };
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                IID_IUNKNOWN,
+                IID_IDIRECT3DRESOURCE9,
+                IID_IDIRECT3DBASETEXTURE9,
+                leaf,
+            ],
+            texture_add_ref,
+            name,
+        )
     }
-    null_out(ppv);
-    E_NOINTERFACE
 }
 
 // Shared by the 2D and volume texture vtables: both wrappers have the identical

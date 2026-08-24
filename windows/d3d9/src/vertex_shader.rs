@@ -4,10 +4,7 @@ use mtld3d_core::{convert::InputSemantic, ids::ProgramId};
 use mtld3d_shared::InPtr;
 use mtld3d_types::{Guid, IDirect3DVertexShader9Vtbl};
 
-use super::{
-    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, com_ref::ComUnknown,
-    device::DeviceInner,
-};
+use super::{D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_VERTEX_SHADER9_VTBL: IDirect3DVertexShader9Vtbl = IDirect3DVertexShader9Vtbl {
     query_interface: vs_query_interface,
@@ -147,12 +144,25 @@ fn vs_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
 
 extern "system" fn vs_query_interface(
     this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = vs_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DVertexShader9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DVERTEXSHADER9,
+            ],
+            vs_add_ref,
+            "IDirect3DVertexShader9",
+        )
+    }
 }
 
 extern "system" fn vs_add_ref(this: *mut c_void) -> u32 {

@@ -993,11 +993,22 @@ extern "system" fn surface_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = surf_timer(this);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DSurface9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DRESOURCE9,
+                mtld3d_types::IID_IDIRECT3DSURFACE9,
+            ],
+            surface_add_ref,
+            "IDirect3DSurface9",
+        )
+    }
 }
 
 /// The parent texture a `GetSurfaceLevel` sub-surface forwards its public refcount to.

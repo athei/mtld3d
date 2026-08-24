@@ -28,7 +28,7 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET,
     com_ref::CachedComPtr,
     device::{DeviceInner, Direct3DDevice9},
     index_buffer::Direct3DIndexBuffer9,
@@ -785,12 +785,25 @@ fn sb_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
 
 extern "system" fn sb_query_interface(
     this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = sb_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DStateBlock9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DSTATEBLOCK9,
+            ],
+            sb_add_ref,
+            "IDirect3DStateBlock9",
+        )
+    }
 }
 
 extern "system" fn sb_add_ref(this: *mut c_void) -> u32 {

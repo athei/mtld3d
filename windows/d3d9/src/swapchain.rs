@@ -13,7 +13,7 @@ use core::ffi::c_void;
 use mtld3d_shared::{InPtr, OutPtr};
 use mtld3d_types::{D3DDISPLAYMODE, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl};
 
-use super::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, device::DeviceInner};
+use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, device::DeviceInner};
 use crate::{device::Direct3DDevice9, null_out, surface::Direct3DSurface9};
 
 pub static DIRECT3D_SWAPCHAIN9_VTBL: IDirect3DSwapChain9Vtbl = IDirect3DSwapChain9Vtbl {
@@ -137,12 +137,25 @@ struct SwapChainInner {
 }
 
 extern "system" fn swapchain_query_interface(
-    _this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
-    mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DSwapChain9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DSWAPCHAIN9,
+            ],
+            swapchain_add_ref,
+            "IDirect3DSwapChain9",
+        )
+    }
 }
 
 extern "system" fn swapchain_add_ref(this: *mut c_void) -> u32 {

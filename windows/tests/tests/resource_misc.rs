@@ -7,7 +7,7 @@ use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_WRITEONLY,
-    E_NOINTERFACE,
+    E_NOINTERFACE, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// Every child resource forwards exactly one reference to the owning device.
@@ -104,6 +104,51 @@ fn query_interface_unknown_is_rejected() {
         E_NOINTERFACE,
         "QueryInterface for an unknown GUID returns E_NOINTERFACE",
     );
+}
+
+/// The device answers `QueryInterface` for `IUnknown` and `IDirect3DDevice9` with itself.
+///
+/// One reference stronger. SDKs that are handed the game's device take their own typed reference
+/// through `QueryInterface(IID_IDirect3DDevice9)` and treat a failure as an
+/// unusable device.
+#[test]
+fn query_interface_identity_on_device() {
+    let h = Harness::new();
+    let base = h.device_refcount();
+    for iid in [IID_IUNKNOWN, IID_IDIRECT3DDEVICE9] {
+        let (hr, same, held) = h.device_query_interface(&iid);
+        assert_eq!(hr, D3D_OK, "QueryInterface({:#010x})", iid.data1);
+        assert!(same, "the interface is the device object itself");
+        assert_eq!(
+            held,
+            base + 1,
+            "QueryInterface hands out one counted reference"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "releasing the QI references balances"
+    );
+}
+
+/// The factory answers for `IUnknown` and `IDirect3D9`, and for nothing else.
+#[test]
+fn query_interface_identity_on_factory() {
+    let h = Harness::factory_only();
+    for iid in [IID_IUNKNOWN, IID_IDIRECT3D9] {
+        let (hr, same, held) = h.factory_query_interface(&iid);
+        assert_eq!(hr, D3D_OK, "QueryInterface({:#010x})", iid.data1);
+        assert!(same, "the interface is the factory object itself");
+        assert_eq!(
+            held, 2,
+            "the factory's own reference plus the one QI handed out"
+        );
+    }
+    let (hr, same, held) = h.factory_query_interface(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, E_NOINTERFACE, "the factory is not a device");
+    assert!(!same, "nothing is handed out on a miss");
+    assert_eq!(held, 1, "a miss leaves the refcount alone");
 }
 
 #[test]
