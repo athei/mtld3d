@@ -2960,7 +2960,17 @@ extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let used = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
         .map_or(0, |obj| obj.inner().vram_bytes_used.load(Ordering::Acquire));
-    u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+    let available =
+        u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+    // Games size their texture budgets from this call or from DXGI; the
+    // one-time line tells which path a title took when its settings menu
+    // shows a surprising video-memory figure.
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "IDirect3DDevice9::GetAvailableTextureMem → {} MiB (first call)",
+        available >> 20
+    );
+    available
 }
 
 extern "system" fn device_evict_managed_resources(this: *mut c_void) -> i32 {
