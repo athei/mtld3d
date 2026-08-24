@@ -13,6 +13,7 @@ mod draw;
 mod encoder;
 mod fullscreen;
 mod index_buffer;
+mod log_sink;
 mod page_box_pool;
 mod pixel_shader;
 mod private_data;
@@ -140,6 +141,9 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
 #[unsafe(export_name = "Direct3DCreate9")]
 #[must_use]
 pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
+    // The first entry point outside `DllMain`: the logging thread can start
+    // here (DllMain runs under the loader lock and must not spawn threads).
+    log_sink::start();
     // First touch resolves `mtld3d.conf` and logs the option set; later
     // call sites read `&*config::CONFIG` cheaply.
     let _cfg = &*config::CONFIG;
@@ -213,7 +217,7 @@ pub const extern "system" fn d3dperf_get_status() -> u32 {
 // dispatcher — DLL load ordering is guaranteed by d3d9.dll's implicit
 // import of `mtld3d_unix_call` from mtld3d.dll.
 fn init_logger(instance: *mut c_void) {
-    mtld3d_shared::init_logger();
+    mtld3d_shared::init_logger_to(Box::new(log_sink::Sink));
     log_identity(instance);
     // Latch the d3d9-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
     // from `RUST_LOG`. Per-cdylib because each cdylib has its own

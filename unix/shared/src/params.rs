@@ -69,6 +69,20 @@ impl Thunk for InitLoggerParams {
     const CODE: u32 = Thunks::InitLogger as u32;
 }
 
+/// One formatted log line from the PE-side logger, for the unix stderr.
+///
+/// `ptr`/`len` describe a byte slice the PE side keeps alive for the call.
+#[repr(C, align(8))]
+pub struct WriteLogParams {
+    pub ptr: u64, // in: *const u8
+    pub len: u32, // in: byte count
+    pub pad0: u32,
+}
+
+impl Thunk for WriteLogParams {
+    const CODE: u32 = Thunks::WriteLog as u32;
+}
+
 #[repr(C, align(8))]
 pub struct GetDeviceInfoParams {
     pub name_ptr: u64,
