@@ -495,6 +495,8 @@ pub struct Pass {
     /// and persistent rt contents survive.
     color_store: StoreAction,
     depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth_texture` the pass renders depth into.
+    depth_level: u32,
     depth_load: DepthLoad,
     stencil_load: StencilLoad,
     /// Defaults to `Store`.
@@ -653,6 +655,11 @@ impl Pass {
     #[must_use]
     pub const fn depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.depth_texture
+    }
+    /// Mip level of `depth_texture` the pass renders depth into.
+    #[must_use]
+    pub const fn depth_level(&self) -> u32 {
+        self.depth_level
     }
     #[must_use]
     pub const fn color_load(&self) -> ColorLoad {
@@ -854,6 +861,8 @@ pub struct PassState {
     /// Cached so a draw copies 16 bytes instead of walking the three slots.
     current_extra_attachments: ExtraColorAttachments,
     current_depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `current_depth_texture` bound as the depth attachment.
+    current_depth_level: u32,
     /// Descriptor bits for the currently bound colour/depth attachments.
     ///
     /// `COLOR_HAS_ALPHA` / `DEPTH_SAMPLEABLE` / `DEPTH_HAS_STENCIL`. See
@@ -1081,6 +1090,7 @@ impl PassState {
             current_extra_present_mask: 0,
             current_extra_attachments: ExtraColorAttachments::NONE,
             current_depth_texture: MetalHandle::NULL,
+            current_depth_level: 0,
             // Placeholder; `reset_frame` reseeds these for the backbuffer, and
             // every `SetRenderTarget` bind overwrites `COLOR_HAS_ALPHA` via
             // `set_color_rt_has_alpha`. The dominant backbuffer is alpha-bearing
@@ -1197,6 +1207,7 @@ impl PassState {
         self.current_attachments
             .insert(CurrentAttachmentFlags::COLOR_HAS_ALPHA);
         self.current_depth_texture = depth_texture;
+        self.current_depth_level = 0;
         // The frame's default depth target is the standalone backbuffer
         // depth surface from `CreateDepthStencilSurface` — not
         // sampleable. Sub-frame `set_depth_stencil_attachment` calls
@@ -1986,6 +1997,7 @@ impl PassState {
             color_load,
             color_store: StoreAction::Store,
             depth_texture: self.current_depth_texture,
+            depth_level: self.current_depth_level,
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
@@ -2217,6 +2229,20 @@ impl PassState {
         is_sampleable: bool,
         has_stencil: bool,
     ) {
+        self.set_depth_stencil_attachment_level(texture, 0, is_sampleable, has_stencil);
+    }
+
+    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    ///
+    /// A different level of the same texture is a different attachment and
+    /// ends the pass the way a different texture does.
+    pub fn set_depth_stencil_attachment_level(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        level: u32,
+        is_sampleable: bool,
+        has_stencil: bool,
+    ) {
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
@@ -2236,6 +2262,7 @@ impl PassState {
         self.current_attachments
             .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
         if self.current_depth_texture == texture
+            && self.current_depth_level == level
             && self
                 .current_attachments
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
@@ -2248,9 +2275,11 @@ impl PassState {
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
-                "pass-break trigger=set_depth_attach prev={:#x} new={:#x}",
+                "pass-break trigger=set_depth_attach prev={:#x}:{} new={:#x}:{}",
                 self.current_depth_texture,
+                self.current_depth_level,
                 texture,
+                level,
             );
         }
         if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
@@ -2258,6 +2287,7 @@ impl PassState {
         }
         self.end_current_pass("set_depth_attach");
         self.current_depth_texture = texture;
+        self.current_depth_level = level;
     }
 
     /// Apply a color clear.

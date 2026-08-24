@@ -1298,16 +1298,24 @@ impl DeviceInner {
         depth_has_stencil: bool,
     ) {
         self.push_op(Box::new(move |enc| {
-            let depth_texture = match binding {
-                DepthBinding::None => MetalHandle::NULL,
-                DepthBinding::Eager(h) => h,
-                // SAFETY: `get_or_create_texture` returns a Metal texture
-                // handle from the typed `texture_cache` via `.raw()`.
-                DepthBinding::Lazy(info) => unsafe {
-                    MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
-                },
+            let (depth_texture, level) = match binding {
+                DepthBinding::None => (MetalHandle::NULL, 0),
+                DepthBinding::Eager(h) => (h, 0),
+                DepthBinding::Lazy(info, level) => {
+                    // SAFETY: `get_or_create_texture` returns a Metal texture
+                    // handle from the typed `texture_cache` via `.raw()`.
+                    let handle = unsafe {
+                        MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
+                    };
+                    (handle, level)
+                }
             };
-            enc.set_depth_stencil_attachment(depth_texture, is_sampleable, depth_has_stencil);
+            enc.set_depth_stencil_attachment_level(
+                depth_texture,
+                level,
+                is_sampleable,
+                depth_has_stencil,
+            );
         }));
     }
 
@@ -3948,16 +3956,6 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    if levels > 1 {
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: u64::from(levels),
-            "reject CreateTexture depth levels={levels} → INVALIDCALL (mip chains not supported on depth)"
-        );
-        null_out(texture);
-        return D3DERR_INVALIDCALL;
-    }
-
     let Some(metal_pixel_format) = mtld3d_core::format::map_d3d_depth_format(format) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
@@ -3968,13 +3966,20 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         return D3DERR_INVALIDCALL;
     };
 
-    let actual_levels = 1u32;
+    // A mip chain on a depth texture is an engine's depth pyramid: each level
+    // is rendered into through `GetSurfaceLevel(n)` bound as the depth
+    // attachment and sampled back at a coarser resolution.
+    let actual_levels = if levels == 0 {
+        compute_mip_count(width, height)
+    } else {
+        levels
+    };
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
 
     trace!(
         target: LOG_TARGET,
-        "CreateTexture depth {width}x{height} format={format} → sampleable shadow map"
+        "CreateTexture depth {width}x{height} levels={actual_levels} format={format} → sampleable shadow map"
     );
 
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -4006,12 +4011,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         block_h: 1,
         block_bytes: 0,
         staging: Vec::new(),
-        // Single mip carries the full texture dimensions so GetLevelDesc
-        // returns the right size; no `bytes_per_row` since there's no
-        // CPU staging path.
-        mip_widths: vec![width],
-        mip_heights: vec![height],
-        mip_bytes_per_row: vec![0],
+        // Per-level dimensions so `GetLevelDesc` reports each mip; no
+        // `bytes_per_row` since there's no CPU staging path.
+        mip_widths: (0..actual_levels).map(|l| (width >> l).max(1)).collect(),
+        mip_heights: (0..actual_levels).map(|l| (height >> l).max(1)).collect(),
+        mip_bytes_per_row: vec![0; actual_levels as usize],
     });
 
     // Queue the eager `MTLTexture` create (sampleable shadow map path).
@@ -6605,7 +6609,8 @@ extern "system" fn device_get_render_target(
 enum DepthBinding {
     None,
     Eager(MetalHandle<MTLTextureKind>),
-    Lazy(TextureInfo),
+    /// A texture-backed depth surface: the parent's info and the mip level bound.
+    Lazy(TextureInfo, u32),
 }
 
 extern "system" fn device_set_depth_stencil_surface(
@@ -6691,7 +6696,7 @@ extern "system" fn device_set_depth_stencil_surface(
             info.texture_id,
             mip
         );
-        DepthBinding::Lazy(info)
+        DepthBinding::Lazy(info, mip)
     } else {
         // SAFETY: `surf` is non-null (else-if branch) and points to a
         // live surface.
@@ -6713,7 +6718,7 @@ extern "system" fn device_set_depth_stencil_surface(
     // sampleable shadow maps (Rule B short-circuit), since they may
     // be sampled in a future frame even if no sample lands this
     // frame — typical of cascade-3 in CSM rotations.
-    let is_sampleable = matches!(binding, DepthBinding::Lazy(_));
+    let is_sampleable = matches!(binding, DepthBinding::Lazy(..));
     // Whether the bound depth attachment is a combined depth+stencil format
     // (D24S8 etc. → the combined Metal texture), so the clear-quad / draw
     // pipelines declare matching depth/stencil attachment formats. Mirrors

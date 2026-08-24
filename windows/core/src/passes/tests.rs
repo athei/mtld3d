@@ -3450,3 +3450,24 @@ fn a_clear_within_one_segment_still_paints_a_quad() {
         "a cross-pass clear inside one segment still scissors a quad",
     );
 }
+
+/// A different mip level of the same depth texture is a different attachment.
+#[test]
+fn depth_level_change_breaks_the_pass_and_a_repeat_bind_does_not() {
+    let d = depth();
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(d, 0, false, false);
+    s.emit_command(dummy_draw());
+    s.set_depth_stencil_attachment_level(d, 0, false, false);
+    s.emit_command(dummy_draw());
+    s.set_depth_stencil_attachment_level(d, 1, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "a repeat bind of the same level stays in the pass; a new level ends it"
+    );
+    assert_eq!(s.passes()[0].depth_level(), 0);
+    assert_eq!(s.passes()[1].depth_level(), 1);
+}

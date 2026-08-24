@@ -1780,3 +1780,97 @@ fn stretch_rect_converts_r5g6b5_into_x8r8g8b8() {
     assert_eq!(h.read_pixel(400, 240), BLUE, "pixel 2 is blue");
     assert_eq!(h.read_pixel(560, 240), WHITE, "pixel 3 is white");
 }
+
+/// A depth texture with a mip chain: a level binds as the depth attachment.
+///
+/// An engine's depth pyramid renders depth into successive levels through
+/// `GetSurfaceLevel(n)`. Level 1 of a 1280x960 chain is the back buffer's size,
+/// so it is bound beside the back buffer and a farther draw after a nearer one
+/// must lose the depth test in that level.
+#[test]
+fn depth_texture_mip_level_binds_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        1280,
+        960,
+        2,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(depth_tex.level_count(), 2, "both levels created");
+    let (hr, desc) = depth_tex.level_desc(1);
+    assert_eq!(hr, 0, "GetLevelDesc(1)");
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "level 1 is half the base level"
+    );
+
+    let depth_surf = depth_tex.surface_level(1);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind level 1 as the depth attachment"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, mtld3d_types::D3DCMP_LESSEQUAL),
+        0
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    // Lighting defaults on and the vertices carry no normal, which would
+    // light every draw black; the test reads the vertex colour.
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_LIGHTING, 0), 0);
+
+    let tri = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.3, RED)),
+        0,
+        "near draw"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.7, GREEN)),
+        0,
+        "far draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40,
+        "the far draw loses the depth test in level 1, got {center:?}"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+}

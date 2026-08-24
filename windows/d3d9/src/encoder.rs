@@ -2445,14 +2445,20 @@ impl FrameEncoder {
         self.pass_state.note_color_read_back(handle);
     }
 
-    pub fn set_depth_stencil_attachment(
+    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    pub fn set_depth_stencil_attachment_level(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
+        level: u32,
         is_sampleable: bool,
         has_stencil: bool,
     ) {
-        self.pass_state
-            .set_depth_stencil_attachment(texture, is_sampleable, has_stencil);
+        self.pass_state.set_depth_stencil_attachment_level(
+            texture,
+            level,
+            is_sampleable,
+            has_stencil,
+        );
     }
 
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) {
@@ -6918,6 +6924,7 @@ fn pass_to_descriptor(
             !leading.is_empty(),
             p.color_slice(),
             p.color_level(),
+            p.depth_level(),
         ),
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
@@ -6995,7 +7002,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(true, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(true, 0, 0, 0),
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

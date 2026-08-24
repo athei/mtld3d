@@ -539,13 +539,26 @@ impl PassDescriptor {
     const LEADING_BLITS_NEED_ENCODER: u32 = 1;
     const COLOR_SLICE_SHIFT: u32 = 1;
     const COLOR_LEVEL_SHIFT: u32 = 4;
+    const DEPTH_LEVEL_SHIFT: u32 = 8;
 
-    /// Pack leading-blit and color-subresource state.
+    /// Pack leading-blit, color-subresource and depth-level state.
     #[must_use]
-    pub const fn pack_flags(needs_encoder: bool, color_slice: u32, color_level: u32) -> u32 {
+    pub const fn pack_flags(
+        needs_encoder: bool,
+        color_slice: u32,
+        color_level: u32,
+        depth_level: u32,
+    ) -> u32 {
         (if needs_encoder { 1 } else { 0 })
             | ((color_slice & 0x7) << Self::COLOR_SLICE_SHIFT)
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
+            | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
+    }
+
+    /// Depth attachment mip level.
+    #[must_use]
+    pub const fn depth_level(&self) -> u32 {
+        (self.pass_flags >> Self::DEPTH_LEVEL_SHIFT) & 0xf
     }
 
     /// Whether the leading-blit list contains an encoder-bound command.

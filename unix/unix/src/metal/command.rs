@@ -1489,10 +1489,12 @@ fn encode_pass(
             );
         }
         if let Some(depth_tex) = depth_tex {
-            rt_width = rt_width.min(depth_tex.width());
-            rt_height = rt_height.min(depth_tex.height());
+            let level = pass.depth_level();
+            rt_width = rt_width.min((depth_tex.width() >> level).max(1));
+            rt_height = rt_height.min((depth_tex.height() >> level).max(1));
             let depth_attach = rp_desc.depthAttachment();
             depth_attach.setTexture(Some(&depth_tex));
+            depth_attach.setLevel(level as usize);
             depth_attach.setStoreAction(map_store_action(pass.depth_store_action));
             match pass.depth_load_action {
                 LoadAction::Clear => {
@@ -1507,6 +1509,7 @@ fn encode_pass(
             if fmt == MTLPixelFormat::Depth32Float_Stencil8 {
                 let stencil_attach = rp_desc.stencilAttachment();
                 stencil_attach.setTexture(Some(&depth_tex));
+                stencil_attach.setLevel(level as usize);
                 // Stencil shares the depth attachment's storage on
                 // `Depth32Float_Stencil8`, so the store action mirrors
                 // depth — flipping one without the other would either
