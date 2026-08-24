@@ -4,9 +4,10 @@ use mtld3d_shared::{
         MTLCommandQueueKind, MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind, NSViewKind,
     },
 };
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
+    MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
+    MTLPixelFormat,
 };
 
 use super::{
@@ -19,11 +20,21 @@ use super::{
 unsafe extern "C" {}
 
 /// Returns (`device_name`, `registry_id`) from the system default Metal device.
-pub fn default_device_info() -> Option<(String, u64)> {
+pub fn default_device_info() -> Option<(String, u64, bool)> {
     let device = MTLCreateSystemDefaultDevice()?;
     let name = device.name().to_string();
     let registry_id = device.registryID();
-    Some((name, registry_id))
+    let sampler_border = supports_sampler_border(&device);
+    Some((name, registry_id, sampler_border))
+}
+
+/// True when the device can create border-colour samplers.
+///
+/// On paper a Mac2-family feature, but the paravirtualized device on CI
+/// runners claims Mac2 and still aborts sampler creation on a border
+/// colour, so the device name is checked as well.
+pub fn supports_sampler_border(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    device.supportsFamily(MTLGPUFamily::Mac2) && !device.name().to_string().contains("Paravirtual")
 }
 
 /// Snapshot of the Metal device values the PE side needs.

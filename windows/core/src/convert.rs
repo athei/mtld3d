@@ -465,13 +465,46 @@ pub fn d3d_to_metal_mip_filter(d3d_filter: u32) -> MipFilter {
     }
 }
 
+/// `D3DSAMP_BORDERCOLOR` (a D3DCOLOR) → the nearest Metal border preset.
+///
+/// Metal samplers offer three border colours. Transparent black, opaque
+/// black and opaque white map exactly; anything else takes opaque black and
+/// is logged once per colour, since the border then reads differently from
+/// what the game asked for.
+pub fn d3d_border_color_to_metal(color: u32) -> mtld3d_shared::mtl::BorderColor {
+    if let Some(preset) = border_color_preset(color) {
+        return preset;
+    }
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(color),
+        "D3DSAMP_BORDERCOLOR {color:#010x} has no Metal preset → opaque black"
+    );
+    mtld3d_shared::mtl::BorderColor::OpaqueBlack
+}
+
+/// The Metal border preset a D3DCOLOR maps to exactly, if any.
+///
+/// Const so the sampler cache key can fold it in; the logging fallback for
+/// other colours lives in [`d3d_border_color_to_metal`].
+#[must_use]
+pub const fn border_color_preset(color: u32) -> Option<mtld3d_shared::mtl::BorderColor> {
+    use mtld3d_shared::mtl::BorderColor;
+    match color {
+        0x0000_0000 => Some(BorderColor::TransparentBlack),
+        0xFF00_0000 => Some(BorderColor::OpaqueBlack),
+        0xFFFF_FFFF => Some(BorderColor::OpaqueWhite),
+        _ => None,
+    }
+}
+
 /// D3DTADDRESS_* → Metal sampler address mode.
 pub fn d3d_to_metal_address_mode(d3d_mode: u32) -> AddressMode {
     match d3d_mode {
         D3DTADDRESS_WRAP => AddressMode::Repeat,
         D3DTADDRESS_MIRROR => AddressMode::MirrorRepeat,
         D3DTADDRESS_CLAMP => AddressMode::ClampToEdge,
-        D3DTADDRESS_BORDER => AddressMode::ClampToZero,
+        D3DTADDRESS_BORDER => AddressMode::ClampToBorderColor,
         D3DTADDRESS_MIRRORONCE => AddressMode::MirrorClampToEdge,
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

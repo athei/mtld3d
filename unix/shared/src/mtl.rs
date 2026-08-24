@@ -296,6 +296,19 @@ pub enum AddressMode {
     Repeat = 2,
     MirrorRepeat = 3,
     ClampToZero = 4,
+    ClampToBorderColor = 5,
+}
+
+/// `MTLSamplerBorderColor` wire encoding: the three presets Metal offers.
+///
+/// A D3D9 border colour that is not one of them falls back to opaque black
+/// on the PE side, which logs the substitution once per colour.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum BorderColor {
+    TransparentBlack = 0,
+    OpaqueBlack = 1,
+    OpaqueWhite = 2,
 }
 
 /// Shader stage selector for `CompileShaderLibraryParams::stage_tag`.

@@ -1,10 +1,10 @@
 use super::{
     Thunk, Thunks,
     mtl::{
-        AddressMode, BlendFactor, BlendOperation, BufferKind, ClearQuadFlags, ColorSpacePolicy,
-        ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
-        VertexStepFunction,
+        AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
+        ColorSpacePolicy, ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter,
+        MipFilter, PixelFormat, StageTag, StencilOp, StorageMode, StoreAction, Swizzle,
+        TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -89,6 +89,10 @@ pub struct GetDeviceInfoParams {
     pub name_buf_len: u64,
     pub name_len: u64,    // out
     pub registry_id: u64, // out
+    /// Out: 1 when the device supports sampler border colours.
+    ///
+    /// Mac2 family and not paravirtualized; CI devices do not qualify.
+    pub supports_sampler_border: u64,
 }
 
 impl Thunk for GetDeviceInfoParams {
@@ -841,6 +845,8 @@ pub struct CreateSamplerStateParams {
     /// set); separate cache entry from the non-compare variant of the
     /// same D3D9 sampler state.
     pub is_compare: u32,
+    /// Border preset for `AddressMode::ClampToBorderColor` on any axis.
+    pub border_color: BorderColor, // in
     pub sampler_handle: MetalHandle<MTLSamplerStateKind>, // out
 }
 

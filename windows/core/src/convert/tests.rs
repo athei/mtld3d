@@ -958,3 +958,30 @@ fn f32_to_f16_bits_matches_the_ieee_encoding() {
         0x3c02
     );
 }
+
+#[test]
+fn border_addressing_and_colour_presets() {
+    use mtld3d_shared::mtl::BorderColor;
+    assert_eq!(
+        d3d_to_metal_address_mode(D3DTADDRESS_BORDER),
+        AddressMode::ClampToBorderColor
+    );
+    assert_eq!(d3d_border_color_to_metal(0), BorderColor::TransparentBlack);
+    assert_eq!(
+        d3d_border_color_to_metal(0xFF00_0000),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FFFF),
+        BorderColor::OpaqueWhite
+    );
+    // Anything else has no preset and falls back to opaque black.
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FF00),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0x00FF_FFFF),
+        BorderColor::OpaqueBlack
+    );
+}

@@ -486,6 +486,7 @@ extern "system" fn d3d9_get_adapter_identifier(
         name_buf_len: 256,
         name_len: 0,
         registry_id: 0,
+        supports_sampler_border: 0,
     };
     unix_call(&mut params);
 
@@ -501,6 +502,26 @@ extern "system" fn d3d9_get_adapter_identifier(
     id.device_id = u32::try_from(params.registry_id & 0xFFFF).expect("16-bit mask fits u32");
 
     0 // S_OK
+}
+
+/// Whether the Metal device can create border-colour samplers.
+///
+/// Queried once per process from the unix side; `GetDeviceCaps` strips
+/// `D3DPTADDRESSCAPS_BORDER` when it cannot (virtualized CI devices), and
+/// the unix sampler path clamps to edge for a title that ignores the cap.
+pub fn sampler_border_supported() -> bool {
+    static SUPPORTED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let mut params = GetDeviceInfoParams {
+            name_ptr: 0,
+            name_buf_len: 0,
+            name_len: 0,
+            registry_id: 0,
+            supports_sampler_border: 0,
+        };
+        unix_call(&mut params);
+        params.supports_sampler_border != 0
+    });
+    *SUPPORTED
 }
 
 extern "system" fn d3d9_get_adapter_mode_count(
@@ -818,7 +839,11 @@ extern "system" fn d3d9_get_device_caps(
     let Some(mut caps) = (unsafe { InPtrMut::<D3DCAPS9>::opt(caps.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
-    caps::fill(&mut caps, crate::config::CONFIG.caps_all);
+    caps::fill(
+        &mut caps,
+        crate::config::CONFIG.caps_all,
+        sampler_border_supported(),
+    );
     0 // S_OK
 }
 

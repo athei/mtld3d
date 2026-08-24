@@ -3018,7 +3018,11 @@ extern "system" fn device_get_device_caps(this: *mut c_void, caps: *mut D3DCAPS9
     }
     // SAFETY: `caps` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `D3DCAPS9` slot owned by the caller.
-    caps::fill(unsafe { &mut *caps }, crate::config::CONFIG.caps_all);
+    caps::fill(
+        unsafe { &mut *caps },
+        crate::config::CONFIG.caps_all,
+        crate::direct3d9::sampler_border_supported(),
+    );
     0 // S_OK
 }
 

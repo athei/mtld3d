@@ -146,13 +146,50 @@ fn clamp_and_wrap_addressing_differ() {
 }
 
 #[test]
-fn border_addressing_uses_metal_black_preset() {
+fn white_border_colour_reads_as_white() {
+    // Opaque white is one of Metal's three border presets, so BORDER
+    // addressing with D3DSAMP_BORDERCOLOR = 0xFFFFFFFF reads white past the
+    // unit square (the classic shadow-map border: outside the light frustum
+    // counts as lit).
+    let h = Harness::new();
+    if h.device_caps().texture_address_caps & mtld3d_types::AddressCaps::BORDER.bits() == 0 {
+        // The device cannot create border-colour samplers (virtualized CI
+        // devices); the cap is stripped and a title would not use BORDER.
+        return;
+    }
+    let tex = rgbw_2x2(&h);
+    let quad = uv_quad(2.0);
+
+    arm_texture(&h, &tex, D3DTADDRESS_BORDER, D3DTEXF_POINT);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_BORDERCOLOR, 0xFFFF_FFFF),
+        0,
+        "border colour stored"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+
+    let px = Rgba8::from_pixel(h.read_pixel(PROBE_X, PROBE_Y));
+    assert!(
+        px.r > 215 && px.g > 215 && px.b > 215,
+        "border is Metal's opaque-white preset, got {px:?}",
+    );
+}
+
+#[test]
+fn non_preset_border_colour_falls_back_to_black() {
     // Metal samplers support only preset border colours (transparent / opaque
     // black / white), not an arbitrary D3DSAMP_BORDERCOLOR. BORDER addressing is
     // applied (out-of-range texels read as the border, distinct from CLAMP's
-    // edge texel) but the requested colour is ignored — the border reads black.
+    // edge texel) but a colour outside the presets falls back to opaque black.
     // Pinned as a Metal limitation; D3DSAMP_BORDERCOLOR still round-trips above.
     let h = Harness::new();
+    if h.device_caps().texture_address_caps & mtld3d_types::AddressCaps::BORDER.bits() == 0 {
+        // The device cannot create border-colour samplers (virtualized CI
+        // devices); the cap is stripped and a title would not use BORDER.
+        return;
+    }
     let tex = rgbw_2x2(&h);
     let quad = uv_quad(2.0);
 
@@ -169,7 +206,7 @@ fn border_addressing_uses_metal_black_preset() {
     let px = Rgba8::from_pixel(h.read_pixel(PROBE_X, PROBE_Y));
     assert!(
         px.r < 40 && px.g < 40 && px.b < 40,
-        "border is Metal's black preset (arbitrary BORDERCOLOR unsupported), got {px:?}",
+        "non-preset border colour falls back to Metal's opaque-black preset, got {px:?}",
     );
 }
 

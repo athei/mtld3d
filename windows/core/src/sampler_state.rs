@@ -15,15 +15,18 @@
 
 use std::fmt;
 
-use mtld3d_shared::{CreateSamplerStateParams, MetalHandle, mtl_handle::MTLDeviceKind};
+use mtld3d_shared::{
+    CreateSamplerStateParams, MetalHandle, mtl::BorderColor, mtl_handle::MTLDeviceKind,
+};
 use mtld3d_types::{
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE,
-    SAMPLER_STATE_COUNT,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
+    D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT,
 };
 
 use crate::convert::{
-    d3d_to_metal_address_mode, d3d_to_metal_min_mag_filter, d3d_to_metal_mip_filter,
+    border_color_preset, d3d_border_color_to_metal, d3d_to_metal_address_mode,
+    d3d_to_metal_min_mag_filter, d3d_to_metal_mip_filter,
 };
 
 /// Upper LOD clamp passed to every `MTLSamplerDescriptor`.
@@ -76,6 +79,10 @@ pub struct SamplerSnapshot {
     /// (counterintuitive name). Maps to Metal's `setLodMinClamp`.
     /// Zero = default (no clamp).
     pub max_mip_level: u32,
+    /// `D3DSAMP_BORDERCOLOR` as the game set it (a D3DCOLOR).
+    ///
+    /// Reduced to a Metal border preset for the key and the wire params.
+    pub border_color: u32,
     /// Cache-key booleans not sourced from a D3DSAMP slot value (`IS_COMPARE` / `SRGB_TEXTURE`).
     ///
     /// See [`SamplerFlags`].
@@ -95,6 +102,7 @@ pub struct SamplerSnapshot {
 /// - 32..36 `max_mip_level` (5 bits — D3D9 mip count fits in 5)
 /// - 37     `is_compare` (depth-bound shadow sampler)
 /// - 38     `srgb_texture` (`D3DSAMP_SRGBTEXTURE` — picks linear vs sRGB texture-view at bind)
+/// - 39..40 border preset (`D3DSAMP_BORDERCOLOR` reduced to the Metal preset, not the raw colour)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SamplerKey(u64);
 
@@ -138,6 +146,7 @@ pub const fn snapshot_from_state(
         address_w: ss[D3DSAMP_ADDRESSW as usize],
         max_anisotropy: ss[D3DSAMP_MAXANISOTROPY as usize],
         max_mip_level: ss[D3DSAMP_MAXMIPLEVEL as usize],
+        border_color: ss[D3DSAMP_BORDERCOLOR as usize],
         flags: SamplerFlags::from_bits_truncate(flag_bits),
     }
 }
@@ -154,8 +163,21 @@ pub const fn key_from_snapshot(s: &SamplerSnapshot) -> SamplerKey {
             | ((s.max_anisotropy as u64 & 0xFF) << 24)
             | ((s.max_mip_level as u64 & 0x1F) << 32)
             | ((s.flags.contains(SamplerFlags::IS_COMPARE) as u64) << 37)
-            | ((s.flags.contains(SamplerFlags::SRGB_TEXTURE) as u64) << 38),
+            | ((s.flags.contains(SamplerFlags::SRGB_TEXTURE) as u64) << 38)
+            | ((border_preset_for_key(s.border_color) as u64 & 0x3) << 39),
     )
+}
+
+/// The border preset the key carries.
+///
+/// Exact presets map to themselves, anything else to opaque black, matching
+/// what `params_from_snapshot` (which also logs the substitution) hands to the
+/// unix side.
+const fn border_preset_for_key(color: u32) -> BorderColor {
+    match border_color_preset(color) {
+        Some(preset) => preset,
+        None => BorderColor::OpaqueBlack,
+    }
 }
 
 /// Translate a snapshot into the wire-format `CreateSamplerStateParams`.
@@ -186,6 +208,7 @@ pub fn params_from_snapshot(
         lod_min_clamp: f32::from(max_mip_u16).to_bits(),
         lod_max_clamp: LOD_MAX_CLAMP.to_bits(),
         is_compare: u32::from(s.flags.contains(SamplerFlags::IS_COMPARE)),
+        border_color: d3d_border_color_to_metal(s.border_color),
         sampler_handle: MetalHandle::NULL,
     }
 }
