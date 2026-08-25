@@ -732,6 +732,16 @@ extern "system" fn d3d9_check_device_format(
     if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
+    // The RESZ pseudo-format: probing it asks "is the RESZ depth resolve
+    // supported" (`SetRenderState(POINTSIZE, 0x7fa05000)`, implemented in
+    // the device). No surface of this format is ever created.
+    if check_format == D3DFMT_RESZ {
+        return if rtype == D3DRTYPE_SURFACE && usage & D3DUSAGE_RENDERTARGET != 0 {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        };
+    }
     // Vertex texture fetch is not implemented (no sampler binds on the vertex
     // stage, `VertexTextureFilterCaps` is zero); the per-format query agrees.
     if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {

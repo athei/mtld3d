@@ -1986,3 +1986,134 @@ fn depth_texture_mip_level_binds_as_depth_attachment() {
     );
     assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
 }
+
+#[test]
+fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
+    // The RESZ hack: SetRenderState(POINTSIZE, 0x7fa05000) resolves the
+    // bound depth-stencil into the depth texture at stage 0. Engines on the
+    // matching vendor path use it as their only depth hand-off, so support
+    // is probed via the RESZ pseudo-format and must answer D3D_OK.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DUSAGE_RENDERTARGET,
+            mtld3d_types::D3DRTYPE_SURFACE,
+            0x5A53_4552,
+        ),
+        0,
+        "RESZ pseudo-format probe answers available"
+    );
+
+    let depth_src = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_dst = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+
+    // Pass 1: write depth 0.25 into the source through the FF pipeline.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth_src.surface_level(0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+
+    // The resolve: destination at stage 0, then the magic POINTSIZE write.
+    assert_eq!(h.set_texture(0, &depth_dst), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0
+    );
+
+    // Pass 2: sample the DESTINATION; only the resolve can have filled it.
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the resolved copy"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
+        "the resolved depth (0.25) samples back as dark gray, got {center:?}"
+    );
+
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+}

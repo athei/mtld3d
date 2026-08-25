@@ -7385,6 +7385,31 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    // The 'RESZ' hack: this magic written to POINTSIZE asks the driver to
+    // resolve the bound depth-stencil into the depth texture bound at
+    // stage 0. Advertised via the RESZ fourcc in CheckDeviceFormat;
+    // engines on the matching vendor path use it as their only way to
+    // hand scene depth to a second depth consumer.
+    if state == D3DRS_POINTSIZE && value == 0x7fa0_5000 {
+        let bindings = dev.stage_bindings();
+        let tex = bindings.texture(0);
+        if tex.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve requested with no stage-0 texture bound — skipped"
+            );
+        } else {
+            // SAFETY: a bound stage holds a live texture reference until it
+            // is rebound or released, both on this thread.
+            let tex = unsafe { &*tex };
+            let inner = tex.inner();
+            let (id, w, h) = (tex.texture_id(), inner.mip_width(0), inner.mip_height(0));
+            dev.push_op(Box::new(move |enc| {
+                let dst = enc.get_texture_handle_by_id(id);
+                enc.resolve_depth_to_texture(dst, w, h);
+            }));
+        }
+    }
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::RenderState { state, value });
         return D3D_OK;

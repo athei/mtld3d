@@ -2304,6 +2304,58 @@ impl FrameEncoder {
         self.depth_write_epoch += 1;
     }
 
+    /// Resolve the bound depth attachment into `dst` (the RESZ hack).
+    ///
+    /// The magic `SetRenderState(POINTSIZE, 0x7fa05000)` asks for the
+    /// current depth-stencil contents in the texture bound at stage 0.
+    /// Mechanically identical to the snapshot copy: close the pass, queue
+    /// a full-surface depth blit ahead of the next one. The destination
+    /// keeps its own contents when no depth attachment is bound (the
+    /// resolve is then a no-op, as on hardware).
+    pub fn resolve_depth_to_texture(&mut self, dst: u64, dst_w: u32, dst_h: u32) {
+        let src = self.pass_state.current_depth_texture();
+        if src.is_null() || dst == 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve without a bound depth attachment or destination texture — skipped"
+            );
+            return;
+        }
+        let (width, height, _) = self.depth_attachment_desc;
+        if width != dst_w || height != dst_h {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve size mismatch: depth {width}x{height} vs destination \
+                 {dst_w}x{dst_h} — skipped"
+            );
+            return;
+        }
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "RESZ resolve: copying the bound depth attachment ({width}x{height}) into the \
+             stage-0 texture"
+        );
+        self.end_current_pass("resz");
+        self.pass_state.push_pending_leading_blit(BlitCommand {
+            cmd: BlitCommandType::CopyTextureToTexture as u32,
+            mip_level: 0,
+            src_handle: src.raw(),
+            dst_handle: dst,
+            src_offset: 0,
+            bytes_per_row: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: width,
+            region_h: height,
+            dst_offset: 0,
+            byte_size: 0,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
+        });
+    }
+
     /// A readable copy of the bound depth attachment, for a draw that samples it.
     ///
     /// Metal forbids reading a texture that is an attachment of the running
