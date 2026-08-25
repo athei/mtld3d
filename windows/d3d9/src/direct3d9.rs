@@ -501,6 +501,47 @@ extern "system" fn d3d9_get_adapter_identifier(
     // D3DADAPTER_IDENTIFIER9.device_id is u32 by D3D9 spec; mask to 16 bits.
     id.device_id = u32::try_from(params.registry_id & 0xFFFF).expect("16-bit mask fits u32");
 
+    // `adapter.spoof`: report a consistent well-known GPU identity. Engines of
+    // this era key whole render paths (depth copies, shadow filtering) off the
+    // vendor id, sniff the description string for a marketing name, and gate
+    // on a minimum driver version, so all of these move together.
+    let spoof = match crate::config::CONFIG.adapter_spoof {
+        mtld3d_core::config::AdapterSpoof::None => None,
+        mtld3d_core::config::AdapterSpoof::Nvidia => Some(SpoofIdentity {
+            vendor: 0x10DE,
+            device: 0x0611, // GeForce 8800 GT, in every launch-era device table
+            description: b"NVIDIA GeForce 8800 GT\0",
+            driver: b"nvd3dum.dll\0",
+            // 8.17.11.9745 (a WDDM 1.1 driver, NVIDIA 197.45) as
+            // LARGE_INTEGER LowPart / HighPart. The first field matters:
+            // 6.x is the XP driver model, and a title running on an NT 6
+            // prefix can reject or mis-parse an XP-model version.
+            version: [0x000B_2611, 0x0008_0011],
+        }),
+        mtld3d_core::config::AdapterSpoof::Amd => Some(SpoofIdentity {
+            vendor: 0x1002,
+            device: 0x9440, // Radeon HD 4870
+            description: b"ATI Radeon HD 4800 Series\0",
+            driver: b"atiumdag.dll\0",
+            // 8.17.10.1129 (a WDDM 1.1 Catalyst driver) as LARGE_INTEGER
+            // LowPart / HighPart; see the NVIDIA arm for why 8.x.
+            version: [0x000A_0469, 0x0008_0011],
+        }),
+    };
+    if let Some(s) = spoof {
+        id.vendor_id = s.vendor;
+        id.device_id = s.device;
+        id.description = [0; 512];
+        id.description[..s.description.len()].copy_from_slice(s.description);
+        id.driver = [0; 512];
+        id.driver[..s.driver.len()].copy_from_slice(s.driver);
+        id.driver_version = s.version;
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "adapter.spoof: reporting vendor {:#06x} device {:#06x}", s.vendor, s.device
+        );
+    }
+
     0 // S_OK
 }
 
@@ -522,6 +563,16 @@ pub fn sampler_border_supported() -> bool {
         params.supports_sampler_border != 0
     });
     *SUPPORTED
+}
+
+/// One spoofed adapter identity: everything a game sniffs, kept consistent.
+struct SpoofIdentity {
+    vendor: u32,
+    device: u32,
+    description: &'static [u8],
+    driver: &'static [u8],
+    /// Win32 `LARGE_INTEGER` driver version as `LowPart` / `HighPart`.
+    version: [u32; 2],
 }
 
 extern "system" fn d3d9_get_adapter_mode_count(
@@ -646,6 +697,9 @@ extern "system" fn d3d9_check_device_type(
     D3D_OK
 }
 
+/// The 'RESZ' pseudo-format fourcc: probed to detect the depth-resolve hack.
+const D3DFMT_RESZ: u32 = 0x5A53_4552;
+
 extern "system" fn d3d9_check_device_format(
     _this: *mut c_void,
     adapter: u32,
@@ -671,6 +725,11 @@ extern "system" fn d3d9_check_device_format(
     // D3DFMT_UNKNOWN is the "no format" sentinel — spec-correct to reject, and
     // games routinely probe it, so don't clutter the log with it.
     if check_format == 0 {
+        return D3DERR_NOTAVAILABLE;
+    }
+    // `caps.dfFormats = false` hides the DF fourccs (INTZ stays): an engine
+    // finding both DF and INTZ can pick a mixed depth path no real GPU had.
+    if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
     // Vertex texture fetch is not implemented (no sampler binds on the vertex
@@ -800,6 +859,10 @@ extern "system" fn d3d9_check_depth_stencil_match(
             target: LOG_TARGET,
             "reject CheckDepthStencilMatch(adapter={adapter}, dev_type={dev_type}, adapter_fmt={adapter_format}, rt_fmt={rt_format}, ds_fmt={ds_format}) → NOTAVAILABLE"
         );
+        return D3DERR_NOTAVAILABLE;
+    }
+    // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here.
+    if matches!(ds_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
     D3D_OK

@@ -136,6 +136,33 @@ pub struct Mtld3dConfig {
     /// the struct keeps its `Eq`; the file key is written as a float. File
     /// key: `render.scale` (e.g. `0.75`), accepted range `(0, 1.0]`.
     pub render_scale_percent: u32,
+    /// Present the adapter as a well-known GPU vendor.
+    ///
+    /// D3D9-era engines pick vendor-specific render paths (a depth copy
+    /// via `StretchRect` on one vendor, a resolve hack on another) and
+    /// disable those paths for a vendor they do not recognize, leaving
+    /// depth-dependent effects reading a buffer nothing updates. The
+    /// spoof fills `GetAdapterIdentifier` with a consistent vendor id,
+    /// device id, description, driver name and driver version. Default:
+    /// [`AdapterSpoof::None`] — report the real identity. File key:
+    /// `adapter.spoof` (`none` | `nvidia` | `amd`).
+    pub adapter_spoof: AdapterSpoof,
+    /// Advertise the `DF24` / `DF16` sampleable-depth formats.
+    ///
+    /// These fourccs existed on one vendor's hardware. A game that
+    /// probes them next to `INTZ` and finds both can take a mixed path
+    /// no real GPU ever ran; hiding them (`false`) keeps such engines on
+    /// the plain `INTZ` route (`INTZ` stays advertised). Default:
+    /// `true`. File key: `caps.dfFormats`.
+    pub df_formats: bool,
+}
+
+/// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterSpoof {
+    None,
+    Nvidia,
+    Amd,
 }
 
 /// `cursor.scale` policy.
@@ -173,6 +200,8 @@ impl Default for Mtld3dConfig {
             pagebox_pool_cap_bytes: 128 * 1024 * 1024,
             present_max_fps: 0,
             render_scale_percent: 100,
+            adapter_spoof: AdapterSpoof::None,
+            df_formats: true,
         }
     }
 }
@@ -289,6 +318,15 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: render.scale = {}",
         f64::from(cfg.render_scale_percent) / 100.0
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: adapter.spoof = {}",
+        adapter_spoof_label(cfg.adapter_spoof)
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: caps.dfFormats = {}", cfg.df_formats
+    );
 }
 
 const fn color_space_label(p: ColorSpacePolicy) -> &'static str {
@@ -326,6 +364,8 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
+        "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
+        "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
@@ -345,6 +385,27 @@ fn assign_cursor_scale(source: &str, value: &str, slot: &mut CursorScale) {
             "{source}: 'cursor.scale = {value}' is not 'auto' or a positive integer → kept {kept}",
             kept = cursor_scale_label(*slot)
         ),
+    }
+}
+
+fn assign_adapter_spoof(source: &str, value: &str, slot: &mut AdapterSpoof) {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => *slot = AdapterSpoof::None,
+        "nvidia" => *slot = AdapterSpoof::Nvidia,
+        "amd" | "ati" => *slot = AdapterSpoof::Amd,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'adapter.spoof = {other}' is not a known vendor (expected none/nvidia/amd) → kept {kept}",
+            kept = adapter_spoof_label(*slot)
+        ),
+    }
+}
+
+const fn adapter_spoof_label(s: AdapterSpoof) -> &'static str {
+    match s {
+        AdapterSpoof::None => "none",
+        AdapterSpoof::Nvidia => "nvidia",
+        AdapterSpoof::Amd => "amd",
     }
 }
 
