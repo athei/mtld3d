@@ -1782,7 +1782,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let bit = 1u16 << stage_u32;
         bound_mask |= bit;
         let is_compare = (depth_mask & bit) != 0 && (fetch_mask & bit) == 0;
-        let sampler = enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare);
+        let is_fetch = (fetch_mask & bit) != 0;
+        let sampler = enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare, is_fetch);
         if enc.last_bound().fragment_texture_changed(stage_u32, handle) {
             enc.emit_command(Command::set_fragment_texture(handle, stage_u32));
         }

@@ -3107,7 +3107,7 @@ impl FrameEncoder {
         ss[mtld3d_types::D3DSAMP_ADDRESSU as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSV as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSW as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
-        self.get_or_create_sampler(0, &ss, false)
+        self.get_or_create_sampler(0, &ss, false, false)
     }
 
     /// Scaling `StretchRect`: render the source texture onto a quad covering the destination rect.
@@ -5592,14 +5592,29 @@ impl FrameEncoder {
         stage: u32,
         sampler_state: &[u32; SAMPLER_STATE_COUNT],
         is_compare: bool,
+        force_point: bool,
     ) -> u64 {
-        if let Some(Some(memo)) = self.sampler_resolve_memo.get(stage as usize)
+        if !force_point
+            && let Some(Some(memo)) = self.sampler_resolve_memo.get(stage as usize)
             && memo.is_compare == is_compare
             && memo.state == *sampler_state
         {
             return memo.handle;
         }
-        let snapshot = sampler_state::snapshot_from_state(sampler_state, is_compare);
+        let mut snapshot = sampler_state::snapshot_from_state(sampler_state, is_compare);
+        if force_point {
+            // Raw depth fetch: Apple GPUs cannot filter Depth32Float, and a
+            // linear sample of it returns garbage rather than depth. D3D9
+            // games set LINEAR on everything, so the slot's sampler is forced
+            // to point; the shader reads exact stored depths, which is what
+            // position reconstruction wants anyway. Comparison samplers stay
+            // as configured: linear there is hardware PCF, which Apple GPUs
+            // do support.
+            snapshot.min_filter = 1; // D3DTEXF_POINT
+            snapshot.mag_filter = 1;
+            snapshot.mip_filter = 0; // D3DTEXF_NONE
+            snapshot.max_anisotropy = 1;
+        }
         let key = sampler_state::key_from_snapshot(&snapshot);
         let lodbias_raw = sampler_state[D3DSAMP_MIPMAPLODBIAS as usize];
         let dedup = (u64::from(stage) << 56) ^ (u64::from(lodbias_raw) << 24) ^ key.raw();
@@ -5617,7 +5632,9 @@ impl FrameEncoder {
             lb = lodbias_raw, lf = f32::from_bits(lodbias_raw),
         );
         if let Some(&handle) = self.sampler_cache.get(&key) {
-            self.memoize_sampler_resolve(stage, sampler_state, is_compare, handle.raw());
+            if !force_point {
+                self.memoize_sampler_resolve(stage, sampler_state, is_compare, handle.raw());
+            }
             return handle.raw();
         }
         let mut params = sampler_state::params_from_snapshot(&snapshot, key, self.device_handle);
@@ -5628,7 +5645,9 @@ impl FrameEncoder {
             return 0;
         }
         self.sampler_cache.insert(key, sampler);
-        self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());
+        if !force_point {
+            self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());
+        }
         sampler.raw()
     }
 

@@ -679,7 +679,9 @@ fn stretch_rect_accepts_one_to_one_same_format() {
 /// its light-volume draws sample it to reconstruct positions. Metal forbids
 /// reading an attachment of the running pass, so the encoder copies the
 /// attachment before such a draw and binds the copy: the sampled value is
-/// the depth written earlier (0.5), not garbage.
+/// the depth written earlier, not garbage. The depth is 0.25 (a value a
+/// `1 - z` mix-up cannot fake) and the stage's filters are LINEAR, which
+/// the fetch sampler must override: Apple GPUs cannot filter `Depth32Float`.
 #[test]
 fn intz_depth_sampled_while_bound_as_depth_attachment() {
     let h = Harness::new();
@@ -713,19 +715,19 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
         PosColorVertex {
             x: -1.0,
             y: 3.0,
-            z: 0.5,
+            z: 0.25,
             color: WHITE,
         },
         PosColorVertex {
             x: 3.0,
             y: -1.0,
-            z: 0.5,
+            z: 0.25,
             color: WHITE,
         },
         PosColorVertex {
             x: -1.0,
             y: -1.0,
-            z: 0.5,
+            z: 0.25,
             color: WHITE,
         },
     ];
@@ -741,8 +743,8 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
     assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
     h.select_texture_stage(0);
     for (state, value) in [
-        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
-        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MINFILTER, D3DTEXF_LINEAR),
+        (D3DSAMP_MAGFILTER, D3DTEXF_LINEAR),
         (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
         (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
     ] {
@@ -775,10 +777,10 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
 
     let center = Rgba8::from_pixel(h.read_pixel(320, 240));
     assert!(
-        (96..=160).contains(&center.r)
-            && (96..=160).contains(&center.g)
-            && (96..=160).contains(&center.b),
-        "the depth written by the occluder (0.5) samples back as mid-gray, got {center:?}"
+        (48..=90).contains(&center.r)
+            && (48..=90).contains(&center.g)
+            && (48..=90).contains(&center.b),
+        "the depth written by the occluder (0.25) samples back as dark gray, got {center:?}"
     );
     assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
 }
