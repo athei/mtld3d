@@ -184,6 +184,80 @@ fn two_stream_declaration_drives_programmable_draw() {
     );
 }
 
+/// A stride below an unconsumed declaration tail still fetches every vertex.
+///
+/// A shared declaration can carry trailing elements only other shaders read;
+/// a mesh drawn with a shader that ignores them legitimately binds a buffer
+/// packed at the span of the consumed elements alone. The vertex fetch must
+/// step by that bound stride: covering the unconsumed tail instead would
+/// read every vertex past the first from the wrong offset.
+#[test]
+fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PackedVertex {
+        x: f32,
+        y: f32,
+        z: f32,
+        color: u32,
+    }
+
+    // POSITION @0 and COLOR @12 are consumed by VS_POS_COLOR; the TEXCOORD0
+    // FLOAT3 tail at 16..28 is not, and the bound buffer does not carry it.
+    let elements = [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 16,
+            type_: D3DDECLTYPE_FLOAT3,
+            method: 0,
+            usage: D3DDECLUSAGE_TEXCOORD,
+            usage_index: 0,
+        },
+        end(),
+    ];
+
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&elements);
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+
+    let tri = centered_triangle();
+    let packed: Vec<PackedVertex> = tri
+        .iter()
+        .map(|p| PackedVertex {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            color: GREEN,
+        })
+        .collect();
+    let stride = stride_of::<PackedVertex>();
+    let vb = h.create_vertex_buffer(stride * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(packed.as_slice());
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), D3D_OK);
+
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "vertices step by the bound stride, not the unconsumed tail's extent"
+    );
+}
+
 /// The `SetStreamSourceFreq` / `GetStreamSourceFreq` contract.
 ///
 /// Defaults to 1 on every stream, rejects the combinations the runtime

@@ -885,12 +885,15 @@ pub fn fvf_to_elements(fvf: u32) -> (Vec<D3DVERTEXELEMENT9>, u32) {
 pub struct ResolvedAttrs {
     /// One entry per consumed element; `buffer_index` is the element's stream.
     pub attrs: Vec<VertexAttrDesc>,
-    /// Per stream, `max(offset + size)` over every element on it.
+    /// Per stream, `max(offset + size)` over the elements kept in `attrs`.
     ///
-    /// Unconsumed elements count too: the stream's vertex buffer layout must
-    /// cover this extent, since Metal rejects a pipeline whose attribute
-    /// reaches past its layout's stride. Zero for a stream the declaration
-    /// never names.
+    /// Only kept elements count: Metal validates a layout's stride against
+    /// the attributes in the descriptor, and an element the shader never
+    /// consumes is not in it. Counting unconsumed tail fields would widen
+    /// the fetch step past the stream's true stride and mis-fetch every
+    /// vertex after the first — applications legitimately bind a packed
+    /// buffer under a shared declaration whose trailing elements only exist
+    /// for other shaders. Zero for a stream with no kept element.
     pub extents: [u32; MAX_STREAMS as usize],
     /// Bit `s` set: stream `s` feeds at least one consumed attribute.
     ///
@@ -940,8 +943,6 @@ fn resolve_attrs(
             continue;
         }
         let (format, size) = decl_type_to_metal_format(e.type_);
-        let extent = &mut extents[stream as usize];
-        *extent = (*extent).max(u32::from(e.offset) + size);
         if format == VertexFormat::Invalid {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "{path} vertex decl: type={} has no Metal format → element dropped",
@@ -957,6 +958,8 @@ fn resolve_attrs(
                 format,
             });
             used_streams |= 1 << stream;
+            let extent = &mut extents[stream as usize];
+            *extent = (*extent).max(u32::from(e.offset) + size);
         }
     }
     ResolvedAttrs {

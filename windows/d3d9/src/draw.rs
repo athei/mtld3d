@@ -163,18 +163,20 @@ impl VertexSource {
 /// The stride a stream's vertex buffer layout steps by.
 ///
 /// The application's `SetStreamSource` stride wins when it covers the
-/// declaration's extent on that stream (it can exceed it when the vertex
-/// struct carries fields past the declared elements). A zero stride means
-/// the application left it to the declaration. A non-zero stride smaller
-/// than the extent would make Metal reject the pipeline (an attribute past
-/// its layout's stride), so it is widened to the extent with a warning.
+/// extent of the declaration elements the shader consumes on that stream
+/// (it can exceed it when the vertex struct carries fields past them). A
+/// zero stride means the application left it to the declaration. A non-zero
+/// stride smaller than the consumed extent means the shader reads an
+/// attribute past the end of each vertex — Metal rejects such a pipeline,
+/// so the layout is widened to the extent with a warning; the affected
+/// draw fetches wrong data either way.
 fn layout_stride(app_stride: u32, extent: u32) -> u32 {
     if app_stride == 0 {
         return extent;
     }
     if app_stride < extent {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "stream stride {app_stride} below the declaration extent {extent}; layout widened to the extent"
+            "stream stride {app_stride} below the consumed declaration extent {extent}; layout widened to the extent"
         );
         return extent;
     }
