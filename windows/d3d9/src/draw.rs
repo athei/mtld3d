@@ -1403,11 +1403,28 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let skip_set = skip_shader_hashes();
     if !skip_set.is_empty() {
         let (vs_h, ps_h) = (vs.disk_key(), ps.disk_key(ps_variant));
-        if skip_set.contains(&vs_h) || skip_set.contains(&ps_h) {
+        // Also match the raw content-hash program ids: they are what the
+        // frame dump prints per draw and what names the dumped bytecode
+        // files, so a dump line's id can go straight into the skip list
+        // without a debug-log run to harvest variant-mixed disk keys.
+        let vs_raw = match vs {
+            VsSource::Programmable { vs_id, .. } => vs_id.raw(),
+            VsSource::FixedFunction { .. } => 0,
+        };
+        let ps_raw = match ps {
+            PsSource::Programmable { ps_id, .. } => ps_id.raw(),
+            PsSource::FixedFunction { .. } => 0,
+        };
+        if skip_set.contains(&vs_h)
+            || skip_set.contains(&ps_h)
+            || (vs_raw != 0 && skip_set.contains(&vs_raw))
+            || (ps_raw != 0 && skip_set.contains(&ps_raw))
+        {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: vs_h ^ ps_h,
-                "debug.skipShaders: dropping draw with VS {vs_h:#x} PS {ps_h:#x}"
+                "debug.skipShaders: dropping draw with VS {vs_h:#x}/{vs_raw:#x} \
+                 PS {ps_h:#x}/{ps_raw:#x}"
             );
             return;
         }
