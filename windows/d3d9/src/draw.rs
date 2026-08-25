@@ -1791,8 +1791,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     for (stage_u32, b) in stage_bindings.iter() {
         let handle = stage_texture_handles[stage_u32 as usize];
         if handle == 0 {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "draw: stage bound but texture handle is 0 — bind skipped, an unbound declared sampler reads opaque black"
+            mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
+                key: b.texture_id.raw(),
+                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0 — bind \
+                 skipped, an unbound declared sampler reads opaque black",
+                b.texture_id
             );
             continue;
         }

@@ -709,6 +709,13 @@ extern "system" fn d3d9_check_device_format(
     rtype: u32,
     check_format: u32,
 ) -> i32 {
+    // One line per distinct probe: which formats a title asks about (and in
+    // what usage/rtype shape) is the map of the render path it is choosing.
+    mtld3d_shared::log_once_debug_by!(
+        target: LOG_TARGET,
+        key: (u64::from(usage) << 40) ^ (u64::from(rtype) << 32) ^ u64::from(check_format),
+        "CheckDeviceFormat probe: usage={usage:#x} rtype={rtype} fmt={check_format:#x}"
+    );
     // A D3DFMT_UNKNOWN (0) adapter format is never a valid query — the runtime
     // rejects it with INVALIDCALL ahead of any availability check, for every
     // device type.

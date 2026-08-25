@@ -3985,6 +3985,18 @@ extern "system" fn device_create_texture(
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
     unsafe { crate::com_ref::com_register_child(tex_ptr) };
+    // Target textures (render target / depth-stencil usage) are rare and
+    // long-lived, and which of them a game keeps, releases, or re-creates
+    // decides how cross-pass data flows; log their lifecycle unconditionally.
+    if usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) != 0 {
+        // SAFETY: `tex_ptr` is the freshly created, live texture from above.
+        let id = unsafe { (*tex_ptr).texture_id() };
+        debug!(
+            target: LOG_TARGET,
+            "target texture created: {id:?} fmt={format:#x} {width}x{height} usage={usage:#x} \
+             ptr={tex_ptr:p}"
+        );
+    }
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     0 // S_OK
@@ -4004,6 +4016,9 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
         return;
     }
     for level in 0..levels {
+        if inner.staging_is_dropped(level as usize) {
+            continue;
+        }
         dev.push_staging_warmup(StagingWarmupEntry {
             texture_id,
             level,
@@ -4912,6 +4927,16 @@ extern "system" fn device_update_surface(
     let Some(dst_surf) = (unsafe { InPtr::<crate::surface::Direct3DSurface9>::opt(dst) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    if let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        && obj.inner().frame_dump.active
+    {
+        obj.inner().frame_dump_event(&format!(
+            "UpdateSurface(src={}, dst={})",
+            frame_dump::surface_label(src),
+            frame_dump::surface_label(dst)
+        ));
+    }
     // D3D9 rejects UpdateSurface when either endpoint has an outstanding lock.
     if src_surf.is_locked() || dst_surf.is_locked() {
         mtld3d_shared::log_once_warn!(
@@ -5016,6 +5041,17 @@ extern "system" fn device_update_texture(
     let dst_parent = dst.cast::<crate::texture::Direct3DTexture9>();
     if std::ptr::eq(src_parent.cast_const(), dst_parent.cast_const()) {
         return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    if let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        && obj.inner().frame_dump.active
+    {
+        // SAFETY: `src_parent` is a non-null live base-texture wrapper.
+        let src_id = unsafe { (*src_parent).texture_id() };
+        // SAFETY: `dst_parent` is a non-null live base-texture wrapper.
+        let dst_id = unsafe { (*dst_parent).texture_id() };
+        obj.inner()
+            .frame_dump_event(&format!("UpdateTexture(src={src_id:?}, dst={dst_id:?})"));
     }
     // SAFETY: both pointers are non-null live base-texture wrappers. All three
     // texture interfaces share the same wrapper layout.
@@ -5175,6 +5211,13 @@ extern "system" fn device_get_render_target_data(
     let Some(dst_surf) = (unsafe { InPtr::<Direct3DSurface9>::opt(dst) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if obj.inner().frame_dump.active {
+        obj.inner().frame_dump_event(&format!(
+            "GetRenderTargetData(src={}, dst={})",
+            frame_dump::surface_label(rt),
+            frame_dump::surface_label(dst)
+        ));
+    }
     let Some((dst_ptr, dst_len)) = dst_surf.system_memory_blit_dst() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "GetRenderTargetData: dst is not a D3DPOOL_SYSTEMMEM offscreen surface → INVALIDCALL");
@@ -5410,6 +5453,13 @@ extern "system" fn device_stretch_rect(
 
     flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "StretchRect(src={}, dst={}, filter={filter})",
+            frame_dump::surface_label(src),
+            frame_dump::surface_label(dst)
+        ));
+    }
 
     let Some(src_info) = resolve_stretch_surface(dev, src_surf) else {
         mtld3d_shared::log_once_warn_by!(
@@ -5488,6 +5538,9 @@ extern "system" fn device_stretch_rect(
         // discards), and a clear still waiting for a pass on either endpoint
         // is materialized before the copy.
         let mip_level = src_info.mip_level;
+        if dev.frame_dump.active {
+            dev.frame_dump_event("StretchRect: full-surface depth copy queued");
+        }
         dev.push_op(Box::new(move |enc| {
             emit_stretch_rect_blit(
                 enc,
@@ -5620,6 +5673,16 @@ extern "system" fn device_stretch_rect(
     }
 
     let mip_level = src_info.mip_level;
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "StretchRect: {} queued",
+            if render_quad {
+                "render quad"
+            } else {
+                "1:1 blit"
+            }
+        ));
+    }
     dev.push_op(Box::new(move |enc| {
         emit_stretch_rect_blit(
             enc,
@@ -6238,6 +6301,12 @@ extern "system" fn device_color_fill(
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if obj.inner().frame_dump.active {
+        obj.inner().frame_dump_event(&format!(
+            "ColorFill({}, {color:#010x})",
+            frame_dump::surface_label(surface)
+        ));
+    }
     // SAFETY: `surface` is a live IDirect3DSurface9 per the D3D9 ABI.
     let s = unsafe { &*surface.cast::<Direct3DSurface9>() };
     let parent = s.parent_texture();
@@ -6517,7 +6586,26 @@ extern "system" fn device_set_render_target(
     };
     let dev = obj.inner();
     if dev.frame_dump.active {
-        dev.frame_dump_event(&format!("SetRenderTarget({index}, {surface:?})"));
+        dev.frame_dump_event(&format!(
+            "SetRenderTarget({index}, {})",
+            frame_dump::surface_label(surface)
+        ));
+        // Extra targets feed later passes (a deferred G-buffer's side
+        // planes), and small offscreen targets hold derived data (visibility
+        // probes, sky maps) consumed out of band; queue both for the
+        // frame-end content readback.
+        if !surface.is_null() {
+            // SAFETY: `surface` is a live IDirect3DSurface9 per the ABI.
+            let parent = unsafe { (*surface.cast::<Direct3DSurface9>()).parent_texture() };
+            if !parent.is_null() {
+                // SAFETY: a surface keeps its parent texture alive.
+                let tex = unsafe { &*parent };
+                let small = tex.inner().mip_width(0) <= 512 && tex.inner().mip_height(0) <= 512;
+                if index > 0 || small {
+                    dev.frame_dump_note_readback(tex);
+                }
+            }
+        }
     }
 
     if surface.is_null() {
@@ -6778,7 +6866,10 @@ extern "system" fn device_set_depth_stencil_surface(
     };
     let dev = obj.inner();
     if dev.frame_dump.active {
-        dev.frame_dump_event(&format!("SetDepthStencilSurface({surface:?})"));
+        dev.frame_dump_event(&format!(
+            "SetDepthStencilSurface({})",
+            frame_dump::surface_label(surface)
+        ));
     }
     let surf = surface.cast::<Direct3DSurface9>();
     // A non-NULL depth-stencil surface must report D3DUSAGE_DEPTHSTENCIL; NULL
@@ -7034,8 +7125,10 @@ extern "system" fn device_clear(
     };
     let dev = obj.inner();
     if dev.frame_dump.active {
+        let (rt, ds) = dev.frame_dump_target_labels();
         dev.frame_dump_event(&format!(
-            "clear flags={flags:#x} color={color:#010x} z={z} stencil={stencil} rects={count}"
+            "clear flags={flags:#x} color={color:#010x} z={z} stencil={stencil} rects={count} \
+             rt={rt} ds={ds}"
         ));
     }
 
@@ -7480,6 +7573,9 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
             let tex = unsafe { &*tex };
             let inner = tex.inner();
             let (id, w, h) = (tex.texture_id(), inner.mip_width(0), inner.mip_height(0));
+            if dev.frame_dump.active {
+                dev.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
+            }
             dev.push_op(Box::new(move |enc| {
                 let dst = enc.get_texture_handle_by_id(id);
                 enc.resolve_depth_to_texture(dst, w, h);

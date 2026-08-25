@@ -2328,6 +2328,17 @@ impl FrameEncoder {
         self.depth_write_epoch += 1;
     }
 
+    /// Metal handle of the snapshot copy kept for a depth attachment, or 0.
+    ///
+    /// Diagnostics only: the frame dump reads the copy back, since that is
+    /// what depth-sampling draws actually saw.
+    #[must_use]
+    pub fn depth_snapshot_handle(&self, src_raw: u64) -> u64 {
+        self.depth_snapshots
+            .get(&src_raw)
+            .map_or(0, |s| s.handle.raw())
+    }
+
     /// Resolve the bound depth attachment into `dst` (the RESZ hack).
     ///
     /// The magic `SetRenderState(POINTSIZE, 0x7fa05000)` asks for the

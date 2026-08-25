@@ -2148,6 +2148,16 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     let ti = obj.inner();
     let texture_id = ti.texture_id;
     let dev_inner_raw = ti.device_inner;
+    // Mirror of the "target texture created" line: target textures are rare
+    // and their release timing decides cross-pass data flow.
+    if obj.d3d_usage() & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
+        != 0
+    {
+        log::debug!(
+            target: crate::LOG_TARGET,
+            "target texture destroyed: {texture_id:?} ptr={this:p}"
+        );
+    }
 
     // `device_inner == 0` after `detach_from_device` — the owning
     // device has already been released and torn down (its

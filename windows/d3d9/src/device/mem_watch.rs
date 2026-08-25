@@ -11,7 +11,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-use log::{info, warn};
+use log::{debug, warn};
 
 use super::DeviceInner;
 use crate::{
@@ -92,10 +92,12 @@ impl DeviceInner {
         let Some(avail) = avail_virtual_mib() else {
             return;
         };
-        if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES) {
+        if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES)
+            && log::log_enabled!(target: LOG_TARGET, log::Level::Debug)
+        {
             let fp = self.live_texture_footprint();
             let largest = largest_free_region_mib();
-            info!(
+            debug!(
                 target: LOG_TARGET,
                 "address space: {avail} MiB free, largest free block {largest} MiB; mtld3d holds \
                  {} textures with {} MiB of mip data, staging resident {} MiB \

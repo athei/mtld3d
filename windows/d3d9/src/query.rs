@@ -226,6 +226,21 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
     // `DeviceInner` and is kept alive by the device — query outlives the
     // app's device only if the app violates D3D9 lifetime rules.
     let dev = unsafe { &mut *device_inner };
+    if dev.frame_dump_active() {
+        dev.frame_dump_event(&format!(
+            "Query({this:?}) Issue{}{}",
+            if flags & D3DISSUE_BEGIN != 0 {
+                " BEGIN"
+            } else {
+                ""
+            },
+            if flags & D3DISSUE_END != 0 {
+                " END"
+            } else {
+                ""
+            }
+        ));
+    }
     // Clone once for BEGIN (defensive — both bits can be set in one
     // call), move the original into END so we don't waste a refcount
     // bump in the common END-only path.
@@ -279,6 +294,15 @@ extern "system" fn query_get_data(
         // Caller is polling for "is it done?"; always yes.
         return D3D_OK;
     }
+    let device_inner_ptr = inner.device_inner;
+    let dump_event = |msg: &str| {
+        // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
+        // live `DeviceInner` and is kept alive by the device.
+        let dev = unsafe { &*device_inner_ptr };
+        if dev.frame_dump_active() {
+            dev.frame_dump_event(msg);
+        }
+    };
     let wanted = inner.data_size.min(size) as usize;
     match inner.query_type {
         D3DQUERYTYPE_EVENT if wanted >= 4 => {
@@ -299,6 +323,9 @@ extern "system" fn query_get_data(
                 // the FLUSH stub below and the exhaustion path in `visibility`,
                 // so a missing query never makes a title cull geometry it would
                 // otherwise draw (lens flares, occlusion-gated effects).
+                dump_event(&format!(
+                    "Query({this:?}) GetData → no slot, stub fully-visible"
+                ));
                 // SAFETY: `data` is non-null with >= `size` writable bytes per
                 // the ABI and `size >= 1`; `write_occlusion` writes `min(size, 8)`.
                 unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
@@ -331,6 +358,10 @@ extern "system" fn query_get_data(
                             // the real count finalizes naturally on
                             // the next `begin_frame` intake if the
                             // game ever reads via `flags = 0`.
+                            dump_event(&format!(
+                                "Query({this:?}) GetData(FLUSH) → stub fully-visible \
+                                 (query.flushImmediate)"
+                            ));
                             // SAFETY: as above — non-null `data`, `size >= 1`.
                             unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
                             return D3D_OK;
@@ -371,17 +402,26 @@ extern "system" fn query_get_data(
                                 dev.encoder_intake_visibility_for(core.seq_end_loaded());
                             }
                             if core.status() == QueryStatus::Issued {
+                                dump_event(&format!(
+                                    "Query({this:?}) GetData(FLUSH) → flushed, count {}",
+                                    core.get_u64()
+                                ));
                                 // SAFETY: as above — non-null `data`, `size >= 1`.
                                 unsafe { write_occlusion(data, size, core.get_u64()) };
                                 return D3D_OK;
                             }
                         }
                     }
+                    dump_event(&format!("Query({this:?}) GetData → S_FALSE, pending"));
                     // S_FALSE (0x1) — still not ready; caller will
                     // retry.
                     1
                 }
                 QueryStatus::Issued => {
+                    dump_event(&format!(
+                        "Query({this:?}) GetData → count {}",
+                        core.get_u64()
+                    ));
                     // SAFETY: as above — non-null `data`, `size >= 1`.
                     unsafe { write_occlusion(data, size, core.get_u64()) };
                     D3D_OK
