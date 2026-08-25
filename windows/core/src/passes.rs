@@ -143,6 +143,9 @@ const DEPTH_TRACE_TARGET: &str = "mtld3d::d3d9::depth";
 /// slot 8.
 pub const LAST_BOUND_MAX_STAGES: usize = 16;
 
+/// Vertex texture fetch slots (`vs_3_0` s0..s3, `D3DVERTEXTEXTURESAMPLER0..3`).
+pub const VERTEX_SAMPLER_SLOTS: usize = 4;
+
 /// Cap on `command_vec_pool` size.
 ///
 /// A 5-pass frame is the typical shape; 16 absorbs every realistic
@@ -3790,6 +3793,12 @@ impl Default for PassState {
 pub struct LastBoundCache {
     fragment_samplers: [u64; LAST_BOUND_MAX_STAGES],
     fragment_textures: [u64; LAST_BOUND_MAX_STAGES],
+    /// Vertex texture fetch slots 0..3.
+    ///
+    /// `MTLTexture` / `MTLSamplerState` handles bound on the vertex
+    /// stage; `0` is the unset sentinel.
+    vertex_textures: [u64; VERTEX_SAMPLER_SLOTS],
+    vertex_samplers: [u64; VERTEX_SAMPLER_SLOTS],
     pipeline: u64,
     depth_stencil: u64,
     stencil_reference: u32,
@@ -3851,6 +3860,8 @@ impl LastBoundCache {
         Self {
             fragment_samplers: [0; LAST_BOUND_MAX_STAGES],
             fragment_textures: [0; LAST_BOUND_MAX_STAGES],
+            vertex_textures: [0; VERTEX_SAMPLER_SLOTS],
+            vertex_samplers: [0; VERTEX_SAMPLER_SLOTS],
             pipeline: 0,
             depth_stencil: 0,
             stencil_reference: 0,
@@ -3878,6 +3889,8 @@ impl LastBoundCache {
     pub fn reset(&mut self) {
         self.fragment_samplers = [0; LAST_BOUND_MAX_STAGES];
         self.fragment_textures = [0; LAST_BOUND_MAX_STAGES];
+        self.vertex_textures = [0; VERTEX_SAMPLER_SLOTS];
+        self.vertex_samplers = [0; VERTEX_SAMPLER_SLOTS];
         self.pipeline = 0;
         self.depth_stencil = 0;
         self.stencil_reference = 0;
@@ -3902,6 +3915,28 @@ impl LastBoundCache {
             false
         } else {
             *slot = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_texture_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_textures[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_sampler_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_samplers[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
             true
         }
     }

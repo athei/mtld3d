@@ -465,6 +465,23 @@ fn emit_vs_function(
             ",\n    constant uint &vs_b [[buffer({VS_BOOL_CONST_SLOT})]]"
         );
     }
+    // Vertex texture fetch (`vs_3_0`): every declared sampler becomes a
+    // texture/sampler argument pair, same names as the fragment side so the
+    // shared sample-expression path serves both stages. The model only
+    // allows `texldl` (explicit LOD), which is also the only sample form
+    // MSL permits in a vertex function. Depth-format bindings are not
+    // routed to the vertex stage, so the type is always the declared one.
+    for (idx, ty) in declared_vs_samplers(vs) {
+        let tex_ty = match ty {
+            TextureType::TextureCube => "texturecube<float>",
+            TextureType::Texture3D => "texture3d<float>",
+            TextureType::Texture2D | TextureType::Unknown => "texture2d<float>",
+        };
+        let _ = write!(
+            out,
+            ",\n    {tex_ty} s{idx} [[texture({idx})]],\n    sampler samp{idx} [[sampler({idx})]]"
+        );
+    }
     w(out, "\n) {\n");
     w(out, "    float4 r[32];\n");
     // D3D9 address register `a0`. SM2 has exactly one int4 a0; the emitter
@@ -699,6 +716,23 @@ pub fn write_point_sprite_prologue(out: &mut String) {
             "    in.texcoord{i} = float4(point_coord.x, point_coord.y, 0.0, 0.0);"
         );
     }
+}
+
+/// Declared VS sampler slots and their texture dimensionality.
+///
+/// Vertex texture fetch: only `vs_3_0` can declare samplers (four slots,
+/// `D3DVERTEXTEXTURESAMPLER0..3` on the API side, `s0..s3` in bytecode),
+/// and only `texldl` may read them. The runtime binds the matching
+/// vertex-stage texture and sampler for each entry.
+#[must_use]
+pub fn declared_vs_samplers(vs: &DxsoProgram) -> BTreeMap<u16, TextureType> {
+    let mut samplers: BTreeMap<u16, TextureType> = BTreeMap::new();
+    for decl in &vs.declarations {
+        if let Declaration::Sampler { texture_type, reg } = decl {
+            samplers.insert(reg.index, *texture_type);
+        }
+    }
+    samplers
 }
 
 /// Declared PS sampler slots and their texture dimensionality.

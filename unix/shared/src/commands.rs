@@ -88,6 +88,20 @@ pub enum CommandType {
     /// `param_b` is a [`NullTextureKind`], selecting the 2D / cube / 3D black
     /// texture whose type matches the declaration.
     SetFragmentNullTexture = 20,
+    /// `encoder.setVertexTexture(texture, index)`
+    ///
+    /// Vertex texture fetch: a `vs_3_0` shader declaring a sampler reads it
+    /// with `texldl` (explicit LOD, the only form the model allows), so the
+    /// vertex function carries `[[texture(n)]]` / `[[sampler(n)]]` arguments
+    /// bound by this pair of commands.
+    SetVertexTexture = 21,
+    /// `encoder.setVertexSamplerState(sampler, index)`
+    SetVertexSamplerState = 22,
+    /// Opaque-black fallback for a declared-but-unbound VERTEX sampler.
+    ///
+    /// Same contract as [`CommandType::SetFragmentNullTexture`], on the
+    /// vertex stage: `param_a` is the slot, `param_b` a [`NullTextureKind`].
+    SetVertexNullTexture = 23,
 }
 
 /// Dimensionality of the opaque-black texture a null-texture bind selects.
@@ -221,6 +235,42 @@ impl Command {
             cmd: CommandType::SetFragmentTexture as u32,
             param_a: index,
             param_b: texture_handle,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.setVertexTexture(texture, index)`
+    #[must_use]
+    pub const fn set_vertex_texture(texture_handle: u64, index: u32) -> Self {
+        Self {
+            cmd: CommandType::SetVertexTexture as u32,
+            param_a: index,
+            param_b: texture_handle,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.setVertexSamplerState(sampler, index)`
+    #[must_use]
+    pub const fn set_vertex_sampler_state(sampler_handle: u64, index: u32) -> Self {
+        Self {
+            cmd: CommandType::SetVertexSamplerState as u32,
+            param_a: index,
+            param_b: sampler_handle,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// Opaque-black fallback texture + default sampler for a vertex slot.
+    #[must_use]
+    pub const fn set_vertex_null_texture(kind: NullTextureKind, index: u32) -> Self {
+        Self {
+            cmd: CommandType::SetVertexNullTexture as u32,
+            param_a: index,
+            param_b: kind as u64,
             param_c: 0,
             param_d: 0,
         }

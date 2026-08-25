@@ -182,9 +182,13 @@ impl RecordingStateBlock {
                     type_,
                     value,
                 } => {
-                    *value = dev
-                        .stage_bindings()
-                        .sampler_state(*sampler as usize, *type_ as usize);
+                    *value = crate::device::vertex_sampler_slot(*sampler).map_or_else(
+                        || {
+                            dev.stage_bindings()
+                                .sampler_state(*sampler as usize, *type_ as usize)
+                        },
+                        |slot| dev.vertex_sampler_state(slot, *type_ as usize),
+                    );
                 }
                 StateOp::TextureStageState {
                     stage,
@@ -226,7 +230,10 @@ impl RecordingStateBlock {
                     *fvf = dev.fvf_field();
                 }
                 StateOp::Texture { stage, tex } => {
-                    let live = dev.stage_bindings().texture(*stage as usize);
+                    let live = crate::device::vertex_sampler_slot(*stage).map_or_else(
+                        || dev.stage_bindings().texture(*stage as usize),
+                        |slot| dev.vertex_texture(slot),
+                    );
                     if tex.raw() != live {
                         // SAFETY: `live` came from the device's stage-binding
                         // slot, so it is null or a live IDirect3DTexture9
@@ -340,11 +347,15 @@ impl RecordingStateBlock {
                     type_,
                     value,
                 } => {
-                    dev.stage_bindings_mut().set_sampler_state(
-                        *sampler as usize,
-                        *type_ as usize,
-                        *value,
-                    );
+                    if let Some(slot) = crate::device::vertex_sampler_slot(*sampler) {
+                        dev.set_vertex_sampler_slot_state(slot, *type_ as usize, *value);
+                    } else {
+                        dev.stage_bindings_mut().set_sampler_state(
+                            *sampler as usize,
+                            *type_ as usize,
+                            *value,
+                        );
+                    }
                 }
                 StateOp::TextureStageState {
                     stage,
@@ -382,8 +393,12 @@ impl RecordingStateBlock {
                     dev.set_fvf_field(*fvf);
                 }
                 StateOp::Texture { stage, tex } => {
-                    dev.stage_bindings_mut()
-                        .replace_texture(*stage as usize, tex.raw());
+                    if let Some(slot) = crate::device::vertex_sampler_slot(*stage) {
+                        dev.set_vertex_texture_slot(slot, tex.raw());
+                    } else {
+                        dev.stage_bindings_mut()
+                            .replace_texture(*stage as usize, tex.raw());
+                    }
                 }
                 StateOp::VertexDeclaration(decl) => {
                     // D3D9 restores the vertex declaration on Apply only when the

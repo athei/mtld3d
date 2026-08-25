@@ -742,11 +742,20 @@ extern "system" fn d3d9_check_device_format(
             D3DERR_NOTAVAILABLE
         };
     }
-    // Vertex texture fetch is not implemented (no sampler binds on the vertex
-    // stage, `VertexTextureFilterCaps` is zero); the per-format query agrees.
-    if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {
-        return D3DERR_NOTAVAILABLE;
-    }
+    // Vertex texture fetch: any sampleable texture format can be read from
+    // the vertex stage (Metal binds textures to vertex functions natively),
+    // matching the non-zero `VertexTextureFilterCaps`. Strip the bit and
+    // let the remaining usage bits evaluate normally, so combined queries
+    // (RENDERTARGET | QUERY_VERTEXTEXTURE, the render-then-fetch pattern)
+    // answer on their other halves.
+    let usage = if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {
+        if !is_texture_format(check_format) {
+            return D3DERR_NOTAVAILABLE;
+        }
+        usage & !D3DUSAGE_QUERY_VERTEXTEXTURE
+    } else {
+        usage
+    };
     // D3DUSAGE_QUERY_SRGBWRITE asks whether a format works as an sRGB-encoding
     // render target. On a plain offscreen SURFACE — which can never be a render
     // target without D3DUSAGE_RENDERTARGET — the combination is invalid. (A

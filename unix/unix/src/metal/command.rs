@@ -1711,6 +1711,33 @@ fn encode_pass(
                         encoder.setFragmentTexture_atIndex(Some(&tex), cmd.param_a as usize);
                     }
                 }
+                Some(CommandType::SetVertexTexture) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLTexture address.
+                    let Some(tex) = (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) })
+                        .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; `tex` is retained for the
+                    // duration of the binding (encoder retains the texture).
+                    unsafe {
+                        encoder.setVertexTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexSamplerState) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLSamplerState address.
+                    let Some(sampler) =
+                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(cmd.param_b) })
+                            .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; `sampler` is retained for
+                    // the duration of the binding.
+                    unsafe {
+                        encoder.setVertexSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                    }
+                }
                 Some(CommandType::SetFragmentSamplerState) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLSamplerState address.
                     let Some(sampler) =
@@ -1763,6 +1790,44 @@ fn encode_pass(
                     unsafe {
                         encoder
                             .setFragmentSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexNullTexture) => {
+                    let Some(kind) = NullTextureKind::from_repr(to_u32(cmd.param_b)) else {
+                        mtld3d_shared::log_once_warn!(
+                            target: LOG_TARGET,
+                            "null texture: unknown kind {}; leaving the vertex slot unbound",
+                            cmd.param_b,
+                        );
+                        continue;
+                    };
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
+                        continue;
+                    };
+                    // SAFETY: the handle came from `null_texture::create`'s
+                    // `Retained::into_raw`, alive for the process lifetime.
+                    let Some(tex) =
+                        (unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) })
+                            .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: as above, for the shared default sampler.
+                    let Some(sampler) =
+                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) })
+                            .into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; both are retained for the
+                    // binding's duration.
+                    unsafe {
+                        encoder.setVertexTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                    }
+                    // SAFETY: objc2 typed binding; retained for the duration.
+                    unsafe {
+                        encoder.setVertexSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetVertexBytesAt) => {

@@ -647,3 +647,83 @@ fn depth_writing_ps_draws_without_a_depth_buffer() {
         "the colour output lands although the shader writes oDepth"
     );
 }
+
+/// `vs_3_0` fetching a texel with `texldl` and forwarding it as the color.
+///
+/// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
+/// def c4, 0.5, 0.5, 0, 0; mov o0, v0; texldl r0, c4, s0; mov o1, r0;`
+/// The fetch coordinate is `c4` — center of the texture, LOD 0 from `.w`.
+#[rustfmt::skip]
+const VS_FETCH: [u32; 27] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0500_0051, 0xA00F_0004,                           // def c4,
+    0x3F00_0000, 0x3F00_0000, 0x0000_0000, 0x0000_0000, //   0.5, 0.5, 0, 0
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0300_005F, 0x800F_0000, 0xA0E4_0004, 0xA0E4_0800, // texldl r0, c4, s0
+    0x0000_FFFF,                                        // end (o1 write below)
+];
+
+/// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }` — pass the VS color through.
+#[rustfmt::skip]
+const PS_COLOR_PASSTHROUGH: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_000A, 0x900F_0000,              // dcl_color0 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn vertex_texture_fetch_reads_the_bound_slot() {
+    // Vertex texture fetch: a vs_3_0 declares a sampler, the game binds a
+    // texture at D3DVERTEXTEXTURESAMPLER0 (stage 257), and texldl reads it
+    // per vertex. The fetched color rides a varying to the pixel shader, so
+    // the rendered triangle proves the vertex-stage bind end to end.
+    // Support is probed exactly like a title does: the caps bit and the
+    // per-format QUERY_VERTEXTEXTURE answer.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            mtld3d_types::D3DFMT_X8R8G8B8,
+            0x0010_0000, // D3DUSAGE_QUERY_VERTEXTEXTURE
+            3,           // D3DRTYPE_TEXTURE
+            mtld3d_types::D3DFMT_A8R8G8B8,
+        ),
+        0,
+        "vertex texture format probe answers available"
+    );
+
+    let tex = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[0xFF00_FF00; 4]); // all-green
+    }
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `mov o1, r0` before the end token.
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the texel fetched in the vertex shader colors the triangle"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}

@@ -505,6 +505,15 @@ pub struct DeviceInner {
     bound_buffers: BoundBuffers,
     shader_bindings: ShaderBindings,
     stage_bindings: StageBindings,
+    /// Vertex texture fetch slots (`D3DVERTEXTEXTURESAMPLER0..3`).
+    ///
+    /// Bound-slot refcounts like `StageBindings`; the encoder mirror is
+    /// pushed via ops at set time rather than riding the per-draw
+    /// snapshot, since vertex textures change orders of magnitude less
+    /// often than draws.
+    vertex_textures: [CachedComPtr<crate::texture::Direct3DTexture9, Bound>; 4],
+    /// Sampler state for the vertex slots, for `GetSamplerState`.
+    vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
     /// In-progress `BeginStateBlock` recording.
     ///
     /// `Some(..)` between a successful `BeginStateBlock` and its matching
@@ -996,6 +1005,62 @@ impl DeviceInner {
         let decl = self.get_or_create_fvf_decl(fvf);
         self.fvf = fvf;
         self.replace_vertex_decl(decl)
+    }
+
+    /// Release every vertex fetch slot's bound-texture refcount at device teardown.
+    pub fn teardown_vertex_textures(&mut self) {
+        self.vertex_textures = [const { CachedComPtr::null() }; 4];
+    }
+
+    /// One vertex-slot sampler state value, for `GetSamplerState` and capture.
+    #[must_use]
+    pub const fn vertex_sampler_state(&self, slot: usize, type_: usize) -> u32 {
+        self.vertex_sampler_states[slot][type_]
+    }
+
+    /// The texture bound at a vertex fetch slot, for `GetTexture` and capture.
+    #[must_use]
+    pub const fn vertex_texture(&self, slot: usize) -> *mut crate::texture::Direct3DTexture9 {
+        self.vertex_textures[slot].raw()
+    }
+
+    /// Store one vertex-slot sampler state and mirror the row to the encoder.
+    pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
+        self.vertex_sampler_states[slot][type_] = value;
+        let state = self.vertex_sampler_states[slot];
+        self.push_op(Box::new(move |enc| {
+            enc.set_vertex_sampler_binding(slot, state);
+        }));
+    }
+
+    /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
+    ///
+    /// Swaps the bound-slot refcount, flushes the texture's dirty mips
+    /// (vertex slots are off the snapshot path that flushes fragment
+    /// binds), and mirrors the id to the encoder. Later CPU writes to a
+    /// texture bound ONLY here reach the GPU on its next fragment bind or
+    /// re-bind, a shape no known title uses (the fetched textures are
+    /// render targets).
+    pub fn set_vertex_texture_slot(
+        &mut self,
+        slot: usize,
+        tex: *mut crate::texture::Direct3DTexture9,
+    ) {
+        // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
+        // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
+        self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
+        let id = if tex.is_null() {
+            None
+        } else {
+            // SAFETY: non-null per the branch; live per D3D9 lifetime rules.
+            let ti = unsafe { (*tex).inner_mut() };
+            crate::texture::flush_dirty_mips(ti, self);
+            // SAFETY: as above.
+            Some(unsafe { (*tex).texture_id() })
+        };
+        self.push_op(Box::new(move |enc| {
+            enc.set_vertex_texture_binding(slot, id);
+        }));
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -1885,6 +1950,14 @@ impl DeviceInner {
         self.bound_buffers.teardown();
         self.stage_bindings
             .reset_to_defaults(&[mtld3d_types::sampler_state_defaults(); STAGE_COUNT]);
+        // Vertex fetch slots unbind like the fragment stages; the encoder
+        // mirror clears with them.
+        for slot in 0..self.vertex_textures.len() {
+            if !self.vertex_textures[slot].raw().is_null() {
+                self.set_vertex_texture_slot(slot, core::ptr::null_mut());
+            }
+        }
+        self.vertex_sampler_states = [mtld3d_types::sampler_state_defaults(); 4];
         self.replace_vertex_decl(core::ptr::null_mut());
         self.shader_bindings
             .replace_vertex_shader(core::ptr::null_mut());
@@ -2275,6 +2348,8 @@ impl Direct3DDevice9 {
             bound_buffers: BoundBuffers::new(),
             shader_bindings: ShaderBindings::new(),
             stage_bindings: StageBindings::new(&info.sampler_states),
+            vertex_textures: [const { CachedComPtr::null() }; 4],
+            vertex_sampler_states: [mtld3d_types::sampler_state_defaults(); 4],
             recording_state_block: None,
             pending_display_sync_enabled: None,
             last_color_rt_binding: None,
@@ -2813,6 +2888,7 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         device_inner.bound_rt_mut().teardown();
         device_inner.bound_buffers_mut().teardown();
         device_inner.stage_bindings_mut().teardown();
+        device_inner.teardown_vertex_textures();
         device_inner.replace_vertex_decl(core::ptr::null_mut());
 
         // Finalize the device-owned implicit RT + depth-stencil surfaces. They
@@ -7551,7 +7627,8 @@ extern "system" fn device_get_texture(
     texture: *mut *mut c_void,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Texture);
-    if stage >= 8 || texture.is_null() {
+    let vertex_slot = vertex_sampler_slot(stage);
+    if (vertex_slot.is_none() && stage >= 8) || texture.is_null() {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7559,7 +7636,10 @@ extern "system" fn device_get_texture(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    let tex_ptr = dev.stage_bindings().texture(stage as usize);
+    let tex_ptr = vertex_slot.map_or_else(
+        || dev.stage_bindings().texture(stage as usize),
+        |slot| dev.vertex_textures[slot].raw(),
+    );
     if !tex_ptr.is_null() {
         // SAFETY: `tex_ptr` is non-null (checked above) and points to a
         // live `Direct3DTexture9` whose refcount keeps it alive while
@@ -7575,9 +7655,22 @@ extern "system" fn device_get_texture(
     0 // S_OK
 }
 
+/// Map a `D3DVERTEXTEXTURESAMPLER0..3` stage index (257..=260) to a slot.
+///
+/// `SetTexture` / `Set|GetSamplerState` accept these next to the sixteen
+/// fragment stages; everything else in that range stays invalid
+/// (`D3DDMAPSAMPLER` = 256 is displacement mapping, unimplemented).
+pub const fn vertex_sampler_slot(stage: u32) -> Option<usize> {
+    match stage {
+        257..=260 => Some((stage - 257) as usize),
+        _ => None,
+    }
+}
+
 extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *mut c_void) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Texture);
-    if stage as usize >= STAGE_COUNT {
+    let vertex_slot = vertex_sampler_slot(stage);
+    if vertex_slot.is_none() && stage as usize >= STAGE_COUNT {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7597,6 +7690,10 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
         return D3D_OK;
     }
 
+    if let Some(slot) = vertex_slot {
+        dev.set_vertex_texture_slot(slot, new_tex);
+        return D3D_OK;
+    }
     let delta = dev
         .stage_bindings_mut()
         .replace_texture(stage as usize, new_tex);
@@ -7722,7 +7819,11 @@ extern "system" fn device_get_sampler_state(
     value: *mut u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
-    if sampler as usize >= STAGE_COUNT || type_ as usize >= SAMPLER_STATE_COUNT || value.is_null() {
+    let vertex_slot = vertex_sampler_slot(sampler);
+    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
+        || type_ as usize >= SAMPLER_STATE_COUNT
+        || value.is_null()
+    {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7730,12 +7831,17 @@ extern "system" fn device_get_sampler_state(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    let read = vertex_slot.map_or_else(
+        || {
+            dev.stage_bindings()
+                .sampler_state(sampler as usize, type_ as usize)
+        },
+        |slot| dev.vertex_sampler_states[slot][type_ as usize],
+    );
     // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `u32` slot owned by the caller.
     unsafe {
-        *value = dev
-            .stage_bindings()
-            .sampler_state(sampler as usize, type_ as usize);
+        *value = read;
     }
     0 // S_OK
 }
@@ -7747,7 +7853,10 @@ extern "system" fn device_set_sampler_state(
     value: u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
-    if sampler as usize >= STAGE_COUNT || type_ as usize >= SAMPLER_STATE_COUNT {
+    let vertex_slot = vertex_sampler_slot(sampler);
+    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
+        || type_ as usize >= SAMPLER_STATE_COUNT
+    {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7761,6 +7870,10 @@ extern "system" fn device_set_sampler_state(
             type_,
             value,
         });
+        return D3D_OK;
+    }
+    if let Some(slot) = vertex_slot {
+        dev.set_vertex_sampler_slot_state(slot, type_ as usize, value);
         return D3D_OK;
     }
     dev.stage_bindings_mut()

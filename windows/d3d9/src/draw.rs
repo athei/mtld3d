@@ -1821,6 +1821,40 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 .fragment_sampler_changed(stage, NULL_TEXTURE_SAMPLER_SENTINEL);
         }
     }
+    // Vertex texture fetch: bind each slot the VS declares a sampler for
+    // (`vs_3_0`, at most four). The bindings mirror `SetTexture` /
+    // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
+    // encoder rather than the per-draw snapshot; a declared slot the game
+    // never bound gets the shared black fallback, as on the fragment side.
+    if let VsSource::Programmable { vs_id, .. } = vs {
+        let decls = enc.ps_declared_samplers(*vs_id);
+        let mut mask = decls.unbound(0) & 0xF;
+        while mask != 0 {
+            let slot = mask.trailing_zeros();
+            mask &= mask - 1;
+            let (id, ss) = enc.vertex_binding(slot as usize);
+            let handle = id.map_or(0, |id| enc.get_texture_handle_by_id(id));
+            if handle == 0 {
+                let kind = decls.kind(slot);
+                let tex_sentinel = null_texture_tex_sentinel(kind as u64);
+                if enc.last_bound().vertex_texture_changed(slot, tex_sentinel) {
+                    enc.emit_command(Command::set_vertex_null_texture(kind, slot));
+                }
+                enc.last_bound()
+                    .vertex_sampler_changed(slot, NULL_TEXTURE_SAMPLER_SENTINEL);
+            } else {
+                // Slot indices 16..19: past the fragment-stage memo range,
+                // so vertex samplers never collide with a stage's memo entry.
+                let sampler = enc.get_or_create_sampler(16 + slot, &ss, false, false);
+                if enc.last_bound().vertex_texture_changed(slot, handle) {
+                    enc.emit_command(Command::set_vertex_texture(handle, slot));
+                }
+                if sampler != 0 && enc.last_bound().vertex_sampler_changed(slot, sampler) {
+                    enc.emit_command(Command::set_vertex_sampler_state(sampler, slot));
+                }
+            }
+        }
+    }
     drop(t_samplers);
 
     let t_binds = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Binds));

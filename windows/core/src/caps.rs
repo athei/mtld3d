@@ -378,9 +378,12 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.stretch_rect_filter_caps = STRETCH_RECT_FILTER.bits();
     // Vertex texture fetch is not implemented: no sampler binds on the vertex
     // stage and `SetTexture` rejects the `D3DVERTEXTEXTURESAMPLER` range, so
-    // `vertex_texture_filter_caps` stays zero. That is a legal SM3 shape (ATI's
-    // R5xx shipped it), and `CheckDeviceFormat` denies
-    // `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
+    // Vertex texture fetch: point and linear min/mag filtering, no mip
+    // filter bit — `texldl` supplies its LOD explicitly, and Metal samples
+    // any level from a vertex function. Titles gate whole effect paths
+    // (per-sprite occlusion, displacement) on this being non-zero next to
+    // the matching `CheckDeviceFormat(QUERY_VERTEXTEXTURE)` answer.
+    caps.vertex_texture_filter_caps = FILTER_DEFAULT.bits();
     caps.stencil_caps = STENCIL_DEFAULT.bits();
     caps.texture_op_caps = TEXOP_DEFAULT.bits();
     caps.max_texture_blend_stages = FF_TEXTURE_STAGES;

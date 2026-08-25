@@ -600,6 +600,22 @@ impl Default for PsSamplerDecls {
     }
 }
 
+/// One vertex-sampler slot's binding, mirrored from the device.
+struct VertexTexBinding {
+    /// Bound texture, or `None` for an empty slot.
+    texture_id: Option<mtld3d_core::ids::TextureId>,
+    sampler_state: [u32; SAMPLER_STATE_COUNT],
+}
+
+impl Default for VertexTexBinding {
+    fn default() -> Self {
+        Self {
+            texture_id: None,
+            sampler_state: mtld3d_types::sampler_state_defaults(),
+        }
+    }
+}
+
 impl PsSamplerDecls {
     /// Collect the declared samplers from a parsed program (empty for a VS).
     ///
@@ -859,6 +875,13 @@ pub struct FrameEncoder {
     /// invalidated: `sampler_cache` entries live until encoder shutdown,
     /// so a memoized handle can't dangle.
     sampler_resolve_memo: [Option<SamplerResolveMemo>; crate::stage_bindings::STAGE_COUNT],
+    /// Vertex texture fetch slots 0..3, mirrored from the device via ops.
+    ///
+    /// `SetTexture` / `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3`
+    /// push updates; `emit_draw` binds the slots a programmable VS
+    /// declares samplers for. Kept off the per-draw snapshot: vertex
+    /// textures change orders of magnitude less often than draws.
+    vertex_tex_bindings: [VertexTexBinding; mtld3d_core::passes::VERTEX_SAMPLER_SLOTS],
     /// Lazy `MTLBuffer` wrappers for bound VBs / IBs, keyed by their process-unique `BufferId`.
     ///
     /// One entry per live backing; on Lock-rename the API thread pushes
@@ -1236,6 +1259,7 @@ impl FrameEncoder {
             texture_cache: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
+            vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
             buffer_cache: FxHashMap::default(),
             pending_resource_retention: VecDeque::new(),
             fan_index_buffer: FanIndexBuffer::EMPTY,
@@ -3856,11 +3880,47 @@ impl FrameEncoder {
     /// The declared sampler slots + types for a programmable pixel shader.
     ///
     /// Empty for an unregistered id (the draw path then binds no fallback).
+    /// Also serves vertex shaders: `register_program` collects
+    /// `Declaration::Sampler` entries for every program, so a `vs_3_0`
+    /// using vertex texture fetch reports its slots here too.
     pub fn ps_declared_samplers(&self, ps_id: ProgramId) -> PsSamplerDecls {
         self.prog_sampler_decls
             .get(&ps_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Update one mirrored vertex texture slot (`SetTexture` on 257..=260).
+    pub const fn set_vertex_texture_binding(
+        &mut self,
+        slot: usize,
+        id: Option<mtld3d_core::ids::TextureId>,
+    ) {
+        self.vertex_tex_bindings[slot].texture_id = id;
+    }
+
+    /// Update one mirrored vertex sampler state (`SetSamplerState` on 257..=260).
+    pub const fn set_vertex_sampler_binding(
+        &mut self,
+        slot: usize,
+        state: [u32; SAMPLER_STATE_COUNT],
+    ) {
+        self.vertex_tex_bindings[slot].sampler_state = state;
+    }
+
+    /// One mirrored vertex slot: `(texture id, sampler state)` by value.
+    #[must_use]
+    pub const fn vertex_binding(
+        &self,
+        slot: usize,
+    ) -> (
+        Option<mtld3d_core::ids::TextureId>,
+        [u32; SAMPLER_STATE_COUNT],
+    ) {
+        (
+            self.vertex_tex_bindings[slot].texture_id,
+            self.vertex_tex_bindings[slot].sampler_state,
+        )
     }
 
     /// Absorb the pre-warm thread's compiled MSL → `MTLLibrary` handles into `lib_cache`.
