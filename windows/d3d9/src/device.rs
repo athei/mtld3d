@@ -514,6 +514,12 @@ pub struct DeviceInner {
     vertex_textures: [CachedComPtr<crate::texture::Direct3DTexture9, Bound>; 4],
     /// Sampler state for the vertex slots, for `GetSamplerState`.
     vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
+    /// The last texture-backed depth-stencil bind, as `(texture, width, height)`.
+    ///
+    /// Read by the `depth.aliasSameSize` carry: a bind of a *different*
+    /// texture with equal dimensions inherits this one's contents (see
+    /// the config key's doc). Dimensions are those of the bound mip.
+    last_sized_depth: Option<(TextureId, u32, u32)>,
     /// In-progress `BeginStateBlock` recording.
     ///
     /// `Some(..)` between a successful `BeginStateBlock` and its matching
@@ -2350,6 +2356,7 @@ impl Direct3DDevice9 {
             stage_bindings: StageBindings::new(&info.sampler_states),
             vertex_textures: [const { CachedComPtr::null() }; 4],
             vertex_sampler_states: [mtld3d_types::sampler_state_defaults(); 4],
+            last_sized_depth: None,
             recording_state_block: None,
             pending_display_sync_enabled: None,
             last_color_rt_binding: None,
@@ -4173,6 +4180,17 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
     unsafe { crate::com_ref::com_register_child(tex_ptr) };
+    // Mirror of the colour path's "target texture created" line; the depth
+    // path returns before that one runs.
+    {
+        // SAFETY: `tex_ptr` is the freshly created, live texture from above.
+        let id = unsafe { (*tex_ptr).texture_id() };
+        debug!(
+            target: LOG_TARGET,
+            "target texture created: {id:?} fmt={format:#x} {width}x{height} usage={usage:#x} \
+             ptr={tex_ptr:p}"
+        );
+    }
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     D3D_OK
@@ -6944,6 +6962,29 @@ extern "system" fn device_set_depth_stencil_surface(
             info.texture_id,
             mip
         );
+        // The depth.aliasSameSize carry: a different texture bound at the
+        // same dimensions inherits the previous one's contents, matching
+        // the shared physical depth allocation of D3D9-era drivers that
+        // engines of that era rely on (bind one handle, sample the other).
+        if crate::config::CONFIG.depth_alias_same_size {
+            let mip_w = (w >> mip).max(1);
+            let mip_h = (h >> mip).max(1);
+            if let Some((prev_id, pw, ph)) = dev.last_sized_depth
+                && prev_id != info.texture_id
+                && (pw, ph) == (mip_w, mip_h)
+            {
+                let cur_id = info.texture_id;
+                if dev.frame_dump.active {
+                    dev.frame_dump_event(&format!(
+                        "depth-alias carry {prev_id:?} → {cur_id:?} {mip_w}x{mip_h}"
+                    ));
+                }
+                dev.push_op(Box::new(move |enc| {
+                    enc.carry_depth_contents(prev_id, cur_id, mip_w, mip_h);
+                }));
+            }
+            dev.last_sized_depth = Some((info.texture_id, mip_w, mip_h));
+        }
         DepthBinding::Lazy(info, mip)
     } else {
         // SAFETY: `surf` is non-null (else-if branch) and points to a

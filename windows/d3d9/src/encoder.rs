@@ -2391,6 +2391,49 @@ impl FrameEncoder {
         });
     }
 
+    /// Copy one depth texture's contents into another (`depth.aliasSameSize`).
+    ///
+    /// The bind-time carry for engines that expect equal-size depth-stencil
+    /// surfaces to share one physical allocation: the destination is about to
+    /// be bound as the depth attachment and must open on the source's
+    /// contents. Same shape as the RESZ resolve: close the pass, queue a
+    /// full-surface blit ahead of the next one (which registers the
+    /// destination as blit-written, so its first-use load stays `Load`).
+    pub fn carry_depth_contents(&mut self, src_id: TextureId, dst_id: TextureId, w: u32, h: u32) {
+        let src = self.get_texture_handle_by_id(src_id);
+        let dst = self.get_texture_handle_by_id(dst_id);
+        if src == 0 || dst == 0 || src == dst {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "depth.aliasSameSize: carry skipped (unresolved handle or identical textures)"
+            );
+            return;
+        }
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "depth.aliasSameSize: carrying {w}x{h} depth contents across a same-size bind"
+        );
+        self.end_current_pass("depth-alias");
+        self.pass_state.push_pending_leading_blit(BlitCommand {
+            cmd: BlitCommandType::CopyTextureToTexture as u32,
+            mip_level: 0,
+            src_handle: src,
+            dst_handle: dst,
+            src_offset: 0,
+            bytes_per_row: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: w,
+            region_h: h,
+            dst_offset: 0,
+            byte_size: 0,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
+        });
+    }
+
     /// A readable copy of the bound depth attachment, for a draw that samples it.
     ///
     /// Metal forbids reading a texture that is an attachment of the running

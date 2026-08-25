@@ -81,6 +81,20 @@ pub struct Mtld3dConfig {
     /// pixel count immediately after FLUSH. File key:
     /// `query.flushImmediate`.
     pub query_flush_immediate: bool,
+    /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
+    ///
+    /// D3D9-era drivers commonly backed all equal-size depth-stencil
+    /// surfaces with one physical allocation, so engines of that era
+    /// bind a *different* depth texture of the same dimensions and rely
+    /// on the just-rendered scene depth being visible through it (the
+    /// point of the trick: z-test one handle while sampling the other,
+    /// which D3D9 forbids on a single surface). When enabled, binding a
+    /// texture-backed depth-stencil whose dimensions match the
+    /// previously bound one queues a GPU copy of the previous contents
+    /// into it. Default: `false` — engines that clear every depth
+    /// target before use (the common case) would pay one full-surface
+    /// copy per switch for nothing. File key: `depth.aliasSameSize`.
+    pub depth_alias_same_size: bool,
     /// Proactive cap on live VB/IB retained-`PageBox` bytes.
     ///
     /// When live retention reaches this, the Lock-rename alloc path
@@ -188,6 +202,7 @@ impl Default for Mtld3dConfig {
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
+            depth_alias_same_size: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             // The 32-bit address space is the ceiling that matters, not the
             // GPU's memory: a unified-memory Mac has far more than a D3D9
@@ -296,6 +311,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: depth.aliasSameSize = {}", cfg.depth_alias_same_size
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: memory.vbibRetentionCapMB = {}",
         cfg.vbib_retention_cap_bytes / (1024 * 1024)
     );
@@ -353,6 +372,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
+        "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "memory.vbibRetentionCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);
         }

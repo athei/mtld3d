@@ -156,6 +156,14 @@ fn query_flush_immediate_round_trips_true() {
 }
 
 #[test]
+fn depth_alias_same_size_defaults_off_and_round_trips() {
+    let cfg = parse("", None);
+    assert!(!cfg.depth_alias_same_size);
+    let cfg = parse("depth.aliasSameSize = true\n", None);
+    assert!(cfg.depth_alias_same_size);
+}
+
+#[test]
 fn cursor_scale_auto_keyword_case_insensitive() {
     let cfg = parse("cursor.scale = Auto\n", None);
     assert_eq!(cfg.cursor_scale, CursorScale::Auto);

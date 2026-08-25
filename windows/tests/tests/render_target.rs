@@ -2623,3 +2623,128 @@ fn intz_carries_a_working_stencil_plane() {
 
     assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 0), 0);
 }
+
+/// `depth.aliasSameSize`: a same-size depth-stencil bind inherits contents.
+///
+/// Engines of the D3D9 era rely on equal-size depth-stencil surfaces
+/// sharing one physical driver allocation: they render scene depth with
+/// one depth texture bound, then bind a *different* same-size depth
+/// texture and z-test against the scene depth through it, with no copy
+/// anywhere in the API stream. With the option on, rebinding texture A
+/// after rendering into texture B must make A's z-test see B's contents.
+#[test]
+fn same_size_depth_bind_inherits_contents_when_aliased() {
+    // The harness process owns its environment and no other thread runs
+    // yet; extend the suite-wide config with the option under test.
+    let merged = format!(
+        "{};depth.aliasSameSize=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the
+    // harness and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::with_depth();
+    let a = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let b = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    let half = |x0: f32, x1: f32, z: f32| {
+        let v = |x: f32, y: f32| PosColorVertex {
+            x,
+            y,
+            z,
+            color: WHITE,
+        };
+        [
+            v(x0, 1.0),
+            v(x1, 1.0),
+            v(x0, -1.0),
+            v(x1, 1.0),
+            v(x1, -1.0),
+            v(x0, -1.0),
+        ]
+    };
+
+    assert_eq!(h.begin_scene(), 0);
+    // Depth A: left half occluded at 0.25, right half stays at the clear.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(-1.0, 0.0, 0.25)),
+        0,
+        "occluder into depth A"
+    );
+    // Depth B: cleared (killing the A→B carry), right half occluded at 0.25.
+    assert_eq!(h.set_depth_stencil_surface(&b.surface_level(0)), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(0.0, 1.0, 0.25)),
+        0,
+        "occluder into depth B"
+    );
+    // Rebind A with no clear: the carry must hand it B's contents (right
+    // blocked at 0.25, left back at 1.0), not leave its own.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    let full = |z: f32, color: u32| {
+        let v = |x: f32, y: f32| PosColorVertex { x, y, z, color };
+        [
+            v(-1.0, 1.0),
+            v(1.0, 1.0),
+            v(-1.0, -1.0),
+            v(1.0, 1.0),
+            v(1.0, -1.0),
+            v(-1.0, -1.0),
+        ]
+    };
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full(0.5, GREEN)),
+        0,
+        "z-tested full-screen quad"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "left half passes: the inherited depth is clear there"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        BLACK,
+        "right half fails: the inherited depth carries B's occluder"
+    );
+}
