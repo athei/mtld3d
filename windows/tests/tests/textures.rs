@@ -577,6 +577,27 @@ fn update_surface_uploads_the_selected_cube_face() {
     );
 }
 
+/// A default-pool texture the game cannot lock takes a second `UpdateTexture`.
+///
+/// Its staging goes away once the first upload has been submitted (the GPU
+/// holds the only copy, as on real D3D9); the second update re-creates it,
+/// and what samples back is the second fill.
+#[test]
+fn default_pool_texture_takes_a_second_update_after_its_upload() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let src = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    src.lock_rect(0, 0).write::<u32>(&[RED; 4]);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "first UpdateTexture");
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), RED, "first fill");
+
+    src.lock_rect(0, 0).write::<u32>(&[GREEN; 4]);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "second UpdateTexture");
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "second fill");
+}
+
 #[test]
 fn update_texture_keeps_cube_faces_independent() {
     let h = Harness::new();

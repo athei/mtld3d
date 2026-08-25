@@ -36,22 +36,51 @@ static PRESENTS: AtomicU32 = AtomicU32::new(0);
 /// Index of the next threshold to report; thresholds above it were already logged.
 static NEXT_THRESHOLD: AtomicU8 = AtomicU8::new(0);
 
+/// What the live textures hold in the 32-bit address space.
+struct TextureFootprint {
+    count: usize,
+    mip_bytes: u64,
+    resident_default_static: u64,
+    resident_default_dynamic: u64,
+    resident_other: u64,
+}
+
 impl DeviceInner {
-    /// Count and total mip bytes of every live texture, whatever its pool.
-    fn live_texture_footprint(&self) -> (usize, u64) {
+    /// Count, total mip bytes, and resident staging bytes of every live texture.
+    ///
+    /// The staging split names who still holds a system copy: default-pool
+    /// static (droppable after upload), default-pool dynamic, and the
+    /// lockable pools.
+    fn live_texture_footprint(&self) -> TextureFootprint {
         let live = self
             .live_textures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bytes = live
-            .iter()
-            .map(|&t| {
-                // SAFETY: the registry holds every live texture until its
-                // release deregisters it under the same lock.
-                unsafe { (*t).allocated_bytes() }
-            })
-            .sum();
-        (live.len(), bytes)
+        let mut fp = TextureFootprint {
+            count: live.len(),
+            mip_bytes: 0,
+            resident_default_static: 0,
+            resident_default_dynamic: 0,
+            resident_other: 0,
+        };
+        for &t in live.iter() {
+            // SAFETY: the registry holds every live texture until its
+            // release deregisters it under the same lock.
+            let ti = unsafe { &*t };
+            fp.mip_bytes += ti.allocated_bytes();
+            let resident = ti.resident_staging_bytes();
+            if ti.d3d_pool() == mtld3d_types::D3DPOOL_DEFAULT {
+                if ti.d3d_usage() & mtld3d_types::D3DUSAGE_DYNAMIC == 0 {
+                    fp.resident_default_static += resident;
+                } else {
+                    fp.resident_default_dynamic += resident;
+                }
+            } else {
+                fp.resident_other += resident;
+            }
+        }
+        drop(live);
+        fp
     }
 
     /// Sample the free virtual address space and log threshold crossings.
@@ -64,16 +93,23 @@ impl DeviceInner {
             return;
         };
         if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES) {
-            let (texture_count, texture_bytes) = self.live_texture_footprint();
+            let fp = self.live_texture_footprint();
             let largest = largest_free_region_mib();
             info!(
                 target: LOG_TARGET,
                 "address space: {avail} MiB free, largest free block {largest} MiB; mtld3d holds \
-                 {texture_count} textures with {} MiB of mip data ({} MiB default pool), \
-                 retained vertex/index buffers {} MiB",
-                texture_bytes >> 20,
-                self.vram_bytes_used.load(Ordering::Relaxed) >> 20,
-                self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20
+                 {} textures with {} MiB of mip data, staging resident {} MiB \
+                 (default static {} / default dynamic {} / other {}), page boxes {} MiB, \
+                 retained vertex/index buffers {} MiB, locks on static default textures {}",
+                fp.count,
+                fp.mip_bytes >> 20,
+                (fp.resident_default_static + fp.resident_default_dynamic + fp.resident_other) >> 20,
+                fp.resident_default_static >> 20,
+                fp.resident_default_dynamic >> 20,
+                fp.resident_other >> 20,
+                mtld3d_core::page_box::live_bytes() >> 20,
+                self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20,
+                crate::texture::default_static_lock_count()
             );
             if largest < MAP_BELOW_MIB && !MAP_LOGGED.swap(true, Ordering::Relaxed) {
                 warn!(target: LOG_TARGET, "address space map: {}", address_space_map());
@@ -85,15 +121,14 @@ impl DeviceInner {
         {
             next += 1;
             NEXT_THRESHOLD.store(next, Ordering::Relaxed);
-            let (texture_count, texture_bytes) = self.live_texture_footprint();
+            let fp = self.live_texture_footprint();
             warn!(
                 target: LOG_TARGET,
                 "address space: {avail} MiB free (below {threshold} MiB); mtld3d holds \
-                 {texture_count} textures with {} MiB of mip data ({} MiB default pool), \
-                 retained vertex/index buffers {} MiB",
-                texture_bytes >> 20,
-                self.vram_bytes_used.load(Ordering::Relaxed) >> 20,
-                self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20
+                 {} textures with {} MiB of mip data, page boxes {} MiB",
+                fp.count,
+                fp.mip_bytes >> 20,
+                mtld3d_core::page_box::live_bytes() >> 20
             );
         }
     }

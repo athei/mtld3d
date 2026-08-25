@@ -1827,6 +1827,12 @@ impl Harness {
         }
     }
 
+    /// `UpdateTexture` between two 2D textures.
+    pub fn update_texture_hr(&self, src: &Texture<'_>, dst: &Texture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
     /// `UpdateTexture` between two cube textures.
     pub fn update_cube_texture_hr(&self, src: &CubeTexture<'_>, dst: &CubeTexture<'_>) -> i32 {
         // SAFETY: vtable thunk; both cube textures are live base textures.

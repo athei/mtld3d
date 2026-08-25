@@ -97,6 +97,11 @@ bitflags::bitflags! {
         ///
         /// Backed by six Metal array slices when the pool is GPU-visible.
         const CUBE = 1 << 3;
+        /// The texture behind a `CreateOffscreenPlainSurface` surface.
+        ///
+        /// D3D9 lets a game lock such a surface even in the default pool,
+        /// so its staging is never released after an upload.
+        const OFFSCREEN_PLAIN = 1 << 4;
     }
 }
 
@@ -242,11 +247,25 @@ pub struct TextureInner {
     /// Per-mip "needs upload" mask, bit `level` set at non-READONLY `UnlockRect`.
     ///
     /// Cleared by `flush_dirty_mips` at bind time. The bind-time flush
-    /// schedules a full-mip upload via `schedule_upload`; no sub-rect is
-    /// tracked here, so granularity is per-mip. A mask (not a `Vec<bool>`)
+    /// schedules an upload via `schedule_upload`. A mask (not a `Vec<bool>`)
     /// so the every-draw bind-time gate is a single load; level count is
     /// bounded by log2(max texture dim 16384) + 1 = 15 bits.
     dirty_mask: u32,
+    /// Sub-rect a dirty 2D level's upload may narrow to (`None` = whole mip).
+    ///
+    /// A partial copy into a level whose staging was dropped after its
+    /// upload re-creates the staging uninitialized outside the copied
+    /// region; a whole-mip upload would then push that garbage over GPU
+    /// content the copy never touched. Tracking the written union lets the
+    /// flush upload only what the copies wrote. Whole-mip writes reset the
+    /// entry to `None`.
+    pending_upload_rects: Vec<Option<DirtyRect>>,
+    /// Levels whose staging was released after their upload retired (bit N = level N).
+    ///
+    /// Only default-pool textures the game cannot lock qualify, see
+    /// [`TextureInner::staging_droppable`]; `staging[N]` then holds the
+    /// shared placeholder page until a write re-creates the level.
+    dropped_staging: u32,
     /// `LockRect(D3DLOCK_READONLY)` stash per mip.
     ///
     /// Suppresses the upload at `UnlockRect` so a game's read-only inspection
@@ -316,7 +335,112 @@ pub struct TextureInner {
     private_data: PrivateDataStore,
 }
 
+/// Locks taken on default-pool textures created without `D3DUSAGE_DYNAMIC`.
+///
+/// D3D9 rejects those; mtld3d serves them. The count tells whether a game
+/// streams through that path, which the staging drop has to respect.
+static DEFAULT_STATIC_LOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many locks landed on default-pool textures without `D3DUSAGE_DYNAMIC`.
+pub fn default_static_lock_count() -> u32 {
+    DEFAULT_STATIC_LOCKS.load(Ordering::Relaxed)
+}
+
+/// The page every dropped staging level points at.
+///
+/// One shared page instead of a per-level allocation: the slot has to hold
+/// an `Arc<PageBox>` so the accessors keep their shape, but nothing may
+/// read it, and a write re-creates the level first.
+fn dropped_staging_placeholder() -> Arc<PageBox> {
+    static PLACEHOLDER: std::sync::LazyLock<Arc<PageBox>> =
+        std::sync::LazyLock::new(|| Arc::new(PageBox::new_zeroed(1)));
+    Arc::clone(&PLACEHOLDER)
+}
+
 impl TextureInner {
+    /// D3DPOOL_* the texture was created in.
+    pub const fn d3d_pool(&self) -> u32 {
+        self.d3d_pool
+    }
+
+    /// D3DUSAGE_* the texture was created with.
+    pub const fn d3d_usage(&self) -> u32 {
+        self.d3d_usage
+    }
+
+    /// Bytes of staging this texture still holds in the 32-bit address space.
+    pub fn resident_staging_bytes(&self) -> u64 {
+        self.staging
+            .iter()
+            .enumerate()
+            .filter(|(level, _)| self.dropped_staging & (1u32 << level) == 0)
+            .map(|(_, b)| b.logical_len() as u64)
+            .sum()
+    }
+
+    /// Whether `level`'s staging is currently released (placeholder only).
+    ///
+    /// The staging warmup skips such levels: there is no backing worth
+    /// wrapping, and every dropped level of every texture shares one page.
+    pub const fn staging_is_dropped(&self, level: usize) -> bool {
+        self.dropped_staging & (1u32 << level) != 0
+    }
+
+    /// Whether `level`'s staging can go once its upload has retired.
+    ///
+    /// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked
+    /// in D3D9, and the runtime keeps no system-memory copy of it: the GPU
+    /// holds the only bytes. Keeping ours doubles the footprint of every
+    /// streamed texture inside a 32-bit game. Render targets, depth
+    /// textures, cubes and volumes keep theirs (their copies serve other
+    /// paths); so do the lockable pools.
+    fn staging_droppable(&self, level: usize) -> bool {
+        self.d3d_pool == D3DPOOL_DEFAULT
+            && self.d3d_usage
+                & (D3DUSAGE_DYNAMIC
+                    | mtld3d_types::D3DUSAGE_RENDERTARGET
+                    | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
+                == 0
+            && !self.flags.contains(TextureFlags::CUBE)
+            && !self.flags.contains(TextureFlags::OFFSCREEN_PLAIN)
+            && !self.flags.contains(TextureFlags::DEPTH_FORMAT)
+            && self.depth <= 1
+            && self.dropped_staging & (1u32 << level) == 0
+            && !self.locked[level]
+    }
+
+    /// Mark the texture as the backing of an offscreen-plain surface.
+    pub fn mark_offscreen_plain(&mut self) {
+        self.flags |= TextureFlags::OFFSCREEN_PLAIN;
+    }
+
+    /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
+    fn drop_staging(&mut self, level: usize) {
+        self.staging[level] = dropped_staging_placeholder();
+        self.dropped_staging |= 1u32 << level;
+    }
+
+    /// Give `level` a staging buffer again before a write lands in it.
+    ///
+    /// The fresh buffer holds no pixels: a full-level write follows in
+    /// every path that calls this, and a partial one is logged, since the
+    /// pixels outside its region then no longer match the GPU copy.
+    fn ensure_staging(&mut self, level: usize) {
+        if self.dropped_staging & (1u32 << level) == 0 {
+            return;
+        }
+        let block_rows = self.mip_heights[level].div_ceil(self.block_h.max(1));
+        let len = (self.mip_bytes_per_row[level] as usize).saturating_mul(block_rows as usize);
+        self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
+        self.dropped_staging &= !(1u32 << level);
+        mtld3d_shared::log_once_trace_by!(
+            target: TEX_TRACE_TARGET,
+            key: self.texture_id.raw(),
+            "texture {:#x}: staging re-created for level {level} after a write",
+            self.texture_id.raw()
+        );
+    }
+
     pub fn mip_width(&self, level: usize) -> u32 {
         self.mip_widths[level]
     }
@@ -486,6 +610,7 @@ impl TextureInner {
         src_rect: Option<(i32, i32, i32, i32)>,
         dst_point: (i32, i32),
     ) -> bool {
+        self.ensure_staging(dst_level);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -553,7 +678,26 @@ impl TextureInner {
                 }
             }
         }
-        self.mark_mip_dirty(dst_level);
+        // A copy covering the whole destination level marks it whole; a
+        // partial one narrows the upload to the written union (2D only: the
+        // volume upload path has no sub-rect form and keeps whole-mip).
+        let whole = dx == 0
+            && dy == 0
+            && rw >= self.mip_width(dst_level)
+            && rh >= self.mip_height(dst_level);
+        if whole || self.depth > 1 {
+            self.mark_mip_dirty(dst_level);
+        } else {
+            self.mark_mip_dirty_rect(
+                dst_level,
+                DirtyRect {
+                    x: dx,
+                    y: dy,
+                    w: rw,
+                    h: rh,
+                },
+            );
+        }
         true
     }
 
@@ -662,6 +806,7 @@ impl TextureInner {
         if !(is_convertible_rgb(src_fmt) || yuv_src) || !is_convertible_rgb(dst_fmt) {
             return false;
         }
+        self.ensure_staging(dst_level);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -770,6 +915,7 @@ impl TextureInner {
             width: src_w,
             height: src_h,
         } = src;
+        self.ensure_staging(dst_level);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -916,7 +1062,7 @@ impl TextureInner {
     /// block-compressed `ColorFill` is rejected upstream). Returns false on a
     /// missing level or an out-of-bounds region.
     pub fn fill_staging_region(
-        &self,
+        &mut self,
         level: usize,
         ox: u32,
         oy: u32,
@@ -924,6 +1070,9 @@ impl TextureInner {
         h: u32,
         pixel: &[u8],
     ) -> bool {
+        // A fill is a write: a level whose staging was never materialized (or
+        // was dropped after its upload) gets one here, like any first write.
+        self.ensure_staging(level);
         let Some(box_) = self.staging.get(level) else {
             return false;
         };
@@ -1255,6 +1404,19 @@ impl TextureInner {
         rect: Option<DirtyRect>,
         flags: u32,
     ) -> (*mut u8, u32, usize) {
+        if self.d3d_pool == D3DPOOL_DEFAULT && self.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
+            DEFAULT_STATIC_LOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.dropped_staging & (1u32 << level) != 0 && rect.is_some() {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: self.texture_id.raw(),
+                "texture {:#x}: partial lock of level {level} after its staging was released; \
+                 pixels outside the rect no longer match the GPU copy",
+                self.texture_id.raw()
+            );
+        }
+        self.ensure_staging(level);
         let pitch = self.mip_bytes_per_row[level];
         let offset = mtld3d_core::texture_staging::texture_lock_offset(
             rect,
@@ -1452,6 +1614,44 @@ impl TextureInner {
     pub fn mark_mip_dirty(&mut self, level: usize) {
         if level < (self.levels as usize).min(32) {
             self.dirty_mask |= 1 << level;
+            if let Some(slot) = self.pending_upload_rects.get_mut(level) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Mark `level` dirty for only `rect` of it (see `pending_upload_rects`).
+    ///
+    /// A level already dirty for its whole mip stays whole; partial marks
+    /// union.
+    pub fn mark_mip_dirty_rect(&mut self, level: usize, rect: DirtyRect) {
+        if level >= (self.levels as usize).min(32) {
+            return;
+        }
+        let already_full = self.dirty_mask & (1 << level) != 0
+            && self
+                .pending_upload_rects
+                .get(level)
+                .copied()
+                .flatten()
+                .is_none();
+        self.dirty_mask |= 1 << level;
+        if already_full {
+            return;
+        }
+        if let Some(slot) = self.pending_upload_rects.get_mut(level) {
+            *slot = Some(slot.map_or(rect, |cur| {
+                let x = cur.x.min(rect.x);
+                let y = cur.y.min(rect.y);
+                let right = (cur.x + cur.w).max(rect.x + rect.w);
+                let bottom = (cur.y + cur.h).max(rect.y + rect.h);
+                DirtyRect {
+                    x,
+                    y,
+                    w: right - x,
+                    h: bottom - y,
+                }
+            }));
         }
     }
 
@@ -1719,7 +1919,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
     } else {
         (info.staging.into_iter().map(Arc::new).collect(), None)
     };
-    let inner = Box::into_raw(Box::new(TextureInner {
+    let mut boxed = Box::new(TextureInner {
         texture_id: info.texture_id,
         device_handle: info.device_handle,
         device_inner: info.device_inner,
@@ -1739,6 +1939,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         d3d_pool: info.d3d_pool,
         priority: 0,
         staging,
+        dropped_staging: 0,
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
         mip_bytes_per_row: info.mip_bytes_per_row,
@@ -1747,6 +1948,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         block_h: info.block_h,
         block_bytes: info.block_bytes,
         dirty_mask: 0,
+        pending_upload_rects: vec![None; mip_count],
         current_lock_readonly: vec![false; mip_count],
         current_lock_no_dirty: vec![false; mip_count],
         last_submit_seq: vec![0; mip_count],
@@ -1755,7 +1957,18 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         update_dirty,
         cube,
         private_data: PrivateDataStore::default(),
-    }));
+    });
+    // A default-pool static texture's staging only carries writes to the
+    // GPU, and a streaming engine creates far more textures than it ever
+    // writes through this device. Release the pages now and let
+    // `ensure_staging` materialize a level on its first write; a whole-level
+    // upload then releases it again ([`schedule_upload`]).
+    for level in 0..boxed.staging.len() {
+        if boxed.staging_droppable(level) {
+            boxed.drop_staging(level);
+        }
+    }
+    let inner = Box::into_raw(boxed);
     DeviceInner::from_ptr(dev_ptr).register_texture(inner);
     inner
 }
@@ -2645,6 +2858,18 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
 /// `snapshot_stage_bindings`) already holds one.
 fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rect: DirtyRect) {
     let level_u = level as usize;
+    if ti.dropped_staging & (1u32 << level_u) != 0 {
+        // Nothing to upload from: the level's bytes live on the GPU only. A
+        // re-upload request (eviction, device rehydration) for it is moot.
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: ti.texture_id.raw(),
+            "texture {:#x}: upload of level {level} requested after its staging was released; \
+             the GPU copy stands",
+            ti.texture_id.raw()
+        );
+        return;
+    }
     // Volume (3D) textures upload `(depth >> level)` slices; 2D textures are
     // `depth == 1` (the encoder then keeps the untouched single-slice path).
     // `slice_pitch` is the box slice stride — `row_pitch * ceil(mip_h /
@@ -2672,6 +2897,16 @@ fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rec
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
     ti.last_submit_seq[level as usize] = dev.current_seq();
     ti.was_uploaded[level as usize] = true;
+    // A whole-level upload of a texture the game cannot lock again: the job
+    // holds its own `Arc` of the staging, so the texture's copy can go now.
+    if rect.x == 0
+        && rect.y == 0
+        && rect.w == ti.mip_widths[level_u]
+        && rect.h == ti.mip_heights[level_u]
+        && ti.staging_droppable(level_u)
+    {
+        ti.drop_staging(level_u);
+    }
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
         enc.run_texture_upload(job);
         if regen_mipmaps {
@@ -2897,7 +3132,11 @@ fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
         let level = mask.trailing_zeros();
         mask &= mask - 1;
         let level_u = level as usize;
-        let rect = DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]);
+        let rect = ti
+            .pending_upload_rects
+            .get_mut(level_u)
+            .and_then(Option::take)
+            .unwrap_or_else(|| DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]));
         schedule_upload(ti, dev, level, rect);
         dirty_count += 1;
     }

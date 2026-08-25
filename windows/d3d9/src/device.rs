@@ -5061,6 +5061,22 @@ extern "system" fn device_update_texture(
         // SAFETY: `src_parent` is a live texture distinct from `dst_parent`
         // (checked via `ptr::eq` above).
         unsafe { (*src_parent).inner_mut() }.clear_all_update_dirty();
+        // Eager upload for a destination the game cannot lock: the copy just
+        // wrote the whole payload, and flushing now (instead of at first
+        // bind) lets the level's staging drop immediately. A texture the
+        // game updates but never draws would otherwise hold its copy
+        // indefinitely.
+        // SAFETY: `dst_parent` is the live destination texture and `this`
+        // the device; distinct allocations, both live for this call.
+        let dst_ti = unsafe { (*dst_parent).inner_mut() };
+        // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+        let dev_obj = unsafe { InPtrMut::<Direct3DDevice9>::opt(this) };
+        if dst_ti.d3d_pool() == D3DPOOL_DEFAULT
+            && dst_ti.d3d_usage() & D3DUSAGE_DYNAMIC == 0
+            && let Some(obj) = dev_obj
+        {
+            crate::texture::flush_dirty_mips(dst_ti, obj.inner());
+        }
     }
     hr
 }
@@ -6186,8 +6202,9 @@ extern "system" fn device_color_fill(
         return D3D_OK;
     }
     // SAFETY: `parent` non-null (checked); its refcount keeps it alive while
-    // the surface is alive.
-    let tex = unsafe { &*parent };
+    // the surface is alive, and D3D9 objects are single-threaded so the
+    // mutable access is exclusive.
+    let tex = unsafe { &mut *parent };
     // D3D9: ColorFill on a texture surface is valid for a DEFAULT-pool render
     // target AND for a DEFAULT-pool offscreen-plain surface (which owns its
     // internal texture). Managed / sysmem / scratch and an ordinary DEFAULT
@@ -6253,7 +6270,7 @@ extern "system" fn device_color_fill(
     // LockRect (CPU staging), so mirror the fill into staging. The GPU upload
     // below keeps the internal Metal texture coherent for StretchRect/sampling.
     if s.owns_parent_texture() {
-        tex.inner()
+        tex.inner_mut()
             .fill_staging_region(lvl, origin_x, origin_y, region_w, region_h, &pixel);
     }
     let info = tex.inner().texture_info();
@@ -6334,10 +6351,11 @@ extern "system" fn device_create_offscreen_plain_surface(
             null_out(surface);
             return D3DERR_INVALIDCALL;
         }
-        let surf = Direct3DSurface9::new_owned_texture_backed(
-            device_inner,
-            tex_out.cast::<crate::texture::Direct3DTexture9>(),
-        );
+        let tex_ptr = tex_out.cast::<crate::texture::Direct3DTexture9>();
+        // SAFETY: `device_create_texture` just returned this live texture at
+        // refcount 1; nothing else holds it yet.
+        unsafe { (*tex_ptr).inner_mut().mark_offscreen_plain() };
+        let surf = Direct3DSurface9::new_owned_texture_backed(device_inner, tex_ptr);
         // The internal texture (created just above) forwards the device
         // reference, so this owned surface is NOT registered (no double-count).
         // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.

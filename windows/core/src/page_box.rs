@@ -17,6 +17,18 @@ use std::{
     ptr::NonNull,
 };
 
+/// Bytes held by live `PageBox`es, always on: one add per alloc, one sub per free.
+///
+/// The address-space watch reports it next to the free-space figures, so a
+/// 32-bit game's log says how much of the space is ours.
+static PAGEBOX_LIVE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bytes currently held by live `PageBox`es.
+#[must_use]
+pub fn live_bytes() -> u64 {
+    PAGEBOX_LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Cumulative count of `PageBox` allocations served by the global allocator.
 #[cfg(perf_tracking)]
 static PAGEBOX_ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -261,6 +273,7 @@ impl PageBox {
         let ptr = unsafe { alloc::alloc(layout) };
         let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
         note_alloc(len);
+        PAGEBOX_LIVE_BYTES.fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
         Self {
             ptr,
             len,
@@ -285,6 +298,7 @@ impl PageBox {
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
         note_alloc(len);
+        PAGEBOX_LIVE_BYTES.fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
         Self {
             ptr,
             len,
@@ -388,6 +402,7 @@ impl PageBox {
 impl Drop for PageBox {
     fn drop(&mut self) {
         note_free(self.len);
+        PAGEBOX_LIVE_BYTES.fetch_sub(self.len as u64, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: same layout used to alloc; pointer came from that
         // allocator; nothing else owns this allocation.
         unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
