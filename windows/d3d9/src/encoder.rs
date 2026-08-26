@@ -1963,6 +1963,17 @@ impl FrameEncoder {
                 backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
                 backbuffer_format: frame.backbuffer_format,
                 depth_texture: frame.depth_texture,
+                // The frame's default depth attachment is created at the
+                // rasterized back-buffer size so it matches the colour one
+                // exactly, and `Clear` measures the viewport against that.
+                depth_size: if frame.depth_texture.is_null() {
+                    (0, 0)
+                } else {
+                    (
+                        frame.render_scale.dimension(frame.backbuffer_width),
+                        frame.render_scale.dimension(frame.backbuffer_height),
+                    )
+                },
                 depth_has_stencil: frame.flags.contains(FrameDataFlags::DEPTH_HAS_STENCIL),
                 render_scale: frame.render_scale,
                 continues_frame: self.prev_submit_no_present,
@@ -2427,12 +2438,6 @@ impl FrameEncoder {
         self.depth_attachment_desc = (width, height, format);
     }
 
-    /// The default depth attachment is backbuffer-sized.
-    #[must_use]
-    pub const fn backbuffer_size(&self) -> (u32, u32) {
-        (self.backbuffer_width, self.backbuffer_height)
-    }
-
     /// Note that the bound depth attachment is about to be written.
     ///
     /// Depth-writing draws and depth clears call this; a snapshot taken
@@ -2811,6 +2816,7 @@ impl FrameEncoder {
     fn clear_targets_outside_pass(&mut self, mut f: impl FnMut(&mut Self)) {
         let saved = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         for slot in 1..4usize {
@@ -2830,12 +2836,13 @@ impl FrameEncoder {
             );
             self.pass_state.set_color_rt_has_alpha(target.has_alpha);
             self.pass_state
-                .set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+                .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
             f(self);
             self.end_current_pass("color_target_clear");
         }
         self.pass_state.set_depth_stencil_attachment(
             prev_depth,
+            prev_depth_size,
             prev_depth_sampleable,
             prev_depth_has_stencil,
         );
@@ -2860,17 +2867,19 @@ impl FrameEncoder {
         self.pass_state.note_color_read_back(handle);
     }
 
-    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    /// Bind mip `level` of `texture`, extent `size`, as the depth/stencil attachment.
     pub fn set_depth_stencil_attachment_level(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
         level: u32,
+        size: (u32, u32),
         is_sampleable: bool,
         has_stencil: bool,
     ) {
         self.pass_state.set_depth_stencil_attachment_level(
             texture,
             level,
+            size,
             is_sampleable,
             has_stencil,
         );
@@ -2896,16 +2905,17 @@ impl FrameEncoder {
         }
     }
 
-    /// `Clear(pRects = NULL)` for colour only — D3D9 bounds it to the current viewport ∩ RT.
+    /// `Clear(pRects = NULL)` for colour: D3D9 bounds it to the current viewport ∩ RT.
     ///
     /// A viewport that covers the whole attachment folds to a fast
     /// full-attachment `loadAction = Clear`; a strict sub-region instead
     /// emits one scissored clear-quad over the viewport so pixels
     /// outside it keep their prior content.
     ///
-    /// Only used for colour-only clears — a combined `TARGET|ZBUFFER`
-    /// clear stays on the fold path (`clear_color` + `clear_depth`) so
-    /// the depth side is not forced onto the clear-quad path.
+    /// Every whole-target colour `Clear` comes here, combined with a depth or
+    /// stencil plane or not. The bound is per plane and per attachment;
+    /// [`Self::clear_depth_stencil_bounded_to_viewport`] answers the same
+    /// question for the depth-stencil side.
     pub fn clear_color_bounded_to_viewport(&mut self, r: u32, g: u32, b: u32, a: u32) {
         if self.pass_state.viewport_covers_color_attachment() {
             self.clear_color(r, g, b, a);
@@ -3007,19 +3017,33 @@ impl FrameEncoder {
         stencil: Option<u32>,
         rects: &[(i32, i32, i32, i32)],
     ) {
-        self.bump_depth_write_epoch();
         let scale = self.pass_state.target_scale();
+        if scale.is_identity() {
+            self.clear_depth_stencil_rects_resolved(depth, stencil, rects);
+        } else {
+            let scaled: Vec<(i32, i32, i32, i32)> =
+                rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
+            self.clear_depth_stencil_rects_resolved(depth, stencil, &scaled);
+        }
+    }
+
+    /// `clear_depth_stencil_rects` for rects already in the bound texture's space.
+    ///
+    /// The depth-stencil mirror of `clear_color_rects_resolved`, split out for
+    /// the same reason: a caller that derived its rect from
+    /// `effective_viewport` (itself already converted) must not scale it a
+    /// second time.
+    fn clear_depth_stencil_rects_resolved(
+        &mut self,
+        depth: Option<u32>,
+        stencil: Option<u32>,
+        rects: &[(i32, i32, i32, i32)],
+    ) {
+        self.bump_depth_write_epoch();
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
             .iter()
-            .map(|&rc| {
-                if scale.is_identity() {
-                    rc
-                } else {
-                    scale.rect_edges_i32(rc)
-                }
-            })
-            .filter_map(|rc| clip_rect_to_viewport(rc, vp))
+            .filter_map(|&rc| clip_rect_to_viewport(rc, vp))
             .collect();
         if regions.is_empty() {
             return;
@@ -3039,6 +3063,57 @@ impl FrameEncoder {
                 color_format,
             );
         }
+    }
+
+    /// `Clear(pRects = NULL)` for depth and/or stencil, bounded to the viewport ∩ DS.
+    ///
+    /// The depth-stencil mirror of [`Self::clear_color_bounded_to_viewport`]:
+    /// a viewport covering the whole depth attachment folds to a fast
+    /// full-attachment `loadAction = Clear`, and a strict sub-region emits one
+    /// scissored clear-quad over the viewport so depth and stencil outside it
+    /// keep their prior values. Coverage is asked of the depth attachment's
+    /// own extent rather than the colour one: a depth-only pass has no colour
+    /// attachment to measure against, and D3D9 permits a depth surface larger
+    /// than render target 0.
+    ///
+    /// `depth`/`stencil` carry the f32 bits / the masked stencil value of the
+    /// planes being cleared, as for `clear_depth_stencil_rects`. Both planes
+    /// arrive in one call so a covering clear of both paints one quad rather
+    /// than two: shadow-volume renderers clear depth and stencil together
+    /// between lights.
+    pub fn clear_depth_stencil_bounded_to_viewport(
+        &mut self,
+        depth: Option<u32>,
+        stencil: Option<u32>,
+    ) {
+        if depth.is_none() && stencil.is_none() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "viewport-bounded depth-stencil clear with neither plane; skipped"
+            );
+            return;
+        }
+        if self.pass_state.viewport_covers_depth_attachment() {
+            match (depth, stencil) {
+                (Some(depth), Some(stencil)) => self.clear_depth_stencil(depth, stencil),
+                (Some(depth), None) => self.clear_depth(depth),
+                (None, Some(stencil)) => self.clear_stencil(stencil),
+                // Rejected above. The arm exists for exhaustiveness, not
+                // because it is reachable.
+                (None, None) => {}
+            }
+            return;
+        }
+        let (vpx, vpy, vpw, vph) = self.pass_state.effective_viewport();
+        let rect = (
+            vpx.cast_signed(),
+            vpy.cast_signed(),
+            vpx.saturating_add(vpw).cast_signed(),
+            vpy.saturating_add(vph).cast_signed(),
+        );
+        // Derived from `effective_viewport`, so already in the bound texture's
+        // space: it goes to the resolved entry point, not the converting one.
+        self.clear_depth_stencil_rects_resolved(depth, stencil, &[rect]);
     }
 
     pub fn clear_depth(&mut self, value: u32) {
@@ -3448,6 +3523,7 @@ impl FrameEncoder {
         // the identity, which would otherwise leak onto the device's target.
         let saved_color = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_viewport = self.pass_state.viewport();
@@ -3469,7 +3545,7 @@ impl FrameEncoder {
             (0, dst_mip),
         );
         self.pass_state
-            .set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+            .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state
             .set_viewport(dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h, 0.0, 1.0);
         self.pass_state.ensure_pass_open();
@@ -3519,6 +3595,7 @@ impl FrameEncoder {
         self.pass_state.restore_color_attachments(saved_color);
         self.pass_state.set_depth_stencil_attachment(
             prev_depth,
+            prev_depth_size,
             prev_depth_sampleable,
             prev_depth_has_stencil,
         );
@@ -3631,6 +3708,24 @@ impl FrameEncoder {
             return;
         }
         let depth_state = self.get_or_create_depth_stencil(&snapshot);
+        // `Clear`'s Z is a raw depth value: D3D9's `MinZ`/`MaxZ` scale a
+        // transformed vertex's z, not a clear. The quad writes its value as
+        // the vertex's clip-space z, so Metal's viewport depth transform would
+        // remap it under a partitioned depth range (a sky / world / weapon
+        // split, and D3D9 accepts an inverted `MinZ > MaxZ` too). Emit
+        // the raw range for the draw and hand the game's own range back
+        // straight after, so nothing downstream sees the bracket. Skipped
+        // where the range is already raw, which is the overwhelmingly common
+        // case, and where no depth plane is being written at all.
+        let saved_range = self.pass_state.viewport_depth_range();
+        let raw_range = (0.0f32, 1.0f32);
+        let bracket_depth_range = depth.is_some()
+            && (saved_range.0.to_bits(), saved_range.1.to_bits())
+                != (raw_range.0.to_bits(), raw_range.1.to_bits());
+        if bracket_depth_range {
+            self.pass_state
+                .set_emitted_depth_range(raw_range.0, raw_range.1);
+        }
         // A stencil-only clear writes no depth, but the vertex stage still
         // consumes a constant z at slot 0; any value inside the clip range
         // will do.
@@ -3673,6 +3768,10 @@ impl FrameEncoder {
         self.debug_assert_cache_in_sync();
         self.pass_state
             .emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
+        if bracket_depth_range {
+            self.pass_state
+                .set_emitted_depth_range(saved_range.0, saved_range.1);
+        }
     }
 
     /// Color-clear mirror of `emit_clear_quad_depth_inner`.

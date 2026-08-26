@@ -1413,8 +1413,7 @@ impl DeviceInner {
                     0,
                     (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
                 ),
-                DepthBinding::Eager(h) => {
-                    let (w, hgt) = enc.backbuffer_size();
+                DepthBinding::Eager(h, (w, hgt)) => {
                     let format = if depth_has_stencil {
                         mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8
                     } else {
@@ -1440,6 +1439,7 @@ impl DeviceInner {
             enc.set_depth_stencil_attachment_level(
                 depth_texture,
                 level,
+                (desc.0, desc.1),
                 is_sampleable,
                 depth_has_stencil,
             );
@@ -6891,7 +6891,8 @@ extern "system" fn device_get_render_target(
 #[derive(Clone)]
 enum DepthBinding {
     None,
-    Eager(MetalHandle<MTLTextureKind>),
+    /// A standalone depth surface: its Metal handle and the texture's real extent.
+    Eager(MetalHandle<MTLTextureKind>, (u32, u32)),
     /// A texture-backed depth surface: the parent's info and the mip level bound.
     Lazy(TextureInfo, u32),
 }
@@ -6918,7 +6919,11 @@ extern "system" fn device_set_depth_stencil_surface(
     // depth texture's DEPTHSTENCIL for a sampleable shadow map, the implicit
     // DS, or a CreateDepthStencilSurface surface), so WoW's shadow-map and
     // implicit-DS binds all pass. Validate before mutating any device state.
-    if !surf.is_null() {
+    // The extent comes back with it, for the standalone-surface bind arm
+    // below: that one has no parent `TextureInfo` to read a size out of.
+    let reported_size = if surf.is_null() {
+        (0, 0)
+    } else {
         // SAFETY: `surf` is non-null (checked) and a live `Direct3DSurface9`.
         let vtbl = unsafe { (*surf).vtbl() };
         let mut desc = mtld3d_types::D3DSURFACE_DESC {
@@ -6943,7 +6948,8 @@ extern "system" fn device_set_depth_stencil_surface(
             );
             return D3DERR_INVALIDCALL;
         }
-    }
+        (desc.width, desc.height)
+    };
     dev.bound_rt_mut().replace_depth_stencil(surf);
     // A null surface explicitly removes the depth buffer; track it so the
     // pipeline snapshot reports no depth instead of falling back to the
@@ -7020,7 +7026,21 @@ extern "system" fn device_set_depth_stencil_surface(
                 surface as usize
             );
         }
-        DepthBinding::Eager(h)
+        // The Metal texture behind a standalone depth surface was created at
+        // the scale `CreateDepthStencilSurface` resolved for its reported
+        // extent, so re-resolve the same rule rather than assume the extent
+        // D3D9 reports: a surface sized like the back buffer is rasterized
+        // with it, anything else is its own size. What the pass machine
+        // measures a `Clear`'s viewport against, and what a depth snapshot
+        // copy has to match, is the texture's real extent.
+        let scale = dev.scale_for_created_target(reported_size.0, reported_size.1, true);
+        DepthBinding::Eager(
+            h,
+            (
+                scale.dimension(reported_size.0),
+                scale.dimension(reported_size.1),
+            ),
+        )
     };
     // `is_sampleable` distinguishes a sampleable shadow map
     // (`CreateTexture(D24X8, DEPTHSTENCIL)` — the `DepthBinding::Lazy`
@@ -7260,17 +7280,14 @@ extern "system" fn device_clear(
         let b_bits = f32::to_bits(rgba[2]);
         let a_bits = f32::to_bits(rgba[3]);
 
-        // A combined TARGET|ZBUFFER clear keeps both attachments on the fold
-        // path (whole-attachment loadAction); only a colour-ONLY Clear(NULL)
-        // honours viewport bounding via a scissored clear-quad, so the depth
-        // side is never forced onto the (state-sensitive) clear-quad path.
-        let color_only = flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) == 0;
+        // `pRects == NULL` still means "the whole target ∩ the viewport", so
+        // the encoder decides per attachment whether the viewport covers it:
+        // covered folds to a whole-attachment loadAction, a strict sub-region
+        // paints a scissored clear-quad. Independent of which other planes
+        // this Clear names, exactly as the depth side below is.
         match &regions {
-            None if color_only => dev.push_op(Box::new(move |enc| {
-                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
-            })),
             None => dev.push_op(Box::new(move |enc| {
-                enc.clear_color(r_bits, g_bits, b_bits, a_bits);
+                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
             })),
             Some(list) if list.is_empty() => {}
             Some(list) => {
@@ -7299,17 +7316,13 @@ extern "system" fn device_clear(
                 }));
             }
         }
-        // Both planes in one op so a mid-frame clear paints one quad:
+        // The whole target, which D3D9 still bounds by the viewport. Both
+        // planes go in one op so a covering clear of both paints one quad
+        // (or folds into one pair of load actions) rather than two:
         // shadow-volume renderers clear depth and stencil together between
         // lights.
-        (None, Some(z_bits), Some(stencil)) => dev.push_op(Box::new(move |enc| {
-            enc.clear_depth_stencil(z_bits, stencil);
-        })),
-        (None, Some(z_bits), None) => dev.push_op(Box::new(move |enc| {
-            enc.clear_depth(z_bits);
-        })),
-        (None, None, Some(stencil)) => dev.push_op(Box::new(move |enc| {
-            enc.clear_stencil(stencil);
+        (None, depth, stencil) => dev.push_op(Box::new(move |enc| {
+            enc.clear_depth_stencil_bounded_to_viewport(depth, stencil);
         })),
     }
 

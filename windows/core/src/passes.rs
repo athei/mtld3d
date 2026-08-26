@@ -57,10 +57,11 @@ const ENABLE_LAST_USE_DEPTH_DONTCARE: bool = true;
 /// Compile-time gate for Rule C (color `Store=DontCare`).
 ///
 /// Applies when the next pass that touches the same color rt begins with
-/// a full-attachment clear. D3D9's `Clear()` always covers the full
-/// attachment regardless of viewport or scissor, so the prior Store is
-/// provably redundant whenever the next pass's
-/// `color_load == ColorLoad::Clear { .. }`. Mirrors Rule B but keyed on
+/// a full-attachment clear, i.e. its `color_load == ColorLoad::Clear
+/// { .. }`. That load action is reached only by a `Clear` the encoder
+/// judged to cover the whole attachment; a `Clear` bounded by a sub-rect
+/// viewport, a scissor or `pRects` paints a quad over a `Load` instead and
+/// is therefore not a Rule C opportunity. Mirrors Rule B but keyed on
 /// color and predicated on the next-pass clear instead of
 /// last-occurrence. Flip to `false` if a game starts a pass with `Clear`
 /// but expects to read the underlying rt contents in some way mtld3d
@@ -828,6 +829,14 @@ pub struct FrameReset {
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
     pub depth_texture: MetalHandle<MTLTextureKind>,
+    /// Extent of `depth_texture` in its own space; `(0, 0)` when there is none.
+    ///
+    /// The frame's default depth attachment is created at the rasterized back
+    /// buffer's size, so this is `render_scale` of `backbuffer_size`. Passed in
+    /// rather than derived here for the same reason `depth_has_stencil` is:
+    /// how the attachment was made is the caller's knowledge, not the pass
+    /// machine's.
+    pub depth_size: (u32, u32),
     pub depth_has_stencil: bool,
     pub render_scale: RenderScale,
     /// `true` when the previous submit was a mid-frame flush, not a `Present`.
@@ -866,6 +875,13 @@ pub struct PassState {
     current_depth_texture: MetalHandle<MTLTextureKind>,
     /// Mip level of `current_depth_texture` bound as the depth attachment.
     current_depth_level: u32,
+    /// Extent of the bound depth attachment's mip level, in its own space.
+    ///
+    /// `(0, 0)` when nothing is attached. Held beside the handle the way
+    /// `current_color_size` is held beside `current_color_texture`, so
+    /// `viewport_covers_depth_attachment` can answer whether a whole-target
+    /// depth `Clear` may fold into the pass's load action.
+    current_depth_size: (u32, u32),
     /// Descriptor bits for the currently bound colour/depth attachments.
     ///
     /// `COLOR_HAS_ALPHA` / `DEPTH_SAMPLEABLE` / `DEPTH_HAS_STENCIL`. See
@@ -1094,6 +1110,7 @@ impl PassState {
             current_extra_attachments: ExtraColorAttachments::NONE,
             current_depth_texture: MetalHandle::NULL,
             current_depth_level: 0,
+            current_depth_size: (0, 0),
             // Placeholder; `reset_frame` reseeds these for the backbuffer, and
             // every `SetRenderTarget` bind overwrites `COLOR_HAS_ALPHA` via
             // `set_color_rt_has_alpha`. The dominant backbuffer is alpha-bearing
@@ -1162,6 +1179,7 @@ impl PassState {
             backbuffer_size,
             backbuffer_format,
             depth_texture,
+            depth_size,
             depth_has_stencil,
             render_scale,
             continues_frame,
@@ -1211,6 +1229,7 @@ impl PassState {
             .insert(CurrentAttachmentFlags::COLOR_HAS_ALPHA);
         self.current_depth_texture = depth_texture;
         self.current_depth_level = 0;
+        self.current_depth_size = depth_size;
         // The frame's default depth target is the standalone backbuffer
         // depth surface from `CreateDepthStencilSurface` — not
         // sampleable. Sub-frame `set_depth_stencil_attachment` calls
@@ -1357,6 +1376,16 @@ impl PassState {
     #[must_use]
     pub const fn current_depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.current_depth_texture
+    }
+
+    /// Extent of the bound depth attachment's mip level, `(0, 0)` when unbound.
+    ///
+    /// Exposed so a save/restore around a one-off pass (a scoped
+    /// `StretchRect` or extra-target clear) rebinds the attachment with the
+    /// size it came in with.
+    #[must_use]
+    pub const fn current_depth_size(&self) -> (u32, u32) {
+        self.current_depth_size
     }
 
     /// `true` when the bound depth attachment is a combined depth+stencil Metal format.
@@ -1680,6 +1709,25 @@ impl PassState {
         }
         let (vpx, vpy, vpw, vph) = self.effective_viewport();
         vpx == 0 && vpy == 0 && vpw >= self.current_color_size.0 && vph >= self.current_color_size.1
+    }
+
+    /// True when the current viewport covers (or exceeds) the whole bound depth attachment.
+    ///
+    /// The depth-stencil mirror of [`Self::viewport_covers_color_attachment`],
+    /// answering the same question for a `Clear(NULL rects)` of the depth
+    /// and/or stencil plane: cover means the clear may fold to a fast
+    /// full-attachment `loadAction = Clear`, and a strict sub-region viewport
+    /// means it must be scissored to that region. Greater-or-equal for the
+    /// same reason: D3D9 clips the viewport to the attachment, so an oversized
+    /// viewport still covers. With no depth attachment bound there is nothing
+    /// to bound, so fold.
+    #[must_use]
+    pub fn viewport_covers_depth_attachment(&self) -> bool {
+        if self.current_depth_texture.is_null() {
+            return true;
+        }
+        let (vpx, vpy, vpw, vph) = self.effective_viewport();
+        vpx == 0 && vpy == 0 && vpw >= self.current_depth_size.0 && vph >= self.current_depth_size.1
     }
 
     /// Tag the current pass with "color writes happened" iff `mask != 0`.
@@ -2225,24 +2273,30 @@ impl PassState {
     /// Mirrors `set_color_render_target`: only flushes pending clears when a
     /// pending *depth* clear exists (depth attachment is about to change). A
     /// solo pending color clear stays pending for the unchanged color
-    /// attachment.
+    /// attachment. `size` is the attachment's extent in its own space, `(0, 0)`
+    /// for an unbind.
     pub fn set_depth_stencil_attachment(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
+        size: (u32, u32),
         is_sampleable: bool,
         has_stencil: bool,
     ) {
-        self.set_depth_stencil_attachment_level(texture, 0, is_sampleable, has_stencil);
+        self.set_depth_stencil_attachment_level(texture, 0, size, is_sampleable, has_stencil);
     }
 
     /// Bind mip `level` of `texture` as the depth/stencil attachment.
     ///
     /// A different level of the same texture is a different attachment and
-    /// ends the pass the way a different texture does.
+    /// ends the pass the way a different texture does. `size` is that level's
+    /// own extent, not level 0's: it is what
+    /// [`Self::viewport_covers_depth_attachment`] measures the viewport
+    /// against.
     pub fn set_depth_stencil_attachment_level(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
         level: u32,
+        size: (u32, u32),
         is_sampleable: bool,
         has_stencil: bool,
     ) {
@@ -2271,6 +2325,8 @@ impl PassState {
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
                 == is_sampleable
         {
+            // Same handle and level, so the same extent: a repeat bind carries
+            // nothing new for the size either.
             return;
         }
         self.current_attachments
@@ -2291,6 +2347,7 @@ impl PassState {
         self.end_current_pass("set_depth_attach");
         self.current_depth_texture = texture;
         self.current_depth_level = level;
+        self.current_depth_size = size;
     }
 
     /// Apply a color clear.
@@ -2957,13 +3014,37 @@ impl PassState {
         // The fields above keep the game's own numbers so a later render-target
         // change re-reads them in the new target's space; only what reaches
         // Metal is converted.
-        let (sx, sy, sw, sh) = self.target_scale().rect(x, y, width, height);
-        // Re-emit only on an actual change. A fresh `set_viewport` whose
-        // value matches what was last emitted on this encoder would be a
-        // redundant Metal bind (Xcode's "bound … when it was already
-        // bound"); the z-range is part of the key, compared by bits so a
-        // depth-range-only change (sky / weapon) still re-emits. Keyed on the
-        // converted rect, which is what the encoder actually holds.
+        let rect = self.target_scale().rect(x, y, width, height);
+        self.emit_viewport_if_changed(rect, min_z, max_z);
+    }
+
+    /// Override just the depth range Metal holds, keeping the viewport rect.
+    ///
+    /// `Clear` writes a raw depth value that D3D9's `MinZ`/`MaxZ` do not
+    /// touch, but the clear quad writes its value as the vertex's clip-space
+    /// z, which Metal's viewport transform would remap. The clear-quad emit
+    /// path therefore brackets its draw with `[0, 1]` and then the game's own
+    /// range. Only the emitted range moves: the sticky viewport rect and the
+    /// coordinate space it is read in stay exactly as the game left them,
+    /// which a `set_viewport` round trip could not promise (it takes the
+    /// game's rect, and a game that never called `SetViewport` has none).
+    pub fn set_emitted_depth_range(&mut self, min_z: f32, max_z: f32) {
+        self.viewport_min_z = min_z;
+        self.viewport_max_z = max_z;
+        let rect = self.effective_viewport();
+        self.emit_viewport_if_changed(rect, min_z, max_z);
+    }
+
+    /// Push `setViewport` onto the open pass unless the encoder already holds it.
+    ///
+    /// Re-emit only on an actual change. A fresh `set_viewport` whose value
+    /// matches what was last emitted on this encoder would be a redundant
+    /// Metal bind (Xcode's "bound … when it was already bound"); the z-range
+    /// is part of the key, compared by bits so a depth-range-only change (sky
+    /// / weapon, or the clear quad's bracket) still re-emits. `rect` is
+    /// already in the bound texture's space, which is what the encoder holds.
+    fn emit_viewport_if_changed(&mut self, rect: (u32, u32, u32, u32), min_z: f32, max_z: f32) {
+        let (sx, sy, sw, sh) = rect;
         let key = (sx, sy, sw, sh, min_z.to_bits(), max_z.to_bits());
         if !self.current_pass_closed
             && self.last_emitted_viewport != Some(key)

@@ -15,12 +15,69 @@
 //! upscale reproduces the source colour exactly. Sampling *on* a boundary would
 //! be scale-dependent by construction, so the probes stay away from them.
 
-use mtld3d_tests::{Harness, assert_pixel_eq};
-use mtld3d_types::{D3DFMT_X8R8G8B8, D3DRECT, D3DRS_SCISSORTESTENABLE, D3DVIEWPORT9};
+use mtld3d_tests::{Harness, PosColorVertex, assert_pixel_eq};
+use mtld3d_types::{
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_X8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
+    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DVIEWPORT9,
+};
 
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
+const BLACK: u32 = 0xFF00_0000;
+
+/// The sub-rect every viewport-bound test narrows to, in reported coordinates.
+///
+/// Deliberately not a clean fraction of the 640x480 frame, and every probe
+/// below sits at least 50 reported pixels from one of its edges so a rounding
+/// difference at a non-dividing scale cannot move a probe across a boundary.
+const NARROW: D3DVIEWPORT9 = D3DVIEWPORT9 {
+    x: 128,
+    y: 96,
+    width: 384,
+    height: 288,
+    min_z: 0.0,
+    max_z: 1.0,
+};
+
+/// One triangle covering the whole viewport at a constant `z`, coloured `GREEN`.
+///
+/// `D3DFVF_XYZ` under the default identity transforms, so `[-1, 1]` is the
+/// viewport: the same shape the depth-occlusion tests use to read a depth
+/// buffer back through the depth test, there being no direct depth readback.
+const fn covering_quad(z: f32) -> [PosColorVertex; 3] {
+    [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z,
+            color: GREEN,
+        },
+    ]
+}
+
+/// Set up a depth-tested, depth-write-disabled diffuse draw under `compare`.
+fn depth_probe_setup(h: &Harness, compare: u32) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, compare), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+}
 
 #[test]
 fn scissor_confines_a_clear_to_its_rect() {
@@ -138,6 +195,123 @@ fn viewport_bounds_a_clear_in_reported_coordinates() {
         h.read_pixel(600, 440),
         BLUE,
         "outside the viewport, far corner",
+    );
+}
+
+#[test]
+fn a_combined_clear_bounds_its_colour_plane_to_the_viewport() {
+    // D3D9 bounds `Clear` by the viewport whichever planes it names. A
+    // `TARGET | ZBUFFER` clear is what most titles issue at the top of a
+    // frame, so the colour plane has to honour the viewport there exactly as
+    // it does on its own.
+    let h = Harness::with_depth();
+    h.render_once(BLUE, |h| {
+        assert_eq!(h.set_viewport(&NARROW), 0);
+        assert_eq!(
+            h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 1.0, 0),
+            0,
+            "combined colour + depth clear under a narrowed viewport",
+        );
+    });
+
+    assert_pixel_eq(h.read_pixel(320, 240), RED, "viewport interior");
+    assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside the viewport");
+    assert_pixel_eq(
+        h.read_pixel(600, 440),
+        BLUE,
+        "outside the viewport, far corner",
+    );
+}
+
+#[test]
+fn a_viewport_bounded_depth_clear_leaves_the_depth_outside_it() {
+    // Read the depth buffer back the only way this suite can: clear it to 1.0
+    // everywhere, clear it to 0.0 inside the viewport alone, then draw a
+    // covering quad at 0.5 under `LESSEQUAL` with depth writes off. It survives
+    // exactly where depth is still 1.0.
+    let h = Harness::with_depth();
+    depth_probe_setup(&h, D3DCMP_LESSEQUAL);
+    let full = h.viewport();
+
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(h.set_viewport(&NARROW), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0),
+        0,
+        "whole-target depth clear under a narrowed viewport",
+    );
+    // Back to the whole frame: the covering quad has to reach the pixels
+    // outside the narrowed viewport for them to be worth probing.
+    assert_eq!(h.set_viewport(&full), 0);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        BLACK,
+        "inside the viewport depth is 0.0 and rejects the quad",
+    );
+    assert_pixel_eq(
+        h.read_pixel(40, 40),
+        GREEN,
+        "outside the viewport depth keeps 1.0 and accepts the quad",
+    );
+    assert_pixel_eq(
+        h.read_pixel(600, 440),
+        GREEN,
+        "outside the viewport, far corner",
+    );
+}
+
+#[test]
+fn a_bounded_depth_clear_writes_the_raw_value_under_a_partitioned_depth_range() {
+    // `Clear`'s Z is a raw depth value: `MinZ`/`MaxZ` scale a transformed
+    // vertex, never a clear. A bounded depth clear is painted by a quad whose
+    // depth is the vertex's clip-space z, so without care the viewport's depth
+    // range remaps it. Under `MinZ = 0.5` a clear to 0.0 would land at 0.5,
+    // which the 0.25 quad below then passes instead of failing.
+    let h = Harness::with_depth();
+    depth_probe_setup(&h, D3DCMP_LESS);
+    let full = h.viewport();
+
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.set_viewport(&D3DVIEWPORT9 {
+            min_z: 0.5,
+            ..NARROW
+        }),
+        0,
+    );
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0), 0);
+    assert_eq!(h.set_viewport(&full), 0);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.25)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        BLACK,
+        "the clear wrote a raw 0.0, not 0.5 remapped through MinZ",
+    );
+    assert_pixel_eq(
+        h.read_pixel(40, 40),
+        GREEN,
+        "outside the viewport depth keeps 1.0 and accepts the quad",
     );
 }
 
