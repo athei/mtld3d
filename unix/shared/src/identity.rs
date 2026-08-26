@@ -14,6 +14,11 @@
 //! Every cdylib logs both on load. A crash report then names the debug archive
 //! that resolves it, instead of leaving us to fingerprint the build from
 //! indirect evidence.
+//!
+//! `version_blob` answers the other identity question, and about a different
+//! image: who the host application is. It hands back the raw `VS_VERSIONINFO`
+//! resource of a mapped PE, which is where a built-in app profile reads the
+//! vendor's own `CompanyName` and `ProductName` from.
 
 /// Release identity, stamped by `build.rs` from `git describe --tags --always`.
 ///
@@ -22,6 +27,8 @@
 pub const BUILD: &str = env!("MTLD3D_BUILD");
 
 pub use platform::image_id;
+#[cfg(target_family = "windows")]
+pub use platform::version_blob;
 
 #[cfg(target_family = "windows")]
 mod platform {
@@ -41,8 +48,26 @@ mod platform {
     const NUM_RVA_PE32: usize = 0x5c;
     /// Offset of `NumberOfRvaAndSizes` within a PE32+ optional header.
     const NUM_RVA_PE32_PLUS: usize = 0x6c;
+    /// Offset of `SizeOfImage` within an optional header, PE32 and PE32+ alike.
+    const SIZE_OF_IMAGE: usize = 0x38;
     /// Index of the debug directory among the data directories.
     const DIRECTORY_DEBUG: usize = 6;
+    /// Index of the resource directory among the data directories.
+    const DIRECTORY_RESOURCE: usize = 2;
+    /// Size of one data directory entry: an RVA and a size, both dwords.
+    const DIRECTORY_ENTRY_SIZE: usize = 8;
+    /// `RT_VERSION`, the resource type of a `VS_VERSIONINFO` blob.
+    const RT_VERSION: u32 = 16;
+    /// Size of one `IMAGE_RESOURCE_DIRECTORY`, after which its entries start.
+    const RESOURCE_DIRECTORY_SIZE: usize = 16;
+    /// Size of one `IMAGE_RESOURCE_DIRECTORY_ENTRY`: a name and an offset.
+    const RESOURCE_ENTRY_SIZE: usize = 8;
+    /// Offset of `NumberOfNamedEntries` within an `IMAGE_RESOURCE_DIRECTORY`.
+    const NAMED_ENTRIES: usize = 12;
+    /// Offset of `NumberOfIdEntries` within an `IMAGE_RESOURCE_DIRECTORY`.
+    const ID_ENTRIES: usize = 14;
+    /// High bit of a resource entry's offset: the child is another directory.
+    const SUBDIRECTORY: u32 = 0x8000_0000;
     /// Size of one `IMAGE_DEBUG_DIRECTORY` entry.
     const DEBUG_ENTRY_SIZE: usize = 28;
     /// `IMAGE_DEBUG_TYPE_CODEVIEW`, the entry pointing at the PDB record.
@@ -67,38 +92,69 @@ mod platform {
         if base == 0 {
             return None;
         }
-        // SAFETY: `base` is a loaded image, so its DOS header is mapped and
-        // `e_lfanew` is the dword at `+0x3c`.
-        let nt = base + unsafe { read_u32(base + E_LFANEW) } as usize;
-        // SAFETY: `nt` is the NT header the DOS stub points at, mapped in the
-        // same image; the optional header magic is the word at `+0x18`.
-        let magic = unsafe { read_u16(nt + OPTIONAL_HEADER) };
-        // The data directories follow `NumberOfRvaAndSizes`, whose offset in
-        // the optional header differs between PE32 and PE32+ (the wider image
-        // base and the four larger reserve/commit fields push it out by 0x10).
-        let num_rva_offset = match magic {
-            MAGIC_PE32 => NUM_RVA_PE32,
-            MAGIC_PE32_PLUS => NUM_RVA_PE32_PLUS,
-            _ => return None,
-        };
-        let num_rva_at = nt + OPTIONAL_HEADER + num_rva_offset;
-        // SAFETY: within the optional header of a mapped image.
-        let num_rva = unsafe { read_u32(num_rva_at) } as usize;
-        if num_rva <= DIRECTORY_DEBUG {
-            return None;
-        }
-        // Each data directory entry is an RVA/size pair of dwords.
-        let entry = num_rva_at + 4 + DIRECTORY_DEBUG * 8;
-        // SAFETY: entry `DIRECTORY_DEBUG` exists, per the `num_rva` check.
-        let dir_rva = unsafe { read_u32(entry) } as usize;
-        // SAFETY: the size dword follows the RVA in the same entry.
-        let dir_size = unsafe { read_u32(entry + 4) } as usize;
-        if dir_rva == 0 || dir_size < DEBUG_ENTRY_SIZE {
+        // SAFETY: `base` is a loaded image, per the contract.
+        let (dir_rva, dir_size) = unsafe { data_directory(base, DIRECTORY_DEBUG) }?;
+        if dir_size < DEBUG_ENTRY_SIZE {
             return None;
         }
         // SAFETY: the debug directory RVA points into a mapped section (the
         // linker places the record in `.rdata`), and `dir_size` is its extent.
         unsafe { codeview_guid(base, base + dir_rva, dir_size / DEBUG_ENTRY_SIZE) }
+    }
+
+    /// The raw `VS_VERSIONINFO` resource of a mapped image, as UTF-16 units.
+    ///
+    /// Returns `None` when the image carries no version resource, which is
+    /// normal: only vendors that set the linker's resource fields have one.
+    /// Every read is bounded by the image's own `SizeOfImage`, so a malformed
+    /// resource tree yields `None` rather than a wild read.
+    ///
+    /// Reading the mapped image keeps this free of imports. The obvious
+    /// alternative, `version.dll`, is one of the DLL names game mods install
+    /// proxies under, and so is the `d3d9.dll` this code ships as, so calling it
+    /// would route our startup through whatever a modded install dropped beside
+    /// the executable.
+    ///
+    /// # Safety
+    ///
+    /// `module` must be the `HMODULE` of an image the loader has mapped, so
+    /// that its headers and every section its `SizeOfImage` covers are readable.
+    #[must_use]
+    pub unsafe fn version_blob(module: *mut c_void) -> Option<Vec<u16>> {
+        let base = module as usize;
+        if base == 0 {
+            return None;
+        }
+        // SAFETY: `base` is a loaded image, per the contract.
+        let (res, _) = unsafe { data_directory(base, DIRECTORY_RESOURCE) }?;
+        // SAFETY: same image, so its optional header is mapped.
+        let size = unsafe { image_size(base) }?;
+        let img = Image { base, size };
+
+        // Three levels, by the resource tree's fixed shape: type, then name,
+        // then language. Only the type is looked up by id; a version resource
+        // carries one name and one language in practice, and taking the first
+        // of each is what the loader's own `FindResource` fallback settles on.
+        // SAFETY: `img` bounds every read to the mapped image.
+        let by_name = unsafe { img.subdirectory(res, res, RT_VERSION) }?;
+        // SAFETY: as above.
+        let (by_language, is_dir) = unsafe { img.first_child(res, by_name) }?;
+        if !is_dir {
+            return None;
+        }
+        // SAFETY: as above.
+        let (leaf, is_dir) = unsafe { img.first_child(res, by_language) }?;
+        if is_dir {
+            return None;
+        }
+
+        // `IMAGE_RESOURCE_DATA_ENTRY`: the blob's own RVA, then its size.
+        // SAFETY: as above.
+        let data = unsafe { img.u32(leaf) }? as usize;
+        // SAFETY: the size dword follows the RVA in the same entry.
+        let size = unsafe { img.u32(leaf + 4) }? as usize;
+        // SAFETY: as above.
+        unsafe { img.utf16(data, size) }
     }
 
     /// Scan the debug directory for the `CodeView` entry and format its GUID.
@@ -153,6 +209,175 @@ mod platform {
             let _ = write!(out, "{byte:02X}");
         }
         out
+    }
+
+    /// One data directory's RVA and size.
+    ///
+    /// `None` when the image declares no entry at `index`, or when the entry is
+    /// empty.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the load base of a mapped image.
+    const unsafe fn data_directory(base: usize, index: usize) -> Option<(usize, usize)> {
+        // SAFETY: a loaded image has its DOS header mapped, and `e_lfanew` is
+        // the dword at `+0x3c`.
+        let nt = base + unsafe { read_u32(base + E_LFANEW) } as usize;
+        // SAFETY: `nt` is the NT header the DOS stub points at, mapped in the
+        // same image; the optional header magic is the word at `+0x18`.
+        let magic = unsafe { read_u16(nt + OPTIONAL_HEADER) };
+        // The data directories follow `NumberOfRvaAndSizes`, whose offset in
+        // the optional header differs between PE32 and PE32+ (the wider image
+        // base and the four larger reserve/commit fields push it out by 0x10).
+        let num_rva_offset = match magic {
+            MAGIC_PE32 => NUM_RVA_PE32,
+            MAGIC_PE32_PLUS => NUM_RVA_PE32_PLUS,
+            _ => return None,
+        };
+        let num_rva_at = nt + OPTIONAL_HEADER + num_rva_offset;
+        // SAFETY: within the optional header of a mapped image.
+        let num_rva = unsafe { read_u32(num_rva_at) } as usize;
+        if num_rva <= index {
+            return None;
+        }
+        let entry = num_rva_at + 4 + index * DIRECTORY_ENTRY_SIZE;
+        // SAFETY: entry `index` exists, per the `num_rva` check.
+        let rva = unsafe { read_u32(entry) } as usize;
+        // SAFETY: the size dword follows the RVA in the same entry.
+        let size = unsafe { read_u32(entry + 4) } as usize;
+        if rva == 0 {
+            return None;
+        }
+        Some((rva, size))
+    }
+
+    /// The extent a mapped image covers, from its own `SizeOfImage`.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the load base of a mapped image.
+    unsafe fn image_size(base: usize) -> Option<usize> {
+        // SAFETY: a loaded image has its DOS header mapped.
+        let nt = base + unsafe { read_u32(base + E_LFANEW) } as usize;
+        // SAFETY: `nt` is the mapped NT header.
+        let size = unsafe { read_u32(nt + OPTIONAL_HEADER + SIZE_OF_IMAGE) } as usize;
+        (size != 0).then_some(size)
+    }
+
+    /// A mapped image, with every read bounded by its own extent.
+    ///
+    /// Resource walking follows offsets the image itself supplies, and the
+    /// image here is the host application's rather than our own, so a bound is
+    /// the difference between "no version resource" and a fault in someone's
+    /// game.
+    struct Image {
+        base: usize,
+        size: usize,
+    }
+
+    impl Image {
+        /// The address of `len` bytes at `off`, or `None` if they leave the image.
+        const fn at(&self, off: usize, len: usize) -> Option<usize> {
+            match off.checked_add(len) {
+                Some(end) if end <= self.size => self.base.checked_add(off),
+                _ => None,
+            }
+        }
+
+        /// Read a bounded `u16` at image offset `off`.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn u16(&self, off: usize) -> Option<u16> {
+            let addr = self.at(off, 2)?;
+            // SAFETY: `at` placed two readable bytes at `addr`.
+            Some(unsafe { read_u16(addr) })
+        }
+
+        /// Read a bounded `u32` at image offset `off`.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn u32(&self, off: usize) -> Option<u32> {
+            let addr = self.at(off, 4)?;
+            // SAFETY: `at` placed four readable bytes at `addr`.
+            Some(unsafe { read_u32(addr) })
+        }
+
+        /// Read `bytes` bytes at image offset `off` as UTF-16 units.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn utf16(&self, off: usize, bytes: usize) -> Option<Vec<u16>> {
+            let mut out = Vec::with_capacity(bytes / 2);
+            for i in 0..bytes / 2 {
+                // SAFETY: each offset is bounds-checked by `u16` in turn.
+                out.push(unsafe { self.u16(off + i * 2) }?);
+            }
+            Some(out)
+        }
+
+        /// The sub-directory of the entry with numeric id `id`.
+        ///
+        /// `res` is the resource directory's RVA, which every entry offset
+        /// inside the tree is relative to.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn subdirectory(&self, res: usize, dir: usize, id: u32) -> Option<usize> {
+            // SAFETY: bounded reads on a mapped image.
+            let count = unsafe { self.entry_count(dir) }?;
+            for i in 0..count {
+                let entry = dir + RESOURCE_DIRECTORY_SIZE + i * RESOURCE_ENTRY_SIZE;
+                // SAFETY: as above.
+                let name = unsafe { self.u32(entry) }?;
+                // SAFETY: the offset dword follows the name in the same entry.
+                let offset = unsafe { self.u32(entry + 4) }?;
+                // A numeric id (high bit clear) that matches, pointing at a
+                // sub-directory (high bit of the offset set).
+                if name == id && offset & SUBDIRECTORY != 0 {
+                    return res.checked_add((offset & !SUBDIRECTORY) as usize);
+                }
+            }
+            None
+        }
+
+        /// The first entry of a resource directory.
+        ///
+        /// Reports where its child sits, and whether that child is another
+        /// directory rather than a leaf.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn first_child(&self, res: usize, dir: usize) -> Option<(usize, bool)> {
+            // SAFETY: bounded reads on a mapped image.
+            if unsafe { self.entry_count(dir) }? == 0 {
+                return None;
+            }
+            // SAFETY: as above; the offset dword is the second half of the
+            // first entry.
+            let offset = unsafe { self.u32(dir + RESOURCE_DIRECTORY_SIZE + 4) }?;
+            let child = res.checked_add((offset & !SUBDIRECTORY) as usize)?;
+            Some((child, offset & SUBDIRECTORY != 0))
+        }
+
+        /// How many entries a resource directory holds, named and id-keyed.
+        ///
+        /// # Safety
+        ///
+        /// `self` must describe a mapped image.
+        unsafe fn entry_count(&self, dir: usize) -> Option<usize> {
+            // SAFETY: bounded reads on a mapped image.
+            let named = usize::from(unsafe { self.u16(dir + NAMED_ENTRIES) }?);
+            // SAFETY: as above.
+            let ids = usize::from(unsafe { self.u16(dir + ID_ENTRIES) }?);
+            named.checked_add(ids)
+        }
     }
 
     /// Read a `u16` at `addr` without assuming alignment.

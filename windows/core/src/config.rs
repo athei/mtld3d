@@ -9,6 +9,8 @@
 use log::info;
 use mtld3d_shared::{log_once_warn, mtl::ColorSpacePolicy};
 
+use crate::app_profile::AppProfile;
+
 /// Resolved runtime configuration.
 ///
 /// One instance built at startup from the user's `mtld3d.conf` (or
@@ -221,24 +223,38 @@ impl Default for Mtld3dConfig {
     }
 }
 
-/// Parse `mtld3d.conf` source text into a [`Mtld3dConfig`].
+/// Resolve the three configuration layers into a [`Mtld3dConfig`].
 ///
-/// An optional `MTLD3D_CONFIG` env-var override is applied on top.
+/// Weakest first: the [`Default`] values, then the built-in
+/// [`AppProfile`] for this application if it has one, then the
+/// `mtld3d.conf` body, then the `MTLD3D_CONFIG` env override. A key set
+/// by a later layer wins, so a user can always take one option back
+/// from a profile without losing the rest of it.
 ///
 /// `file_src` is the file body (newline-separated `key = value`),
 /// `env_override` is the env-var body (semicolon-separated
-/// `key=value`). Both flow through the same per-entry decode; env
-/// segments are applied after file lines so env wins on conflict.
-/// Missing keys keep their [`Default`] value.
+/// `key=value`), and a profile's settings use the env form. All three
+/// flow through the same per-entry decode. Missing keys keep the value
+/// the layer below left.
 ///
 /// Unrecognised keys, malformed entries, and unparseable values fire
 /// `log_once_warn!` (tagged with `mtld3d.conf line N` for file input,
-/// `MTLD3D_CONFIG` for env input) so a typo doesn't silently no-op, then
-/// parsing continues. The pure-string interface keeps the parser
-/// host-testable.
+/// `MTLD3D_CONFIG` for env input, and the profile's name for a profile)
+/// so a typo doesn't silently no-op, then parsing continues. The
+/// pure-string interface keeps the parser host-testable.
 #[must_use]
-pub fn parse(file_src: &str, env_override: Option<&str>) -> Mtld3dConfig {
+pub fn parse(
+    profile: Option<&AppProfile>,
+    file_src: &str,
+    env_override: Option<&str>,
+) -> Mtld3dConfig {
     let mut cfg = Mtld3dConfig::default();
+    if let Some(profile) = profile {
+        let source = format!("app profile '{}'", profile.name());
+        for segment in profile.settings().split(';') {
+            apply_line(&mut cfg, segment, &source, None);
+        }
+    }
     for (lineno, raw_line) in file_src.lines().enumerate() {
         apply_line(&mut cfg, raw_line, "mtld3d.conf", Some(lineno));
     }
