@@ -28,8 +28,9 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PrimitiveType, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
-        VS_POS_FIXUP_SLOT, VertexStepFunction,
+        IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PrimitiveType, VS_BOOL_CONST_SLOT,
+        VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+        VertexStepFunction,
     },
 };
 use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
@@ -162,18 +163,20 @@ impl VertexSource {
 /// The stride a stream's vertex buffer layout steps by.
 ///
 /// The application's `SetStreamSource` stride wins when it covers the
-/// declaration's extent on that stream (it can exceed it when the vertex
-/// struct carries fields past the declared elements). A zero stride means
-/// the application left it to the declaration. A non-zero stride smaller
-/// than the extent would make Metal reject the pipeline (an attribute past
-/// its layout's stride), so it is widened to the extent with a warning.
+/// extent of the declaration elements the shader consumes on that stream
+/// (it can exceed it when the vertex struct carries fields past them). A
+/// zero stride means the application left it to the declaration. A non-zero
+/// stride smaller than the consumed extent means the shader reads an
+/// attribute past the end of each vertex — Metal rejects such a pipeline,
+/// so the layout is widened to the extent with a warning; the affected
+/// draw fetches wrong data either way.
 fn layout_stride(app_stride: u32, extent: u32) -> u32 {
     if app_stride == 0 {
         return extent;
     }
     if app_stride < extent {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "stream stride {app_stride} below the declaration extent {extent}; layout widened to the extent"
+            "stream stride {app_stride} below the consumed declaration extent {extent}; layout widened to the extent"
         );
         return extent;
     }
@@ -611,6 +614,21 @@ pub struct CurrentSnapshot {
     /// Bound only for a VS that reads a dynamic integer constant
     /// (`VsSource::Programmable::uses_int_const`).
     pub vs_int_const_bytes: Option<ScratchSlice>,
+    /// VS boolean-constant bitmask (vertex slot 26).
+    ///
+    /// Bound only for a VS that reads a dynamic boolean constant
+    /// (`VsSource::Programmable::uses_bool_const`).
+    pub vs_bool_const_bytes: Option<ScratchSlice>,
+    /// PS integer-constant file (fragment slot 11).
+    ///
+    /// Bound only for a PS that reads a dynamic integer constant
+    /// (`PsSource::Programmable::uses_int_const`).
+    pub ps_int_const_bytes: Option<ScratchSlice>,
+    /// PS boolean-constant bitmask (fragment slot 10).
+    ///
+    /// Bound only for a PS that reads a dynamic boolean constant
+    /// (`PsSource::Programmable::uses_bool_const`).
+    pub ps_bool_const_bytes: Option<ScratchSlice>,
     /// Per-draw `VsDraw` uniform (`mtld3d_core::vs_draw`): point size state.
     ///
     /// Every vertex shader reads it, so it is bound for every draw and
@@ -637,6 +655,9 @@ impl CurrentSnapshot {
         fog_color_bytes: None,
         bump_env_bytes: None,
         vs_int_const_bytes: None,
+        vs_bool_const_bytes: None,
+        ps_int_const_bytes: None,
+        ps_bool_const_bytes: None,
         vs_draw_bytes: None,
         depth_stencil: DepthStencilFlags::empty(),
     };
@@ -815,6 +836,11 @@ pub enum VsSource {
         /// 14. False for the vast majority of shaders, which then pay no
         /// slot-14 bind.
         uses_int_const: bool,
+        /// Whether the VS reads a dynamic boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically a static `if` condition fed by
+        /// `SetVertexShaderConstantB`; the bitmask goes to vertex slot 26.
+        uses_bool_const: bool,
         /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
         ///
         /// Folds into the VS library + disk keys: the shader declares one
@@ -894,6 +920,16 @@ pub enum PsSource {
         /// The per-stage uniform goes to PS slot 12. False for the vast
         /// majority of shaders, which then pay no slot-12 bind.
         uses_bump_env: bool,
+        /// Whether the PS reads a dynamic integer constant.
+        ///
+        /// A non-`defi` `iN`, typically a `rep`/`loop` counter fed by
+        /// `SetPixelShaderConstantI`; the file goes to fragment slot 11.
+        uses_int_const: bool,
+        /// Whether the PS reads a dynamic boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically a static `if` condition fed by
+        /// `SetPixelShaderConstantB`; the bitmask goes to fragment slot 10.
+        uses_bool_const: bool,
         /// Bit `i` set ⇒ the bytecode writes `oCi`.
         ///
         /// Feeds the pipeline key so a render target the shader never
@@ -1218,6 +1254,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if metal_prim != PrimitiveType::Point {
         ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
     }
+    // A fragment function declaring a depth output against a pass with no
+    // depth attachment is a Metal pipeline error, so a programmable PS drops
+    // its depth export when no depth buffer is bound (D3D9 discards the
+    // write). The FF PS never writes depth and keeps the default key.
+    if matches!(ps, PsSource::Programmable { .. }) {
+        ps_variant.flags.set(
+            VariantFlags::NO_DEPTH_ATTACHMENT,
+            !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
+        );
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1276,6 +1322,45 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     } else {
         ScratchSlice::EMPTY
     };
+    // VS boolean constants (vertex slot 26), gated the same way.
+    let vs_uses_bool_const = matches!(
+        vs,
+        VsSource::Programmable {
+            uses_bool_const: true,
+            ..
+        }
+    );
+    let vs_bool_const_slice = if vs_uses_bool_const {
+        snap.vs_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
+    // PS integer / boolean constants (fragment slots 11 / 10), gated by the
+    // bound PS the same way.
+    let ps_uses_int_const = matches!(
+        ps,
+        PsSource::Programmable {
+            uses_int_const: true,
+            ..
+        }
+    );
+    let ps_int_const_slice = if ps_uses_int_const {
+        snap.ps_int_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
+    let ps_uses_bool_const = matches!(
+        ps,
+        PsSource::Programmable {
+            uses_bool_const: true,
+            ..
+        }
+    );
+    let ps_bool_const_slice = if ps_uses_bool_const {
+        snap.ps_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
+    } else {
+        ScratchSlice::EMPTY
+    };
     let has_depth = snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH);
     let has_stencil = snap.depth_stencil.contains(DepthStencilFlags::HAS_STENCIL);
     drop(t_consts);
@@ -1288,6 +1373,24 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let mut stage_texture_handles: [u64; STAGE_COUNT] = [0; STAGE_COUNT];
     for (stage, b) in stage_bindings.iter() {
         stage_texture_handles[stage as usize] = enc.get_texture_handle_by_id(b.texture_id);
+    }
+    // A draw that samples the bound depth attachment reads a copy of it: Metal
+    // forbids reading an attachment of the running pass. D3D9 permits the
+    // bind (scene depth as both depth test and position source) with the
+    // values as of the last write, which is what the copy holds.
+    let depth_attachment = enc.current_depth_texture();
+    if !depth_attachment.is_null() && stage_texture_handles.contains(&depth_attachment.raw()) {
+        let snapshot = enc.depth_snapshot_for_sampling();
+        if snapshot != 0 {
+            for handle in &mut stage_texture_handles {
+                if *handle == depth_attachment.raw() {
+                    *handle = snapshot;
+                }
+            }
+        }
+    }
+    if !depth_attachment.is_null() && render_state.depth_enable() && render_state.depth_write() {
+        enc.bump_depth_write_epoch();
     }
     drop(t_lookup);
 
@@ -1302,11 +1405,28 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let skip_set = skip_shader_hashes();
     if !skip_set.is_empty() {
         let (vs_h, ps_h) = (vs.disk_key(), ps.disk_key(ps_variant));
-        if skip_set.contains(&vs_h) || skip_set.contains(&ps_h) {
+        // Also match the raw content-hash program ids: they are what the
+        // frame dump prints per draw and what names the dumped bytecode
+        // files, so a dump line's id can go straight into the skip list
+        // without a debug-log run to harvest variant-mixed disk keys.
+        let vs_raw = match vs {
+            VsSource::Programmable { vs_id, .. } => vs_id.raw(),
+            VsSource::FixedFunction { .. } => 0,
+        };
+        let ps_raw = match ps {
+            PsSource::Programmable { ps_id, .. } => ps_id.raw(),
+            PsSource::FixedFunction { .. } => 0,
+        };
+        if skip_set.contains(&vs_h)
+            || skip_set.contains(&ps_h)
+            || (vs_raw != 0 && skip_set.contains(&vs_raw))
+            || (ps_raw != 0 && skip_set.contains(&ps_raw))
+        {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: vs_h ^ ps_h,
-                "debug.skipShaders: dropping draw with VS {vs_h:#x} PS {ps_h:#x}"
+                "debug.skipShaders: dropping draw with VS {vs_h:#x}/{vs_raw:#x} \
+                 PS {ps_h:#x}/{ps_raw:#x}"
             );
             return;
         }
@@ -1673,15 +1793,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     for (stage_u32, b) in stage_bindings.iter() {
         let handle = stage_texture_handles[stage_u32 as usize];
         if handle == 0 {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "draw: stage bound but texture handle is 0 — bind skipped, an unbound declared sampler reads opaque black"
+            mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
+                key: b.texture_id.raw(),
+                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0 — bind \
+                 skipped, an unbound declared sampler reads opaque black",
+                b.texture_id
             );
             continue;
         }
         let bit = 1u16 << stage_u32;
         bound_mask |= bit;
         let is_compare = (depth_mask & bit) != 0 && (fetch_mask & bit) == 0;
-        let sampler = enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare);
+        let is_fetch = (fetch_mask & bit) != 0;
+        let sampler = enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare, is_fetch);
         if enc.last_bound().fragment_texture_changed(stage_u32, handle) {
             enc.emit_command(Command::set_fragment_texture(handle, stage_u32));
         }
@@ -1717,6 +1841,40 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             // so a later real sampler bind to this slot is not deduped away.
             enc.last_bound()
                 .fragment_sampler_changed(stage, NULL_TEXTURE_SAMPLER_SENTINEL);
+        }
+    }
+    // Vertex texture fetch: bind each slot the VS declares a sampler for
+    // (`vs_3_0`, at most four). The bindings mirror `SetTexture` /
+    // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
+    // encoder rather than the per-draw snapshot; a declared slot the game
+    // never bound gets the shared black fallback, as on the fragment side.
+    if let VsSource::Programmable { vs_id, .. } = vs {
+        let decls = enc.ps_declared_samplers(*vs_id);
+        let mut mask = decls.unbound(0) & 0xF;
+        while mask != 0 {
+            let slot = mask.trailing_zeros();
+            mask &= mask - 1;
+            let (id, ss) = enc.vertex_binding(slot as usize);
+            let handle = id.map_or(0, |id| enc.get_texture_handle_by_id(id));
+            if handle == 0 {
+                let kind = decls.kind(slot);
+                let tex_sentinel = null_texture_tex_sentinel(kind as u64);
+                if enc.last_bound().vertex_texture_changed(slot, tex_sentinel) {
+                    enc.emit_command(Command::set_vertex_null_texture(kind, slot));
+                }
+                enc.last_bound()
+                    .vertex_sampler_changed(slot, NULL_TEXTURE_SAMPLER_SENTINEL);
+            } else {
+                // Slot indices 16..19: past the fragment-stage memo range,
+                // so vertex samplers never collide with a stage's memo entry.
+                let sampler = enc.get_or_create_sampler(16 + slot, &ss, false, false);
+                if enc.last_bound().vertex_texture_changed(slot, handle) {
+                    enc.emit_command(Command::set_vertex_texture(handle, slot));
+                }
+                if sampler != 0 && enc.last_bound().vertex_sampler_changed(slot, sampler) {
+                    enc.emit_command(Command::set_vertex_sampler_state(sampler, slot));
+                }
+            }
         }
     }
     drop(t_samplers);
@@ -1805,6 +1963,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if !vs_int_const_slice.as_slice().is_empty() {
         let (p, n) = vs_int_const_slice.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_INT_CONST_SLOT));
+    }
+    // VS boolean constants: a 4-byte bitmask, same rare-draw policy.
+    if !vs_bool_const_slice.as_slice().is_empty() {
+        let (p, n) = vs_bool_const_slice.as_raw();
+        enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_BOOL_CONST_SLOT));
+    }
+    // PS integer / boolean constants: the fragment-side twins, same policy.
+    if !ps_int_const_slice.as_slice().is_empty() {
+        let (p, n) = ps_int_const_slice.as_raw();
+        enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_INT_CONST_SLOT));
+    }
+    if !ps_bool_const_slice.as_slice().is_empty() {
+        let (p, n) = ps_bool_const_slice.as_raw();
+        enc.emit_command(Command::set_fragment_bytes_at(p, n, PS_BOOL_CONST_SLOT));
     }
     drop(t_cbind);
 

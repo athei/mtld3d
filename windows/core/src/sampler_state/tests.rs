@@ -18,6 +18,7 @@ fn base() -> SamplerSnapshot {
         address_w: 1,  // D3DTADDRESS_WRAP
         max_anisotropy: 1,
         max_mip_level: 0,
+        border_color: 0,
         flags: SamplerFlags::empty(),
     }
 }
@@ -38,6 +39,7 @@ fn key_changes_on_every_field() {
     assert_ne!(k0, mutate(|s| s.address_w = 2), "address_w");
     assert_ne!(k0, mutate(|s| s.max_anisotropy = 8), "max_anisotropy");
     assert_ne!(k0, mutate(|s| s.max_mip_level = 3), "max_mip_level");
+    assert_ne!(k0, mutate(|s| s.border_color = 0xFFFF_FFFF), "border_color");
     assert_ne!(
         k0,
         mutate(|s| s.flags.insert(SamplerFlags::IS_COMPARE)),
@@ -59,6 +61,34 @@ fn srgb_texture_lives_in_bit_38() {
     let k = key_from_snapshot(&s);
     assert_eq!(k.raw() & (1 << 38), 1 << 38);
     assert_eq!(k.raw() & (1 << 37), 0); // is_compare untouched
+}
+
+#[test]
+fn border_preset_lives_in_bits_39_and_40() {
+    // The key carries the Metal preset, not the raw D3DCOLOR: two colours
+    // that reduce to the same preset share a sampler, and only the three
+    // presets (plus the black fallback) can ever appear in the field.
+    let mut s = base();
+    s.border_color = 0xFFFF_FFFF;
+    let white = key_from_snapshot(&s);
+    assert_eq!((white.raw() >> 39) & 0x3, BorderColor::OpaqueWhite as u64);
+    assert_eq!(white.raw() & (1 << 38), 0, "srgb_texture untouched");
+
+    s.border_color = 0xFF00_0000;
+    let black = key_from_snapshot(&s);
+    assert_eq!((black.raw() >> 39) & 0x3, BorderColor::OpaqueBlack as u64);
+
+    s.border_color = 0xFF10_2030;
+    let fallback = key_from_snapshot(&s);
+    assert_eq!(
+        fallback, black,
+        "non-preset colour shares the black sampler"
+    );
+
+    // SAFETY: tests; opaque values never dereferenced.
+    let dev = unsafe { MetalHandle::new(0xDEAD) };
+    let p = params_from_snapshot(&s, fallback, dev);
+    assert_eq!(p.border_color, BorderColor::OpaqueBlack);
 }
 
 #[test]

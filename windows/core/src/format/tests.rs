@@ -27,9 +27,8 @@ fn depth_only_formats_promote_to_depth32float() {
         D3DFMT_D24X8,
         D3DFMT_D16,
         D3DFMT_D32F_LOCKABLE,
-        // FOURCC sampleable-depth — engines (incl. WoW CSM) gate the
-        // shadow-map path on at least one of these being available.
-        D3DFMT_INTZ,
+        // FOURCC sampleable-depth, minus INTZ (it carries a stencil
+        // plane, tested with the stencil-bearing family below).
         D3DFMT_DF24,
         D3DFMT_DF16,
     ] {
@@ -43,7 +42,15 @@ fn depth_only_formats_promote_to_depth32float() {
 
 #[test]
 fn stencil_bearing_formats_promote_to_depth32float_stencil8() {
-    for fmt in [D3DFMT_D15S1, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24FS8] {
+    // INTZ belongs here: it is the sampleable twin of D24S8 and carries
+    // its stencil plane.
+    for fmt in [
+        D3DFMT_D15S1,
+        D3DFMT_D24S8,
+        D3DFMT_D24X4S4,
+        D3DFMT_D24FS8,
+        D3DFMT_INTZ,
+    ] {
         assert_eq!(
             map_d3d_depth_format(fmt),
             Some(PixelFormat::Depth32FloatStencil8),

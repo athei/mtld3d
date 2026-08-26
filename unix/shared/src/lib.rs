@@ -19,7 +19,7 @@ pub use commands::{
     CopyBufferToTextureInfo, CopyTextureSubRectInfo, NullTextureKind,
 };
 pub use ffi_boundary::{InPtr, InPtrMut, OutPtr, ValueIn, VtableThis};
-pub use log_filter::init_logger;
+pub use log_filter::{init_logger, init_logger_to};
 pub use mtl_handle::MetalHandle;
 pub use params::{
     AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc,
@@ -31,7 +31,7 @@ pub use params::{
     ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, PassDescriptor,
     SetDisplaySyncEnabledParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
     SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
-    WaitForGpuRetireParams,
+    WaitForGpuRetireParams, WriteLogParams,
 };
 
 #[repr(u32)]
@@ -61,6 +61,7 @@ pub enum Thunks {
     EnsureClearQuadPipeline,
     EnsureBlitPipeline,
     GetTaskFaults,
+    WriteLog,
 }
 
 pub trait Thunk {

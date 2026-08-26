@@ -441,11 +441,12 @@ fn device_caps_are_sane() {
         0,
         "display-rate presentation interval not advertised"
     );
-    // Vertex texture fetch is not implemented, and the two places that say so
-    // have to agree.
-    assert_eq!(
+    // Vertex texture fetch: the caps bit and the per-format probe must
+    // agree, and both now advertise it (titles gate whole effect paths on
+    // the pair).
+    assert_ne!(
         caps.vertex_texture_filter_caps, 0,
-        "VTF filter caps advertised"
+        "VTF filter caps not advertised"
     );
     assert_eq!(
         h.check_device_format(
@@ -454,8 +455,8 @@ fn device_caps_are_sane() {
             D3DRTYPE_TEXTURE,
             D3DFMT_A8R8G8B8
         ),
-        D3DERR_NOTAVAILABLE,
-        "QUERY_VERTEXTEXTURE accepted without VTF"
+        0,
+        "QUERY_VERTEXTEXTURE denied despite VTF caps"
     );
 }
 

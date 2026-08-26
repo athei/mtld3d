@@ -28,7 +28,7 @@
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
 use mtld3d_shared::{InPtr, VtableThis};
-use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
+use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, Guid};
 
 use crate::device::{
     device_wrapper_add_ref, device_wrapper_note_reset_blocker, device_wrapper_release,
@@ -471,4 +471,44 @@ pub unsafe fn com_release<T: ComChild>(this: *mut c_void) -> u32 {
     // freed (finalized above), so `forward` must have been read before that.
     device_wrapper_release(forward);
     rc
+}
+
+/// `IUnknown::QueryInterface` for a wrapper that is exactly one COM object.
+///
+/// Every `IDirect3DXxx9` wrapper here answers for `IUnknown` and the
+/// interfaces it implements with itself: `*ppv = this` plus one `AddRef`
+/// through `add_ref`, the wrapper's own thunk, so the reference is counted
+/// the way the wrapper counts. Anything else is `E_NOINTERFACE` with `*ppv`
+/// nulled, logged once per IID: an SDK probing for an interface the object
+/// does not have (`IDirect3DDevice9Ex`, say) is a port candidate worth seeing.
+///
+/// # Safety
+/// `this` is the live wrapper for the vtable call, `riid` is the caller's
+/// read-only GUID pointer (or null) and `ppv` is a writable out slot (or null).
+pub unsafe fn com_query_interface(
+    this: *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+    accepted: &[Guid],
+    add_ref: extern "system" fn(*mut c_void) -> u32,
+    name: &'static str,
+) -> i32 {
+    // SAFETY: `riid` is the caller's read-only GUID pointer per the contract.
+    let iid = unsafe { mtld3d_shared::InPtr::<Guid>::opt(riid.cast()) };
+    let riid_lo = iid.as_ref().map_or(0, |g| g.data1);
+    log::trace!(target: crate::LOG_TARGET, "{name}::QueryInterface(riid_lo={riid_lo:#010x})");
+    let matched = iid.is_some_and(|iid| accepted.contains(&iid));
+    if matched && !ppv.is_null() {
+        // SAFETY: validated writable out pointer per the contract.
+        unsafe { *ppv = this };
+        add_ref(this);
+        return D3D_OK;
+    }
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(riid_lo),
+        "{name}::QueryInterface(riid_lo={riid_lo:#010x}) → E_NOINTERFACE"
+    );
+    crate::null_out(ppv);
+    E_NOINTERFACE
 }

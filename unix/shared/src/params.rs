@@ -1,10 +1,10 @@
 use super::{
     Thunk, Thunks,
     mtl::{
-        AddressMode, BlendFactor, BlendOperation, BufferKind, ClearQuadFlags, ColorSpacePolicy,
-        ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat,
-        VertexStepFunction,
+        AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
+        ColorSpacePolicy, ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter,
+        MipFilter, PixelFormat, StageTag, StencilOp, StorageMode, StoreAction, Swizzle,
+        TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -69,12 +69,30 @@ impl Thunk for InitLoggerParams {
     const CODE: u32 = Thunks::InitLogger as u32;
 }
 
+/// One formatted log line from the PE-side logger, for the unix stderr.
+///
+/// `ptr`/`len` describe a byte slice the PE side keeps alive for the call.
+#[repr(C, align(8))]
+pub struct WriteLogParams {
+    pub ptr: u64, // in: *const u8
+    pub len: u32, // in: byte count
+    pub pad0: u32,
+}
+
+impl Thunk for WriteLogParams {
+    const CODE: u32 = Thunks::WriteLog as u32;
+}
+
 #[repr(C, align(8))]
 pub struct GetDeviceInfoParams {
     pub name_ptr: u64,
     pub name_buf_len: u64,
     pub name_len: u64,    // out
     pub registry_id: u64, // out
+    /// Out: 1 when the device supports sampler border colours.
+    ///
+    /// Mac2 family and not paravirtualized; CI devices do not qualify.
+    pub supports_sampler_border: u64,
 }
 
 impl Thunk for GetDeviceInfoParams {
@@ -525,13 +543,26 @@ impl PassDescriptor {
     const LEADING_BLITS_NEED_ENCODER: u32 = 1;
     const COLOR_SLICE_SHIFT: u32 = 1;
     const COLOR_LEVEL_SHIFT: u32 = 4;
+    const DEPTH_LEVEL_SHIFT: u32 = 8;
 
-    /// Pack leading-blit and color-subresource state.
+    /// Pack leading-blit, color-subresource and depth-level state.
     #[must_use]
-    pub const fn pack_flags(needs_encoder: bool, color_slice: u32, color_level: u32) -> u32 {
+    pub const fn pack_flags(
+        needs_encoder: bool,
+        color_slice: u32,
+        color_level: u32,
+        depth_level: u32,
+    ) -> u32 {
         (if needs_encoder { 1 } else { 0 })
             | ((color_slice & 0x7) << Self::COLOR_SLICE_SHIFT)
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
+            | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
+    }
+
+    /// Depth attachment mip level.
+    #[must_use]
+    pub const fn depth_level(&self) -> u32 {
+        (self.pass_flags >> Self::DEPTH_LEVEL_SHIFT) & 0xf
     }
 
     /// Whether the leading-blit list contains an encoder-bound command.
@@ -814,6 +845,8 @@ pub struct CreateSamplerStateParams {
     /// set); separate cache entry from the non-compare variant of the
     /// same D3D9 sampler state.
     pub is_compare: u32,
+    /// Border preset for `AddressMode::ClampToBorderColor` on any axis.
+    pub border_color: BorderColor, // in
     pub sampler_handle: MetalHandle<MTLSamplerStateKind>, // out
 }
 

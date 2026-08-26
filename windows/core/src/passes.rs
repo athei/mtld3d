@@ -143,6 +143,9 @@ const DEPTH_TRACE_TARGET: &str = "mtld3d::d3d9::depth";
 /// slot 8.
 pub const LAST_BOUND_MAX_STAGES: usize = 16;
 
+/// Vertex texture fetch slots (`vs_3_0` s0..s3, `D3DVERTEXTEXTURESAMPLER0..3`).
+pub const VERTEX_SAMPLER_SLOTS: usize = 4;
+
 /// Cap on `command_vec_pool` size.
 ///
 /// A 5-pass frame is the typical shape; 16 absorbs every realistic
@@ -495,6 +498,8 @@ pub struct Pass {
     /// and persistent rt contents survive.
     color_store: StoreAction,
     depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth_texture` the pass renders depth into.
+    depth_level: u32,
     depth_load: DepthLoad,
     stencil_load: StencilLoad,
     /// Defaults to `Store`.
@@ -653,6 +658,11 @@ impl Pass {
     #[must_use]
     pub const fn depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.depth_texture
+    }
+    /// Mip level of `depth_texture` the pass renders depth into.
+    #[must_use]
+    pub const fn depth_level(&self) -> u32 {
+        self.depth_level
     }
     #[must_use]
     pub const fn color_load(&self) -> ColorLoad {
@@ -854,6 +864,8 @@ pub struct PassState {
     /// Cached so a draw copies 16 bytes instead of walking the three slots.
     current_extra_attachments: ExtraColorAttachments,
     current_depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `current_depth_texture` bound as the depth attachment.
+    current_depth_level: u32,
     /// Descriptor bits for the currently bound colour/depth attachments.
     ///
     /// `COLOR_HAS_ALPHA` / `DEPTH_SAMPLEABLE` / `DEPTH_HAS_STENCIL`. See
@@ -1081,6 +1093,7 @@ impl PassState {
             current_extra_present_mask: 0,
             current_extra_attachments: ExtraColorAttachments::NONE,
             current_depth_texture: MetalHandle::NULL,
+            current_depth_level: 0,
             // Placeholder; `reset_frame` reseeds these for the backbuffer, and
             // every `SetRenderTarget` bind overwrites `COLOR_HAS_ALPHA` via
             // `set_color_rt_has_alpha`. The dominant backbuffer is alpha-bearing
@@ -1197,6 +1210,7 @@ impl PassState {
         self.current_attachments
             .insert(CurrentAttachmentFlags::COLOR_HAS_ALPHA);
         self.current_depth_texture = depth_texture;
+        self.current_depth_level = 0;
         // The frame's default depth target is the standalone backbuffer
         // depth surface from `CreateDepthStencilSurface` — not
         // sampleable. Sub-frame `set_depth_stencil_attachment` calls
@@ -1986,6 +2000,7 @@ impl PassState {
             color_load,
             color_store: StoreAction::Store,
             depth_texture: self.current_depth_texture,
+            depth_level: self.current_depth_level,
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
@@ -2217,6 +2232,20 @@ impl PassState {
         is_sampleable: bool,
         has_stencil: bool,
     ) {
+        self.set_depth_stencil_attachment_level(texture, 0, is_sampleable, has_stencil);
+    }
+
+    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    ///
+    /// A different level of the same texture is a different attachment and
+    /// ends the pass the way a different texture does.
+    pub fn set_depth_stencil_attachment_level(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        level: u32,
+        is_sampleable: bool,
+        has_stencil: bool,
+    ) {
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
@@ -2236,6 +2265,7 @@ impl PassState {
         self.current_attachments
             .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
         if self.current_depth_texture == texture
+            && self.current_depth_level == level
             && self
                 .current_attachments
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
@@ -2248,9 +2278,11 @@ impl PassState {
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
-                "pass-break trigger=set_depth_attach prev={:#x} new={:#x}",
+                "pass-break trigger=set_depth_attach prev={:#x}:{} new={:#x}:{}",
                 self.current_depth_texture,
+                self.current_depth_level,
                 texture,
+                level,
             );
         }
         if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
@@ -2258,6 +2290,7 @@ impl PassState {
         }
         self.end_current_pass("set_depth_attach");
         self.current_depth_texture = texture;
+        self.current_depth_level = level;
     }
 
     /// Apply a color clear.
@@ -3760,6 +3793,12 @@ impl Default for PassState {
 pub struct LastBoundCache {
     fragment_samplers: [u64; LAST_BOUND_MAX_STAGES],
     fragment_textures: [u64; LAST_BOUND_MAX_STAGES],
+    /// Vertex texture fetch slots 0..3.
+    ///
+    /// `MTLTexture` / `MTLSamplerState` handles bound on the vertex
+    /// stage; `0` is the unset sentinel.
+    vertex_textures: [u64; VERTEX_SAMPLER_SLOTS],
+    vertex_samplers: [u64; VERTEX_SAMPLER_SLOTS],
     pipeline: u64,
     depth_stencil: u64,
     stencil_reference: u32,
@@ -3821,6 +3860,8 @@ impl LastBoundCache {
         Self {
             fragment_samplers: [0; LAST_BOUND_MAX_STAGES],
             fragment_textures: [0; LAST_BOUND_MAX_STAGES],
+            vertex_textures: [0; VERTEX_SAMPLER_SLOTS],
+            vertex_samplers: [0; VERTEX_SAMPLER_SLOTS],
             pipeline: 0,
             depth_stencil: 0,
             stencil_reference: 0,
@@ -3848,6 +3889,8 @@ impl LastBoundCache {
     pub fn reset(&mut self) {
         self.fragment_samplers = [0; LAST_BOUND_MAX_STAGES];
         self.fragment_textures = [0; LAST_BOUND_MAX_STAGES];
+        self.vertex_textures = [0; VERTEX_SAMPLER_SLOTS];
+        self.vertex_samplers = [0; VERTEX_SAMPLER_SLOTS];
         self.pipeline = 0;
         self.depth_stencil = 0;
         self.stencil_reference = 0;
@@ -3872,6 +3915,28 @@ impl LastBoundCache {
             false
         } else {
             *slot = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_texture_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_textures[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_sampler_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_samplers[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
             true
         }
     }

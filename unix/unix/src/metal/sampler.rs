@@ -1,15 +1,18 @@
 use mtld3d_shared::{
     CreateSamplerStateParams, MetalHandle,
-    mtl::{AddressMode, MinMagFilter, MipFilter},
+    mtl::{AddressMode, BorderColor, MinMagFilter, MipFilter},
     mtl_handle::MTLSamplerStateKind,
 };
 use objc2::rc::Retained;
 use objc2_metal::{
-    MTLCompareFunction, MTLDevice, MTLSamplerAddressMode, MTLSamplerDescriptor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLCompareFunction, MTLDevice, MTLSamplerAddressMode, MTLSamplerBorderColor,
+    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
 };
 
-use crate::metal::handle::{IntoRetained, ReleaseRetain};
+use crate::metal::{
+    device::supports_sampler_border,
+    handle::{IntoRetained, ReleaseRetain},
+};
 
 /// Sub-target for the depth-path diagnostic probe in `create_sampler_state`.
 ///
@@ -24,13 +27,35 @@ pub fn create_sampler_state(
 ) -> Option<MetalHandle<MTLSamplerStateKind>> {
     let device = params.device_handle.into_retained()?;
 
+    // A device without border-colour support (the paravirtualized CI
+    // device) aborts sampler creation on one. Fall back to clamp-to-edge
+    // there — the PE side stops advertising border addressing on such a
+    // device, so only a title that ignores the cap sees the substitution.
+    let border_ok = supports_sampler_border(&device);
+    let uses_border = matches!(params.address_u, AddressMode::ClampToBorderColor)
+        || matches!(params.address_v, AddressMode::ClampToBorderColor)
+        || matches!(params.address_w, AddressMode::ClampToBorderColor);
+    let address = |wire: AddressMode| {
+        if !border_ok && matches!(wire, AddressMode::ClampToBorderColor) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "sampler border addressing unsupported on this device — clamped to edge"
+            );
+            return MTLSamplerAddressMode::ClampToEdge;
+        }
+        mtl_address_mode(wire)
+    };
+
     let desc = MTLSamplerDescriptor::new();
     desc.setMinFilter(mtl_min_mag_filter(params.min_filter));
     desc.setMagFilter(mtl_min_mag_filter(params.mag_filter));
     desc.setMipFilter(mtl_mip_filter(params.mip_filter));
-    desc.setSAddressMode(mtl_address_mode(params.address_u));
-    desc.setTAddressMode(mtl_address_mode(params.address_v));
-    desc.setRAddressMode(mtl_address_mode(params.address_w));
+    desc.setSAddressMode(address(params.address_u));
+    desc.setTAddressMode(address(params.address_v));
+    desc.setRAddressMode(address(params.address_w));
+    if border_ok && uses_border {
+        desc.setBorderColor(mtl_border_color(params.border_color));
+    }
     if params.max_anisotropy > 1 {
         desc.setMaxAnisotropy(params.max_anisotropy as usize);
     }
@@ -154,5 +179,14 @@ const fn mtl_address_mode(wire: AddressMode) -> MTLSamplerAddressMode {
         AddressMode::Repeat => MTLSamplerAddressMode::Repeat,
         AddressMode::MirrorRepeat => MTLSamplerAddressMode::MirrorRepeat,
         AddressMode::ClampToZero => MTLSamplerAddressMode::ClampToZero,
+        AddressMode::ClampToBorderColor => MTLSamplerAddressMode::ClampToBorderColor,
+    }
+}
+
+const fn mtl_border_color(wire: BorderColor) -> MTLSamplerBorderColor {
+    match wire {
+        BorderColor::TransparentBlack => MTLSamplerBorderColor::TransparentBlack,
+        BorderColor::OpaqueBlack => MTLSamplerBorderColor::OpaqueBlack,
+        BorderColor::OpaqueWhite => MTLSamplerBorderColor::OpaqueWhite,
     }
 }

@@ -465,13 +465,46 @@ pub fn d3d_to_metal_mip_filter(d3d_filter: u32) -> MipFilter {
     }
 }
 
+/// `D3DSAMP_BORDERCOLOR` (a D3DCOLOR) → the nearest Metal border preset.
+///
+/// Metal samplers offer three border colours. Transparent black, opaque
+/// black and opaque white map exactly; anything else takes opaque black and
+/// is logged once per colour, since the border then reads differently from
+/// what the game asked for.
+pub fn d3d_border_color_to_metal(color: u32) -> mtld3d_shared::mtl::BorderColor {
+    if let Some(preset) = border_color_preset(color) {
+        return preset;
+    }
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(color),
+        "D3DSAMP_BORDERCOLOR {color:#010x} has no Metal preset → opaque black"
+    );
+    mtld3d_shared::mtl::BorderColor::OpaqueBlack
+}
+
+/// The Metal border preset a D3DCOLOR maps to exactly, if any.
+///
+/// Const so the sampler cache key can fold it in; the logging fallback for
+/// other colours lives in [`d3d_border_color_to_metal`].
+#[must_use]
+pub const fn border_color_preset(color: u32) -> Option<mtld3d_shared::mtl::BorderColor> {
+    use mtld3d_shared::mtl::BorderColor;
+    match color {
+        0x0000_0000 => Some(BorderColor::TransparentBlack),
+        0xFF00_0000 => Some(BorderColor::OpaqueBlack),
+        0xFFFF_FFFF => Some(BorderColor::OpaqueWhite),
+        _ => None,
+    }
+}
+
 /// D3DTADDRESS_* → Metal sampler address mode.
 pub fn d3d_to_metal_address_mode(d3d_mode: u32) -> AddressMode {
     match d3d_mode {
         D3DTADDRESS_WRAP => AddressMode::Repeat,
         D3DTADDRESS_MIRROR => AddressMode::MirrorRepeat,
         D3DTADDRESS_CLAMP => AddressMode::ClampToEdge,
-        D3DTADDRESS_BORDER => AddressMode::ClampToZero,
+        D3DTADDRESS_BORDER => AddressMode::ClampToBorderColor,
         D3DTADDRESS_MIRRORONCE => AddressMode::MirrorClampToEdge,
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -852,12 +885,15 @@ pub fn fvf_to_elements(fvf: u32) -> (Vec<D3DVERTEXELEMENT9>, u32) {
 pub struct ResolvedAttrs {
     /// One entry per consumed element; `buffer_index` is the element's stream.
     pub attrs: Vec<VertexAttrDesc>,
-    /// Per stream, `max(offset + size)` over every element on it.
+    /// Per stream, `max(offset + size)` over the elements kept in `attrs`.
     ///
-    /// Unconsumed elements count too: the stream's vertex buffer layout must
-    /// cover this extent, since Metal rejects a pipeline whose attribute
-    /// reaches past its layout's stride. Zero for a stream the declaration
-    /// never names.
+    /// Only kept elements count: Metal validates a layout's stride against
+    /// the attributes in the descriptor, and an element the shader never
+    /// consumes is not in it. Counting unconsumed tail fields would widen
+    /// the fetch step past the stream's true stride and mis-fetch every
+    /// vertex after the first — applications legitimately bind a packed
+    /// buffer under a shared declaration whose trailing elements only exist
+    /// for other shaders. Zero for a stream with no kept element.
     pub extents: [u32; MAX_STREAMS as usize],
     /// Bit `s` set: stream `s` feeds at least one consumed attribute.
     ///
@@ -907,8 +943,6 @@ fn resolve_attrs(
             continue;
         }
         let (format, size) = decl_type_to_metal_format(e.type_);
-        let extent = &mut extents[stream as usize];
-        *extent = (*extent).max(u32::from(e.offset) + size);
         if format == VertexFormat::Invalid {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "{path} vertex decl: type={} has no Metal format → element dropped",
@@ -924,6 +958,8 @@ fn resolve_attrs(
                 format,
             });
             used_streams |= 1 << stream;
+            let extent = &mut extents[stream as usize];
+            *extent = (*extent).max(u32::from(e.offset) + size);
         }
     }
     ResolvedAttrs {

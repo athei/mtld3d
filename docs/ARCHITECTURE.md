@@ -27,6 +27,8 @@ A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) 
 
 A dedicated **submit thread** (one per device) executes the `SubmitFrame` thunk — the cross-boundary command replay, the `nextDrawable` wait, present, and commit — overlapping the encoder's build of the next frame. The frame crosses as an owned `FramePayload` holding every buffer the thunk aliases by raw pointer; two payloads ping-pong over a cap-1 work channel, so render-ahead is bounded at one frame. Rare synchronous submits (`Reset`, mid-frame flushes, GPU capture) first drain the submit thread to idle, then run the thunk inline on the encoder thread — the two paths never call `SubmitFrame` concurrently and present order is preserved.
 
+A **log thread** (one per process) is the only thread that thunks for logging. d3d9.dll's `env_logger` sink pushes each formatted line onto an unbounded channel and returns, so a log line costs the API and encoder threads an allocation and a queue push; the log thread drains the queue and forwards every line through the `WriteLog` thunk to the process's unix stderr, the stream wine's own debug output and the unix side's logger use, whatever Windows standard handles the process was started with. The thread starts from the first `Direct3DCreate9`, never from `DllMain` (loader lock); lines logged before that wait in the queue.
+
 ```
 API thread                     Encoder thread              Submit thread
 ──────────                     ──────────────              ─────────────

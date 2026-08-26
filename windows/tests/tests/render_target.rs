@@ -673,6 +673,118 @@ fn stretch_rect_accepts_one_to_one_same_format() {
     );
 }
 
+/// Sampling the INTZ texture that is still the bound depth attachment.
+///
+/// A deferred renderer keeps its scene depth bound for the depth test while
+/// its light-volume draws sample it to reconstruct positions. Metal forbids
+/// reading an attachment of the running pass, so the encoder copies the
+/// attachment before such a draw and binds the copy: the sampled value is
+/// the depth written earlier, not garbage. The depth is 0.25 (a value a
+/// `1 - z` mix-up cannot fake) and the stage's filters are LINEAR, which
+/// the fetch sampler must override: Apple GPUs cannot filter `Depth32Float`.
+#[test]
+fn intz_depth_sampled_while_bound_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind INTZ as depth"
+    );
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    // The INTZ texture stays bound as the depth attachment: depth test on,
+    // depth write off, and the same texture sampled through stage 0.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_LINEAR),
+        (D3DSAMP_MAGFILTER, D3DTEXF_LINEAR),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw with the attachment still bound"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (48..=90).contains(&center.r)
+            && (48..=90).contains(&center.g)
+            && (48..=90).contains(&center.b),
+        "the depth written by the occluder (0.25) samples back as dark gray, got {center:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
 #[test]
 fn intz_depth_sample_via_fixed_function() {
     // The cascade-shadow plumbing under the fixed-function pixel pipeline: an
@@ -1779,4 +1891,860 @@ fn stretch_rect_converts_r5g6b5_into_x8r8g8b8() {
     assert_eq!(h.read_pixel(240, 240), GREEN, "pixel 1 is green");
     assert_eq!(h.read_pixel(400, 240), BLUE, "pixel 2 is blue");
     assert_eq!(h.read_pixel(560, 240), WHITE, "pixel 3 is white");
+}
+
+/// A depth texture with a mip chain: a level binds as the depth attachment.
+///
+/// An engine's depth pyramid renders depth into successive levels through
+/// `GetSurfaceLevel(n)`. Level 1 of a 1280x960 chain is the back buffer's size,
+/// so it is bound beside the back buffer and a farther draw after a nearer one
+/// must lose the depth test in that level.
+#[test]
+fn depth_texture_mip_level_binds_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        1280,
+        960,
+        2,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(depth_tex.level_count(), 2, "both levels created");
+    let (hr, desc) = depth_tex.level_desc(1);
+    assert_eq!(hr, 0, "GetLevelDesc(1)");
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "level 1 is half the base level"
+    );
+
+    let depth_surf = depth_tex.surface_level(1);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind level 1 as the depth attachment"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, mtld3d_types::D3DCMP_LESSEQUAL),
+        0
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    // Lighting defaults on and the vertices carry no normal, which would
+    // light every draw black; the test reads the vertex colour.
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_LIGHTING, 0), 0);
+
+    let tri = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.3, RED)),
+        0,
+        "near draw"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.7, GREEN)),
+        0,
+        "far draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40,
+        "the far draw loses the depth test in level 1, got {center:?}"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+}
+
+#[test]
+fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
+    // The RESZ hack: SetRenderState(POINTSIZE, 0x7fa05000) resolves the
+    // bound depth-stencil into the depth texture at stage 0. Engines on the
+    // matching vendor path use it as their only depth hand-off, so support
+    // is probed via the RESZ pseudo-format and must answer D3D_OK.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DUSAGE_RENDERTARGET,
+            mtld3d_types::D3DRTYPE_SURFACE,
+            0x5A53_4552,
+        ),
+        0,
+        "RESZ pseudo-format probe answers available"
+    );
+
+    let depth_src = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_dst = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+
+    // Pass 1: write depth 0.25 into the source through the FF pipeline.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth_src.surface_level(0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+
+    // The resolve: destination at stage 0, then the magic POINTSIZE write.
+    assert_eq!(h.set_texture(0, &depth_dst), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0
+    );
+
+    // Pass 2: sample the DESTINATION; only the resolve can have filled it.
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the resolved copy"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
+        "the resolved depth (0.25) samples back as dark gray, got {center:?}"
+    );
+
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+}
+
+/// `ps_3_0`: sample s0 at the interpolated texcoord, write it to oDepth.
+///
+/// `dcl_2d s0; dcl_texcoord0 v0; texld r0, v0, s0; mov oC0, c0; mov
+/// oDepth, r0.x;` — the depth-restore shape a deferred engine uses to
+/// copy scene depth into the persistent depth buffer for its late
+/// (sprite/alpha) pass. `oDepth` is register type `DEPTHOUT` (9).
+#[rustfmt::skip]
+const PS_RESTORE_DEPTH: [u32; 21] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, //   0, 0, 0, 0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x9001_0800, 0x8000_0000,              // mov oDepth, r0.x
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn odepth_restore_feeds_a_later_sprite_z_test() {
+    // The deferred late-pass depth hand-off: scene depth lives in an INTZ
+    // texture; a full-screen draw with color writes OFF, stencil REPLACE,
+    // ZFUNC=ALWAYS and z-write ON copies it into the bound depth buffer by
+    // writing oDepth per pixel; sprites drawn afterwards z-test LESSEQUAL
+    // against the restored values. A sprite behind restored near geometry
+    // must be occluded; over restored far background it must show.
+    let h = Harness::with_depth();
+    let scene_depth = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("implicit depth");
+
+    // Pass 1: scene depth into the INTZ texture — cleared 1.0, an occluder
+    // quad at 0.25 over the LEFT half.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.set_depth_stencil_surface(&scene_depth.surface_level(0)),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left_occluder),
+        0,
+        "scene occluder"
+    );
+
+    // Pass 2: back to the implicit depth buffer, cleared to 0.1 (a value
+    // that hides the sprite everywhere if the restore does not land), then
+    // the restore draw: full-screen, color writes off, stencil REPLACE,
+    // ZFUNC=ALWAYS + z-write, PS samples the INTZ and writes oDepth.
+    assert_eq!(h.set_depth_stencil_surface(&implicit), 0);
+    assert_eq!(h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 0.1, 0), 0);
+    let ps = h.create_pixel_shader(&PS_RESTORE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_texture(0, &scene_depth), 0, "bind INTZ");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, D3DCMP_ALWAYS),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILREF, 7), 0);
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            mtld3d_types::D3DSTENCILOP_REPLACE
+        ),
+        0
+    );
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let full = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full),
+        0,
+        "depth-restore draw"
+    );
+
+    // Pass 3: color writes back on, stencil off, a green sprite quad at
+    // z=0.6 z-tested LESSEQUAL against the restored depth.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    let sprite = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.6,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.6,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.6,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &sprite),
+        0,
+        "late sprite draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Left half: restored 0.25 occludes the 0.6 sprite → red clear shows.
+    // Right half: restored 1.0 lets it through → green. A stale 0.1 buffer
+    // (restore never landed) reads red on BOTH sides.
+    assert_eq!(
+        h.read_pixel(160, 240),
+        RED,
+        "sprite occluded where the restore copied near depth"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        GREEN,
+        "sprite visible where the restore copied far depth"
+    );
+}
+
+/// `ps_3_0`: sample s0 at texcoord, write it to BOTH oC0 and oDepth.
+#[rustfmt::skip]
+const PS_RESTORE_DEPTH_VIS: [u32; 18] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x8000_0000,              // mov oC0, r0.x
+    0x0200_0001, 0x9001_0800, 0x8000_0000,              // mov oDepth, r0.x
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn odepth_restore_probe_shows_the_sampled_depth() {
+    // Diagnosis twin of `odepth_restore_feeds_a_later_sprite_z_test`: same
+    // sample, color writes ON, painting the sampled INTZ value as
+    // grayscale. Left half must be dark (0.25), right half white (1.0).
+    let h = Harness::with_depth();
+    let scene_depth = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("implicit depth");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.set_depth_stencil_surface(&scene_depth.surface_level(0)),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left_occluder),
+        0
+    );
+
+    let _ = &implicit;
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.clear_target(RED), 0);
+    let ps = h.create_pixel_shader(&PS_RESTORE_DEPTH_VIS);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_texture(0, &scene_depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let full = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let left = Rgba8::from_pixel(h.read_pixel(160, 240));
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        (48..=90).contains(&left.r),
+        "left half painted with sampled 0.25, got {left:?}"
+    );
+    assert!(
+        right.r > 220,
+        "right half painted with sampled 1.0, got {right:?}"
+    );
+}
+
+#[test]
+fn intz_carries_a_working_stencil_plane() {
+    // INTZ is the sampleable twin of D24S8 and carries its stencil: a
+    // deferred engine REPLACE-writes material/sky ids into the stencil of
+    // the same buffer it later samples raw depth from, then gates late
+    // draws on stencil EQUAL/NOTEQUAL. With a stencil-less mapping those
+    // gates silently pass everywhere.
+    let h = Harness::with_depth();
+    let intz = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | mtld3d_types::D3DCLEAR_STENCIL,
+            BLACK,
+            1.0,
+            0
+        ),
+        0
+    );
+
+    // Mark stencil = 7 over the left half (color writes off).
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, D3DCMP_ALWAYS),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILREF, 7), 0);
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            mtld3d_types::D3DSTENCILOP_REPLACE
+        ),
+        0
+    );
+    let left = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left(0.5, WHITE)),
+        0,
+        "stencil mark draw"
+    );
+
+    // Full-screen green quad gated on stencil EQUAL 7: left half only.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, mtld3d_types::D3DCMP_EQUAL),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            1 // D3DSTENCILOP_KEEP
+        ),
+        0
+    );
+    let cover = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover),
+        0,
+        "stencil-gated draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "stencil EQUAL 7 passes where the mark landed"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        BLACK,
+        "stencil EQUAL 7 rejects the unmarked half"
+    );
+
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 0), 0);
+}
+
+/// `depth.aliasSameSize`: a same-size depth-stencil bind inherits contents.
+///
+/// Engines of the D3D9 era rely on equal-size depth-stencil surfaces
+/// sharing one physical driver allocation: they render scene depth with
+/// one depth texture bound, then bind a *different* same-size depth
+/// texture and z-test against the scene depth through it, with no copy
+/// anywhere in the API stream. With the option on, rebinding texture A
+/// after rendering into texture B must make A's z-test see B's contents.
+#[test]
+fn same_size_depth_bind_inherits_contents_when_aliased() {
+    // The harness process owns its environment and no other thread runs
+    // yet; extend the suite-wide config with the option under test.
+    let merged = format!(
+        "{};depth.aliasSameSize=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the
+    // harness and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::with_depth();
+    let a = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let b = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    let half = |x0: f32, x1: f32, z: f32| {
+        let v = |x: f32, y: f32| PosColorVertex {
+            x,
+            y,
+            z,
+            color: WHITE,
+        };
+        [
+            v(x0, 1.0),
+            v(x1, 1.0),
+            v(x0, -1.0),
+            v(x1, 1.0),
+            v(x1, -1.0),
+            v(x0, -1.0),
+        ]
+    };
+
+    assert_eq!(h.begin_scene(), 0);
+    // Depth A: left half occluded at 0.25, right half stays at the clear.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(-1.0, 0.0, 0.25)),
+        0,
+        "occluder into depth A"
+    );
+    // Depth B: cleared (killing the A→B carry), right half occluded at 0.25.
+    assert_eq!(h.set_depth_stencil_surface(&b.surface_level(0)), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(0.0, 1.0, 0.25)),
+        0,
+        "occluder into depth B"
+    );
+    // Rebind A with no clear: the carry must hand it B's contents (right
+    // blocked at 0.25, left back at 1.0), not leave its own.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    let full = |z: f32, color: u32| {
+        let v = |x: f32, y: f32| PosColorVertex { x, y, z, color };
+        [
+            v(-1.0, 1.0),
+            v(1.0, 1.0),
+            v(-1.0, -1.0),
+            v(1.0, 1.0),
+            v(1.0, -1.0),
+            v(-1.0, -1.0),
+        ]
+    };
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full(0.5, GREEN)),
+        0,
+        "z-tested full-screen quad"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "left half passes: the inherited depth is clear there"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        BLACK,
+        "right half fails: the inherited depth carries B's occluder"
+    );
 }

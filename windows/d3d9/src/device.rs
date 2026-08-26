@@ -5,6 +5,9 @@ use std::sync::{
 };
 
 use log::{debug, error, info, trace, warn};
+
+mod frame_dump;
+mod mem_watch;
 use mtld3d_core::{
     caps,
     convert::{
@@ -57,15 +60,15 @@ use mtld3d_types::{
     D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTSS_BUMPENVLOFFSET,
     D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
+    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY,
     D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
     TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOINTERFACE, E_NOTIMPL, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOTIMPL, LOG_TARGET,
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
@@ -502,6 +505,21 @@ pub struct DeviceInner {
     bound_buffers: BoundBuffers,
     shader_bindings: ShaderBindings,
     stage_bindings: StageBindings,
+    /// Vertex texture fetch slots (`D3DVERTEXTEXTURESAMPLER0..3`).
+    ///
+    /// Bound-slot refcounts like `StageBindings`; the encoder mirror is
+    /// pushed via ops at set time rather than riding the per-draw
+    /// snapshot, since vertex textures change orders of magnitude less
+    /// often than draws.
+    vertex_textures: [CachedComPtr<crate::texture::Direct3DTexture9, Bound>; 4],
+    /// Sampler state for the vertex slots, for `GetSamplerState`.
+    vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
+    /// The last texture-backed depth-stencil bind, as `(texture, width, height)`.
+    ///
+    /// Read by the `depth.aliasSameSize` carry: a bind of a *different*
+    /// texture with equal dimensions inherits this one's contents (see
+    /// the config key's doc). Dimensions are those of the bound mip.
+    last_sized_depth: Option<(TextureId, u32, u32)>,
     /// In-progress `BeginStateBlock` recording.
     ///
     /// `Some(..)` between a successful `BeginStateBlock` and its matching
@@ -580,6 +598,8 @@ pub struct DeviceInner {
     /// every frame starts with `snapshot_dirty == all()` so every field is
     /// freshly populated before the cached state is composed.
     snapshot_cache: CurrentSnapshot,
+    /// The Ctrl+Shift+D one-frame draw-state dump, see `frame_dump`.
+    frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
     /// Input to FF VS/PS key construction; not part of `CurrentSnapshot` (the
@@ -736,6 +756,21 @@ bitflags::bitflags! {
         /// `mtld3d_core::vs_draw::build_vs_draw_bytes` over the point render
         /// states, bound for every draw.
         const VS_DRAW     = 1 << 14;
+        /// VS boolean-constant bitmask (vertex slot 26).
+        ///
+        /// `vs_constants_b`, consumed by a VS reading a dynamic (non-`defb`)
+        /// boolean constant.
+        const VS_CONST_B  = 1 << 15;
+        /// PS integer-constant file bytes (fragment slot 11).
+        ///
+        /// `ps_constants_i`, consumed by a PS reading a dynamic (non-`defi`)
+        /// integer constant.
+        const PS_CONST_I  = 1 << 16;
+        /// PS boolean-constant bitmask (fragment slot 10).
+        ///
+        /// `ps_constants_b`, consumed by a PS reading a dynamic (non-`defb`)
+        /// boolean constant.
+        const PS_CONST_B  = 1 << 17;
     }
 }
 
@@ -976,6 +1011,62 @@ impl DeviceInner {
         let decl = self.get_or_create_fvf_decl(fvf);
         self.fvf = fvf;
         self.replace_vertex_decl(decl)
+    }
+
+    /// Release every vertex fetch slot's bound-texture refcount at device teardown.
+    pub fn teardown_vertex_textures(&mut self) {
+        self.vertex_textures = [const { CachedComPtr::null() }; 4];
+    }
+
+    /// One vertex-slot sampler state value, for `GetSamplerState` and capture.
+    #[must_use]
+    pub const fn vertex_sampler_state(&self, slot: usize, type_: usize) -> u32 {
+        self.vertex_sampler_states[slot][type_]
+    }
+
+    /// The texture bound at a vertex fetch slot, for `GetTexture` and capture.
+    #[must_use]
+    pub const fn vertex_texture(&self, slot: usize) -> *mut crate::texture::Direct3DTexture9 {
+        self.vertex_textures[slot].raw()
+    }
+
+    /// Store one vertex-slot sampler state and mirror the row to the encoder.
+    pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
+        self.vertex_sampler_states[slot][type_] = value;
+        let state = self.vertex_sampler_states[slot];
+        self.push_op(Box::new(move |enc| {
+            enc.set_vertex_sampler_binding(slot, state);
+        }));
+    }
+
+    /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
+    ///
+    /// Swaps the bound-slot refcount, flushes the texture's dirty mips
+    /// (vertex slots are off the snapshot path that flushes fragment
+    /// binds), and mirrors the id to the encoder. Later CPU writes to a
+    /// texture bound ONLY here reach the GPU on its next fragment bind or
+    /// re-bind, a shape no known title uses (the fetched textures are
+    /// render targets).
+    pub fn set_vertex_texture_slot(
+        &mut self,
+        slot: usize,
+        tex: *mut crate::texture::Direct3DTexture9,
+    ) {
+        // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
+        // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
+        self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
+        let id = if tex.is_null() {
+            None
+        } else {
+            // SAFETY: non-null per the branch; live per D3D9 lifetime rules.
+            let ti = unsafe { (*tex).inner_mut() };
+            crate::texture::flush_dirty_mips(ti, self);
+            // SAFETY: as above.
+            Some(unsafe { (*tex).texture_id() })
+        };
+        self.push_op(Box::new(move |enc| {
+            enc.set_vertex_texture_binding(slot, id);
+        }));
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -1298,16 +1389,42 @@ impl DeviceInner {
         depth_has_stencil: bool,
     ) {
         self.push_op(Box::new(move |enc| {
-            let depth_texture = match binding {
-                DepthBinding::None => MetalHandle::NULL,
-                DepthBinding::Eager(h) => h,
-                // SAFETY: `get_or_create_texture` returns a Metal texture
-                // handle from the typed `texture_cache` via `.raw()`.
-                DepthBinding::Lazy(info) => unsafe {
-                    MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
-                },
+            let (depth_texture, level, desc) = match binding {
+                DepthBinding::None => (
+                    MetalHandle::NULL,
+                    0,
+                    (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
+                ),
+                DepthBinding::Eager(h) => {
+                    let (w, hgt) = enc.backbuffer_size();
+                    let format = if depth_has_stencil {
+                        mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8
+                    } else {
+                        mtld3d_shared::mtl::PixelFormat::Depth32Float
+                    };
+                    (h, 0, (w, hgt, format))
+                }
+                DepthBinding::Lazy(info, level) => {
+                    // SAFETY: `get_or_create_texture` returns a Metal texture
+                    // handle from the typed `texture_cache` via `.raw()`.
+                    let handle = unsafe {
+                        MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
+                    };
+                    let desc = (
+                        (info.width >> level).max(1),
+                        (info.height >> level).max(1),
+                        info.pixel_format,
+                    );
+                    (handle, level, desc)
+                }
             };
-            enc.set_depth_stencil_attachment(depth_texture, is_sampleable, depth_has_stencil);
+            enc.set_depth_attachment_desc(desc.0, desc.1, desc.2);
+            enc.set_depth_stencil_attachment_level(
+                depth_texture,
+                level,
+                is_sampleable,
+                depth_has_stencil,
+            );
         }));
     }
 
@@ -1500,6 +1617,9 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self, new_frame: FrameData) {
+        // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
+        // the diagnostics that run once per frame poll from this point.
+        crate::capture::poll();
         let frame = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
@@ -1508,6 +1628,8 @@ impl DeviceInner {
         // when it drops at end of scope.
         let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         self.encoder.send_frame(frame);
+        self.frame_dump_present(crate::capture::take_frame_dump_request());
+        self.mem_watch_present();
     }
 
     pub const fn perf_mut(&mut self) -> &mut ApiPerfState {
@@ -1834,6 +1956,14 @@ impl DeviceInner {
         self.bound_buffers.teardown();
         self.stage_bindings
             .reset_to_defaults(&[mtld3d_types::sampler_state_defaults(); STAGE_COUNT]);
+        // Vertex fetch slots unbind like the fragment stages; the encoder
+        // mirror clears with them.
+        for slot in 0..self.vertex_textures.len() {
+            if !self.vertex_textures[slot].raw().is_null() {
+                self.set_vertex_texture_slot(slot, core::ptr::null_mut());
+            }
+        }
+        self.vertex_sampler_states = [mtld3d_types::sampler_state_defaults(); 4];
         self.replace_vertex_decl(core::ptr::null_mut());
         self.shader_bindings
             .replace_vertex_shader(core::ptr::null_mut());
@@ -2224,6 +2354,9 @@ impl Direct3DDevice9 {
             bound_buffers: BoundBuffers::new(),
             shader_bindings: ShaderBindings::new(),
             stage_bindings: StageBindings::new(&info.sampler_states),
+            vertex_textures: [const { CachedComPtr::null() }; 4],
+            vertex_sampler_states: [mtld3d_types::sampler_state_defaults(); 4],
+            last_sized_depth: None,
             recording_state_block: None,
             pending_display_sync_enabled: None,
             last_color_rt_binding: None,
@@ -2233,6 +2366,7 @@ impl Direct3DDevice9 {
             live_textures: Mutex::new(Vec::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: CurrentSnapshot::EMPTY,
+            frame_dump: frame_dump::FrameDump::IDLE,
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
@@ -2657,11 +2791,21 @@ extern "system" fn device_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DDevice9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DDEVICE9,
+            ],
+            device_add_ref,
+            "IDirect3DDevice9",
+        )
+    }
 }
 
 extern "system" fn device_add_ref(this: *mut c_void) -> u32 {
@@ -2751,6 +2895,7 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         device_inner.bound_rt_mut().teardown();
         device_inner.bound_buffers_mut().teardown();
         device_inner.stage_bindings_mut().teardown();
+        device_inner.teardown_vertex_textures();
         device_inner.replace_vertex_decl(core::ptr::null_mut());
 
         // Finalize the device-owned implicit RT + depth-stencil surfaces. They
@@ -2937,7 +3082,17 @@ extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let used = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
         .map_or(0, |obj| obj.inner().vram_bytes_used.load(Ordering::Acquire));
-    u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+    let available =
+        u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+    // Games size their texture budgets from this call or from DXGI; the
+    // one-time line tells which path a title took when its settings menu
+    // shows a surprising video-memory figure.
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "IDirect3DDevice9::GetAvailableTextureMem → {} MiB (first call)",
+        available >> 20
+    );
+    available
 }
 
 extern "system" fn device_evict_managed_resources(this: *mut c_void) -> i32 {
@@ -2995,7 +3150,11 @@ extern "system" fn device_get_device_caps(this: *mut c_void, caps: *mut D3DCAPS9
     }
     // SAFETY: `caps` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `D3DCAPS9` slot owned by the caller.
-    caps::fill(unsafe { &mut *caps }, crate::config::CONFIG.caps_all);
+    caps::fill(
+        unsafe { &mut *caps },
+        crate::config::CONFIG.caps_all,
+        crate::direct3d9::sampler_border_supported(),
+    );
     0 // S_OK
 }
 
@@ -3513,7 +3672,6 @@ extern "system" fn device_present(
     _dirty_region: *const c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Frame);
-    crate::capture::poll();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -3834,6 +3992,18 @@ extern "system" fn device_create_texture(
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
     unsafe { crate::com_ref::com_register_child(tex_ptr) };
+    // Target textures (render target / depth-stencil usage) are rare and
+    // long-lived, and which of them a game keeps, releases, or re-creates
+    // decides how cross-pass data flows; log their lifecycle unconditionally.
+    if usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) != 0 {
+        // SAFETY: `tex_ptr` is the freshly created, live texture from above.
+        let id = unsafe { (*tex_ptr).texture_id() };
+        debug!(
+            target: LOG_TARGET,
+            "target texture created: {id:?} fmt={format:#x} {width}x{height} usage={usage:#x} \
+             ptr={tex_ptr:p}"
+        );
+    }
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     0 // S_OK
@@ -3853,6 +4023,9 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
         return;
     }
     for level in 0..levels {
+        if inner.staging_is_dropped(level as usize) {
+            continue;
+        }
         dev.push_staging_warmup(StagingWarmupEntry {
             texture_id,
             level,
@@ -3938,16 +4111,6 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    if levels > 1 {
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: u64::from(levels),
-            "reject CreateTexture depth levels={levels} → INVALIDCALL (mip chains not supported on depth)"
-        );
-        null_out(texture);
-        return D3DERR_INVALIDCALL;
-    }
-
     let Some(metal_pixel_format) = mtld3d_core::format::map_d3d_depth_format(format) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
@@ -3958,13 +4121,20 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         return D3DERR_INVALIDCALL;
     };
 
-    let actual_levels = 1u32;
+    // A mip chain on a depth texture is an engine's depth pyramid: each level
+    // is rendered into through `GetSurfaceLevel(n)` bound as the depth
+    // attachment and sampled back at a coarser resolution.
+    let actual_levels = if levels == 0 {
+        compute_mip_count(width, height)
+    } else {
+        levels
+    };
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
 
     trace!(
         target: LOG_TARGET,
-        "CreateTexture depth {width}x{height} format={format} → sampleable shadow map"
+        "CreateTexture depth {width}x{height} levels={actual_levels} format={format} → sampleable shadow map"
     );
 
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -3996,12 +4166,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         block_h: 1,
         block_bytes: 0,
         staging: Vec::new(),
-        // Single mip carries the full texture dimensions so GetLevelDesc
-        // returns the right size; no `bytes_per_row` since there's no
-        // CPU staging path.
-        mip_widths: vec![width],
-        mip_heights: vec![height],
-        mip_bytes_per_row: vec![0],
+        // Per-level dimensions so `GetLevelDesc` reports each mip; no
+        // `bytes_per_row` since there's no CPU staging path.
+        mip_widths: (0..actual_levels).map(|l| (width >> l).max(1)).collect(),
+        mip_heights: (0..actual_levels).map(|l| (height >> l).max(1)).collect(),
+        mip_bytes_per_row: vec![0; actual_levels as usize],
     });
 
     // Queue the eager `MTLTexture` create (sampleable shadow map path).
@@ -4011,6 +4180,17 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
     unsafe { crate::com_ref::com_register_child(tex_ptr) };
+    // Mirror of the colour path's "target texture created" line; the depth
+    // path returns before that one runs.
+    {
+        // SAFETY: `tex_ptr` is the freshly created, live texture from above.
+        let id = unsafe { (*tex_ptr).texture_id() };
+        debug!(
+            target: LOG_TARGET,
+            "target texture created: {id:?} fmt={format:#x} {width}x{height} usage={usage:#x} \
+             ptr={tex_ptr:p}"
+        );
+    }
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     D3D_OK
@@ -4765,6 +4945,16 @@ extern "system" fn device_update_surface(
     let Some(dst_surf) = (unsafe { InPtr::<crate::surface::Direct3DSurface9>::opt(dst) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    if let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        && obj.inner().frame_dump.active
+    {
+        obj.inner().frame_dump_event(&format!(
+            "UpdateSurface(src={}, dst={})",
+            frame_dump::surface_label(src),
+            frame_dump::surface_label(dst)
+        ));
+    }
     // D3D9 rejects UpdateSurface when either endpoint has an outstanding lock.
     if src_surf.is_locked() || dst_surf.is_locked() {
         mtld3d_shared::log_once_warn!(
@@ -4869,6 +5059,17 @@ extern "system" fn device_update_texture(
     let dst_parent = dst.cast::<crate::texture::Direct3DTexture9>();
     if std::ptr::eq(src_parent.cast_const(), dst_parent.cast_const()) {
         return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    if let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
+        && obj.inner().frame_dump.active
+    {
+        // SAFETY: `src_parent` is a non-null live base-texture wrapper.
+        let src_id = unsafe { (*src_parent).texture_id() };
+        // SAFETY: `dst_parent` is a non-null live base-texture wrapper.
+        let dst_id = unsafe { (*dst_parent).texture_id() };
+        obj.inner()
+            .frame_dump_event(&format!("UpdateTexture(src={src_id:?}, dst={dst_id:?})"));
     }
     // SAFETY: both pointers are non-null live base-texture wrappers. All three
     // texture interfaces share the same wrapper layout.
@@ -4990,6 +5191,22 @@ extern "system" fn device_update_texture(
         // SAFETY: `src_parent` is a live texture distinct from `dst_parent`
         // (checked via `ptr::eq` above).
         unsafe { (*src_parent).inner_mut() }.clear_all_update_dirty();
+        // Eager upload for a destination the game cannot lock: the copy just
+        // wrote the whole payload, and flushing now (instead of at first
+        // bind) lets the level's staging drop immediately. A texture the
+        // game updates but never draws would otherwise hold its copy
+        // indefinitely.
+        // SAFETY: `dst_parent` is the live destination texture and `this`
+        // the device; distinct allocations, both live for this call.
+        let dst_ti = unsafe { (*dst_parent).inner_mut() };
+        // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+        let dev_obj = unsafe { InPtrMut::<Direct3DDevice9>::opt(this) };
+        if dst_ti.d3d_pool() == D3DPOOL_DEFAULT
+            && dst_ti.d3d_usage() & D3DUSAGE_DYNAMIC == 0
+            && let Some(obj) = dev_obj
+        {
+            crate::texture::flush_dirty_mips(dst_ti, obj.inner());
+        }
     }
     hr
 }
@@ -5012,6 +5229,13 @@ extern "system" fn device_get_render_target_data(
     let Some(dst_surf) = (unsafe { InPtr::<Direct3DSurface9>::opt(dst) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if obj.inner().frame_dump.active {
+        obj.inner().frame_dump_event(&format!(
+            "GetRenderTargetData(src={}, dst={})",
+            frame_dump::surface_label(rt),
+            frame_dump::surface_label(dst)
+        ));
+    }
     let Some((dst_ptr, dst_len)) = dst_surf.system_memory_blit_dst() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "GetRenderTargetData: dst is not a D3DPOOL_SYSTEMMEM offscreen surface → INVALIDCALL");
@@ -5247,6 +5471,13 @@ extern "system" fn device_stretch_rect(
 
     flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "StretchRect(src={}, dst={}, filter={filter})",
+            frame_dump::surface_label(src),
+            frame_dump::surface_label(dst)
+        ));
+    }
 
     let Some(src_info) = resolve_stretch_surface(dev, src_surf) else {
         mtld3d_shared::log_once_warn_by!(
@@ -5325,6 +5556,9 @@ extern "system" fn device_stretch_rect(
         // discards), and a clear still waiting for a pass on either endpoint
         // is materialized before the copy.
         let mip_level = src_info.mip_level;
+        if dev.frame_dump.active {
+            dev.frame_dump_event("StretchRect: full-surface depth copy queued");
+        }
         dev.push_op(Box::new(move |enc| {
             emit_stretch_rect_blit(
                 enc,
@@ -5457,6 +5691,16 @@ extern "system" fn device_stretch_rect(
     }
 
     let mip_level = src_info.mip_level;
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "StretchRect: {} queued",
+            if render_quad {
+                "render quad"
+            } else {
+                "1:1 blit"
+            }
+        ));
+    }
     dev.push_op(Box::new(move |enc| {
         emit_stretch_rect_blit(
             enc,
@@ -6075,6 +6319,12 @@ extern "system" fn device_color_fill(
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if obj.inner().frame_dump.active {
+        obj.inner().frame_dump_event(&format!(
+            "ColorFill({}, {color:#010x})",
+            frame_dump::surface_label(surface)
+        ));
+    }
     // SAFETY: `surface` is a live IDirect3DSurface9 per the D3D9 ABI.
     let s = unsafe { &*surface.cast::<Direct3DSurface9>() };
     let parent = s.parent_texture();
@@ -6115,8 +6365,9 @@ extern "system" fn device_color_fill(
         return D3D_OK;
     }
     // SAFETY: `parent` non-null (checked); its refcount keeps it alive while
-    // the surface is alive.
-    let tex = unsafe { &*parent };
+    // the surface is alive, and D3D9 objects are single-threaded so the
+    // mutable access is exclusive.
+    let tex = unsafe { &mut *parent };
     // D3D9: ColorFill on a texture surface is valid for a DEFAULT-pool render
     // target AND for a DEFAULT-pool offscreen-plain surface (which owns its
     // internal texture). Managed / sysmem / scratch and an ordinary DEFAULT
@@ -6182,7 +6433,7 @@ extern "system" fn device_color_fill(
     // LockRect (CPU staging), so mirror the fill into staging. The GPU upload
     // below keeps the internal Metal texture coherent for StretchRect/sampling.
     if s.owns_parent_texture() {
-        tex.inner()
+        tex.inner_mut()
             .fill_staging_region(lvl, origin_x, origin_y, region_w, region_h, &pixel);
     }
     let info = tex.inner().texture_info();
@@ -6263,10 +6514,11 @@ extern "system" fn device_create_offscreen_plain_surface(
             null_out(surface);
             return D3DERR_INVALIDCALL;
         }
-        let surf = Direct3DSurface9::new_owned_texture_backed(
-            device_inner,
-            tex_out.cast::<crate::texture::Direct3DTexture9>(),
-        );
+        let tex_ptr = tex_out.cast::<crate::texture::Direct3DTexture9>();
+        // SAFETY: `device_create_texture` just returned this live texture at
+        // refcount 1; nothing else holds it yet.
+        unsafe { (*tex_ptr).inner_mut().mark_offscreen_plain() };
+        let surf = Direct3DSurface9::new_owned_texture_backed(device_inner, tex_ptr);
         // The internal texture (created just above) forwards the device
         // reference, so this owned surface is NOT registered (no double-count).
         // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
@@ -6351,6 +6603,28 @@ extern "system" fn device_set_render_target(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "SetRenderTarget({index}, {})",
+            frame_dump::surface_label(surface)
+        ));
+        // Extra targets feed later passes (a deferred G-buffer's side
+        // planes), and small offscreen targets hold derived data (visibility
+        // probes, sky maps) consumed out of band; queue both for the
+        // frame-end content readback.
+        if !surface.is_null() {
+            // SAFETY: `surface` is a live IDirect3DSurface9 per the ABI.
+            let parent = unsafe { (*surface.cast::<Direct3DSurface9>()).parent_texture() };
+            if !parent.is_null() {
+                // SAFETY: a surface keeps its parent texture alive.
+                let tex = unsafe { &*parent };
+                let small = tex.inner().mip_width(0) <= 512 && tex.inner().mip_height(0) <= 512;
+                if index > 0 || small {
+                    dev.frame_dump_note_readback(tex);
+                }
+            }
+        }
+    }
 
     if surface.is_null() {
         if slot == 0 {
@@ -6595,7 +6869,8 @@ extern "system" fn device_get_render_target(
 enum DepthBinding {
     None,
     Eager(MetalHandle<MTLTextureKind>),
-    Lazy(TextureInfo),
+    /// A texture-backed depth surface: the parent's info and the mip level bound.
+    Lazy(TextureInfo, u32),
 }
 
 extern "system" fn device_set_depth_stencil_surface(
@@ -6608,6 +6883,12 @@ extern "system" fn device_set_depth_stencil_surface(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "SetDepthStencilSurface({})",
+            frame_dump::surface_label(surface)
+        ));
+    }
     let surf = surface.cast::<Direct3DSurface9>();
     // A non-NULL depth-stencil surface must report D3DUSAGE_DEPTHSTENCIL; NULL
     // unbinds the depth buffer. GetDesc reports the true usage (the parent
@@ -6681,7 +6962,30 @@ extern "system" fn device_set_depth_stencil_surface(
             info.texture_id,
             mip
         );
-        DepthBinding::Lazy(info)
+        // The depth.aliasSameSize carry: a different texture bound at the
+        // same dimensions inherits the previous one's contents, matching
+        // the shared physical depth allocation of D3D9-era drivers that
+        // engines of that era rely on (bind one handle, sample the other).
+        if crate::config::CONFIG.depth_alias_same_size {
+            let mip_w = (w >> mip).max(1);
+            let mip_h = (h >> mip).max(1);
+            if let Some((prev_id, pw, ph)) = dev.last_sized_depth
+                && prev_id != info.texture_id
+                && (pw, ph) == (mip_w, mip_h)
+            {
+                let cur_id = info.texture_id;
+                if dev.frame_dump.active {
+                    dev.frame_dump_event(&format!(
+                        "depth-alias carry {prev_id:?} → {cur_id:?} {mip_w}x{mip_h}"
+                    ));
+                }
+                dev.push_op(Box::new(move |enc| {
+                    enc.carry_depth_contents(prev_id, cur_id, mip_w, mip_h);
+                }));
+            }
+            dev.last_sized_depth = Some((info.texture_id, mip_w, mip_h));
+        }
+        DepthBinding::Lazy(info, mip)
     } else {
         // SAFETY: `surf` is non-null (else-if branch) and points to a
         // live surface.
@@ -6703,7 +7007,7 @@ extern "system" fn device_set_depth_stencil_surface(
     // sampleable shadow maps (Rule B short-circuit), since they may
     // be sampled in a future frame even if no sample lands this
     // frame — typical of cascade-3 in CSM rotations.
-    let is_sampleable = matches!(binding, DepthBinding::Lazy(_));
+    let is_sampleable = matches!(binding, DepthBinding::Lazy(..));
     // Whether the bound depth attachment is a combined depth+stencil format
     // (D24S8 etc. → the combined Metal texture), so the clear-quad / draw
     // pipelines declare matching depth/stencil attachment formats. Mirrors
@@ -6861,6 +7165,13 @@ extern "system" fn device_clear(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.frame_dump.active {
+        let (rt, ds) = dev.frame_dump_target_labels();
+        dev.frame_dump_event(&format!(
+            "clear flags={flags:#x} color={color:#010x} z={z} stencil={stencil} rects={count} \
+             rt={rt} ds={ds}"
+        ));
+    }
 
     // Clearing depth or stencil with no depth-stencil attachment bound is
     // invalid: a prior `SetDepthStencilSurface(NULL)` leaves no surface to
@@ -7284,6 +7595,34 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    // The 'RESZ' hack: this magic written to POINTSIZE asks the driver to
+    // resolve the bound depth-stencil into the depth texture bound at
+    // stage 0. Advertised via the RESZ fourcc in CheckDeviceFormat;
+    // engines on the matching vendor path use it as their only way to
+    // hand scene depth to a second depth consumer.
+    if state == D3DRS_POINTSIZE && value == 0x7fa0_5000 {
+        let bindings = dev.stage_bindings();
+        let tex = bindings.texture(0);
+        if tex.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve requested with no stage-0 texture bound — skipped"
+            );
+        } else {
+            // SAFETY: a bound stage holds a live texture reference until it
+            // is rebound or released, both on this thread.
+            let tex = unsafe { &*tex };
+            let inner = tex.inner();
+            let (id, w, h) = (tex.texture_id(), inner.mip_width(0), inner.mip_height(0));
+            if dev.frame_dump.active {
+                dev.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
+            }
+            dev.push_op(Box::new(move |enc| {
+                let dst = enc.get_texture_handle_by_id(id);
+                enc.resolve_depth_to_texture(dst, w, h);
+            }));
+        }
+    }
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::RenderState { state, value });
         return D3D_OK;
@@ -7425,7 +7764,8 @@ extern "system" fn device_get_texture(
     texture: *mut *mut c_void,
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Texture);
-    if stage >= 8 || texture.is_null() {
+    let vertex_slot = vertex_sampler_slot(stage);
+    if (vertex_slot.is_none() && stage >= 8) || texture.is_null() {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7433,7 +7773,10 @@ extern "system" fn device_get_texture(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    let tex_ptr = dev.stage_bindings().texture(stage as usize);
+    let tex_ptr = vertex_slot.map_or_else(
+        || dev.stage_bindings().texture(stage as usize),
+        |slot| dev.vertex_textures[slot].raw(),
+    );
     if !tex_ptr.is_null() {
         // SAFETY: `tex_ptr` is non-null (checked above) and points to a
         // live `Direct3DTexture9` whose refcount keeps it alive while
@@ -7449,9 +7792,22 @@ extern "system" fn device_get_texture(
     0 // S_OK
 }
 
+/// Map a `D3DVERTEXTEXTURESAMPLER0..3` stage index (257..=260) to a slot.
+///
+/// `SetTexture` / `Set|GetSamplerState` accept these next to the sixteen
+/// fragment stages; everything else in that range stays invalid
+/// (`D3DDMAPSAMPLER` = 256 is displacement mapping, unimplemented).
+pub const fn vertex_sampler_slot(stage: u32) -> Option<usize> {
+    match stage {
+        257..=260 => Some((stage - 257) as usize),
+        _ => None,
+    }
+}
+
 extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *mut c_void) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Texture);
-    if stage as usize >= STAGE_COUNT {
+    let vertex_slot = vertex_sampler_slot(stage);
+    if vertex_slot.is_none() && stage as usize >= STAGE_COUNT {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7471,6 +7827,10 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
         return D3D_OK;
     }
 
+    if let Some(slot) = vertex_slot {
+        dev.set_vertex_texture_slot(slot, new_tex);
+        return D3D_OK;
+    }
     let delta = dev
         .stage_bindings_mut()
         .replace_texture(stage as usize, new_tex);
@@ -7596,7 +7956,11 @@ extern "system" fn device_get_sampler_state(
     value: *mut u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
-    if sampler as usize >= STAGE_COUNT || type_ as usize >= SAMPLER_STATE_COUNT || value.is_null() {
+    let vertex_slot = vertex_sampler_slot(sampler);
+    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
+        || type_ as usize >= SAMPLER_STATE_COUNT
+        || value.is_null()
+    {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7604,12 +7968,17 @@ extern "system" fn device_get_sampler_state(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    let read = vertex_slot.map_or_else(
+        || {
+            dev.stage_bindings()
+                .sampler_state(sampler as usize, type_ as usize)
+        },
+        |slot| dev.vertex_sampler_states[slot][type_ as usize],
+    );
     // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `u32` slot owned by the caller.
     unsafe {
-        *value = dev
-            .stage_bindings()
-            .sampler_state(sampler as usize, type_ as usize);
+        *value = read;
     }
     0 // S_OK
 }
@@ -7621,7 +7990,10 @@ extern "system" fn device_set_sampler_state(
     value: u32,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
-    if sampler as usize >= STAGE_COUNT || type_ as usize >= SAMPLER_STATE_COUNT {
+    let vertex_slot = vertex_sampler_slot(sampler);
+    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
+        || type_ as usize >= SAMPLER_STATE_COUNT
+    {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -7635,6 +8007,10 @@ extern "system" fn device_set_sampler_state(
             type_,
             value,
         });
+        return D3D_OK;
+    }
+    if let Some(slot) = vertex_slot {
+        dev.set_vertex_sampler_slot_state(slot, type_ as usize, value);
         return D3D_OK;
     }
     dev.stage_bindings_mut()
@@ -8645,6 +9021,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 uses_rel_const: vs_obj.uses_rel_const(),
                 provided_input_mask: dev.cached_vs_provided_mask,
                 uses_int_const: vs_obj.uses_int_const(),
+                uses_bool_const: vs_obj.uses_bool_const(),
                 clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
             })
         }
@@ -8664,6 +9041,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 ps_id: ps_obj.shader_id(),
                 max_const_used: clamp_const_rows(ps_obj.max_const_used()),
                 uses_bump_env: ps_obj.uses_bump_env(),
+                uses_int_const: ps_obj.uses_int_const(),
+                uses_bool_const: ps_obj.uses_bool_const(),
                 color_out_mask: ps_obj.color_out_mask(),
             })
         }
@@ -8879,6 +9258,25 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     } else {
         None
     };
+    // VS boolean-constant bitmask (vertex slot 26), same lifecycle as the
+    // integer file above.
+    let vs_bool_const_buf = if dirty.contains(SnapshotDirty::VS_CONST_B) {
+        Some(dev.shader_bindings().vs_constants_b_bits().to_ne_bytes())
+    } else {
+        None
+    };
+    // PS integer / boolean constant files (fragment slots 11 / 10), the
+    // fragment-side twins with the same lifecycle.
+    let ps_int_const_buf = if dirty.contains(SnapshotDirty::PS_CONST_I) {
+        Some(dev.shader_bindings().ps_constants_i_bytes())
+    } else {
+        None
+    };
+    let ps_bool_const_buf = if dirty.contains(SnapshotDirty::PS_CONST_B) {
+        Some(dev.shader_bindings().ps_constants_b_bits().to_ne_bytes())
+    } else {
+        None
+    };
 
     // Phase 2: take scratch + bump dirty pieces + update cache. The
     // const payloads above are fixed stack buffers built in Phase 1, so
@@ -8914,6 +9312,15 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     }
     if let Some(buf) = vs_int_const_buf {
         dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = vs_bool_const_buf {
+        dev.snapshot_cache.vs_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = ps_int_const_buf {
+        dev.snapshot_cache.ps_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+    }
+    if let Some(buf) = ps_bool_const_buf {
+        dev.snapshot_cache.ps_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
     }
     if let Some(buf) = vs_draw_buf {
         dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
@@ -9001,6 +9408,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let snap_nn = NonNull::new(snap_ptr).expect("ScratchArena returned non-null");
     dev.push_op_inline(Op::SetCurrentSnapshot(CurrentSnapshotPtr(snap_nn)));
     dev.snapshot_dirty = SnapshotDirty::empty();
+    if dev.frame_dump.active {
+        dev.frame_dump_draw();
+    }
     drop(bumps_timer);
 }
 
@@ -9706,8 +10116,19 @@ extern "system" fn device_create_vertex_shader(
         return D3DERR_INVALIDCALL;
     }
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
-    let uses_rel_const = program.uses_relative_const_addressing();
-    let uses_int_const = program.uses_dynamic_int_constants();
+    let mut const_usage = crate::vertex_shader::VsConstUsage::empty();
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_REL_CONST,
+        program.uses_relative_const_addressing(),
+    );
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_INT_CONST,
+        program.uses_dynamic_int_constants(),
+    );
+    const_usage.set(
+        crate::vertex_shader::VsConstUsage::USES_BOOL_CONST,
+        program.uses_dynamic_bool_constants(),
+    );
     // Extract the input-register semantics so `snapshot_shared` can resolve
     // a bound vertex declaration's elements → `[[attribute(N)]]` indices
     // without a trip to the encoder thread.
@@ -9726,8 +10147,7 @@ extern "system" fn device_create_vertex_shader(
         obj.inner_ptr(),
         shader_id,
         max_const_used,
-        uses_rel_const,
-        uses_int_const,
+        const_usage,
         input_semantics,
         bytecode.into_boxed_slice(),
     );
@@ -9953,7 +10373,7 @@ extern "system" fn device_set_vertex_shader_constant_i(
     }
     // A VS reading a dynamic integer constant (a `loop`/`rep` counter) consumes
     // these via the `vs_i` buffer (vertex slot 14), captured into the snapshot
-    // on change. Boolean constants remain store-only (no shader consumer yet).
+    // on change. Boolean constants take the same route as a bitmask.
     let changed = dev
         .shader_bindings_mut()
         .write_vs_constants_i(start_register, slice);
@@ -10012,9 +10432,15 @@ extern "system" fn device_set_vertex_shader_constant_b(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
+    // A VS reading a dynamic boolean constant (a static `if b0`) consumes
+    // these as the `vs_b` bitmask (vertex slot 26), captured into the
+    // snapshot on change.
+    let changed = dev
+        .shader_bindings_mut()
         .write_vs_constants_b(start_register, slice);
+    if changed {
+        dev.mark_snapshot_dirty(SnapshotDirty::VS_CONST_B);
+    }
     0
 }
 
@@ -10272,7 +10698,19 @@ extern "system" fn device_create_pixel_shader(
         return D3DERR_INVALIDCALL;
     }
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
-    let uses_bump_env = program.uses_bump_env();
+    let mut usage = crate::pixel_shader::PsUsage::empty();
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_BUMP_ENV,
+        program.uses_bump_env(),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_INT_CONST,
+        program.uses_dynamic_int_constants(),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_BOOL_CONST,
+        program.uses_dynamic_bool_constants(),
+    );
     let color_out_mask = program.color_out_mask();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
@@ -10285,7 +10723,7 @@ extern "system" fn device_create_pixel_shader(
         obj.inner_ptr(),
         shader_id,
         max_const_used,
-        uses_bump_env,
+        usage,
         color_out_mask,
         bytecode.into_boxed_slice(),
     );
@@ -10441,9 +10879,12 @@ extern "system" fn device_set_pixel_shader_constant_i(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
-        .write_ps_constants_i(start_register, slice);
+    if dev
+        .shader_bindings_mut()
+        .write_ps_constants_i(start_register, slice)
+    {
+        dev.mark_snapshot_dirty(SnapshotDirty::PS_CONST_I);
+    }
     0
 }
 
@@ -10496,9 +10937,12 @@ extern "system" fn device_set_pixel_shader_constant_b(
         });
         return D3D_OK;
     }
-    // Stored only — see `device_set_vertex_shader_constant_i`.
-    dev.shader_bindings_mut()
-        .write_ps_constants_b(start_register, slice);
+    if dev
+        .shader_bindings_mut()
+        .write_ps_constants_b(start_register, slice)
+    {
+        dev.mark_snapshot_dirty(SnapshotDirty::PS_CONST_B);
+    }
     0
 }
 
@@ -10799,6 +11243,11 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
     if usage & D3DUSAGE_NONSECURE != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Create{kind}: D3DUSAGE_NONSECURE set but non-secure hint ignored");
     }
+    // D3DUSAGE_DMAP marks a displacement map for the N-patch tessellator,
+    // which no modern driver runs either; the texture is an ordinary texture.
+    if usage & D3DUSAGE_DMAP != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "Create{kind}: D3DUSAGE_DMAP set but displacement mapping not implemented");
+    }
 
     // Surface any remaining unknown bits (beyond the union of honored + warned).
     let known = D3DUSAGE_RENDERTARGET
@@ -10811,7 +11260,8 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
         | D3DUSAGE_NPATCHES
         | D3DUSAGE_DYNAMIC
         | D3DUSAGE_AUTOGENMIPMAP
-        | D3DUSAGE_NONSECURE;
+        | D3DUSAGE_NONSECURE
+        | D3DUSAGE_DMAP;
     let unknown = usage & !known;
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

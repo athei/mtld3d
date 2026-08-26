@@ -539,9 +539,10 @@ fn resolve_attrs_skips_unused_semantics() {
     let resolved = resolve_attrs_for_vs(&elems, &semantics);
     assert_eq!(resolved.attrs.len(), 1);
     assert_eq!(resolved.attrs[0].attr_index, 0);
-    // The extent still covers the normal element so the vertex buffer
-    // layout is correct even with an unused attribute.
-    assert_eq!(resolved.extents[0], 24);
+    // The extent covers only the consumed position: the unconsumed normal
+    // is not in the descriptor, and counting it would force the layout
+    // stride past a packed buffer's true per-vertex span.
+    assert_eq!(resolved.extents[0], 12);
 }
 
 #[test]
@@ -559,7 +560,7 @@ fn resolve_attrs_for_ff_matches_ff_convention() {
 #[test]
 fn resolve_attrs_keeps_each_stream_separate() {
     // POSITION on stream 0, COLOR0 on stream 1 at offset 0, an unconsumed
-    // NORMAL on stream 1 past it: stream 1's extent covers the normal,
+    // NORMAL on stream 1 past it: stream 1's extent stops at the colour,
     // the colour attribute points at buffer 1, and both streams are used.
     let elems = [
         pos3(),
@@ -598,14 +599,14 @@ fn resolve_attrs_keeps_each_stream_separate() {
     assert_eq!(resolved.attrs[1].buffer_index, 1);
     assert_eq!(resolved.attrs[1].attr_index, 1);
     assert_eq!(resolved.extents[0], 12);
-    assert_eq!(resolved.extents[1], 16);
+    assert_eq!(resolved.extents[1], 4);
     assert_eq!(resolved.used_streams, 0b11);
 
-    // A stream that only carries unconsumed elements is not used, but its
-    // extent is still reported.
+    // A stream that only carries unconsumed elements is not used and
+    // reports no extent — nothing in the descriptor reads from it.
     let resolved = resolve_attrs_for_vs(&elems, &semantics[..1]);
     assert_eq!(resolved.used_streams, 0b1);
-    assert_eq!(resolved.extents[1], 16);
+    assert_eq!(resolved.extents[1], 0);
 
     // The FF path maps streams the same way.
     let resolved = resolve_attrs_for_ff(&elems);
@@ -956,5 +957,32 @@ fn f32_to_f16_bits_matches_the_ieee_encoding() {
     assert_eq!(
         f32_to_f16_bits(3.0f32.mul_add(0.000_488_281_25, 1.0)),
         0x3c02
+    );
+}
+
+#[test]
+fn border_addressing_and_colour_presets() {
+    use mtld3d_shared::mtl::BorderColor;
+    assert_eq!(
+        d3d_to_metal_address_mode(D3DTADDRESS_BORDER),
+        AddressMode::ClampToBorderColor
+    );
+    assert_eq!(d3d_border_color_to_metal(0), BorderColor::TransparentBlack);
+    assert_eq!(
+        d3d_border_color_to_metal(0xFF00_0000),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FFFF),
+        BorderColor::OpaqueWhite
+    );
+    // Anything else has no preset and falls back to opaque black.
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FF00),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0x00FF_FFFF),
+        BorderColor::OpaqueBlack
     );
 }

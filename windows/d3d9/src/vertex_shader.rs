@@ -4,7 +4,7 @@ use mtld3d_core::{convert::InputSemantic, ids::ProgramId};
 use mtld3d_shared::InPtr;
 use mtld3d_types::{Guid, IDirect3DVertexShader9Vtbl};
 
-use super::{D3DERR_INVALIDCALL, E_NOINTERFACE, com_ref::ComUnknown, device::DeviceInner};
+use super::{D3DERR_INVALIDCALL, com_ref::ComUnknown, device::DeviceInner};
 
 static DIRECT3D_VERTEX_SHADER9_VTBL: IDirect3DVertexShader9Vtbl = IDirect3DVertexShader9Vtbl {
     query_interface: vs_query_interface,
@@ -36,14 +36,10 @@ impl Direct3DVertexShader9 {
         device_inner: *mut DeviceInner,
         shader_id: ProgramId,
         max_const_used: u32,
-        uses_rel_const: bool,
-        uses_int_const: bool,
+        flags: VsConstUsage,
         input_semantics: Vec<InputSemantic>,
         bytecode: Box<[u32]>,
     ) -> Self {
-        let mut flags = VsConstUsage::empty();
-        flags.set(VsConstUsage::USES_REL_CONST, uses_rel_const);
-        flags.set(VsConstUsage::USES_INT_CONST, uses_int_const);
         let inner = Box::into_raw(Box::new(VertexShaderInner {
             device_inner,
             shader_id,
@@ -93,6 +89,10 @@ impl Direct3DVertexShader9 {
         self.inner().flags.contains(VsConstUsage::USES_INT_CONST)
     }
 
+    pub fn uses_bool_const(&self) -> bool {
+        self.inner().flags.contains(VsConstUsage::USES_BOOL_CONST)
+    }
+
     pub fn input_semantics(&self) -> &[InputSemantic] {
         &self.inner().input_semantics
     }
@@ -122,6 +122,12 @@ bitflags::bitflags! {
         /// `SetVertexShaderConstantI`; such draws upload + bind the
         /// integer-constant buffer (vertex slot 14).
         const USES_INT_CONST = 1 << 1;
+        /// Reads a *dynamic* boolean constant.
+        ///
+        /// A non-`defb` `bN`, typically the condition of a static `if` fed by
+        /// `SetVertexShaderConstantB`; such draws bind the boolean-constant
+        /// bitmask (vertex slot 26).
+        const USES_BOOL_CONST = 1 << 2;
     }
 }
 
@@ -151,12 +157,25 @@ fn vs_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
 
 extern "system" fn vs_query_interface(
     this: *mut c_void,
-    _riid: *const Guid,
-    _ppv: *mut *mut c_void,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = vs_timer(this);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DVertexShader9::QueryInterface → E_NOINTERFACE");
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DVERTEXSHADER9,
+            ],
+            vs_add_ref,
+            "IDirect3DVertexShader9",
+        )
+    }
 }
 
 extern "system" fn vs_add_ref(this: *mut c_void) -> u32 {

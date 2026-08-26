@@ -46,11 +46,11 @@ use mtld3d_core::{
     },
 };
 use mtld3d_shared::{
-    BlitCommand, BufferCreateDesc, Command, CommandType, CompileShaderLibraryParams,
-    CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
-    CreateTexturesBatchParams, DestroyResourcesBulkParams, EnsureBlitPipelineParams,
-    EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams, MetalHandle,
-    NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
+    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType,
+    CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
+    CreateBuffersBatchParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
+    MetalHandle, NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
     TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
@@ -335,6 +335,16 @@ struct SamplerResolveMemo {
 /// `mip_staging_buffers` is sized to the texture's `levels` count but
 /// entries stay unpopulated (`handle == 0`) until the first upload for
 /// that mip.
+/// A scratch copy of a depth attachment handed to draws that sample it.
+struct DepthSnapshot {
+    handle: MetalHandle<MTLTextureKind>,
+    width: u32,
+    height: u32,
+    format: mtld3d_shared::mtl::PixelFormat,
+    /// `depth_write_epoch` the copy reflects.
+    epoch: u64,
+}
+
 pub struct TextureGpuState {
     pub mtl_texture: MetalHandle<MTLTextureKind>,
     pub mip_staging_buffers: Vec<MipStagingBuffer>,
@@ -590,6 +600,22 @@ impl Default for PsSamplerDecls {
     }
 }
 
+/// One vertex-sampler slot's binding, mirrored from the device.
+struct VertexTexBinding {
+    /// Bound texture, or `None` for an empty slot.
+    texture_id: Option<mtld3d_core::ids::TextureId>,
+    sampler_state: [u32; SAMPLER_STATE_COUNT],
+}
+
+impl Default for VertexTexBinding {
+    fn default() -> Self {
+        Self {
+            texture_id: None,
+            sampler_state: mtld3d_types::sampler_state_defaults(),
+        }
+    }
+}
+
 impl PsSamplerDecls {
     /// Collect the declared samplers from a parsed program (empty for a VS).
     ///
@@ -726,6 +752,16 @@ pub struct FrameEncoder {
     // Per-frame config (seeded by begin_frame).
     backbuffer_width: u32,
     backbuffer_height: u32,
+    /// Size and pixel format of the bound depth attachment.
+    ///
+    /// Read by `depth_snapshot_for_sampling` to size its copy.
+    depth_attachment_desc: (u32, u32, mtld3d_shared::mtl::PixelFormat),
+    /// Bumped by every depth-writing draw and every depth clear.
+    ///
+    /// A snapshot taken under an older value is stale.
+    depth_write_epoch: u64,
+    /// Scratch copies of depth attachments that draws sampled while bound, by source handle.
+    depth_snapshots: FxHashMap<u64, DepthSnapshot>,
 
     /// Every per-frame and rolling telemetry field.
     ///
@@ -839,6 +875,13 @@ pub struct FrameEncoder {
     /// invalidated: `sampler_cache` entries live until encoder shutdown,
     /// so a memoized handle can't dangle.
     sampler_resolve_memo: [Option<SamplerResolveMemo>; crate::stage_bindings::STAGE_COUNT],
+    /// Vertex texture fetch slots 0..3, mirrored from the device via ops.
+    ///
+    /// `SetTexture` / `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3`
+    /// push updates; `emit_draw` binds the slots a programmable VS
+    /// declares samplers for. Kept off the per-draw snapshot: vertex
+    /// textures change orders of magnitude less often than draws.
+    vertex_tex_bindings: [VertexTexBinding; mtld3d_core::passes::VERTEX_SAMPLER_SLOTS],
     /// Lazy `MTLBuffer` wrappers for bound VBs / IBs, keyed by their process-unique `BufferId`.
     ///
     /// One entry per live backing; on Lock-rename the API thread pushes
@@ -1193,6 +1236,9 @@ impl FrameEncoder {
             current_submit_seq: 0,
             backbuffer_width: 0,
             backbuffer_height: 0,
+            depth_attachment_desc: (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
+            depth_write_epoch: 0,
+            depth_snapshots: FxHashMap::default(),
             perf: EncoderPerfState::new(),
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
@@ -1213,6 +1259,7 @@ impl FrameEncoder {
             texture_cache: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
+            vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
             buffer_cache: FxHashMap::default(),
             pending_resource_retention: VecDeque::new(),
             fan_index_buffer: FanIndexBuffer::EMPTY,
@@ -2253,6 +2300,261 @@ impl FrameEncoder {
     ///
     /// Proxies `PassState::current_depth_texture` for the
     /// `mtld3d::d3d9::caster` trace probe in `emit_draw`.
+    /// Record what the depth attachment just bound looks like.
+    ///
+    /// A snapshot copy of it (see [`Self::depth_snapshot_for_sampling`]) has
+    /// to match in size and format, and the encoder's texture cache keeps
+    /// only handles.
+    pub const fn set_depth_attachment_desc(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: mtld3d_shared::mtl::PixelFormat,
+    ) {
+        self.depth_attachment_desc = (width, height, format);
+    }
+
+    /// The default depth attachment is backbuffer-sized.
+    #[must_use]
+    pub const fn backbuffer_size(&self) -> (u32, u32) {
+        (self.backbuffer_width, self.backbuffer_height)
+    }
+
+    /// Note that the bound depth attachment is about to be written.
+    ///
+    /// Depth-writing draws and depth clears call this; a snapshot taken
+    /// before the bump no longer reflects the attachment.
+    pub const fn bump_depth_write_epoch(&mut self) {
+        self.depth_write_epoch += 1;
+    }
+
+    /// Metal handle of the snapshot copy kept for a depth attachment, or 0.
+    ///
+    /// Diagnostics only: the frame dump reads the copy back, since that is
+    /// what depth-sampling draws actually saw.
+    #[must_use]
+    pub fn depth_snapshot_handle(&self, src_raw: u64) -> u64 {
+        self.depth_snapshots
+            .get(&src_raw)
+            .map_or(0, |s| s.handle.raw())
+    }
+
+    /// Resolve the bound depth attachment into `dst` (the RESZ hack).
+    ///
+    /// The magic `SetRenderState(POINTSIZE, 0x7fa05000)` asks for the
+    /// current depth-stencil contents in the texture bound at stage 0.
+    /// Mechanically identical to the snapshot copy: close the pass, queue
+    /// a full-surface depth blit ahead of the next one. The destination
+    /// keeps its own contents when no depth attachment is bound (the
+    /// resolve is then a no-op, as on hardware).
+    pub fn resolve_depth_to_texture(&mut self, dst: u64, dst_w: u32, dst_h: u32) {
+        let src = self.pass_state.current_depth_texture();
+        if src.is_null() || dst == 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve without a bound depth attachment or destination texture — skipped"
+            );
+            return;
+        }
+        let (width, height, _) = self.depth_attachment_desc;
+        if width != dst_w || height != dst_h {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve size mismatch: depth {width}x{height} vs destination \
+                 {dst_w}x{dst_h} — skipped"
+            );
+            return;
+        }
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "RESZ resolve: copying the bound depth attachment ({width}x{height}) into the \
+             stage-0 texture"
+        );
+        self.end_current_pass("resz");
+        self.pass_state.push_pending_leading_blit(BlitCommand {
+            cmd: BlitCommandType::CopyTextureToTexture as u32,
+            mip_level: 0,
+            src_handle: src.raw(),
+            dst_handle: dst,
+            src_offset: 0,
+            bytes_per_row: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: width,
+            region_h: height,
+            dst_offset: 0,
+            byte_size: 0,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
+        });
+    }
+
+    /// Copy one depth texture's contents into another (`depth.aliasSameSize`).
+    ///
+    /// The bind-time carry for engines that expect equal-size depth-stencil
+    /// surfaces to share one physical allocation: the destination is about to
+    /// be bound as the depth attachment and must open on the source's
+    /// contents. Same shape as the RESZ resolve: close the pass, queue a
+    /// full-surface blit ahead of the next one (which registers the
+    /// destination as blit-written, so its first-use load stays `Load`).
+    pub fn carry_depth_contents(&mut self, src_id: TextureId, dst_id: TextureId, w: u32, h: u32) {
+        let src = self.get_texture_handle_by_id(src_id);
+        let dst = self.get_texture_handle_by_id(dst_id);
+        if src == 0 || dst == 0 || src == dst {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "depth.aliasSameSize: carry skipped (unresolved handle or identical textures)"
+            );
+            return;
+        }
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "depth.aliasSameSize: carrying {w}x{h} depth contents across a same-size bind"
+        );
+        self.end_current_pass("depth-alias");
+        self.pass_state.push_pending_leading_blit(BlitCommand {
+            cmd: BlitCommandType::CopyTextureToTexture as u32,
+            mip_level: 0,
+            src_handle: src,
+            dst_handle: dst,
+            src_offset: 0,
+            bytes_per_row: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: w,
+            region_h: h,
+            dst_offset: 0,
+            byte_size: 0,
+            depth: 1,
+            bytes_per_image: 0,
+            dst_mip_level: 0,
+            pad0: 0,
+        });
+    }
+
+    /// A readable copy of the bound depth attachment, for a draw that samples it.
+    ///
+    /// Metal forbids reading a texture that is an attachment of the running
+    /// pass, and Apple GPUs return garbage rather than the depth. D3D9 allows
+    /// it (a deferred renderer binds its INTZ scene depth for the depth test
+    /// and samples it for position reconstruction in the same draws), with
+    /// the values as of the last write. So: close the pass, queue a blit that
+    /// copies the attachment into a scratch depth texture of the same size
+    /// and format, and hand that copy out. The copy stays valid until a
+    /// depth write or clear bumps the epoch, so a run of light-volume draws
+    /// costs one copy. Returns 0 when no depth attachment is bound or the
+    /// scratch texture cannot be created.
+    pub fn depth_snapshot_for_sampling(&mut self) -> u64 {
+        let src = self.pass_state.current_depth_texture();
+        if src.is_null() {
+            return 0;
+        }
+        let (width, height, format) = self.depth_attachment_desc;
+        if width == 0 || height == 0 {
+            return 0;
+        }
+        let epoch = self.depth_write_epoch;
+        let stale_handle = match self.depth_snapshots.get(&src.raw()) {
+            Some(snap) if snap.width == width && snap.height == height && snap.format == format => {
+                None
+            }
+            Some(snap) => Some(snap.handle),
+            None => None,
+        };
+        if let Some(old) = stale_handle {
+            // Same source handle, different geometry: the texture behind the
+            // handle was recreated. Retire the old copy behind the GPU.
+            self.depth_snapshots.remove(&src.raw());
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: old.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: false,
+                });
+        }
+        if !self.depth_snapshots.contains_key(&src.raw()) {
+            // The generic texture path: a depth format with DEPTH_STENCIL |
+            // RENDER_TARGET usage comes back RenderTarget | ShaderRead, which
+            // the copy needs on both ends (blit destination, then sampled).
+            let desc = TextureCreateDesc {
+                tex_id: src.raw(),
+                width,
+                height,
+                depth: 1,
+                levels: 1,
+                pixel_format: format,
+                storage_mode: StorageMode::Private,
+                flags: TextureCreateFlags::empty(),
+                swizzle_r: mtld3d_shared::mtl::Swizzle::Red,
+                swizzle_g: mtld3d_shared::mtl::Swizzle::Green,
+                swizzle_b: mtld3d_shared::mtl::Swizzle::Blue,
+                swizzle_a: mtld3d_shared::mtl::Swizzle::Alpha,
+                usage_flags: TextureUsage::DEPTH_STENCIL | TextureUsage::RENDER_TARGET,
+            };
+            let mut handles = [MetalHandle::<MTLTextureKind>::NULL];
+            let status = self.batch_create_textures(&[desc], &mut handles);
+            if status != 0 || handles[0].is_null() {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "depth snapshot: creating a {width}x{height} {format:?} copy failed \
+                     ({status:#x}); the draw samples the live attachment"
+                );
+                return 0;
+            }
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "depth snapshot: a draw samples the bound depth attachment; copying it \
+                 ({width}x{height} {format:?}) before such draws"
+            );
+            self.depth_snapshots.insert(
+                src.raw(),
+                DepthSnapshot {
+                    handle: handles[0],
+                    width,
+                    height,
+                    format,
+                    epoch: epoch.wrapping_sub(1),
+                },
+            );
+        }
+        let (dst, needs_copy) = {
+            let snap = self
+                .depth_snapshots
+                .get_mut(&src.raw())
+                .expect("inserted above");
+            let needs_copy = snap.epoch != epoch;
+            snap.epoch = epoch;
+            (snap.handle, needs_copy)
+        };
+        if needs_copy {
+            self.end_current_pass("depth_snapshot");
+            self.pass_state.push_pending_leading_blit(BlitCommand {
+                cmd: BlitCommandType::CopyTextureToTexture as u32,
+                mip_level: 0,
+                src_handle: src.raw(),
+                dst_handle: dst.raw(),
+                src_offset: 0,
+                bytes_per_row: 0,
+                origin_x: 0,
+                origin_y: 0,
+                region_w: width,
+                region_h: height,
+                dst_offset: 0,
+                byte_size: 0,
+                depth: 1,
+                bytes_per_image: 0,
+                dst_mip_level: 0,
+                pad0: 0,
+            });
+        }
+        dst.raw()
+    }
+
     #[must_use]
     pub const fn current_depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.pass_state.current_depth_texture()
@@ -2445,14 +2747,20 @@ impl FrameEncoder {
         self.pass_state.note_color_read_back(handle);
     }
 
-    pub fn set_depth_stencil_attachment(
+    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    pub fn set_depth_stencil_attachment_level(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
+        level: u32,
         is_sampleable: bool,
         has_stencil: bool,
     ) {
-        self.pass_state
-            .set_depth_stencil_attachment(texture, is_sampleable, has_stencil);
+        self.pass_state.set_depth_stencil_attachment_level(
+            texture,
+            level,
+            is_sampleable,
+            has_stencil,
+        );
     }
 
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) {
@@ -2586,6 +2894,7 @@ impl FrameEncoder {
         stencil: Option<u32>,
         rects: &[(i32, i32, i32, i32)],
     ) {
+        self.bump_depth_write_epoch();
         let scale = self.pass_state.target_scale();
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
@@ -2620,6 +2929,7 @@ impl FrameEncoder {
     }
 
     pub fn clear_depth(&mut self, value: u32) {
+        self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_depth(value) {
             DepthClearOutcome::Folded | DepthClearOutcome::NoOp => {}
@@ -2642,6 +2952,7 @@ impl FrameEncoder {
     }
 
     pub fn clear_stencil(&mut self, value: u32) {
+        self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_stencil(value) {
             StencilClearOutcome::Folded | StencilClearOutcome::NoOp => {}
@@ -2675,6 +2986,7 @@ impl FrameEncoder {
     /// The single-plane fallback below only guards the pairing; it is not
     /// expected to run.
     pub fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
+        self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         let depth_outcome = self.pass_state.clear_depth(depth);
         let stencil_outcome = self.pass_state.clear_stencil(stencil);
@@ -2925,7 +3237,7 @@ impl FrameEncoder {
         ss[mtld3d_types::D3DSAMP_ADDRESSU as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSV as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
         ss[mtld3d_types::D3DSAMP_ADDRESSW as usize] = mtld3d_types::D3DTADDRESS_CLAMP;
-        self.get_or_create_sampler(0, &ss, false)
+        self.get_or_create_sampler(0, &ss, false, false)
     }
 
     /// Scaling `StretchRect`: render the source texture onto a quad covering the destination rect.
@@ -3622,11 +3934,47 @@ impl FrameEncoder {
     /// The declared sampler slots + types for a programmable pixel shader.
     ///
     /// Empty for an unregistered id (the draw path then binds no fallback).
+    /// Also serves vertex shaders: `register_program` collects
+    /// `Declaration::Sampler` entries for every program, so a `vs_3_0`
+    /// using vertex texture fetch reports its slots here too.
     pub fn ps_declared_samplers(&self, ps_id: ProgramId) -> PsSamplerDecls {
         self.prog_sampler_decls
             .get(&ps_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Update one mirrored vertex texture slot (`SetTexture` on 257..=260).
+    pub const fn set_vertex_texture_binding(
+        &mut self,
+        slot: usize,
+        id: Option<mtld3d_core::ids::TextureId>,
+    ) {
+        self.vertex_tex_bindings[slot].texture_id = id;
+    }
+
+    /// Update one mirrored vertex sampler state (`SetSamplerState` on 257..=260).
+    pub const fn set_vertex_sampler_binding(
+        &mut self,
+        slot: usize,
+        state: [u32; SAMPLER_STATE_COUNT],
+    ) {
+        self.vertex_tex_bindings[slot].sampler_state = state;
+    }
+
+    /// One mirrored vertex slot: `(texture id, sampler state)` by value.
+    #[must_use]
+    pub const fn vertex_binding(
+        &self,
+        slot: usize,
+    ) -> (
+        Option<mtld3d_core::ids::TextureId>,
+        [u32; SAMPLER_STATE_COUNT],
+    ) {
+        (
+            self.vertex_tex_bindings[slot].texture_id,
+            self.vertex_tex_bindings[slot].sampler_state,
+        )
     }
 
     /// Absorb the pre-warm thread's compiled MSL → `MTLLibrary` handles into `lib_cache`.
@@ -5410,14 +5758,29 @@ impl FrameEncoder {
         stage: u32,
         sampler_state: &[u32; SAMPLER_STATE_COUNT],
         is_compare: bool,
+        force_point: bool,
     ) -> u64 {
-        if let Some(Some(memo)) = self.sampler_resolve_memo.get(stage as usize)
+        if !force_point
+            && let Some(Some(memo)) = self.sampler_resolve_memo.get(stage as usize)
             && memo.is_compare == is_compare
             && memo.state == *sampler_state
         {
             return memo.handle;
         }
-        let snapshot = sampler_state::snapshot_from_state(sampler_state, is_compare);
+        let mut snapshot = sampler_state::snapshot_from_state(sampler_state, is_compare);
+        if force_point {
+            // Raw depth fetch: Apple GPUs cannot filter Depth32Float, and a
+            // linear sample of it returns garbage rather than depth. D3D9
+            // games set LINEAR on everything, so the slot's sampler is forced
+            // to point; the shader reads exact stored depths, which is what
+            // position reconstruction wants anyway. Comparison samplers stay
+            // as configured: linear there is hardware PCF, which Apple GPUs
+            // do support.
+            snapshot.min_filter = 1; // D3DTEXF_POINT
+            snapshot.mag_filter = 1;
+            snapshot.mip_filter = 0; // D3DTEXF_NONE
+            snapshot.max_anisotropy = 1;
+        }
         let key = sampler_state::key_from_snapshot(&snapshot);
         let lodbias_raw = sampler_state[D3DSAMP_MIPMAPLODBIAS as usize];
         let dedup = (u64::from(stage) << 56) ^ (u64::from(lodbias_raw) << 24) ^ key.raw();
@@ -5435,7 +5798,9 @@ impl FrameEncoder {
             lb = lodbias_raw, lf = f32::from_bits(lodbias_raw),
         );
         if let Some(&handle) = self.sampler_cache.get(&key) {
-            self.memoize_sampler_resolve(stage, sampler_state, is_compare, handle.raw());
+            if !force_point {
+                self.memoize_sampler_resolve(stage, sampler_state, is_compare, handle.raw());
+            }
             return handle.raw();
         }
         let mut params = sampler_state::params_from_snapshot(&snapshot, key, self.device_handle);
@@ -5446,7 +5811,9 @@ impl FrameEncoder {
             return 0;
         }
         self.sampler_cache.insert(key, sampler);
-        self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());
+        if !force_point {
+            self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());
+        }
         sampler.raw()
     }
 
@@ -6918,6 +7285,7 @@ fn pass_to_descriptor(
             !leading.is_empty(),
             p.color_slice(),
             p.color_level(),
+            p.depth_level(),
         ),
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
@@ -6995,7 +7363,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(true, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(true, 0, 0, 0),
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

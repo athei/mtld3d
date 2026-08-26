@@ -24,7 +24,10 @@ use std::{
     fmt::Write,
 };
 
-use mtld3d_shared::mtl::{VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{
+    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+    VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+};
 
 use super::{
     ir::{
@@ -75,6 +78,13 @@ bitflags::bitflags! {
         /// primitive other than points, so triangle draws keep their
         /// libraries. Folded into the PS cache key.
         const POINT_SPRITE = 1 << 3;
+        /// The render pass has no depth attachment.
+        ///
+        /// A PS writing `oDepth` computes the value but does not export it:
+        /// D3D9 discards the write, while Metal rejects a pipeline whose
+        /// fragment function declares a depth output against no depth
+        /// attachment. Folded into the PS cache key.
+        const NO_DEPTH_ATTACHMENT = 1 << 4;
     }
 }
 
@@ -363,7 +373,10 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // at the same declaration index in `ff::emit_varyings` for FF↔programmable
     // stage-in linkage.
     w(out, "    float4 position1;\n");
-    for i in 0..8 {
+    // SM3 declares texture coordinates by usage index up to 15; sixteen slots
+    // keep every `dcl_texcoordN` linkable and stay well inside Metal's
+    // fragment-input budget.
+    for i in 0..16 {
         let _ = writeln!(out, "    float4 texcoord{i};");
     }
     // `[[flat]]` on the PS input takes diffuse/specular from the provoking
@@ -443,6 +456,32 @@ fn emit_vs_function(
             ",\n    constant int4 *vs_i [[buffer({VS_INT_CONST_SLOT})]]"
         );
     }
+    // A dynamic boolean constant (a `bN` no `defb` defines, fed by
+    // SetVertexShaderConstantB, typically the condition of a static `if`)
+    // reads bit N of the runtime bitmask.
+    if vs.uses_dynamic_bool_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant uint &vs_b [[buffer({VS_BOOL_CONST_SLOT})]]"
+        );
+    }
+    // Vertex texture fetch (`vs_3_0`): every declared sampler becomes a
+    // texture/sampler argument pair, same names as the fragment side so the
+    // shared sample-expression path serves both stages. The model only
+    // allows `texldl` (explicit LOD), which is also the only sample form
+    // MSL permits in a vertex function. Depth-format bindings are not
+    // routed to the vertex stage, so the type is always the declared one.
+    for (idx, ty) in declared_vs_samplers(vs) {
+        let tex_ty = match ty {
+            TextureType::TextureCube => "texturecube<float>",
+            TextureType::Texture3D => "texture3d<float>",
+            TextureType::Texture2D | TextureType::Unknown => "texture2d<float>",
+        };
+        let _ = write!(
+            out,
+            ",\n    {tex_ty} s{idx} [[texture({idx})]],\n    sampler samp{idx} [[sampler({idx})]]"
+        );
+    }
     w(out, "\n) {\n");
     w(out, "    float4 r[32];\n");
     // D3D9 address register `a0`. SM2 has exactly one int4 a0; the emitter
@@ -509,19 +548,26 @@ fn emit_vs_function(
         );
     }
 
+    for def in &vs.def_bool_constants {
+        let _ = writeln!(out, "    bool b{} = {};", def.reg.index, def.value);
+    }
+
     let def_consts: BTreeSet<u16> = vs.def_constants.iter().map(|d| d.reg.index).collect();
     let def_int_consts: BTreeSet<u16> = vs.def_int_constants.iter().map(|d| d.reg.index).collect();
+    let def_bool_consts: BTreeSet<u16> =
+        vs.def_bool_constants.iter().map(|d| d.reg.index).collect();
     let vs_output_map = build_vs_output_map(vs);
     let subs = (!vs.subroutines.is_empty()).then_some(&vs.subroutines);
-    let ctx = EmitContext::vs(
-        vs.major,
-        vs.minor,
-        &def_consts,
-        &def_int_consts,
-        vs_output_map.as_ref(),
-        subs,
-        provided_mask,
-    );
+    let ctx = EmitContext::vs(&VsInit {
+        major: vs.major,
+        minor: vs.minor,
+        def_consts: &def_consts,
+        def_int_consts: &def_int_consts,
+        def_bool_consts: &def_bool_consts,
+        vs_output_map: vs_output_map.as_ref(),
+        subroutines: subs,
+        vs_provided_mask: provided_mask,
+    });
     for inst in &vs.instructions {
         translate_instruction(out, inst, &ctx)?;
     }
@@ -672,6 +718,23 @@ pub fn write_point_sprite_prologue(out: &mut String) {
     }
 }
 
+/// Declared VS sampler slots and their texture dimensionality.
+///
+/// Vertex texture fetch: only `vs_3_0` can declare samplers (four slots,
+/// `D3DVERTEXTEXTURESAMPLER0..3` on the API side, `s0..s3` in bytecode),
+/// and only `texldl` may read them. The runtime binds the matching
+/// vertex-stage texture and sampler for each entry.
+#[must_use]
+pub fn declared_vs_samplers(vs: &DxsoProgram) -> BTreeMap<u16, TextureType> {
+    let mut samplers: BTreeMap<u16, TextureType> = BTreeMap::new();
+    for decl in &vs.declarations {
+        if let Declaration::Sampler { texture_type, reg } = decl {
+            samplers.insert(reg.index, *texture_type);
+        }
+    }
+    samplers
+}
+
 /// Declared PS sampler slots and their texture dimensionality.
 ///
 /// The single source of truth for which `[[texture(n)]]`/`[[sampler(n)]]`
@@ -800,6 +863,10 @@ fn emit_ps_function(
                 .as_ref()
                 .is_some_and(|d| d.reg.kind == RegKind::DepthOut)
     });
+    // The value is still computed (writes route through `_depth_storage`),
+    // but it only reaches `[[depth(any)]]` when the pass has a depth
+    // attachment: see `VariantFlags::NO_DEPTH_ATTACHMENT`.
+    let exports_depth = has_depth_out && !variant.flags.contains(VariantFlags::NO_DEPTH_ATTACHMENT);
     // Colour outputs. `written` is what the bytecode stores to; `exported` is
     // the subset the render pass can receive (bit 0 always). A bare `float4`
     // return covers the common single-output case; anything else returns a
@@ -809,7 +876,7 @@ fn emit_ps_function(
     let written_colors = ps.color_out_mask();
     let exported_colors = (written_colors & variant.color_out_mask) | 1;
     let color_local_count = 8 - written_colors.leading_zeros().min(7);
-    let returns_struct = has_depth_out || exported_colors != 1;
+    let returns_struct = exports_depth || exported_colors != 1;
     if returns_struct {
         w(out, "struct PsOut {\n");
         for i in 0..4u32 {
@@ -817,7 +884,7 @@ fn emit_ps_function(
                 let _ = writeln!(out, "    float4 oC{i} [[color({i})]];");
             }
         }
-        if has_depth_out {
+        if exports_depth {
             w(out, "    float oDepth [[depth(any)]];\n");
         }
         w(out, "};\n\n");
@@ -857,6 +924,21 @@ fn emit_ps_function(
     }
     if has_bump_env {
         w(out, ",\n    constant float4 *bump_env [[buffer(12)]]");
+    }
+    // Dynamic integer / boolean constants (a non-`defi` `iN` / non-`defb`
+    // `bN`, fed by SetPixelShaderConstantI/B) read the runtime files, the
+    // fragment-side twins of `vs_i` / `vs_b`.
+    if ps.uses_dynamic_int_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant int4 *ps_i [[buffer({PS_INT_CONST_SLOT})]]"
+        );
+    }
+    if ps.uses_dynamic_bool_constants() {
+        let _ = write!(
+            out,
+            ",\n    constant uint &ps_b [[buffer({PS_BOOL_CONST_SLOT})]]"
+        );
     }
     for (idx, ty) in &samplers {
         // Depth-format binding (sampleable shadow map): the texture
@@ -973,8 +1055,14 @@ fn emit_ps_function(
         );
     }
 
+    for def in &ps.def_bool_constants {
+        let _ = writeln!(out, "    bool b{} = {};", def.reg.index, def.value);
+    }
+
     let def_consts: BTreeSet<u16> = ps.def_constants.iter().map(|d| d.reg.index).collect();
     let def_int_consts: BTreeSet<u16> = ps.def_int_constants.iter().map(|d| d.reg.index).collect();
+    let def_bool_consts: BTreeSet<u16> =
+        ps.def_bool_constants.iter().map(|d| d.reg.index).collect();
     let subs = (!ps.subroutines.is_empty()).then_some(&ps.subroutines);
     let ctx = EmitContext::ps(&PsInit {
         major: ps.major,
@@ -986,6 +1074,7 @@ fn emit_ps_function(
         tt_projected_mask: variant.tt_projected_mask,
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
+        def_bool_consts: &def_bool_consts,
         has_vpos,
         has_vface,
         has_depth_out,
@@ -1028,7 +1117,7 @@ fn emit_ps_function(
                 let _ = writeln!(out, "    _ps_out.oC{i} = oC{i};");
             }
         }
-        if has_depth_out {
+        if exports_depth {
             w(out, "    _ps_out.oDepth = _depth_storage.x;\n");
         }
         w(out, "    return _ps_out;\n");
@@ -1245,6 +1334,11 @@ struct EmitContext<'a> {
     /// A `ConstInt` read NOT in this set is a *dynamic* integer constant: in a
     /// VS it reads the runtime `vs_i` buffer (slot 14).
     def_int_consts: &'a BTreeSet<u16>,
+    /// Bool-const indices defined by a `defb` instruction (baked into MSL as `bool bN` locals).
+    ///
+    /// A `ConstBool` read NOT in this set is a *dynamic* boolean constant: in
+    /// a VS it reads a bit of the runtime `vs_b` bitmask.
+    def_bool_consts: &'a BTreeSet<u16>,
     /// VS only: bit `i` set ⇒ input register `vi` is provided by the vertex declaration.
     ///
     /// A clear bit means the declaration omits that attribute, so the VS reads
@@ -1267,38 +1361,44 @@ struct PsInit<'a> {
     tt_projected_mask: u8,
     def_consts: &'a BTreeSet<u16>,
     def_int_consts: &'a BTreeSet<u16>,
+    def_bool_consts: &'a BTreeSet<u16>,
     has_vpos: bool,
     has_vface: bool,
     has_depth_out: bool,
     subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
 }
 
+/// Init bundle for `EmitContext::vs`, the VS-specific subset of `EmitContext`.
+struct VsInit<'a> {
+    major: u8,
+    minor: u8,
+    def_consts: &'a BTreeSet<u16>,
+    def_int_consts: &'a BTreeSet<u16>,
+    def_bool_consts: &'a BTreeSet<u16>,
+    vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
+    subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
+    vs_provided_mask: u16,
+}
+
 impl<'a> EmitContext<'a> {
-    const fn vs(
-        major: u8,
-        minor: u8,
-        def_consts: &'a BTreeSet<u16>,
-        def_int_consts: &'a BTreeSet<u16>,
-        vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
-        subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
-        vs_provided_mask: u16,
-    ) -> Self {
+    const fn vs(init: &VsInit<'a>) -> Self {
         Self {
             flags: EmitContextFlags::IS_VERTEX,
-            shader_major: major,
-            shader_minor: minor,
+            shader_major: init.major,
+            shader_minor: init.minor,
             ps_input_map: None,
             ps_samplers: None,
             ps_depth_sampler_mask: 0,
             ps_depth_fetch_mask: 0,
             ps_tt_projected_mask: 0,
-            vs_output_map,
-            def_consts,
-            def_int_consts,
-            vs_provided_mask,
+            vs_output_map: init.vs_output_map,
+            def_consts: init.def_consts,
+            def_int_consts: init.def_int_consts,
+            def_bool_consts: init.def_bool_consts,
+            vs_provided_mask: init.vs_provided_mask,
             loop_stack: RefCell::new(Vec::new()),
             loop_al_count: RefCell::new(0),
-            subroutines,
+            subroutines: init.subroutines,
             expansion_stack: RefCell::new(Vec::new()),
         }
     }
@@ -1320,6 +1420,7 @@ impl<'a> EmitContext<'a> {
             vs_output_map: None,
             def_consts: init.def_consts,
             def_int_consts: init.def_int_consts,
+            def_bool_consts: init.def_bool_consts,
             vs_provided_mask: u16::MAX,
             loop_stack: RefCell::new(Vec::new()),
             loop_al_count: RefCell::new(0),
@@ -2308,14 +2409,30 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
             |idx| format!("float4(aL_{idx})"),
         ),
         // `iN` integer-constant reads. A `defi`-declared constant is a baked
-        // `int4 iN` local; a dynamic one (fed by SetVertexShaderConstantI) in a
-        // VS reads the runtime `vs_i` buffer (slot 14). Cast to float4 so the
+        // `int4 iN` local; a dynamic one (fed by Set*ShaderConstantI) reads
+        // the stage's runtime file (`vs_i` / `ps_i`). Cast to float4 so the
         // standard swizzle / modifier pipeline applies.
         RegKind::ConstInt => {
-            if ctx.is_vertex() && !ctx.def_int_consts.contains(&reg.index) {
+            if ctx.def_int_consts.contains(&reg.index) {
+                format!("float4(i{})", reg.index)
+            } else if ctx.is_vertex() {
                 format!("float4(vs_i[{}])", reg.index)
             } else {
-                format!("float4(i{})", reg.index)
+                format!("float4(ps_i[{}])", reg.index)
+            }
+        }
+        // `bN` boolean-constant reads. A `defb`-declared constant is a baked
+        // `bool bN` local; a dynamic one (fed by Set*ShaderConstantB) reads
+        // bit N of the stage's runtime bitmask (`vs_b` / `ps_b`). Both widen to
+        // float4 so `if`'s `.x != 0.0` test and the `!` modifier apply
+        // unchanged.
+        RegKind::ConstBool => {
+            if ctx.def_bool_consts.contains(&reg.index) {
+                format!("float4(float(b{}))", reg.index)
+            } else if ctx.is_vertex() {
+                format!("float4(float((vs_b >> {}u) & 1u))", reg.index)
+            } else {
+                format!("float4(float((ps_b >> {}u) & 1u))", reg.index)
             }
         }
         // Label register reads only land here as the operand of

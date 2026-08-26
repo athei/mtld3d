@@ -81,6 +81,20 @@ pub struct Mtld3dConfig {
     /// pixel count immediately after FLUSH. File key:
     /// `query.flushImmediate`.
     pub query_flush_immediate: bool,
+    /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
+    ///
+    /// D3D9-era drivers commonly backed all equal-size depth-stencil
+    /// surfaces with one physical allocation, so engines of that era
+    /// bind a *different* depth texture of the same dimensions and rely
+    /// on the just-rendered scene depth being visible through it (the
+    /// point of the trick: z-test one handle while sampling the other,
+    /// which D3D9 forbids on a single surface). When enabled, binding a
+    /// texture-backed depth-stencil whose dimensions match the
+    /// previously bound one queues a GPU copy of the previous contents
+    /// into it. Default: `false` — engines that clear every depth
+    /// target before use (the common case) would pay one full-surface
+    /// copy per switch for nothing. File key: `depth.aliasSameSize`.
+    pub depth_alias_same_size: bool,
     /// Proactive cap on live VB/IB retained-`PageBox` bytes.
     ///
     /// When live retention reaches this, the Lock-rename alloc path
@@ -136,6 +150,33 @@ pub struct Mtld3dConfig {
     /// the struct keeps its `Eq`; the file key is written as a float. File
     /// key: `render.scale` (e.g. `0.75`), accepted range `(0, 1.0]`.
     pub render_scale_percent: u32,
+    /// Present the adapter as a well-known GPU vendor.
+    ///
+    /// D3D9-era engines pick vendor-specific render paths (a depth copy
+    /// via `StretchRect` on one vendor, a resolve hack on another) and
+    /// disable those paths for a vendor they do not recognize, leaving
+    /// depth-dependent effects reading a buffer nothing updates. The
+    /// spoof fills `GetAdapterIdentifier` with a consistent vendor id,
+    /// device id, description, driver name and driver version. Default:
+    /// [`AdapterSpoof::None`] — report the real identity. File key:
+    /// `adapter.spoof` (`none` | `nvidia` | `amd`).
+    pub adapter_spoof: AdapterSpoof,
+    /// Advertise the `DF24` / `DF16` sampleable-depth formats.
+    ///
+    /// These fourccs existed on one vendor's hardware. A game that
+    /// probes them next to `INTZ` and finds both can take a mixed path
+    /// no real GPU ever ran; hiding them (`false`) keeps such engines on
+    /// the plain `INTZ` route (`INTZ` stays advertised). Default:
+    /// `true`. File key: `caps.dfFormats`.
+    pub df_formats: bool,
+}
+
+/// `adapter.spoof` policy: the vendor identity `GetAdapterIdentifier` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterSpoof {
+    None,
+    Nvidia,
+    Amd,
 }
 
 /// `cursor.scale` policy.
@@ -161,6 +202,7 @@ impl Default for Mtld3dConfig {
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
+            depth_alias_same_size: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             // The 32-bit address space is the ceiling that matters, not the
             // GPU's memory: a unified-memory Mac has far more than a D3D9
@@ -173,6 +215,8 @@ impl Default for Mtld3dConfig {
             pagebox_pool_cap_bytes: 128 * 1024 * 1024,
             present_max_fps: 0,
             render_scale_percent: 100,
+            adapter_spoof: AdapterSpoof::None,
+            df_formats: true,
         }
     }
 }
@@ -267,6 +311,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: depth.aliasSameSize = {}", cfg.depth_alias_same_size
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: memory.vbibRetentionCapMB = {}",
         cfg.vbib_retention_cap_bytes / (1024 * 1024)
     );
@@ -288,6 +336,15 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: render.scale = {}",
         f64::from(cfg.render_scale_percent) / 100.0
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: adapter.spoof = {}",
+        adapter_spoof_label(cfg.adapter_spoof)
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: caps.dfFormats = {}", cfg.df_formats
     );
 }
 
@@ -315,6 +372,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
+        "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "memory.vbibRetentionCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);
         }
@@ -326,6 +384,8 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
+        "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
+        "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         _ => log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: unknown key '{key}' → ignored"
@@ -345,6 +405,27 @@ fn assign_cursor_scale(source: &str, value: &str, slot: &mut CursorScale) {
             "{source}: 'cursor.scale = {value}' is not 'auto' or a positive integer → kept {kept}",
             kept = cursor_scale_label(*slot)
         ),
+    }
+}
+
+fn assign_adapter_spoof(source: &str, value: &str, slot: &mut AdapterSpoof) {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => *slot = AdapterSpoof::None,
+        "nvidia" => *slot = AdapterSpoof::Nvidia,
+        "amd" | "ati" => *slot = AdapterSpoof::Amd,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'adapter.spoof = {other}' is not a known vendor (expected none/nvidia/amd) → kept {kept}",
+            kept = adapter_spoof_label(*slot)
+        ),
+    }
+}
+
+const fn adapter_spoof_label(s: AdapterSpoof) -> &'static str {
+    match s {
+        AdapterSpoof::None => "none",
+        AdapterSpoof::Nvidia => "nvidia",
+        AdapterSpoof::Amd => "amd",
     }
 }
 

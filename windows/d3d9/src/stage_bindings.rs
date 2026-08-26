@@ -373,13 +373,17 @@ const fn samp_classify(type_: u32) -> SampClass {
         // lossless compression; no mtld3d target game actually sets
         // this bit, and the CAMetalLayer DisplayP3 colorspace tag
         // handles colour-space correctness at the compositor level.
-        | D3DSAMP_SRGBTEXTURE => SampClass::Consumed,
+        | D3DSAMP_SRGBTEXTURE
+        // BORDERCOLOR consumed by sampler_state::params_from_snapshot as
+        // the nearest Metal border preset (transparent black, opaque black,
+        // opaque white; other colours fall back to opaque black with a
+        // once-per-colour warn from convert::d3d_border_color_to_metal).
+        | D3DSAMP_BORDERCOLOR => SampClass::Consumed,
 
         // Known gap: Metal has no sampler-level LOD bias; bias is
         // expressed inside the shader's sample() call, which would
         // require DXSO→MSL emitter changes. Stays PortCandidate.
         D3DSAMP_MIPMAPLODBIAS => SampClass::PortCandidate("LOD bias (Metal shader-only)"),
-        D3DSAMP_BORDERCOLOR => SampClass::PortCandidate("border color"),
 
         _ => SampClass::NotImplemented,
     }

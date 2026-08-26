@@ -384,10 +384,14 @@ fn stretch_rect_filter_caps_match_what_the_call_accepts() {
 }
 
 #[test]
-fn vertex_texture_fetch_is_not_advertised() {
-    // No sampler binds on the vertex stage; `CheckDeviceFormat` denies
-    // `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
-    assert_eq!(filled().vertex_texture_filter_caps, 0);
+fn vertex_texture_fetch_is_advertised() {
+    // Vertex texture fetch is implemented; the filter caps carry the same
+    // point/linear set as the fragment stages, and `CheckDeviceFormat`
+    // answers `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
+    assert_eq!(
+        filled().vertex_texture_filter_caps,
+        filled().texture_filter_caps
+    );
 }
 
 #[test]

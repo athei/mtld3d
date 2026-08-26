@@ -101,6 +101,13 @@ pub struct DefIntConstant {
     pub value: [i32; 4],
 }
 
+/// A `defb bN, value` shader-defined boolean constant.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DefBoolConstant {
+    pub reg: Register,
+    pub value: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SrcModifier {
     None,
@@ -268,6 +275,7 @@ pub struct DxsoProgram {
     pub declarations: Vec<Declaration>,
     pub def_constants: Vec<DefConstant>,
     pub def_int_constants: Vec<DefIntConstant>,
+    pub def_bool_constants: Vec<DefBoolConstant>,
     pub instructions: Vec<Instruction>,
     /// SM2.x / SM3 subroutines: `Label N` / `Ret` pairs.
     ///
@@ -359,10 +367,10 @@ impl DxsoProgram {
             .filter(|s| s.reg.kind == kind)
             .map(|s| s.reg.index)
             .max();
-        let def_max = if kind == RegKind::ConstInt {
-            self.def_int_constants.iter().map(|d| d.reg.index).max()
-        } else {
-            None
+        let def_max = match kind {
+            RegKind::ConstInt => self.def_int_constants.iter().map(|d| d.reg.index).max(),
+            RegKind::ConstBool => self.def_bool_constants.iter().map(|d| d.reg.index).max(),
+            _ => None,
         };
         src_max.into_iter().chain(def_max).max()
     }
@@ -437,6 +445,28 @@ impl DxsoProgram {
                 .iter()
                 .any(|s| s.reg.kind == RegKind::ConstInt && !defined.contains(&s.reg.index))
         })
+    }
+
+    /// Whether any instruction reads a boolean constant no `defb` defines.
+    ///
+    /// Such a `bN` is fed by `SetVertexShaderConstantB`, typically as the
+    /// condition of a static `if`; draws that bind these shaders upload the
+    /// boolean-constant bitmask.
+    #[must_use]
+    pub fn uses_dynamic_bool_constants(&self) -> bool {
+        let defined: std::collections::BTreeSet<u16> = self
+            .def_bool_constants
+            .iter()
+            .map(|d| d.reg.index)
+            .collect();
+        self.instructions
+            .iter()
+            .chain(self.subroutines.values().flatten())
+            .any(|inst| {
+                inst.srcs
+                    .iter()
+                    .any(|s| s.reg.kind == RegKind::ConstBool && !defined.contains(&s.reg.index))
+            })
     }
 
     /// Whether any instruction is a bump/environment-mapping op (`texbem`/`texbeml`/`bem`).

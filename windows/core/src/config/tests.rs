@@ -8,7 +8,7 @@
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
 
-use super::{CursorScale, Mtld3dConfig, parse};
+use super::{AdapterSpoof, CursorScale, Mtld3dConfig, parse};
 
 #[test]
 fn empty_input_returns_defaults() {
@@ -153,6 +153,14 @@ fn query_flush_immediate_round_trips_false() {
 fn query_flush_immediate_round_trips_true() {
     let cfg = parse("query.flushImmediate = true\n", None);
     assert!(cfg.query_flush_immediate);
+}
+
+#[test]
+fn depth_alias_same_size_defaults_off_and_round_trips() {
+    let cfg = parse("", None);
+    assert!(!cfg.depth_alias_same_size);
+    let cfg = parse("depth.aliasSameSize = true\n", None);
+    assert!(cfg.depth_alias_same_size);
 }
 
 #[test]
@@ -356,4 +364,36 @@ fn env_override_unknown_key_keeps_other_assignments() {
 fn env_override_none_matches_file_only() {
     let src = "debug.capsAll = true\ncursor.scale = 3\n";
     assert_eq!(parse(src, None), parse(src, Some("")));
+}
+
+#[test]
+fn adapter_spoof_parses_all_values() {
+    assert_eq!(
+        parse("adapter.spoof = nvidia\n", None).adapter_spoof,
+        AdapterSpoof::Nvidia
+    );
+    assert_eq!(
+        parse("adapter.spoof = AMD\n", None).adapter_spoof,
+        AdapterSpoof::Amd
+    );
+    assert_eq!(
+        parse("adapter.spoof = ati\n", None).adapter_spoof,
+        AdapterSpoof::Amd
+    );
+    assert_eq!(
+        parse("adapter.spoof = none\n", None).adapter_spoof,
+        AdapterSpoof::None
+    );
+}
+
+#[test]
+fn adapter_spoof_rejects_unknown_vendor() {
+    let cfg = parse("adapter.spoof = matrox\n", None);
+    assert_eq!(cfg.adapter_spoof, AdapterSpoof::None, "default preserved");
+}
+
+#[test]
+fn df_formats_defaults_on_and_parses_off() {
+    assert!(parse("", None).df_formats);
+    assert!(!parse("caps.dfFormats = false\n", None).df_formats);
 }

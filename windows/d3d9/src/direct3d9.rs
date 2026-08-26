@@ -5,7 +5,7 @@ use log::{error, info, trace, warn};
 use mtld3d_core::caps;
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
-    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
+    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
     mtl_handle::{MTLTextureKind, NSViewKind},
 };
@@ -22,11 +22,10 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_NOINTERFACE, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, LOG_TARGET,
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
     fullscreen::Rect,
-    null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
 };
@@ -399,15 +398,22 @@ const fn has_srgb_read_decode(fmt: u32) -> bool {
 // ── IUnknown implementation (IDirect3D9) ──
 
 extern "system" fn d3d9_query_interface(
-    _this: *mut c_void,
+    this: *mut c_void,
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3D9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9],
+            d3d9_add_ref,
+            "IDirect3D9",
+        )
+    }
 }
 
 extern "system" fn d3d9_add_ref(this: *mut c_void) -> u32 {
@@ -480,6 +486,7 @@ extern "system" fn d3d9_get_adapter_identifier(
         name_buf_len: 256,
         name_len: 0,
         registry_id: 0,
+        supports_sampler_border: 0,
     };
     unix_call(&mut params);
 
@@ -494,7 +501,78 @@ extern "system" fn d3d9_get_adapter_identifier(
     // D3DADAPTER_IDENTIFIER9.device_id is u32 by D3D9 spec; mask to 16 bits.
     id.device_id = u32::try_from(params.registry_id & 0xFFFF).expect("16-bit mask fits u32");
 
+    // `adapter.spoof`: report a consistent well-known GPU identity. Engines of
+    // this era key whole render paths (depth copies, shadow filtering) off the
+    // vendor id, sniff the description string for a marketing name, and gate
+    // on a minimum driver version, so all of these move together.
+    let spoof = match crate::config::CONFIG.adapter_spoof {
+        mtld3d_core::config::AdapterSpoof::None => None,
+        mtld3d_core::config::AdapterSpoof::Nvidia => Some(SpoofIdentity {
+            vendor: 0x10DE,
+            device: 0x0611, // GeForce 8800 GT, in every launch-era device table
+            description: b"NVIDIA GeForce 8800 GT\0",
+            driver: b"nvd3dum.dll\0",
+            // 8.17.11.9745 (a WDDM 1.1 driver, NVIDIA 197.45) as
+            // LARGE_INTEGER LowPart / HighPart. The first field matters:
+            // 6.x is the XP driver model, and a title running on an NT 6
+            // prefix can reject or mis-parse an XP-model version.
+            version: [0x000B_2611, 0x0008_0011],
+        }),
+        mtld3d_core::config::AdapterSpoof::Amd => Some(SpoofIdentity {
+            vendor: 0x1002,
+            device: 0x9440, // Radeon HD 4870
+            description: b"ATI Radeon HD 4800 Series\0",
+            driver: b"atiumdag.dll\0",
+            // 8.17.10.1129 (a WDDM 1.1 Catalyst driver) as LARGE_INTEGER
+            // LowPart / HighPart; see the NVIDIA arm for why 8.x.
+            version: [0x000A_0469, 0x0008_0011],
+        }),
+    };
+    if let Some(s) = spoof {
+        id.vendor_id = s.vendor;
+        id.device_id = s.device;
+        id.description = [0; 512];
+        id.description[..s.description.len()].copy_from_slice(s.description);
+        id.driver = [0; 512];
+        id.driver[..s.driver.len()].copy_from_slice(s.driver);
+        id.driver_version = s.version;
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "adapter.spoof: reporting vendor {:#06x} device {:#06x}", s.vendor, s.device
+        );
+    }
+
     0 // S_OK
+}
+
+/// Whether the Metal device can create border-colour samplers.
+///
+/// Queried once per process from the unix side; `GetDeviceCaps` strips
+/// `D3DPTADDRESSCAPS_BORDER` when it cannot (virtualized CI devices), and
+/// the unix sampler path clamps to edge for a title that ignores the cap.
+pub fn sampler_border_supported() -> bool {
+    static SUPPORTED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let mut params = GetDeviceInfoParams {
+            name_ptr: 0,
+            name_buf_len: 0,
+            name_len: 0,
+            registry_id: 0,
+            supports_sampler_border: 0,
+        };
+        unix_call(&mut params);
+        params.supports_sampler_border != 0
+    });
+    *SUPPORTED
+}
+
+/// One spoofed adapter identity: everything a game sniffs, kept consistent.
+struct SpoofIdentity {
+    vendor: u32,
+    device: u32,
+    description: &'static [u8],
+    driver: &'static [u8],
+    /// Win32 `LARGE_INTEGER` driver version as `LowPart` / `HighPart`.
+    version: [u32; 2],
 }
 
 extern "system" fn d3d9_get_adapter_mode_count(
@@ -619,6 +697,9 @@ extern "system" fn d3d9_check_device_type(
     D3D_OK
 }
 
+/// The 'RESZ' pseudo-format fourcc: probed to detect the depth-resolve hack.
+const D3DFMT_RESZ: u32 = 0x5A53_4552;
+
 extern "system" fn d3d9_check_device_format(
     _this: *mut c_void,
     adapter: u32,
@@ -628,6 +709,13 @@ extern "system" fn d3d9_check_device_format(
     rtype: u32,
     check_format: u32,
 ) -> i32 {
+    // One line per distinct probe: which formats a title asks about (and in
+    // what usage/rtype shape) is the map of the render path it is choosing.
+    mtld3d_shared::log_once_debug_by!(
+        target: LOG_TARGET,
+        key: (u64::from(usage) << 40) ^ (u64::from(rtype) << 32) ^ u64::from(check_format),
+        "CheckDeviceFormat probe: usage={usage:#x} rtype={rtype} fmt={check_format:#x}"
+    );
     // A D3DFMT_UNKNOWN (0) adapter format is never a valid query — the runtime
     // rejects it with INVALIDCALL ahead of any availability check, for every
     // device type.
@@ -646,11 +734,35 @@ extern "system" fn d3d9_check_device_format(
     if check_format == 0 {
         return D3DERR_NOTAVAILABLE;
     }
-    // Vertex texture fetch is not implemented (no sampler binds on the vertex
-    // stage, `VertexTextureFilterCaps` is zero); the per-format query agrees.
-    if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {
+    // `caps.dfFormats = false` hides the DF fourccs (INTZ stays): an engine
+    // finding both DF and INTZ can pick a mixed depth path no real GPU had.
+    if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
+    // The RESZ pseudo-format: probing it asks "is the RESZ depth resolve
+    // supported" (`SetRenderState(POINTSIZE, 0x7fa05000)`, implemented in
+    // the device). No surface of this format is ever created.
+    if check_format == D3DFMT_RESZ {
+        return if rtype == D3DRTYPE_SURFACE && usage & D3DUSAGE_RENDERTARGET != 0 {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        };
+    }
+    // Vertex texture fetch: any sampleable texture format can be read from
+    // the vertex stage (Metal binds textures to vertex functions natively),
+    // matching the non-zero `VertexTextureFilterCaps`. Strip the bit and
+    // let the remaining usage bits evaluate normally, so combined queries
+    // (RENDERTARGET | QUERY_VERTEXTEXTURE, the render-then-fetch pattern)
+    // answer on their other halves.
+    let usage = if usage & D3DUSAGE_QUERY_VERTEXTEXTURE != 0 {
+        if !is_texture_format(check_format) {
+            return D3DERR_NOTAVAILABLE;
+        }
+        usage & !D3DUSAGE_QUERY_VERTEXTEXTURE
+    } else {
+        usage
+    };
     // D3DUSAGE_QUERY_SRGBWRITE asks whether a format works as an sRGB-encoding
     // render target. On a plain offscreen SURFACE — which can never be a render
     // target without D3DUSAGE_RENDERTARGET — the combination is invalid. (A
@@ -775,6 +887,10 @@ extern "system" fn d3d9_check_depth_stencil_match(
         );
         return D3DERR_NOTAVAILABLE;
     }
+    // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here.
+    if matches!(ds_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
+        return D3DERR_NOTAVAILABLE;
+    }
     D3D_OK
 }
 
@@ -812,7 +928,11 @@ extern "system" fn d3d9_get_device_caps(
     let Some(mut caps) = (unsafe { InPtrMut::<D3DCAPS9>::opt(caps.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
-    caps::fill(&mut caps, crate::config::CONFIG.caps_all);
+    caps::fill(
+        &mut caps,
+        crate::config::CONFIG.caps_all,
+        sampler_border_supported(),
+    );
     0 // S_OK
 }
 

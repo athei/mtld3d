@@ -136,11 +136,9 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
 ///
 /// Apple Silicon has no native 24-bit depth format, so the entire D24
 /// family promotes to `Depth32Float`. Stencil-bearing variants share
-/// `Depth32FloatStencil8`. The FOURCC sampleable-depth formats
-/// (`INTZ`/`DF24`/`DF16`) are 24- or 16-bit depth-only on real hardware;
-/// they likewise promote to `Depth32Float` — the receiver shader uses
-/// `depth2d<float>` + `sample_compare` regardless of the source
-/// precision, so collapsing them keeps the create/sample path uniform.
+/// `Depth32FloatStencil8` — INTZ included: it is the sampleable twin of
+/// D24S8 and carries its stencil plane. DF24/DF16 are depth-only fetch
+/// formats and promote to plain `Depth32Float`.
 /// Returns `None` for non-depth or unknown formats.
 ///
 /// Used by both `CreateDepthStencilSurface` (standalone depth surface) and
@@ -150,8 +148,13 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
 pub const fn map_d3d_depth_format(d3d_format: u32) -> Option<PixelFormat> {
     match d3d_format {
         D3DFMT_D16_LOCKABLE | D3DFMT_D32 | D3DFMT_D24X8 | D3DFMT_D16 | D3DFMT_D32F_LOCKABLE
-        | D3DFMT_INTZ | D3DFMT_DF24 | D3DFMT_DF16 => Some(PixelFormat::Depth32Float),
-        D3DFMT_D15S1 | D3DFMT_D24S8 | D3DFMT_D24X4S4 | D3DFMT_D24FS8 => {
+        | D3DFMT_DF24 | D3DFMT_DF16 => Some(PixelFormat::Depth32Float),
+        // INTZ is the sampleable twin of D24S8 and CARRIES ITS STENCIL
+        // PLANE: a deferred engine marks material/sky ids in the stencil of
+        // the same buffer it later samples raw depth from, and a
+        // stencil-less mapping silently no-ops every one of those writes
+        // and gates. DF24/DF16 are depth-only fetch formats and stay so.
+        D3DFMT_D15S1 | D3DFMT_D24S8 | D3DFMT_D24X4S4 | D3DFMT_D24FS8 | D3DFMT_INTZ => {
             Some(PixelFormat::Depth32FloatStencil8)
         }
         _ => None,

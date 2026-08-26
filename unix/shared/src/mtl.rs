@@ -296,6 +296,19 @@ pub enum AddressMode {
     Repeat = 2,
     MirrorRepeat = 3,
     ClampToZero = 4,
+    ClampToBorderColor = 5,
+}
+
+/// `MTLSamplerBorderColor` wire encoding: the three presets Metal offers.
+///
+/// A D3D9 border colour that is not one of them falls back to opaque black
+/// on the PE side, which logs the substitution once per colour.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum BorderColor {
+    TransparentBlack = 0,
+    OpaqueBlack = 1,
+    OpaqueWhite = 2,
 }
 
 /// Shader stage selector for `CompileShaderLibraryParams::stage_tag`.
@@ -400,6 +413,12 @@ pub const VS_POS_FIXUP_SLOT: u32 = 28;
 /// Vertex-stage buffer slot of the runtime integer constant table (`vs_i`).
 pub const VS_INT_CONST_SLOT: u32 = 29;
 
+/// Vertex-stage buffer slot of the runtime boolean constant bitmask (`vs_b`).
+///
+/// One `uint`: bit N is `bN`. Bound only for a VS that reads a boolean
+/// constant no `defb` defines.
+pub const VS_BOOL_CONST_SLOT: u32 = 26;
+
 /// Vertex-stage buffer slot of the float constant table (`vs_c`).
 pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 
@@ -409,12 +428,26 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
 
+/// Fragment-stage buffer slot of the runtime integer constant table (`ps_i`).
+///
+/// The fragment uniforms count down from 15 (`ps_c`, alpha ref, fog, bump
+/// env at 15..12); the two constant files sit below them. Bound only for a
+/// PS that reads an integer constant no `defi` defines.
+pub const PS_INT_CONST_SLOT: u32 = 11;
+
+/// Fragment-stage buffer slot of the runtime boolean constant bitmask (`ps_b`).
+///
+/// One `uint`: bit N is `bN`. Bound only for a PS that reads a boolean
+/// constant no `defb` defines.
+pub const PS_BOOL_CONST_SLOT: u32 = 10;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {
     assert!(VS_DRAW_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_POS_FIXUP_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_BOOL_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };

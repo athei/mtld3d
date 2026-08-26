@@ -13,6 +13,7 @@ unix/shared/src/lib.rs Thunks Clone,Copy,EnumCount,VariantArray
 unix/shared/src/mtl.rs AddressMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BlendFactor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BlendOperation Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs BorderColor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BufferKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs ClearQuadFlags Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs ColorSpacePolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -53,6 +54,7 @@ unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/buffer_rename.rs BufferMapMode Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs LockPlan Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/config.rs AdapterSpoof Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/config.rs CursorScale Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/convert.rs DecalHeuristicInputs Clone,Copy,Debug
 windows/core/src/convert.rs FfVsLayout Clone,Copy,Default
@@ -166,6 +168,7 @@ windows/d3d9/src/encoder.rs SubmitMode Clone,Copy,PartialEq,Eq
 windows/d3d9/src/encoder.rs TextureInfo Clone
 windows/d3d9/src/encoder.rs VbibWarmupEntry Clone,Copy
 windows/d3d9/src/fullscreen.rs Rect Clone,Copy
+windows/d3d9/src/pixel_shader.rs PsUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/surface.rs GdiDc Clone,Copy
 windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq
@@ -183,6 +186,7 @@ windows/tests/src/vertex.rs Vertex Clone,Copy
 windows/tests/src/win32.rs Rect Clone,Copy,PartialEq,Eq,Debug
 windows/tests/tests/draw.rs PaddedVertex Clone,Copy
 windows/tests/tests/points.rs PsizeVertex Clone,Copy
+windows/tests/tests/streams.rs PackedVertex Clone,Copy
 windows/tests/tests/texture_stages.rs PaddedVertex Clone,Copy
 windows/tests/tests/texture_stages.rs PosNormalTexVertex Clone,Copy
 windows/tests/tests/texture_stages.rs RhwTexVertex Clone,Copy

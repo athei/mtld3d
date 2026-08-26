@@ -102,11 +102,11 @@ fn frame_param_layouts_match_wow64() {
 
 #[test]
 fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
-    assert_eq!(PassDescriptor::pack_flags(false, 0, 0), 0);
-    assert_eq!(PassDescriptor::pack_flags(true, 0, 0), 1);
+    assert_eq!(PassDescriptor::pack_flags(false, 0, 0, 0), 0);
+    assert_eq!(PassDescriptor::pack_flags(true, 0, 0, 0), 1);
     assert_eq!(
-        PassDescriptor::pack_flags(true, 5, 9),
-        1 | (5 << 1) | (9 << 4)
+        PassDescriptor::pack_flags(true, 5, 9, 3),
+        1 | (5 << 1) | (9 << 4) | (3 << 8)
     );
     assert_eq!(core::mem::size_of::<PassDescriptor>(), 168);
 }

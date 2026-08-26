@@ -1,0 +1,137 @@
+//! Address-space watch for 32-bit games.
+//!
+//! A large-address-aware i386 process has 4 GiB of virtual address space
+//! and every texture streamed, every shader compiled and every one of our
+//! staging copies lives inside it. When it runs out, allocations fail and
+//! the game usually follows a garbage pointer a few frames later, far from
+//! the cause. This watch samples `GlobalMemoryStatusEx` every few presents
+//! and logs one line per threshold crossed on the way down, with the sizes
+//! of the pools mtld3d itself holds, so the log says how close the process
+//! was and who owned the space.
+
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+
+use log::{debug, warn};
+
+use super::DeviceInner;
+use crate::{
+    LOG_TARGET,
+    crash::{address_space_map, avail_virtual_mib, largest_free_region_mib},
+};
+
+/// Largest-free-block size below which the one-shot region map is logged.
+const MAP_BELOW_MIB: u64 = 512;
+static MAP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Presents between two samples; the query is a syscall, this keeps it off the frame time.
+const SAMPLE_EVERY: u32 = 120;
+
+/// Samples between two unconditional log lines: a time series of the space at ~10 s.
+const REPORT_EVERY_SAMPLES: u32 = 10;
+
+/// Free-address-space thresholds, in MiB, each logged once when crossed downwards.
+const THRESHOLDS_MIB: [u64; 6] = [1536, 1024, 768, 512, 256, 128];
+
+static PRESENTS: AtomicU32 = AtomicU32::new(0);
+/// Index of the next threshold to report; thresholds above it were already logged.
+static NEXT_THRESHOLD: AtomicU8 = AtomicU8::new(0);
+
+/// What the live textures hold in the 32-bit address space.
+struct TextureFootprint {
+    count: usize,
+    mip_bytes: u64,
+    resident_default_static: u64,
+    resident_default_dynamic: u64,
+    resident_other: u64,
+}
+
+impl DeviceInner {
+    /// Count, total mip bytes, and resident staging bytes of every live texture.
+    ///
+    /// The staging split names who still holds a system copy: default-pool
+    /// static (droppable after upload), default-pool dynamic, and the
+    /// lockable pools.
+    fn live_texture_footprint(&self) -> TextureFootprint {
+        let live = self
+            .live_textures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut fp = TextureFootprint {
+            count: live.len(),
+            mip_bytes: 0,
+            resident_default_static: 0,
+            resident_default_dynamic: 0,
+            resident_other: 0,
+        };
+        for &t in live.iter() {
+            // SAFETY: the registry holds every live texture until its
+            // release deregisters it under the same lock.
+            let ti = unsafe { &*t };
+            fp.mip_bytes += ti.allocated_bytes();
+            let resident = ti.resident_staging_bytes();
+            if ti.d3d_pool() == mtld3d_types::D3DPOOL_DEFAULT {
+                if ti.d3d_usage() & mtld3d_types::D3DUSAGE_DYNAMIC == 0 {
+                    fp.resident_default_static += resident;
+                } else {
+                    fp.resident_default_dynamic += resident;
+                }
+            } else {
+                fp.resident_other += resident;
+            }
+        }
+        drop(live);
+        fp
+    }
+
+    /// Sample the free virtual address space and log threshold crossings.
+    pub fn mem_watch_present(&self) {
+        let present = PRESENTS.fetch_add(1, Ordering::Relaxed);
+        if !present.is_multiple_of(SAMPLE_EVERY) {
+            return;
+        }
+        let Some(avail) = avail_virtual_mib() else {
+            return;
+        };
+        if (present / SAMPLE_EVERY).is_multiple_of(REPORT_EVERY_SAMPLES)
+            && log::log_enabled!(target: LOG_TARGET, log::Level::Debug)
+        {
+            let fp = self.live_texture_footprint();
+            let largest = largest_free_region_mib();
+            debug!(
+                target: LOG_TARGET,
+                "address space: {avail} MiB free, largest free block {largest} MiB; mtld3d holds \
+                 {} textures with {} MiB of mip data, staging resident {} MiB \
+                 (default static {} / default dynamic {} / other {}), page boxes {} MiB, \
+                 retained vertex/index buffers {} MiB, locks on static default textures {}",
+                fp.count,
+                fp.mip_bytes >> 20,
+                (fp.resident_default_static + fp.resident_default_dynamic + fp.resident_other) >> 20,
+                fp.resident_default_static >> 20,
+                fp.resident_default_dynamic >> 20,
+                fp.resident_other >> 20,
+                mtld3d_core::page_box::live_bytes() >> 20,
+                self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20,
+                crate::texture::default_static_lock_count()
+            );
+            if largest < MAP_BELOW_MIB && !MAP_LOGGED.swap(true, Ordering::Relaxed) {
+                warn!(target: LOG_TARGET, "address space map: {}", address_space_map());
+            }
+        }
+        let mut next = NEXT_THRESHOLD.load(Ordering::Relaxed);
+        while let Some(&threshold) = THRESHOLDS_MIB.get(usize::from(next))
+            && avail < threshold
+        {
+            next += 1;
+            NEXT_THRESHOLD.store(next, Ordering::Relaxed);
+            let fp = self.live_texture_footprint();
+            warn!(
+                target: LOG_TARGET,
+                "address space: {avail} MiB free (below {threshold} MiB); mtld3d holds \
+                 {} textures with {} MiB of mip data, page boxes {} MiB",
+                fp.count,
+                fp.mip_bytes >> 20,
+                mtld3d_core::page_box::live_bytes() >> 20
+            );
+        }
+    }
+}

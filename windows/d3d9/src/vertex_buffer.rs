@@ -14,7 +14,6 @@
 use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
-use log::trace;
 use mtld3d_core::{
     buffer_rename::{BufferMapMode, LockPlan, PreserveKind, classify_map_mode, plan_lock},
     dirty_range::DirtyRange,
@@ -28,8 +27,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
-    device::DeviceInner, null_out, private_data::PrivateDataStore,
+    D3D_OK, D3DERR_INVALIDCALL, com_ref::ComUnknown, device::DeviceInner,
+    private_data::PrivateDataStore,
 };
 
 static DIRECT3D_VERTEX_BUFFER9_VTBL: IDirect3DVertexBuffer9Vtbl = IDirect3DVertexBuffer9Vtbl {
@@ -283,11 +282,22 @@ extern "system" fn vb_query_interface(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let _timer = vb_timer(this);
-    // SAFETY: vtable in-param; `riid` is *const Guid per IUnknown::QueryInterface ABI.
-    let riid_lo = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).map_or(0, |g| g.data1);
-    trace!(target: LOG_TARGET, "IDirect3DVertexBuffer9::QueryInterface(riid_lo={riid_lo:#010x})");
-    null_out(ppv);
-    E_NOINTERFACE
+    // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
+    // IUnknown::QueryInterface ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[
+                mtld3d_types::IID_IUNKNOWN,
+                mtld3d_types::IID_IDIRECT3DRESOURCE9,
+                mtld3d_types::IID_IDIRECT3DVERTEXBUFFER9,
+            ],
+            vb_add_ref,
+            "IDirect3DVertexBuffer9",
+        )
+    }
 }
 
 extern "system" fn vb_add_ref(this: *mut c_void) -> u32 {

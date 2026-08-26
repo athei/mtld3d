@@ -240,6 +240,73 @@ impl Volume<'_> {
         // SAFETY: `self.ptr` is a live volume for the wrapper's lifetime.
         unsafe { deref_vtbl::<IDirect3DVolume9Vtbl>(self.ptr) }
     }
+
+    #[must_use]
+    pub fn desc(&self) -> (i32, D3DVOLUME_DESC) {
+        let mut desc = D3DVOLUME_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_desc)(self.ptr, &raw mut desc) };
+        (hr, desc)
+    }
+
+    /// Fill the level through `IDirect3DVolume9::LockBox` / `UnlockBox`.
+    ///
+    /// `texels` is the whole level, tightly packed slice by slice, row by
+    /// row; the write honours the row and slice pitches the lock reports.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32(&self, texels: &[u32]) {
+        let (hr, desc) = self.desc();
+        expect_ok(hr, "Volume GetDesc");
+        let (width, height, depth) = (
+            desc.width as usize,
+            desc.height as usize,
+            desc.depth as usize,
+        );
+        assert_eq!(texels.len(), width * height * depth, "one level of texels");
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null box locks the whole level.
+        let hr = unsafe { (self.vtbl().lock_box)(self.ptr, &raw mut locked, core::ptr::null(), 0) };
+        expect_ok(hr, "Volume LockBox");
+        assert!(!locked.bits.is_null(), "LockBox handed out a pointer");
+        let row_pitch = usize::try_from(locked.row_pitch).expect("row pitch is positive");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("slice pitch is positive");
+        for z in 0..depth {
+            for y in 0..height {
+                let row = &texels[(z * height + y) * width..][..width];
+                // SAFETY: `LockBox` mapped `slice_pitch * depth` writable bytes
+                // at `bits`, so the row start lands inside its own slice.
+                let dst = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                // SAFETY: `width * 4` bytes from the row start never exceed
+                // `row_pitch`, so the copy stays inside the mapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, width * 4);
+                }
+            }
+        }
+        // SAFETY: vtable thunk; `self.ptr` is live and the level is locked.
+        let hr = unsafe { (self.vtbl().unlock_box)(self.ptr) };
+        expect_ok(hr, "Volume UnlockBox");
+    }
 }
 
 impl Drop for Volume<'_> {

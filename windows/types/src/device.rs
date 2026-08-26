@@ -204,6 +204,7 @@ pub const D3DUSAGE_QUERY_SRGBWRITE: u32 = 0x0004_0000;
 pub const D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING: u32 = 0x0008_0000;
 pub const D3DUSAGE_QUERY_VERTEXTEXTURE: u32 = 0x0010_0000;
 pub const D3DUSAGE_NONSECURE: u32 = 0x0080_0000;
+pub const D3DUSAGE_DMAP: u32 = 0x0000_4000;
 
 // ── D3D9 resource pools (`D3DPOOL`, the `Pool` arg of the Create*
 // methods) ──

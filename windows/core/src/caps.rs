@@ -319,8 +319,16 @@ const ADVERTISE_ALL_FILTER: FilterCaps = FilterCaps::all().difference(FilterCaps
 /// `true` (the resolved `debug.capsAll` from `mtld3d.conf`). The override is
 /// process-wide — no per-call-site opt-in — so games can't accidentally see a
 /// half-advertised cap set.
-pub fn fill(caps: &mut D3DCAPS9, caps_all: bool) {
+pub fn fill(caps: &mut D3DCAPS9, caps_all: bool, sampler_border: bool) {
     fill_default(caps);
+    if !sampler_border {
+        // The device cannot create border-colour samplers (virtualized CI
+        // devices); a title that checks the cap then avoids the address mode
+        // instead of hitting the clamp-to-edge substitution.
+        let strip = !AddressCaps::BORDER.bits();
+        caps.texture_address_caps &= strip;
+        caps.volume_texture_address_caps &= strip;
+    }
     if caps_all {
         apply_advertise_all(caps);
         mtld3d_shared::log_once_warn!(
@@ -370,9 +378,12 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.stretch_rect_filter_caps = STRETCH_RECT_FILTER.bits();
     // Vertex texture fetch is not implemented: no sampler binds on the vertex
     // stage and `SetTexture` rejects the `D3DVERTEXTEXTURESAMPLER` range, so
-    // `vertex_texture_filter_caps` stays zero. That is a legal SM3 shape (ATI's
-    // R5xx shipped it), and `CheckDeviceFormat` denies
-    // `D3DUSAGE_QUERY_VERTEXTEXTURE` to match.
+    // Vertex texture fetch: point and linear min/mag filtering, no mip
+    // filter bit — `texldl` supplies its LOD explicitly, and Metal samples
+    // any level from a vertex function. Titles gate whole effect paths
+    // (per-sprite occlusion, displacement) on this being non-zero next to
+    // the matching `CheckDeviceFormat(QUERY_VERTEXTEXTURE)` answer.
+    caps.vertex_texture_filter_caps = FILTER_DEFAULT.bits();
     caps.stencil_caps = STENCIL_DEFAULT.bits();
     caps.texture_op_caps = TEXOP_DEFAULT.bits();
     caps.max_texture_blend_stages = FF_TEXTURE_STAGES;

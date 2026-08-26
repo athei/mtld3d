@@ -7,7 +7,10 @@
 //! Each test emits VS and PS independently (matching the per-stage API) and
 //! concatenates the two strings into one check target.
 
-use mtld3d_shared::mtl::{VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{
+    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
+    VS_POS_FIXUP_SLOT,
+};
 
 use super::{
     VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
@@ -3631,4 +3634,207 @@ fn declared_ps_samplers_reads_the_sampler_dimension() {
             "sampler s0 dimensionality"
         );
     }
+}
+
+const TYPE_CONSTBOOL: u32 = 14;
+const OP_DEFB: u16 = 47;
+
+#[test]
+fn defb_emits_bool_local() {
+    // vs_3_0 { defb b0, true; dcl_position v0; if b0 mov oT0, v0 endif }
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DEFB, 2),
+        dst_token(TYPE_CONSTBOOL, 0, 0xF, false),
+        1u32,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(
+        !vs.uses_dynamic_bool_constants(),
+        "a defb-defined bool is not dynamic"
+    );
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("bool b0 = true;"),
+        "defb must emit a `bool bN` local:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("if ((float4(float(b0))).x != 0.0)"),
+        "`if b0` must test the local:\n{vs_msl}"
+    );
+    assert!(
+        !vs_msl.contains("vs_b"),
+        "no runtime bitmask uniform for a defb-only shader:\n{vs_msl}"
+    );
+}
+
+#[test]
+fn dynamic_bool_constant_reads_the_runtime_vs_b_bitmask() {
+    // vs_3_0 { dcl_position v0; if b3 mov oT0, v0 endif }
+    // b3 has NO `defb`: it is fed by SetVertexShaderConstantB, so the branch
+    // must read bit 3 of the `vs_b` uniform.
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 3, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(vs.uses_dynamic_bool_constants());
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("constant uint &vs_b [[buffer(26)]]"),
+        "a dynamic bool declares the bitmask uniform:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("(vs_b >> 3u) & 1u"),
+        "`if b3` reads bit 3 of the bitmask:\n{vs_msl}"
+    );
+}
+
+#[test]
+fn sm3_texcoord_index_above_seven_links_through_the_varyings() {
+    // vs_3_0 { dcl_position v0; dcl_texcoord8 o0; mov o0, v0; }
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 8),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("float4 texcoord8;") && vs_msl.contains("float4 texcoord15;"),
+        "the varyings carry every SM3 texcoord index:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("out.texcoord8"),
+        "`dcl_texcoord8 o0` writes the matching varying:\n{vs_msl}"
+    );
+}
+
+#[test]
+fn ps_writing_odepth_drops_the_export_without_a_depth_attachment() {
+    // ps_3_0 { dcl t0; mov oDepth, t0.x; mov oC0, t0; } against a pass with
+    // no depth attachment: the value is still computed, the return type stays
+    // a bare float4 and nothing binds `[[depth(any)]]`.
+    const TYPE_DEPTHOUT: u32 = 9;
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_DEPTHOUT, 0, 0x1, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let variant = VariantKey {
+        flags: VariantFlags::NO_DEPTH_ATTACHMENT,
+        ..VariantKey::default()
+    };
+    let ps_msl = emit_ps_programmable(&ps, variant).expect("emit PS3");
+    assert!(
+        !ps_msl.contains("[[depth(any)]]") && !ps_msl.contains("_ps_out.oDepth"),
+        "no depth export against a depth-less pass:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("fragment float4 mtld3d_ps("),
+        "a single colour output keeps the bare float4 return:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("_depth_storage"),
+        "the oDepth write still has a target:\n{ps_msl}"
+    );
+}
+
+#[test]
+fn dynamic_int_constant_reads_the_runtime_ps_i_buffer() {
+    // ps_3_0 { rep i0; mov r0, c0; endrep; mov oC0, r0 }
+    // i0 has NO `defi`: it is fed by SetPixelShaderConstantI, so the loop
+    // count must read the runtime `ps_i` file, the fragment twin of `vs_i`.
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_REP, 1),
+        src_token(TYPE_CONSTINT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDREP, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    assert!(ps.uses_dynamic_int_constants());
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains(&format!(
+            "constant int4 *ps_i [[buffer({PS_INT_CONST_SLOT})]]"
+        )),
+        "a dynamic-int-const PS declares the ps_i file:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("ps_i[0]"),
+        "`rep i0` reads the runtime file, not a baked local:\n{ps_msl}"
+    );
+}
+
+#[test]
+fn dynamic_bool_constant_reads_the_runtime_ps_b_bitmask() {
+    // ps_3_0 { if b3 mov oC0, c0 endif }
+    // b3 has NO `defb`: it is fed by SetPixelShaderConstantB, so the branch
+    // must read bit 3 of the `ps_b` uniform.
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 3, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    assert!(ps.uses_dynamic_bool_constants());
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains(&format!(
+            "constant uint &ps_b [[buffer({PS_BOOL_CONST_SLOT})]]"
+        )),
+        "a dynamic bool declares the bitmask uniform:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("(ps_b >> 3u) & 1u"),
+        "`if b3` reads bit 3 of the bitmask:\n{ps_msl}"
+    );
 }

@@ -392,3 +392,338 @@ fn get_function_round_trips_the_bytecode() {
     // SAFETY: every call passes either null or a buffer of the size it names.
     check_get_function("ps_2_0", &PS_BC, &|d, s| unsafe { ps.get_function(d, s) });
 }
+
+/// `vs_2_0`: `if b0` picks red, else green, for the diffuse output.
+///
+/// `dcl_position v0; def c0, 1,0,0,1; def c1, 0,1,0,1; mov oPos, v0;
+/// if b0 mov oD0, c0 else mov oD0, c1 endif`
+const VS_BOOL_BRANCH_BC: [u32; 30] = [
+    0xFFFE_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// `ps_2_0`: `dcl v0; mov oC0, v0;` (the interpolated diffuse).
+const PS_DIFFUSE_BC: [u32; 8] = [
+    0xFFFF_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0x90E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the vertex shader.
+///
+/// The branch's condition is `b0`, set through `SetVertexShaderConstantB`:
+/// TRUE takes the red arm, FALSE the green one, and the change reaches the
+/// draw without a shader rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BOOL_BRANCH_BC);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_vertex_shader_constant_b(0, &[value]),
+            0,
+            "SetVertexShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_3_0`: `if b0` picks red, else green, for the colour output.
+///
+/// `def c0, 1,0,0,1; def c1, 0,1,0,1; if b0 mov oC0, c0 else mov oC0, c1 endif`
+const PS_BOOL_BRANCH_BC: [u32; 24] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the pixel shader.
+///
+/// The fragment twin of the vertex-shader test above: `b0` comes from
+/// `SetPixelShaderConstantB`, TRUE paints red, FALSE green, no rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BOOL_BRANCH_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_b(0, &[value]),
+            0,
+            "SetPixelShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_3_0`: `rep i0` adds a quarter of red per iteration.
+///
+/// `def c0, 0.25,0,0,0; def c1, 0,0,0,1; mov r0, c1; rep i0; add r0, r0, c0;
+/// endrep; mov oC0, r0`
+const PS_INT_LOOP_BC: [u32; 27] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3E80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x800F_0000,
+    0xA0E4_0001,
+    0x0100_0026,
+    0xF0E4_0000,
+    0x0300_0002,
+    0x800F_0000,
+    0x80E4_0000,
+    0xA0E4_0000,
+    0x0000_0027,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic integer constant drives a `rep` loop count in the pixel shader.
+///
+/// `i0.x` comes from `SetPixelShaderConstantI`: four iterations reach full
+/// red, zero iterations leave the black start value, no rebind in between.
+#[test]
+fn int_shader_constant_drives_loop_count_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_INT_LOOP_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (count, expected, what) in [
+        (4, 0xFFFF_0000, "i0 = 4 iterations add up to full red"),
+        (
+            0,
+            0xFF00_0000,
+            "i0 = 0 iterations keep the black start value",
+        ),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_i(0, &[count, 0, 0, 0]),
+            0,
+            "SetPixelShaderConstantI"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_2_0`: `def c0, 1,0,0,1; mov oDepth, c0.x; mov oC0, c0;`
+const PS_DEPTH_WRITE_BC: [u32; 14] = [
+    0xFFFF_0200,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x9001_0800,
+    0xA000_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+/// A pixel shader writing `oDepth` still draws when no depth buffer is bound.
+///
+/// D3D9 discards the depth write in that case; the pipeline must not fail
+/// (Metal rejects a depth output against no depth attachment), so the draw
+/// lands and the colour output shows.
+#[test]
+fn depth_writing_ps_draws_without_a_depth_buffer() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_DEPTH_WRITE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind the depth buffer"
+    );
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "the colour output lands although the shader writes oDepth"
+    );
+}
+
+/// `vs_3_0` fetching a texel with `texldl` and forwarding it as the color.
+///
+/// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
+/// def c4, 0.5, 0.5, 0, 0; mov o0, v0; texldl r0, c4, s0; mov o1, r0;`
+/// The fetch coordinate is `c4` — center of the texture, LOD 0 from `.w`.
+#[rustfmt::skip]
+const VS_FETCH: [u32; 27] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0500_0051, 0xA00F_0004,                           // def c4,
+    0x3F00_0000, 0x3F00_0000, 0x0000_0000, 0x0000_0000, //   0.5, 0.5, 0, 0
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0300_005F, 0x800F_0000, 0xA0E4_0004, 0xA0E4_0800, // texldl r0, c4, s0
+    0x0000_FFFF,                                        // end (o1 write below)
+];
+
+/// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }` — pass the VS color through.
+#[rustfmt::skip]
+const PS_COLOR_PASSTHROUGH: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_000A, 0x900F_0000,              // dcl_color0 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn vertex_texture_fetch_reads_the_bound_slot() {
+    // Vertex texture fetch: a vs_3_0 declares a sampler, the game binds a
+    // texture at D3DVERTEXTEXTURESAMPLER0 (stage 257), and texldl reads it
+    // per vertex. The fetched color rides a varying to the pixel shader, so
+    // the rendered triangle proves the vertex-stage bind end to end.
+    // Support is probed exactly like a title does: the caps bit and the
+    // per-format QUERY_VERTEXTEXTURE answer.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            mtld3d_types::D3DFMT_X8R8G8B8,
+            0x0010_0000, // D3DUSAGE_QUERY_VERTEXTEXTURE
+            3,           // D3DRTYPE_TEXTURE
+            mtld3d_types::D3DFMT_A8R8G8B8,
+        ),
+        0,
+        "vertex texture format probe answers available"
+    );
+
+    let tex = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[0xFF00_FF00; 4]); // all-green
+    }
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `mov o1, r0` before the end token.
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the texel fetched in the vertex shader colors the triangle"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}

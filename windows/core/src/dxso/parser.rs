@@ -13,9 +13,9 @@ use mtld3d_types::{
 
 use super::{
     ir::{
-        CmpFunc, DeclUsage, Declaration, DefConstant, DefIntConstant, DstMods, DstOperand,
-        DxsoError, DxsoProgram, InstrFlags, Instruction, RegKind, Register, RelativeAddr,
-        ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
+        CmpFunc, DeclUsage, Declaration, DefBoolConstant, DefConstant, DefIntConstant, DstMods,
+        DstOperand, DxsoError, DxsoProgram, InstrFlags, Instruction, RegKind, Register,
+        RelativeAddr, ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
     },
     opcode::Opcode,
 };
@@ -114,6 +114,7 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
     let mut declarations = Vec::new();
     let mut def_constants = Vec::new();
     let mut def_int_constants = Vec::new();
+    let mut def_bool_constants = Vec::new();
     let mut instructions = Vec::new();
     let mut subroutines: std::collections::BTreeMap<u32, Vec<Instruction>> =
         std::collections::BTreeMap::new();
@@ -192,11 +193,19 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
                 def_int_constants.push(DefIntConstant { reg, value });
             }
             Opcode::DefB => {
-                // Bool def constant: dst + 1 bool.
-                pos = pos.checked_add(2).ok_or(DxsoError::Truncated)?;
-                if pos > bytecode.len() {
-                    return Err(DxsoError::Truncated);
-                }
+                // Bool def constant: dst + 1 BOOL word.
+                let dst_token = *bytecode.get(pos).ok_or(DxsoError::Truncated)?;
+                pos += 1;
+                let reg = Register {
+                    kind: decode_reg_type(dst_token)?,
+                    index: (dst_token & 0x7FF) as u16,
+                };
+                let bits = *bytecode.get(pos).ok_or(DxsoError::Truncated)?;
+                pos += 1;
+                def_bool_constants.push(DefBoolConstant {
+                    reg,
+                    value: bits != 0,
+                });
             }
             // ps_1_4 `phase` separates the two texture-addressing passes. It
             // carries no operands and only marks a boundary; our emitter lowers
@@ -318,6 +327,7 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
         declarations,
         def_constants,
         def_int_constants,
+        def_bool_constants,
         instructions,
         subroutines,
     })
