@@ -2921,12 +2921,23 @@ extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
     // value visibly decreases as the app allocates GPU resources, while
     // staying generous enough never to starve a real workload. 2 GiB budget
     // (fits u32; well above any title's needs).
+    //
+    // `memory.vramBudgetMB` lowers that ceiling, and defaults to doing so on a
+    // 32-bit guest. An engine of this era sizes its streaming pool from what
+    // this call reports, so an unrestricted figure invites a title to commit
+    // past the process address space; what fails then is not an allocation it
+    // could handle but a Metal command buffer, out of memory, whose rendering
+    // is discarded.
     const VRAM_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+    let budget = match crate::config::CONFIG.vram_budget_cap_bytes {
+        0 => VRAM_BUDGET,
+        cap => VRAM_BUDGET.min(cap),
+    };
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let used = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
         .map_or(0, |obj| obj.inner().vram_bytes_used.load(Ordering::Acquire));
-    u32::try_from(VRAM_BUDGET.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+    u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
 }
 
 extern "system" fn device_evict_managed_resources(this: *mut c_void) -> i32 {

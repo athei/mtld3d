@@ -92,6 +92,17 @@ pub struct Mtld3dConfig {
     /// run out (the A/B baseline arm). Default: 512 MiB. File key:
     /// `memory.vbibRetentionCapMB` (value in MiB).
     pub vbib_retention_cap_bytes: u64,
+    /// Ceiling for the figure `GetAvailableTextureMem` advertises.
+    ///
+    /// `0` lifts the ceiling.
+    ///
+    /// An engine of this era sizes its texture and streaming pools off that
+    /// figure and commits against it, so on a 32-bit guest an unrestricted
+    /// report invites a title past the process address space. What fails then
+    /// is a Metal command buffer, out of memory, whose rendering is discarded.
+    /// Default: 1 GiB on a 32-bit guest, no ceiling on 64-bit. File key:
+    /// `memory.vramBudgetMB` (value in MiB).
+    pub vram_budget_cap_bytes: u64,
     /// Byte cap for the `PageBox` recycle pool. `0` = pool disabled.
     ///
     /// VB/IB `PageBox`es retired by the encoder's retention drain are
@@ -151,6 +162,14 @@ impl Default for Mtld3dConfig {
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
+            // The 32-bit address space is the ceiling that matters, not the
+            // GPU's memory: a unified-memory Mac has far more than a D3D9
+            // title can use, while the guest process runs out first.
+            vram_budget_cap_bytes: if cfg!(target_pointer_width = "32") {
+                1024 * 1024 * 1024
+            } else {
+                0
+            },
             pagebox_pool_cap_bytes: 128 * 1024 * 1024,
             present_max_fps: 0,
             render_scale_percent: 100,
@@ -253,6 +272,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: memory.vramBudgetMB = {}",
+        cfg.vram_budget_cap_bytes / (1024 * 1024)
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: memory.pageboxPoolCapMB = {}",
         cfg.pagebox_pool_cap_bytes / (1024 * 1024)
     );
@@ -293,6 +317,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "memory.vbibRetentionCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);
+        }
+        "memory.vramBudgetMB" => {
+            assign_cap_mb(source, key, value, &mut cfg.vram_budget_cap_bytes);
         }
         "memory.pageboxPoolCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.pagebox_pool_cap_bytes);

@@ -32,6 +32,36 @@ fn defaults_match_documented_values() {
     assert_eq!(d.render_scale_percent, 100);
 }
 
+/// The advertised video-memory ceiling defaults by guest width.
+///
+/// A 32-bit guest runs out of process address space long before a
+/// unified-memory Mac runs out of GPU memory, and an engine that sizes its
+/// streaming pool from the advertised figure will commit until it does.
+#[test]
+fn vram_budget_defaults_to_a_ceiling_only_on_a_32_bit_guest() {
+    let d = parse("", None);
+    if cfg!(target_pointer_width = "32") {
+        assert_eq!(d.vram_budget_cap_bytes, 1024 * 1024 * 1024);
+    } else {
+        assert_eq!(
+            d.vram_budget_cap_bytes, 0,
+            "a 64-bit guest keeps no ceiling"
+        );
+    }
+}
+
+#[test]
+fn vram_budget_parses_as_mib_and_zero_lifts_the_ceiling() {
+    assert_eq!(
+        parse("memory.vramBudgetMB = 512\n", None).vram_budget_cap_bytes,
+        512 * 1024 * 1024
+    );
+    assert_eq!(
+        parse("memory.vramBudgetMB = 0\n", None).vram_budget_cap_bytes,
+        0
+    );
+}
+
 #[test]
 fn pagebox_pool_cap_parses_as_mib() {
     let cfg = parse("memory.pageboxPoolCapMB = 96\n", None);
