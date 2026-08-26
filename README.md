@@ -109,8 +109,8 @@ own fallback paths instead of breaking:
 
 ### Faster than conformant
 
-Divergences from D3D9 kept on purpose, because closing them costs frame time
-and no game depends on them:
+Divergences from D3D9 kept on purpose, because closing them costs frame time or
+memory headroom and no tested game depends on them:
 
 - **`GetData(D3DGETDATA_FLUSH)` returns `S_OK` immediately** for a pending
   occlusion query instead of blocking until the GPU has the count. Games use
@@ -122,6 +122,24 @@ and no game depends on them:
   that relies on depth surviving a pass it never cleared can read stale depth.
   Preserving it unconditionally would cost the optimization on every frame of
   every game that does clear, which is all of the tested ones.
+- **A partial `Lock` of a dynamic vertex or index buffer hands back a pointer
+  into memory a queued draw may still be reading**, unless the game passed
+  `D3DLOCK_DISCARD` or locked the whole buffer. On D3D9 the runtime keeps the
+  game's writes from landing under a draw the GPU has not reached yet, and
+  `D3DLOCK_NOOVERWRITE` is how a game opts out of that protection; here it is
+  the other way round, so a game that locks a sub-range and expects the
+  runtime to manage the timing can get corrupted geometry for a frame, with
+  nothing in the log. Matching D3D9 means either stalling until the draw
+  retires or renaming the backing on every such `Lock`, and a dynamic buffer is
+  precisely the one a UI or particle batcher locks dozens of times per frame.
+  The rename-and-retain path those extra locks would run through has already
+  been observed peaking around 1.4 GB of retained backings, which is why
+  `memory.vbibRetentionCapMB` exists and why hitting that cap forces a
+  mid-frame GPU sync. So this one trades memory headroom rather than frame
+  time, and it has no knob: turning it on is the memory growth. Wine's d3d9
+  test suite probes this and reports it in some runs, so the rationale is
+  written up in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) like every
+  other kept divergence.
 
 ### Deliberately not implemented
 

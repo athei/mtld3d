@@ -80,6 +80,7 @@ fn api_perf_drain_moves_and_resets() {
     api.bump_vb_rename();
     api.bump_vb_rename();
     api.bump_vbib_preserve_cpu();
+    api.bump_vbib_write_in_place_contended();
 
     let mut p = FramePerfPayload::new();
     api.drain_into_payload(&mut p);
@@ -94,6 +95,7 @@ fn api_perf_drain_moves_and_resets() {
     );
     assert_eq!(p.counters.vb_rename, 2);
     assert_eq!(p.counters.vbib_preserve_cpu, 1);
+    assert_eq!(p.counters.vbib_write_in_place_contended, 1);
     assert_eq!(
         p.timing.frame_total_cycles, 0,
         "first frame has no predecessor"
@@ -106,6 +108,7 @@ fn api_perf_drain_moves_and_resets() {
     );
     assert_eq!(api.counters.vb_rename, 0);
     assert_eq!(api.counters.vbib_preserve_cpu, 0);
+    assert_eq!(api.counters.vbib_write_in_place_contended, 0);
 
     // Second drain should report a real frame_total (tsc moved).
     let mut p2 = FramePerfPayload::new();
@@ -303,6 +306,7 @@ fn summary_golden_layout() {
         "  discards  VB=10     IB=3                                      API: rename, no preserve (DISCARD or whole-buffer WRITEONLY)\n",
         "  preserve  2                                                   API: rename + sync memcpy (whole-buffer non-WRITEONLY contended — game may read back)\n",
         "  bytes     720 KB                  peak/frame 720 KB           API: fresh PageBox bytes behind rename (16 KiB-padded; what the allocator serves)\n",
+        "in-place    3                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
         "staging up  0                                                   encoder: Staged (non-DYNAMIC) dirty-range upload blits — separate-staging path; high here with rename≈0 is the goal\n",
         "reorder     0                                                   encoder: rename-at-overlap (upload hit a just-drawn region; rare)\n",
         "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
@@ -475,6 +479,10 @@ fn sample_window() -> PerfWindow {
             // CPU-memcpy preserve path. Surfaces in the `preserve` row.
             // `rename = discards + preserve_cpu` holds (12 = 10 + 2 for VB).
             vbib_preserve_cpu: 2,
+            // Three contended partial Locks took the kept-divergence
+            // in-place arm. Outside the `rename = discards +
+            // preserve_cpu` partition: no rename was allocated.
+            vbib_write_in_place_contended: 3,
             // Two cheap-tier recoveries (drain) and one heavy
             // (submit) — exercises the row formatting on both halves.
             retention_cap_drain: 2,

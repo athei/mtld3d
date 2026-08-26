@@ -472,6 +472,13 @@ extern "system" fn ib_lock(
         // resources per D3D9 lifetime rules.
         let dev = unsafe { &mut *inner.device_inner };
         let coh = dev.coherent_seq_arc().load(Ordering::Acquire);
+        // The same contention test `plan_lock` applies, named here so
+        // both it and the plan read one sampled `coh`. A stale `coh` is
+        // a lower bound on GPU progress (only the unix side raises it,
+        // with a `fetch_max` once the GPU retires the frame), so it can
+        // turn a legal in-place write into an unnecessary rename, never
+        // the reverse.
+        let contended = inner.last_submit_seq > coh;
         match plan_lock(
             flags,
             inner.usage,
@@ -517,7 +524,20 @@ extern "system" fn ib_lock(
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
             }
-            LockPlan::WriteInPlace => {}
+            LockPlan::WriteInPlace => {
+                // Count the kept divergence: a contended partial Lock
+                // without DISCARD or NOOVERWRITE hands back a pointer
+                // into the backing a queued draw may still be reading
+                // (README, "Faster than conformant"). Counted and not
+                // warned because it is a by-design no-op on a per-frame
+                // batcher path, not a stub or a fallback. The other two
+                // ways to reach `WriteInPlace` (NOOVERWRITE/READONLY,
+                // uncontended) are conformant, so it takes both tests to
+                // select this arm.
+                if contended && !bypass_rename {
+                    dev.perf_mut().bump_vbib_write_in_place_contended();
+                }
+            }
         }
     }
 

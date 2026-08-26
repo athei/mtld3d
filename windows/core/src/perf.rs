@@ -560,6 +560,17 @@ struct FrameCounters {
     /// the memcpy itself, so a non-zero count means the preserve actually
     /// ran — not merely that a rename was planned.
     vbib_preserve_cpu: u32,
+    /// Contended partial VB/IB Locks this frame that were handed back in place.
+    ///
+    /// The plain (no `DISCARD`, no `NOOVERWRITE`) partial Lock of a
+    /// DYNAMIC buffer a queued draw may still be reading. `plan_lock`
+    /// answers `WriteInPlace` on the strength of the DYNAMIC timing
+    /// contract rather than renaming, the divergence the README lists
+    /// under "Faster than conformant". The arm has no other side effect,
+    /// so this count is the only signal that a game leans on it.
+    /// `NOOVERWRITE` / `READONLY` and uncontended Locks are excluded:
+    /// handing those back in place is the specified behaviour.
+    vbib_write_in_place_contended: u32,
     /// VB/IB rename allocs that found retained bytes at the cap.
     ///
     /// Each one paid a cheap `DrainRetiredNow` round-trip before
@@ -707,6 +718,7 @@ impl FrameCounters {
             vb_discards: 0,
             ib_discards: 0,
             vbib_preserve_cpu: 0,
+            vbib_write_in_place_contended: 0,
             retention_cap_drain: 0,
             retention_cap_submit: 0,
             texture_renames: 0,
@@ -1141,6 +1153,19 @@ impl ApiPerfState {
         self.counters.vbib_preserve_cpu = self.counters.vbib_preserve_cpu.saturating_add(1);
     }
 
+    /// Contended partial Lock of a DYNAMIC VB/IB handed back in place.
+    ///
+    /// The kept divergence: no rename, no preserve, no stall, so the
+    /// count is the only trace the arm leaves. Corrupted geometry with
+    /// nothing in the log is its symptom, and this row is where to look
+    /// for whether it fired.
+    pub const fn bump_vbib_write_in_place_contended(&mut self) {
+        self.counters.vbib_write_in_place_contended = self
+            .counters
+            .vbib_write_in_place_contended
+            .saturating_add(1);
+    }
+
     /// Bump when the retention cap forced a `DrainRetiredNow`.
     ///
     /// The cheap tier: one encoder round-trip, no GPU wait.
@@ -1291,6 +1316,8 @@ impl ApiPerfState {
     pub const fn bump_vbib_pool_miss(&mut self) {}
     #[inline]
     pub const fn bump_vbib_preserve_cpu(&mut self) {}
+    #[inline]
+    pub const fn bump_vbib_write_in_place_contended(&mut self) {}
     #[inline]
     pub const fn bump_retention_cap_drain(&mut self) {}
     #[inline]
@@ -2328,6 +2355,11 @@ struct PerfWindow {
     vb_discards: Stat,
     ib_discards: Stat,
     vbib_preserve_cpu: Stat,
+    /// Contended partial Locks handed back in place (sum only).
+    ///
+    /// Counts the kept divergence firing, not work done: the arm
+    /// allocates nothing and stalls nothing.
+    vbib_write_in_place_contended: Stat,
     /// `Staged` VB/IB dirty-range upload blits.
     ///
     /// The separate-staging path's headline counter (replaces renames for
@@ -2518,6 +2550,8 @@ impl PerfWindow {
         self.ib_discards.add(u64::from(s.counters.ib_discards));
         self.vbib_preserve_cpu
             .add(u64::from(s.counters.vbib_preserve_cpu));
+        self.vbib_write_in_place_contended
+            .add(u64::from(s.counters.vbib_write_in_place_contended));
         self.vbib_staging_uploads
             .add(u64::from(s.enc.vbib_staging_uploads));
         self.vbib_mid_pass_reorders
@@ -3841,6 +3875,15 @@ impl<'a> Summary<'a> {
             &rename_bytes_fmt,
             Some(&format!("peak/frame {rename_bytes_peak_fmt}")),
             "API: fresh PageBox bytes behind rename (16 KiB-padded; what the allocator serves)",
+        );
+        // Not a rename child: this arm allocates nothing, so it stays
+        // outside the `rename = discards + preserve` partition.
+        self.res_row(
+            out,
+            "in-place",
+            &format!("{c}", c = w.vbib_write_in_place_contended.sum),
+            None,
+            "API: contended partial Lock handed back live (kept divergence; no rename, no stall)",
         );
         self.res_row(
             out,

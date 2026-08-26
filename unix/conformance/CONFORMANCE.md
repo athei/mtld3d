@@ -605,7 +605,12 @@ test observes the divergence is a per-run CPU-vs-GPU race (the probe's Lock
 write lands before or after the GPU consumes the in-flight draw), so the
 count flutters between 0 and 1 across runs of the same binary; it read 0 on
 the CI runner and tripped the stale-baseline gate (PR #12), hence the flaky
-tolerance. The kept divergence itself is unchanged.
+tolerance. That race is in the observation only, not in the decision:
+`plan_lock` is a pure function of a `coherent_seq` its caller read once
+with Acquire before calling, and only the unix side raises that counter
+(`fetch_max`, on GPU retirement), so a stale read can turn a legal
+in-place write into a needless rename but never the reverse. The kept
+divergence itself is unchanged.
 
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected
