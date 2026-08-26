@@ -398,7 +398,7 @@ impl DeviceInner {
             Some((DepthBinding::Lazy(info, level), _, _)) => {
                 format!("{:?} level={level}", info.texture_id)
             }
-            Some((DepthBinding::Eager(_), _, _)) => String::from("default"),
+            Some((DepthBinding::Eager(..), _, _)) => String::from("default"),
             Some((DepthBinding::None, _, _)) | None => String::from("none"),
         };
         (rt, ds)

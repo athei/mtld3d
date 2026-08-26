@@ -38,6 +38,7 @@ fn fresh() -> PassState {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -53,6 +54,7 @@ fn fresh_scaled() -> PassState {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: (BB_SIZE.0 / 2, BB_SIZE.1 / 2),
         depth_has_stencil: false,
         render_scale: RenderScale::from_percent(50),
         continues_frame: false,
@@ -174,6 +176,7 @@ fn frame_sampled_textures_clears_on_reset_frame() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -382,7 +385,7 @@ fn depth_change_triggers_pass_break() {
     let other_depth = tex(0x4000);
     let mut s = fresh();
     s.emit_command(dummy_draw());
-    s.set_depth_stencil_attachment(other_depth, false, false);
+    s.set_depth_stencil_attachment(other_depth, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     assert_eq!(s.passes().len(), 2);
     assert_eq!(s.passes()[0].depth_texture(), depth());
@@ -476,7 +479,7 @@ fn region_depth_clear_after_pending_full_clear_keeps_the_clear() {
 #[test]
 fn region_depth_clear_without_depth_attachment_is_noop() {
     let mut s = fresh();
-    s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
     assert!(s.begin_region_depth_stencil_clear().is_none());
     assert!(s.passes().is_empty());
 }
@@ -503,6 +506,7 @@ fn reset_frame_drops_pending_clears() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -1142,6 +1146,7 @@ fn rule_a_reset_frame_re_arms_dontcare() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -1160,7 +1165,7 @@ fn rule_a_first_use_stencil_is_dontcare_and_later_use_loads() {
     let ds = tex(0x3300);
     let rt = tex(0x3000);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.emit_command(dummy_draw());
@@ -1174,7 +1179,7 @@ fn rule_a_first_use_stencil_is_dontcare_and_later_use_loads() {
 fn rule_a_pending_stencil_clear_beats_dontcare() {
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     assert_eq!(s.clear_stencil(5), StencilClearOutcome::Folded);
     s.emit_command(dummy_draw());
     assert_eq!(
@@ -1198,6 +1203,7 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: true,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -1215,10 +1221,10 @@ fn rule_a_reverts_stencil_dontcare_when_depth_sampled_later() {
     // depth plane, since the sampler reads the texture both live in.
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
     assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
-    s.set_depth_stencil_attachment(depth(), false, false);
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
     s.emit_command(Command::set_fragment_texture(ds.raw(), 0));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
@@ -1296,13 +1302,13 @@ fn rule_b_alternating_depth_each_gets_last_use_dontcare() {
     // Pass 0: backbuffer() + d1
     s.emit_command(dummy_draw());
     // Pass 1: backbuffer() + d2
-    s.set_depth_stencil_attachment(d2, false, false);
+    s.set_depth_stencil_attachment(d2, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     // Pass 2: backbuffer() + d1
-    s.set_depth_stencil_attachment(d1, false, false);
+    s.set_depth_stencil_attachment(d1, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     // Pass 3: backbuffer() + d2
-    s.set_depth_stencil_attachment(d2, false, false);
+    s.set_depth_stencil_attachment(d2, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.finalize_store_actions(false);
@@ -1511,7 +1517,7 @@ fn rule_b_keeps_store_when_depth_sampled_later() {
     let mut s = fresh();
     // Pass 0: cascade caster pass — write into cascade_depth.
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(cascade_depth, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     s.clear_depth(f32::to_bits(1.0));
     s.emit_command(dummy_draw());
     // Pass 1: scene pass — different rt+depth, sample cascade_depth.
@@ -1522,7 +1528,7 @@ fn rule_b_keeps_store_when_depth_sampled_later() {
         BB_FORMAT,
         s.render_scale,
     );
-    s.set_depth_stencil_attachment(depth(), false, false);
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
     s.emit_command(Command::set_fragment_texture(cascade_depth.raw(), 4));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
@@ -1585,12 +1591,12 @@ fn rule_g_strips_color_from_clear_only_pass_with_wasted_color() {
     let mut s = fresh();
     // Pass 0: cascade-color + cascade_d0, clear-only (no draws).
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(cascade_d0, false, false);
+    s.set_depth_stencil_attachment(cascade_d0, BB_SIZE, false, false);
     s.clear_color(1, 2, 3, 4);
     s.clear_depth(f32::to_bits(1.0));
     // Pass 1: same cascade_color but different depth. cascade_d0
     // is sampled in the scene pass later.
-    s.set_depth_stencil_attachment(cascade_d1, false, false);
+    s.set_depth_stencil_attachment(cascade_d1, BB_SIZE, false, false);
     s.clear_color(1, 2, 3, 4);
     s.clear_depth(f32::to_bits(1.0));
     s.emit_command(dummy_draw());
@@ -1602,7 +1608,7 @@ fn rule_g_strips_color_from_clear_only_pass_with_wasted_color() {
         BB_FORMAT,
         s.render_scale,
     );
-    s.set_depth_stencil_attachment(depth(), false, false);
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
     s.emit_command(Command::set_fragment_texture(cascade_d0.raw(), 4));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
@@ -1639,7 +1645,7 @@ fn rule_f_culls_pass_where_both_stores_become_dontcare() {
     // Both Stores DontCare + no draws + no blits → Rule F culls.
     let mut s = fresh();
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(cascade_depth, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     s.clear_color(1, 2, 3, 4);
     s.clear_depth(f32::to_bits(1.0));
     // No draws, no blits — pure clear-only pass.
@@ -1651,7 +1657,7 @@ fn rule_f_culls_pass_where_both_stores_become_dontcare() {
         BB_FORMAT,
         s.render_scale,
     );
-    s.set_depth_stencil_attachment(depth(), false, false);
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.coalesce_clear_only_passes();
@@ -1674,7 +1680,7 @@ fn rule_f_keeps_pass_where_depth_is_sampled() {
     // sampler). Rule F must NOT cull.
     let mut s = fresh();
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(cascade_depth, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     s.clear_color(1, 2, 3, 4);
     s.clear_depth(f32::to_bits(1.0));
     s.set_color_render_target(
@@ -1684,7 +1690,7 @@ fn rule_f_keeps_pass_where_depth_is_sampled() {
         BB_FORMAT,
         s.render_scale,
     );
-    s.set_depth_stencil_attachment(depth(), false, false);
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
     s.emit_command(Command::set_fragment_texture(cascade_depth.raw(), 4));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
@@ -1749,7 +1755,7 @@ fn a_stencil_clear_paints_once_the_plane_is_in_use() {
     // draw, then clear again under a narrowed viewport.
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
 
     // Nothing drawn yet: folding is observationally identical.
     assert_eq!(s.clear_stencil(5), StencilClearOutcome::Folded);
@@ -1777,7 +1783,7 @@ fn a_stencil_clear_under_a_zero_area_viewport_is_a_no_op() {
     // draws, ahead of them.
     let ds = tex(0x3300);
     let mut s = fresh_scaled();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
     let before = s.passes()[0].stencil_load();
     s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
@@ -1800,7 +1806,7 @@ fn a_stencil_clear_under_a_zero_area_viewport_opens_no_pass() {
     // no encoder is opened for it either.
     let ds = tex(0x3300);
     let mut s = fresh_scaled();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
@@ -1845,7 +1851,7 @@ fn a_depth_clear_under_a_zero_area_viewport_opens_no_pass() {
 #[test]
 fn a_depth_clear_with_no_depth_attachment_is_a_no_op() {
     let mut s = fresh();
-    s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
 
     assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
     assert!(s.pending_depth_clear.is_none());
@@ -1857,7 +1863,7 @@ fn a_stencil_clear_with_no_depth_attachment_is_a_no_op() {
     // Nothing is attached, so there is nothing to fold or paint; stashing
     // would clear whatever texture the next pass happens to attach.
     let mut s = fresh();
-    s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
 
     assert_eq!(s.clear_stencil(1), StencilClearOutcome::NoOp);
     assert!(s.pending_stencil_clear.is_none());
@@ -1871,7 +1877,7 @@ fn depth_and_stencil_clears_over_draws_paint_matching_quads() {
     // because neither call changes the state the other reads.
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
 
     let depth = s.clear_depth(f32::to_bits(1.0));
@@ -1894,7 +1900,7 @@ fn depth_and_stencil_clears_under_a_counting_query_share_the_fresh_pass() {
     // the encoder uses to know its binding cache must start over.
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     s.emit_command(Command::set_visibility_result_mode(
@@ -1920,7 +1926,7 @@ fn rule_e_carries_the_stencil_clear_into_the_merge_target() {
     let other_rt = tex(0x3100);
     let ds = tex(0x3200);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(ds, false, true);
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.clear_color(1, 2, 3, 4);
     s.clear_stencil(0x2A);
     s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
@@ -2055,7 +2061,7 @@ fn cascade_init_sequence_collapses_to_one_pass() {
     let mut s = fresh();
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
     s.clear_color(1, 2, 3, 4);
-    s.set_depth_stencil_attachment(cascade_depth, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     s.clear_depth(f32::to_bits(1.0));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
@@ -2088,7 +2094,7 @@ fn pending_color_clear_survives_depth_attach_change() {
     // materialise into a spurious pass).
     let mut s = fresh();
     s.clear_color(7, 7, 7, 7);
-    s.set_depth_stencil_attachment(d2, false, false);
+    s.set_depth_stencil_attachment(d2, BB_SIZE, false, false);
     // No draws yet — the pending color clear should still be
     // pending on the same (unchanged) color rt.
     assert!(s.passes().is_empty());
@@ -2224,7 +2230,7 @@ fn rule_h_skipped_without_depth_attachment() {
     // Detach depth so the candidate pass has color but no depth —
     // stripping color would produce an encoder with zero
     // attachments, which Metal rejects.
-    s.set_depth_stencil_attachment(MetalHandle::NULL, false, false);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
     s.note_draw_color_write_mask(0);
     s.emit_command(set_pso(PSO_WITH));
     s.emit_command(dummy_draw());
@@ -2704,7 +2710,7 @@ fn cross_pass_depth_clear_uses_load_plus_quad() {
 fn sampleable_depth_keeps_store_even_when_never_sampled() {
     let cascade_depth = tex(0xCAFE_5000);
     let mut s = fresh();
-    s.set_depth_stencil_attachment(cascade_depth, /* is_sampleable */ true, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, /* is_sampleable */ true, false);
     s.emit_command(dummy_draw());
     s.finalize_store_actions(false);
     let cascade_pass = s
@@ -2730,7 +2736,7 @@ fn non_sampleable_depth_still_gets_rule_b_dontcare() {
     let rt_depth = tex(0xCAFE_6000);
     let mut s = fresh();
     s.set_depth_stencil_attachment(
-        rt_depth, /* is_sampleable */ false, /* has_stencil */ false,
+        rt_depth, BB_SIZE, /* is_sampleable */ false, /* has_stencil */ false,
     );
     s.emit_command(dummy_draw());
     s.finalize_store_actions(false);
@@ -2761,10 +2767,10 @@ fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
     let mut s = fresh();
     // First bind as sampleable, draw into it, then rebind the SAME handle
     // with a stale is_sampleable=false (the GetDepthStencilSurface path).
-    s.set_depth_stencil_attachment(cascade_depth, true, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, true, false);
     s.emit_command(dummy_draw());
     let passes_before = s.passes().len();
-    s.set_depth_stencil_attachment(cascade_depth, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     assert!(
         !s.current_pass_closed(),
         "a rebind of a known-sampleable cascade must not break the pass",
@@ -2918,7 +2924,7 @@ fn clear_after_a_target_was_drawn_opens_a_load_pass_for_every_target() {
     s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     // A depth change ends the pass; the extra target has content now.
-    s.set_depth_stencil_attachment(tex(0x5000), false, false);
+    s.set_depth_stencil_attachment(tex(0x5000), BB_SIZE, false, false);
     assert!(matches!(
         s.clear_color(1, 2, 3, 4),
         ColorClearOutcome::EmitQuad { .. }
@@ -3251,6 +3257,7 @@ fn blit_written_set_resets_with_the_frame() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -3357,6 +3364,7 @@ fn continuation_loads_targets_drawn_before_the_flush() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: true,
@@ -3387,6 +3395,7 @@ fn a_real_present_still_dontcares_first_use() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
@@ -3399,12 +3408,17 @@ fn a_real_present_still_dontcares_first_use() {
 #[test]
 fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
     // The frame continues past a mid-frame flush, so the backbuffer stays
-    // "seen" for the load rules — but a Clear issued after the flush must
-    // still fold to a full loadAction=Clear, not the cross-pass scissored
-    // quad, because the pre-flush content is safely in VRAM. A sub-rect
-    // viewport is set to expose the bug: the quad would clip to it.
-    // (This is the `test_viewport` conformance shape: readback mid-frame,
-    // then Clear under a viewport.)
+    // "seen" for the load rules, yet a Clear issued after the flush must
+    // still fold to a full loadAction=Clear rather than the cross-pass
+    // scissored quad, because the pre-flush content is safely in VRAM.
+    //
+    // The sub-rect viewport is what makes the fold observable: it is the
+    // rect the cross-pass quad would clip to, so a `Folded` answer proves
+    // the flush cleared the segment's seen-set and no quad was chosen. It
+    // is not a claim about the viewport BOUND on a whole-target Clear:
+    // D3D9 does bound one, and the two encoder entry points
+    // (`clear_{color,depth_stencil}_bounded_to_viewport`) decide that a
+    // layer above, before calling in here.
     let mut s = fresh();
     s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
     s.emit_command(dummy_draw());
@@ -3414,6 +3428,7 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
+        depth_size: BB_SIZE,
         depth_has_stencil: false,
         render_scale: RenderScale::IDENTITY,
         continues_frame: true,
@@ -3456,11 +3471,11 @@ fn a_clear_within_one_segment_still_paints_a_quad() {
 fn depth_level_change_breaks_the_pass_and_a_repeat_bind_does_not() {
     let d = depth();
     let mut s = fresh();
-    s.set_depth_stencil_attachment_level(d, 0, false, false);
+    s.set_depth_stencil_attachment_level(d, 0, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
-    s.set_depth_stencil_attachment_level(d, 0, false, false);
+    s.set_depth_stencil_attachment_level(d, 0, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
-    s.set_depth_stencil_attachment_level(d, 1, false, false);
+    s.set_depth_stencil_attachment_level(d, 1, (BB_SIZE.0 / 2, BB_SIZE.1 / 2), false, false);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert_eq!(
@@ -3470,4 +3485,107 @@ fn depth_level_change_breaks_the_pass_and_a_repeat_bind_does_not() {
     );
     assert_eq!(s.passes()[0].depth_level(), 0);
     assert_eq!(s.passes()[1].depth_level(), 1);
+}
+
+/// The whole-target `Clear` bound: a covering viewport folds, a sub-rect does not.
+///
+/// Both predicates in one test because the two attachments answer
+/// independently and the interesting cases are the same four for each.
+#[test]
+fn viewport_coverage_is_answered_per_attachment() {
+    let mut s = fresh();
+
+    // The default viewport (the game never called `SetViewport`) falls back to
+    // the attachment's own extent, so it covers both.
+    assert!(s.viewport_covers_color_attachment());
+    assert!(s.viewport_covers_depth_attachment());
+
+    // Exactly the attachment: covers.
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    assert!(s.viewport_covers_color_attachment());
+    assert!(s.viewport_covers_depth_attachment());
+
+    // Larger than the attachment still covers: D3D9 clips the viewport to the
+    // render target, so an oversized one is not a sub-region. The comparison
+    // has to be greater-or-equal, not equality.
+    s.set_viewport(0, 0, 8192, 8192, 0.0, 1.0);
+    assert!(s.viewport_covers_color_attachment());
+    assert!(s.viewport_covers_depth_attachment());
+
+    // Full extent but moved off the origin: a sub-region, because the far
+    // edges fall outside.
+    s.set_viewport(16, 16, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
+
+    // At the origin but narrower on one axis only.
+    s.set_viewport(0, 0, BB_SIZE.0 - 1, BB_SIZE.1, 0.0, 1.0);
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1 - 1, 0.0, 1.0);
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
+}
+
+/// Nothing attached means nothing to bound, so the clear folds.
+#[test]
+fn viewport_coverage_folds_when_the_attachment_is_absent() {
+    let mut s = fresh();
+    s.set_viewport(100, 100, 64, 64, 0.0, 1.0);
+    assert!(!s.viewport_covers_color_attachment(), "both are bound");
+    assert!(!s.viewport_covers_depth_attachment(), "both are bound");
+
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    assert!(
+        s.viewport_covers_depth_attachment(),
+        "an unbound depth attachment has no extent to bound the clear to"
+    );
+    assert!(
+        !s.viewport_covers_color_attachment(),
+        "and the colour side is unaffected by the depth unbind"
+    );
+}
+
+/// The two attachments are measured separately, not through render target 0.
+#[test]
+fn a_depth_attachment_sized_unlike_the_colour_one_is_measured_on_its_own() {
+    let mut s = fresh();
+    // A cascade tile: the depth attachment is smaller than the back buffer and
+    // the viewport covers all of it.
+    s.set_depth_stencil_attachment(tex(0x9000), (256, 256), false, false);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    assert!(
+        s.viewport_covers_depth_attachment(),
+        "the viewport covers the whole depth attachment"
+    );
+    assert!(
+        !s.viewport_covers_color_attachment(),
+        "the same viewport is a sub-region of the larger colour attachment"
+    );
+
+    // And the other way round: a depth surface larger than render target 0,
+    // which D3D9 permits.
+    s.set_depth_stencil_attachment(tex(0x9100), (1024, 1024), false, false);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    assert!(s.viewport_covers_color_attachment());
+    assert!(
+        !s.viewport_covers_depth_attachment(),
+        "a viewport the size of render target 0 is a sub-region of a larger depth surface"
+    );
+}
+
+/// Coverage is asked in the bound texture's space, not the reported one.
+#[test]
+fn viewport_coverage_converts_through_the_render_scale() {
+    let mut s = fresh_scaled();
+    // The game's own numbers describe the whole reported back buffer; the
+    // rasterized attachments are half that, and the converted viewport has to
+    // be compared against the rasterized extent for the answer to hold.
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    assert!(s.viewport_covers_color_attachment());
+    assert!(s.viewport_covers_depth_attachment());
+
+    s.set_viewport(0, 0, BB_SIZE.0 / 2, BB_SIZE.1 / 2, 0.0, 1.0);
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
 }
