@@ -47,7 +47,7 @@ const _: () = {
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 64);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 32);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
-    assert!(core::mem::size_of::<SubmitFrameParams>() == 96);
+    assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
     assert!(core::mem::size_of::<PassDescriptor>() == 168);
 };
 
@@ -209,6 +209,13 @@ impl Thunk for SetDisplaySyncEnabledParams {
 pub struct WaitForGpuRetireParams {
     pub target_seq: u64,       // in
     pub coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
+    /// Where an aborted command buffer is recorded, mirroring `SubmitFrameParams`.
+    ///
+    /// The wait bumps `coherent_seq` itself so the caller observes the
+    /// advance synchronously, which would otherwise launder a command
+    /// buffer the GPU killed into "retired cleanly". 0 disables the
+    /// check.
+    pub failed_submit_seq_ptr: u64, // in: PE-side AtomicU64 backing
 }
 
 impl Thunk for WaitForGpuRetireParams {
@@ -674,6 +681,19 @@ pub struct SubmitFrameParams {
     /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
     /// VB/IB.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
+    /// Highest submit seq whose command buffer the GPU aborted.
+    ///
+    /// Both completion handlers `fetch_max` `submit_seq` into
+    /// `*(failed_submit_seq_ptr as *const AtomicU64)` when the command
+    /// buffer reaches `MTLCommandBufferStatus::Error`. Deliberately a
+    /// second counter rather than a gate on `coherent_seq`: an aborted
+    /// command buffer *is* finished with its source memory, so withholding
+    /// the retirement bump would pin every seq-gated queue behind a seq
+    /// that never retires and deadlock `wait_for_gpu_retire`. Retirement
+    /// for lifetime and retirement for success are separate facts, and the
+    /// PE side needs both to tell an upload it can free from one it must
+    /// re-issue. 0 before the frame is stamped.
+    pub failed_submit_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
     /// Nanoseconds spent in `nextDrawable()`, 0 outside a `PERF=1` build.
     ///
     /// Nanoseconds, not cycles, because this is the one duration that crosses

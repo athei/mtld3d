@@ -42,5 +42,6 @@ pub mod storage_policy;
 pub mod streams;
 pub mod stretch_rect;
 pub mod texture_staging;
+pub mod upload_recovery;
 pub mod visibility;
 pub mod vs_draw;

@@ -60,9 +60,9 @@ fn blit_texture_to_buffer_layout() {
 #[test]
 fn wait_for_gpu_retire_layout() {
     use super::WaitForGpuRetireParams;
-    // 2 * u64 = 16
+    // 3 * u64 = 24
     assert_eq!(core::mem::align_of::<WaitForGpuRetireParams>(), 8);
-    assert_eq!(core::mem::size_of::<WaitForGpuRetireParams>(), 16);
+    assert_eq!(core::mem::size_of::<WaitForGpuRetireParams>(), 24);
 }
 
 #[test]
@@ -83,9 +83,10 @@ fn frame_param_layouts_match_wow64() {
     //   + 8 passes_ptr + 4 pass_count + 4 _pad1
     //   + 8 present_layer + 8 present_texture
     //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
+    //   + 8 failed_submit_seq_ptr
     //   + 8 drawable_wait_ns + 8 present_view
-    //   = 96
-    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 96);
+    //   = 104
+    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 104);
 
     // CreateTexturesBatchParams:
     //   8 device_handle + 4 count + 4 _pad0 + 8 descs_ptr + 8 handles_out_ptr = 32
