@@ -293,6 +293,12 @@ impl Direct3DSurface9 {
         }
     }
 
+    /// A 2D texture level surface (`GetSurfaceLevel`).
+    ///
+    /// Container-cached: the parent texture keeps it in a sub-resource slot and
+    /// hands the same object back on every call for that level, so
+    /// `Release`-to-zero leaves the wrapper alive and only
+    /// `finalize_texture` frees it. See [`SurfaceFlags::CONTAINER_CACHED`].
     pub fn new_texture_backed(
         device_inner: *mut DeviceInner,
         parent_texture: *mut Direct3DTexture9,
@@ -312,7 +318,7 @@ impl Direct3DSurface9 {
             metal_color_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
-            flags: SurfaceFlags::empty(),
+            flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -329,6 +335,9 @@ impl Direct3DSurface9 {
     }
 
     /// Cube face surface backed by its parent cube subresource.
+    ///
+    /// Container-cached exactly like [`Self::new_texture_backed`], keyed by
+    /// `(face, mip_level)`.
     pub fn new_cube_texture_backed(
         device_inner: *mut DeviceInner,
         parent_texture: *mut Direct3DTexture9,
@@ -349,7 +358,7 @@ impl Direct3DSurface9 {
             metal_color_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
-            flags: SurfaceFlags::empty(),
+            flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -488,6 +497,37 @@ impl Direct3DSurface9 {
     /// texture's Metal handle and restoring the backbuffer.
     pub fn parent_texture(&self) -> *mut Direct3DTexture9 {
         self.inner().parent_texture
+    }
+
+    /// The container texture both refcounts of this surface forward to, or null.
+    ///
+    /// Non-null only for a `GetSurfaceLevel` / `GetCubeMapSurface` sub-surface:
+    /// D3D9 makes a sub-resource's count identical to its container's, and the
+    /// sub-surface reads its extent, format and lock state *through* the parent,
+    /// so the parent has to outlive every reference to the surface, public or
+    /// device-internal. Null for a standalone RT / depth-stencil, an owned
+    /// offscreen-plain (which forwards through the texture it owns instead), a
+    /// system-memory surface, and a device-owned implicit surface: those use the
+    /// central engine.
+    fn forward_texture(&self) -> *mut Direct3DTexture9 {
+        let inner = self.inner();
+        if inner.implicit_kind == ImplicitKind::None
+            && !inner.parent_texture.is_null()
+            && !inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
+        {
+            inner.parent_texture
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    /// Whether the container texture caches this wrapper and owns its lifetime.
+    ///
+    /// A cached sub-surface survives its own refcounts reaching zero so that
+    /// `GetSurfaceLevel` keeps handing back one identity; `finalize_texture`
+    /// frees it. See [`SurfaceFlags::CONTAINER_CACHED`].
+    fn container_cached(&self) -> bool {
+        self.inner().flags.contains(SurfaceFlags::CONTAINER_CACHED)
     }
 
     /// Whether this surface currently has an outstanding `LockRect`.
@@ -695,6 +735,14 @@ bitflags::bitflags! {
         /// faces of one cube map each carry their own, so two faces can be
         /// mapped at once even though they share `DcLockState`.
         const MAPPED = 1 << 1;
+        /// The container texture caches this wrapper, so `Release` never frees it.
+        ///
+        /// Set on a `GetSurfaceLevel` / `GetCubeMapSurface` surface, which the
+        /// parent texture keeps in a sub-resource slot: repeated getter calls
+        /// hand back the same object (D3D9 sub-resource identity), and
+        /// `finalize_texture` is the single free site. Clear for every other
+        /// surface, freed on its own last release.
+        const CONTAINER_CACHED = 1 << 2;
     }
 }
 
@@ -1020,15 +1068,7 @@ extern "system" fn surface_query_interface(
 unsafe fn container_forward_texture(this: *mut c_void) -> *mut Direct3DTexture9 {
     // SAFETY: live wrapper per the caller's contract.
     let obj = unsafe { &*this.cast::<Direct3DSurface9>() };
-    let inner = obj.inner();
-    if inner.implicit_kind == ImplicitKind::None
-        && !inner.parent_texture.is_null()
-        && !inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
-    {
-        inner.parent_texture
-    } else {
-        core::ptr::null_mut()
-    }
+    obj.forward_texture()
 }
 
 extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
@@ -1063,24 +1103,34 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
         // (or forwards the device release for a device-owned implicit surface).
         return unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
     }
-    // A texture sub-surface: forward the public Release to the container texture
-    // first (its return is the shared count we report), then drop our own
-    // refcount and free the surface Box once no app/bound reference remains.
-    // SAFETY: `tex` is the live parent texture; forward to its Release thunk.
-    let rc = unsafe { crate::com_ref::com_release::<Direct3DTexture9>(tex.cast::<c_void>()) };
+    // A texture sub-surface: drop our own refcount and free the surface Box once
+    // no app/bound reference remains, THEN forward the public Release to the
+    // container texture (its return is the shared count we report). The forward
+    // has to come last: it can take the texture to zero, and a cached
+    // sub-surface is freed together with its container, so nothing may touch
+    // `this` afterwards.
     let finalize_now = {
-        // SAFETY: the surface Box is a separate allocation from the texture
-        // (which the forward above may have freed); `this` is still live.
+        // SAFETY: `this` is live: this surface still holds the container
+        // reference that the forward below drops.
         let mut wrap = unsafe { VtableThis::<Direct3DSurface9>::new(this) };
+        // D3D9 tolerates Release past zero, and a cached sub-surface makes it
+        // reachable: the wrapper outlives its own last release. Answer 0 without
+        // dropping a container reference this surface never took.
+        if wrap.refcount == 0 {
+            return 0;
+        }
         wrap.refcount -= 1;
-        wrap.refcount == 0 && wrap.private_refcount == 0
+        wrap.refcount == 0 && wrap.private_refcount == 0 && !wrap.container_cached()
     };
     if finalize_now {
-        // SAFETY: both surface counters are zero — no other reference survives;
-        // a sub-surface does not own the texture, so this only frees the Box.
+        // SAFETY: both surface counters are zero and the container does not cache
+        // this wrapper, so no other reference survives; a sub-surface does not
+        // own the texture, so this only frees the Box.
         unsafe { finalize_surface(this.cast::<Direct3DSurface9>()) };
     }
-    rc
+    // SAFETY: `tex` is the live parent texture; forward to its Release thunk,
+    // whose return is the shared (texture) refcount D3D9 reports for the surface.
+    unsafe { crate::com_ref::com_release::<Direct3DTexture9>(tex.cast::<c_void>()) }
 }
 
 /// Destroy a `Direct3DSurface9` wrapper once `refcount` and `private_refcount` reach zero.
@@ -1107,6 +1157,14 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
     debug_assert!(
         inner.implicit_kind == ImplicitKind::None,
         "device-owned implicit surface finalized outside device teardown"
+    );
+    // Same invariant for a container-cached sub-surface: only
+    // `finalize_cached_surface` (from `finalize_texture`) may bring one here, and
+    // it clears the marker first, so any other path is a gating bug that would
+    // free a wrapper the texture still hands out.
+    debug_assert!(
+        !inner.flags.contains(SurfaceFlags::CONTAINER_CACHED),
+        "container-cached sub-resource surface finalized outside its container's teardown"
     );
     let owner_tex = inner.state_owner_texture;
     if owner_tex.is_null() {
@@ -1169,6 +1227,58 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
     unsafe { finalize_surface(surf) };
 }
 
+/// Finalize a container-cached sub-resource surface at its container's teardown.
+///
+/// Mirrors [`finalize_implicit_surface`]: clear the ownership marker first so
+/// `finalize_surface`'s invariant assert keeps catching every other path, then
+/// drop the `SurfaceInner` (releasing any registered `D3DSPD_IUNKNOWN`
+/// private-data object) and free the wrapper shell. A cached sub-surface is
+/// never finalized by `Release` (it outlives the app's last one so
+/// `GetSurfaceLevel` keeps handing back one identity), so `finalize_texture` is
+/// its single finalize site.
+///
+/// # Safety
+/// `ptr` must be `0` or a live `*mut Direct3DSurface9` held in a `TextureInner`
+/// sub-resource slot with both refcounts at zero; after this returns the pointer
+/// is dangling and must not be used again.
+pub unsafe fn finalize_cached_surface(ptr: u64) {
+    if ptr == 0 {
+        return;
+    }
+    let surf = ptr as *mut Direct3DSurface9;
+    // SAFETY: `surf` is the live cached sub-resource surface wrapper.
+    let inner_ptr = unsafe { (*surf).inner };
+    // SAFETY: `inner_ptr` is its valid `SurfaceInner` for the duration of teardown.
+    unsafe { (*inner_ptr).flags.remove(SurfaceFlags::CONTAINER_CACHED) };
+    // SAFETY: the caller guarantees `ptr` is a live cached sub-resource wrapper
+    // whose container is finalizing; D3D9 is single-threaded so nothing else
+    // references it.
+    unsafe { finalize_surface(surf) };
+}
+
+/// Repoint a container-cached sub-resource surface at `device_inner`.
+///
+/// A cached sub-surface keeps a `DeviceInner*` of its own (for `ApiTimer`
+/// accumulation and the `SetRenderTarget` same-device check) and outlives the
+/// app's last `Release`, so it has to travel with its container across the two
+/// migration points a `D3DPOOL_MANAGED` texture sees: `detach_from_device`
+/// passes null when the creating device goes (otherwise `surf_timer` would read
+/// a freed `DeviceInner`), and `rehydrate_for_device` passes the device the
+/// texture has just been adopted by.
+///
+/// # Safety
+/// `ptr` must be `0` or a live `*mut Direct3DSurface9` held in a `TextureInner`
+/// sub-resource slot, and `device_inner` null or a live `DeviceInner`.
+pub unsafe fn set_cached_surface_device(ptr: u64, device_inner: *mut DeviceInner) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: `ptr` is a live cached sub-resource surface wrapper per the contract.
+    let inner_ptr = unsafe { (*(ptr as *mut Direct3DSurface9)).inner };
+    // SAFETY: `inner_ptr` is its valid `SurfaceInner`; D3D9 is single-threaded.
+    unsafe { (*inner_ptr).device_inner = device_inner };
+}
+
 impl ComUnknown for Direct3DSurface9 {
     fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
         self.vtbl().add_ref
@@ -1178,23 +1288,50 @@ impl ComUnknown for Direct3DSurface9 {
     }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
+        // A sub-surface's private count pins its container too. `bound_rt` holds
+        // a private reference on a bound render-target or depth-stencil surface,
+        // and every accessor on that surface (`GetDesc`, `LockRect`,
+        // `GetContainer`, the `SetRenderTarget` attachment capture) reads through
+        // `parent_texture`, so the parent must outlive the binding even after the
+        // application's last public `Release` of both.
+        let tex = self.forward_texture();
+        if !tex.is_null() {
+            // SAFETY: `tex` is the live container texture, kept alive by the
+            // reference this surface already holds on it; D3D9 objects are
+            // single-threaded, so the exclusive borrow is sound for this call.
+            unsafe { &mut *tex }.private_refcount_inc();
+        }
     }
     unsafe fn private_refcount_dec_maybe_finalize(this: *mut Self) {
-        // SAFETY: caller asserts `this` points to a live wrapper with
-        // at least one private refcount outstanding.
-        let obj = unsafe { &mut *this };
-        obj.private_refcount -= 1;
-        // Device-owned implicit surfaces are NEVER finalized by the private-ref
-        // path (e.g. `bound_rt` unbinding the implicit RT) — they are destroyed
-        // only at device teardown. Gating on `implicit_kind == None` keeps the
-        // device's cached surface pointer valid (see `ImplicitKind`).
-        if obj.refcount == 0
-            && obj.private_refcount == 0
-            && obj.inner().implicit_kind == ImplicitKind::None
-        {
+        let (finalize_now, tex) = {
+            // SAFETY: caller asserts `this` points to a live wrapper with
+            // at least one private refcount outstanding.
+            let obj = unsafe { &mut *this };
+            obj.private_refcount -= 1;
+            // Device-owned implicit surfaces are NEVER finalized by the
+            // private-ref path (e.g. `bound_rt` unbinding the implicit RT), and
+            // neither is a container-cached sub-surface: both are destroyed only
+            // at their owner's teardown, which keeps the cached pointer their
+            // owner hands out valid (see `ImplicitKind` and
+            // `SurfaceFlags::CONTAINER_CACHED`).
+            let finalize_now = obj.refcount == 0
+                && obj.private_refcount == 0
+                && obj.inner().implicit_kind == ImplicitKind::None
+                && !obj.container_cached();
+            (finalize_now, obj.forward_texture())
+        };
+        if finalize_now {
             // SAFETY: both counters reached zero — no other reference
             // can survive; finalize takes exclusive ownership.
             unsafe { finalize_surface(this) };
+        }
+        if !tex.is_null() {
+            // Drop the container's private reference last: it can finalize the
+            // texture, which frees the sub-surfaces it caches along with it, so
+            // `this` must not be touched afterwards.
+            // SAFETY: `tex` is the live container texture this surface took a
+            // private reference on in `private_refcount_inc`.
+            unsafe { Direct3DTexture9::private_refcount_dec_maybe_finalize(tex) };
         }
     }
 }
@@ -1250,8 +1387,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
     }
     fn finalizes_on_zero(&self) -> bool {
         // Implicit surfaces are never freed by `Release` — they are destroyed
-        // only at device teardown (see `ImplicitKind`).
-        self.inner().implicit_kind == ImplicitKind::None
+        // only at device teardown (see `ImplicitKind`), and neither is a
+        // container-cached sub-surface, freed by its texture's finalize.
+        self.inner().implicit_kind == ImplicitKind::None && !self.container_cached()
     }
     fn blocks_reset_while_referenced(&self) -> bool {
         // The implicit surfaces, and the standalone `D3DPOOL_DEFAULT` ones

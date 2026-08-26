@@ -241,6 +241,33 @@ impl Volume<'_> {
         unsafe { deref_vtbl::<IDirect3DVolume9Vtbl>(self.ptr) }
     }
 
+    /// The raw COM `this` pointer (for asserting sub-resource identity).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
     #[must_use]
     pub fn desc(&self) -> (i32, D3DVOLUME_DESC) {
         let mut desc = D3DVOLUME_DESC {
@@ -499,6 +526,20 @@ impl<'h> Texture<'h> {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().get_priority)(self.ptr) }
     }
+
+    /// Current public refcount, read through a balanced `AddRef`/`Release` pair.
+    ///
+    /// `AddRef` answers the count it just produced, so the standing count is one
+    /// less. A sub-resource forwards its own references here, which is what makes
+    /// this the count a `GetSurfaceLevel` test watches.
+    #[must_use]
+    pub fn refcount(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        let bumped = unsafe { (self.vtbl().add_ref)(self.ptr) };
+        // SAFETY: balances the AddRef above; this wrapper keeps its own reference.
+        unsafe { (self.vtbl().release)(self.ptr) };
+        bumped - 1
+    }
 }
 
 impl Drop for Texture<'_> {
@@ -686,6 +727,38 @@ impl Surface<'_> {
         // SAFETY: vtable thunk; `self.ptr` is live and `&mut out` is writable.
         let hr = unsafe { (self.vtbl().get_dc)(self.ptr, &raw mut out) };
         (hr, out)
+    }
+
+    /// Give up this wrapper's reference without releasing it.
+    ///
+    /// For a test that hands a surface's last reference to the device (a bound
+    /// render target) and then reads the object back through a non-owning view.
+    #[must_use]
+    pub const fn into_raw(self) -> *mut c_void {
+        let ptr = self.ptr;
+        core::mem::forget(self);
+        ptr
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
     }
 }
 

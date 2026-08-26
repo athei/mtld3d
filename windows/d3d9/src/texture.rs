@@ -31,7 +31,7 @@ use super::{
     encoder::{FrameEncoder, TextureInfo, TextureUploadJob},
     null_out,
     private_data::PrivateDataStore,
-    surface::DcLockState,
+    surface::{DcLockState, Direct3DSurface9},
 };
 
 /// Sub-target for texture-lifecycle probes.
@@ -102,6 +102,15 @@ bitflags::bitflags! {
         /// D3D9 lets a game lock such a surface even in the default pool,
         /// so its staging is never released after an upload.
         const OFFSCREEN_PLAIN = 1 << 4;
+        /// Created through `CreateVolumeTexture`, whatever its depth.
+        ///
+        /// Distinct from `Direct3DTexture9::is_volume` (`depth > 1`), which asks
+        /// whether the *Metal* texture is 3D: a single-slice volume texture is
+        /// created 2D on both sides yet still hands out `IDirect3DVolume9`
+        /// sub-resources rather than surfaces. The cached sub-resource slots have
+        /// to be freed as the kind they hold, so the container records which one
+        /// that is.
+        const VOLUME_TEXTURE = 1 << 5;
     }
 }
 
@@ -333,6 +342,24 @@ pub struct TextureInner {
     /// `TextureInner`-backed); any stored `IUnknown` is released when this
     /// `TextureInner` drops.
     private_data: PrivateDataStore,
+    /// Cached sub-resource COM wrappers, one raw pointer per sub-resource.
+    ///
+    /// D3D9 sub-resources have identity: repeated `GetSurfaceLevel(0)` hands
+    /// back the same `IDirect3DSurface9*` (one reference stronger each time),
+    /// and the same holds for `GetCubeMapSurface` and `GetVolumeLevel`. The
+    /// slots hold `*mut Direct3DSurface9` as `u64` (matching
+    /// `DeviceInner::implicit_render_target`), or `*mut Direct3DVolume9` when
+    /// [`TextureFlags::VOLUME_TEXTURE`] is set. Indexed by mip level, or by
+    /// [`TextureInner::cube_subresource_index`] for a cube map.
+    ///
+    /// The slot holds NO reference: the wrapper holds one on this texture, so
+    /// counting back would be a cycle. It is instead an owning raw pointer freed
+    /// by `finalize_texture`, which cannot run while any wrapper still holds a
+    /// public or private reference here.
+    ///
+    /// Empty until the first getter hands a sub-resource out, so a texture a
+    /// streaming engine only ever writes through `LockRect` pays nothing.
+    subresources: Vec<u64>,
 }
 
 /// Locks taken on default-pool textures created without `D3DUSAGE_DYNAMIC`.
@@ -529,6 +556,51 @@ impl TextureInner {
     /// Raw `DeviceInner*` (as `u64`) recorded at create, or 0 if detached.
     pub const fn device_inner(&self) -> u64 {
         self.device_inner
+    }
+
+    /// How many sub-resource cache slots this texture addresses.
+    ///
+    /// `levels * 6` for a cube map (see
+    /// [`Self::cube_subresource_index`]), else one per mip level. Sized from
+    /// `levels` rather than [`Self::app_level_count`] because that is the widest
+    /// range any of the three getters admits.
+    const fn subresource_slot_count(&self) -> usize {
+        if self.flags.contains(TextureFlags::CUBE) {
+            (self.levels as usize).saturating_mul(CUBE_FACE_COUNT as usize)
+        } else {
+            self.levels as usize
+        }
+    }
+
+    /// The cached sub-resource wrapper at `index`, or `0` when there is none yet.
+    ///
+    /// `index` is a mip level, or a [`Self::cube_subresource_index`] for a cube
+    /// map. An out-of-range index answers `0`: the slots are unallocated until
+    /// the first hand-out, which is the one case a caller sees before its own
+    /// bounds check has anything to index.
+    fn cached_subresource(&self, index: usize) -> u64 {
+        self.subresources.get(index).copied().unwrap_or(0)
+    }
+
+    /// Record `ptr` as the cached sub-resource wrapper at `index`.
+    ///
+    /// Allocates the slot vector on first use. `index` has already been bounds
+    /// checked by the getter against `levels`, which is what
+    /// [`Self::subresource_slot_count`] covers.
+    fn cache_subresource(&mut self, index: usize, ptr: u64) {
+        if self.subresources.is_empty() {
+            self.subresources = vec![0; self.subresource_slot_count()];
+        }
+        self.subresources[index] = ptr;
+    }
+
+    /// Take every cached sub-resource wrapper, leaving the slots empty.
+    ///
+    /// For the container's finalize, which owns them: taking the `Vec` hands
+    /// ownership over in one move and leaves nothing behind that a later
+    /// accessor could hand out again.
+    fn take_subresources(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.subresources)
     }
 
     /// Validate an `UpdateSurface` copy of `src`'s `src_level` into this texture's `dst_level`.
@@ -1126,6 +1198,26 @@ impl TextureInner {
             for slot in &mut cube.last_submit_seq {
                 *slot = 0;
             }
+        }
+        self.point_cached_surfaces_at(core::ptr::null_mut());
+    }
+
+    /// Repoint every cached sub-resource surface at `device_inner`.
+    ///
+    /// They outlive the app's last `Release` of them, so they travel with the
+    /// container across both migration points a `D3DPOOL_MANAGED` texture sees
+    /// (`detach_from_device` with null, `rehydrate_for_device` with the adopting
+    /// device). Volume level shells hold no device pointer of their own; they
+    /// read the container.
+    fn point_cached_surfaces_at(&self, device_inner: *mut DeviceInner) {
+        if self.flags.contains(TextureFlags::VOLUME_TEXTURE) {
+            return;
+        }
+        for &slot in &self.subresources {
+            // SAFETY: a non-zero slot is a live cached sub-resource surface this
+            // texture owns (freed only by `finalize_texture`), and `device_inner`
+            // is null or the live device this texture has just joined.
+            unsafe { crate::surface::set_cached_surface_device(slot, device_inner) };
         }
     }
 
@@ -1957,6 +2049,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         update_dirty,
         cube,
         private_data: PrivateDataStore::default(),
+        subresources: Vec::new(),
     });
     // A default-pool static texture's staging only carries writes to the
     // GPU, and a streaming engine creates far more textures than it ever
@@ -2175,11 +2268,30 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
         // pointer.
         dev.deregister_texture(inner_ptr);
     }
+    // Free the sub-resource wrappers this texture cached for `GetSurfaceLevel` /
+    // `GetCubeMapSurface` / `GetVolumeLevel`. They survive their own last
+    // `Release` so the getters keep handing back one identity, which makes the
+    // container their single free site. Both of a cached wrapper's counters are
+    // necessarily zero here: a live one holds a public or private reference on
+    // this texture, and we would not be finalizing.
+    // SAFETY: `inner_ptr` is the live `TextureInner` about to be freed.
+    let ti_mut = unsafe { &mut *inner_ptr };
+    let volume_levels = ti_mut.flags.contains(TextureFlags::VOLUME_TEXTURE);
+    for slot in ti_mut.take_subresources() {
+        if volume_levels {
+            // SAFETY: a non-zero slot of a volume texture is a live cached
+            // `Direct3DVolume9` shell this texture owns; freed exactly once here.
+            unsafe { finalize_cached_volume(slot) };
+        } else {
+            // SAFETY: a non-zero slot is a live cached sub-resource surface this
+            // texture owns; finalized exactly once here.
+            unsafe { crate::surface::finalize_cached_surface(slot) };
+        }
+    }
     // A cube texture finalizing with a face's `GetDC` never released would
     // otherwise leak the memory DC + DIB held on the shared state; tear it down.
     // (The cube outlives every face referencing it, so this is the last owner.)
-    // SAFETY: `inner_ptr` is the live `TextureInner` about to be freed.
-    if let Some(cube) = unsafe { &mut *inner_ptr }.cube.as_deref_mut() {
+    if let Some(cube) = ti_mut.cube.as_deref_mut() {
         cube.dc_lock.teardown();
     }
     // SAFETY: both counters reached zero; `inner_ptr` is the original
@@ -2514,28 +2626,57 @@ extern "system" fn texture_get_surface_level(
 ) -> i32 {
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     if level >= obj.inner().app_level_count() || surface.is_null() {
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-
-    let device_inner = obj.inner().device_inner as *mut DeviceInner; // last use of `obj`
-    let surf =
-        super::surface::Direct3DSurface9::new_texture_backed(device_inner, this.cast(), level);
+    let index = level as usize;
+    let cached = obj.inner().cached_subresource(index); // last use of `obj` on this path
+    if cached != 0 {
+        // SAFETY: a non-zero slot is the live cached surface for this level, and
+        // the `obj` borrow ended above, so the AddRef it forwards to this texture
+        // does not alias it.
+        unsafe { hand_back_cached_surface(cached, surface) };
+        return 0; // S_OK
+    }
+    let device_inner = obj.inner().device_inner as *mut DeviceInner;
+    let surf = Direct3DSurface9::new_texture_backed(device_inner, this.cast(), level);
     let surf_ptr = Box::into_raw(Box::new(surf));
+    // The container owns the wrapper from here: every later call for this level
+    // hands the same pointer back, and `finalize_texture` frees it.
+    obj.inner_mut().cache_subresource(index, surf_ptr as u64); // last use of `obj`
     // The sub-surface's public refcount is shared with (forwards to) this
     // texture, so account for the reference the returned surface holds — D3D9's
     // GetSurfaceLevel AddRefs the container texture.
     // The `obj` borrow ended above, so this AddRef does not alias it.
     // SAFETY: `this` is the live parent texture for the call.
-    // SAFETY: `this` is the live cube parent and the surface owns the new ref.
     unsafe { crate::com_ref::com_add_ref::<Direct3DTexture9>(this) };
     // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DTexture9 ABI.
     unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
     0 // S_OK
+}
+
+/// Hand a cached sub-resource surface back to a getter's caller.
+///
+/// D3D9 sub-resource getters return the *same* object every call, one reference
+/// stronger. The surface's own `AddRef` forwards to its container texture, so the
+/// count the application observes is identical to the creating call's.
+///
+/// # Safety
+/// `cached` must be a live `*mut Direct3DSurface9` from a `TextureInner`
+/// sub-resource slot, and `out` a writable out-param per the D3D9 ABI.
+unsafe fn hand_back_cached_surface(cached: u64, out: *mut *mut c_void) {
+    let surf = cached as *mut Direct3DSurface9;
+    // SAFETY: `surf` is the live cached surface wrapper per the contract.
+    let add_ref = unsafe { (*surf).vtbl().add_ref };
+    // SAFETY: `add_ref` is the surface's own IUnknown::AddRef thunk; `surf` is
+    // its `this`.
+    unsafe { add_ref(surf.cast::<c_void>()) };
+    // SAFETY: `out` is the getter's writable out-param per the contract.
+    unsafe { OutPtr::write_opt(out, surf.cast::<c_void>()) };
 }
 
 extern "system" fn texture_lock_rect(
@@ -3066,6 +3207,7 @@ fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_p
     }
     ti.device_inner = dev_ptr;
     ti.device_handle = dev.device_handle();
+    ti.point_cached_surfaces_at(std::ptr::from_mut::<DeviceInner>(dev));
     dev.register_texture(std::ptr::from_mut::<TextureInner>(ti));
     // Seed the new device's encoder texture_cache with this texture's
     // info so the per-draw stage binding (which carries only
@@ -3263,7 +3405,7 @@ extern "system" fn volume_get_volume_level(
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per the shared ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         null_out(volume);
         return D3DERR_INVALIDCALL;
     };
@@ -3271,7 +3413,23 @@ extern "system" fn volume_get_volume_level(
         null_out(volume);
         return D3DERR_INVALIDCALL;
     }
+    let index = level as usize;
+    let cached = obj.inner().cached_subresource(index); // last use of `obj` on this path
+    if cached != 0 {
+        let vol = cached as *mut c_void;
+        // The same shell every call, one reference stronger: its `AddRef`
+        // forwards to this texture, so the count the app observes is what the
+        // creating call reported. The `obj` borrow ended above, so that forward
+        // does not alias it.
+        volume9_add_ref(vol);
+        // SAFETY: `volume` is non-null per the check at entry; the app owns the slot.
+        unsafe { *volume = vol };
+        return D3D_OK;
+    }
     let vol = Direct3DVolume9::new(this, level);
+    // The container owns the shell from here: every later call for this level
+    // hands the same pointer back, and `finalize_texture` frees it.
+    obj.inner_mut().cache_subresource(index, vol as u64); // last use of `obj`
     texture_add_ref(this);
     // SAFETY: `volume` is non-null per the check above; the app owns the slot.
     unsafe { *volume = vol.cast::<c_void>() };
@@ -3451,14 +3609,13 @@ extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) 
 
 // ── IDirect3DVolume9 (one level of a volume texture) ──
 //
-// `GetVolumeLevel` hands back a standalone CPU shell carrying the level's
-// dimensions/format/usage/pool plus its own lockable backing — the same shape
-// as the cube-face surface shells. It is a leaf object (never bound, no Metal
-// backing, no device reference forwarded), so a plain refcount freed at zero is
-// enough. `LockBox` returns the shell's own standalone staging (distinct from
-// the parent texture's per-level staging), which is never uploaded to the 3D
-// texture — unlike `IDirect3DVolumeTexture9::UnlockBox`, this leaf shell path
-// has no wired box→3D upload.
+// `GetVolumeLevel` hands back a shell that owns no pixels of its own: it names
+// a level of the container and forwards `GetDesc`/`LockBox`/`UnlockBox` there,
+// so a write through the level lands in the same staging the texture uploads
+// from. It is a leaf object (never bound, no Metal backing, no device reference
+// forwarded of its own), and it is container-cached like a `GetSurfaceLevel`
+// surface: the same pointer every call, alive past its own last `Release`, and
+// freed by `finalize_texture`.
 
 static DIRECT3D_VOLUME9_VTBL: IDirect3DVolume9Vtbl = IDirect3DVolume9Vtbl {
     query_interface: volume9_query_interface,
@@ -3485,17 +3642,29 @@ static DIRECT3D_VOLUME9_VTBL: IDirect3DVolume9Vtbl = IDirect3DVolume9Vtbl {
 /// `GetVolumeLevel` takes one parent reference on the app's behalf. Forwarding
 /// (rather than an independent count) is load-bearing: an independent count
 /// would let the app's `Release(volumeTexture)` free the texture while a level
-/// reference is still held. The shell keeps a private count of the references
-/// handed out on it only to know when to free itself.
+/// reference is still held.
+///
+/// The container caches the shell for the lifetime of the texture, so
+/// `GetVolumeLevel(n)` answers with one identity and the private data stored
+/// through it round-trips; `finalize_texture` is the single free site. Its own
+/// count then tracks only the references the application still holds, so a
+/// stray extra `Release` is answered rather than underflowing the shared count.
 #[repr(C)]
 struct Direct3DVolume9 {
     vtbl: *const IDirect3DVolume9Vtbl,
-    /// References handed out on this shell; the shell is freed when it reaches zero.
+    /// References handed out on this shell; zero means only the container holds it.
     refcount: u32,
     /// Parent `Direct3DVolumeTexture9` wrapper; `AddRef`/`Release` forward here.
     parent_texture: *mut c_void,
     /// Mip level of the parent this shell addresses.
     level: u32,
+    /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
+    ///
+    /// A volume is not an `IDirect3DResource9`, so this is the level's own store
+    /// rather than the container's: `SetPrivateData` on a level and on its
+    /// texture address different tables. Any stored `IUnknown` is released when
+    /// the shell drops.
+    private_data: PrivateDataStore,
 }
 
 impl Direct3DVolume9 {
@@ -3509,12 +3678,15 @@ impl Direct3DVolume9 {
             refcount: 1,
             parent_texture,
             level,
+            private_data: PrivateDataStore::default(),
         }))
     }
 
     fn parent(&self) -> &Direct3DTexture9 {
-        // SAFETY: the shell holds a forwarded reference on the parent for as
-        // long as it is alive, so the wrapper behind `parent_texture` is live.
+        // SAFETY: every reference on the shell is forwarded to the parent, and
+        // past the shell's own last one the parent owns the shell and frees it
+        // in its finalize, so the wrapper behind `parent_texture` is live either
+        // way.
         unsafe { &*self.parent_texture.cast::<Direct3DTexture9>() }
     }
 }
@@ -3554,17 +3726,40 @@ extern "system" fn volume9_release(this: *mut c_void) -> u32 {
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
         return 0;
     };
-    // Forward to the parent texture; its (shared) count is what D3D9 reports.
-    // The shell is freed on its own last release, after the forward, since
-    // the parent pointer is not touched again.
-    let rc = texture_release(obj.parent_texture);
-    obj.refcount -= 1;
+    // D3D9 tolerates Release past zero, which a container-cached shell makes
+    // reachable: it outlives its own last release. Answer 0 without dropping a
+    // container reference this shell never took.
     if obj.refcount == 0 {
-        // SAFETY: `this` is the `Box::into_raw` allocation of `Direct3DVolume9::new`
-        // and no reference to the shell remains.
-        drop(unsafe { Box::from_raw(this.cast::<Direct3DVolume9>()) });
+        return 0;
     }
-    rc
+    obj.refcount -= 1;
+    let parent = obj.parent_texture;
+    // Reaching zero does NOT free the shell: the container caches it so
+    // `GetVolumeLevel(n)` keeps one identity and the private data stored through
+    // it survives, and `finalize_texture` frees it. Forward last, since that can
+    // take the texture to zero and free the shell along with it, and report the
+    // parent's (shared) count, which is what D3D9 answers for a sub-resource.
+    texture_release(parent)
+}
+
+/// Free a container-cached `IDirect3DVolume9` shell at its container's teardown.
+///
+/// The volume counterpart of `crate::surface::finalize_cached_surface`: a level
+/// shell is never freed by `Release`, so `finalize_texture` is its single free
+/// site. Dropping the shell releases any `D3DSPD_IUNKNOWN` private-data object
+/// it holds.
+///
+/// # Safety
+/// `ptr` must be `0` or a live `*mut Direct3DVolume9` held in a `TextureInner`
+/// sub-resource slot; after this returns the pointer is dangling and must not be
+/// used again.
+unsafe fn finalize_cached_volume(ptr: u64) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: `ptr` is the `Box::into_raw` allocation of `Direct3DVolume9::new`
+    // and the caller guarantees no reference to the shell remains.
+    drop(unsafe { Box::from_raw(ptr as *mut Direct3DVolume9) });
 }
 
 extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
@@ -3600,27 +3795,53 @@ extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_voi
     D3D_OK
 }
 
-const extern "system" fn volume9_set_private_data(
-    _this: *mut c_void,
-    _guid: *const Guid,
-    _data: *const c_void,
-    _size: u32,
-    _flags: u32,
+extern "system" fn volume9_set_private_data(
+    this: *mut c_void,
+    guid: *const Guid,
+    data: *const c_void,
+    size: u32,
+    flags: u32,
 ) -> i32 {
-    D3D_OK
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: IDirect3DVolume9 SetPrivateData thunk; `this` is the live wrapper.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `data`/`size`/`flags` are the caller-supplied payload; `set` validates.
+    unsafe { obj.private_data.set(&guid, data, size, flags) }
 }
 
-const extern "system" fn volume9_get_private_data(
-    _this: *mut c_void,
-    _guid: *const Guid,
-    _data: *mut c_void,
-    _size: *mut u32,
+extern "system" fn volume9_get_private_data(
+    this: *mut c_void,
+    guid: *const Guid,
+    data: *mut c_void,
+    size: *mut u32,
 ) -> i32 {
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: IDirect3DVolume9 GetPrivateData thunk; `this` is the live wrapper.
+    let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: `data`/`size` are caller out-params per the D3D9 ABI; `get` validates.
+    unsafe { obj.private_data.get(&guid, data, size) }
 }
 
-const extern "system" fn volume9_free_private_data(_this: *mut c_void, _guid: *const Guid) -> i32 {
-    D3D_OK
+extern "system" fn volume9_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
+    let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: IDirect3DVolume9 FreePrivateData thunk; `this` is the live wrapper.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    obj.private_data.free(&guid)
 }
 
 extern "system" fn volume9_get_container(
@@ -3789,7 +4010,7 @@ extern "system" fn cube_get_cube_map_surface(
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DCubeTexture9, layout-identical
     // to Direct3DTexture9.
-    let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
@@ -3798,18 +4019,33 @@ extern "system" fn cube_get_cube_map_surface(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    let device_inner = ti.device_inner as *mut DeviceInner; // last use of `obj`
-    let surf = super::surface::Direct3DSurface9::new_cube_texture_backed(
+    let Some(index) = ti.cube_subresource_index(face, level as usize) else {
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
+    };
+    let cached = ti.cached_subresource(index); // last use of `obj` on this path
+    if cached != 0 {
+        // SAFETY: a non-zero slot is the live cached surface for this face and
+        // level, and the `obj` borrow ended above, so the AddRef it forwards to
+        // this cube does not alias it.
+        unsafe { hand_back_cached_surface(cached, surface) };
+        return 0;
+    }
+    let device_inner = ti.device_inner as *mut DeviceInner;
+    let surf = Direct3DSurface9::new_cube_texture_backed(
         device_inner,
         this.cast::<Direct3DTexture9>(),
         face,
         level,
     );
+    let surf_ptr = Box::into_raw(Box::new(surf));
+    // The container owns the wrapper from here: every later call for this face
+    // and level hands the same pointer back, and `finalize_texture` frees it.
+    obj.inner_mut().cache_subresource(index, surf_ptr as u64); // last use of `obj`
     // The returned surface forwards its public reference to the parent cube,
     // matching ordinary texture-level surfaces.
     // SAFETY: `this` is the live cube parent and the surface owns the new ref.
     unsafe { crate::com_ref::com_add_ref::<Direct3DTexture9>(this) };
-    let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: vtable out-param; `surface` is *mut *mut c_void per the ABI.
     unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
     0

@@ -4332,7 +4332,10 @@ extern "system" fn device_create_volume_texture(
         levels: actual_levels,
         d3d_format: format,
         metal_pixel_format: fmt.metal_pixel_format(),
-        flags: TextureFlags::empty(),
+        // Its sub-resources are `IDirect3DVolume9` levels, not surfaces, whatever
+        // the depth; the container has to free the cached slots as the kind they
+        // hold.
+        flags: TextureFlags::VOLUME_TEXTURE,
         swizzle: fmt.swizzle(),
         usage_flags: mtld3d_shared::mtl::TextureUsage::empty(),
         d3d_usage: usage,
