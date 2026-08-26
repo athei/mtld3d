@@ -659,26 +659,29 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
     inner.locked = false;
     if matches!(inner.map_mode, BufferMapMode::Staged)
         && let Some((min, max)) = inner.dirty.span()
+        && !inner.device_inner.is_null()
     {
-        if !inner.device_inner.is_null() {
-            // SAFETY: `inner.device_inner` was stamped at `Self::new` from
-            // a live `DeviceInner` that outlives its children.
-            let dev = unsafe { &mut *inner.device_inner };
-            let size = (max - min) as usize;
-            let mut transient = dev.alloc_pagebox_capped(size);
-            // SAFETY: `min <= length` and `current_box` is allocated for
-            // `length` bytes, so the offset stays in-bounds.
-            let src = unsafe { inner.current_box.as_ptr().add(min as usize) };
-            // SAFETY: `src` spans `[min, max)` of `current_box`;
-            // `transient` is a fresh `PageBox` of ≥ `size` bytes; the two
-            // allocations are disjoint.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
-            }
-            // Push the upload as an inline op so the encoder sees it in
-            // draw order (for rename-at-overlap). No Metal thunk here.
-            dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
+        // SAFETY: `inner.device_inner` was stamped at `Self::new` from
+        // a live `DeviceInner` that outlives its children.
+        let dev = unsafe { &mut *inner.device_inner };
+        let size = (max - min) as usize;
+        let mut transient = dev.alloc_pagebox_capped(size);
+        // SAFETY: `min <= length` and `current_box` is allocated for
+        // `length` bytes, so the offset stays in-bounds.
+        let src = unsafe { inner.current_box.as_ptr().add(min as usize) };
+        // SAFETY: `src` spans `[min, max)` of `current_box`;
+        // `transient` is a fresh `PageBox` of ≥ `size` bytes; the two
+        // allocations are disjoint.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
         }
+        // Push the upload as an inline op so the encoder sees it in
+        // draw order (for rename-at-overlap). No Metal thunk here.
+        dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
+        // Only once the upload is actually queued: the range is the
+        // only record that these bytes still owe a copy to the device
+        // buffer, so clearing it on a path that queued nothing would
+        // drop them silently.
         inner.dirty.clear();
     }
     D3D_OK

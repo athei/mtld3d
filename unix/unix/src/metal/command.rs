@@ -177,7 +177,13 @@ fn register_presented_probe(
 /// atomic ourselves: the completion handler may not have fired yet (it
 /// runs on Metal's own dispatch queue), and our caller needs to observe
 /// `coherent_seq >= target_seq` on return.
-pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64) {
+///
+/// Bumping `coherent_seq` by hand is also why this has to inspect the
+/// status: a command buffer the GPU killed is finished, so the bump is
+/// right, but recording it as retired and nothing else would hide the
+/// abort from the PE-side upload recovery that the completion handlers
+/// feed. `failed_submit_seq_ptr` gets the same `fetch_max` they do.
+pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64, failed_submit_seq_ptr: u64) {
     if coherent_seq_ptr == 0 || target_seq == 0 {
         return;
     }
@@ -204,7 +210,53 @@ pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64) {
     mtld3d_shared::crumb!("gpuretirebeg", target_seq, atomic.load(Ordering::Acquire));
     cmdbuf.waitUntilCompleted();
     mtld3d_shared::crumb!("gpuretireend", target_seq);
+    // Record the abort before the retirement bump: both stores are
+    // `Release`, so a PE-side `Acquire` load of `coherent_seq` that sees
+    // this seq is guaranteed to see the failure too.
+    if let Some((code, desc)) = record_failed_submit(&cmdbuf, target_seq, failed_submit_seq_ptr) {
+        mtld3d_shared::crumb!("gpuretirecberr", target_seq);
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: code,
+            "wait_for_gpu_retire: command buffer for frame seq={target_seq} failed on the \
+             GPU (code {code}: {desc}); everything it carried was discarded",
+        );
+    }
     atomic.fetch_max(target_seq, Ordering::Release);
+}
+
+/// `fetch_max` an aborted command buffer's seq into the PE-side failed-submit counter.
+///
+/// Returns the Metal error's `(code, localizedDescription)` when the
+/// command buffer failed, so the caller can name it in its own tripwire,
+/// and `None` when it completed normally. A `failed_submit_seq_ptr` of 0
+/// (a frame stamped before the atomic was wired) records nothing and
+/// still reports the error.
+fn record_failed_submit(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    seq: u64,
+    failed_submit_seq_ptr: u64,
+) -> Option<(u64, String)> {
+    if cb.status() != MTLCommandBufferStatus::Error {
+        return None;
+    }
+    if failed_submit_seq_ptr != 0 {
+        // SAFETY: the PE side allocated an `Arc<AtomicU64>` and passed its
+        // pointer. The Arc is kept alive for the device's lifetime, and all
+        // command buffers that reference it are drained on device teardown
+        // before the Arc drops.
+        let atomic = unsafe { &*(failed_submit_seq_ptr as *const AtomicU64) };
+        atomic.fetch_max(seq, Ordering::Release);
+    }
+    Some(cb.error().map_or_else(
+        || (0, String::new()),
+        |e| {
+            (
+                e.code().unsigned_abs() as u64,
+                e.localizedDescription().to_string(),
+            )
+        },
+    ))
 }
 
 // SubmitFrame breadcrumb probes via `mtld3d_shared::crumb!()`. Each
@@ -288,6 +340,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 params.blit_commands_need_encoder != 0,
                 params.submit_seq,
                 params.upload_coherent_seq_ptr,
+                params.failed_submit_seq_ptr,
             ) {
                 return false;
             }
@@ -524,6 +577,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
         let atomic_ptr = usize::try_from(params.coherent_seq_ptr)
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = params.submit_seq;
+        let failed_seq_ptr = params.failed_submit_seq_ptr;
         let handler = RcBlock::new(
             move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 // Tripwire: a command buffer the GPU rejected discards every
@@ -538,17 +592,12 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 // SAFETY: Metal invokes the block with the completed command
                 // buffer; the pointer is valid for the handler's duration.
                 let cb = unsafe { cb_ptr.as_ref() };
-                if cb.status() == MTLCommandBufferStatus::Error {
+                // The failure is recorded before the retirement bump below:
+                // both stores are `Release`, so a PE-side `Acquire` load of
+                // `coherent_seq` that observes this seq observes the failure
+                // too, and the upload recovery never reads a stale "clean".
+                if let Some((code, desc)) = record_failed_submit(cb, seq, failed_seq_ptr) {
                     mtld3d_shared::crumb!("submit:cberr", seq);
-                    let (code, desc) = cb.error().map_or_else(
-                        || (0, String::new()),
-                        |e| {
-                            (
-                                e.code().unsigned_abs() as u64,
-                                e.localizedDescription().to_string(),
-                            )
-                        },
-                    );
                     mtld3d_shared::log_once_warn_by!(
                         target: LOG_TARGET,
                         key: code,
@@ -607,6 +656,7 @@ fn submit_upload_cmd_buf(
     need_encoder: bool,
     submit_seq: u64,
     upload_coherent_seq_ptr: u64,
+    failed_submit_seq_ptr: u64,
 ) -> bool {
     mtld3d_shared::crumb!("submit:upcmdbuf");
     let Some(upload_cb) = queue.commandBuffer() else {
@@ -624,8 +674,31 @@ fn submit_upload_cmd_buf(
         let atomic_ptr = usize::try_from(upload_coherent_seq_ptr)
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = submit_seq;
+        let failed_seq_ptr = failed_submit_seq_ptr;
         let handler = RcBlock::new(
-            move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                // Tripwire: this command buffer carries every frame-leading
+                // blit, so an abort here loses texture uploads and `Staged`
+                // VB/IB dirty-range copies rather than rendering. Nothing
+                // in the API stream ever re-announces them, so the loss is
+                // permanent unless the PE side replays it: record the seq
+                // before the retirement bump (both `Release`, so a reader
+                // that sees the retirement sees the failure) and let the
+                // encoder's upload-recovery queues re-issue.
+                //
+                // SAFETY: Metal invokes the block with the completed command
+                // buffer; the pointer is valid for the handler's duration.
+                let cb = unsafe { cb_ptr.as_ref() };
+                if let Some((code, desc)) = record_failed_submit(cb, seq, failed_seq_ptr) {
+                    mtld3d_shared::crumb!("submit:upcberr", seq);
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: code,
+                        "submit_frame: upload command buffer for frame seq={seq} failed on \
+                         the GPU (code {code}: {desc}); every texture and VB/IB upload it \
+                         carried was discarded and will be re-issued",
+                    );
+                }
                 // SAFETY: the PE side allocated an `Arc<AtomicU64>` and
                 // passed its pointer. The Arc is kept alive for the
                 // device's lifetime, and all command buffers that

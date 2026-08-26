@@ -82,7 +82,7 @@ use super::{
     },
     encoder::{
         BlitSide, EncoderThread, FrameData, FrameEncoder, FrameInit, Op, StagingWarmupEntry,
-        TextureInfo, TextureUploadJob, VbibWarmupEntry,
+        SubmitFence, TextureInfo, TextureUploadJob, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -413,6 +413,18 @@ pub struct DeviceInner {
     /// Texture-staging contention reads this; VB/IB stays on `coherent_seq`
     /// (their backings are consumed by draws, which live in the draw CB).
     upload_coherent_seq: Arc<AtomicU64>,
+    /// Highest submit seq whose command buffer the GPU aborted.
+    ///
+    /// `fetch_max`'d by both completion handlers (and by
+    /// `wait_for_gpu_retire`) when a command buffer reaches
+    /// `MTLCommandBufferStatus::Error`. Kept separate from `coherent_seq`
+    /// because an aborted command buffer is genuinely finished with its
+    /// source memory: withholding the retirement bump instead would pin
+    /// every seq-gated queue behind a seq that never retires, and
+    /// `wait_for_gpu_idle` would block forever. The encoder reads the pair
+    /// to tell an upload it can free from one whose blit was discarded and
+    /// has to be re-issued.
+    failed_submit_seq: Arc<AtomicU64>,
     /// Live VB/IB retained-`PageBox` byte total, shared with the encoder.
     ///
     /// Mirrors `coherent_seq`'s sharing. The encoder `fetch_add`s on intake
@@ -1330,11 +1342,12 @@ impl DeviceInner {
 
         let this_seq = self.current_seq;
         self.current_seq = self.current_seq.saturating_add(1);
-        frame.set_submit_fence(
-            this_seq,
-            Arc::as_ptr(&self.coherent_seq) as u64,
-            Arc::as_ptr(&self.upload_coherent_seq) as u64,
-        );
+        frame.set_submit_fence(&SubmitFence {
+            submit_seq: this_seq,
+            coherent_seq_ptr: Arc::as_ptr(&self.coherent_seq) as u64,
+            upload_coherent_seq_ptr: Arc::as_ptr(&self.upload_coherent_seq) as u64,
+            failed_submit_seq_ptr: Arc::as_ptr(&self.failed_submit_seq) as u64,
+        });
         frame.set_retained_bytes_ptr(Arc::as_ptr(&self.vbib_retained_bytes) as u64);
         // Every cached snapshot pointer in the encoder's CurrentSnapshot
         // aliases into the outgoing frame's `ScratchArena`, which is
@@ -2299,6 +2312,7 @@ impl Direct3DDevice9 {
 
         let coherent_seq = Arc::new(AtomicU64::new(0));
         let upload_coherent_seq = Arc::new(AtomicU64::new(0));
+        let failed_submit_seq = Arc::new(AtomicU64::new(0));
         let vbib_retained_bytes = Arc::new(AtomicU64::new(0));
 
         let inner = Box::into_raw(Box::new(DeviceInner {
@@ -2331,6 +2345,7 @@ impl Direct3DDevice9 {
             current_frame: info.current_frame,
             coherent_seq,
             upload_coherent_seq,
+            failed_submit_seq,
             vbib_retained_bytes,
             vram_bytes_used: Arc::new(AtomicU64::new(0)),
             outstanding_reset_blockers: AtomicU32::new(0),

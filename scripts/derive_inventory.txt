@@ -140,6 +140,7 @@ windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/upload_recovery.rs UploadFate Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/visibility.rs QueryStatus Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/cursor.rs CursorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/device.rs DepthBinding Clone

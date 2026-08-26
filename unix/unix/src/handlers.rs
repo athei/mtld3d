@@ -210,7 +210,11 @@ pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<WaitForGpuRetireParams>::opt(args.cast()) }) else {
         return -1;
     };
-    metal::wait_for_gpu_retire(params.target_seq, params.coherent_seq_ptr);
+    metal::wait_for_gpu_retire(
+        params.target_seq,
+        params.coherent_seq_ptr,
+        params.failed_submit_seq_ptr,
+    );
     STATUS_SUCCESS
 }
 

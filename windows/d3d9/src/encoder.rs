@@ -41,6 +41,7 @@ use mtld3d_core::{
     shader_cache::{self, CachedKind},
     shader_compile_stats::{self, BurstTracker, CompileBucket},
     storage_policy::buffer_storage_mode,
+    upload_recovery::{UploadFate, UploadRecoveryQueue},
     visibility::{
         MAX_SLOTS, RetiredVisibilityBuffer, SLOT_BYTES, VisibilityQueryCore, VisibilityQueryState,
     },
@@ -736,6 +737,38 @@ pub struct FrameEncoder {
     /// means "not yet seeded" — the very first frame has no retention to
     /// drain.
     coherent_seq_ptr: u64,
+    /// Pointer to the shared `failed_submit_seq` atomic, copied from `FrameData` in `begin_frame`.
+    ///
+    /// Read next to `coherent_seq_ptr` when the upload-recovery queues
+    /// settle: a seq that retired at or below this one had its command
+    /// buffer discarded, so its upload has to be re-issued rather than
+    /// freed. 0 means "not yet seeded".
+    failed_seq_ptr: u64,
+    /// Pointer to the shared `upload_coherent_seq` atomic, copied from `FrameData`.
+    ///
+    /// The upload command buffer is the one that actually carries an
+    /// upload's copy, and its own completion handler is the only thing that
+    /// ever moves this counter. `coherent_seq` can be hand-advanced by
+    /// `wait_for_gpu_retire` before that handler has run, so an upload is
+    /// only settled once both counters have reached its seq. 0 means "not
+    /// yet seeded", or the defensive path where the leading blits rode the
+    /// draw command buffer instead.
+    upload_coherent_seq_ptr: u64,
+    /// `Staged` VB/IB dirty-range uploads the GPU has not acknowledged yet.
+    ///
+    /// Each entry owns the transient `bytesNoCopy` wrapper and the
+    /// PE-heap snapshot the blit reads, so settling one either frees both
+    /// or re-emits the copy from them. Replaces what used to be a plain
+    /// `PendingResourceRetention` entry: destroying at a seq and replaying
+    /// at a seq are different policies, and one front-gated loop cannot
+    /// hold both.
+    pending_stage_uploads: UploadRecoveryQueue<StagedUploadRetry>,
+    /// Texture mip uploads the GPU has not acknowledged yet.
+    ///
+    /// Holds the whole `TextureUploadJob`, whose `staging_arc` is a clone
+    /// of the texture's own persistent staging, so a replay costs one blit
+    /// and no extra memory.
+    pending_texture_uploads: UploadRecoveryQueue<TextureUploadJob>,
     /// Pointer to the shared `vbib_retained_bytes` atomic (device-owned).
     ///
     /// Copied from `FrameData` in `begin_frame`. `fetch_add`'d when a
@@ -1153,6 +1186,23 @@ struct PendingResourceRetention {
     from_texture: bool,
 }
 
+/// Everything a replay of one `Staged` VB/IB upload needs.
+///
+/// The payload of a `pending_stage_uploads` entry. Both the transient
+/// `bytesNoCopy` wrapper and the PE-heap snapshot it wraps stay alive
+/// until the GPU acknowledges the copy, so a replay is one more
+/// buffer-to-buffer blit from the same source: the buffer's persistent CPU
+/// staging may have moved on since, and the bytes this upload owed are the
+/// ones in `page_box`. Freed the other way round (wrapper destroyed, then
+/// backing dropped) because Metal holds a raw pointer into the box.
+struct StagedUploadRetry {
+    buffer_id: BufferId,
+    transient: MetalHandle<MTLBufferKind>,
+    page_box: PageBox,
+    dst_offset: u32,
+    size: u32,
+}
+
 /// Out-parameter for `drain_retention_and_wait`.
 ///
 /// Holds the `PageBox`/`Arc<PageBox>` backings of every drained
@@ -1232,6 +1282,10 @@ impl FrameEncoder {
             current_blit_retention: Vec::new(),
             pending_blit_retention: VecDeque::new(),
             coherent_seq_ptr: 0,
+            failed_seq_ptr: 0,
+            upload_coherent_seq_ptr: 0,
+            pending_stage_uploads: UploadRecoveryQueue::new(),
+            pending_texture_uploads: UploadRecoveryQueue::new(),
             retained_bytes_ptr: 0,
             current_submit_seq: 0,
             backbuffer_width: 0,
@@ -1676,20 +1730,68 @@ impl FrameEncoder {
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_vbib_staging_upload();
 
-        // Retire the transient wrapper + backing once this frame's submit
-        // retires (the blit reads it by then). Account the CPU bytes into
-        // the shared retention total like every queued `PageBox`.
+        // Hold the transient wrapper + backing until this frame's submit is
+        // *acknowledged*, not merely retired: an aborted command buffer
+        // discards the blit above, and the recovery queue is what re-emits
+        // it from these same bytes. Account the CPU bytes into the shared
+        // retention total like every queued `PageBox`.
         self.perf.bump_vbib_retained_add(page_box.len());
         self.add_retained_bytes(page_box.len());
-        self.pending_resource_retention
-            .push_back(PendingResourceRetention {
-                kind: DestroyKind::Buffer,
-                handle: transient.raw(),
-                page_box: Some(page_box),
-                staging_arc: None,
-                seq: current_seq,
-                from_texture: false,
-            });
+        self.pending_stage_uploads.push(
+            buffer_id.raw(),
+            current_seq,
+            StagedUploadRetry {
+                buffer_id,
+                transient,
+                page_box,
+                dst_offset,
+                size,
+            },
+        );
+    }
+
+    /// Re-emit one discarded `Staged` VB/IB upload into this frame's leading blits.
+    ///
+    /// The transient `MTLBuffer` and its backing are still alive (holding
+    /// them is the recovery queue's whole job), so the replay is the same
+    /// buffer-to-buffer copy aimed at the buffer's *current* device buffer.
+    /// No second `didModifyRange` notify: nothing has written the transient
+    /// since the original upload notified it. No rename-at-overlap check
+    /// either, because this runs from `begin_frame` after
+    /// `PassState::reset_frame`, so no draw of this frame has read the
+    /// destination yet.
+    ///
+    /// Returns `false` when the buffer no longer has a `Staged` device
+    /// buffer, which means the game released it and the lost upload has
+    /// nowhere left to land.
+    fn reissue_stage_upload(&mut self, retry: &StagedUploadRetry) -> bool {
+        let current_seq = self.current_submit_seq;
+        let Some(dst_handle) = self
+            .buffer_cache
+            .get_mut(&retry.buffer_id)
+            .filter(|s| s.is_staged)
+            .map(|s| {
+                if current_seq > s.last_submit_seq {
+                    s.last_submit_seq = current_seq;
+                }
+                s.device_buffer.raw()
+            })
+        else {
+            return false;
+        };
+        self.frame_blit_commands
+            .push(BlitCommand::copy_buffer_to_buffer(
+                &CopyBufferToBufferInfo {
+                    src_buffer: retry.transient.raw(),
+                    dst_buffer: dst_handle,
+                    src_offset: 0,
+                    dst_offset: u64::from(retry.dst_offset),
+                    byte_size: u64::from(retry.size),
+                },
+            ));
+        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.perf.bump_vbib_staging_upload();
+        true
     }
 
     /// Allocate a fresh `StorageModePrivate` device buffer for a `Staged` VB/IB.
@@ -1827,6 +1929,12 @@ impl FrameEncoder {
         if frame.retained_bytes_ptr != 0 {
             self.retained_bytes_ptr = frame.retained_bytes_ptr;
         }
+        if frame.failed_submit_seq_ptr != 0 {
+            self.failed_seq_ptr = frame.failed_submit_seq_ptr;
+        }
+        if frame.upload_coherent_seq_ptr != 0 {
+            self.upload_coherent_seq_ptr = frame.upload_coherent_seq_ptr;
+        }
         self.current_submit_seq = frame.submit_seq;
         self.backbuffer_width = frame.backbuffer_width;
         self.backbuffer_height = frame.backbuffer_height;
@@ -1859,6 +1967,11 @@ impl FrameEncoder {
                 render_scale: frame.render_scale,
                 continues_frame: self.prev_submit_no_present,
             });
+        // After `reset_frame`: a replayed upload is a frame-leading blit,
+        // and the rename-at-overlap bookkeeping it must not trip on still
+        // holds the previous frame's draws until the reset above runs.
+        mtld3d_shared::crumb!("phase:BfUpRec");
+        self.settle_pending_uploads();
         mtld3d_shared::crumb!("phase:BfDone");
     }
 
@@ -4812,6 +4925,255 @@ impl FrameEncoder {
             });
     }
 
+    /// Release or replay every upload the GPU has finished with.
+    ///
+    /// Reads the retirement counter and the aborted-submit counter as a
+    /// pair. `coherent_seq` is loaded first: both unix-side stores are
+    /// `Release` with the failure recorded before the retirement, so
+    /// observing a retirement guarantees the matching failure is visible.
+    /// An upload whose seq retired without a failure at or after it is
+    /// released; one whose command buffer aborted is re-emitted into this
+    /// frame's leading blits and re-queued under this frame's seq.
+    ///
+    /// Called at the end of `begin_frame`, after `PassState::reset_frame`:
+    /// the replays are frame-leading blits, and the rename-at-overlap
+    /// bookkeeping they would otherwise consult still holds the previous
+    /// frame's draws until that reset runs.
+    fn settle_pending_uploads(&mut self) {
+        if self.pending_stage_uploads.is_empty() && self.pending_texture_uploads.is_empty() {
+            return;
+        }
+        let Some((settled, failed)) = self.upload_gate() else {
+            return;
+        };
+        self.settle_stage_uploads(settled, failed);
+        self.settle_texture_uploads(settled, failed);
+    }
+
+    /// The `(settled_seq, failed_seq)` pair the upload-recovery queues gate on.
+    ///
+    /// `settled_seq` is the lower of the two retirement counters: `coherent_seq`
+    /// for the draw command buffer and `upload_coherent_seq` for the upload
+    /// command buffer that actually carries the copies. Both matter because
+    /// `wait_for_gpu_retire` advances `coherent_seq` by hand so its caller sees
+    /// the advance synchronously, and that hand-advance can outrun the upload
+    /// handler which is the only thing that records an aborted upload. Taking
+    /// the minimum means an entry is never freed before the handler that would
+    /// have condemned it has reported in. `None` before the encoder is wired
+    /// up; the upload counter is skipped on the defensive path where the
+    /// leading blits rode the draw command buffer.
+    ///
+    /// `coherent_seq` is read first: the unix side records a failure before
+    /// bumping either retirement counter and both stores are `Release`, so a
+    /// retirement observed here implies the matching failure is visible.
+    fn upload_gate(&self) -> Option<(u64, u64)> {
+        if self.coherent_seq_ptr == 0 {
+            return None;
+        }
+        // SAFETY: `coherent_seq_ptr` is a PE-heap `Arc<AtomicU64>` raw
+        // pointer kept alive by the device-side `Arc`; nonzero here
+        // (checked above) means the encoder has been wired up.
+        let coherent = unsafe { SharedCounter::new(self.coherent_seq_ptr) }.load(Ordering::Acquire);
+        let settled = if self.upload_coherent_seq_ptr == 0 {
+            coherent
+        } else {
+            // SAFETY: same contract as `coherent_seq_ptr`: a device-owned
+            // `Arc<AtomicU64>` outliving every frame.
+            let upload =
+                unsafe { SharedCounter::new(self.upload_coherent_seq_ptr) }.load(Ordering::Acquire);
+            coherent.min(upload)
+        };
+        let failed = if self.failed_seq_ptr == 0 {
+            0
+        } else {
+            // SAFETY: same contract as `coherent_seq_ptr`.
+            unsafe { SharedCounter::new(self.failed_seq_ptr) }.load(Ordering::Acquire)
+        };
+        Some((settled, failed))
+    }
+
+    /// Settle the `Staged` VB/IB half of the upload recovery.
+    ///
+    /// Frees a released entry the way `drain_retired_resource_retention`
+    /// does (wrapper destroyed in one bulk thunk, then the backing offered
+    /// to the page-box pool), and subtracts its bytes from the shared
+    /// retention total exactly once, so a replayed entry (whose bytes stay
+    /// live) is never double-counted in either direction.
+    fn settle_stage_uploads(&mut self, settled: u64, failed: u64) {
+        if self.pending_stage_uploads.is_empty() {
+            return;
+        }
+        let reissue_seq = self.current_submit_seq;
+        let mut freed: Vec<StagedUploadRetry> = Vec::new();
+        for (fate, entry) in self.pending_stage_uploads.settle(settled, failed) {
+            match fate {
+                UploadFate::Reissue if self.reissue_stage_upload(entry.payload()) => {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: failed,
+                        "settle_stage_uploads: re-issuing VB/IB uploads discarded by the \
+                         aborted submit at seq {failed}; without this the geometry they \
+                         carried would stay stale for the rest of the run",
+                    );
+                    self.pending_stage_uploads.requeue(entry, reissue_seq);
+                    continue;
+                }
+                UploadFate::Abandoned => {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: entry.key(),
+                        "settle_stage_uploads: dropping the upload for buffer {:#x} after \
+                         {} aborted submits; its geometry stays stale until the game locks \
+                         that range again",
+                        entry.key(),
+                        entry.attempts(),
+                    );
+                }
+                // Acknowledged, or re-issue found no destination left
+                // (the game released the buffer): free it either way.
+                UploadFate::Released | UploadFate::Reissue => {}
+            }
+            freed.push(entry.into_payload());
+        }
+        self.free_stage_upload_transients(freed);
+    }
+
+    /// Free the transient wrapper + PE-heap backing of settled `Staged` VB/IB uploads.
+    ///
+    /// Destroy order mirrors `drain_retired_resource_retention`: every
+    /// `MTLBuffer` wrapper goes in one bulk thunk, and only then do the
+    /// backings drop, because Metal holds a `bytesNoCopy` pointer into them
+    /// until the wrapper is released. The bytes leave the shared retention
+    /// total here, exactly once per entry.
+    fn free_stage_upload_transients(&mut self, retries: Vec<StagedUploadRetry>) {
+        if retries.is_empty() {
+            return;
+        }
+        let mut wrappers: Vec<u64> = Vec::new();
+        let mut backings: Vec<PageBox> = Vec::new();
+        for retry in retries {
+            if !retry.transient.is_null() {
+                wrappers.push(retry.transient.raw());
+                self.perf.bump_buffer_destroy();
+            }
+            self.perf.bump_vbib_retained_sub(retry.page_box.len());
+            self.sub_retained_bytes(retry.page_box.len());
+            backings.push(retry.page_box);
+        }
+        destroy_resources_bulk(DestroyKind::Buffer, &wrappers);
+        let pool = &*crate::page_box_pool::PAGEBOX_POOL;
+        for pb in backings {
+            let len = pb.len();
+            if pool.recycle(pb).is_none() {
+                self.perf.bump_pagebox_pool_recycled(len);
+            }
+        }
+    }
+
+    /// Free every upload the GPU acknowledged, without replaying anything.
+    ///
+    /// The retention-cap relief drains (`DrainRetiredNow` and the mid-frame
+    /// submit) run outside `begin_frame`, so `frame_blit_commands` belongs
+    /// to no frame there and a replay pushed into it would be cleared
+    /// unnoticed at the next `begin_frame`. They take only the
+    /// acknowledged prefix; anything owing a replay waits for the next
+    /// `begin_frame`, one frame later, which is the right trade on a path
+    /// that only runs after a GPU abort.
+    ///
+    /// This is what keeps `memory.vbibRetentionCapMB` relief working: a
+    /// `Staged` upload's snapshot is counted in the shared retained-bytes
+    /// total, so it has to be freeable from the drain the API thread
+    /// triggers when it hits the cap.
+    fn release_acknowledged_uploads(&mut self) {
+        if self.pending_stage_uploads.is_empty() && self.pending_texture_uploads.is_empty() {
+            return;
+        }
+        let Some((settled, failed)) = self.upload_gate() else {
+            return;
+        };
+        let freed: Vec<StagedUploadRetry> = self
+            .pending_stage_uploads
+            .release_acknowledged(settled, failed)
+            .into_iter()
+            .map(mtld3d_core::upload_recovery::PendingUpload::into_payload)
+            .collect();
+        self.free_stage_upload_transients(freed);
+        // Texture jobs own only a staging Arc clone, so dropping them here
+        // is the whole release.
+        drop(
+            self.pending_texture_uploads
+                .release_acknowledged(settled, failed),
+        );
+    }
+
+    /// Settle the texture half of the upload recovery.
+    ///
+    /// Cheaper than the VB/IB half: the job holds a clone of the texture's
+    /// own staging `Arc` rather than a private snapshot, so a released entry
+    /// frees only the clone and a replay re-reads the same pages the
+    /// original upload did (the cached per-mip `MTLBuffer` still wraps
+    /// them, so it is a cache hit). When the PE side has since swapped that
+    /// `Arc` for a fresh box, the newer upload's own entry orders after this
+    /// one under the queue's per-key rule, same as the VB/IB half.
+    fn settle_texture_uploads(&mut self, settled: u64, failed: u64) {
+        if self.pending_texture_uploads.is_empty() {
+            return;
+        }
+        let reissue_seq = self.current_submit_seq;
+        for (fate, entry) in self.pending_texture_uploads.settle(settled, failed) {
+            match fate {
+                UploadFate::Reissue if self.reissue_texture_upload(entry.payload()) => {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: failed,
+                        "settle_texture_uploads: re-issuing texture uploads discarded by the \
+                         aborted submit at seq {failed}; without this their mips would keep \
+                         whatever was in the texture before",
+                    );
+                    self.pending_texture_uploads.requeue(entry, reissue_seq);
+                }
+                UploadFate::Abandoned => {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: entry.key(),
+                        "settle_texture_uploads: dropping the upload for texture {:#x} after \
+                         {} aborted submits; that mip keeps its previous contents",
+                        entry.key(),
+                        entry.attempts(),
+                    );
+                }
+                // Acknowledged, or the game released the texture so the
+                // replay had no destination: dropping the job releases the
+                // staging Arc clone, which is all the entry owns.
+                UploadFate::Released | UploadFate::Reissue => {}
+            }
+        }
+    }
+
+    /// Re-emit one discarded texture mip upload into this frame's leading blits.
+    ///
+    /// Skips the sampled-this-frame rename `run_texture_upload` does: this
+    /// runs from `begin_frame` after `PassState::reset_frame`, so no draw of
+    /// this frame has sampled the destination yet. Returns `false` when the
+    /// texture is gone from the cache (the game released it) or when the
+    /// blit path declined to emit anything, both of which make the upload
+    /// moot.
+    fn reissue_texture_upload(&mut self, job: &TextureUploadJob) -> bool {
+        let Some(handle) = self
+            .texture_cache
+            .get(&job.info.texture_id)
+            .map(|state| state.mtl_texture.raw())
+            .filter(|handle| *handle != 0)
+        else {
+            return false;
+        };
+        if job.depth > 1 {
+            self.run_volume_upload_blit(job, handle)
+        } else {
+            self.run_texture_upload_blit(job, handle)
+        }
+    }
+
     /// Drain resource-retention entries whose seq has retired on the GPU.
     ///
     /// Partitions popped entries by `DestroyKind`, destroys each kind's
@@ -5098,10 +5460,20 @@ impl FrameEncoder {
         }
         // Volume (3D) textures take a dedicated full-box path; 2D textures
         // keep the original hot-path blit untouched.
-        if job.depth > 1 {
-            self.run_volume_upload_blit(job, handle);
+        let emitted = if job.depth > 1 {
+            self.run_volume_upload_blit(&job, handle)
         } else {
-            self.run_texture_upload_blit(job, handle);
+            self.run_texture_upload_blit(&job, handle)
+        };
+        if emitted {
+            // Keep the job so an aborted upload command buffer can replay
+            // it. It only holds a clone of the texture's own persistent
+            // staging Arc, so the memory cost is the clone.
+            self.pending_texture_uploads.push(
+                job.info.texture_id.raw(),
+                self.current_submit_seq,
+                job,
+            );
         }
     }
 
@@ -5237,11 +5609,11 @@ impl FrameEncoder {
     /// Reuses the per-mip staging `MTLBuffer` (wrapping the game's staging
     /// `PageBox`) and emits a `BlitCopyBufferToTexture` against the frame's
     /// leading blit pass.
-    fn run_texture_upload_blit(&mut self, job: TextureUploadJob, texture_handle: u64) {
+    fn run_texture_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
         if backing_length == 0 {
-            return;
+            return false;
         }
 
         // Compute the blit descriptor against the staging buffer's
@@ -5253,7 +5625,7 @@ impl FrameEncoder {
         let staging_buffer_handle =
             self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
         if staging_buffer_handle == 0 {
-            return;
+            return false;
         }
 
         let (info, num_blit_rows) = if job.bytes_per_pixel == 0 {
@@ -5350,7 +5722,7 @@ impl FrameEncoder {
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
             match self.repack_blit_source_padded(&job.arc, &info, num_blit_rows) {
                 Some(padded_info) => padded_info,
-                None => return,
+                None => return false,
             }
         } else {
             // Notify the staging MTLBuffer (no-op on UMA). The padded
@@ -5377,9 +5749,12 @@ impl FrameEncoder {
         // Retain the staging Box for the GPU's view of this frame —
         // even on the padded path the source bytes were just copied
         // out, but keeping the Arc alive is harmless and uniform.
-        // Refcount drops back to 1 when `pending_blit_retention`
-        // releases this Arc after `coherent_seq >= submit_seq`.
-        self.current_blit_retention.push(job.arc);
+        // `pending_blit_retention` releases this clone once
+        // `coherent_seq >= submit_seq`; the caller's own clone in
+        // `pending_texture_uploads` outlives it by however long the
+        // upload takes to be acknowledged.
+        self.current_blit_retention.push(Arc::clone(&job.arc));
+        true
     }
 
     /// Volume (3D) full-box upload.
@@ -5400,11 +5775,11 @@ impl FrameEncoder {
     /// every slice is repacked to the padded stride (the rows being
     /// contiguous makes this a single `region_rows * depth` repack), and
     /// `bytes_per_image` widens to `padded_pitch * region_rows`.
-    fn run_volume_upload_blit(&mut self, job: TextureUploadJob, texture_handle: u64) {
+    fn run_volume_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
         if backing_length == 0 {
-            return;
+            return false;
         }
         let src_pitch = job.src_pitch;
         let slice_pitch = job.slice_pitch;
@@ -5413,7 +5788,7 @@ impl FrameEncoder {
         // exactly `src_pitch * block_rows`, so recover it by division.
         let region_rows = slice_pitch.checked_div(src_pitch).unwrap_or(0);
         if region_rows == 0 {
-            return;
+            return false;
         }
         let mip_w = (job.info.width.max(1) >> job.level).max(1);
         let mip_h = (job.info.height.max(1) >> job.level).max(1);
@@ -5421,7 +5796,7 @@ impl FrameEncoder {
         let staging_buffer_handle =
             self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
         if staging_buffer_handle == 0 {
-            return;
+            return false;
         }
 
         let info = CopyBufferToTextureInfo {
@@ -5451,7 +5826,7 @@ impl FrameEncoder {
                         padded_info.bytes_per_row.saturating_mul(region_rows);
                     padded_info
                 }
-                None => return,
+                None => return false,
             }
         } else {
             self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
@@ -5462,7 +5837,8 @@ impl FrameEncoder {
             .push(BlitCommand::copy_buffer_to_texture(&info));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
-        self.current_blit_retention.push(job.arc);
+        self.current_blit_retention.push(Arc::clone(&job.arc));
+        true
     }
 
     /// Repack `num_blit_rows` source rows from `staging` into a transient `PageBox`.
@@ -5978,6 +6354,25 @@ impl FrameEncoder {
         textures: &mut Vec<u64>,
     ) -> HeldBackings {
         let mut held = HeldBackings::default();
+        // Un-acknowledged uploads go the same way as retention: the GPU is
+        // about to be idle, so there is nothing left to replay into. Their
+        // bytes leave the shared retention total here, which is the only
+        // place besides `settle_stage_uploads` that subtracts them.
+        for entry in self.pending_stage_uploads.drain_all() {
+            let retry = entry.into_payload();
+            if !retry.transient.is_null() {
+                buffers.push(retry.transient.raw());
+            }
+            self.perf.bump_vbib_retained_sub(retry.page_box.len());
+            self.sub_retained_bytes(retry.page_box.len());
+            held.pageboxes.push(retry.page_box);
+        }
+        // Texture jobs own only a clone of the texture's staging Arc; park
+        // it with the other staging keepalives so it outlives the bulk
+        // destroy of the `MTLBuffer`s that wrap those pages.
+        for entry in self.pending_texture_uploads.drain_all() {
+            held.staging_arcs.push(entry.into_payload().arc);
+        }
         for entry in self.pending_resource_retention.drain(..) {
             if entry.handle != 0 {
                 match entry.kind {
@@ -6031,6 +6426,7 @@ impl FrameEncoder {
         let mut params = WaitForGpuRetireParams {
             target_seq: self.current_submit_seq,
             coherent_seq_ptr: self.coherent_seq_ptr,
+            failed_submit_seq_ptr: self.failed_seq_ptr,
         };
         let _ = unix_call(&mut params);
     }
@@ -6192,6 +6588,13 @@ pub struct FrameData {
     /// stamped (`FrameData::new` default); every submitted frame carries
     /// the real pointer.
     upload_coherent_seq_ptr: u64,
+    /// Raw pointer to the device's `Arc<AtomicU64>` failed-submit seq.
+    ///
+    /// Same lifetime guarantee as `coherent_seq_ptr`. Forwarded verbatim
+    /// into `SubmitFrameParams::failed_submit_seq_ptr`, which both
+    /// completion handlers `fetch_max` when their command buffer aborts.
+    /// 0 only before the frame is stamped.
+    failed_submit_seq_ptr: u64,
     /// Raw pointer to the device's `Arc<AtomicU64>` VB/IB retained-bytes total.
     ///
     /// Same lifetime guarantee as `coherent_seq_ptr`. The encoder
@@ -6226,6 +6629,23 @@ pub struct FrameData {
     /// at 0 — non-zero signals a new variant or workload that perturbed the
     /// peak.
     op_vec_realloc_bytes: u64,
+}
+
+/// The four GPU-fencing values `DeviceInner::stamp_and_swap` puts on a frame.
+///
+/// One bag rather than four positional `u64`s, because three of them are
+/// raw pointers to device-owned atomics and swapping two at a call site
+/// would compile silently. Every pointer is an `Arc<AtomicU64>` address
+/// that stays valid for the device's lifetime.
+pub struct SubmitFence {
+    /// Monotonic seq of the frame being handed to the encoder.
+    pub submit_seq: u64,
+    /// Draw-command-buffer retirement counter.
+    pub coherent_seq_ptr: u64,
+    /// Upload-command-buffer retirement counter.
+    pub upload_coherent_seq_ptr: u64,
+    /// Highest seq whose command buffer the GPU aborted.
+    pub failed_submit_seq_ptr: u64,
 }
 
 /// Parameter bag for `FrameData::new`.
@@ -6292,6 +6712,7 @@ impl FrameData {
             submit_seq: 0,
             coherent_seq_ptr: 0,
             upload_coherent_seq_ptr: 0,
+            failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
             apply_display_sync_enabled: init.apply_display_sync_enabled,
             scratch: ScratchArena::new(),
@@ -6346,15 +6767,11 @@ impl FrameData {
         };
     }
 
-    pub const fn set_submit_fence(
-        &mut self,
-        submit_seq: u64,
-        coherent_seq_ptr: u64,
-        upload_coherent_seq_ptr: u64,
-    ) {
-        self.submit_seq = submit_seq;
-        self.coherent_seq_ptr = coherent_seq_ptr;
-        self.upload_coherent_seq_ptr = upload_coherent_seq_ptr;
+    pub const fn set_submit_fence(&mut self, fence: &SubmitFence) {
+        self.submit_seq = fence.submit_seq;
+        self.coherent_seq_ptr = fence.coherent_seq_ptr;
+        self.upload_coherent_seq_ptr = fence.upload_coherent_seq_ptr;
+        self.failed_submit_seq_ptr = fence.failed_submit_seq_ptr;
     }
 
     pub const fn set_retained_bytes_ptr(&mut self, ptr: u64) {
@@ -6817,6 +7234,7 @@ fn encoder_thread_main(
                 // API thread allocates.
                 enc.wait_for_gpu_idle();
                 enc.drain_retired_resource_retention();
+                enc.release_acknowledged_uploads();
                 let _ = done.send(());
             }
             Ok(EncoderMessage::DrainRetiredNow(done)) => {
@@ -6826,6 +7244,7 @@ fn encoder_thread_main(
                 // (coherent only advances on GPU completion of committed
                 // work), so the seq-gated drain can't free it early.
                 enc.drain_retired_resource_retention();
+                enc.release_acknowledged_uploads();
                 let _ = done.send(());
             }
             Ok(EncoderMessage::IntakeVisibilityFor { target_seq, done }) => {
@@ -6847,6 +7266,7 @@ fn encoder_thread_main(
                         let mut params = WaitForGpuRetireParams {
                             target_seq,
                             coherent_seq_ptr: enc.coherent_seq_ptr,
+                            failed_submit_seq_ptr: enc.failed_seq_ptr,
                         };
                         mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);
                         let _ = unix_call(&mut params);
@@ -7160,6 +7580,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         submit_seq: frame.submit_seq,
         coherent_seq_ptr: frame.coherent_seq_ptr,
         upload_coherent_seq_ptr: frame.upload_coherent_seq_ptr,
+        failed_submit_seq_ptr: frame.failed_submit_seq_ptr,
         drawable_wait_ns: 0,
         present_view: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
