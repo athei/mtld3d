@@ -99,10 +99,11 @@ pub struct Mtld3dConfig {
     pub depth_alias_same_size: bool,
     /// Proactive cap on live VB/IB retained-`PageBox` bytes.
     ///
-    /// When live retention reaches this, the Lock-rename alloc path
-    /// drains retired backings and, if still over, forces a mid-frame
-    /// GPU-sync before allocating — bounding peak PE-heap retention so
-    /// a camera-turn rename burst can't thrash the 32-bit game process.
+    /// When live retention reaches this, the capped alloc path (a Lock
+    /// rename, or a `Staged` buffer's `Unlock` snapshot) drains retired
+    /// backings and, if still over, forces a mid-frame GPU-sync before
+    /// allocating, bounding peak PE-heap retention so a camera-turn
+    /// rename burst can't thrash the 32-bit game process.
     /// This is the only bound: allocation itself is infallible, so `0`
     /// means unbounded retention and an abort if the address space does
     /// run out (the A/B baseline arm). Default: 512 MiB. File key:

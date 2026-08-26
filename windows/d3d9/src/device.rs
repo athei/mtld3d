@@ -399,8 +399,13 @@ pub struct DeviceInner {
     current_frame: FrameData,
     /// Shared with the encoder thread and the unix completion handler.
     ///
-    /// Bumped in `present()` before `send_frame`; completion block
-    /// `fetch_max`'s it when a frame retires on the GPU.
+    /// The frame's submit seq is stamped in `stamp_and_swap`; this atomic
+    /// is the *retired* seq, raised on the unix side only: the draw
+    /// command buffer's completion handler, and `wait_for_gpu_retire`
+    /// once its `waitUntilCompleted` returns, both with a `Release`
+    /// `fetch_max`. Every PE-side reader only `Acquire`-loads it, so a
+    /// read that misses a concurrent retirement is a lower bound on GPU
+    /// progress: it can make a caller more conservative, never less.
     coherent_seq: Arc<AtomicU64>,
     /// Texture-upload retirement seq.
     ///

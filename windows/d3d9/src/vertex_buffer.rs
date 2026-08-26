@@ -1,11 +1,15 @@
 //! `IDirect3DVertexBuffer9` COM wrapper.
 //!
-//! Per-buffer `PageBox` backing: every Lock that renames
-//! (`!NOOVERWRITE && !READONLY && last_submit_seq > coherent_seq`) swaps
-//! `current_box` for a fresh uninit `PageBox`; the old one goes onto the
-//! device's retention pipeline, picked up by the encoder and paired with
-//! its wrapped `MTLBuffer` for GPU-retirement-gated destruction. Unlock is a
-//! no-op for `Direct` buffers; `Staged` buffers upload their dirty span there.
+//! Per-buffer `PageBox` backing: a Lock that renames swaps `current_box`
+//! for a fresh uninit `PageBox`; the old one goes onto the device's
+//! retention pipeline, picked up by the encoder and paired with its
+//! wrapped `MTLBuffer` for GPU-retirement-gated destruction. Renaming
+//! takes contention (`last_submit_seq > coherent_seq`, without
+//! `NOOVERWRITE` or `READONLY`) plus either `DISCARD` or a whole-buffer
+//! range: a contended *partial* Lock keeps the live pointer, the
+//! divergence the README lists under "Faster than conformant". Unlock is
+//! a no-op for `Direct` buffers; `Staged` buffers upload their dirty
+//! span there.
 //!
 //! Layout follows the "state on Inner" pattern: the `#[repr(C)]` outer
 //! struct only carries the vtable, refcount, and an opaque pointer to
@@ -515,12 +519,14 @@ extern "system" fn vb_get_type(this: *mut c_void) -> u32 {
 ///   buffer is non-WRITEONLY, memcpy the old bytes across (game
 ///   might read the whole buffer through the Lock pointer).
 /// - Contended partial non-DISCARD, `D3DUSAGE_DYNAMIC`: `WriteInPlace`.
-///   The game opted into the DISCARD/NOOVERWRITE timing contract — the
+///   The game opted into the DISCARD/NOOVERWRITE timing contract, the
 ///   same one non-persistent mapped-buffer APIs (e.g. OpenGL
-///   `glBufferSubData`) make implicitly.
-/// - Contended partial non-DISCARD, non-DYNAMIC: same fresh-`PageBox`
-///   swap, with the old bytes carried across via synchronous CPU
-///   memcpy (a "static" buffer repacked while a draw is in flight).
+///   `glBufferSubData`) make implicitly. This is the divergence the
+///   README lists under "Faster than conformant"; the only trace it
+///   leaves is the `in-place` perf counter bumped below.
+/// - Non-DYNAMIC buffers never reach `plan_lock`: they are `Staged`, and
+///   a partial write there uploads the dirtied range to a separate
+///   device buffer on Unlock, so it cannot land under a queued draw.
 extern "system" fn vb_lock(
     this: *mut c_void,
     offset_to_lock: u32,
@@ -580,6 +586,13 @@ extern "system" fn vb_lock(
         // resources per D3D9 lifetime rules.
         let dev = unsafe { &mut *inner.device_inner };
         let coh = dev.coherent_seq_arc().load(Ordering::Acquire);
+        // The same contention test `plan_lock` applies, named here so
+        // both it and the plan read one sampled `coh`. A stale `coh` is
+        // a lower bound on GPU progress (only the unix side raises it,
+        // with a `fetch_max` once the GPU retires the frame), so it can
+        // turn a legal in-place write into an unnecessary rename, never
+        // the reverse.
+        let contended = inner.last_submit_seq > coh;
         match plan_lock(
             flags,
             inner.usage,
@@ -626,7 +639,20 @@ extern "system" fn vb_lock(
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
             }
-            LockPlan::WriteInPlace => {}
+            LockPlan::WriteInPlace => {
+                // Count the kept divergence: a contended partial Lock
+                // without DISCARD or NOOVERWRITE hands back a pointer
+                // into the backing a queued draw may still be reading
+                // (README, "Faster than conformant"). Counted and not
+                // warned because it is a by-design no-op on a per-frame
+                // batcher path, not a stub or a fallback. The other two
+                // ways to reach `WriteInPlace` (NOOVERWRITE/READONLY,
+                // uncontended) are conformant, so it takes both tests to
+                // select this arm.
+                if contended && !bypass_rename {
+                    dev.perf_mut().bump_vbib_write_in_place_contended();
+                }
+            }
         }
     }
 
