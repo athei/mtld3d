@@ -29,6 +29,7 @@ fn defaults_match_documented_values() {
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
     assert!(d.query_flush_immediate);
+    assert!(!d.buffer_ignore_lock_bounds);
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
     assert_eq!(d.present_max_fps, 0);
@@ -174,6 +175,16 @@ fn depth_alias_same_size_defaults_off_and_round_trips() {
     assert!(!cfg.depth_alias_same_size);
     let cfg = parse(None, "depth.aliasSameSize = true\n", None);
     assert!(cfg.depth_alias_same_size);
+}
+
+#[test]
+fn buffer_ignore_lock_bounds_defaults_off_and_round_trips() {
+    let cfg = parse(None, "", None);
+    assert!(!cfg.buffer_ignore_lock_bounds);
+    let cfg = parse(None, "buffer.ignoreLockBounds = true\n", None);
+    assert!(cfg.buffer_ignore_lock_bounds);
+    let cfg = parse(None, "buffer.ignoreLockBounds = false\n", None);
+    assert!(!cfg.buffer_ignore_lock_bounds);
 }
 
 #[test]

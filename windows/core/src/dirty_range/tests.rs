@@ -18,6 +18,31 @@ fn empty_has_no_span() {
 }
 
 #[test]
+fn full_covers_the_whole_buffer() {
+    let d = DirtyRange::full(LEN);
+    assert!(!d.is_empty());
+    assert_eq!(d.span(), Some((0, LEN)));
+}
+
+#[test]
+fn full_of_zero_length_is_empty() {
+    // A zero-length buffer has nothing to upload, so the seed must not
+    // report a span the Unlock path would then try to copy.
+    let d = DirtyRange::full(0);
+    assert!(d.is_empty());
+    assert_eq!(d.span(), None);
+}
+
+#[test]
+fn conjoin_into_full_is_a_no_op() {
+    // The creation seed already covers everything, so a later partial
+    // Lock cannot narrow it.
+    let mut d = DirtyRange::full(LEN);
+    d.conjoin(128, 256, LEN);
+    assert_eq!(d.span(), Some((0, LEN)));
+}
+
+#[test]
 fn single_conjoin_sets_span() {
     let mut d = DirtyRange::empty();
     d.conjoin(256, 1024, LEN);

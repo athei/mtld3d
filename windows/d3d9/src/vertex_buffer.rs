@@ -19,7 +19,10 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
-    buffer_rename::{BufferMapMode, LockPlan, PreserveKind, classify_map_mode, plan_lock},
+    buffer_rename::{
+        BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
+        records_dirty_range,
+    },
     dirty_range::DirtyRange,
     ids::BufferId,
     page_box::PageBox,
@@ -223,7 +226,31 @@ pub struct VertexBufferCreateInfo {
 
 impl Direct3DVertexBuffer9 {
     pub fn new(info: &VertexBufferCreateInfo) -> Self {
-        let current_box = PageBox::new_uninit(info.length as usize);
+        // Zeroed, not uninit: a `Staged` buffer's first upload carries the
+        // whole staging region, so any byte the game left alone has to be
+        // a defined value rather than heap residue. One `bzero` per create,
+        // and renames keep using the recycle pool.
+        let current_box = PageBox::new_zeroed(info.length as usize);
+        let map_mode = classify_map_mode(info.usage, info.pool);
+        // A `Staged` buffer starts full-dirty, whatever
+        // `buffer.ignoreLockBounds` says. Its device allocation is
+        // `Private`, Metal does not zero it, and no blit command can fill
+        // a buffer, so the opening upload is the only thing that can give
+        // it defined contents. A fill made entirely through locks that
+        // record no range (a `MANAGED` buffer's `READONLY` locks)
+        // announces nothing, so that upload has to carry every byte or
+        // the GPU reads an undefined buffer. It is also the one whole-buffer
+        // range that is free: no draw has read the buffer yet, so it
+        // cannot trip rename-at-overlap. `Direct` buffers share one
+        // allocation with the GPU and never read `dirty`.
+        // `texture_unlock_rect`'s `was_uploaded` gate is the same rule for
+        // mips: a level filled only through READONLY locks still has to
+        // reach the GPU once.
+        let dirty = if matches!(map_mode, BufferMapMode::Staged) {
+            DirtyRange::full(info.length)
+        } else {
+            DirtyRange::empty()
+        };
         let inner = Box::into_raw(Box::new(VertexBufferInner {
             device_inner: info.device_inner,
             buffer_id: BufferId::new_unique(),
@@ -232,8 +259,8 @@ impl Direct3DVertexBuffer9 {
             fvf: info.fvf,
             pool: info.pool,
             private_data: PrivateDataStore::default(),
-            map_mode: classify_map_mode(info.usage, info.pool),
-            dirty: DirtyRange::empty(),
+            map_mode,
+            dirty,
             current_box,
             last_submit_seq: 0,
             locked: false,
@@ -560,15 +587,36 @@ extern "system" fn vb_lock(
         // Separate CPU staging: record the dirtied range for the Unlock
         // upload. No rename / no `plan_lock` — the GPU reads a distinct
         // device buffer, so a partial write can't race an in-flight draw.
-        // READONLY contributes nothing (the game promises not to write).
-        if flags & D3DLOCK_READONLY == 0 {
+        // `records_dirty_range` drops the locks that leave the device
+        // buffer nothing to pick up: READONLY, in the one pool that keeps
+        // a system-memory copy whose upload it can skip, and
+        // NO_DIRTY_UPDATE is not honoured: it is not a promise that
+        // nothing was written, and this path has no later upload to carry
+        // the bytes, so dropping the range would drop the write.
+        if records_dirty_range(flags, inner.pool) {
             if flags & D3DLOCK_DISCARD != 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "vb_lock: D3DLOCK_DISCARD on a non-DYNAMIC (Staged) buffer — treating as a normal dirtied-range upload");
             }
-            inner
-                .dirty
-                .conjoin(offset_to_lock, size_to_lock, inner.length);
+            // The announced window is normally taken as a bound on what
+            // the game wrote. It is not under `buffer.ignoreLockBounds`,
+            // nor for the two shapes that name no narrower window at all
+            // (`D3DLOCK_DISCARD`, and a zero `SizeToLock`, which D3D9
+            // documents as locking the whole buffer). Then the upload
+            // widens to `(0, 0)`, which is `conjoin`'s "to end of buffer"
+            // from offset zero, so the head is covered too.
+            let (dirty_offset, dirty_size) = if may_trust_lock_bounds(
+                flags,
+                inner.usage,
+                inner.pool,
+                size_to_lock,
+                crate::config::CONFIG.buffer_ignore_lock_bounds,
+            ) {
+                (offset_to_lock, size_to_lock)
+            } else {
+                (0, 0)
+            };
+            inner.dirty.conjoin(dirty_offset, dirty_size, inner.length);
         }
     }
 

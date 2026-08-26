@@ -5,14 +5,16 @@
 
 use mtld3d_tests::{Harness, Vertex};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLOCK_DISCARD,
-    D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRTYPE_INDEXBUFFER,
-    D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY,
+    D3D_OK, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ,
+    D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_CULLMODE, D3DRS_LIGHTING,
+    D3DRTYPE_INDEXBUFFER, D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY,
 };
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
 const BLUE: u32 = 0xFF00_00FF;
 const MAGENTA: u32 = 0xFFFF_00FF;
+const GREEN: u32 = 0xFF00_FF00;
+const RED: u32 = 0xFFFF_0000;
 
 fn stride() -> u32 {
     u32::try_from(size_of::<Vertex>()).expect("vertex stride fits u32")
@@ -52,7 +54,7 @@ fn arm_diffuse(h: &Harness) {
 #[test]
 fn draw_primitive_from_vertex_buffer() {
     let h = Harness::new();
-    let tri = solid_triangle(0xFF00_FF00);
+    let tri = solid_triangle(GREEN);
     let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
     vb.lock(0, 0, 0).write(&tri);
 
@@ -69,11 +71,7 @@ fn draw_primitive_from_vertex_buffer() {
             "DrawPrimitive"
         );
     });
-    assert_eq!(
-        h.read_pixel(320, 280),
-        0xFF00_FF00,
-        "VB triangle renders green"
-    );
+    assert_eq!(h.read_pixel(320, 280), GREEN, "VB triangle renders green");
 }
 
 #[test]
@@ -151,22 +149,191 @@ fn dynamic_vertex_buffer_discard_refill() {
         "SetStreamSource"
     );
 
-    vb.lock(0, 0, D3DLOCK_DISCARD)
-        .write(&solid_triangle(0xFF00_FF00));
+    vb.lock(0, 0, D3DLOCK_DISCARD).write(&solid_triangle(GREEN));
     h.render_once(BLUE, |d| {
         assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
     });
-    assert_eq!(h.read_pixel(320, 280), 0xFF00_FF00, "first fill is green");
+    assert_eq!(h.read_pixel(320, 280), GREEN, "first fill is green");
 
-    vb.lock(0, 0, D3DLOCK_DISCARD)
-        .write(&solid_triangle(0xFFFF_0000));
+    vb.lock(0, 0, D3DLOCK_DISCARD).write(&solid_triangle(RED));
     h.render_once(BLUE, |d| {
         assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+    });
+    assert_eq!(h.read_pixel(320, 280), RED, "DISCARD refill shows red");
+}
+
+/// `buffer.ignoreLockBounds`: a write past the announced `Lock` range reaches the GPU (VB).
+///
+/// A `D3DPOOL_DEFAULT` non-`DYNAMIC` buffer is `Staged`: its CPU staging and
+/// the device buffer the GPU reads are separate allocations, and only what
+/// `Unlock` uploads ever crosses. A few D3D9-era titles write outside the
+/// window they named at `Lock` and a real driver never noticed, because the
+/// pointer it handed back was into the one allocation the GPU read. With the
+/// option on, uploading only the announcement would leave the previous
+/// triangle on screen here: the four announced bytes are vertex 0's `x`,
+/// which both triangles share.
+#[test]
+fn staged_vertex_buffer_upload_ignores_the_announced_lock_range() {
+    // `buffer.ignoreLockBounds` is off by default, so this test asks for
+    // it. The harness process owns its environment and no other thread
+    // runs yet; extend the suite-wide config with the option under test.
+    let merged = format!(
+        "{};buffer.ignoreLockBounds=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the
+    // harness and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+
+    // Whole-buffer fill, so the device buffer holds a known triangle.
+    vb.lock(0, 0, 0).write(&solid_triangle(GREEN));
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            0,
+            "DrawPrimitive after the whole-buffer fill"
+        );
     });
     assert_eq!(
         h.read_pixel(320, 280),
-        0xFFFF_0000,
-        "DISCARD refill shows red"
+        GREEN,
+        "whole-buffer fill draws green"
+    );
+
+    // Announce four bytes at offset 0, write all three vertices.
+    vb.lock(0, 4, 0).write(&solid_triangle(RED));
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            0,
+            "DrawPrimitive after the narrow-announcement refill"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "the vertices written past the announced Lock range reached the GPU"
+    );
+}
+
+/// `buffer.ignoreLockBounds`: a write past the announced `Lock` range reaches the GPU (IB).
+///
+/// Same shape as the vertex-buffer case, and it needs the same option on.
+/// Both index triples start at vertex 0, so the two announced bytes carry no
+/// change and an announcement-only upload leaves the first triangle
+/// selected.
+#[test]
+fn staged_index_buffer_upload_ignores_the_announced_lock_range() {
+    // `buffer.ignoreLockBounds` is off by default, so this test asks for
+    // it. The harness process owns its environment and no other thread
+    // runs yet; extend the suite-wide config with the option under test.
+    let merged = format!(
+        "{};buffer.ignoreLockBounds=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the
+    // harness and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::new();
+    // Two disjoint triangles sharing vertex 0 (top centre): 0-1-2 fills the
+    // left of the screen, 0-3-2 the right, with the shared v0-v2 edge as the
+    // boundary. Culling off so neither winding matters.
+    let verts = [
+        Vertex {
+            x: 0.0,
+            y: 0.9,
+            z: 0.5,
+            color: MAGENTA,
+        },
+        Vertex {
+            x: -0.9,
+            y: -0.9,
+            z: 0.5,
+            color: MAGENTA,
+        },
+        Vertex {
+            x: -0.05,
+            y: -0.9,
+            z: 0.5,
+            color: MAGENTA,
+        },
+        Vertex {
+            x: 0.9,
+            y: -0.9,
+            z: 0.5,
+            color: MAGENTA,
+        },
+    ];
+    let left: [u16; 3] = [0, 1, 2];
+    let right: [u16; 3] = [0, 3, 2];
+    // Well inside each triangle at y = 400 of the 640x480 backbuffer, where
+    // the left one spans x in [69, 306] and the right one x in [306, 571].
+    let (in_left, in_right) = ((150, 400), (450, 400));
+
+    let vb = h.create_vertex_buffer(stride() * 4, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&left);
+
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "culling off"
+    );
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 1),
+            0,
+            "DIP after the whole-buffer fill"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(in_left.0, in_left.1),
+        MAGENTA,
+        "indices 0-1-2 fill the left triangle"
+    );
+    assert_eq!(
+        h.read_pixel(in_right.0, in_right.1),
+        BLUE,
+        "the right triangle is background before the reindex"
+    );
+
+    // Announce two bytes at offset 0, write all three indices.
+    ib.lock(0, 2, 0).write(&right);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 1),
+            0,
+            "DIP after the narrow-announcement reindex"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(in_right.0, in_right.1),
+        MAGENTA,
+        "the indices written past the announced Lock range reached the GPU"
+    );
+    assert_eq!(
+        h.read_pixel(in_left.0, in_left.1),
+        BLUE,
+        "the left triangle is gone once indices 0-3-2 are the ones drawn"
     );
 }
 

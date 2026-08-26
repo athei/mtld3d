@@ -6,6 +6,14 @@ getter round-trip — no manual inspection. Run with `make test` (nextest runs
 each test in its own Wine process, in parallel, on both `i686`/`x86_64`
 windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 
+A test that needs a non-default option sets it itself: because each test is its
+own process and config resolves lazily on the first `Direct3DCreate9`, the test
+appends its key to `MTLD3D_CONFIG` before constructing the `Harness`. That keeps
+the option-gated behaviour in the ordinary `make test` run rather than behind a
+command a reader has to be told about. Two options are gated this way today:
+`buffer.ignoreLockBounds` in `buffers.rs` and `depth.aliasSameSize` in
+`render_target.rs`.
+
 ## Covered behaviour by file
 
 | File | Coverage |
@@ -16,7 +24,7 @@ windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
 | `draw.rs` | XYZRHW screen-space quad; every accepted primitive type (point/line/linestrip/tristrip); triangle fans through `DrawPrimitiveUP`, `DrawPrimitive` (bound stream, `StartVertex`, and a 300 triangle fan that outgrows the encoder's shared index pattern mid-frame) and `DrawIndexedPrimitive` (bound 16-bit indices, `StartIndex` + `BaseVertexIndex`), all rewritten as triangle lists; `DrawIndexedPrimitiveUP`; `ProcessVertices` transforming through the current FVF, and rejected from an explicit declaration. |
 | `points.rs` | `D3DRS_POINTSIZE` sizing the square; an XYZ-only point under an ortho projection (Wine's test_pointsize shape); several sizes in one scene with a Clear between scenes and no Present; `POINTSIZE_MIN`/`MAX` clamp; `D3DFVF_PSIZE` per-vertex size; `POINTSCALEENABLE` with the viewport-height factor and eye-distance attenuation; programmable VS `oPts` vs the render-state default; point sprites through fixed-function and `ps_2_0` texcoords (quadrant texture), and the sprite state leaving triangles alone. |
 | `clip_planes.rs` | Fixed-function plane keeping the positive side and released when disabled; world-space semantics under a translated view; `D3DRS_CLIPPING` gating; two sparse-index planes intersecting; RHW geometry ignoring the planes; clip-space semantics under a programmable VS; `D3DSBT_ALL` capture/apply round trip that renders. |
-| `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices` round-trips including higher streams and the NULL-bind offset/stride retention. |
+| `buffers.rs` | `CreateVertexBuffer`/`CreateIndexBuffer`; `DrawPrimitive`/`DrawIndexedPrimitive` from bound streams; DYNAMIC+DISCARD refill; `GetDesc` round-trips; `GetStreamSource`/`GetIndices` round-trips including higher streams and the NULL-bind offset/stride retention; under `buffer.ignoreLockBounds=true`, a `Staged` (DEFAULT, non-DYNAMIC) vertex buffer and index buffer each carrying the writes a title makes past the `[OffsetToLock, SizeToLock)` window it announced, checked by re-locking a window whose announced bytes do not change and reading back the pixel the rest of the write moves. |
 | `streams.rs` | A two-stream declaration through a programmable VS; the `SetStreamSourceFreq` contract (defaults, rejections leaving state untouched, flag round-trip); instanced indexed draws (count from stream 0, per-instance step rate, non-indexed draws never instance, no per-instance stream means one instance); recorded and `D3DSBT_ALL` state blocks restoring stream bindings and frequencies. |
 | `render_states.rs` | Alpha + additive blend; COLORWRITEENABLE mask; scissor; cull-mode winding; defaults vs `render_state_defaults()`; set/get round-trip; stencil round-trip; stencil test gating a draw; stencil clear preserving depth; combined depth+stencil mid-frame clear resetting both planes; stencil reference compared through the mask; stencil clear and test against a depth-only surface; wireframe no-op (pinned).; a Clear after a draw in the same pass (clear quad) surviving the draw's cull mode. |
 | `textures.rs` | Lock/sample A8R8G8B8/X8R8G8B8/R5G6B5/A1R5G5B5/A4R4G4B4/L8; DXT1 block decode; mip chain levels/dims; AUTOGENMIPMAP; SetLOD no-op; cube creation in all pools; CPU-only extension-format cubes; managed DXT face isolation; cube face upload, sampling, state blocks, render targets, and AUTOGENMIPMAP; volume creates; `UpdateTexture` between volumes copies every slice (sampled per slice centre through the fixed-function 3D texcoord path); a level from `GetVolumeLevel` locked through `IDirect3DVolume9` and written samples back on every slice. |
