@@ -152,6 +152,10 @@ Each of these rots silently when it is left for later:
   cache key serves stale MSL, and the result looks like a rendering bug.
 - A new config key ships with its dispatch arm, its unit test, and its entry in
   the `mtld3d.conf` sample with the default and a short why.
+- A new built-in app profile ships with the rationale for every key it sets, a
+  test that resolves it from the version strings the shipped binary actually
+  carries, and its row in the README profile table. A profile that pins no
+  version field is not a profile, it is a name collision waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
   (`scripts/audit.sh --update-derives`).
 

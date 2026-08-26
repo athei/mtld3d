@@ -303,6 +303,18 @@ User-facing runtime options live in the optional `mtld3d.conf`, read once at
 restart. The sample in the repo root documents every option, its default, and
 the `MTLD3D_CONFIG` environment override that beats the file.
 
+Below both sits a third layer: a handful of games need options nobody should
+have to discover, so mtld3d ships built-in profiles for them. A profile is
+matched on the executable name plus the version resource its vendor linked in,
+so it follows the game wherever it is installed and never fires on an unrelated
+program of the same name. It only supplies starting values, and both the file
+and the environment override it key by key.
+`RUST_LOG=mtld3d::d3d9=info` names the profile that matched.
+
+| Profile | Application | What it sets and why |
+|---|---|---|
+| `gta-iv` | Grand Theft Auto IV | `adapter.spoof=amd`, because the renderer branches on the reported vendor and stalls in its own identifier parsing on the NVIDIA identity. `caps.dfFormats=false`, because with the DF fourccs advertised it picks a mixed DF24 plus INTZ depth path that no hardware of its era offered. `query.flushImmediate=false`, because its occlusion culling needs real pixel counts rather than an immediate answer. `depth.aliasSameSize=true`, because its late alpha, sky and glow passes z-test one INTZ depth texture against scene depth rendered into a same-size sibling. |
+
 Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*`
 and `env_logger` matches by `::`-separated prefix, so `RUST_LOG=mtld3d=warn` is
 the single switch for the whole project; narrow it per target, for example
