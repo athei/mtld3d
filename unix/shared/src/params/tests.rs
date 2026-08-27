@@ -89,8 +89,9 @@ fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 104);
 
     // CreateTexturesBatchParams:
-    //   8 device_handle + 4 count + 4 _pad0 + 8 descs_ptr + 8 handles_out_ptr = 32
-    assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 32);
+    //   8 device_handle + 4 count + 4 _pad0 + 8 descs_ptr + 8 handles_out_ptr
+    //   + 8 srgb_handles_out_ptr = 40
+    assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 40);
 
     // TextureCreateDesc:
     //   8 tex_id

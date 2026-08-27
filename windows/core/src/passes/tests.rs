@@ -3589,3 +3589,32 @@ fn viewport_coverage_converts_through_the_render_scale() {
     assert!(!s.viewport_covers_color_attachment());
     assert!(!s.viewport_covers_depth_attachment());
 }
+
+#[test]
+fn srgb_twin_bind_marks_the_base_texture_sampled() {
+    let mut s = fresh();
+    let base = tex(0x7E10);
+    let twin = tex(0x7E11);
+    s.register_srgb_twin(twin, base);
+    // A draw sampling through the sRGB twin reads the base's storage:
+    // rename-at-overlap and the store-action rules must see the base as
+    // sampled even though the command stream only carries the twin.
+    s.emit_command(Command::set_fragment_texture(twin.raw(), 0));
+    assert!(s.texture_sampled_this_frame(base));
+    assert!(s.texture_sampled_this_frame(twin));
+    // After the twin is unregistered (texture destroyed/renamed), a stray
+    // bind of the stale handle no longer implicates the base.
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s.unregister_srgb_twin(twin);
+    s.emit_command(Command::set_fragment_texture(twin.raw(), 0));
+    assert!(!s.texture_sampled_this_frame(base));
+}

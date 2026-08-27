@@ -166,9 +166,11 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **2 `real` · 92 `expected` ·
+re-checked before retagging. Headline: **2 `real` · 91 `expected` ·
 2 `caps` · 21 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
-subtest-arches `crash=0`. Only two tags change what the gate tolerates:
+subtest-arches `crash=0`. (2026-08-27: the wine-11.0-13 bump retired the
+`expected` site device.c:15088; the SRGBTEXTURE decode landing the same day
+changed no site counts — the newly-running `srgbtexture_test` passes.) Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
@@ -493,18 +495,14 @@ Raw output confirms the remaining halves: 14480-14493 fail only as
 Their sibling sites 14451/14454 and 14472/14474 pass with the harness's
 pinned Retina mode.
 
-### device.c/init_d3d9on12_modules
-Sites: 15088=expected
-
-`win_skip("Direct3DCreate9On12 is not supported…")`: under Wine, win_skip
-counts as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on
-Metal.
-
 ### device.c/test_d3d9on12
 Sites: 15160=expected
 
-The `win_skip("Failed to load d3d9on12 modules…")` companion to 15088,
-same rationale.
+`win_skip("Failed to load d3d9on12 modules…")`: under Wine, win_skip counts
+as a test failure. We don't provide the D3D9-on-D3D12 bridge; N/A on Metal.
+(Its former companion site in `init_d3d9on12_modules`, the
+`win_skip("Direct3DCreate9On12 is not supported…")` at 15088, stopped
+firing with the wine-11.0-13 bump and left the baseline then.)
 
 ### visual.c clusters
 

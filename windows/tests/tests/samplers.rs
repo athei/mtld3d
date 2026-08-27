@@ -1,11 +1,13 @@
 //! Sampler states: addressing modes, filtering, and get/set round-trips.
 
-use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex};
+use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, assert_pixel_approx, assert_pixel_eq};
 use mtld3d_types::{
-    D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
-    D3DTEXF_LINEAR, D3DTEXF_POINT,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+    D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
+    D3DSAMP_MAXANISOTROPY, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_SRGBTEXTURE,
+    D3DTA_TEXTURE, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR,
+    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -232,5 +234,81 @@ fn point_and_linear_filtering_differ() {
     assert_ne!(
         point, linear,
         "LINEAR must blend where POINT snaps to a texel"
+    );
+}
+
+/// `D3DSAMP_SRGBTEXTURE=1` decodes the sampled texel from sRGB to linear.
+///
+/// A mid-gray 0x80 texel (0.502 sRGB-encoded) decodes to linear ~0.216
+/// (0x37). Source-engine games gate their whole gamma-correct pipeline on
+/// this decode — without it Half-Life 2 drops to an untested shader-gamma
+/// fallback that renders its lightmaps black. The state must also take
+/// effect on a mid-scene flip over an unchanged texture bind: the decode
+/// lives in which texture view is bound, so the flip has to re-emit the
+/// bind, not just the sampler.
+#[test]
+fn srgbtexture_decodes_on_sample() {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_A8R8G8B8, 0);
+    tex.lock_rect(0, 0).write_u32(&[0xFF80_8080]);
+    let quad = uv_quad(1.0);
+
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        0xFF80_8080,
+        "SRGBTEXTURE=0 must return the raw texel",
+    );
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        assert_eq!(d.set_sampler_state(0, D3DSAMP_SRGBTEXTURE, 1), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xFF37_3737,
+        2,
+        "mid-scene SRGBTEXTURE=1 flip must decode 0x80 to linear ~0x37",
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_SRGBTEXTURE, 0), 0);
+}
+
+/// The sRGB twin view of an X8R8G8B8 texture keeps the alpha=1 swizzle.
+///
+/// The texel's X byte is 0, so a twin view that dropped the swizzle samples
+/// alpha 0 and the SRCALPHA/ZERO blend turns the quad black; a missing
+/// decode returns the raw 0xBB instead of linear ~0x7F.
+#[test]
+fn srgbtexture_x8_twin_keeps_alpha_swizzle() {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_X8R8G8B8, 0);
+    tex.lock_rect(0, 0).write_u32(&[0x00BB_BBBB]);
+    let quad = uv_quad(1.0);
+
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_SRGBTEXTURE, 1), 0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ZERO), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xFF7F_7F7F,
+        2,
+        "X8R8G8B8 with SRGBTEXTURE=1 must decode 0xBB to ~0x7F at full alpha",
     );
 }

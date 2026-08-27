@@ -386,13 +386,16 @@ const fn has_srgb_twin(fmt: u32) -> bool {
 }
 
 // Formats for which `D3DUSAGE_QUERY_SRGBREAD` (the `D3DSAMP_SRGBTEXTURE`
-// sampling decode) is honoured. The 32-bit RGB formats have an sRGB twin for
-// SRGBWRITE (eager render-target views, `has_srgb_twin`) but NO runtime
-// SRGBTEXTURE sampling decode, so advertising SRGBREAD for them over-promises
-// (a sampler expecting the sRGB decode then reads them un-decoded). The
-// block-compressed formats keep their existing SRGBREAD advertisement.
+// sampling decode) is honoured: every format with an sRGB twin. The unix
+// side creates the twin view eagerly at `create_texture` time and the
+// draw-time bind selects it whenever the stage's sampler sets
+// `D3DSAMP_SRGBTEXTURE=1`, so the advertisement is backed by a real
+// hardware decode. Keep in lock-step with `has_srgb_twin` — Source-engine
+// games gate their entire gamma-correct pipeline on the A8R8G8B8
+// SRGBREAD|SRGBWRITE probe and fall back to an untested shader-gamma path
+// (black lightmaps in Half-Life 2) when it fails.
 const fn has_srgb_read_decode(fmt: u32) -> bool {
-    matches!(fmt, D3DFMT_DXT1 | D3DFMT_DXT3 | D3DFMT_DXT5)
+    has_srgb_twin(fmt)
 }
 
 // ── IUnknown implementation (IDirect3D9) ──
@@ -807,9 +810,9 @@ extern "system" fn d3d9_check_device_format(
             is_render_target_format(check_format)
         }
     } else if rtype == D3DRTYPE_SURFACE || rtype == D3DRTYPE_TEXTURE {
-        // SRGBREAD: per-format gate for whether the runtime/game can
-        // ask for `D3DSAMP_SRGBTEXTURE=1`. Matches the eager sRGB-view
-        // path in `unix/unix/src/metal/texture.rs::create_texture`
+        // SRGBREAD: per-format gate for whether `D3DSAMP_SRGBTEXTURE=1`
+        // delivers a real decode. Matches the eager sRGB twin view
+        // created in `unix/unix/src/metal/texture.rs::create_texture`
         // — only formats with an MTLPixelFormat sRGB twin succeed.
         if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false

@@ -552,14 +552,25 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             params.count as usize,
         )
     };
+    // SAFETY: same wire contract as `handles_out_ptr` — a caller-owned
+    // `[MetalHandle<MTLTextureKind>; count]` slice for the sRGB twin views.
+    let srgb_handles = unsafe {
+        core::slice::from_raw_parts_mut(
+            params.srgb_handles_out_ptr as *mut MetalHandle<MTLTextureKind>,
+            params.count as usize,
+        )
+    };
     let mut any_failed = false;
-    for (desc, slot) in descs.iter().zip(handles.iter_mut()) {
-        if let Some(handle) = metal::create_texture(&device, desc) {
-            // SAFETY: `create_texture` returns the raw u64 of a freshly
-            // retained MTLTexture; adopt it as the canonical typed handle.
+    for ((desc, slot), srgb_slot) in descs.iter().zip(handles.iter_mut()).zip(srgb_handles) {
+        if let Some((handle, srgb_handle)) = metal::create_texture(&device, desc) {
+            // SAFETY: `create_texture` returns the raw u64s of freshly
+            // retained MTLTextures; adopt them as the canonical typed handles.
             *slot = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
+            // SAFETY: as above; 0 (no twin) adopts as NULL.
+            *srgb_slot = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
         } else {
             *slot = MetalHandle::NULL;
+            *srgb_slot = MetalHandle::NULL;
             any_failed = true;
             error!(
                 target: LOG_TARGET,

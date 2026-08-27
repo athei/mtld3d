@@ -78,9 +78,9 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   pre-transformed geometry.
 - **Stencil**: the full test, both faces, and every stencil operation, with
   `Clear(D3DCLEAR_STENCIL)` bounded to the viewport independently of depth.
-- **Sampling and output**: anisotropic filtering, sRGB read (compressed
-  formats) and sRGB write, alpha test, scissor, separate alpha blend, blend
-  factor, color write masks.
+- **Sampling and output**: anisotropic filtering, sRGB read (32-bit and
+  compressed formats) and sRGB write, alpha test, scissor, separate alpha
+  blend, blend factor, color write masks.
 - **Multiple render targets**: four simultaneous targets with independent
   formats and write masks, post-pixel-shader blending on each, and Clear
   reaching every bound target.

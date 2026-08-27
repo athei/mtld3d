@@ -1,5 +1,5 @@
 # mtld3d d3d9 conformance baseline — per-site failure counts.
-# Wine: wine-11.0-10-g276777cca0e
+# Wine: wine-11.0-13-ge5553de95c2
 # Regenerate with 'make conformance-baseline'. Classifications + triage prose
 # live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test
 # keeps the two files covering the same sites.
@@ -95,7 +95,6 @@
   device.c:14482 count=1
   device.c:14491 count=1
   device.c:14493 count=1
-  device.c:15088 count=1
   device.c:15160 count=1
 [i686/visual] crash=0
   visual.c:3887 count=1
@@ -217,7 +216,6 @@
   device.c:14482 count=1
   device.c:14491 count=1
   device.c:14493 count=1
-  device.c:15088 count=1
   device.c:15160 count=1
 [x86_64/visual] crash=0
   visual.c:3887 count=1

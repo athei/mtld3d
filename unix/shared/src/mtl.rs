@@ -114,16 +114,17 @@ impl PixelFormat {
     /// sRGB pairs in mtld3d's wire today. Depth formats, single-channel
     /// formats (A8/R8) and float formats have no sRGB encoding.
     ///
-    /// Drives two paths:
-    /// - `D3DSAMP_SRGBTEXTURE=1`: eagerly create a
-    ///   `newTextureViewWithPixelFormat:` of the sRGB twin at
-    ///   `CreateTexture` time and bind that view at draw time.
-    /// - `D3DRS_SRGBWRITEENABLE=1`: upgrade the colour-attachment format
-    ///   of the pipeline state to the sRGB twin.
+    /// Drives the `D3DSAMP_SRGBTEXTURE=1` decode: `create_texture` eagerly
+    /// creates a view of the sRGB twin next to every colour texture whose
+    /// format has one, and the draw-time bind selects that view when the
+    /// sampling stage sets the state. (`D3DRS_SRGBWRITEENABLE=1` is NOT
+    /// view-based — it is a pixel-shader OETF variant; see
+    /// `unix/unix/src/metal/pipeline.rs` for why the attachment-format
+    /// upgrade was rejected.)
     ///
     /// Returning `None` means the linear format is the only thing mtld3d
-    /// supports — callers should fall back to the linear path with a
-    /// once-per-format warn.
+    /// supports — callers fall back to the linear view with a once-per-id
+    /// info line.
     #[must_use]
     pub const fn srgb_twin(self) -> Option<Self> {
         match self {

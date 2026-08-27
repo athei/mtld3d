@@ -1372,7 +1372,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
     let mut stage_texture_handles: [u64; STAGE_COUNT] = [0; STAGE_COUNT];
     for (stage, b) in stage_bindings.iter() {
-        stage_texture_handles[stage as usize] = enc.get_texture_handle_by_id(b.texture_id);
+        // D3DSAMP_SRGBTEXTURE binds the texture's eager sRGB twin view so
+        // the hardware decodes sRGB→linear at sample time. The handle value
+        // itself carries the choice, so the `last_bound` dedup below re-emits
+        // the bind whenever a stage flips the state on an unchanged texture.
+        stage_texture_handles[stage as usize] =
+            if mtld3d_core::sampler_state::srgb_texture_enabled(&b.sampler_state) {
+                enc.get_texture_handle_by_id_srgb(b.texture_id)
+            } else {
+                enc.get_texture_handle_by_id(b.texture_id)
+            };
     }
     // A draw that samples the bound depth attachment reads a copy of it: Metal
     // forbids reading an attachment of the running pass. D3D9 permits the
@@ -1855,7 +1864,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             let slot = mask.trailing_zeros();
             mask &= mask - 1;
             let (id, ss) = enc.vertex_binding(slot as usize);
-            let handle = id.map_or(0, |id| enc.get_texture_handle_by_id(id));
+            let handle = id.map_or(0, |id| {
+                if mtld3d_core::sampler_state::srgb_texture_enabled(&ss) {
+                    enc.get_texture_handle_by_id_srgb(id)
+                } else {
+                    enc.get_texture_handle_by_id(id)
+                }
+            });
             if handle == 0 {
                 let kind = decls.kind(slot);
                 let tex_sentinel = null_texture_tex_sentinel(kind as u64);
