@@ -1,6 +1,6 @@
 //! `IDirect3DVertexBuffer9` COM wrapper.
 //!
-//! Per-buffer `PageBox` backing: a Lock that renames swaps `current_box`
+//! Per-buffer `PageBox` backing: a Lock that renames swaps the backing
 //! for a fresh uninit `PageBox`; the old one goes onto the device's
 //! retention pipeline, picked up by the encoder and paired with its
 //! wrapped `MTLBuffer` for GPU-retirement-gated destruction. Renaming
@@ -19,6 +19,7 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
+    buffer_backing::{BufferBacking, classify_backing, may_release_backing},
     buffer_rename::{
         BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
         records_dirty_range,
@@ -94,8 +95,9 @@ pub struct VertexBufferInner {
     /// For `Direct`, the GPU reads this directly and rename swaps it out
     /// onto the retention pipeline. For `Staged`, this is pure CPU
     /// staging — the game writes it; `Unlock` snapshots the dirty range up
-    /// to the device buffer.
-    current_box: PageBox,
+    /// to the device buffer, and a buffer D3D9 promises no readback
+    /// releases it there (see `mtld3d_core::buffer_backing`).
+    backing: BufferBacking,
     /// Submit seq of the most recent frame that drew from this buffer.
     ///
     /// Stamped at Draw snapshot time; read by `lock` to decide whether
@@ -123,10 +125,41 @@ impl VertexBufferInner {
     ///
     /// Used as the `ProcessVertices` source read: the source stream is a
     /// system-memory or default buffer whose current backing holds what the
-    /// app wrote.
+    /// app wrote. Empty for a buffer that released its backing, which
+    /// `may_release_backing` keeps out of this path and the caller checks.
     #[must_use]
-    pub const fn backing(&self) -> &[u8] {
-        self.current_box.as_slice()
+    pub fn backing(&self) -> &[u8] {
+        self.backing.as_slice()
+    }
+
+    /// Whether the buffer holds no CPU copy of its contents.
+    ///
+    /// True only for a `D3DUSAGE_WRITEONLY` default-pool buffer whose
+    /// upload has been queued: its bytes live on the GPU alone until the
+    /// next `Lock` re-creates the backing.
+    #[must_use]
+    pub const fn backing_is_released(&self) -> bool {
+        self.backing.is_released()
+    }
+
+    /// Give a released buffer a backing again, zeroed.
+    ///
+    /// Every write path calls this before it touches the backing. The
+    /// fresh pages hold no contents: only what is written into them from
+    /// here on matches the device buffer, which is what
+    /// `BackingState::Partial` records.
+    fn restore_backing(&mut self) {
+        if !self.backing.is_released() {
+            return;
+        }
+        self.backing
+            .restore(PageBox::new_zeroed(self.length as usize));
+        mtld3d_shared::log_once_trace_by!(
+            target: crate::LOG_TARGET,
+            key: self.buffer_id.raw(),
+            "vertex buffer {:#x}: backing re-created for a write",
+            self.buffer_id.raw()
+        );
     }
 
     /// The buffer's creation FVF.
@@ -143,7 +176,8 @@ impl VertexBufferInner {
     /// a later draw from a default-pool destination sees it. Out-of-range
     /// writes are clipped to the backing.
     pub fn write_processed(&mut self, offset: usize, bytes: &[u8], dev: &mut DeviceInner) {
-        let dst = self.current_box.as_mut_slice();
+        self.restore_backing();
+        let dst = self.backing.as_mut_slice();
         let end = offset.saturating_add(bytes.len()).min(dst.len());
         if offset >= end {
             return;
@@ -153,16 +187,20 @@ impl VertexBufferInner {
             return;
         }
         let size = end - offset;
+        let Some(src) = self.backing.read_ptr_at(offset) else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "write_processed: no CPU backing to upload the processed vertices from");
+            return;
+        };
         let mut transient = dev.alloc_pagebox_capped(size);
-        // SAFETY: `offset < end <= len`, so the read stays inside `current_box`.
-        let src = unsafe { self.current_box.as_ptr().add(offset) };
-        // SAFETY: `src` spans `[offset, end)` of `current_box`; `transient` is a
+        // SAFETY: `src` spans `[offset, end)` of the backing; `transient` is a
         // fresh `PageBox` of at least `size` bytes; the two are disjoint.
         unsafe { core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size) };
         let (min, len) = (
             u32::try_from(offset).expect("VB offset fits u32"),
             u32::try_from(size).expect("VB span fits u32"),
         );
+        self.backing.note_upload(min, min + len);
         dev.push_stage_upload(self.buffer_id, transient, min, len);
     }
 
@@ -180,16 +218,19 @@ impl VertexBufferInner {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
+        let Some(src) = self.backing.read_ptr_at(min as usize) else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "flush_staged_if_mapped: no CPU backing behind a mapped dirty range");
+            return;
+        };
         let size = (max - min) as usize;
         let mut transient = dev.alloc_pagebox_capped(size);
-        // SAFETY: `min <= length` and `current_box` is allocated for `length`
-        // bytes, so the offset stays in-bounds.
-        let src = unsafe { self.current_box.as_ptr().add(min as usize) };
-        // SAFETY: `src` spans `[min, max)` of `current_box`; `transient` is a
+        // SAFETY: `src` spans `[min, max)` of the backing; `transient` is a
         // fresh `PageBox` of ≥ `size` bytes; the two allocations are disjoint.
         unsafe {
             core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
         }
+        self.backing.note_upload(min, max);
         dev.push_stage_upload(self.buffer_id, transient, min, max - min);
     }
 
@@ -198,11 +239,11 @@ impl VertexBufferInner {
     }
 
     pub fn current_backing_ptr(&self) -> u64 {
-        self.current_box.as_ptr() as u64
+        self.backing.ptr()
     }
 
     pub const fn current_backing_len(&self) -> u64 {
-        self.current_box.len() as u64
+        self.backing.padded_len()
     }
 
     /// Stamp the current frame's submit seq onto the buffer.
@@ -230,7 +271,11 @@ impl Direct3DVertexBuffer9 {
         // whole staging region, so any byte the game left alone has to be
         // a defined value rather than heap residue. One `bzero` per create,
         // and renames keep using the recycle pool.
-        let current_box = PageBox::new_zeroed(info.length as usize);
+        let backing = BufferBacking::new(
+            PageBox::new_zeroed(info.length as usize),
+            info.length,
+            classify_backing(info.usage, info.pool),
+        );
         let map_mode = classify_map_mode(info.usage, info.pool);
         // A `Staged` buffer starts full-dirty, whatever
         // `buffer.ignoreLockBounds` says. Its device allocation is
@@ -261,7 +306,7 @@ impl Direct3DVertexBuffer9 {
             private_data: PrivateDataStore::default(),
             map_mode,
             dirty,
-            current_box,
+            backing,
             last_submit_seq: 0,
             locked: false,
             priority: 0,
@@ -366,15 +411,19 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(VertexBufferInner)` from `Self::new` and no
     // other reference can survive.
-    let inner_box = unsafe { Box::from_raw(inner_ptr) };
+    let mut inner_box = unsafe { Box::from_raw(inner_ptr) };
+    // A buffer that already released its backing has nothing left to
+    // retain: the GPU reads its device buffer, not this memory.
+    let current_box = inner_box.backing.release();
     let VertexBufferInner {
         device_inner,
         buffer_id,
-        current_box,
         last_submit_seq,
         ..
     } = *inner_box;
-    if !device_inner.is_null() {
+    if !device_inner.is_null()
+        && let Some(current_box) = current_box
+    {
         // SAFETY: `device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
@@ -540,7 +589,7 @@ extern "system" fn vb_get_type(this: *mut c_void) -> u32 {
 ///
 /// - `NOOVERWRITE | READONLY`, or uncontended: return the existing
 ///   backing pointer.
-/// - Contended `DISCARD`: swap `current_box` for a fresh uninit
+/// - Contended `DISCARD`: swap the backing for a fresh uninit
 ///   `PageBox`; old goes to seq-gated retention.
 /// - Contended whole-buffer (any flag combo): same swap. If the
 ///   buffer is non-WRITEONLY, memcpy the old bytes across (game
@@ -583,6 +632,17 @@ extern "system" fn vb_lock(
         );
     }
 
+    if inner.backing.is_released() {
+        // The bytes live on the GPU alone. A read through this pointer sees
+        // zeros rather than the buffer's contents, which is why only the
+        // usages D3D9 promises no readback release their backing at all.
+        if flags & D3DLOCK_READONLY != 0 {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "vb_lock: D3DLOCK_READONLY on a D3DUSAGE_WRITEONLY buffer whose backing was released; the mapped bytes read as zero");
+        }
+        inner.restore_backing();
+    }
+
     if matches!(inner.map_mode, BufferMapMode::Staged) {
         // Separate CPU staging: record the dirtied range for the Unlock
         // upload. No rename / no `plan_lock` — the GPU reads a distinct
@@ -605,16 +665,32 @@ extern "system" fn vb_lock(
             // documents as locking the whole buffer). Then the upload
             // widens to `(0, 0)`, which is `conjoin`'s "to end of buffer"
             // from offset zero, so the head is covered too.
-            let (dirty_offset, dirty_size) = if may_trust_lock_bounds(
+            //
+            // A backing re-created after a release is the one case where
+            // widening cannot help: it holds zeros outside what the game
+            // writes through this very Lock, so the wider upload would push
+            // those zeros over device bytes nobody rewrote. The announced
+            // window stands instead. `D3DLOCK_DISCARD` is exempt because it
+            // abandons the buffer's contents by definition, so a whole-buffer
+            // upload of whatever the game leaves behind is what D3D9 promises,
+            // and it puts the backing back in step with the device buffer.
+            let trusted = may_trust_lock_bounds(
                 flags,
                 inner.usage,
                 inner.pool,
                 size_to_lock,
                 crate::config::CONFIG.buffer_ignore_lock_bounds,
-            ) {
-                (offset_to_lock, size_to_lock)
-            } else {
+            );
+            let discard = flags & D3DLOCK_DISCARD != 0;
+            let widen = !trusted && (inner.backing.may_widen_upload() || discard);
+            if !trusted && !widen {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "vb_lock: keeping the announced lock window on a re-created backing; a widened upload would overwrite device bytes the buffer no longer holds");
+            }
+            let (dirty_offset, dirty_size) = if widen {
                 (0, 0)
+            } else {
+                (offset_to_lock, size_to_lock)
             };
             inner.dirty.conjoin(dirty_offset, dirty_size, inner.length);
         }
@@ -655,7 +731,13 @@ extern "system" fn vb_lock(
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
                 let fresh = dev.alloc_pagebox_capped(logical_len);
-                let old_box = core::mem::replace(&mut inner.current_box, fresh);
+                // `Direct` buffers never release their backing (the GPU
+                // reads it), so the swap always hands the old one back.
+                let Some(old_box) = inner.backing.replace(fresh) else {
+                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                        "vb_lock: rename found no backing to retain on a zero-copy buffer");
+                    return D3DERR_INVALIDCALL;
+                };
                 match preserve {
                     PreserveKind::None => {
                         // Rename without preserve. Either explicit DISCARD
@@ -669,21 +751,22 @@ extern "system" fn vb_lock(
                         // pointer, so carry the old bytes across
                         // synchronously.
                         dev.perf_mut().bump_vbib_preserve_cpu();
-                        // SAFETY: both `old_box` and `inner.current_box` are
-                        // freshly allocated `PageBox`es of `logical_len`
-                        // bytes; the two allocations don't alias.
+                        let dst = inner
+                            .backing
+                            .write_ptr_at(0)
+                            .expect("the fresh rename backing was just installed");
+                        // SAFETY: both `old_box` and the fresh backing are
+                        // `PageBox`es of `logical_len` bytes; the two
+                        // allocations don't alias.
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                old_box.as_ptr(),
-                                inner.current_box.as_mut_ptr(),
-                                logical_len,
-                            );
+                            core::ptr::copy_nonoverlapping(old_box.as_ptr(), dst, logical_len);
                         }
                     }
                 }
                 dev.perf_mut().bump_vb_rename();
-                dev.perf_mut()
-                    .bump_vbib_rename_bytes(inner.current_box.len());
+                let renamed_bytes = usize::try_from(inner.backing.padded_len())
+                    .expect("a PageBox length fits the host address space");
+                dev.perf_mut().bump_vbib_rename_bytes(renamed_bytes);
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
             }
@@ -710,10 +793,15 @@ extern "system" fn vb_lock(
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: unrecognised D3DLOCK bits {unknown:#x} ignored");
     }
-    // SAFETY: `offset_to_lock <= inner.length` (checked above) and
-    // `inner.current_box` is allocated for `inner.length` bytes, so the
-    // pointer arithmetic stays within the allocation.
-    let ptr = unsafe { inner.current_box.as_mut_ptr().add(offset_to_lock as usize) };
+    // `offset_to_lock <= inner.length` is checked above and the backing is
+    // allocated for `inner.length` bytes, so the offset lands inside it.
+    let Some(ptr) = inner.backing.write_ptr_at(offset_to_lock as usize) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: no backing to map");
+        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
+        // ABI points to a writable `*mut c_void` slot owned by the caller.
+        unsafe { *pp_data = core::ptr::null_mut() };
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
     // ABI points to a writable `*mut c_void` slot owned by the caller.
     unsafe { *pp_data = ptr.cast::<c_void>() };
@@ -738,27 +826,61 @@ extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from
         // a live `DeviceInner` that outlives its children.
         let dev = unsafe { &mut *inner.device_inner };
+        let Some(src) = inner.backing.read_ptr_at(min as usize) else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "vb_unlock: dirty range with no CPU backing behind it, dropping the upload");
+            inner.dirty.clear();
+            return D3D_OK;
+        };
         let size = (max - min) as usize;
         let mut transient = dev.alloc_pagebox_capped(size);
-        // SAFETY: `min <= length` and `current_box` is allocated for
-        // `length` bytes, so the offset stays in-bounds.
-        let src = unsafe { inner.current_box.as_ptr().add(min as usize) };
-        // SAFETY: `src` spans `[min, max)` of `current_box`;
-        // `transient` is a fresh `PageBox` of ≥ `size` bytes; the two
-        // allocations are disjoint.
+        // SAFETY: `src` spans `[min, max)` of the backing; `transient` is
+        // a fresh `PageBox` of ≥ `size` bytes; the two allocations are
+        // disjoint.
         unsafe {
             core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
         }
         // Push the upload as an inline op so the encoder sees it in
         // draw order (for rename-at-overlap). No Metal thunk here.
+        inner.backing.note_upload(min, max);
         dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
         // Only once the upload is actually queued: the range is the
         // only record that these bytes still owe a copy to the device
         // buffer, so clearing it on a path that queued nothing would
         // drop them silently.
         inner.dirty.clear();
+        release_backing_after_upload(inner);
     }
     D3D_OK
+}
+
+/// Release the CPU backing of a buffer whose upload just carried every byte.
+///
+/// The transient the upload owns holds the bytes until the GPU has them, so
+/// the buffer's own copy is dead weight from here: `D3DUSAGE_WRITEONLY` in
+/// `D3DPOOL_DEFAULT` is the one class D3D9 promises no readback, and inside a
+/// 32-bit title that copy competes with the title's own address space. A
+/// later `Lock` re-creates the backing and uploads only what it announces.
+///
+/// The trade is the one the texture-staging release already accepts: the GPU
+/// holds the only copy, so nothing can re-upload these buffers if the Metal
+/// device is recreated under them.
+fn release_backing_after_upload(inner: &mut VertexBufferInner) {
+    // `buffer.ignoreLockBounds` says this title writes outside the windows it
+    // announces, and the only way to carry those writes is to upload the whole
+    // buffer out of the CPU copy. Releasing the copy would leave that upload
+    // nothing true to carry, so the knob keeps it.
+    if inner.locked
+        || crate::config::CONFIG.buffer_ignore_lock_bounds
+        || !may_release_backing(inner.usage, inner.pool)
+        || !inner.backing.may_widen_upload()
+    {
+        return;
+    }
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "releasing the CPU backing of uploaded D3DPOOL_DEFAULT D3DUSAGE_WRITEONLY buffers; \
+         their bytes then live on the GPU alone and a device recreate cannot restore them");
+    drop(inner.backing.release());
 }
 
 extern "system" fn vb_get_desc(this: *mut c_void, desc: *mut D3DVERTEXBUFFER_DESC) -> i32 {

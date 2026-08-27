@@ -3,7 +3,7 @@
 //! Plus the stream/index getter round-trip. Streams beyond stream 0 and
 //! `SetStreamSourceFreq` are exercised in `streams.rs`.
 
-use mtld3d_tests::{Harness, Vertex};
+use mtld3d_tests::{Harness, Vertex, VertexBuffer};
 use mtld3d_types::{
     D3D_OK, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ,
     D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_CULLMODE, D3DRS_LIGHTING,
@@ -462,5 +462,167 @@ fn buffer_getters_roundtrip() {
         (offset, stride_out),
         (4, stride()),
         "offset/stride retained across a NULL stream-source bind",
+    );
+}
+
+/// The two triangles `released_backing_*` draws, side by side and disjoint.
+///
+/// The left one covers pixel (160, 280), the right one (480, 280), so a
+/// readback at each says which half of the buffer the GPU is reading.
+fn side_by_side_triangles(left: u32, right: u32) -> [Vertex; 6] {
+    let tri = |centre: f32, color: u32| {
+        [
+            Vertex {
+                x: centre - 0.4,
+                y: -0.5,
+                z: 0.5,
+                color,
+            },
+            Vertex {
+                x: centre + 0.4,
+                y: -0.5,
+                z: 0.5,
+                color,
+            },
+            Vertex {
+                x: centre,
+                y: 0.5,
+                z: 0.5,
+                color,
+            },
+        ]
+    };
+    let [l0, l1, l2] = tri(-0.5, left);
+    let [r0, r1, r2] = tri(0.5, right);
+    [l0, l1, l2, r0, r1, r2]
+}
+
+/// Arm the fixed-function pipeline and bind `vb` as the only stream, culling off.
+fn arm_two_triangles(h: &Harness, vb: &VertexBuffer<'_>) {
+    arm_diffuse(h);
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "cull off"
+    );
+    assert_eq!(
+        h.set_stream_source(0, vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+}
+
+/// Draw both triangles and read the pixel at the centre of each.
+fn draw_and_sample(h: &Harness) -> (u32, u32) {
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 2),
+            0,
+            "DrawPrimitive of both triangles"
+        );
+    });
+    (h.read_pixel(160, 280), h.read_pixel(480, 280))
+}
+
+/// A sub-range refill of a released backing leaves the rest of the buffer alone.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` non-`DYNAMIC` buffer releases its
+/// CPU staging once an upload has carried every byte: D3D9 promises no
+/// readback, and inside a 32-bit title the copy competes with the title's own
+/// address space. The next `Lock` re-creates the staging with nothing in it, so
+/// the upload has to stay inside the window that `Lock` announced. The right
+/// triangle's vertices are rewritten and the left triangle's, which no `Lock`
+/// has touched since the release, must still be on the GPU.
+#[test]
+fn writeonly_default_vertex_buffer_keeps_the_half_a_sub_range_relock_leaves_alone() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(stride() * 6, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    arm_two_triangles(&h, &vb);
+
+    vb.lock(0, 0, 0)
+        .write(&side_by_side_triangles(GREEN, MAGENTA));
+    assert_eq!(
+        draw_and_sample(&h),
+        (GREEN, MAGENTA),
+        "the whole-buffer fill draws both triangles"
+    );
+
+    // Announce the second triangle's three vertices and rewrite only those.
+    let half = stride() * 3;
+    vb.lock(half, half, 0)
+        .write(&side_by_side_triangles(RED, RED)[3..]);
+    assert_eq!(
+        draw_and_sample(&h),
+        (GREEN, RED),
+        "the refilled half changes and the untouched half keeps its device bytes"
+    );
+}
+
+/// A `SizeToLock` of zero past offset zero refills the tail without erasing the head.
+///
+/// `SizeToLock == 0` names no narrower window than "to the end of the buffer",
+/// so an ordinary upload widens to the whole buffer rather than trusting it.
+/// A backing re-created after a release holds zeros outside what this very
+/// `Lock` writes, so widening there would push those zeros over the head of
+/// the device buffer: the announced tail is the most the upload may carry.
+#[test]
+fn writeonly_default_vertex_buffer_keeps_its_head_across_a_zero_size_tail_relock() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(stride() * 6, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    arm_two_triangles(&h, &vb);
+
+    vb.lock(0, 0, 0)
+        .write(&side_by_side_triangles(GREEN, MAGENTA));
+    assert_eq!(
+        draw_and_sample(&h),
+        (GREEN, MAGENTA),
+        "the whole-buffer fill draws both triangles"
+    );
+
+    // `SizeToLock == 0` from the halfway offset: the tail, announced the way
+    // D3D9 documents it.
+    vb.lock(stride() * 3, 0, 0)
+        .write(&side_by_side_triangles(RED, RED)[3..]);
+    assert_eq!(
+        draw_and_sample(&h),
+        (GREEN, RED),
+        "the head of the device buffer survives a tail-only refill"
+    );
+}
+
+/// `Reset` after a buffer released its backing, and buffers still work after it.
+///
+/// A released backing leaves the bytes on the GPU alone, so nothing can
+/// re-upload them if the Metal device is recreated under them; that trade is
+/// what the release path warns about once. `Reset` itself keeps the device and
+/// its buffers, and D3D9 makes the application release its default-pool
+/// resources first, so the outcome a caller sees is an ordinary `Reset`
+/// followed by ordinary buffer draws.
+#[test]
+fn reset_after_a_released_backing_leaves_buffer_draws_working() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let vb = h.create_vertex_buffer(stride() * 6, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    arm_two_triangles(&h, &vb);
+    vb.lock(0, 0, 0)
+        .write(&side_by_side_triangles(GREEN, MAGENTA));
+    assert_eq!(
+        draw_and_sample(&h),
+        (GREEN, MAGENTA),
+        "the fill draws before the Reset"
+    );
+
+    // `Reset` rejects any outstanding application reference to a
+    // `D3DPOOL_DEFAULT` resource, so the buffer goes first.
+    drop(vb);
+    assert_eq!(h.reset(width, height), D3D_OK, "Reset at the same size");
+
+    let vb = h.create_vertex_buffer(stride() * 6, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    arm_two_triangles(&h, &vb);
+    vb.lock(0, 0, 0).write(&side_by_side_triangles(RED, GREEN));
+    assert_eq!(
+        draw_and_sample(&h),
+        (RED, GREEN),
+        "a buffer created after the Reset fills and draws"
     );
 }
