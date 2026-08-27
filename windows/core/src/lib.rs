@@ -22,6 +22,7 @@ pub mod dirty_rect;
 pub mod dxso;
 pub mod ff_state;
 pub mod format;
+pub mod format_probe;
 pub mod fullscreen_resize;
 pub mod gpu_caps;
 pub mod ids;

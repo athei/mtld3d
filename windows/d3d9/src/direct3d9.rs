@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::sync::LazyLock;
 
 use log::{error, info, trace, warn};
-use mtld3d_core::caps;
+use mtld3d_core::{caps, format_probe::FormatProbeKey};
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
@@ -786,7 +786,7 @@ extern "system" fn d3d9_check_device_format(
     // what usage/rtype shape) is the map of the render path it is choosing.
     mtld3d_shared::log_once_debug_by!(
         target: LOG_TARGET,
-        key: (u64::from(usage) << 40) ^ (u64::from(rtype) << 32) ^ u64::from(check_format),
+        key: FormatProbeKey::from_probe(usage, rtype, check_format).raw(),
         "CheckDeviceFormat probe: usage={usage:#x} rtype={rtype} fmt={check_format:#x}"
     );
     // A D3DFMT_UNKNOWN (0) adapter format is never a valid query — the runtime
@@ -911,7 +911,7 @@ extern "system" fn d3d9_check_device_format(
     }
     mtld3d_shared::log_once_debug_by!(
         target: DISPLAY_TRACE_TARGET,
-        key: (u64::from(adapter_format) << 48) | (u64::from(usage) << 32) | (u64::from(rtype) << 16) | u64::from(check_format),
+        key: FormatProbeKey::from_query(adapter_format, usage, rtype, check_format).raw(),
         "CheckDeviceFormat(adapter_fmt={adapter_format}, usage={usage:#x}, rtype={rtype}, check_fmt={check_format}) → OK"
     );
     D3D_OK
