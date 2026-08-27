@@ -913,6 +913,14 @@ struct EncoderFrameCounters {
     /// `gpu_caps.min_linear_texture_align`. Subset of
     /// `texture_blit_uploads`.
     texture_blit_padded_uploads: u32,
+    /// Per-frame count of uploads taking the packed 16-bit expansion path.
+    ///
+    /// Taken when the texture's D3D format is packed 16-bit but its Metal
+    /// backing is BGRA8 (a device without the native packed formats, or
+    /// `debug.expandPacked16`): the staging texels are widened on the CPU
+    /// into a transient buffer before the blit. Subset of
+    /// `texture_blit_uploads`, disjoint from the padded counter.
+    texture_expand_uploads: u32,
     /// Per-frame count of texture rename-at-overlap.
     ///
     /// An upload whose target texture was already sampled by a draw
@@ -993,6 +1001,7 @@ impl EncoderFrameCounters {
             vbib_mid_pass_reorders: 0,
             texture_blit_uploads: 0,
             texture_blit_padded_uploads: 0,
+            texture_expand_uploads: 0,
             texture_gpu_renames: 0,
             op_cycles: 0,
             op_sub_cycles: [0; OpSub::COUNT],
@@ -1878,6 +1887,10 @@ impl EncoderPerfState {
             self.enc.texture_blit_padded_uploads.saturating_add(1);
     }
 
+    pub const fn bump_texture_expand_upload(&mut self) {
+        self.enc.texture_expand_uploads = self.enc.texture_expand_uploads.saturating_add(1);
+    }
+
     /// Count one texture rename-at-overlap.
     ///
     /// An upload into a texture a draw already sampled this frame,
@@ -2212,6 +2225,8 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_texture_blit_padded_upload(&mut self) {}
     #[inline]
+    pub const fn bump_texture_expand_upload(&mut self) {}
+    #[inline]
     pub const fn bump_texture_gpu_rename(&mut self) {}
     #[inline]
     pub const fn bump_pair_stats(&mut self, _sample: PairStatsSample) {}
@@ -2495,6 +2510,7 @@ struct PerfWindow {
     texture_destroys: Stat,
     texture_blit_uploads: Stat,
     texture_blit_padded_uploads: Stat,
+    texture_expand_uploads: Stat,
     texture_gpu_renames: Stat,
     pending_blit_retention_depth: Stat,
     tex_staging_retained_bytes: Stat,
@@ -2686,6 +2702,8 @@ impl PerfWindow {
             .add(u64::from(s.enc.texture_blit_uploads));
         self.texture_blit_padded_uploads
             .add(u64::from(s.enc.texture_blit_padded_uploads));
+        self.texture_expand_uploads
+            .add(u64::from(s.enc.texture_expand_uploads));
         self.texture_gpu_renames
             .add(u64::from(s.enc.texture_gpu_renames));
         self.pending_blit_retention_depth
@@ -4177,21 +4195,24 @@ impl<'a> Summary<'a> {
             )),
             "API: rename + sync memcpy (non-DISCARD non-DYNAMIC contended)",
         );
-        // `uploads = raw + padded` — every Unlock takes one of the two
-        // paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
+        // `uploads = raw + padded + expand` — every Unlock takes one of the
+        // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
         // around the game's PageBox). `padded` is a blit too, but its
         // source had to be repacked into a transient widened-stride buffer
-        // (extra alloc + memcpy + sync `CreateBuffer` thunk).
+        // (extra alloc + memcpy + sync `CreateBuffer` thunk). `expand` is
+        // the packed 16-bit CPU widening into a transient buffer (non-Apple
+        // devices or `debug.expandPacked16`).
         let raw_blits = w
             .texture_blit_uploads
             .sum
-            .saturating_sub(w.texture_blit_padded_uploads.sum);
+            .saturating_sub(w.texture_blit_padded_uploads.sum)
+            .saturating_sub(w.texture_expand_uploads.sum);
         self.res_row(
             out,
             "uploads",
             &format!("{t}", t = w.texture_blit_uploads.sum),
             None,
-            "encoder: total texture uploads (raw + padded)",
+            "encoder: total texture uploads (raw + padded + expand)",
         );
         self.res_row(
             out,
@@ -4206,6 +4227,13 @@ impl<'a> Summary<'a> {
             &format!("{p}", p = w.texture_blit_padded_uploads.sum),
             None,
             "encoder: blit; source repacked into transient buffer (alloc + memcpy + extra unix_call)",
+        );
+        self.res_row(
+            out,
+            "  expand",
+            &format!("{e}", e = w.texture_expand_uploads.sum),
+            None,
+            "encoder: blit; packed 16-bit source widened to BGRA8 into a transient buffer",
         );
         self.res_row(
             out,

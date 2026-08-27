@@ -149,6 +149,18 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u32(&self, level: u32, texels: &[u32]) {
+        self.write_texels(level, texels);
+    }
+
+    /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u16(&self, level: u32, texels: &[u16]) {
+        self.write_texels(level, texels);
+    }
+
+    fn write_texels<T: Copy>(&self, level: u32, texels: &[T]) {
         let (hr, desc) = self.level_desc(level);
         expect_ok(hr, "VolumeTexture GetLevelDesc");
         let (width, height, depth) = (
@@ -182,10 +194,15 @@ impl VolumeTexture<'_> {
                         .cast::<u8>()
                         .add(z * slice_pitch + y * row_pitch)
                 };
-                // SAFETY: `width * 4` bytes from the row start never exceed
-                // `row_pitch`, so the copy stays inside the mapping.
+                // SAFETY: `width * size_of::<T>()` bytes from the row start
+                // never exceed `row_pitch`, so the copy stays inside the
+                // mapping.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, width * 4);
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr().cast::<u8>(),
+                        dst,
+                        width * core::mem::size_of::<T>(),
+                    );
                 }
             }
         }
@@ -292,6 +309,18 @@ impl Volume<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u32(&self, texels: &[u32]) {
+        self.write_texels(texels);
+    }
+
+    /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u16(&self, texels: &[u16]) {
+        self.write_texels(texels);
+    }
+
+    fn write_texels<T: Copy>(&self, texels: &[T]) {
         let (hr, desc) = self.desc();
         expect_ok(hr, "Volume GetDesc");
         let (width, height, depth) = (
@@ -323,10 +352,15 @@ impl Volume<'_> {
                         .cast::<u8>()
                         .add(z * slice_pitch + y * row_pitch)
                 };
-                // SAFETY: `width * 4` bytes from the row start never exceed
-                // `row_pitch`, so the copy stays inside the mapping.
+                // SAFETY: `width * size_of::<T>()` bytes from the row start
+                // never exceed `row_pitch`, so the copy stays inside the
+                // mapping.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, width * 4);
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr().cast::<u8>(),
+                        dst,
+                        width * core::mem::size_of::<T>(),
+                    );
                 }
             }
         }

@@ -32,6 +32,15 @@ pub struct Mtld3dConfig {
     /// Surfaces unimplemented paths via `log_once_warn!`. Default:
     /// `false`. File key: `debug.capsAll`.
     pub caps_all: bool,
+    /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
+    ///
+    /// Treats the device as lacking the native packed 16-bit pixel
+    /// formats: A4R4G4B4 / R5G6B5 / A1R5G5B5 textures are backed by
+    /// BGRA8 and expanded on the CPU at upload, and the 16-bit render
+    /// target formats stop being advertised. Exists so the Intel/AMD
+    /// path can be exercised on Apple Silicon. Default: `false`. File
+    /// key: `debug.expandPacked16`.
+    pub expand_packed16: bool,
     /// Enable HDR present pipeline on EDR-capable displays.
     ///
     /// The display gates this, not the value: the present pipeline only
@@ -217,6 +226,7 @@ impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
             caps_all: false,
+            expand_packed16: false,
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
@@ -319,6 +329,10 @@ fn apply_line(cfg: &mut Mtld3dConfig, raw: &str, source: &str, lineno: Option<us
 /// logged too).
 pub fn log_options(cfg: &Mtld3dConfig) {
     info!(target: crate::LOG_TARGET, "config: debug.capsAll = {}", cfg.caps_all);
+    info!(
+        target: crate::LOG_TARGET,
+        "config: debug.expandPacked16 = {}", cfg.expand_packed16
+    );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
     info!(
         target: crate::LOG_TARGET,
@@ -406,6 +420,7 @@ fn cursor_scale_label(s: CursorScale) -> String {
 fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
     match key {
         "debug.capsAll" => assign_bool(source, key, value, &mut cfg.caps_all),
+        "debug.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),

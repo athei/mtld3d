@@ -1,0 +1,319 @@
+//! The packed 16-bit expansion path, forced on via `debug.expandPacked16`.
+//!
+//! On devices without Metal's packed 16-bit pixel formats (Intel/AMD Mac2),
+//! A4R4G4B4 / R5G6B5 / A1R5G5B5 textures are backed by BGRA8 and expanded on
+//! the CPU at upload, and the 16-bit render-target formats stop being
+//! advertised. These tests run that whole path on Apple Silicon by forcing
+//! the config key, so it cannot rot between rare Intel-hardware runs.
+
+use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq};
+use mtld3d_types::{
+    D3D_OK, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+};
+
+const BLACK: u32 = 0xFF00_0000;
+const RED: u32 = 0xFFFF_0000;
+const GREEN: u32 = 0xFF00_FF00;
+const BLUE: u32 = 0xFF00_00FF;
+const WHITE: u32 = 0xFFFF_FFFF;
+
+/// Force the expansion path for this test process.
+///
+/// Must run before `Harness::new()` (the config is read once at device
+/// bring-up). nextest runs each test in its own process, so the append is
+/// test-local.
+fn force_expand() {
+    let merged = format!(
+        "{};debug.expandPacked16=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness
+    // and with it the config read are only constructed afterwards).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+}
+
+/// A full-backbuffer quad (two triangles) with UVs spanning the unit square.
+const fn fullscreen_quad() -> [TexturedVertex; 6] {
+    const W: u32 = 0xFFFF_FFFF;
+    const fn v(x: f32, y: f32, u: f32, tv: f32) -> TexturedVertex {
+        TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: W,
+            u,
+            v: tv,
+        }
+    }
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+fn point_clamp(h: &Harness) {
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_NONE),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+}
+
+/// Bind `tex`, sample it across the backbuffer, return the pixel at `(x, y)`.
+fn sample_at(h: &Harness, tex: &Texture<'_>, x: u32, y: u32) -> Rgba8 {
+    assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample draw"
+        );
+    });
+    Rgba8::from_pixel(h.read_pixel(x, y))
+}
+
+#[test]
+fn expanded_color_formats_sample_red() {
+    force_expand();
+    let h = Harness::new();
+    // 1×1 opaque-red texel encoded for each format (little-endian bytes).
+    let cases: [(u32, &[u8]); 3] = [
+        (D3DFMT_R5G6B5, &[0x00, 0xF8]),   // R=31
+        (D3DFMT_A1R5G5B5, &[0x00, 0xFC]), // A=1 R=31
+        (D3DFMT_A4R4G4B4, &[0x00, 0xFF]), // A=F R=F
+    ];
+    for (format, bytes) in cases {
+        let tex = h.create_texture(1, 1, 1, 0, format, 0);
+        tex.lock_rect(0, 0).write(bytes);
+        let px = sample_at(&h, &tex, 320, 240);
+        assert!(
+            px.r > 200 && px.g < 60 && px.b < 60,
+            "format {format:#x} red, got {px:?}"
+        );
+    }
+}
+
+#[test]
+fn expanded_partial_lock_updates_only_the_dirty_rect() {
+    // 4×4 A4R4G4B4, MANAGED so partial locks track a dirty sub-rect. Fill
+    // green everywhere, sample once (uploads the whole mip), then rewrite the
+    // centre 2×2 red through a partial lock. The re-upload takes the 2 bpp →
+    // 4 bpp sub-rect repack: origin offset, differing pitches, and the
+    // untouched border texels must survive.
+    const GREEN16: u16 = 0xF0F0; // A=F R=0 G=F B=0
+    const RED16: u16 = 0xFF00; // A=F R=F G=0 B=0
+    force_expand();
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write(&[GREEN16; 16]);
+    let px = sample_at(&h, &tex, 320, 240);
+    assert!(px.g > 200 && px.r < 60, "initial fill green, got {px:?}");
+
+    {
+        let locked = tex.lock_rect_partial(0, &[1, 1, 3, 3], 0);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+        let base = locked.bits_ptr();
+        let [lo, hi] = RED16.to_le_bytes();
+        let red_row = [lo, hi, lo, hi];
+        for row in 0..2usize {
+            // SAFETY: the lock maps the 2×2 sub-rect at `base` with `pitch`
+            // row stride; both rows × 2 texels stay inside the mapping.
+            let dst = unsafe { base.add(row * pitch) };
+            // SAFETY: 4 bytes (2 texels) fit in the locked row per above.
+            unsafe { core::ptr::copy_nonoverlapping(red_row.as_ptr(), dst, 4) };
+        }
+    }
+    // Texel (2,2) is inside the rect: red. Texel (0,0) is outside: still the
+    // original green. Point sampling maps each texel of the 4×4 onto a
+    // 160×120 backbuffer cell.
+    let inside = sample_at(&h, &tex, 320 + 80, 240 + 60);
+    assert!(
+        inside.r > 200 && inside.g < 60,
+        "texel inside the dirty rect red, got {inside:?}"
+    );
+    let outside = sample_at(&h, &tex, 80, 60);
+    assert!(
+        outside.g > 200 && outside.r < 60,
+        "texel outside the dirty rect keeps green, got {outside:?}"
+    );
+}
+
+#[test]
+fn expanded_render_target_caps_are_denied() {
+    force_expand();
+    let h = Harness::new();
+    for format in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_RENDERTARGET,
+                D3DRTYPE_SURFACE,
+                format
+            ),
+            D3DERR_NOTAVAILABLE,
+            "RT usage denied for {format:#x}"
+        );
+        assert_ne!(
+            h.create_render_target_hr(64, 64, format),
+            D3D_OK,
+            "CreateRenderTarget({format:#x}) rejected"
+        );
+        let (hr, _tex) =
+            h.try_create_texture(64, 64, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT);
+        assert_ne!(hr, D3D_OK, "CreateTexture(RT, {format:#x}) rejected");
+    }
+    // The sampled answers stay advertised: the expansion makes them true.
+    for format in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, format),
+            D3D_OK,
+            "sampled texture answer for {format:#x}"
+        );
+    }
+    // Conversion SOURCE side and the backbuffer question are
+    // device-independent: a 16-bit source is sampled (expansion covers it)
+    // and a 16-bit backbuffer substitutes to BGRA8 at CreateDevice.
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
+        D3D_OK,
+        "R5G6B5 stays a conversion source"
+    );
+    assert_eq!(
+        h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, true),
+        D3D_OK,
+        "16-bit windowed backbuffer stays advertised"
+    );
+}
+
+#[test]
+fn expanded_cube_face_samples_red() {
+    force_expand();
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
+    cube.lock_rect(0, 0, 0).write(&[0xFF00u16; 16]); // +X face opaque red
+    assert_eq!(h.set_cube_texture(0, &cube), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u: 1.0, // +X direction vector
+        v: 0.0,
+        w: 0.0,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), RED, "expanded +X cube face");
+}
+
+#[test]
+fn expanded_volume_slices_sample_their_colors() {
+    force_expand();
+    let h = Harness::new();
+    let (hr, tex) = h.try_create_volume_texture([2, 2, 2], 1, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0, "MANAGED R5G6B5 volume");
+    let tex = tex.expect("volume texture");
+    // Slice 0 red, slice 1 blue.
+    tex.write_u16(
+        0,
+        &[
+            0xF800, 0xF800, 0xF800, 0xF800, 0x001F, 0x001F, 0x001F, 0x001F,
+        ],
+    );
+    assert_eq!(h.set_volume_texture(0, &tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    for (w, expected, name) in [(0.25f32, RED, "slice 0"), (0.75, BLUE, "slice 1")] {
+        let v = |x: f32, y: f32| VolumeVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u: 0.5,
+            v: 0.5,
+            w,
+        };
+        let quad = [
+            v(-1.0, 1.0),
+            v(1.0, 1.0),
+            v(-1.0, -1.0),
+            v(1.0, 1.0),
+            v(1.0, -1.0),
+            v(-1.0, -1.0),
+        ];
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "volume sample draw"
+            );
+        });
+        assert_pixel_eq(h.read_pixel(320, 240), expected, name);
+    }
+}
+
+#[test]
+fn expanded_offscreen_plain_is_a_stretch_rect_source() {
+    force_expand();
+    let h = Harness::new();
+    // Clone of render_target.rs's R5G6B5 → X8R8G8B8 conversion test: the
+    // DEFAULT offscreen-plain source is BGRA8-backed here, and the scaling
+    // render quad samples the expanded texels.
+    let bb = h.render_target(0);
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        locked.write(&[0xF800u16, 0x07E0, 0x001F, 0xFFFF]);
+    }
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&src, &bb, D3DTEXF_POINT),
+        D3D_OK,
+        "R5G6B5 -> X8R8G8B8 scaling StretchRect"
+    );
+    assert_eq!(h.read_pixel(80, 240), RED, "pixel 0 is red");
+    assert_eq!(h.read_pixel(240, 240), GREEN, "pixel 1 is green");
+    assert_eq!(h.read_pixel(400, 240), BLUE, "pixel 2 is blue");
+    assert_eq!(h.read_pixel(560, 240), WHITE, "pixel 3 is white");
+}

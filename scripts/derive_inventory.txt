@@ -21,6 +21,7 @@ unix/shared/src/mtl.rs ColorWriteMask Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs CompareFunc Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs CullMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs DestroyKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs DeviceCapsFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/shared/src/mtl.rs IndexType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs LoadAction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MinMagFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -99,6 +100,7 @@ windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs ProgramId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs TextureId Clone,Copy,PartialEq,Eq,Hash,Debug
+windows/core/src/packed16.rs Packed16Kind Clone,Copy
 windows/core/src/passes.rs ColorClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs CurrentAttachmentFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash

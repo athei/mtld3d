@@ -2,9 +2,9 @@ use super::{
     Thunk, Thunks,
     mtl::{
         AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
-        ColorSpacePolicy, ColorWriteMask, CompareFunc, DestroyKind, LoadAction, MinMagFilter,
-        MipFilter, PixelFormat, StageTag, StencilOp, StorageMode, StoreAction, Swizzle,
-        TextureUsage, VertexFormat, VertexStepFunction,
+        ColorSpacePolicy, ColorWriteMask, CompareFunc, DestroyKind, DeviceCapsFlags, LoadAction,
+        MinMagFilter, MipFilter, PixelFormat, StageTag, StencilOp, StorageMode, StoreAction,
+        Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -89,10 +89,13 @@ pub struct GetDeviceInfoParams {
     pub name_buf_len: u64,
     pub name_len: u64,    // out
     pub registry_id: u64, // out
-    /// Out: 1 when the device supports sampler border colours.
+    /// Out: the device's boolean capability bits.
     ///
-    /// Mac2 family and not paravirtualized; CI devices do not qualify.
-    pub supports_sampler_border: u64,
+    /// See `DeviceCapsFlags` for the members; the PE side caches the whole
+    /// answer once per process and derives every device-conditional cap from
+    /// it.
+    pub caps: DeviceCapsFlags,
+    pub pad0: u32,
 }
 
 impl Thunk for GetDeviceInfoParams {

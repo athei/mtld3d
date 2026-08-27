@@ -96,9 +96,9 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
         return -1;
     };
 
-    if let Some((name, registry_id, sampler_border)) = metal::default_device_info() {
+    if let Some((name, registry_id, caps)) = metal::default_device_info() {
         params.registry_id = registry_id;
-        params.supports_sampler_border = u64::from(sampler_border);
+        params.caps = caps;
 
         if params.name_ptr != 0 && params.name_buf_len > 0 {
             let buf_len =

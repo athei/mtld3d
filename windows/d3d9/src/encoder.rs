@@ -5882,12 +5882,18 @@ impl FrameEncoder {
         self.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
     }
 
-    /// Blit-based upload for non-expansion formats.
+    /// Blit-based 2D upload.
     ///
-    /// Reuses the per-mip staging `MTLBuffer` (wrapping the game's staging
-    /// `PageBox`) and emits a `BlitCopyBufferToTexture` against the frame's
-    /// leading blit pass.
+    /// A packed 16-bit expansion job diverts to `run_texture_upload_expand`
+    /// up front; the remaining formats reuse the per-mip staging `MTLBuffer`
+    /// (wrapping the game's staging `PageBox`) and emit a
+    /// `BlitCopyBufferToTexture` against the frame's leading blit pass.
     fn run_texture_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
+        if let Some(kind) =
+            mtld3d_core::packed16::expansion_kind(job.src_d3d_format, job.info.pixel_format)
+        {
+            return self.run_texture_upload_expand(job, texture_handle, kind);
+        }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
         if backing_length == 0 {
@@ -6054,6 +6060,11 @@ impl FrameEncoder {
     /// contiguous makes this a single `region_rows * depth` repack), and
     /// `bytes_per_image` widens to `padded_pitch * region_rows`.
     fn run_volume_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
+        if let Some(kind) =
+            mtld3d_core::packed16::expansion_kind(job.src_d3d_format, job.info.pixel_format)
+        {
+            return self.run_texture_upload_expand(job, texture_handle, kind);
+        }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
         if backing_length == 0 {
@@ -6115,6 +6126,178 @@ impl FrameEncoder {
             .push(BlitCommand::copy_buffer_to_texture(&info));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
+        self.current_blit_retention.push(Arc::clone(&job.arc));
+        true
+    }
+
+    /// Packed 16-bit expansion upload: widen staging texels to BGRA8, then blit.
+    ///
+    /// Serves the textures `map_d3d_format_device` backed with `Bgra8Unorm`
+    /// because this device lacks the native packed 16-bit formats. The
+    /// texture's 16-bit staging stays authoritative (Lock semantics and
+    /// upload-abort replay both read it); every upload expands the dirty
+    /// region into a fresh page-aligned `PageBox` via `packed16::expand_rows`
+    /// and emits the same `copyFromBuffer:toTexture:` as the raw path. The
+    /// staging is never wrapped in a cached `MTLBuffer` here (see the warmup
+    /// skip in `push_texture_warmups`), and the expanded pitch is already at
+    /// or above `min_linear_texture_align`, so the padded repack never
+    /// applies. Handles both the 2D dirty-rect shape and the volume
+    /// whole-box shape (`job.depth > 1`).
+    fn run_texture_upload_expand(
+        &mut self,
+        job: &TextureUploadJob,
+        texture_handle: u64,
+        kind: mtld3d_core::packed16::Packed16Kind,
+    ) -> bool {
+        let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
+        if job.arc.is_empty() || job.bytes_per_pixel != 2 {
+            return false;
+        }
+        let src_pitch = job.src_pitch as usize;
+        let mip_w = (job.info.width.max(1) >> job.level).max(1);
+        let mip_h = (job.info.height.max(1) >> job.level).max(1);
+        let depth = job.depth.max(1);
+        // 2D uploads expand exactly the dirty sub-rect; volumes re-upload the
+        // whole contiguous box on Unlock (matching `run_volume_upload_blit`),
+        // so the expansion covers `rows_per_slice * depth` contiguous rows.
+        let (width_px, rows_per_slice, src_offset) = if depth > 1 {
+            let rows_per_slice = (job.slice_pitch as usize)
+                .checked_div(src_pitch)
+                .unwrap_or(0);
+            (mip_w as usize, rows_per_slice, 0usize)
+        } else {
+            (
+                job.region_w as usize,
+                job.region_h as usize,
+                job.origin_y as usize * src_pitch + job.origin_x as usize * 2,
+            )
+        };
+        let total_rows = rows_per_slice * depth as usize;
+        if width_px == 0 || total_rows == 0 {
+            return false;
+        }
+        let src_needed = (total_rows - 1) * src_pitch + width_px * 2;
+        let Some(src) = job
+            .arc
+            .as_slice()
+            .get(src_offset..)
+            .filter(|s| s.len() >= src_needed)
+        else {
+            error!(
+                target: LOG_TARGET,
+                "run_texture_upload_expand: staging {} too short for offset {src_offset} + \
+                 {total_rows} rows × pitch {src_pitch}",
+                job.arc.len(),
+            );
+            return false;
+        };
+
+        let dst_pitch = (width_px * 4).max(self.gpu_caps.min_linear_texture_align as usize);
+        let Some(expanded_size) = dst_pitch.checked_mul(total_rows) else {
+            error!(target: LOG_TARGET, "run_texture_upload_expand: expanded size overflow");
+            return false;
+        };
+        let mut expanded = PageBox::new_uninit(expanded_size);
+        // Zero the row-tail padding `expand_rows` leaves untouched — the blit
+        // reads whole `dst_pitch` rows and uninitialised bytes must not cross
+        // the wire (they land outside the region, but keep the buffer defined).
+        if dst_pitch > width_px * 4 {
+            expanded.as_mut_slice().fill(0);
+        }
+        mtld3d_core::packed16::expand_rows(
+            kind,
+            src,
+            src_pitch,
+            expanded.as_mut_slice(),
+            dst_pitch,
+            width_px,
+            total_rows,
+        );
+
+        let expanded_ptr = expanded.as_ptr() as u64;
+        let expanded_len = expanded.len() as u64;
+        let desc = BufferCreateDesc {
+            backing_ptr: expanded_ptr,
+            length: expanded_len,
+            id: 0,
+            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            kind: BufferKind::Repack,
+        };
+        let mut expanded_handle = MetalHandle::<MTLBufferKind>::NULL;
+        let status = self.batch_create_buffers(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut expanded_handle),
+        );
+        if status != 0 || expanded_handle.is_null() {
+            error!(
+                target: LOG_TARGET,
+                "run_texture_upload_expand: CreateBuffer failed (status={status:#x}, \
+                 len={expanded_len})",
+            );
+            return false;
+        }
+        // Non-UMA: the CPU just wrote the whole expanded slab.
+        self.enqueue_notify_buffer_did_modify_range(expanded_handle.raw(), 0, expanded_len);
+
+        let bytes_per_row =
+            u32::try_from(dst_pitch).expect("expanded pitch fits u32 (mip width bounded)");
+        let bytes_per_image = bytes_per_row.saturating_mul(
+            u32::try_from(rows_per_slice).expect("rows per slice fits u32 (mip height bounded)"),
+        );
+        let info = if depth > 1 {
+            CopyBufferToTextureInfo {
+                buffer_handle: expanded_handle.raw(),
+                buffer_offset: 0,
+                bytes_per_row,
+                texture_handle,
+                destination_slice: 0,
+                mip_level: job.level,
+                origin_x: 0,
+                origin_y: 0,
+                region_w: mip_w,
+                region_h: mip_h,
+                depth,
+                bytes_per_image,
+            }
+        } else {
+            CopyBufferToTextureInfo {
+                buffer_handle: expanded_handle.raw(),
+                buffer_offset: 0,
+                bytes_per_row,
+                texture_handle,
+                destination_slice: job.destination_slice,
+                mip_level: job.level,
+                origin_x: job.origin_x,
+                origin_y: job.origin_y,
+                region_w: job.region_w,
+                region_h: job.region_h,
+                depth: 1,
+                bytes_per_image,
+            }
+        };
+        self.frame_blit_commands
+            .push(BlitCommand::copy_buffer_to_texture(&info));
+        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.perf.bump_texture_blit_upload();
+        self.perf.bump_texture_expand_upload();
+
+        // Retire the wrapper + expanded PageBox after the GPU retires this
+        // frame's blit — wrapper first, so Metal releases its `bytesNoCopy`
+        // pointer before the PageBox frees (the canonical disposal order).
+        self.perf.bump_vbib_retained_add(expanded.len());
+        self.add_retained_bytes(expanded.len());
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Buffer,
+                handle: expanded_handle.raw(),
+                page_box: Some(expanded),
+                staging_arc: None,
+                seq: self.current_submit_seq,
+                from_texture: true,
+            });
+        // The GPU never reads the 16-bit staging on this path, but retaining
+        // the Arc keeps the "every emitted upload retains its staging"
+        // invariant uniform with the raw/padded paths (cost: one Arc clone).
         self.current_blit_retention.push(Arc::clone(&job.arc));
         true
     }

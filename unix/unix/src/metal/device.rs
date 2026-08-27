@@ -1,5 +1,6 @@
 use mtld3d_shared::{
     MetalHandle,
+    mtl::DeviceCapsFlags,
     mtl_handle::{
         MTLCommandQueueKind, MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind, NSViewKind,
     },
@@ -19,13 +20,21 @@ use super::{
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
-/// Returns (`device_name`, `registry_id`) from the system default Metal device.
-pub fn default_device_info() -> Option<(String, u64, bool)> {
+/// Returns (`device_name`, `registry_id`, capability bits) from the system default Metal device.
+pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
     let device = MTLCreateSystemDefaultDevice()?;
     let name = device.name().to_string();
     let registry_id = device.registryID();
-    let sampler_border = supports_sampler_border(&device);
-    Some((name, registry_id, sampler_border))
+    let mut caps = DeviceCapsFlags::empty();
+    caps.set(
+        DeviceCapsFlags::SAMPLER_BORDER,
+        supports_sampler_border(&device),
+    );
+    caps.set(
+        DeviceCapsFlags::NATIVE_PACKED16,
+        supports_native_packed16(&device),
+    );
+    Some((name, registry_id, caps))
 }
 
 /// True when the device can create border-colour samplers.
@@ -35,6 +44,17 @@ pub fn default_device_info() -> Option<(String, u64, bool)> {
 /// colour, so the device name is checked as well.
 pub fn supports_sampler_border(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.supportsFamily(MTLGPUFamily::Mac2) && !device.name().to_string().contains("Paravirtual")
+}
+
+/// True when the packed 16-bit pixel formats exist natively on this device.
+///
+/// `B5G6R5Unorm` / `Bgr5A1Unorm` / `Abgr4Unorm` are listed Apple-family-only
+/// in Metal's pixel-format capability table; the Mac2 Bronze driver
+/// (Intel/AMD) raises a validation abort when a texture descriptor names one.
+/// When false, the PE side backs the corresponding D3D formats with
+/// `Bgra8Unorm` and expands texels on the CPU at upload time.
+pub fn supports_native_packed16(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    device.supportsFamily(MTLGPUFamily::Apple2)
 }
 
 /// Snapshot of the Metal device values the PE side needs.

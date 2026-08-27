@@ -213,7 +213,9 @@ fn color_fill_r5g6b5_packs_top_bits() {
 
 #[test]
 fn color_fill_unsupported_format_is_none() {
-    // Block / expanded / unmapped formats aren't encoded yet.
+    // Block-compressed / unmapped formats aren't encoded yet. (The packed
+    // 16-bit formats ARE encoded — on a device that expands them to BGRA8
+    // the 16-bit fill page rides the ordinary upload, which widens it.)
     assert!(d3dcolor_fill_pixel_bytes(0xffff_ffff, D3DFMT_X8R8G8B8).is_some());
     assert!(d3dcolor_fill_pixel_bytes(0xffff_ffff, 0x0000_0000).is_none());
 }
