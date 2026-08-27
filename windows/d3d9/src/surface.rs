@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 
 use log::trace;
-use mtld3d_core::page_box::PageBox;
+use mtld3d_core::{page_box::PageBox, perf::SurfaceSubCategory};
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
     mtl_handle::MTLTextureKind,
@@ -1021,14 +1021,14 @@ impl SurfaceInner {
 // ── IUnknown ──
 
 #[inline]
-fn surf_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
-    use mtld3d_core::perf::{ApiCategory, ApiTimer};
+fn surf_timer(this: *mut c_void, sub: SurfaceSubCategory) -> mtld3d_core::perf::ApiTimer {
+    use mtld3d_core::perf::ApiTimer;
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let perf_ptr = (unsafe { InPtr::<Direct3DSurface9>::opt(this) })
         .map_or(core::ptr::null_mut(), |obj| {
             crate::device::DeviceInner::perf_ptr_of(obj.inner().device_inner)
         });
-    ApiTimer::start(perf_ptr, ApiCategory::Surface)
+    ApiTimer::start_surface(perf_ptr, sub)
 }
 
 extern "system" fn surface_query_interface(
@@ -1036,7 +1036,7 @@ extern "system" fn surface_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
@@ -1072,7 +1072,7 @@ unsafe fn container_forward_texture(this: *mut c_void) -> *mut Direct3DTexture9 
 }
 
 extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: IDirect3DSurface9 AddRef thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
     if tex.is_null() {
@@ -1095,7 +1095,7 @@ extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn surface_release(this: *mut c_void) -> u32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: IDirect3DSurface9 Release thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
     if tex.is_null() {
@@ -1411,7 +1411,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
 // ── IDirect3DResource9 stubs ──
 
 extern "system" fn surface_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetDevice()");
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     unsafe { crate::com_ref::com_get_device::<Direct3DSurface9>(this, device) }
@@ -1424,7 +1424,7 @@ extern "system" fn surface_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -1448,7 +1448,7 @@ extern "system" fn surface_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -1463,7 +1463,7 @@ extern "system" fn surface_get_private_data(
 }
 
 extern "system" fn surface_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -1479,7 +1479,7 @@ extern "system" fn surface_free_private_data(this: *mut c_void, guid: *const Gui
 }
 
 extern "system" fn surface_set_priority(this: *mut c_void, _priority: u32) -> u32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
         "IDirect3DSurface9::SetPriority: no Metal analog, no-op"
@@ -1488,7 +1488,7 @@ extern "system" fn surface_set_priority(this: *mut c_void, _priority: u32) -> u3
 }
 
 extern "system" fn surface_get_priority(this: *mut c_void) -> u32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
         "IDirect3DSurface9::GetPriority: no Metal analog, no-op"
@@ -1497,7 +1497,7 @@ extern "system" fn surface_get_priority(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn surface_pre_load(this: *mut c_void) {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // See IDirect3DTexture9::PreLoad — Metal has no resident-set hint.
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
@@ -1506,7 +1506,7 @@ extern "system" fn surface_pre_load(this: *mut c_void) {
 }
 
 extern "system" fn surface_get_type(this: *mut c_void) -> u32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetType()");
     1 // D3DRTYPE_SURFACE
 }
@@ -1535,7 +1535,7 @@ extern "system" fn surface_get_container(
     riid: *const Guid,
     container: *mut *mut c_void,
 ) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     if container.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -1606,7 +1606,7 @@ extern "system" fn surface_get_container(
 }
 
 extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DESC) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -1661,7 +1661,7 @@ extern "system" fn surface_lock_rect(
     rect: *const c_void,
     flags: u32,
 ) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::LockRect);
     if locked_rect.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -1764,7 +1764,7 @@ extern "system" fn surface_lock_rect(
 }
 
 extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::UnlockRect);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -2475,7 +2475,7 @@ impl SurfaceInner {
 }
 
 extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::GetDc);
     if hdc.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -2583,7 +2583,7 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
 }
 
 extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i32 {
-    let _timer = surf_timer(this);
+    let _timer = surf_timer(this, SurfaceSubCategory::ReleaseDc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DSurface9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
