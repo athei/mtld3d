@@ -1766,6 +1766,19 @@ impl Harness {
         unsafe { (self.dev_vtbl().set_depth_stencil_surface)(self.device, core::ptr::null_mut()) }
     }
 
+    /// `GetDepthStencilSurface` with the raw `HRESULT`.
+    ///
+    /// Returns `(hr, surface)`; the surface is `None` when the call left the
+    /// out-pointer null (no depth-stencil bound reports `D3DERR_NOTFOUND`
+    /// that way).
+    pub fn depth_stencil_surface_hr(&self) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_depth_stencil_surface)(self.device, &raw mut out) };
+        let wrapped = (!out.is_null()).then(|| Surface::from_raw(out));
+        (hr, wrapped)
+    }
+
     /// `GetDepthStencilSurface` — `None` if no depth-stencil is bound.
     #[must_use]
     pub fn depth_stencil_surface(&self) -> Option<Surface<'_>> {

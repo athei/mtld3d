@@ -5,14 +5,15 @@
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
-    D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8,
-    D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
-    D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE,
+    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -302,6 +303,59 @@ fn create_depth_stencil_surface_succeeds() {
     let ds = h.create_depth_stencil_surface(256, 256, D3DFMT_D24S8);
     let (hr, _desc) = ds.desc();
     assert_eq!(hr, 0, "created depth-stencil surface describes");
+}
+
+#[test]
+fn get_depth_stencil_surface_reports_the_bound_surface() {
+    // `GetDepthStencilSurface` answers with the object `SetDepthStencilSurface`
+    // bound, not with the device's auto depth-stencil, so pointer identity
+    // holds and the save/restore pattern round-trips through an app-created
+    // surface. With nothing bound it reports `D3DERR_NOTFOUND` and nulls the
+    // caller's out-pointer.
+    let h = Harness::with_depth();
+    let implicit = h
+        .depth_stencil_surface()
+        .expect("auto depth-stencil present");
+    let custom = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    assert_eq!(
+        h.set_depth_stencil_surface(&custom),
+        0,
+        "bind the app-created depth-stencil"
+    );
+
+    let saved = h.depth_stencil_surface().expect("a depth-stencil is bound");
+    assert_eq!(
+        saved.as_ptr(),
+        custom.as_ptr(),
+        "GetDepthStencilSurface must hand back the bound surface"
+    );
+
+    // Save / bind another / restore: the restore has to put the app surface
+    // back, not the auto depth the saved handle would name if `Get` reported
+    // the implicit shell.
+    assert_eq!(
+        h.set_depth_stencil_surface(&implicit),
+        0,
+        "temporarily bind the auto depth-stencil"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&saved),
+        0,
+        "restore the saved depth-stencil"
+    );
+    let restored = h
+        .depth_stencil_surface()
+        .expect("a depth-stencil is bound after the restore");
+    assert_eq!(
+        restored.as_ptr(),
+        custom.as_ptr(),
+        "the restore must leave the app-created surface bound"
+    );
+
+    assert_eq!(h.clear_depth_stencil_surface(), 0, "unbind depth-stencil");
+    let (hr, none) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3DERR_NOTFOUND, "no depth-stencil bound");
+    assert!(none.is_none(), "a rejected Get nulls the out-pointer");
 }
 
 #[test]
