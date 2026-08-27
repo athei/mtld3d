@@ -225,3 +225,32 @@ parallelism.
   sample entry, derive inventory.
 - Incident provenance or a private path in a comment.
 - Two unrelated changes in one branch.
+
+## Issues and labels
+
+The GitHub tracker is the backlog. A finding worth keeping, whether it comes
+out of a review, a session, or a game report, becomes an issue the moment it is
+not being fixed on the spot: one issue per finding, verified against the source
+before filing.
+
+Every open issue carries one type label, one priority label, and, where the
+work can be estimated, one effort label:
+
+- Type: `bug` is wrong behaviour in an implemented path; `enhancement` is a new
+  capability or an unimplemented part of the D3D9 surface; `performance` is
+  speed or memory with no behaviour change; `game-compat` is a specific game
+  failing or misbehaving; `infra` is build, CI, test harness, or tooling.
+- Priority: `P1` is next in line, a user-visible breakage or a live correctness
+  hazard; `P2` is real and expected to get done; `P3` is speculative,
+  nice-to-have, or waiting on its trigger.
+- Effort: `effort/S` is hours; `effort/M` is a normal single-PR change;
+  `effort/L` is multi-day or needs a design first.
+
+Two modifiers exist. `blocked` marks an issue waiting on an external trigger,
+a machine we do not have, or an upstream change, with the body naming exactly
+what it waits for; a blocked issue keeps its priority, the label only says why
+it is not moving. `needs-repro` marks an external report that has not been
+reproduced or root-caused locally yet.
+
+File the issue with its labels attached. When a claim in an issue body stops
+being true, edit the body rather than correcting it in a comment trail.
