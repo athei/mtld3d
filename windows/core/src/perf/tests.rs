@@ -232,7 +232,7 @@ fn summary_golden_layout() {
         "buckets: api_d3d9=2.80  api_outside=3.00  enc_work=1.50  submit_work=0.10  gpu_wait=6.00  (ms/frame, avg)\n",
         "\n",
         "API thread             10.00 ms                                             peak 10.00 ms\n",
-        "├─ D3D9 calls           4.00 ms   ( 40.0 %)           243 calls             peak  4.00 ms\n",
+        "├─ D3D9 calls           4.00 ms   ( 40.0 %)           263 calls             peak  4.00 ms\n",
         "│  ├─ Device            0.30 ms   (       123)                              peak  0.30 ms\n",
         "│  │  ├─ Frame          0.04 ms   (         3)                              peak  0.04 ms\n",
         "│  │  │  ├─ Send stall  3.20 ms                       encoder backpressure  peak  3.20 ms\n",
@@ -262,7 +262,12 @@ fn summary_golden_layout() {
         "│  ├─ VertexBuffer      0.20 ms   (        88)                              peak  0.20 ms\n",
         "│  ├─ IndexBuffer       0.08 ms   (        32)                              peak  0.08 ms\n",
         "│  ├─ Texture           0.00 ms   (         0)                              peak  0.00 ms\n",
-        "│  ├─ Surface           0.00 ms   (         0)                              peak  0.00 ms\n",
+        "│  ├─ Surface           0.04 ms   (        20)                              peak  0.04 ms\n",
+        "│  │  ├─ LockRect       0.02 ms   (         2)        map/rename/readback   peak  0.02 ms\n",
+        "│  │  ├─ UnlockRect     0.01 ms   (         2)        unmap + upload queue  peak  0.01 ms\n",
+        "│  │  ├─ GetDC          0.01 ms   (         1)        DIB + memory DC       peak  0.01 ms\n",
+        "│  │  ├─ ReleaseDC      0.00 ms   (         0)        DC write-back         peak  0.00 ms\n",
+        "│  │  └─ Misc           0.00 ms   (        15)        getters + IUnknown    peak  0.00 ms\n",
         "│  ├─ Query             0.00 ms   (         0)                              peak  0.00 ms\n",
         "│  │  └─ Wait for GPU   0.00 ms                       waitUntilCompleted    peak  0.00 ms\n",
         "│  ├─ StateBlock        0.00 ms   (         0)                              peak  0.00 ms\n",
@@ -411,9 +416,11 @@ fn sample_window() -> PerfWindow {
     cats[ApiCategory::Device as usize] = 300_000;
     cats[ApiCategory::VertexBuffer as usize] = 200_000;
     cats[ApiCategory::IndexBuffer as usize] = 80_000;
+    cats[ApiCategory::Surface as usize] = 40_000;
     calls[ApiCategory::Device as usize] = 123;
     calls[ApiCategory::VertexBuffer as usize] = 88;
     calls[ApiCategory::IndexBuffer as usize] = 32;
+    calls[ApiCategory::Surface as usize] = 20;
     // Decompose Device into sub-buckets; must sum to cats[Device]
     // = 300_000 to mirror the production invariant. Calls sum to
     // calls[Device] = 123.
@@ -460,6 +467,23 @@ fn sample_window() -> PerfWindow {
     bcalls[BindSubCategory::RtDs as usize] = 1;
     bcalls[BindSubCategory::FfFixed as usize] = 1;
     bcalls[BindSubCategory::ViewScissor as usize] = 0;
+    // Decompose the Surface category (40_000 cyc, 20 calls) into
+    // SurfaceSubCategory rows. Sums must match `cats[Surface]` exactly —
+    // every surface thunk tags a variant via `surf_timer`, with `Misc`
+    // as the catch-all. Multiples of 10_000 cycles round cleanly at
+    // `{:.2}` under runtime tsc_hz calibration.
+    let mut ssub = [0u64; SurfaceSubCategory::COUNT];
+    let mut scalls = [0u32; SurfaceSubCategory::COUNT];
+    ssub[SurfaceSubCategory::LockRect as usize] = 20_000;
+    ssub[SurfaceSubCategory::UnlockRect as usize] = 10_000;
+    ssub[SurfaceSubCategory::GetDc as usize] = 10_000;
+    ssub[SurfaceSubCategory::ReleaseDc as usize] = 0;
+    ssub[SurfaceSubCategory::Misc as usize] = 0;
+    scalls[SurfaceSubCategory::LockRect as usize] = 2;
+    scalls[SurfaceSubCategory::UnlockRect as usize] = 2;
+    scalls[SurfaceSubCategory::GetDc as usize] = 1;
+    scalls[SurfaceSubCategory::ReleaseDc as usize] = 0;
+    scalls[SurfaceSubCategory::Misc as usize] = 15;
     let s = FrameSample {
         counters: FrameCounters {
             api_cycles_by_category: cats,
@@ -503,6 +527,8 @@ fn sample_window() -> PerfWindow {
             device_sub_calls: dcalls,
             bind_sub_cycles: bsub,
             bind_sub_calls: bcalls,
+            surface_sub_cycles: ssub,
+            surface_sub_calls: scalls,
             keys_gate_calls: [0; KeysGate::COUNT],
             keys_gate_skips: [0; KeysGate::COUNT],
             // snapshot dominates the Draws bucket; split inside it

@@ -162,6 +162,34 @@ pub enum BindSubCategory {
     ViewScissor,
 }
 
+/// Sub-bucket inside the `Surface` `ApiCategory`.
+///
+/// Every `IDirect3DSurface9` vtable thunk tags its `ApiTimer` with a
+/// `SurfaceSubCategory` (via `surf_timer`), so the 5-second summary can
+/// decompose the `Surface` row the way `Bind` decomposes. The row mixes
+/// a getter storm (tens of thousands of near-free calls per window) with
+/// the few entry points that can block for milliseconds — `LockRect`
+/// (staging rename, preserve memcpy, or the synchronous backbuffer
+/// readback), `UnlockRect` (upload queueing) and the GDI DC pair — so a
+/// spike in the aggregate row was unattributable before the split.
+///
+/// `Misc` is the catch-all so the sub-buckets sum exactly to
+/// `api_cycles_by_category[Surface]`.
+#[derive(Clone, Copy, Debug, strum::EnumCount)]
+#[repr(u32)]
+pub enum SurfaceSubCategory {
+    /// `LockRect`: map, staging rename, or synchronous backbuffer readback.
+    LockRect = 0,
+    /// `UnlockRect`: unmap plus dirty-range upload queueing.
+    UnlockRect,
+    /// `GetDC`: DIB section + memory DC build.
+    GetDc,
+    /// `ReleaseDC`: DC teardown and write-back.
+    ReleaseDc,
+    /// Everything else: getters, `IUnknown`, container walks.
+    Misc,
+}
+
 /// Per-draw snapshot dirty-mark gate whose redundant-skip rate the perf summary reports.
 ///
 /// Each variant indexes the `keys_gate_calls` / `keys_gate_skips` arrays:
@@ -310,6 +338,12 @@ pub struct ApiTimer {
     /// `start_device(Bind)` timer would, plus the per-`BindSubCategory`
     /// breakdown row. Always implies `device_sub == Some(Bind)`.
     bind_sub: Option<BindSubCategory>,
+    /// Set on `Surface`-category timers built via `start_surface`.
+    ///
+    /// Bumps both the top-level `Surface` bucket and a per-sub-category
+    /// breakdown row. Always implies `category == Surface` and
+    /// `device_sub == None`.
+    surface_sub: Option<SurfaceSubCategory>,
     /// The parent timer's `active_child_cycles` accumulator.
     ///
     /// Saved at `start` and restored (plus this timer's own `elapsed`) at
@@ -360,6 +394,7 @@ impl ApiTimer {
             category,
             device_sub: None,
             bind_sub: None,
+            surface_sub: None,
             saved_child_cycles,
             enabled,
         }
@@ -388,6 +423,7 @@ impl ApiTimer {
             category: ApiCategory::Device,
             device_sub: Some(sub),
             bind_sub: None,
+            surface_sub: None,
             saved_child_cycles,
             enabled,
         }
@@ -418,6 +454,7 @@ impl ApiTimer {
             category: ApiCategory::Device,
             device_sub: Some(DeviceSubCategory::Bind),
             bind_sub: Some(sub),
+            surface_sub: None,
             saved_child_cycles,
             enabled,
         }
@@ -427,6 +464,35 @@ impl ApiTimer {
     #[inline]
     #[must_use]
     pub const fn start_bind(_perf_ptr: *mut ApiPerfState, _sub: BindSubCategory) -> Self {
+        Self
+    }
+
+    /// Like `start(Surface)`, but tags the timer with a `SurfaceSubCategory`.
+    ///
+    /// On `Drop`, a single `rdtsc()` delta bumps the top-level `Surface`
+    /// bucket AND `surface_sub_cycles[sub]` in one pass. Used by every
+    /// `IDirect3DSurface9` vtable thunk (via `surf_timer`).
+    #[cfg(perf_tracking)]
+    pub fn start_surface(perf_ptr: *mut ApiPerfState, sub: SurfaceSubCategory) -> Self {
+        let enabled = !perf_ptr.is_null() && perf_enabled();
+        let saved_child_cycles = Self::enter_scope(perf_ptr, enabled);
+        let start = if enabled { rdtsc() } else { 0 };
+        Self {
+            start,
+            perf_ptr,
+            category: ApiCategory::Surface,
+            device_sub: None,
+            bind_sub: None,
+            surface_sub: Some(sub),
+            saved_child_cycles,
+            enabled,
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start_surface(_perf_ptr: *mut ApiPerfState, _sub: SurfaceSubCategory) -> Self {
         Self
     }
 }
@@ -493,6 +559,8 @@ impl Drop for ApiTimer {
             perf.add_bind_cycles(bind, self_time);
         } else if let Some(sub) = self.device_sub {
             perf.add_device_cycles(sub, self_time);
+        } else if let Some(sub) = self.surface_sub {
+            perf.add_surface_cycles(sub, self_time);
         } else {
             perf.add_api_cycles(self.category, self_time);
         }
@@ -648,6 +716,15 @@ struct FrameCounters {
     bind_sub_cycles: [u64; BindSubCategory::COUNT],
     /// Companion call-count array for `bind_sub_cycles`.
     bind_sub_calls: [u32; BindSubCategory::COUNT],
+    /// Per-sub-category cycle bucket inside the `Surface` `ApiCategory`.
+    ///
+    /// Bumped by `ApiTimer::start_surface` on every `IDirect3DSurface9`
+    /// vtable thunk; sums to `api_cycles_by_category[Surface]` within the
+    /// same frame. Splits the getter storm from the entry points that can
+    /// block (`LockRect` readback, `UnlockRect` upload, the GDI DC pair).
+    surface_sub_cycles: [u64; SurfaceSubCategory::COUNT],
+    /// Companion call-count array for `surface_sub_cycles`.
+    surface_sub_calls: [u32; SurfaceSubCategory::COUNT],
     /// Per-[`KeysGate`] live setter-call count this frame.
     ///
     /// Denominator for the redundant-skip rate in the perf summary.
@@ -732,6 +809,8 @@ impl FrameCounters {
             device_sub_calls: [0; DeviceSubCategory::COUNT],
             bind_sub_cycles: [0; BindSubCategory::COUNT],
             bind_sub_calls: [0; BindSubCategory::COUNT],
+            surface_sub_cycles: [0; SurfaceSubCategory::COUNT],
+            surface_sub_calls: [0; SurfaceSubCategory::COUNT],
             keys_gate_calls: [0; KeysGate::COUNT],
             keys_gate_skips: [0; KeysGate::COUNT],
             draw_snapshot_cycles: 0,
@@ -1100,6 +1179,25 @@ impl ApiPerfState {
         let cyc = &mut self.counters.bind_sub_cycles[idx];
         *cyc = cyc.saturating_add(cycles);
         let cnt = &mut self.counters.bind_sub_calls[idx];
+        *cnt = cnt.saturating_add(1);
+    }
+
+    /// Add cycles + one call to the `Surface` top and per-`SurfaceSubCategory` buckets.
+    ///
+    /// Both land under one `rdtsc()` delta supplied by
+    /// `ApiTimer::start_surface`. Sub-bucket sums equal the parent Surface
+    /// row by construction (`Misc` is the catch-all; every surface thunk
+    /// names a variant).
+    pub const fn add_surface_cycles(&mut self, sub: SurfaceSubCategory, cycles: u64) {
+        let top = &mut self.counters.api_cycles_by_category[ApiCategory::Surface as usize];
+        *top = top.saturating_add(cycles);
+        let top_cnt = &mut self.counters.api_call_counts_by_category[ApiCategory::Surface as usize];
+        *top_cnt = top_cnt.saturating_add(1);
+
+        let idx = sub as usize;
+        let cyc = &mut self.counters.surface_sub_cycles[idx];
+        *cyc = cyc.saturating_add(cycles);
+        let cnt = &mut self.counters.surface_sub_calls[idx];
         *cnt = cnt.saturating_add(1);
     }
 
@@ -2327,6 +2425,10 @@ struct PerfWindow {
     bind_sub_by: [Stat; BindSubCategory::COUNT],
     /// Per-`BindSubCategory` call counts (sum only).
     bind_sub_calls_by: [Stat; BindSubCategory::COUNT],
+    /// Per-`SurfaceSubCategory` bucket: sum + per-frame peak.
+    surface_sub_by: [Stat; SurfaceSubCategory::COUNT],
+    /// Per-`SurfaceSubCategory` call counts (sum only).
+    surface_sub_calls_by: [Stat; SurfaceSubCategory::COUNT],
     /// Per-[`KeysGate`] live setter calls / skips (sum only).
     keys_gate_calls_by: [Stat; KeysGate::COUNT],
     keys_gate_skips_by: [Stat; KeysGate::COUNT],
@@ -2522,6 +2624,10 @@ impl PerfWindow {
         for i in 0..BindSubCategory::COUNT {
             self.bind_sub_by[i].add(s.counters.bind_sub_cycles[i]);
             self.bind_sub_calls_by[i].add(u64::from(s.counters.bind_sub_calls[i]));
+        }
+        for i in 0..SurfaceSubCategory::COUNT {
+            self.surface_sub_by[i].add(s.counters.surface_sub_cycles[i]);
+            self.surface_sub_calls_by[i].add(u64::from(s.counters.surface_sub_calls[i]));
         }
         for i in 0..KeysGate::COUNT {
             self.keys_gate_calls_by[i].add(u64::from(s.counters.keys_gate_calls[i]));
@@ -3223,6 +3329,13 @@ impl<'a> Summary<'a> {
             if *cat as usize == ApiCategory::Device as usize {
                 self.write_device_sub_rows(out, present_ms);
             }
+            // Decompose `Surface` the same way: the row mixes a getter
+            // storm with the few entry points that can block for
+            // milliseconds, so a spiking peak was unattributable from
+            // the aggregate row alone.
+            if *cat as usize == ApiCategory::Surface as usize {
+                self.write_surface_sub_rows(out);
+            }
             // Nest `Wait for GPU` under `Query`: the raw Query bucket
             // accumulates every GetData / Issue / GetType call; the
             // FLUSH-on-Pending wait (Metal `waitUntilCompleted`) is
@@ -3535,6 +3648,55 @@ impl<'a> Summary<'a> {
                     aux: Some(format!("({calls:>10})")),
                     desc: Some(desc),
                     peak: Some(cycles_to_ms(w.bind_sub_by[idx].max)),
+                },
+            );
+        }
+    }
+
+    /// Render the per-`SurfaceSubCategory` rows nested under the `Surface` `ApiCategory`.
+    ///
+    /// Sums to the parent `Surface` row by construction — every
+    /// `IDirect3DSurface9` vtable thunk tags a variant via `surf_timer`,
+    /// with `Misc` as the catch-all.
+    fn write_surface_sub_rows(&self, out: &mut String) {
+        let w = self.w;
+        let f = u64::from(self.frames);
+        let s = &self.s;
+        let rows: &[(&str, SurfaceSubCategory, &str)] = &[
+            (
+                "LockRect",
+                SurfaceSubCategory::LockRect,
+                "map/rename/readback",
+            ),
+            (
+                "UnlockRect",
+                SurfaceSubCategory::UnlockRect,
+                "unmap + upload queue",
+            ),
+            ("GetDC", SurfaceSubCategory::GetDc, "DIB + memory DC"),
+            ("ReleaseDC", SurfaceSubCategory::ReleaseDc, "DC write-back"),
+            ("Misc", SurfaceSubCategory::Misc, "getters + IUnknown"),
+        ];
+        for (i, (name, sub, desc)) in rows.iter().enumerate() {
+            let branch = if i + 1 == rows.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let idx = *sub as usize;
+            let label = format!("│  │  {branch} {name}");
+            let avg_ms = cycles_to_ms(w.surface_sub_by[idx].sum / f);
+            let calls = w.surface_sub_calls_by[idx].sum;
+            write_row(
+                out,
+                s,
+                &Row {
+                    label: &label,
+                    bold_label: false,
+                    ms: Some(avg_ms),
+                    aux: Some(format!("({calls:>10})")),
+                    desc: Some(desc),
+                    peak: Some(cycles_to_ms(w.surface_sub_by[idx].max)),
                 },
             );
         }
