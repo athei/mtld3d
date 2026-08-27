@@ -25,8 +25,8 @@ use std::{
 };
 
 use mtld3d_shared::mtl::{
-    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-    VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT,
+    VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
@@ -85,6 +85,15 @@ bitflags::bitflags! {
         /// fragment function declares a depth output against no depth
         /// attachment. Folded into the PS cache key.
         const NO_DEPTH_ATTACHMENT = 1 << 4;
+        /// A sampler slot this draw binds carries a non-zero `D3DSAMP_MIPMAPLODBIAS`.
+        ///
+        /// Metal samplers have no LOD bias, so it is applied at the sample
+        /// site: the PS takes the per-slot bias table on
+        /// `PS_LOD_BIAS_SLOT` and every implicit-LOD sample passes
+        /// `bias(...)`. A draw with no biased slot compiles the unchanged
+        /// shader and binds nothing, so the common case costs nothing.
+        /// Folded into the PS cache key.
+        const LOD_BIAS = 1 << 5;
     }
 }
 
@@ -931,6 +940,15 @@ fn emit_ps_function(
     if has_bump_env {
         w(out, ",\n    constant float4 *bump_env [[buffer(12)]]");
     }
+    // Per-slot `D3DSAMP_MIPMAPLODBIAS`, one `float4` row per sampler slot.
+    // Metal samplers carry no LOD bias, so the sample sites apply it; the
+    // argument exists only for the biased variant.
+    if variant.flags.contains(VariantFlags::LOD_BIAS) {
+        let _ = write!(
+            out,
+            ",\n    constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
+        );
+    }
     // Dynamic integer / boolean constants (a non-`defi` `iN` / non-`defb`
     // `bN`, fed by SetPixelShaderConstantI/B) read the runtime files, the
     // fragment-side twins of `vs_i` / `vs_b`.
@@ -1070,6 +1088,14 @@ fn emit_ps_function(
     let def_bool_consts: BTreeSet<u16> =
         ps.def_bool_constants.iter().map(|d| d.reg.index).collect();
     let subs = (!ps.subroutines.is_empty()).then_some(&ps.subroutines);
+    let mut ps_context_flags = EmitContextFlags::empty();
+    ps_context_flags.set(EmitContextFlags::PS_HAS_VPOS, has_vpos);
+    ps_context_flags.set(EmitContextFlags::PS_HAS_VFACE, has_vface);
+    ps_context_flags.set(EmitContextFlags::PS_HAS_DEPTH_OUT, has_depth_out);
+    ps_context_flags.set(
+        EmitContextFlags::PS_LOD_BIAS,
+        variant.flags.contains(VariantFlags::LOD_BIAS),
+    );
     let ctx = EmitContext::ps(&PsInit {
         major: ps.major,
         minor: ps.minor,
@@ -1081,9 +1107,7 @@ fn emit_ps_function(
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
         def_bool_consts: &def_bool_consts,
-        has_vpos,
-        has_vface,
-        has_depth_out,
+        flags: ps_context_flags,
         subroutines: subs,
     });
     for inst in &ps.instructions {
@@ -1261,6 +1285,13 @@ bitflags::bitflags! {
         /// `_depth_storage`. Clear → `DepthOut` writes warn-and-sink (legacy
         /// SM2 path).
         const PS_HAS_DEPTH_OUT = 1 << 3;
+        /// PS only: the per-slot LOD-bias uniform is declared and readable.
+        ///
+        /// Set → an implicit-LOD sample appends `bias(lod_bias[N].x)` and an
+        /// explicit-gradient sample scales its derivatives by `lod_bias[N].y`.
+        /// Clear → the sample sites are emitted without either, and no
+        /// `lod_bias` argument exists to read.
+        const PS_LOD_BIAS = 1 << 4;
     }
 }
 
@@ -1368,9 +1399,11 @@ struct PsInit<'a> {
     def_consts: &'a BTreeSet<u16>,
     def_int_consts: &'a BTreeSet<u16>,
     def_bool_consts: &'a BTreeSet<u16>,
-    has_vpos: bool,
-    has_vface: bool,
-    has_depth_out: bool,
+    /// The pixel-stage predicates, already packed.
+    ///
+    /// Carries only the `PS_*` bits of [`EmitContextFlags`]; `IS_VERTEX` has
+    /// no meaning here and the constructor never sets it.
+    flags: EmitContextFlags,
     subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
 }
 
@@ -1409,13 +1442,9 @@ impl<'a> EmitContext<'a> {
         }
     }
 
-    fn ps(init: &PsInit<'a>) -> Self {
-        let mut flags = EmitContextFlags::empty();
-        flags.set(EmitContextFlags::PS_HAS_VPOS, init.has_vpos);
-        flags.set(EmitContextFlags::PS_HAS_VFACE, init.has_vface);
-        flags.set(EmitContextFlags::PS_HAS_DEPTH_OUT, init.has_depth_out);
+    const fn ps(init: &PsInit<'a>) -> Self {
         Self {
-            flags,
+            flags: init.flags.difference(EmitContextFlags::IS_VERTEX),
             shader_major: init.major,
             shader_minor: init.minor,
             ps_input_map: Some(init.map),
@@ -1438,6 +1467,16 @@ impl<'a> EmitContext<'a> {
     #[inline]
     const fn is_vertex(&self) -> bool {
         self.flags.contains(EmitContextFlags::IS_VERTEX)
+    }
+
+    /// Whether sample sites may read the per-slot LOD-bias uniform.
+    ///
+    /// False for every vertex shader: `vs_3_0` allows only `texldl`, whose
+    /// explicit LOD carries no bias, so no vertex function declares the
+    /// argument.
+    #[inline]
+    const fn has_lod_bias(&self) -> bool {
+        self.flags.contains(EmitContextFlags::PS_LOD_BIAS)
     }
 
     /// Whether VS input register `v{reg}` is backed by the vertex declaration.
@@ -1730,19 +1769,29 @@ fn translate_instruction(
         // has matching `gradientcube` / `gradient3d` overloads.
         Opcode::TexLdD => {
             let sampler_idx = inst.srcs[1].reg.index;
+            // A sampler LOD bias shifts the selected mip by `bias`, and the
+            // LOD a gradient sample computes is the log2 of the derivative
+            // magnitude, so scaling both derivatives by `exp2(bias)` shifts it
+            // by exactly the same amount. MSL takes one LOD option per sample
+            // call, so this is how the bias reaches a `gradient*` sample.
+            let scale = if ctx.has_lod_bias() {
+                format!(" * lod_bias[{sampler_idx}].y")
+            } else {
+                String::new()
+            };
             let gradient = match ctx.ps_samplers.and_then(|m| m.get(&sampler_idx)) {
                 Some(TextureType::TextureCube) => format!(
-                    "gradientcube(({ddx}).xyz, ({ddy}).xyz)",
+                    "gradientcube(({ddx}).xyz{scale}, ({ddy}).xyz{scale})",
                     ddx = srcs[2],
                     ddy = srcs[3]
                 ),
                 Some(TextureType::Texture3D) => format!(
-                    "gradient3d(({ddx}).xyz, ({ddy}).xyz)",
+                    "gradient3d(({ddx}).xyz{scale}, ({ddy}).xyz{scale})",
                     ddx = srcs[2],
                     ddy = srcs[3]
                 ),
                 _ => format!(
-                    "gradient2d(({ddx}).xy, ({ddy}).xy)",
+                    "gradient2d(({ddx}).xy{scale}, ({ddy}).xy{scale})",
                     ddx = srcs[2],
                     ddy = srcs[3]
                 ),
@@ -2781,8 +2830,18 @@ fn sample_or_compare(
             "float4(s{sampler_idx}.sample_compare(samp{sampler_idx}, ({coord_expr}).xy, saturate(({coord_expr}).z){lod_suffix}))"
         )
     } else {
+        // `D3DSAMP_MIPMAPLODBIAS` shifts the mip the hardware selects, so it
+        // applies to implicit-LOD samples only. An explicit `level(...)`
+        // supplies the LOD outright (D3D9 leaves it unbiased) and MSL accepts
+        // exactly one LOD option per call, so a suffixed sample keeps its own;
+        // `texldd` folds the shift into its gradients at the call site.
+        let bias = if suffix_str.is_empty() && ctx.has_lod_bias() {
+            format!(", bias(lod_bias[{sampler_idx}].x)")
+        } else {
+            String::new()
+        };
         format!(
-            "s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).{coord_swizzle}{suffix_str})"
+            "s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).{coord_swizzle}{suffix_str}{bias})"
         )
     }
 }

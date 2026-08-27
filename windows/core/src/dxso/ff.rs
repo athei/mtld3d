@@ -27,7 +27,7 @@
 
 use std::fmt::Write;
 
-use mtld3d_shared::mtl::{VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
@@ -1381,6 +1381,16 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if fog_blend_active(variant) {
         out.push_str(",\n    constant float4 *fog_data [[buffer(13)]]");
     }
+    // Per-slot `D3DSAMP_MIPMAPLODBIAS`. Metal samplers carry no LOD bias, so
+    // the cascade's sample sites apply it; declared only for the biased
+    // variant, so an unbiased scene keeps the shader it had.
+    let lod_bias = variant.flags.contains(VariantFlags::LOD_BIAS);
+    if lod_bias {
+        let _ = write!(
+            out,
+            ",\n    constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
+        );
+    }
     for (i, stage) in ps.stages.iter().enumerate() {
         if u32::from(stage.color_op) == D3DTOP_DISABLE {
             break;
@@ -1468,7 +1478,15 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 } else {
                     format!("in.texcoord{i}.{sw}")
                 };
-                let _ = writeln!(out, "    float4 t{i} = s{i}.sample(samp{i}, {uv});");
+                // The bias applies to this implicit-LOD sample only: the
+                // depth branches above pin `level(0)`, which supplies the
+                // level outright.
+                let bias = if lod_bias {
+                    format!(", bias(lod_bias[{i}].x)")
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(out, "    float4 t{i} = s{i}.sample(samp{i}, {uv}{bias});");
             }
         }
         // Unbound-texture "invalid op" handling: a stage with NO bound texture

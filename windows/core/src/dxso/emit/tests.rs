@@ -8,8 +8,8 @@
 //! concatenates the two strings into one check target.
 
 use mtld3d_shared::mtl::{
-    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
-    VS_POS_FIXUP_SLOT,
+    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_FLOAT_CONST_SLOT,
+    VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
@@ -3837,4 +3837,105 @@ fn dynamic_bool_constant_reads_the_runtime_ps_b_bitmask() {
         ps_msl.contains("(ps_b >> 3u) & 1u"),
         "`if b3` reads bit 3 of the bitmask:\n{ps_msl}"
     );
+}
+
+/// A `ps_3_0` wrapping one sampling instruction against `s0` and `t0`.
+///
+/// `ps_3_0 { dcl_2d s0; dcl_texcoord0 t0; <op>; mov oC0, r0; }`, so the
+/// LOD-bias variant tests below differ only in the instruction they pass.
+fn ps3_sampling_program(op: u16, extra_srcs: &[u32]) -> Vec<u32> {
+    let mut bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        0x9000_0000,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(
+            op,
+            u32::try_from(3 + extra_srcs.len()).expect("operand count fits u32"),
+        ),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_IDENTITY, 0),
+    ];
+    bc.extend_from_slice(extra_srcs);
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    bc
+}
+
+fn lod_bias_variant() -> VariantKey {
+    VariantKey {
+        flags: VariantFlags::LOD_BIAS,
+        ..VariantKey::default()
+    }
+}
+
+#[test]
+fn lod_bias_variant_biases_an_implicit_lod_sample() {
+    const OP_TEXLD: u16 = 66;
+    let ps = parse(&ps3_sampling_program(OP_TEXLD, &[])).expect("PS3 parse");
+
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        !plain.contains("lod_bias"),
+        "an unbiased draw must keep the shader it had:\n{plain}"
+    );
+
+    let biased = emit_ps_programmable(&ps, lod_bias_variant()).expect("emit PS3");
+    assert!(
+        biased.contains(&format!(
+            "constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
+        )),
+        "the biased variant must take the per-slot bias table:\n{biased}"
+    );
+    assert!(
+        biased.contains("bias(lod_bias[0].x)"),
+        "texld must apply the bound slot's bias:\n{biased}"
+    );
+    metal_compile_or_fail(&biased);
+}
+
+#[test]
+fn lod_bias_variant_leaves_an_explicit_lod_sample_alone() {
+    // D3D9 applies the sampler bias to the LOD the hardware computes, and
+    // `texldl` supplies its own; MSL also takes one LOD option per sample.
+    let ps = parse(&ps3_sampling_program(OP_TEXLDL, &[])).expect("PS3 parse");
+    let biased = emit_ps_programmable(&ps, lod_bias_variant()).expect("emit PS3");
+    assert!(
+        biased.contains("level("),
+        "texldl keeps its explicit LOD:\n{biased}"
+    );
+    assert!(
+        !biased.contains("bias("),
+        "texldl must not also carry a bias:\n{biased}"
+    );
+    metal_compile_or_fail(&biased);
+}
+
+#[test]
+fn lod_bias_variant_scales_texldd_gradients() {
+    // A gradient sample cannot take `bias()` as well, so the bias rides on the
+    // derivatives: scaling both by `exp2(bias)` shifts the computed LOD by it.
+    let extra = [
+        src_token(TYPE_TEMP, 1, SWIZ_IDENTITY, 0),
+        src_token(TYPE_TEMP, 2, SWIZ_IDENTITY, 0),
+    ];
+    let ps = parse(&ps3_sampling_program(OP_TEXLDD, &extra)).expect("PS3 parse");
+    let biased = emit_ps_programmable(&ps, lod_bias_variant()).expect("emit PS3");
+    assert!(
+        biased.contains("gradient2d((r[1]).xy * lod_bias[0].y, (r[2]).xy * lod_bias[0].y)"),
+        "texldd must scale both gradients by the slot's exp2 lane:\n{biased}"
+    );
+    assert!(
+        !biased.contains("bias("),
+        "the gradient sample carries no second LOD option:\n{biased}"
+    );
+    metal_compile_or_fail(&biased);
 }

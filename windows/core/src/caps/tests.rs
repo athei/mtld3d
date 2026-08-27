@@ -77,6 +77,7 @@ fn raster_caps_matches_implementation() {
     let expected = RasterCaps::ZTEST
         | RasterCaps::FOGVERTEX
         | RasterCaps::FOGRANGE
+        | RasterCaps::MIPMAPLODBIAS
         | RasterCaps::ANISOTROPY
         | RasterCaps::ZFOG
         | RasterCaps::SCISSORTEST

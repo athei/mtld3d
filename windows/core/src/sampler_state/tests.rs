@@ -126,3 +126,67 @@ fn params_match_snapshot_on_default() {
     assert_eq!(p2.lod_min_clamp, 3.0_f32.to_bits());
     assert_eq!(p2.lod_max_clamp, 1000.0_f32.to_bits());
 }
+
+#[test]
+fn lod_bias_decodes_the_raw_float() {
+    let mut ss = [0u32; SAMPLER_STATE_COUNT];
+    assert_eq!(
+        lod_bias(&ss).to_bits(),
+        0.0_f32.to_bits(),
+        "default is zero"
+    );
+
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = (-1.5_f32).to_bits();
+    assert_eq!(lod_bias(&ss).to_bits(), (-1.5_f32).to_bits());
+
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = 2.25_f32.to_bits();
+    assert_eq!(lod_bias(&ss).to_bits(), 2.25_f32.to_bits());
+}
+
+#[test]
+fn lod_bias_folds_nan_and_clamps_the_magnitude() {
+    let mut ss = [0u32; SAMPLER_STATE_COUNT];
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = f32::NAN.to_bits();
+    assert_eq!(
+        lod_bias(&ss).to_bits(),
+        0.0_f32.to_bits(),
+        "NaN reads as no bias"
+    );
+
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = f32::INFINITY.to_bits();
+    assert_eq!(lod_bias(&ss).to_bits(), LOD_BIAS_LIMIT.to_bits());
+
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = f32::NEG_INFINITY.to_bits();
+    assert_eq!(lod_bias(&ss).to_bits(), (-LOD_BIAS_LIMIT).to_bits());
+}
+
+#[test]
+fn lod_bias_active_ignores_both_zeroes() {
+    assert!(!lod_bias_active(0.0));
+    assert!(!lod_bias_active(-0.0));
+    assert!(lod_bias_active(0.25));
+    assert!(lod_bias_active(-0.25));
+}
+
+#[test]
+fn lod_bias_bytes_carry_the_bias_and_its_exponent() {
+    let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
+    biases[3] = 2.0;
+    let bytes = build_lod_bias_bytes(&biases);
+    assert_eq!(bytes.len(), LOD_BIAS_BYTES);
+
+    let row = |slot: usize, lane: usize| {
+        let base = slot * 16 + lane * 4;
+        f32::from_le_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+        ])
+    };
+    assert_eq!(row(3, 0).to_bits(), 2.0_f32.to_bits(), "bias lane");
+    assert_eq!(row(3, 1).to_bits(), 4.0_f32.to_bits(), "exp2 lane");
+    // An unbiased slot must leave the sample unshifted: bias 0, scale 1.
+    assert_eq!(row(0, 0).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(row(0, 1).to_bits(), 1.0_f32.to_bits());
+}

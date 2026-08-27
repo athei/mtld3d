@@ -28,9 +28,9 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, VertexAttrDesc,
     mtl::{
-        IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PrimitiveType, VS_BOOL_CONST_SLOT,
-        VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
-        VertexStepFunction,
+        IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, PrimitiveType,
+        VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
+        VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
 use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
@@ -316,6 +316,9 @@ const _: () = {
         core::mem::size_of::<StageBinding>() <= 64,
         "StageBinding > 64 B — recheck sampler_state layout"
     );
+    // The LOD-bias uniform is indexed by sampler slot, so it needs a row per
+    // stage the encoder can bind a texture to.
+    assert!(crate::stage_bindings::STAGE_COUNT <= mtld3d_core::sampler_state::LOD_BIAS_SLOTS);
 };
 
 /// Per-draw varying parameters.
@@ -1234,6 +1237,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         .expect("emit_draw: ps not populated")
         .as_ref();
     let variant = snap.variant.expect("emit_draw: variant not populated");
+    // `D3DSAMP_MIPMAPLODBIAS` has no Metal sampler equivalent, so the bias
+    // reaches the GPU as a fragment uniform the sample sites read. Resolving
+    // it here keeps every draw that leaves the state at its zero default on
+    // the unbiased shader with nothing extra bound.
+    let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
+    let mut any_lod_bias = false;
+    for (stage_u32, b) in stage_bindings.iter() {
+        let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state);
+        if mtld3d_core::sampler_state::lod_bias_active(bias) {
+            lod_bias[stage_u32 as usize] = bias;
+            any_lod_bias = true;
+        }
+    }
     // The render pass decides which colour outputs the PS may export, and
     // that is only known here on the encoder thread. Patch a PS-only copy so
     // the VS key, which shares `variant`, is untouched; the FF PS writes one
@@ -1265,6 +1281,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
         );
     }
+    // Both emitters honour the bias, so the flag rides on the shared PS key.
+    ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_bias);
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1976,6 +1994,21 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if !bump_env_bytes.is_empty() && enc.last_bound().ps_bump_env_changed(bump_env_bytes) {
         let (p, n) = bump_env_slice.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 12));
+    }
+    // Per-slot LOD bias. Bound only for a draw whose shader declares the
+    // uniform; the binding then persists on the encoder, so a later biased
+    // draw carrying the same table skips the re-bind.
+    if any_lod_bias {
+        let bias_bytes = mtld3d_core::sampler_state::build_lod_bias_bytes(&lod_bias);
+        if enc.last_bound().ps_lod_bias_changed(&bias_bytes) {
+            let ptr = enc.alloc_scratch(&bias_bytes);
+            enc.emit_command(Command::set_fragment_bytes_at(
+                ptr,
+                u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)
+                    .expect("LOD bias uniform is 256 bytes"),
+                PS_LOD_BIAS_SLOT,
+            ));
+        }
     }
     // VS integer constants — bound only for the rare shader that reads a
     // dynamic integer constant. Re-bound unconditionally (no dedup): such

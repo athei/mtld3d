@@ -3971,6 +3971,10 @@ pub struct LastBoundCache {
     ///
     /// Set when the bound PS uses `texbem`/`texbeml`/`bem`.
     ps_bump_env: Vec<u8>,
+    /// PS LOD-bias slot: per-sampler-slot `D3DSAMP_MIPMAPLODBIAS`.
+    ///
+    /// Set only while a bound stage carries a non-zero bias.
+    ps_lod_bias: Vec<u8>,
     /// Vertex stream slots 0..16 — bound `MTLBuffer` handle + byte offset each.
     ///
     /// Indexed by D3D9 stream, which is the Metal vertex buffer slot. `(0, _)`
@@ -4018,6 +4022,7 @@ impl LastBoundCache {
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
+            ps_lod_bias: Vec::new(),
             vertex_buffers: [(0, 0); VERTEX_STREAM_SLOTS as usize],
             scissor_rect: None,
             blend_color: 0xFFFF_FFFF,
@@ -4047,6 +4052,7 @@ impl LastBoundCache {
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
+        self.ps_lod_bias.clear();
         self.vertex_buffers = [(0, 0); VERTEX_STREAM_SLOTS as usize];
         self.scissor_rect = None;
         self.blend_color = 0xFFFF_FFFF;
@@ -4248,6 +4254,11 @@ impl LastBoundCache {
     #[inline]
     pub fn ps_bump_env_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.ps_bump_env, bytes)
+    }
+
+    #[inline]
+    pub fn ps_lod_bias_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_lod_bias, bytes)
     }
 }
 
