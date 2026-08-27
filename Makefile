@@ -415,15 +415,23 @@ test-unit:
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
+#
+# A scaled run reports the whole suite instead of stopping at the first
+# failure. The point of `SCALE` is to survey which assertions still hold in
+# the reported space, and one scale-dependent test would otherwise hide every
+# later test's scaled behaviour. The default run keeps fail-fast: there the
+# first failure is a regression to fix, not a survey to read.
+E2E_NEXTEST_FLAGS := $(if $(SCALE),--no-fail-fast)
+
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386)
+		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386) $(E2E_NEXTEST_FLAGS)
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64)
+		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64) $(E2E_NEXTEST_FLAGS)
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts

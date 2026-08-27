@@ -431,9 +431,11 @@ fn emit_vs_function(
         out,
         "    constant float4 *vs_c [[buffer({VS_FLOAT_CONST_SLOT})]]"
     );
-    // Half-pixel rasterization fixup uniform: `(1/vp_w, -1/vp_h, 0, 0)`,
-    // supplied per-draw by the encoder from the live viewport. Read by the
-    // position epilogue below. The three uniform slots sit above the sixteen
+    // Half-pixel rasterization fixup uniform:
+    // `(1/vp_w, -1/vp_h, depth_clamp, render_scale)`, supplied per-draw by
+    // the encoder from the live viewport. Read by the position epilogue below
+    // and by the point-size epilogue, which uses `.w` to convert a logical
+    // length to render pixels. The three uniform slots sit above the sixteen
     // vertex-stream slots (stream `n` binds at buffer `n`), so neither an app
     // stream nor an app-uploaded constant can collide with them: D3D9 float
     // consts are 0..255 inside vs_c.
@@ -610,10 +612,14 @@ fn emit_vs_function(
     // NDC depth for the table-fog Z source (see the Varyings decl).
     w(out, "    out.fog_z = out.position.z / out.position.w;\n");
     // `D3DRS_POINTSIZE_MIN/MAX` clamp the final size whether it came from
-    // the shader (`oPts` / `dcl_psize`) or the render-state default.
+    // the shader (`oPts` / `dcl_psize`) or the render-state default. The
+    // clamp runs in the logical pixels D3D9 states every point size in, and
+    // `pos_fixup.w` then converts the result to the render pixels
+    // `[[point_size]]` is measured in (an identity unless `render.scale`
+    // shrank the bound target).
     w(
         out,
-        "    out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);\n",
+        "    out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;\n",
     );
     w(out, "    return out;\n");
     w(out, "}\n");

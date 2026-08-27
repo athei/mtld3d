@@ -1913,10 +1913,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // shader declares `constant float4 &pos_fixup` there and shifts
     // clip-space position half a pixel right/down so on-boundary geometry
     // lands on the D3D9 window→NDC reference.
-    // `(1/vp_w, -1/vp_h, depth_clamp_z, 0)` from the live viewport; the `.z`
-    // lane selects the FF RHW epilogue's depth clamp (the D3D9 depth-clamp
-    // rule, see `depth_clamp_z` above). Deduped so it only re-emits when the
-    // viewport dims or the clamp predicate change (rare).
+    // `(1/vp_w, -1/vp_h, depth_clamp_z, render_scale)` from the live viewport;
+    // the `.z` lane selects the FF RHW epilogue's depth clamp (the D3D9
+    // depth-clamp rule, see `depth_clamp_z` above) and the `.w` lane carries
+    // render pixels per logical pixel, which the point-size epilogue applies
+    // to a size D3D9 states in the logical space. The viewport dims are
+    // already in the bound target's space, so `.xy` needs no conversion.
+    // Deduped so it only re-emits when the viewport dims, the clamp predicate
+    // or the bound target's scale change (rare).
     let (_, _, vp_w, vp_h) = enc.effective_viewport();
     // Viewport dims fit u16 in practice; convert without an `as`-cast
     // precision-loss lint (same idiom as `encoder.rs`).
@@ -1925,7 +1929,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         1.0 / to_f(vp_w.max(1)),
         -1.0 / to_f(vp_h.max(1)),
         f32::from(u8::from(depth_clamp_z)),
-        0.0,
+        enc.target_scale().factor(),
     ];
     // SAFETY: `[f32; 4]` is POD with no padding; reinterpreting the array as
     // 16 contiguous bytes is sound and the borrow is local to this scope.

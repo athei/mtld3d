@@ -2961,6 +2961,16 @@ impl FrameEncoder {
         self.pass_state.effective_viewport()
     }
 
+    /// Scale between the D3D9-reported space and the bound target's own.
+    ///
+    /// `render.scale` while the back buffer is bound, the identity otherwise.
+    /// Read at draw time for the `pos_fixup` uniform, whose `.w` lane converts
+    /// the point size from the logical pixels D3D9 states it in to the render
+    /// pixels Metal rasterizes with.
+    pub const fn target_scale(&self) -> RenderScale {
+        self.pass_state.target_scale()
+    }
+
     /// Mark a colour texture as read back this session.
     ///
     /// See `PassState::note_color_read_back`. The store-action optimiser

@@ -5,6 +5,7 @@
 //! out-of-range percentage clamps (rendering above the presented size is not
 //! offered). The rect cases cover edge-based scaling, so abutting rects still
 //! share an edge, and `rect` and `rect_edges_i32` land on the same pixels.
+//! `factor` carries the same ratio as a float, for lengths the shaders scale.
 
 use super::*;
 
@@ -98,4 +99,16 @@ fn never_enlarges() {
     let s = RenderScale::from_percent(200);
     assert!(s.is_identity());
     assert_eq!(s.dimension(960), 960);
+}
+
+#[test]
+fn factor_is_the_render_over_logical_ratio() {
+    assert!((RenderScale::IDENTITY.factor() - 1.0).abs() < f32::EPSILON);
+    assert!((RenderScale::from_percent(50).factor() - 0.5).abs() < f32::EPSILON);
+    assert!((RenderScale::from_percent(75).factor() - 0.75).abs() < f32::EPSILON);
+    // A length converted with the factor lands where `dimension` puts the
+    // matching extent, give or take the rounding rule each side uses.
+    let s = RenderScale::from_percent(67);
+    let scaled = 480.0_f32 * s.factor();
+    assert!((scaled - 321.6).abs() < 0.05);
 }

@@ -244,7 +244,12 @@ use crate::shader_compile_stats::CompileBucket;
 /// `62` vertex texture fetch: a `vs_3_0` shader declaring samplers gains
 /// `[[texture(n)]]` / `[[sampler(n)]]` vertex-function arguments read via
 /// `texldl`, changing the MSL of every such vertex shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 62;
+///
+/// `63` point size converts to render pixels: the vertex epilogue multiplies
+/// the `POINTSIZE_MIN/MAX`-clamped size by `pos_fixup.w` (render pixels per
+/// logical pixel) and the fixed-function attenuation divides the same lane
+/// back out of the viewport height, changing the MSL of every vertex shader.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 63;
 
 /// File magic.
 ///

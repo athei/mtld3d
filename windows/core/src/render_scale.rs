@@ -58,6 +58,22 @@ impl RenderScale {
         self.0
     }
 
+    /// Render pixels per logical pixel, for the shader-side length conversions.
+    ///
+    /// The rect conversions above move coordinates; a length that D3D9 states
+    /// in logical pixels and Metal consumes in render pixels (the point size)
+    /// needs the ratio itself. Exactly `1.0` at the identity, so multiplying
+    /// by it is a no-op on the default path.
+    #[must_use]
+    pub fn factor(self) -> f32 {
+        if self.is_identity() {
+            return 1.0;
+        }
+        // The percentage is bounded to `[1, 100]`, so both operands are
+        // exactly representable and the quotient carries no surprise.
+        f32::from(u8::try_from(self.0).unwrap_or(100)) / 100.0
+    }
+
     /// Convert one logical dimension to its render-resolution counterpart.
     ///
     /// Never returns zero for a non-zero input: a back buffer dimension of `0`

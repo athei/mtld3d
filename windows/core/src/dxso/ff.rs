@@ -566,11 +566,18 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
 /// `D3DFVF_PSIZE` wins over `D3DRS_POINTSIZE`. With `scale` (the
 /// `D3DRS_POINTSCALEENABLE` key bit), the D3D9 attenuation applies:
 /// `S = Vh * Si / sqrt(A + B * De + C * De^2)` with `De` the eye-space
-/// distance of the vertex and `Vh` the viewport height, which the
-/// half-pixel fixup already carries as `-1 / Vh`. The attenuation
+/// distance of the vertex and `Vh` the viewport height. The attenuation
 /// denominator is floored at zero so a degenerate factor set clamps to
 /// `POINTSIZE_MAX` instead of producing a NaN size. `POINTSIZE_MIN/MAX`
 /// clamp the result either way. Needs `pos_view` in scope when `scale`.
+///
+/// Every size in the expression is a D3D9 length, i.e. logical pixels: the
+/// vertex and render-state sizes, the clamp range, and `Vh`, which is why the
+/// viewport height the half-pixel fixup carries as `-1 / Vh` (in the bound
+/// target's own space) is divided back by `pos_fixup.w`. Only the clamped
+/// result converts, once, to the render pixels `[[point_size]]` is measured
+/// in, so `render.scale` moves a point's diameter with the rest of the frame
+/// instead of leaving it at its logical size.
 fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
     if vs.has_psize() {
         out.push_str("    float psize = in.psize.x;\n");
@@ -580,10 +587,12 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
     if scale {
         out.push_str("    float de = length(pos_view.xyz);\n");
         out.push_str(
-            "    psize *= (-1.0 / pos_fixup.y) / sqrt(max(vs_draw.point_scale.x + vs_draw.point_scale.y * de + vs_draw.point_scale.z * de * de, 0.0));\n",
+            "    psize *= ((-1.0 / pos_fixup.y) / pos_fixup.w) / sqrt(max(vs_draw.point_scale.x + vs_draw.point_scale.y * de + vs_draw.point_scale.z * de * de, 0.0));\n",
         );
     }
-    out.push_str("    out.point_size = clamp(psize, vs_draw.point.y, vs_draw.point.z);\n");
+    out.push_str(
+        "    out.point_size = clamp(psize, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;\n",
+    );
 }
 
 /// Emit the vertex-blending block that computes `pos_view` and (when the VS reads normals) `n`.
@@ -728,11 +737,14 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         out,
         "    constant float4 *vs_c [[buffer({VS_FLOAT_CONST_SLOT})]],"
     );
-    // Half-pixel rasterization fixup uniform: `(1/vp_w, -1/vp_h, 0, 0)`,
-    // supplied per-draw by the encoder from the live viewport. Read by the
-    // transformed-position epilogue below (the XYZRHW branch folds the same
-    // offset into `ndc_x`/`ndc_y` directly). The uniform slots sit above the
-    // sixteen vertex-stream slots, so no app stream can collide with them.
+    // Half-pixel rasterization fixup uniform:
+    // `(1/vp_w, -1/vp_h, depth_clamp, render_scale)`, supplied per-draw by
+    // the encoder from the live viewport. Read by the transformed-position
+    // epilogue below (the XYZRHW branch folds the same offset into
+    // `ndc_x`/`ndc_y` directly) and by the point-size epilogue, which uses
+    // `.w` to convert a logical length to render pixels. The uniform slots
+    // sit above the sixteen vertex-stream slots, so no app stream can
+    // collide with them.
     let _ = writeln!(
         out,
         "    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]],"

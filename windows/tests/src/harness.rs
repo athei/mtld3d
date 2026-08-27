@@ -62,6 +62,39 @@ pub struct DrawIndexedUpParams {
     pub index_format: u32,
 }
 
+/// True when the suite rasterizes at the resolution D3D9 reports.
+///
+/// `make test SCALE=<n>` puts `render.scale` in `MTLD3D_CONFIG` for every test
+/// process: the frame is then rasterized smaller and resolved back up to the
+/// reported resolution on the way to a readback. A probe within a pixel or two
+/// of a colour boundary reads that resolve rather than what was rasterized, so
+/// an assertion that needs single-pixel resolution asks this first and pins its
+/// exact shape at the default scale. Everything that stays several pixels clear
+/// of a boundary holds at any scale and must not consult it.
+///
+/// Reads the environment the device reads, and takes the last `render.scale`
+/// segment because that is the one the config parser keeps.
+#[must_use]
+pub fn render_scale_is_identity() -> bool {
+    let Ok(config) = std::env::var("MTLD3D_CONFIG") else {
+        return true;
+    };
+    let Some(value) = config
+        .split(';')
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(key, _)| key.trim() == "render.scale")
+        .map(|(_, value)| value.trim())
+        .next_back()
+    else {
+        return true;
+    };
+    // A value the parser rejects leaves the device at the identity, so
+    // answering `true` matches what the frame will do.
+    value
+        .parse::<f32>()
+        .map_or(true, |scale| (scale - 1.0).abs() < f32::EPSILON)
+}
+
 /// A live device with its factory and window. Drops them in COM-correct order.
 pub struct Harness {
     d3d9: *mut c_void,
