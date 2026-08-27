@@ -11108,9 +11108,10 @@ const fn rs_classify(index: u32) -> RsClass {
         | D3DRS_SEPARATEALPHABLENDENABLE
         | D3DRS_SRCBLENDALPHA
         | D3DRS_DESTBLENDALPHA
-        // SRGBWRITEENABLE is consumed by the unix pipeline's sRGB
-        // format upgrade (unix/src/metal/pipeline.rs); see the
-        // PipelineSnapshot.srgb_write_enable field for the wiring.
+        // SRGBWRITEENABLE is consumed as a pixel-shader variant: the
+        // emitter appends the exact sRGB OETF to every exported colour
+        // output (`VariantFlags::SRGB_WRITE`, windows/core/src/dxso/emit.rs)
+        // and `Clear` converts its colour through the same curve.
         | D3DRS_SRGBWRITEENABLE
         | D3DRS_COLORWRITEENABLE
         | D3DRS_COLORWRITEENABLE1

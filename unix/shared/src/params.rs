@@ -810,19 +810,24 @@ pub struct TextureCreateDesc {
 /// One PE↔Unix crossing creates `count` textures from the descriptor
 /// array. `handles_out_ptr` points at a caller-owned `[u64; count]` buffer;
 /// each slot receives the resulting `MTLTexture*` (zero on per-element
-/// failure). Both arrays must be 8-byte aligned and stable for the
+/// failure). `srgb_handles_out_ptr` points at a second caller-owned
+/// `[u64; count]` buffer; each slot receives the eagerly-created sRGB twin
+/// view of the same texture when the pixel format has one
+/// (`PixelFormat::srgb_twin`), or NULL when the format has no sRGB
+/// encoding. All three arrays must be 8-byte aligned and stable for the
 /// duration of the call — the unix side dereferences these pointers,
 /// so the backing storage cannot move until `unix_call` returns.
 ///
-/// Single-create call sites use `count = 1` against a one-element array.
+/// Single-create call sites use `count = 1` against one-element arrays.
 #[repr(C, align(8))]
 pub struct CreateTexturesBatchParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
     pub count: u32,                                // in
     // allow: FFI struct padding; pub for cross-crate field-init.
     pub pad0: u32,
-    pub descs_ptr: u64,       // in: *const TextureCreateDesc, len=count
+    pub descs_ptr: u64,            // in: *const TextureCreateDesc, len=count
     pub handles_out_ptr: u64, // out: *mut MetalHandle<MTLTextureKind>, len=count (NULL on failure)
+    pub srgb_handles_out_ptr: u64, // out: *mut MetalHandle<MTLTextureKind>, len=count (NULL = no twin)
 }
 
 impl Thunk for CreateTexturesBatchParams {

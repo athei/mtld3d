@@ -119,6 +119,19 @@ impl SamplerKey {
     }
 }
 
+/// Whether a stage's `D3DSAMP_SRGBTEXTURE` value turns the sRGB decode on.
+///
+/// Only the LSB counts. Reference D3D9 drivers disagree on non-boolean
+/// values (some read the low bit, some keep the previous state, some treat
+/// any non-zero as on); the conformance suite pins the low-bit reading, so
+/// values like 0x7e41882a, 100 and 2 sample RAW. The single predicate for
+/// both the sampler-key flag and the draw-time texture-view pick, so the
+/// two can't drift.
+#[must_use]
+pub const fn srgb_texture_enabled(ss: &[u32; SAMPLER_STATE_COUNT]) -> bool {
+    ss[D3DSAMP_SRGBTEXTURE as usize] & 1 != 0
+}
+
 /// Build a `SamplerSnapshot` from the device's per-stage D3DSAMP array.
 ///
 /// `is_compare` is supplied separately by the caller (encoder) from the
@@ -134,7 +147,7 @@ pub const fn snapshot_from_state(
     if is_compare {
         flag_bits |= SamplerFlags::IS_COMPARE.bits();
     }
-    if ss[D3DSAMP_SRGBTEXTURE as usize] != 0 {
+    if srgb_texture_enabled(ss) {
         flag_bits |= SamplerFlags::SRGB_TEXTURE.bits();
     }
     SamplerSnapshot {

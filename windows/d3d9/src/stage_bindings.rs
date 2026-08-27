@@ -365,14 +365,11 @@ const fn samp_classify(type_: u32) -> SampClass {
         // MAXMIPLEVEL consumed by sampler_state::key_from_snapshot (mtld3d-core),
         // plumbed to setLodMinClamp on the unix side.
         | D3DSAMP_MAXMIPLEVEL
-        // SRGBTEXTURE consumed by sampler_state::key_from_snapshot
-        // (bit 38) — feeds the sampler-key hash so distinct samplers
-        // stay distinct, but no draw-time view swap. There is no
-        // eager sRGB texture-view path: it would force PixelFormatView
-        // usage on every BGRA8 / BC1-3 texture and block Metal
-        // lossless compression; no mtld3d target game actually sets
-        // this bit, and the CAMetalLayer DisplayP3 colorspace tag
-        // handles colour-space correctness at the compositor level.
+        // SRGBTEXTURE consumed at draw-time bind: the stage's texture
+        // handle resolves to the eager sRGB twin view
+        // (`Encoder::get_texture_handle_by_id_srgb`) so the hardware
+        // decodes sRGB→linear at sample time. Also feeds the
+        // sampler-key hash (bit 38) so distinct samplers stay distinct.
         | D3DSAMP_SRGBTEXTURE
         // BORDERCOLOR consumed by sampler_state::params_from_snapshot as
         // the nearest Metal border preset (transparent black, opaque black,

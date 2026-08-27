@@ -342,10 +342,16 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// One descriptor → one `MTLTexture`. The batched handler iterates this
 /// per element; same call shape used by both load-phase warmup batches
 /// and one-off lazy creates.
+///
+/// Returns `(handle, srgb_handle)`: the texture (or its swizzle view) plus
+/// the eagerly-created sRGB twin view when the format has one
+/// (`PixelFormat::srgb_twin`), else 0. The draw-time bind picks the twin
+/// when the stage's sampler has `D3DSAMP_SRGBTEXTURE=1`, giving the
+/// hardware sRGB→linear decode D3D9 promises for that state.
 pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let mtl_format = mtl_pixel_format(desc.pixel_format);
     let is_depth = is_depth_pixel_format(desc.pixel_format);
 
@@ -396,9 +402,9 @@ pub fn create_texture(
     // they need both the depth-attachment binding AND ShaderRead. We
     // deliberately don't add `PixelFormatView`: it blocks Metal's
     // lossless framebuffer compression on every BGRA8 / BC1-3 colour
-    // texture, and the only reason to want it would be an eager sRGB
-    // twin view for `D3DSAMP_SRGBTEXTURE`, which no mtld3d target game
-    // actually sets.
+    // texture, and nothing here needs it — the sRGB twin view below is
+    // exempt (linear↔sRGB views of the same base format are allowed
+    // without it), and no other reinterpreting view exists.
     let is_render_target = desc
         .usage_flags
         .intersects(TextureUsage::RENDER_TARGET | TextureUsage::DEPTH_STENCIL);
@@ -428,6 +434,62 @@ pub fn create_texture(
         format!("mtld3d-tex-{:#x}", desc.tex_id)
     };
     let label = objc2_foundation::NSString::from_str(&label_str);
+
+    // sRGB twin view, created eagerly for every colour format that has one so
+    // the draw-time bind can honour `D3DSAMP_SRGBTEXTURE=1` without a
+    // mid-frame crossing. Metal exempts linear↔sRGB views of the same base
+    // format from the `PixelFormatView` usage requirement, so the twin costs
+    // neither an extra usage flag nor the texture's lossless compression.
+    // The twin mirrors the base handle's swizzle (when the base is handed out
+    // as a swizzle view below) so the two views only ever differ in transfer
+    // function; it is sampled only, never bound as an attachment, so the
+    // render-target swizzle restriction doesn't apply to it.
+    let srgb_handle = if is_depth {
+        0
+    } else if let Some(srgb_format) = desc.pixel_format.srgb_twin() {
+        let base_is_swizzle_view =
+            !is_render_target && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
+        let swizzle_channels = if base_is_swizzle_view {
+            MTLTextureSwizzleChannels {
+                red: mtl_texture_swizzle(desc.swizzle_r),
+                green: mtl_texture_swizzle(desc.swizzle_g),
+                blue: mtl_texture_swizzle(desc.swizzle_b),
+                alpha: mtl_texture_swizzle(desc.swizzle_a),
+            }
+        } else {
+            MTLTextureSwizzleChannels {
+                red: objc2_metal::MTLTextureSwizzle::Red,
+                green: objc2_metal::MTLTextureSwizzle::Green,
+                blue: objc2_metal::MTLTextureSwizzle::Blue,
+                alpha: objc2_metal::MTLTextureSwizzle::Alpha,
+            }
+        };
+        // SAFETY: objc2 typed binding; `texture` is the freshly retained
+        // texture above; levels/slices ranges match its descriptor.
+        let view = unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                mtl_pixel_format(srgb_format),
+                texture.textureType(),
+                objc2_foundation::NSRange::new(0, desc.levels as usize),
+                objc2_foundation::NSRange::new(
+                    0,
+                    if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+                        6
+                    } else {
+                        1
+                    },
+                ),
+                swizzle_channels,
+            )
+        };
+        view.map_or(0, |view| {
+            let srgb_label = objc2_foundation::NSString::from_str(&format!("{label_str}-srgb"));
+            view.setLabel(Some(&srgb_label));
+            Retained::into_raw(view) as u64
+        })
+    } else {
+        0
+    };
 
     // Swizzle views don't apply to depth formats — depth shaders sample
     // via the `depth2d<float>` MSL type which returns a single channel.
@@ -469,13 +531,13 @@ pub fn create_texture(
         };
         if let Some(view) = view {
             view.setLabel(Some(&label));
-            return Some(Retained::into_raw(view) as u64);
+            return Some((Retained::into_raw(view) as u64, srgb_handle));
         }
     }
 
     texture.setLabel(Some(&label));
 
-    Some(Retained::into_raw(texture) as u64)
+    Some((Retained::into_raw(texture) as u64, srgb_handle))
 }
 
 /// Release a Metal texture handle.

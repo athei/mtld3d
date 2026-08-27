@@ -1031,6 +1031,17 @@ pub struct PassState {
     /// handle has been sampled by no earlier draw, so a rename needs no
     /// explicit clear here.
     frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// sRGB twin view → base texture, for every live twin the encoder created.
+    ///
+    /// A draw sampling with `D3DSAMP_SRGBTEXTURE=1` binds the twin handle,
+    /// but every identity question this module answers — "was this texture
+    /// sampled this frame" (rename-at-overlap), "does a later pass read this
+    /// attachment" (Clear coalescing, store-action Rules C/D) — is asked with
+    /// the base handle. The `emit_command` funnel resolves sampled twins to
+    /// their base for the sampled sets, and `pass_reads_texture` consults the
+    /// map for its command scans. Maintained by the encoder's texture
+    /// create / rename / destroy paths.
+    srgb_twin_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
     /// Session-wide set of texture handles that were EVER bound as a sampleable depth attachment.
     ///
     /// The bind runs via
@@ -1142,6 +1153,7 @@ impl PassState {
             backbuffer_logical_size: (0, 0),
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
+            srgb_twin_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             seen_sampleable_depth_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_caster_writes: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             frame_cascade_samples: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
@@ -1622,6 +1634,27 @@ impl PassState {
         }
     }
 
+    /// Register a live sRGB twin view for base-handle identity resolution.
+    ///
+    /// Called by the encoder whenever a texture create hands back a twin;
+    /// see the `srgb_twin_to_base` field for what the mapping protects.
+    pub fn register_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        if !twin.is_null() && !base.is_null() {
+            self.srgb_twin_to_base.insert(twin, base);
+        }
+    }
+
+    /// Drop a twin registration when its texture is destroyed or renamed.
+    pub fn unregister_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) {
+        if !twin.is_null() {
+            self.srgb_twin_to_base.remove(&twin);
+        }
+    }
+
     /// True when `handle` was bound as a fragment sampler input by an earlier draw this frame.
     ///
     /// Drives texture rename-at-overlap: an upload into such a texture must go
@@ -1847,6 +1880,13 @@ impl PassState {
             let tex = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
             self.seen_sampled_textures.insert(tex);
             self.frame_sampled_textures.insert(tex);
+            // An sRGB twin bind reads its base texture's storage — record the
+            // base too so rename-at-overlap and the store-action rules see the
+            // read under the handle they key on.
+            if let Some(&base) = self.srgb_twin_to_base.get(&tex) {
+                self.seen_sampled_textures.insert(base);
+                self.frame_sampled_textures.insert(base);
+            }
             // Cascade-sample counter: gated on the probe target so the
             // HashMap inc is skipped at default `RUST_LOG`. The map
             // stays empty when off; `take_cascade_frame_summary` then
@@ -3227,7 +3267,7 @@ impl PassState {
                         || loaded_later.contains(&tex)
                         || self.passes[i + 1..]
                             .iter()
-                            .any(|later| pass_reads_texture(later, tex))
+                            .any(|later| pass_reads_texture(later, tex, &self.srgb_twin_to_base))
                 });
                 if observed_later {
                     record_loads(&mut loaded_later);
@@ -3439,13 +3479,13 @@ impl PassState {
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
-            if needs_color && pass_reads_texture(cand, target_color) {
+            if needs_color && pass_reads_texture(cand, target_color, &self.srgb_twin_to_base) {
                 return None;
             }
             if needs_color
-                && target_extra
-                    .iter()
-                    .any(|&(tex, _)| !tex.is_null() && pass_reads_texture(cand, tex))
+                && target_extra.iter().any(|&(tex, _)| {
+                    !tex.is_null() && pass_reads_texture(cand, tex, &self.srgb_twin_to_base)
+                })
             {
                 return None;
             }
@@ -3492,7 +3532,9 @@ impl PassState {
                     return None;
                 }
             }
-            if (needs_depth || needs_stencil) && pass_reads_texture(cand, target_depth) {
+            if (needs_depth || needs_stencil)
+                && pass_reads_texture(cand, target_depth, &self.srgb_twin_to_base)
+            {
                 return None;
             }
             // Intervening Clear on the same attachment supersedes ours.
@@ -3789,15 +3831,29 @@ impl PassState {
 ///
 /// `target_handle == 0` is treated as "no read" since 0 is the unset
 /// sentinel for texture handles.
-fn pass_reads_texture(pass: &Pass, target_handle: MetalHandle<MTLTextureKind>) -> bool {
+fn pass_reads_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    srgb_twin_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
     if target_handle.is_null() {
         return false;
     }
     let target_raw = target_handle.raw();
-    let sampler_reads = pass
-        .commands
-        .iter()
-        .any(|c| c.cmd == CommandType::SetFragmentTexture as u32 && c.param_b == target_raw);
+    let sampler_reads = pass.commands.iter().any(|c| {
+        if c.cmd != CommandType::SetFragmentTexture as u32 {
+            return false;
+        }
+        if c.param_b == target_raw {
+            return true;
+        }
+        // A bind of the target's sRGB twin view reads the same storage.
+        // SAFETY: SetFragmentTexture's param_b holds a non-null MTLTexture
+        // handle, packed from the encoder's typed cache via .raw().
+        !srgb_twin_to_base.is_empty()
+            && srgb_twin_to_base.get(&unsafe { MetalHandle::new(c.param_b) })
+                == Some(&target_handle)
+    });
     if sampler_reads {
         return true;
     }
