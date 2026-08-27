@@ -508,6 +508,16 @@ impl<'h> Texture<'h> {
         unsafe { (self.vtbl().add_dirty_rect)(self.ptr, core::ptr::null()) }
     }
 
+    /// `AddDirtyRect` over one sub-rectangle. Returns the hr.
+    ///
+    /// `rect` is a `D3DRECT`-style `[left, top, right, bottom]`.
+    #[must_use]
+    pub fn add_dirty_rect_partial(&self, rect: &[i32; 4]) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and `rect` is four `LONG`s,
+        // the `RECT` layout the call reads.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, rect.as_ptr().cast::<c_void>()) }
+    }
+
     /// `GetType` (`D3DRTYPE_*`).
     #[must_use]
     pub fn resource_type(&self) -> u32 {

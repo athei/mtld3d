@@ -138,6 +138,7 @@ windows/core/src/shader_cache.rs CacheEntry Clone,Debug,PartialEq,Eq
 windows/core/src/shader_cache.rs CachedKind Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/shader_compile_stats.rs CompileBucket Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/shader_compile_stats.rs Snapshot Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/staging_coverage.rs CoverageState Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/stretch_rect.rs RejectReason Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
