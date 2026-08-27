@@ -1158,6 +1158,44 @@ fn rule_a_reset_frame_re_arms_dontcare() {
 }
 
 #[test]
+fn rule_a_depth_wider_than_the_rt_loads_on_first_use() {
+    // D3D9 only requires the depth-stencil surface to be at least as large as
+    // the render target, so a larger one is legal. Under a viewport that covers
+    // render target 0 exactly, the pass cannot write the depth surface outside
+    // that area, so its first use in the frame must Load rather than discard
+    // what the surface holds there. The stencil plane rides the same texture.
+    let rt = tex(0x3000);
+    let ds = tex(0x3300);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(ds, (512, 512), false, true);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Load);
+    assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
+    // The colour plane is judged against its own extent and keeps the discard.
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn rule_a_depth_matching_the_rt_still_discards_on_first_use() {
+    // The counterpart to the oversized case: a depth surface the viewport does
+    // cover keeps Rule A's first-use discard, so measuring the depth plane
+    // against its own extent costs nothing in the common shape.
+    let rt = tex(0x3000);
+    let ds = tex(0x3300);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(ds, (256, 256), false, true);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+    assert_eq!(s.passes()[0].stencil_load(), StencilLoad::DontCare);
+}
+
+#[test]
 fn rule_a_first_use_stencil_is_dontcare_and_later_use_loads() {
     // The stencil plane lives in the depth texture, so it takes the
     // first-use DontCare under the depth predicate. A second pass on the
