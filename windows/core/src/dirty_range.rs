@@ -23,6 +23,21 @@ impl DirtyRange {
         Self { min: 0, max: 0 }
     }
 
+    /// Every byte of a `logical_len`-byte buffer.
+    ///
+    /// `Staged` VB/IB creation seeds this so the first `Unlock` uploads
+    /// the whole staging buffer. Its device buffer starts undefined and
+    /// nothing fills it, and a fill done entirely through `D3DLOCK_READONLY`
+    /// locks records no range at all, so the opening upload has to carry
+    /// everything or the GPU reads bytes no one wrote.
+    #[must_use]
+    pub const fn full(logical_len: u32) -> Self {
+        Self {
+            min: 0,
+            max: logical_len,
+        }
+    }
+
     /// Whether the range covers no bytes.
     #[must_use]
     pub const fn is_empty(&self) -> bool {

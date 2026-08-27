@@ -30,12 +30,26 @@
 //!   rationale. It is also the only arm with no other side effect, so
 //!   `d3d9` counts it into a perf row.
 //!
+//! `Staged` buffers get their own two rules here. `records_dirty_range`
+//! decides whether a `Lock` widens the pending-upload range at all, which
+//! is where `D3DLOCK_READONLY` is honoured, and only in the pool that
+//! gives it meaning. `may_trust_lock_bounds`
+//! then decides whether the `[OffsetToLock, SizeToLock)` window a title
+//! announces bounds the bytes it actually writes, and therefore whether
+//! the Unlock upload can be narrowed to that window or has to carry the
+//! whole buffer. It answers yes for an ordinary lock unless
+//! `buffer.ignoreLockBounds` is set, because a whole-buffer range here is
+//! not a wider memcpy but a rename; it answers no either way for the two
+//! lock shapes that name no narrower window, `D3DLOCK_DISCARD` and a zero
+//! `SizeToLock`.
+//!
 //! Side effects (allocate `PageBox`, sync memcpy preserve, queue
 //! retention, bump perf counters) stay in `d3d9`; this module just
 //! returns a verdict.
 
 use mtld3d_types::{
-    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DUSAGE_DYNAMIC,
 };
 
 /// What the caller should do with the old backing's contents on a rename.
@@ -169,6 +183,92 @@ pub const fn classify_map_mode(usage: u32, pool: u32) -> BufferMapMode {
     } else {
         BufferMapMode::Staged
     }
+}
+
+/// Whether a `Staged` buffer's `Lock` bounds may be taken as the extent of its writes.
+///
+/// A `Staged` buffer has a device buffer separate from its CPU staging and
+/// uploads only the range recorded at `Lock`, so every byte a title writes
+/// through the returned pointer without naming it is dropped and the GPU
+/// reads whatever the device allocation happened to hold. A real D3D9
+/// driver never noticed such a write, because the pointer it handed back
+/// was into the single allocation the GPU read.
+///
+/// `true`, the default, means the announcement is taken at its word: it is
+/// the dirty range D3D9 describes, the titles that overrun it are rare,
+/// and widening is far more expensive here than the extra copy it looks
+/// like. A whole-buffer range always overlaps a range a draw already read
+/// this frame, so it takes the rename-at-overlap path, which costs a fresh
+/// device buffer, a full device-to-device preserve copy, and retention
+/// against `memory.vbibRetentionCapMB`, where reaching the cap forces a
+/// synchronous mid-frame submit.
+///
+/// `ignore_configured` is `buffer.ignoreLockBounds`, for a title that
+/// provably writes outside the window it names. It applies to every
+/// `Staged` buffer, whatever its pool and usage: no pool's contract says
+/// how far a write through the returned pointer may reach, so a title that
+/// miscounts the window it announces miscounts it on a `MANAGED` buffer as
+/// readily as on a `DEFAULT` one.
+///
+/// Two further terms hold in both positions, because neither names a
+/// narrower window to disbelieve in the first place. `D3DLOCK_DISCARD`
+/// abandons the whole buffer's contents by definition, and reaching it on
+/// a `Staged` buffer means the flag was used outside the
+/// `D3DUSAGE_DYNAMIC` it is defined for, which the caller warns about.
+/// `SizeToLock == 0` is documented as locking the entire buffer, which
+/// also settles the undocumented `(offset > 0, 0)` form: widening to
+/// `[0, logical_len)` uploads the head rather than leaving it as the
+/// previous upload left it.
+///
+/// - `flags` is the raw `D3DLOCK_*` bitfield from the game.
+/// - `_usage` / `_pool` are the buffer's creation `D3DUSAGE_*` bitfield and
+///   `D3DPOOL_*` value. Neither is read: the rule has no pool or usage
+///   term. They stay so the caller passes what it has, and so the test
+///   matrix can pin that independence over every pair reaching `Staged`.
+/// - `size_to_lock` is the announced size, `0` meaning to end of buffer.
+#[must_use]
+pub const fn may_trust_lock_bounds(
+    flags: u32,
+    _usage: u32,
+    _pool: u32,
+    size_to_lock: u32,
+    ignore_configured: bool,
+) -> bool {
+    !ignore_configured && size_to_lock != 0 && flags & D3DLOCK_DISCARD == 0
+}
+
+/// Whether a `Staged` buffer's `Lock` widens the range its `Unlock` will upload.
+///
+/// `D3DLOCK_READONLY` promises the caller will not write, and that promise
+/// buys something only where a system-memory master copy exists whose
+/// upload can be skipped, which is `D3DPOOL_MANAGED`: the pool is defined
+/// by the runtime holding that copy and refreshing the device one from the
+/// ranges the application dirties. An unmanaged pool has no second copy
+/// and nothing to read back, so the flag carries no information there and
+/// a write made under it has to reach the device buffer like any other.
+///
+/// `D3DLOCK_NO_DIRTY_UPDATE` is deliberately **not** honoured, and the
+/// difference from READONLY is the whole point: it asks that the region
+/// stay out of the dirty record, but it is not a promise that nothing was
+/// written. Dropping the range would drop the write. That is safe only for
+/// an implementation that uploads a managed buffer at draw time from a
+/// standing whole-buffer dirty range, where the bytes ride along on the
+/// next upload anyway. This one uploads at `Unlock` and clears the range,
+/// so the write would simply be lost. The conformance suite pins that it
+/// must not be: it fills a `MANAGED` buffer under no flags, refills it
+/// under `NO_DIRTY_UPDATE` with no draw in between, and requires the draw
+/// to show the second fill.
+///
+/// Returning `false` never loses a buffer's opening contents: creation
+/// seeds a `Staged` buffer's range full, so the first `Unlock` carries
+/// every byte however the title filled it, and a fill made entirely
+/// through locks this rejects still reaches the GPU once.
+///
+/// - `flags` is the raw `D3DLOCK_*` bitfield from the game.
+/// - `pool` is the buffer's creation `D3DPOOL_*` value.
+#[must_use]
+pub const fn records_dirty_range(flags: u32, pool: u32) -> bool {
+    !(flags & D3DLOCK_READONLY != 0 && pool == D3DPOOL_MANAGED)
 }
 
 #[cfg(test)]

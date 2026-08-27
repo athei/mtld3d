@@ -9,7 +9,10 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
-    buffer_rename::{BufferMapMode, LockPlan, PreserveKind, classify_map_mode, plan_lock},
+    buffer_rename::{
+        BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
+        records_dirty_range,
+    },
     dirty_range::DirtyRange,
     ids::BufferId,
     page_box::PageBox,
@@ -140,7 +143,19 @@ pub struct IndexBufferCreateInfo {
 
 impl Direct3DIndexBuffer9 {
     pub fn new(info: &IndexBufferCreateInfo) -> Self {
-        let current_box = PageBox::new_uninit(info.length as usize);
+        // Zeroed and full-dirty for the same reasons as
+        // `Direct3DVertexBuffer9::new`: a `Staged` buffer's opening upload
+        // carries every byte, so untouched bytes must be defined, and that
+        // opening upload is unconditional because the device buffer starts
+        // undefined, no blit command can fill it, and a fill made only
+        // through locks `records_dirty_range` rejects announces nothing.
+        let current_box = PageBox::new_zeroed(info.length as usize);
+        let map_mode = classify_map_mode(info.usage, info.pool);
+        let dirty = if matches!(map_mode, BufferMapMode::Staged) {
+            DirtyRange::full(info.length)
+        } else {
+            DirtyRange::empty()
+        };
         let inner = Box::into_raw(Box::new(IndexBufferInner {
             device_inner: info.device_inner,
             buffer_id: BufferId::new_unique(),
@@ -149,8 +164,8 @@ impl Direct3DIndexBuffer9 {
             format: info.format,
             pool: info.pool,
             private_data: PrivateDataStore::default(),
-            map_mode: classify_map_mode(info.usage, info.pool),
-            dirty: DirtyRange::empty(),
+            map_mode,
+            dirty,
             current_box,
             last_submit_seq: 0,
             locked: false,
@@ -446,15 +461,31 @@ extern "system" fn ib_lock(
         // Separate CPU staging: record the dirtied range for the Unlock
         // upload. No rename / no `plan_lock` — the GPU reads a distinct
         // device buffer, so a partial write can't race an in-flight draw.
-        // READONLY contributes nothing (the game promises not to write).
-        if flags & D3DLOCK_READONLY == 0 {
+        // `records_dirty_range` drops the locks that leave the device
+        // buffer nothing to pick up: READONLY, in the one pool that keeps
+        // a system-memory copy whose upload it can skip, and
+        // NO_DIRTY_UPDATE is not honoured: it is not a promise that
+        // nothing was written, and this path has no later upload to carry
+        // the bytes, so dropping the range would drop the write.
+        if records_dirty_range(flags, inner.pool) {
             if flags & D3DLOCK_DISCARD != 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "ib_lock: D3DLOCK_DISCARD on a non-DYNAMIC (Staged) buffer — treating as a normal dirtied-range upload");
             }
-            inner
-                .dirty
-                .conjoin(offset_to_lock, size_to_lock, inner.length);
+            // `(0, 0)` is `conjoin`'s "to end of buffer"; see the twin
+            // comment in `vb_lock`.
+            let (dirty_offset, dirty_size) = if may_trust_lock_bounds(
+                flags,
+                inner.usage,
+                inner.pool,
+                size_to_lock,
+                crate::config::CONFIG.buffer_ignore_lock_bounds,
+            ) {
+                (offset_to_lock, size_to_lock)
+            } else {
+                (0, 0)
+            };
+            inner.dirty.conjoin(dirty_offset, dirty_size, inner.length);
         }
     }
 

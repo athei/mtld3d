@@ -97,6 +97,25 @@ pub struct Mtld3dConfig {
     /// target before use (the common case) would pay one full-surface
     /// copy per switch for nothing. File key: `depth.aliasSameSize`.
     pub depth_alias_same_size: bool,
+    /// Disbelieve the `[OffsetToLock, SizeToLock)` window a `Lock` on a static VB/IB announces.
+    ///
+    /// Every vertex or index buffer except a `DEFAULT` + `DYNAMIC` one
+    /// keeps its CPU staging separate from the device buffer the GPU
+    /// reads, so only the bytes recorded at `Lock` are uploaded. A
+    /// handful of D3D9-era titles write past the window they named, and a
+    /// real driver never noticed because the pointer it handed back was
+    /// into the one allocation the GPU read. Default: `false`, the
+    /// announcement is taken at its word: that is the dirty range the
+    /// D3D9 contract describes, and the only affordable one here. Set
+    /// `true` for a title whose geometry is stretched, folded or missing
+    /// where it re-locks a static buffer: the announcement then binds
+    /// only for a `MANAGED` or `DYNAMIC` buffer and every other one
+    /// uploads whole. A whole-buffer range always overlaps a range a draw
+    /// already read this frame, so it is not a wider copy but a rename: a
+    /// fresh device buffer, a full device-to-device preserve copy, and
+    /// retention against `memory.vbibRetentionCapMB`.
+    /// File key: `buffer.ignoreLockBounds`.
+    pub buffer_ignore_lock_bounds: bool,
     /// Proactive cap on live VB/IB retained-`PageBox` bytes.
     ///
     /// When live retention reaches this, the capped alloc path (a Lock
@@ -206,6 +225,7 @@ impl Default for Mtld3dConfig {
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
             depth_alias_same_size: false,
+            buffer_ignore_lock_bounds: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             // The 32-bit address space is the ceiling that matters, not the
             // GPU's memory: a unified-memory Mac has far more than a D3D9
@@ -332,6 +352,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: buffer.ignoreLockBounds = {}", cfg.buffer_ignore_lock_bounds
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: memory.vbibRetentionCapMB = {}",
         cfg.vbib_retention_cap_bytes / (1024 * 1024)
     );
@@ -390,6 +414,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
+        "buffer.ignoreLockBounds" => {
+            assign_bool(source, key, value, &mut cfg.buffer_ignore_lock_bounds);
+        }
         "memory.vbibRetentionCapMB" => {
             assign_cap_mb(source, key, value, &mut cfg.vbib_retention_cap_bytes);
         }
