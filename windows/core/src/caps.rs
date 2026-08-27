@@ -207,6 +207,10 @@ const STRETCH_RECT_FILTER: FilterCaps = FilterCaps::MINFPOINT
 const GUARD_BAND: f32 = 32768.0;
 
 /// Filter caps for the 2D texture path: point, linear, and anisotropic minification.
+///
+/// Device-wide, not per format: whether one format samples with linear
+/// filtering is `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`, which answers the
+/// single-precision float family from the device (`format::supports_usage_query`).
 const FILTER_DEFAULT: FilterCaps = FilterCaps::MINFPOINT
     .union(FilterCaps::MINFLINEAR)
     .union(FilterCaps::MINFANISOTROPIC)

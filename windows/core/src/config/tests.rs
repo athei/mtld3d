@@ -23,6 +23,7 @@ fn defaults_match_documented_values() {
     let d = Mtld3dConfig::default();
     assert!(!d.caps_all);
     assert!(!d.expand_packed16);
+    assert!(d.float32_filtering);
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
@@ -246,13 +247,14 @@ fn boolean_keys_round_trip_both_values() {
     let cfg = parse(
         None,
         "debug.capsAll = true\ncolor.hdr.enable = false\nshaderCache.enable = false\n\
-         debug.expandPacked16 = true\n",
+         debug.expandPacked16 = true\ndebug.float32Filtering = false\n",
         None,
     );
     assert!(cfg.caps_all);
     assert!(!cfg.hdr_enable);
     assert!(!cfg.shader_cache_enable);
     assert!(cfg.expand_packed16);
+    assert!(!cfg.float32_filtering);
 }
 
 #[test]

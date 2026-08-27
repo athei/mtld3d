@@ -318,13 +318,17 @@ const fn is_cube_texture_format(fmt: u32) -> bool {
 // affects reads — render writes would land in the wrong bits — so `A4R4G4B4`
 // is a sampling-only format everywhere.
 //
-// The float family is renderable: every one of R16F / G16R16F /
-// A16B16G16R16F / R32F / G32R32F / A32B32G32R32F builds a colour pipeline —
-// blend-enabled included — on Apple Silicon, and `supports32BitFloatFiltering`
-// is true there, so the 32-bit members sample with linear filtering as well.
-// Engines that render HDR internally (an off-screen float scene target, their
-// own tone-map into the 8-bit backbuffer) probe exactly this before choosing
-// their scene format.
+// The float family is renderable on every device: Metal's pixel-format
+// capability table lists R16Float / RG16Float / RGBA16Float and R32Float /
+// RG32Float / RGBA32Float as colour-renderable for both the Apple and the
+// Mac2 GPU families, so the answer needs no device query. Linear FILTERING is
+// the half that differs, and it is not this predicate: the half-float members
+// filter everywhere, while the single-precision three depend on
+// `MTLDevice.supports32BitFloatFiltering`, which `CheckDeviceFormat` answers
+// from the device for `D3DUSAGE_QUERY_FILTER`
+// (`format::supports_usage_query`). Engines that render HDR internally (an
+// off-screen float scene target, their own tone-map into the 8-bit
+// backbuffer) probe exactly this before choosing their scene format.
 pub const fn is_render_target_format(fmt: u32) -> bool {
     matches!(
         fmt,
@@ -638,6 +642,31 @@ pub fn native_packed16_supported() -> bool {
     native
 }
 
+/// Whether the Metal device filters single-precision float textures.
+///
+/// `MTLDevice.supports32BitFloatFiltering` covers exactly R32F / G32R32F /
+/// A32B32G32R32F; `CheckDeviceFormat` answers `D3DUSAGE_QUERY_FILTER` for
+/// those three with it, so an engine that probes before picking a scene
+/// format takes its own fallback instead of sampling a format the device
+/// point-samples. The half-float members are filterable on every family and
+/// are unaffected. `debug.float32Filtering = false` forces the negative
+/// answer on any device so the path can be exercised on Apple Silicon.
+fn float32_filtering_supported() -> bool {
+    let supported = device_info()
+        .caps
+        .contains(DeviceCapsFlags::FLOAT32_FILTERING)
+        && crate::config::CONFIG.float32_filtering;
+    if !supported {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "32-bit float filtering unavailable (forced={}): R32F/G32R32F/A32B32G32R32F \
+             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER",
+            !crate::config::CONFIG.float32_filtering
+        );
+    }
+    supported
+}
+
 /// One spoofed adapter identity: everything a game sniffs, kept consistent.
 struct SpoofIdentity {
     vendor: u32,
@@ -854,6 +883,18 @@ extern "system" fn d3d9_check_device_format(
     if usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING != 0
         && !is_render_target_format_on_device(check_format)
     {
+        return D3DERR_NOTAVAILABLE;
+    }
+    // D3DUSAGE_QUERY_FILTER asks whether the format samples with linear
+    // filtering, which is a per-format device answer rather than the
+    // device-wide `D3DPTFILTERCAPS` bits `GetDeviceCaps` reports. Only the
+    // single-precision float family depends on the device; every other
+    // advertised format filters on both GPU families.
+    if !mtld3d_core::format::supports_usage_query(
+        check_format,
+        usage,
+        float32_filtering_supported(),
+    ) {
         return D3DERR_NOTAVAILABLE;
     }
     let supported = if rtype == D3DRTYPE_CUBETEXTURE {

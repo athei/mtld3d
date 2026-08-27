@@ -7,7 +7,7 @@ use mtld3d_types::{
     D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
     D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
     D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DUSAGE_QUERY_FILTER,
 };
 
 use super::LOG_TARGET;
@@ -268,6 +268,33 @@ pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<F
         }
     }
     map_d3d_format(d3d_format)
+}
+
+/// The device-dependent half of a `CheckDeviceFormat` usage query.
+///
+/// `D3DUSAGE_QUERY_FILTER` asks whether a format samples with linear
+/// filtering. Metal's pixel-format capability table makes every colour format
+/// in the mapping table filterable on both the Apple and the Mac2 families
+/// with one exception: the single-precision floats R32F / G32R32F /
+/// A32B32G32R32F filter only where `MTLDevice.supports32BitFloatFiltering`
+/// holds, which `float32_filtering` carries from the device. The half-float
+/// members (R16F / G16R16F / A16B16G16R16F) filter on every family and stay
+/// advertised either way.
+///
+/// Every other usage bit is device-independent and passes through: the
+/// render-target, blending and sRGB arms are the caller's to answer, and
+/// renderability needs no device query at all, since the same table lists all
+/// six float members as colour-renderable on both families.
+#[must_use]
+pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering: bool) -> bool {
+    if usage & D3DUSAGE_QUERY_FILTER == 0 {
+        return true;
+    }
+    float32_filtering
+        || !matches!(
+            d3d_format,
+            D3DFMT_R32F | D3DFMT_G32R32F | D3DFMT_A32B32G32R32F
+        )
 }
 
 #[must_use]

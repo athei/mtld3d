@@ -518,6 +518,14 @@ bitflags! {
         /// Apple-GPU-family feature; the Intel/AMD Bronze driver (Mac2)
         /// aborts texture creation on them.
         const NATIVE_PACKED16 = 1 << 1;
+        /// Single-precision float textures sample with linear filtering.
+        ///
+        /// `MTLDevice.supports32BitFloatFiltering`, which covers exactly
+        /// `R32Float` / `RG32Float` / `RGBA32Float`. Apple-family GPUs
+        /// report it; Mac2 devices answer for themselves, and the
+        /// Intel/AMD Bronze driver typically says no. The half-float
+        /// formats filter on every family and are not covered by this bit.
+        const FLOAT32_FILTERING = 1 << 2;
     }
 }
 
