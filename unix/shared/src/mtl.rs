@@ -493,6 +493,26 @@ bitflags! {
 }
 
 bitflags! {
+    /// Boolean device capabilities answered by the `GetDeviceInfo` thunk.
+    ///
+    /// One flags word carries every per-device yes/no the PE side needs for
+    /// caps advertisement, so a single `GetDeviceInfo` call (cached process-
+    /// wide on the PE side) serves all consumers. New device-dependent caps
+    /// bits belong here, not in new thunks or new param fields.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DeviceCapsFlags: u32 {
+        /// Border-colour samplers are creatable (Mac2 family, not paravirtual).
+        const SAMPLER_BORDER = 1 << 0;
+        /// The packed 16-bit pixel formats exist natively on this device.
+        ///
+        /// `B5G6R5Unorm` / `Bgr5A1Unorm` / `Abgr4Unorm` are an
+        /// Apple-GPU-family feature; the Intel/AMD Bronze driver (Mac2)
+        /// aborts texture creation on them.
+        const NATIVE_PACKED16 = 1 << 1;
+    }
+}
+
+bitflags! {
     /// `TextureCreateDesc::usage_flags` bits.
     ///
     /// `RENDER_TARGET` requests `MTLTextureUsage::RenderTarget` so the

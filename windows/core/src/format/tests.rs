@@ -131,3 +131,62 @@ fn is_mapped_color_format_tracks_the_lookup() {
         assert!(map_d3d_format(fmt).is_none(), "format {fmt}");
     }
 }
+
+#[test]
+fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5};
+
+    use super::map_d3d_format_device;
+
+    // native_packed16 = true: identical to the plain lookup for every format.
+    for fmt in [
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_A8R8G8B8,
+        D3DFMT_A16B16G16R16F,
+    ] {
+        let native = map_d3d_format_device(fmt, true).expect("mapped");
+        let plain = map_d3d_format(fmt).expect("mapped");
+        assert_eq!(
+            native.metal_pixel_format(),
+            plain.metal_pixel_format(),
+            "format {fmt}"
+        );
+        assert_eq!(native.swizzle(), plain.swizzle(), "format {fmt}");
+        assert_eq!(
+            native.bytes_per_pixel(),
+            plain.bytes_per_pixel(),
+            "format {fmt}"
+        );
+    }
+
+    // native_packed16 = false: the three packed members back Bgra8Unorm while
+    // keeping their 2-byte SOURCE layout (Lock pitch and staging sizing).
+    let r5g6b5 = map_d3d_format_device(D3DFMT_R5G6B5, false).expect("mapped");
+    assert_eq!(r5g6b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(r5g6b5.bytes_per_pixel(), 2);
+    assert_eq!(r5g6b5.block_bytes(), 2);
+    assert_eq!(
+        r5g6b5.swizzle(),
+        Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One])
+    );
+    assert!(!r5g6b5.has_alpha());
+
+    let a1r5g5b5 = map_d3d_format_device(D3DFMT_A1R5G5B5, false).expect("mapped");
+    assert_eq!(a1r5g5b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(a1r5g5b5.bytes_per_pixel(), 2);
+    assert_eq!(a1r5g5b5.swizzle(), None);
+    assert!(a1r5g5b5.has_alpha());
+
+    let a4r4g4b4 = map_d3d_format_device(D3DFMT_A4R4G4B4, false).expect("mapped");
+    assert_eq!(a4r4g4b4.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(a4r4g4b4.bytes_per_pixel(), 2);
+    assert_eq!(a4r4g4b4.swizzle(), None, "repack writes D3D channel order");
+    assert!(a4r4g4b4.has_alpha());
+
+    // Non-packed formats are untouched by the flag.
+    let bgra = map_d3d_format_device(D3DFMT_A8R8G8B8, false).expect("mapped");
+    assert_eq!(bgra.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(bgra.bytes_per_pixel(), 4);
+}

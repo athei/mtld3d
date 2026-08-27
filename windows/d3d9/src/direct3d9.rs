@@ -7,6 +7,7 @@ use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
+    mtl::DeviceCapsFlags,
     mtl_handle::{MTLTextureKind, NSViewKind},
 };
 use mtld3d_types::{
@@ -251,16 +252,17 @@ const fn is_conversion_source(fmt: u32) -> bool {
 ///
 /// A format always converts to itself (the identity rows hold for any code,
 /// mapped or not). Otherwise the source must be something the blit can read
-/// ([`is_conversion_source`]) and the destination a renderable colour format
-/// (`is_render_target_format`), which is what the render-quad writes into.
+/// ([`is_conversion_source`] — a pure predicate, since sources are sampled on
+/// every device) and the destination a colour format this device renders into
+/// (`is_render_target_format_on_device` — the render-quad writes into it).
 /// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
 /// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
 /// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
-const fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
+fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
     if src == dst {
         return true;
     }
-    is_conversion_source(src) && is_render_target_format(dst)
+    is_conversion_source(src) && is_render_target_format_on_device(dst)
 }
 
 // Formats the texture pool can sample or receive uploads in.
@@ -298,16 +300,23 @@ const fn is_cube_texture_format(fmt: u32) -> bool {
         && !is_depth_stencil_format(fmt)
 }
 
-// Formats the Metal backend can render into.
+// Formats the Metal backend can render into, as a pure format-family predicate.
 //
 // `R5G6B5` and `A1R5G5B5` map bit-for-bit to the native `B5G6R5Unorm` /
 // `BGR5A1Unorm` Metal formats, which are colour-renderable on Apple GPUs, so
-// they are valid render targets. `A4R4G4B4` is excluded: its native Metal
-// format (`ABGR4Unorm`) has a different channel order that is corrected with a
-// sampler swizzle, and a swizzle only affects reads — render writes would land
-// in the wrong bits — so `A4R4G4B4` is a sampling-only format. Backbuffer /
-// CAMetalLayer is hardcoded BGRA8, so a request for one of these as a backbuffer
-// format hits the existing substitute-warn at `d3d9_create_device`.
+// they are valid render targets there — but only there: on a device without
+// the packed 16-bit formats they are sampling-only (expanded to BGRA8 at
+// upload), and every advertisement or create gate must use
+// `is_render_target_format_on_device` instead of this predicate. This pure
+// form remains for the sites where the answer is device-independent: the
+// backbuffer question (`CheckDeviceType` — the CAMetalLayer is hardcoded
+// BGRA8 and `d3d9_create_device` substitutes it for a 16-bit request, so a
+// 16-bit backbuffer works on every device) and the conversion SOURCE side (a
+// conversion source is sampled, never rendered into). `A4R4G4B4` is excluded
+// even on Apple GPUs: its native Metal format (`ABGR4Unorm`) has a different
+// channel order that is corrected with a sampler swizzle, and a swizzle only
+// affects reads — render writes would land in the wrong bits — so `A4R4G4B4`
+// is a sampling-only format everywhere.
 //
 // The float family is renderable: every one of R16F / G16R16F /
 // A16B16G16R16F / R32F / G32R32F / A32B32G32R32F builds a colour pipeline —
@@ -332,6 +341,30 @@ pub const fn is_render_target_format(fmt: u32) -> bool {
             | D3DFMT_G32R32F
             | D3DFMT_A32B32G32R32F
     )
+}
+
+/// [`is_render_target_format`], restricted to what this device renders into.
+///
+/// On a device without the native packed 16-bit formats, `R5G6B5` and
+/// `A1R5G5B5` drop out: they are backed by BGRA8 and sampled fine, but a
+/// BGRA8-backed "16-bit render target" would change `GetRenderTargetData` /
+/// `LockRect` readback fidelity and need pack-down machinery, so the honest
+/// answer is to not advertise them (engines probe
+/// `CheckDeviceFormat(RENDERTARGET)` and fall back to X8R8G8B8). Every
+/// advertisement arm and create gate that concerns actually rendering into a
+/// surface uses this form.
+pub fn is_render_target_format_on_device(fmt: u32) -> bool {
+    is_render_target_format(fmt)
+        && (native_packed16_supported() || !matches!(fmt, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
+}
+
+/// `map_d3d_format_device` with this device's packed 16-bit answer applied.
+///
+/// The form every create path that freezes a Metal format into a texture
+/// must use; layout-only callers (Lock pitch, staging sizing) may keep the
+/// plain `map_d3d_format`, whose source-layout fields are identical.
+pub fn map_for_device(format: u32) -> Option<mtld3d_core::format::FormatMapping> {
+    mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported())
 }
 
 /// Depth-stencil formats.
@@ -483,26 +516,10 @@ extern "system" fn d3d9_get_adapter_identifier(
     let device_name = b"\\\\.\\DISPLAY1\0";
     id.device_name[..device_name.len()].copy_from_slice(device_name);
 
-    let mut name_buf = [0u8; 256];
-    let mut params = GetDeviceInfoParams {
-        name_ptr: name_buf.as_mut_ptr() as u64,
-        name_buf_len: 256,
-        name_len: 0,
-        registry_id: 0,
-        supports_sampler_border: 0,
-    };
-    unix_call(&mut params);
-
-    // Clamp to what `name_buf` actually holds (the unix side fills at most
-    // `name_buf_len` bytes). `name_len` is the untruncated length and can exceed
-    // the buffer, so clamping only to `id.description`'s size would slice
-    // `name_buf` out of bounds. `description` (512 B) comfortably holds <= 256.
-    let len = usize::try_from(params.name_len)
-        .unwrap_or(usize::MAX)
-        .min(name_buf.len());
-    id.description[..len].copy_from_slice(&name_buf[..len]);
+    let info = device_info();
+    id.description[..info.name_len].copy_from_slice(&info.name[..info.name_len]);
     // D3DADAPTER_IDENTIFIER9.device_id is u32 by D3D9 spec; mask to 16 bits.
-    id.device_id = u32::try_from(params.registry_id & 0xFFFF).expect("16-bit mask fits u32");
+    id.device_id = u32::try_from(info.registry_id & 0xFFFF).expect("16-bit mask fits u32");
 
     // `adapter.spoof`: report a consistent well-known GPU identity. Engines of
     // this era key whole render paths (depth copies, shadow filtering) off the
@@ -548,24 +565,77 @@ extern "system" fn d3d9_get_adapter_identifier(
     0 // S_OK
 }
 
-/// Whether the Metal device can create border-colour samplers.
+/// Device identity + capability bits from the one process-wide `GetDeviceInfo` call.
 ///
-/// Queried once per process from the unix side; `GetDeviceCaps` strips
-/// `D3DPTADDRESSCAPS_BORDER` when it cannot (virtualized CI devices), and
-/// the unix sampler path clamps to edge for a title that ignores the cap.
-pub fn sampler_border_supported() -> bool {
-    static SUPPORTED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+/// Every device-conditional advertised cap derives from this single cached
+/// answer, so all consumers (adapter identity, `GetDeviceCaps` bits, format
+/// mapping) agree on the same device without re-querying the unix side.
+struct CachedDeviceInfo {
+    name: [u8; 256],
+    name_len: usize,
+    registry_id: u64,
+    caps: DeviceCapsFlags,
+}
+
+/// The process-wide `GetDeviceInfo` answer, fetched once on first use.
+fn device_info() -> &'static CachedDeviceInfo {
+    static INFO: std::sync::LazyLock<CachedDeviceInfo> = std::sync::LazyLock::new(|| {
+        let mut name = [0u8; 256];
         let mut params = GetDeviceInfoParams {
-            name_ptr: 0,
-            name_buf_len: 0,
+            name_ptr: name.as_mut_ptr() as u64,
+            name_buf_len: 256,
             name_len: 0,
             registry_id: 0,
-            supports_sampler_border: 0,
+            caps: DeviceCapsFlags::empty(),
+            pad0: 0,
         };
         unix_call(&mut params);
-        params.supports_sampler_border != 0
+        // `name_len` is the untruncated length and can exceed the buffer;
+        // clamp to what `name` actually holds.
+        let name_len = usize::try_from(params.name_len)
+            .unwrap_or(usize::MAX)
+            .min(name.len());
+        CachedDeviceInfo {
+            name,
+            name_len,
+            registry_id: params.registry_id,
+            caps: params.caps,
+        }
     });
-    *SUPPORTED
+    &INFO
+}
+
+/// Whether the Metal device can create border-colour samplers.
+///
+/// `GetDeviceCaps` strips `D3DPTADDRESSCAPS_BORDER` when it cannot
+/// (virtualized CI devices), and the unix sampler path clamps to edge for a
+/// title that ignores the cap.
+pub fn sampler_border_supported() -> bool {
+    device_info().caps.contains(DeviceCapsFlags::SAMPLER_BORDER)
+}
+
+/// Whether the packed 16-bit Metal formats exist natively on this device.
+///
+/// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
+/// formats A4R4G4B4 / R5G6B5 / A1R5G5B5 are backed by `Bgra8Unorm` instead
+/// and expanded on the CPU at upload time. `debug.expandPacked16` forces the
+/// expansion path on any device so it can be exercised on Apple Silicon; it
+/// folds in here so every consumer (format mapping, `CheckDeviceFormat`,
+/// create gates) flips together.
+pub fn native_packed16_supported() -> bool {
+    let native = device_info()
+        .caps
+        .contains(DeviceCapsFlags::NATIVE_PACKED16)
+        && !crate::config::CONFIG.expand_packed16;
+    if !native {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "packed 16-bit formats unavailable natively (forced={}): A4R4G4B4/R5G6B5/A1R5G5B5 \
+             expand to BGRA8 at upload, 16-bit render targets are not advertised",
+            crate::config::CONFIG.expand_packed16
+        );
+    }
+    native
 }
 
 /// One spoofed adapter identity: everything a game sniffs, kept consistent.
@@ -782,7 +852,7 @@ extern "system" fn d3d9_check_device_format(
     // answer is the render-target question itself, whether or not the caller
     // also passed D3DUSAGE_RENDERTARGET.
     if usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING != 0
-        && !is_render_target_format(check_format)
+        && !is_render_target_format_on_device(check_format)
     {
         return D3DERR_NOTAVAILABLE;
     }
@@ -790,7 +860,7 @@ extern "system" fn d3d9_check_device_format(
         if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
             false
         } else if usage & D3DUSAGE_RENDERTARGET != 0 {
-            is_render_target_format(check_format)
+            is_render_target_format_on_device(check_format)
                 && (usage & D3DUSAGE_QUERY_SRGBWRITE == 0 || has_srgb_twin(check_format))
         } else if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
@@ -807,7 +877,7 @@ extern "system" fn d3d9_check_device_format(
         if usage & D3DUSAGE_QUERY_SRGBWRITE != 0 && !has_srgb_twin(check_format) {
             false
         } else {
-            is_render_target_format(check_format)
+            is_render_target_format_on_device(check_format)
         }
     } else if rtype == D3DRTYPE_SURFACE || rtype == D3DRTYPE_TEXTURE {
         // SRGBREAD: per-format gate for whether `D3DSAMP_SRGBTEXTURE=1`
@@ -831,7 +901,11 @@ extern "system" fn d3d9_check_device_format(
     }
     // D3DUSAGE_AUTOGENMIPMAP needs render-target capability even when the
     // query does not include D3DUSAGE_RENDERTARGET. Metal mip generation is
-    // available for renderable 2D and cube color formats.
+    // available for renderable 2D and cube color formats. Deliberately the
+    // pure predicate: on a device that expands the packed 16-bit formats the
+    // backing is BGRA8 (renderable everywhere), so `generateMipmaps` still
+    // works for R5G6B5/A1R5G5B5 and the NOAUTOGEN answer stays identical
+    // across device kinds.
     if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && !is_render_target_format(check_format) {
         return D3DOK_NOAUTOGEN;
     }
@@ -881,7 +955,7 @@ extern "system" fn d3d9_check_depth_stencil_match(
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
         || !is_display_format(adapter_format)
-        || !is_render_target_format(rt_format)
+        || !is_render_target_format_on_device(rt_format)
         || !is_depth_stencil_format(ds_format)
     {
         warn!(

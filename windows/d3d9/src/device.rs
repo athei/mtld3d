@@ -3878,12 +3878,28 @@ extern "system" fn device_create_texture(
         });
     }
 
-    let Some(fmt) = map_d3d_format(format) else {
+    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
+    // A packed 16-bit format that is renderable in general but not on this
+    // device (no native packed formats — the texture would be BGRA8-backed,
+    // and rendering into that backing breaks Lock/readback fidelity) cannot
+    // carry D3DUSAGE_RENDERTARGET. `CheckDeviceFormat` already answers
+    // NOTAVAILABLE for the combination; this rejects the caller that skipped
+    // the probe. Deliberately NOT the general `is_render_target_format` gate:
+    // formats outside that list keep today's lenient create on every device.
+    if usage_rt
+        && crate::direct3d9::is_render_target_format(format)
+        && !crate::direct3d9::is_render_target_format_on_device(format)
+    {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateTexture(format={format}, RENDERTARGET) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     // D3D9 size-checks block-compressed (DXTn) textures at creation: the top
     // mip's width/height must be block-aligned (a multiple of 4), else
     // INVALIDCALL. WoW's DXT content is power-of-two and
@@ -4038,8 +4054,15 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
     let info = inner.texture_info();
     let texture_id = info.texture_id;
     let usage_flags = info.usage_flags;
+    let pixel_format = info.pixel_format;
     dev.push_texture_warmup(info);
     if usage_flags.contains(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET) {
+        return;
+    }
+    // Expansion-path textures never wrap their 16-bit staging in a cached
+    // MTLBuffer — every upload repacks into a fresh padded PageBox — so a
+    // staging warmup would create wrappers nothing ever uses.
+    if mtld3d_core::packed16::expansion_kind(inner.d3d_format(), pixel_format).is_some() {
         return;
     }
     for level in 0..levels {
@@ -4255,7 +4278,7 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return E_NOTIMPL;
     }
-    let Some(fmt) = map_d3d_format(format) else {
+    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateVolumeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -4432,7 +4455,7 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    let Some(fmt) = map_d3d_format(format) else {
+    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateCubeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -4446,10 +4469,11 @@ extern "system" fn device_create_cube_texture(
     }
     // ATI1 and packed YUV retain only their CPU SCRATCH resource form. Depth
     // formats remain unsupported, and render-target cubes require a Metal
-    // renderable color format.
+    // renderable color format on THIS device (the packed 16-bit members drop
+    // out where they are expansion-backed).
     if (matches!(format, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY) && pool != D3DPOOL_SCRATCH)
         || is_depth_fmt
-        || (usage_rt && !crate::direct3d9::is_render_target_format(format))
+        || (usage_rt && !crate::direct3d9::is_render_target_format_on_device(format))
     {
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -4698,8 +4722,19 @@ fn create_color_target_surface(
     format: u32,
     usage: u32,
 ) -> Option<*mut Direct3DSurface9> {
-    let mapping = map_d3d_format(format)?;
+    let mapping = crate::direct3d9::map_for_device(format)?;
     if mapping.is_compressed() {
+        return None;
+    }
+    // On a device without native packed 16-bit formats these formats are
+    // sampling-only (BGRA8-backed): a standalone surface in one of them would
+    // pair a 16-bit CPU staging with a 32-bit texture through the
+    // lockable-RT upload/readback blits, so reject the create outright.
+    // `CheckDeviceFormat(RENDERTARGET)` already answers NOTAVAILABLE for
+    // them on such a device. On a native device the lenient accept stands.
+    if mtld3d_core::packed16::expansion_kind(format, mapping.metal_pixel_format()).is_some() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateRenderTarget(format={format}) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
         return None;
     }
     // A render target created at the reported back-buffer size is the game's
@@ -5673,9 +5708,12 @@ extern "system" fn device_stretch_rect(
     // cross-format destination is a render target or an offscreen-plain surface
     // (cross-format RT/texture/offscreen → RT, plus the offscreen→offscreen
     // case handled on the CPU just below).
-    let cross_format = mtld3d_core::format::map_d3d_format(src_info.format)
+    // Device-aware mapping: it must agree with the Metal formats the textures
+    // were actually created with (e.g. a packed 16-bit pair that is
+    // BGRA8-backed on this device is NOT cross-format).
+    let cross_format = crate::direct3d9::map_for_device(src_info.format)
         .map(|m| m.metal_pixel_format())
-        != mtld3d_core::format::map_d3d_format(dst_info.format).map(|m| m.metal_pixel_format());
+        != crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format());
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
@@ -5896,8 +5934,10 @@ fn check_stretch_rect_formats(
     src: &StretchSurfaceInfo,
     dst: &StretchSurfaceInfo,
 ) -> Result<(), i32> {
-    let src_mtl = mtld3d_core::format::map_d3d_format(src.format).map(|m| m.metal_pixel_format());
-    let dst_mtl = mtld3d_core::format::map_d3d_format(dst.format).map(|m| m.metal_pixel_format());
+    // Device-aware mapping, so the comparison sees the Metal formats the
+    // textures were actually created with on this device.
+    let src_mtl = crate::direct3d9::map_for_device(src.format).map(|m| m.metal_pixel_format());
+    let dst_mtl = crate::direct3d9::map_for_device(dst.format).map(|m| m.metal_pixel_format());
     // A same-Metal-format pair takes the 1:1 copy path. A cross-Metal-format
     // pair converts either via the render-quad path (sample src → write the dst
     // render target — needs a render-target destination) or, into an
@@ -6104,8 +6144,10 @@ fn emit_stretch_rect_blit(
         // YUV source is decoded to RGB by the fragment function), so this path
         // also converts a cross-format pair. `device_stretch_rect` guarantees
         // the destination is a render target here.
+        // Device-aware: the pipeline's colour format must match the attachment
+        // texture as created on this device (BGRA8 for an expanded 16-bit dst).
         let Some(dst_format) =
-            mtld3d_core::format::map_d3d_format(dst_info.format).map(|m| m.metal_pixel_format())
+            crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format())
         else {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
@@ -6448,7 +6490,13 @@ extern "system" fn device_color_fill(
         return D3D_OK;
     }
     let pitch = region_w as usize * bpp;
-    let mut page = PageBox::new_uninit(pitch * region_h as usize);
+    // The upload job addresses its staging at the whole-mip convention
+    // `origin_y * pitch + origin_x * bpp`, so a sub-rect fill's read window
+    // extends past `pitch * region_h`. Size the page to cover the window and
+    // fill all of it with the pattern — every in-window byte must be fill
+    // colour, not uninitialised page tail.
+    let page_len = pitch * (region_h as usize + origin_y as usize) + origin_x as usize * bpp;
+    let mut page = PageBox::new_uninit(page_len);
     for chunk in page.as_mut_slice().chunks_exact_mut(bpp) {
         chunk.copy_from_slice(&pixel);
     }

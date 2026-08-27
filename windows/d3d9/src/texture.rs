@@ -390,6 +390,11 @@ impl TextureInner {
         self.d3d_pool
     }
 
+    /// D3DFMT_* the texture was created with.
+    pub const fn d3d_format(&self) -> u32 {
+        self.d3d_format
+    }
+
     /// D3DUSAGE_* the texture was created with.
     pub const fn d3d_usage(&self) -> u32 {
         self.d3d_usage
