@@ -1090,7 +1090,9 @@ struct BufferGpuState {
     mtl_buffer: MetalHandle<MTLBufferKind>,
     /// `Staged` buffers only: the persistent `StorageModePrivate` device buffer that draws bind.
     ///
-    /// Written by the staging-upload blit. `NULL` for `Direct`.
+    /// Written by the staging-upload blit. `NULL` for `Direct`, and for a
+    /// `Staged` buffer whose warmup create failed (the placeholder shape,
+    /// recreated lazily on the buffer's next upload or draw).
     device_buffer: MetalHandle<MTLBufferKind>,
     /// `true` for a non-DYNAMIC buffer on the separate-staging upload path.
     ///
@@ -1504,6 +1506,16 @@ impl FrameEncoder {
     /// `ensure_vbib_mtl_buffer` to avoid mid-frame cache collision
     /// (an old-backing draw closure would otherwise mismatch the
     /// freshly-installed new wrapper and trigger redundant churn).
+    ///
+    /// A failed `Direct` create leaves no cache entry: the ensure tail is
+    /// a complete lazy retry for that shape. A failed `Staged` create must
+    /// NOT do the same: with no entry the ensure tail would rebuild the
+    /// buffer as `Direct` over its CPU staging while the PE side keeps
+    /// sending `Op::StageUpload`s, silently switching buffer models. It
+    /// instead inserts a placeholder entry (`is_staged: true`, NULL
+    /// `device_buffer`) so staged-ness survives; the device buffer is
+    /// recreated lazily by `apply_stage_upload` / `ensure_vbib_mtl_buffer`
+    /// on the buffer's next touch.
     fn drain_buffer_warmups(&mut self, warmups: Vec<VbibWarmupEntry>) {
         if warmups.is_empty() {
             return;
@@ -1541,10 +1553,34 @@ impl FrameEncoder {
         }
         let current_seq = self.current_submit_seq;
         for (warmup, handle) in warmups.into_iter().zip(handles) {
+            let staged = matches!(warmup.map_mode, BufferMapMode::Staged);
             if handle.is_null() {
+                error!(
+                    target: LOG_TARGET,
+                    "drain_buffer_warmups: CreateBuffer failed \
+                     (id={:#x}, len={}, staged={staged})",
+                    warmup.buffer_id.raw(),
+                    warmup.backing_len,
+                );
+                if staged {
+                    // Keep the staged identity alive: the device buffer is
+                    // recreated lazily on the buffer's next touch. Occupied
+                    // is unreachable (ids are minted once and warmups are
+                    // pushed once per Create), and there is no handle to
+                    // orphan here anyway.
+                    if let Entry::Vacant(v) = self.buffer_cache.entry(warmup.buffer_id) {
+                        v.insert(BufferGpuState {
+                            mtl_buffer: MetalHandle::NULL,
+                            device_buffer: MetalHandle::NULL,
+                            is_staged: true,
+                            backing_ptr: 0,
+                            length: warmup.backing_len,
+                            last_submit_seq: current_seq,
+                        });
+                    }
+                }
                 continue;
             }
-            let staged = matches!(warmup.map_mode, BufferMapMode::Staged);
             match self.buffer_cache.entry(warmup.buffer_id) {
                 Entry::Vacant(v) => {
                     v.insert(BufferGpuState {
@@ -1610,6 +1646,10 @@ impl FrameEncoder {
     /// equivalent of a `D3DLOCK_DISCARD` buffer rename. Overlaps are rare (measured
     /// ~0.07/frame), so the extra device-buffer churn is negligible and
     /// bounded by the same seq-gated retire as every other VB/IB rename.
+    ///
+    /// A cache entry whose `device_buffer` is NULL is the failed-warmup
+    /// placeholder; the device buffer is recreated here before the upload
+    /// is applied, which makes a warmup create failure fully recoverable.
     fn apply_stage_upload(
         &mut self,
         buffer_id: BufferId,
@@ -1635,11 +1675,46 @@ impl FrameEncoder {
                 (s.device_buffer.raw(), s.length)
             })
         else {
-            mtld3d_shared::log_once_warn!(
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                "apply_stage_upload: no Staged device buffer for buffer_id — dropping upload"
+                key: buffer_id.raw(),
+                "apply_stage_upload: no cache entry for buffer_id {:#x}, dropping upload",
+                buffer_id.raw()
             );
             return;
+        };
+
+        // A NULL device buffer is the placeholder `drain_buffer_warmups`
+        // leaves behind when the warmup create failed: recreate it here so
+        // the upload lands. Warmups drain before the op loop, so the first
+        // post-failure upload passes through this recreate and nothing is
+        // lost once Metal allocates again. Both failure returns above and
+        // below sit before `add_retained_bytes`, so the dropped `page_box`
+        // never skews the retention cap. This must also stay ahead of the
+        // transient create below: returning after it would leak a live
+        // transient wrapper.
+        let device_handle = if device_handle == 0 {
+            let Some(fresh) = self.alloc_fresh_device_buffer(buffer_id, length) else {
+                error!(
+                    target: LOG_TARGET,
+                    "apply_stage_upload: device buffer recreate failed \
+                     (id={buffer_id:#x}), dropping upload ({size} bytes at {dst_offset})",
+                );
+                return;
+            };
+            if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
+                s.device_buffer = fresh;
+            }
+            mtld3d_shared::log_once_info_by!(
+                target: LOG_TARGET,
+                key: buffer_id.raw(),
+                "apply_stage_upload: recreated device buffer for buffer_id {:#x} \
+                 after a failed warmup create",
+                buffer_id.raw()
+            );
+            fresh.raw()
+        } else {
+            device_handle
         };
 
         // Wrap the transient snapshot as a `Shared` `bytesNoCopy` blit
@@ -1763,13 +1838,18 @@ impl FrameEncoder {
     ///
     /// Returns `false` when the buffer no longer has a `Staged` device
     /// buffer, which means the game released it and the lost upload has
-    /// nowhere left to land.
+    /// nowhere left to land. A live entry with a NULL `device_buffer`
+    /// (the failed-warmup placeholder) also returns `false`. That state
+    /// should be unreachable (a pending upload implies a successful
+    /// `apply_stage_upload`, which implies a device buffer nothing nulls
+    /// back out), but the placeholder makes it constructible, and a blit
+    /// into buffer 0 is the one outcome worth a guard.
     fn reissue_stage_upload(&mut self, retry: &StagedUploadRetry) -> bool {
         let current_seq = self.current_submit_seq;
         let Some(dst_handle) = self
             .buffer_cache
             .get_mut(&retry.buffer_id)
-            .filter(|s| s.is_staged)
+            .filter(|s| s.is_staged && !s.device_buffer.is_null())
             .map(|s| {
                 if current_seq > s.last_submit_seq {
                     s.last_submit_seq = current_seq;
@@ -1796,8 +1876,10 @@ impl FrameEncoder {
 
     /// Allocate a fresh `StorageModePrivate` device buffer for a `Staged` VB/IB.
     ///
-    /// Backs a rename-at-overlap. Returns `None` on create failure
-    /// (caller falls back to overwriting the live buffer).
+    /// Backs a rename-at-overlap, and the lazy recreate after a failed
+    /// warmup create. Returns `None` on create failure; each caller has its
+    /// own fallback (overwrite the live buffer, drop the upload, drop the
+    /// draw).
     fn alloc_fresh_device_buffer(
         &self,
         buffer_id: BufferId,
@@ -4815,7 +4897,9 @@ impl FrameEncoder {
     ///
     /// Subsequent Draws within the same-backing window hit the cache. The
     /// rename itself is handled via `intake_vbib_retention` at the start of
-    /// the subsequent frame.
+    /// the subsequent frame. A `Staged` entry left as a failed-warmup
+    /// placeholder gets its device buffer recreated here before the draw
+    /// binds it.
     pub fn ensure_vbib_mtl_buffer(
         &mut self,
         buffer_id: BufferId,
@@ -4834,7 +4918,32 @@ impl FrameEncoder {
                 if current_seq > state.last_submit_seq {
                     state.last_submit_seq = current_seq;
                 }
-                return state.device_buffer.raw();
+                let device = state.device_buffer;
+                let length = state.length;
+                if !device.is_null() {
+                    return device.raw();
+                }
+                // Failed-warmup placeholder: recreate the device buffer so
+                // the entry heals and later uploads take the fast path. Its
+                // contents are undefined until the next upload (any upload
+                // dropped while Metal kept failing is gone), matching what
+                // D3D9 promises for a buffer the game never wrote. On
+                // repeat failure return 0; the draw sites drop the draw
+                // and log it.
+                let Some(fresh) = self.alloc_fresh_device_buffer(buffer_id, length) else {
+                    return 0;
+                };
+                if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
+                    s.device_buffer = fresh;
+                }
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: buffer_id.raw(),
+                    "ensure_vbib_mtl_buffer: recreated device buffer for buffer_id {:#x} \
+                     at draw time, contents undefined until the next upload",
+                    buffer_id.raw()
+                );
+                return fresh.raw();
             }
             if state.backing_ptr == backing_ptr && state.length == backing_len {
                 let mtl_buffer = state.mtl_buffer;
