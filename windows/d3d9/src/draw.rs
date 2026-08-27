@@ -254,29 +254,30 @@ pub enum IndexSource {
         /// Signed — D3D9 explicitly allows negative values.
         base_vertex: i32,
     },
-    /// Non-indexed triangle fan over the bound vertex streams (`DrawPrimitive`).
+    /// Non-indexed triangle fan (`DrawPrimitive` / `DrawPrimitiveUP`).
     ///
     /// Metal has no fan primitive. Every non-indexed fan is a prefix of the
     /// same index pattern, `(0, i+1, i+2)` relative to its first vertex, so
     /// the encoder keeps one shared 16-bit buffer of that pattern
     /// (`FrameEncoder::fan_index_buffer`) and the draw passes `start_vertex`
-    /// as Metal's base vertex: nothing is generated or staged per draw. Fans
-    /// the 16-bit pattern cannot address take the `Generated` path.
+    /// as Metal's base vertex: nothing is generated or staged per draw, and
+    /// the vertices are the caller's, bound or inline, untouched. Fans the
+    /// 16-bit pattern cannot address take the `Generated` path.
     Fan {
         start_vertex: u32,
         primitive_count: u32,
     },
-    /// Indexed draw over the bound vertex streams with a generated index list.
+    /// Indexed draw over a triangle-list index list built in the frame arena.
     ///
-    /// Triangle fans from `DrawIndexedPrimitive` (and `DrawPrimitive` fans
-    /// past the shared pattern's reach): Metal has no fan primitive, so the
-    /// API thread rewrites the fan as a triangle-list index stream
-    /// (`convert::triangle_fan_indices*`) that the encoder stages like `Up`
-    /// indices, while the vertices stay the bound buffers. The indices are
-    /// absolute, and `min_vertex..=max_vertex` is the vertex span they
-    /// reference, which gives the exact VB read range.
+    /// Triangle fans whose indices the shared pattern cannot serve: both
+    /// indexed entry points, and non-indexed fans past the pattern's reach.
+    /// The API thread writes the rewritten list (`convert::FanRewrite`)
+    /// straight into `FrameData::scratch`, so the draw stages `index_count`
+    /// indices and allocates nothing. The indices are absolute, and
+    /// `min_vertex..=max_vertex` is the vertex span they reference, which
+    /// gives the exact VB read range when the vertices are bound buffers.
     Generated {
-        bytes: Vec<u8>,
+        data: ScratchSlice,
         index_count: u32,
         index_type: IndexType,
         min_vertex: u32,
@@ -2250,18 +2251,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             bytes,
             index_count,
             index_type,
-        }
-        | IndexSource::Generated {
-            bytes,
-            index_count,
-            index_type,
-            ..
         } => {
             // Inline index stream: stage the bytes in the per-frame scratch
             // arena and let the unix side wrap them in a transient MTLBuffer
-            // (Metal has no inline-index draw form). The vertices were
-            // already bound above: `VertexSource::Up` for `Up` indices, the
-            // application's buffers for a `Generated` list.
+            // (Metal has no inline-index draw form). The vertices were bound
+            // above from `VertexSource::Up`.
             let scratch_ptr = enc.alloc_scratch(&bytes);
             let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             enc.emit_command(Command::draw_indexed_primitives_up(
@@ -2269,6 +2263,27 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 index_count,
                 index_type,
                 scratch_ptr,
+                byte_len,
+                instances,
+            ));
+            index_count
+        }
+        IndexSource::Generated {
+            data,
+            index_count,
+            index_type,
+            ..
+        } => {
+            // The list is already in the frame arena the unix side reads at
+            // replay time, so it goes to the same inline-index draw form
+            // without a second copy. The vertices were bound above: the
+            // caller's buffers, or `VertexSource::Up` bytes.
+            let (index_ptr, byte_len) = data.as_raw();
+            enc.emit_command(Command::draw_indexed_primitives_up(
+                metal_prim,
+                index_count,
+                index_type,
+                index_ptr,
                 byte_len,
                 instances,
             ));
