@@ -2790,7 +2790,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let ti = obj.inner_mut();
-    if level >= ti.levels {
+    if level >= ti.app_level_count() {
         return D3DERR_INVALIDCALL;
     }
     let level_u = level as usize;
@@ -4020,7 +4020,7 @@ extern "system" fn cube_get_cube_map_surface(
         return D3DERR_INVALIDCALL;
     };
     let ti = obj.inner();
-    if level >= ti.levels {
+    if level >= ti.app_level_count() {
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
