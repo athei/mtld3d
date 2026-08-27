@@ -337,13 +337,21 @@ impl Direct3DSurface9 {
     /// Cube face surface backed by its parent cube subresource.
     ///
     /// Container-cached exactly like [`Self::new_texture_backed`], keyed by
-    /// `(face, mip_level)`.
+    /// `(face, mip_level)`. The owning cube is recorded twice: as
+    /// `parent_texture`, which carries extent, format and the refcount
+    /// forwarding every sub-surface does, and as `state_owner_texture`, the
+    /// resource-wide lock/DC state all six faces share. Both are the same
+    /// pointer, so a face never has one without the other.
     pub fn new_cube_texture_backed(
         device_inner: *mut DeviceInner,
         parent_texture: *mut Direct3DTexture9,
         face: u32,
         mip_level: u32,
     ) -> Self {
+        debug_assert!(
+            !parent_texture.is_null(),
+            "cube face surface created without its owning cube texture"
+        );
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
             parent_texture,
@@ -833,13 +841,17 @@ struct SurfaceInner {
     /// upload on unlock (the staging was filled by a read-back, never written,
     /// so re-uploading it would clobber the rendered pixels). `0` otherwise.
     lock_flags: u32,
-    /// Non-null for a cube-map face shell.
+    /// Non-null for a cube-map face shell, where it equals `parent_texture`.
     ///
     /// The owning cube `Direct3DTexture9`, whose `TextureInner` carries the
     /// per-resource lock/DC state shared by all six faces (D3D9 gates the whole
-    /// cube, not the individual face). The face holds a reference on it (taken
-    /// by `GetCubeMapSurface`) so it outlives the face; the face's finalize
-    /// releases it. Null for every other surface.
+    /// cube, not the individual face). A face is constructed with both this
+    /// field and `parent_texture` pointing at that cube, so neither is ever null
+    /// alone. The cube outlives the face: each reference `GetCubeMapSurface`
+    /// takes on it is dropped by the container forwarding in `surface_release`,
+    /// and the face itself is freed from inside the cube's own teardown
+    /// (`finalize_texture`), so nothing is released here on the face's behalf.
+    /// Null for every other surface.
     state_owner_texture: *mut Direct3DTexture9,
 }
 
@@ -874,9 +886,9 @@ impl SurfaceInner {
             return &raw mut self.dc_lock;
         }
         // SAFETY: `state_owner_texture` is the owning cube `Direct3DTexture9`,
-        // kept alive by the reference this face holds (released only at the
-        // face's finalize); D3D9 objects are single-threaded so the exclusive
-        // borrow of its inner state is sound for this call.
+        // which outlives every face it hands out (a face is freed only from
+        // inside the cube's own teardown); D3D9 objects are single-threaded so
+        // the exclusive borrow of its inner state is sound for this call.
         let tex = unsafe { &*self.state_owner_texture };
         tex.dc_lock_state_ptr()
     }
@@ -888,14 +900,15 @@ impl SurfaceInner {
     /// `GetDC` anywhere on the resource blocks it; so does this surface already
     /// being mapped (same-face double-lock).
     fn try_begin_lock(&mut self) -> Result<(), i32> {
-        // A cube-face surface shares the level's lock with its parent cube
-        // texture: if the level is already locked through the cube's own
-        // `LockRect`, locking the face surface is INVALIDCALL. Cube faces carry
-        // the parent only as `state_owner_texture` (parent_texture is null), so
-        // the texture-level delegation in `surface_lock_rect` doesn't see it.
+        // A cube face and its parent cube map one subresource through two
+        // objects, so a face lock has to see the cube's per-subresource lock
+        // state: a level already locked through the cube's own `LockRect` makes
+        // locking the face INVALIDCALL. Checked before this surface records
+        // anything, so a rejected lock leaves the per-face flag and the shared
+        // map count untouched.
         if !self.state_owner_texture.is_null() {
-            // SAFETY: `state_owner_texture` is the live owning cube texture set
-            // by `set_cube_state_owner`; single-threaded access is sound.
+            // SAFETY: `state_owner_texture` is the owning cube texture, set at
+            // construction and outliving the face; single-threaded access is sound.
             let cube = unsafe { &*self.state_owner_texture };
             if cube
                 .inner()
@@ -1166,20 +1179,19 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         !inner.flags.contains(SurfaceFlags::CONTAINER_CACHED),
         "container-cached sub-resource surface finalized outside its container's teardown"
     );
-    let owner_tex = inner.state_owner_texture;
-    if owner_tex.is_null() {
+    // A cube face has nothing of the cube to give back here. The reference
+    // `GetCubeMapSurface` took on it is dropped by the container forwarding in
+    // `surface_release`, and the face's DC lives on the shared cube state, torn
+    // down when the cube itself finalizes. A face only ever reaches this point
+    // from inside that teardown (`finalize_texture` calls
+    // `finalize_cached_surface` with the cube's inner state borrowed and about
+    // to be freed), so calling back into the cube from here would re-enter an
+    // object mid-teardown.
+    if inner.state_owner_texture.is_null() {
         // A standalone surface released while a `GetDC` is still outstanding
         // (the app skipped `ReleaseDC`) would leak its memory DC + DIB; tear
-        // them down. (A cube face's DC lives on the shared cube state, torn
-        // down when the cube texture itself finalizes — the cube outlives every
-        // face that references it, so no face frees the shared DC here.)
+        // them down.
         teardown_gdi_dc(inner.dc_lock.held_dc);
-    } else if inner.parent_texture.is_null() {
-        // SAFETY: `owner_tex` is the cube `Direct3DTexture9` whose reference
-        // this face took at `GetCubeMapSurface`; drop it to balance that AddRef.
-        let release = unsafe { (*owner_tex).vtbl().release };
-        // SAFETY: `release` is the texture's IUnknown::Release thunk.
-        unsafe { release(owner_tex.cast::<c_void>()) };
     }
     // Release the internal texture an owned offscreen-plain surface holds. The
     // surface took over the texture's single create-ref, so this drops it to
