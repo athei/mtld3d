@@ -95,6 +95,7 @@
   device.c:14482 count=1
   device.c:14491 count=1
   device.c:14493 count=1
+  device.c:15088 count=1
   device.c:15160 count=1
 [i686/visual] crash=0
   visual.c:3887 count=1
@@ -216,6 +217,7 @@
   device.c:14482 count=1
   device.c:14491 count=1
   device.c:14493 count=1
+  device.c:15088 count=1
   device.c:15160 count=1
 [x86_64/visual] crash=0
   visual.c:3887 count=1
