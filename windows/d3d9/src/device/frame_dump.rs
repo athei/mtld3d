@@ -372,23 +372,29 @@ impl DeviceInner {
     #[must_use]
     pub fn frame_dump_target_labels(&self) -> (String, String) {
         let rt = match &self.last_color_rt_binding {
-            Some(RtBinding::Backbuffer { width, height, .. }) => {
+            Some((RtBinding::Backbuffer { width, height, .. }, _)) => {
                 format!("backbuffer {width}x{height}")
             }
-            Some(RtBinding::StandaloneColor {
-                format,
-                width,
-                height,
-                ..
-            }) => format!("surface {format:?} {width}x{height}"),
-            Some(RtBinding::Texture {
-                info,
-                width,
-                height,
-                slice,
-                level,
-                ..
-            }) => format!(
+            Some((
+                RtBinding::StandaloneColor {
+                    format,
+                    width,
+                    height,
+                    ..
+                },
+                _,
+            )) => format!("surface {format:?} {width}x{height}"),
+            Some((
+                RtBinding::Texture {
+                    info,
+                    width,
+                    height,
+                    slice,
+                    level,
+                    ..
+                },
+                _,
+            )) => format!(
                 "texture {:?} {:?} {width}x{height} slice={slice} level={level}",
                 info.texture_id, info.pixel_format
             ),

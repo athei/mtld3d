@@ -569,11 +569,15 @@ pub struct DeviceInner {
     /// Present). Re-pushed into the fresh frame after such a flush so draws that
     /// follow a `GetRenderTargetData` keep rendering to the bound RT instead of
     /// silently reverting to the backbuffer format.
-    last_color_rt_binding: Option<RtBinding>,
+    ///
+    /// Paired with what the bound resource is rasterized at, which the encoder
+    /// thread cannot reach the resource to ask for.
+    last_color_rt_binding: Option<(RtBinding, mtld3d_core::render_scale::RenderScale)>,
     /// Render targets 1..3 as most recently bound, re-asserted like `last_color_rt_binding`.
     ///
     /// Index `i` holds slot `i + 1`; `None` is an unbound slot.
-    last_extra_rt_bindings: [Option<RtBinding>; RENDER_TARGET_SLOTS - 1],
+    last_extra_rt_bindings:
+        [Option<(RtBinding, mtld3d_core::render_scale::RenderScale)>; RENDER_TARGET_SLOTS - 1],
     /// Texture id of the autogen render-target bound at each slot, if any.
     ///
     /// When a slot changes away from it the mip chain is regenerated (a
@@ -1379,12 +1383,12 @@ impl DeviceInner {
         // Clone (not Copy) out of the persistent binding: `TextureInfo` and
         // the binding enums are wide aggregates, and frame swaps are rare
         // relative to draws.
-        if let Some(info) = self.last_color_rt_binding.clone() {
-            self.push_color_rt_binding_op(0, info);
+        if let Some((info, scale)) = self.last_color_rt_binding.clone() {
+            self.push_color_rt_binding_op(0, info, scale);
         }
         for slot in 1..RENDER_TARGET_SLOTS {
-            if let Some(info) = self.last_extra_rt_bindings[slot - 1].clone() {
-                self.push_color_rt_binding_op(slot, info);
+            if let Some((info, scale)) = self.last_extra_rt_bindings[slot - 1].clone() {
+                self.push_color_rt_binding_op(slot, info, scale);
             }
         }
         if let Some((binding, is_sampleable, has_stencil)) = self.last_depth_binding.clone() {
@@ -1460,18 +1464,16 @@ impl DeviceInner {
     ///
     /// Factored out of `device_set_render_target` so `flush_current_frame_
     /// blocking` can re-assert the persistent binding into the fresh frame.
-    fn push_color_rt_binding_op(&mut self, slot: usize, info: RtBinding) {
-        // Every variant carries the size D3D9 reports for the target, and the
-        // same rule decides all three: the back buffer's own scale if it was
-        // created at the reported back-buffer resolution, the identity
-        // otherwise. Resolved here because the closure runs on the encoder
-        // thread, which cannot reach the device.
-        let (logical_w, logical_h) = match &info {
-            RtBinding::Backbuffer { width, height, .. }
-            | RtBinding::StandaloneColor { width, height, .. }
-            | RtBinding::Texture { width, height, .. } => (*width, *height),
-        };
-        let scale = self.scale_for_created_target(logical_w, logical_h, true);
+    /// Every variant of `info` carries the size D3D9 reports for the target;
+    /// `scale` is what the bound resource itself is rasterized at, taken from
+    /// the resource on the API thread because the closure runs on the encoder
+    /// thread, which cannot reach it.
+    fn push_color_rt_binding_op(
+        &mut self,
+        slot: usize,
+        info: RtBinding,
+        scale: mtld3d_core::render_scale::RenderScale,
+    ) {
         self.push_op(Box::new(move |enc| {
             let (handle, w, h, fmt, has_alpha, slice, level) = match info {
                 RtBinding::Backbuffer {
@@ -2539,6 +2541,14 @@ impl DeviceInner {
 
     pub const fn backbuffer_height(&self) -> u32 {
         self.backbuffer_height
+    }
+
+    /// The scale the back buffer and everything sized with it is rasterized at.
+    ///
+    /// Read by the implicit surfaces, whose Metal textures the device recreates
+    /// at this scale whenever it recreates them.
+    pub const fn render_scale(&self) -> mtld3d_core::render_scale::RenderScale {
+        self.render_scale
     }
 
     /// The device's current default depth-stencil `MTLTexture`.
@@ -4889,6 +4899,7 @@ fn create_color_target_surface(
         height,
         format,
         usage,
+        scale,
     );
     // The surface owns a DEFAULT-pool Metal texture no `TextureInner` covers,
     // so charge it here; `finalize_surface`'s colour retire arm refunds it.
@@ -5062,6 +5073,7 @@ extern "system" fn device_create_depth_stencil_surface(
         width,
         height,
         format,
+        scale,
     );
     // Same accounting as a standalone colour target: a real Metal depth
     // texture with no `TextureInner` behind it, refunded by
@@ -5668,7 +5680,7 @@ extern "system" fn device_stretch_rect(
         ));
     }
 
-    let Some(src_info) = resolve_stretch_surface(dev, src_surf) else {
+    let Some(src_info) = resolve_stretch_surface(src_surf) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: RejectReason::UnsupportedSource.key(),
@@ -5677,7 +5689,7 @@ extern "system" fn device_stretch_rect(
         );
         return D3DERR_INVALIDCALL;
     };
-    let Some(dst_info) = resolve_stretch_surface(dev, dst_surf) else {
+    let Some(dst_info) = resolve_stretch_surface(dst_surf) else {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: RejectReason::UnsupportedDestination.key(),
@@ -6398,7 +6410,6 @@ enum StretchKind {
 }
 
 fn resolve_stretch_surface(
-    dev: &DeviceInner,
     surf: *mut crate::surface::Direct3DSurface9,
 ) -> Option<StretchSurfaceInfo> {
     if surf.is_null() {
@@ -6455,7 +6466,10 @@ fn resolve_stretch_surface(
             kind: StretchKind::Backbuffer(color),
             width: s.standalone_width(),
             height: s.standalone_height(),
-            scale: dev.scale_for_created_target(s.standalone_width(), s.standalone_height(), true),
+            // The surface's own scale, fixed when it was created: it is what
+            // its Metal texture was allocated at, and it does not move when
+            // the back buffer is resized under it.
+            scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
             pool: D3DPOOL_DEFAULT,
@@ -6472,7 +6486,9 @@ fn resolve_stretch_surface(
             kind: StretchKind::DepthStencil(depth),
             width: s.standalone_width(),
             height: s.standalone_height(),
-            scale: dev.scale_for_created_target(s.standalone_width(), s.standalone_height(), true),
+            // See the colour branch above: the surface answers with what its
+            // own depth texture was created at.
+            scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
             pool: D3DPOOL_DEFAULT,
@@ -6643,7 +6659,7 @@ extern "system" fn device_color_fill(
     // SAFETY: vtable in-param; `rect` is *const D3DRECT per the D3D9 ABI.
     let rect = unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(rect) };
     let surf = surface.cast::<Direct3DSurface9>();
-    let Some(info) = resolve_stretch_surface(obj.inner(), surf) else {
+    let Some(info) = resolve_stretch_surface(surf) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "ColorFill on a surface with no DEFAULT-pool backing → INVALIDCALL");
         return D3DERR_INVALIDCALL;
@@ -6914,6 +6930,18 @@ extern "system" fn device_set_render_target(
     let surface_ref = unsafe { &*surf };
     let parent = surface_ref.parent_texture();
     let standalone_color = surface_ref.metal_color_handle();
+    // What the bound resource is rasterized at, asked of the resource itself:
+    // the surface for a standalone or implicit target, the parent texture for
+    // a texture level (whose Metal levels all carry the texture's scale, not
+    // only the one that happens to match the back buffer).
+    let scale = if parent.is_null() {
+        surface_ref.render_scale()
+    } else {
+        // SAFETY: `parent` is non-null (checked) and points to a live
+        // `Direct3DTexture9` whose refcount keeps it alive while the surface
+        // is bound.
+        unsafe { &*parent }.inner().render_scale()
+    };
     let info = if parent.is_null() {
         if !standalone_color.is_null() && standalone_color != dev.backbuffer_handle {
             // A standalone `CreateRenderTarget` colour surface: parent-null but
@@ -6999,15 +7027,15 @@ extern "system" fn device_set_render_target(
     // backbuffer default each frame; a D3D9 RT binding outlives an internal
     // flush — see `last_color_rt_binding`).
     if slot != 0 {
-        dev.last_extra_rt_bindings[slot - 1] = Some(info.clone());
-        dev.push_color_rt_binding_op(slot, info);
+        dev.last_extra_rt_bindings[slot - 1] = Some((info.clone(), scale));
+        dev.push_color_rt_binding_op(slot, info, scale);
         // Only render target 0 owns the viewport and scissor; the pipeline
         // reads the extra targets' formats on the encoder thread, so no
         // snapshot section goes stale here.
         return D3D_OK;
     }
-    dev.last_color_rt_binding = Some(info.clone());
-    dev.push_color_rt_binding_op(0, info);
+    dev.last_color_rt_binding = Some((info.clone(), scale));
+    dev.push_color_rt_binding_op(0, info, scale);
 
     // D3D9 spec: SetRenderTarget resets the viewport to cover the new
     // RT's full dimensions. Games rely on this, and skipping it leaves
@@ -7223,13 +7251,13 @@ extern "system" fn device_set_depth_stencil_surface(
             );
         }
         // The Metal texture behind a standalone depth surface was created at
-        // the scale `CreateDepthStencilSurface` resolved for its reported
-        // extent, so re-resolve the same rule rather than assume the extent
-        // D3D9 reports: a surface sized like the back buffer is rasterized
-        // with it, anything else is its own size. What the pass machine
-        // measures a `Clear`'s viewport against, and what a depth snapshot
-        // copy has to match, is the texture's real extent.
-        let scale = dev.scale_for_created_target(reported_size.0, reported_size.1, true);
+        // the scale the surface carries, so ask the surface rather than assume
+        // the extent D3D9 reports. What the pass machine measures a `Clear`'s
+        // viewport against, and what a depth snapshot copy has to match, is
+        // the texture's real extent.
+        // SAFETY: `surf` is non-null (else-if branch) and points to a live
+        // surface.
+        let scale = unsafe { (*surf).render_scale() };
         DepthBinding::Eager(
             h,
             (

@@ -27,7 +27,7 @@ use mtld3d_types::{
     D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE,
     D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
     D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -642,4 +642,38 @@ fn color_fill_of_a_scaled_targets_mip_level_addresses_that_level() {
         "just past the filled quarter on both axes",
     );
     assert_pixel_eq(h.read_pixel(560, 400), BLUE, "the opposite corner");
+}
+
+#[test]
+fn a_standalone_target_at_the_backbuffer_size_fills_and_copies_in_reported_coordinates() {
+    // A `CreateRenderTarget` surface created at the reported back-buffer size
+    // belongs to the same image and is rasterized at the same scale, so both
+    // operations on it convert: the `ColorFill` sub-rect against the surface's
+    // own texture, and the whole-surface `StretchRect` that copies it to the
+    // back buffer. The surface carries the scale it was created at, so neither
+    // endpoint depends on what the back buffer measures at the time. Fill rect
+    // and probes are reported coordinates, so the result is the same at every
+    // scale.
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let rt = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&rt, BLUE), 0, "seed the whole target");
+    assert_eq!(
+        h.color_fill_rect_hr(&rt, (128, 96, 512, 384), RED),
+        0,
+        "ColorFill a sub-rect of the target",
+    );
+
+    let backbuffer = h.render_target(0);
+    assert_eq!(
+        h.stretch_rect(&rt, &backbuffer, D3DTEXF_NONE),
+        0,
+        "copy the whole target onto the back buffer",
+    );
+
+    assert_pixel_eq(h.read_pixel(320, 240), RED, "the middle of the fill rect");
+    assert_pixel_eq(h.read_pixel(180, 140), RED, "inside, near the top-left");
+    assert_pixel_eq(h.read_pixel(460, 340), RED, "inside, near the bottom-right");
+    assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside, above and left");
+    assert_pixel_eq(h.read_pixel(600, 440), BLUE, "outside, below and right");
 }
