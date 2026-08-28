@@ -4682,7 +4682,6 @@ extern "system" fn device_create_volume_texture(
     shared_handle: *mut c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    let _ = pool;
     trace!(
         target: LOG_TARGET,
         "IDirect3DDevice9::CreateVolumeTexture({width}x{height}x{depth}, fmt={format})"
