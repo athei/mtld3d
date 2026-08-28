@@ -1577,6 +1577,31 @@ fn stretch_rect_into_a_texture_level_is_visible_to_get_dc() {
 }
 
 #[test]
+fn get_dc_on_a_default_offscreen_plain_rejects_while_it_is_locked() {
+    // The plain's LockRect is recorded on the level-0 staging of the texture it
+    // owns, not on the surface shell, so GetDC has to consult the texture to
+    // see it. Rejected the same way a texture level's own surface is.
+    const SIZE: u32 = 16;
+    let sentinel = 0xdead_beef_usize as *mut core::ffi::c_void;
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let _locked = plain.lock_rect(0);
+        let (hr, out) = plain.get_dc(sentinel);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "GetDC while the plain's LockRect is outstanding must return INVALIDCALL"
+        );
+        assert_eq!(
+            out, sentinel,
+            "a rejected GetDC must not write through the out HDC"
+        );
+    }
+    let dc = plain.dc();
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+}
+
+#[test]
 fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
     // The classic GDI-on-a-surface case: a game draws text or an overlay into
     // a DEFAULT offscreen plain and copies the result somewhere. The plain's

@@ -5210,11 +5210,16 @@ extern "system" fn device_update_surface(
             frame_dump::surface_label(dst)
         ));
     }
-    // D3D9 rejects UpdateSurface when either endpoint has an outstanding lock.
-    if src_surf.is_locked() || dst_surf.is_locked() {
+    // D3D9 rejects UpdateSurface when either endpoint is mapped, and a held
+    // device context maps the surface exactly as a `LockRect` does.
+    if src_surf.is_locked()
+        || dst_surf.is_locked()
+        || src_surf.has_open_dc()
+        || dst_surf.has_open_dc()
+    {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "reject UpdateSurface: a locked source/destination surface → INVALIDCALL"
+            "reject UpdateSurface: a locked or DC-held source/destination surface → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
     }

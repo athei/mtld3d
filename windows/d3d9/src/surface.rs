@@ -578,12 +578,14 @@ impl Direct3DSurface9 {
 
     /// Whether this surface currently has an outstanding `LockRect`.
     ///
-    /// D3D9 rejects `UpdateSurface` when either endpoint is mapped. A
-    /// texture-level surface records its lock on the parent texture
-    /// (`LockRect` delegates there); a standalone surface uses its own `mapped`
-    /// flag.
+    /// D3D9 rejects `UpdateSurface` and `GetDC` when the surface is mapped. A
+    /// surface whose `LockRect` delegates to a backing texture records the lock
+    /// there and never touches its own flags, so the parent's per-subresource
+    /// lock state is what decides: that covers a `GetSurfaceLevel` level, a
+    /// cube face, and a `D3DPOOL_DEFAULT` offscreen plain over the texture it
+    /// owns. Every other surface uses its own `MAPPED` flag.
     pub fn is_locked(&self) -> bool {
-        let parent = self.parent_texture();
+        let parent = self.inner().parent_texture;
         if parent.is_null() {
             self.inner().flags.contains(SurfaceFlags::MAPPED)
         } else {
@@ -598,6 +600,20 @@ impl Direct3DSurface9 {
                     .cube_is_locked(self.inner().cube_face, self.mip_level() as usize)
             }
         }
+    }
+
+    /// Whether a `GetDC` is outstanding on the resource this surface belongs to.
+    ///
+    /// D3D9 counts a held device context as a map of the surface, so a caller
+    /// that rejects a mapped endpoint rejects one with an open DC too. For a
+    /// cube-map face the state is the whole cube's, matching the way `GetDC`
+    /// itself gates the six faces together.
+    pub fn has_open_dc(&self) -> bool {
+        // SAFETY: `self.inner` is this wrapper's live `SurfaceInner`; D3D9
+        // objects are single-threaded, so the exclusive reborrow is sound.
+        let state = unsafe { (*self.inner).dc_lock_ptr() };
+        // SAFETY: `dc_lock_ptr` returns the live resource-wide state, read-only here.
+        unsafe { &*state }.dc_in_use
     }
 
     /// The `DeviceInner` that created this surface.
@@ -2883,6 +2899,16 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     let Some(obj) = (unsafe { InPtrMut::<Direct3DSurface9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    // A surface is either mapped or holds a DC, never both. A surface whose
+    // `LockRect` delegates to a backing texture records the lock there, out of
+    // reach of the resource-wide map count read below, so the delegated state
+    // is consulted first. Ahead of every other reject for the same reason they
+    // are: a failed `GetDC` leaves the caller's out-`HDC` slot untouched.
+    if obj.is_locked() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::GetDC while a LockRect on the surface is outstanding → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     let inner_ptr = obj.inner;
     // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; D3D9
     // surfaces are single-threaded, so the exclusive borrow is sound.
