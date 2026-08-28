@@ -16,8 +16,8 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
-    device::DeviceInner, null_out, private_data::PrivateDataStore, texture::Direct3DTexture9,
-    unix_call::unix_call,
+    device::DeviceInner, encoder::ResampledUpload, null_out, private_data::PrivateDataStore,
+    texture::Direct3DTexture9, unix_call::unix_call,
 };
 
 static DIRECT3D_SURFACE9_VTBL: IDirect3DSurface9Vtbl = IDirect3DSurface9Vtbl {
@@ -2404,26 +2404,24 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
 /// lands before the next draw (`GetDC` flushed everything before it).
 ///
 /// A `render.scale` below 100% rasterizes the back buffer into a texture
-/// smaller than the logical size the DIB was handed out at, and this path
-/// carries no downscale, so it declines the upload and says so once.
+/// smaller than the extent the DIB was handed out at, so the page cannot be
+/// copied in as it stands. It goes through a scratch texture at its own extent
+/// and a linear-filtered quad instead, the downscale counterpart of the
+/// `MetalFX` resolve that seeded the page at `GetDC`.
 fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     let (width, height) = (inner.live_width(), inner.live_height());
     let color_handle = inner.live_color_handle().raw();
-    let bpp =
-        mtld3d_core::format::map_d3d_format(inner.live_format()).map_or(0, |f| f.bytes_per_pixel());
+    let Some(mapping) = mtld3d_core::format::map_d3d_format(inner.live_format()) else {
+        return;
+    };
+    let format = mapping.metal_pixel_format();
+    let bpp = mapping.bytes_per_pixel();
     if bpp == 0 || width == 0 || height == 0 || color_handle == 0 || inner.device_inner.is_null() {
         return;
     }
     // SAFETY: `device_inner` is non-null (checked above) and points to the live
     // owning device, which outlives its child surfaces.
     let scale = unsafe { (*inner.device_inner).scale_for_created_target(width, height, true) };
-    if !scale.is_identity() {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "IDirect3DSurface9::ReleaseDC on the back buffer: no downscale for render.scale={percent}%, GDI's drawing is dropped",
-            percent = scale.percent(),
-        );
-        return;
-    }
     let needed = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(bpp as usize);
@@ -2442,8 +2440,24 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     let device_inner = unsafe { &mut *inner.device_inner };
     // The snapshot page is tightly packed, so a row is exactly `width` pixels.
     let src_stride = width * bpp;
+    if scale.is_identity() {
+        device_inner.push_op(Box::new(move |enc| {
+            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, src_stride);
+        }));
+        return;
+    }
+    let target = ResampledUpload {
+        color_handle,
+        format,
+        logical: (width, height),
+        texture: (scale.dimension(width), scale.dimension(height)),
+        bytes_per_pixel: bpp,
+        msaa: inner.live_msaa_handle(),
+        msaa_srgb: inner.live_msaa_srgb_handle(),
+        sample_count: inner.live_multi_sample().sample_count,
+    };
     device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, src_stride);
+        enc.upload_bytes_resampled(&target, &bytes);
     }));
 }
 

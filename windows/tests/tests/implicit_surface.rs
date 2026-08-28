@@ -7,7 +7,7 @@
 //! the device so a `Reset` that recreates the backbuffer is reflected without
 //! re-allocating the surface.
 
-use mtld3d_tests::Harness;
+use mtld3d_tests::{Harness, SurfaceDc};
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
 
 #[test]
@@ -101,14 +101,33 @@ fn get_dc_on_non_lockable_backbuffer_rejects_and_preserves_out() {
     );
 }
 
+/// Paint a `side` x `side` block of `color` into `dc`, origin at the top left.
+///
+/// A block rather than a lone pixel: under a `render.scale` the write-back is
+/// a downscale and the read-back an upscale, and only an interior pixel comes
+/// through a resample pair unchanged.
+fn fill_block(dc: &SurfaceDc<'_>, side: i32, color: u32) {
+    for y in 0..side {
+        for x in 0..side {
+            assert_eq!(
+                dc.set_pixel(x, y, color),
+                color,
+                "SetPixel into the DC stores the colour it was handed",
+            );
+        }
+    }
+}
+
 #[test]
 fn release_dc_on_a_lockable_backbuffer_reaches_the_back_buffer() {
     // The DC over a lockable back buffer wraps a read-back snapshot rather than
     // the back buffer's own pixels, so it owes the surface coherence in both
     // directions: it shows what the GPU painted before it, and what GDI draws
     // into it reaches the back buffer at `ReleaseDC`, with no Present in
-    // between.
+    // between. Every coordinate here is the reported one, so the test also
+    // stands under `make test SCALE=<n>`.
     const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
     const GREEN_COLORREF: u32 = 0x0000_FF00;
     const RED_COLORREF: u32 = 0x0000_00FF;
     let h = Harness::with_lockable_back_buffer();
@@ -117,26 +136,63 @@ fn release_dc_on_a_lockable_backbuffer_reaches_the_back_buffer() {
     let bb = h.back_buffer(0);
     let dc = bb.dc();
     assert_eq!(
-        dc.get_pixel(32, 32),
+        dc.get_pixel(320, 240),
         GREEN_COLORREF,
         "the DC reads the colour the Clear painted",
     );
-    assert_eq!(
-        dc.set_pixel(10, 10, RED_COLORREF),
-        RED_COLORREF,
-        "SetPixel into the DC stores the colour it was handed",
-    );
+    fill_block(&dc, 64, RED_COLORREF);
     assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
 
-    // GDI knows no alpha: `SetPixel` stores the three colour bytes and leaves
-    // the fourth at zero, so the read-back reports red with no alpha.
+    // Alpha is masked off: GDI leaves the fourth byte at zero, but a
+    // `render.scale` below 100% returns the frame through the MetalFX resolve,
+    // which hands back an opaque one whatever the surface holds. The claim
+    // here is about the colour GDI drew, not about the byte it did not write.
     assert_eq!(
-        h.read_pixel(10, 10),
-        0x00FF_0000,
+        h.read_pixel(16, 16) | 0xFF00_0000,
+        RED,
         "what GDI drew into the DC reaches the back buffer",
     );
     assert_eq!(
-        h.read_pixel(32, 32),
+        h.read_pixel(320, 240),
+        GREEN,
+        "the pixels GDI left alone still hold the clear colour",
+    );
+}
+
+#[test]
+fn release_dc_on_a_lockable_backbuffer_resamples_under_a_render_scale() {
+    // `render.scale` rasterizes the back buffer smaller than the extent `GetDC`
+    // hands the DIB out at, so the write-back has to resample on the way in.
+    // Pinning the key here runs that path in every test run rather than only in
+    // the scaled sweep; a machine without MetalFX holds the scale at 1.0 and
+    // takes the direct upload, which the same assertions cover.
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let merged = format!(
+        "{};render.scale=0.75",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness,
+    // and with it the config read, is only constructed afterwards).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+    let h = Harness::with_lockable_back_buffer();
+
+    assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the back buffer green");
+    let bb = h.back_buffer(0);
+    let dc = bb.dc();
+    fill_block(&dc, 64, RED_COLORREF);
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    // Deep inside the block on both sides of the round trip, so the linear
+    // downscale and the resolve back up both read only red neighbours.
+    assert_eq!(
+        h.read_pixel(16, 16) | 0xFF00_0000,
+        RED,
+        "the write-back resamples GDI's drawing into the scaled back buffer",
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
         GREEN,
         "the pixels GDI left alone still hold the clear colour",
     );
