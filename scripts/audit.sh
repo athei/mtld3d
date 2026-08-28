@@ -17,6 +17,8 @@ set -eu
 cd "$(git rev-parse --show-toplevel)"
 
 INVENTORY=scripts/derive_inventory.txt
+COVERAGE=windows/tests/COVERAGE.md
+COVERAGE_TESTS=windows/tests/tests
 
 # Files permitted to hold each narrowly-scoped exception. These are sets, not
 # counts: a new site fails even if an old one was deleted in the same change.
@@ -105,6 +107,27 @@ inline_tests() {
             printf "%s:%d: %s\n", FILENAME, FNR, $0
         }
     ' "$@"
+}
+
+# The end-to-end suite's index, matched in both directions. Every test file has
+# a row in COVERAGE.md saying what it pins, and every row names a file that
+# exists: a file with no row is coverage nobody can find from the index, and a
+# row with no file claims coverage that no longer runs.
+#
+# The first cell of a table row is the file the row documents, so the row set is
+# the backticked `*.rs` name that opens a `|`-delimited line.
+coverage_matrix() {
+    rows=$(sed -n 's/^| *`\([^`]*\.rs\)` *|.*/\1/p' "$COVERAGE")
+    for file in $(git ls-files "$COVERAGE_TESTS/*.rs"); do
+        stem=${file##*/}
+        printf '%s\n' "$rows" | grep -qxF "$stem" ||
+            printf '%s: no row in %s\n' "$file" "$COVERAGE"
+    done
+    for row in $rows; do
+        [ -f "$COVERAGE_TESTS/$row" ] ||
+            printf '%s: row names `%s`, which is not a file in %s/\n' \
+                "$COVERAGE" "$row" "$COVERAGE_TESTS"
+    done
 }
 
 # Every type deriving Clone and/or Copy, as `path Type Derives`. The committed
@@ -277,6 +300,13 @@ confined '#\[allow\(' 'Warning suppressions' \
 modules=$(git ls-files '*/mod.rs' || true)
 if [ -n "$modules" ]; then
     report 'Module style: foo.rs + foo/, not foo/mod.rs' 'mod.rs file' "$modules"
+fi
+
+findings=$(coverage_matrix)
+if [ -n "$findings" ]; then
+    report 'End-to-end tests are listed in COVERAGE.md' \
+        "end-to-end coverage table drift: every $COVERAGE_TESTS/*.rs file needs a row in $COVERAGE, and every row needs its file" \
+        "$findings"
 fi
 
 # --- release hygiene ---------------------------------------------------------

@@ -18,6 +18,10 @@ and rasterized spaces instead of staying in one of them.
 
 ## Covered behaviour by file
 
+`make audit` cross-checks this table against the files: every
+`windows/tests/tests/*.rs` needs a row, and every row needs its file. A new
+test file lands with its row in the same change.
+
 | File | Coverage |
 | --- | --- |
 | `smoke.rs` | Clear-to-colour fill; `DrawPrimitiveUP` triangle with interpolated diffuse. |
