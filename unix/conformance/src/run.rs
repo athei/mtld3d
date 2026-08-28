@@ -83,12 +83,20 @@ pub fn run_subtest(
     // inline binds, …). `nslog` *logs* validation failures to stderr instead of
     // aborting, so it cannot mask the per-site counts the way `error`/`abort`
     // mode would — the historical reason the layer was disabled here.
+    //
+    // The layer's *warnings* are ignored. They are performance hints, not
+    // misuse: a resource bound to an encoder no draw went on to read, a state
+    // setter overwritten before the next draw. A leg emits thousands of them
+    // (one `setVisibilityResultMode` pair per occlusion query, one binding per
+    // shader that stops reading a slot), all deduplicated to a handful of
+    // lines that read exactly like the error lines and bury them. Only errors
+    // are reported, so a new validation line means a new misuse.
     let mut child = Command::new(wine)
         .arg(exe)
         .arg(subtest.arg())
         .env("MTL_DEBUG_LAYER", "1")
         .env("MTL_DEBUG_LAYER_ERROR_MODE", "nslog")
-        .env("MTL_DEBUG_LAYER_WARNING_MODE", "nslog")
+        .env("MTL_DEBUG_LAYER_WARNING_MODE", "ignore")
         .env("MTL_HUD_ENABLED", "0")
         .env("WINEDEBUG", "-all")
         .env("WINEDLLOVERRIDES", HEADLESS_DLL_OVERRIDES)

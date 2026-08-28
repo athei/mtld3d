@@ -541,6 +541,61 @@ fn a_multisampled_depth_surface_binds_beside_a_multisampled_target() {
     );
 }
 
+#[test]
+fn a_single_sampled_depth_surface_drops_beside_a_multisampled_target() {
+    // D3D9 leaves the depth-stencil surface bound across `SetRenderTarget`, so
+    // a multisampled target can land beside the single-sampled depth the
+    // device was created with. Metal takes a pass's sample count from its
+    // attachments and rejects one whose attachments disagree, so the pass
+    // drops the depth attachment. Everything else built for that pass has to
+    // agree: a pipeline that still declared a depth format would be rejected
+    // at the draw ("For depth attachment, the renderPipelineState pixelFormat
+    // must be MTLPixelFormatInvalid, as no texture is set"), and the draw
+    // would never reach the target.
+    let h = harness(D3DMULTISAMPLE_NONE, Some(D3DFMT_D24S8));
+    let (width, height) = h.dims();
+    let (width_f, height_f) = back_buffer_extent(&h);
+    let rt = h.create_render_target_ms(
+        (width, height),
+        D3DFMT_X8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(h.set_render_target(0, &rt), 0, "SetRenderTarget(4x)");
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f, height_f, 0.5, WHITE)
+        ),
+        0,
+        "DrawPrimitiveUP",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    let plain = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    assert_eq!(h.stretch_rect(&rt, &plain, D3DTEXF_NONE), 0, "resolve");
+    let row = surface_row(&h, &plain, (width, height));
+    assert!(
+        count_intermediate(&row) > 0,
+        "the draw reached the 4x target with depth dropped: {row:02X?}"
+    );
+    assert_pixel_eq(
+        row[INSIDE_X as usize],
+        WHITE,
+        "a pixel clear of every edge carries the draw",
+    );
+}
+
 // ── D3DRS_MULTISAMPLEMASK ──
 
 #[test]

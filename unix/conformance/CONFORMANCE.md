@@ -46,6 +46,14 @@ with Metal API validation left on in `nslog` mode (it logs rather than aborting,
 so it cannot mask the failure counts) and with our logs and Wine's debug
 channels silenced.
 
+The layer's validation *errors* are reported, deduplicated, as
+`metal-validation:` lines; its *warnings* are ignored. A warning is a
+performance hint, not misuse (a resource bound to an encoder no draw went on to
+read, a state setter overwritten before the next draw), and a leg emits
+thousands of them, so leaving them on buried the error lines in output that
+looked identical. A `metal-validation:` line therefore means the layer
+committed API misuse, and a new one is a regression to chase.
+
 This is **not** part of `make test`: many checks fail by design (see below), so
 it is a tracked-score tool, not a pass/fail gate on zero. The runner exits
 non-zero on a *regression* vs the baseline — a per-site failure count that went
@@ -639,10 +647,13 @@ The whole test draws with a multisampled render target beside a
 single-sampled depth buffer and the other way round. Metal rejects a render
 pass whose attachments disagree on sample count, so mtld3d drops the
 mismatched depth attachment; the draws land but the depth test does not
-gate them. Same rationale as multisampled_depth_buffer_test 17476, and the
-same evidence that D3D9 never defined the case: every assertion here carries
-a second accepted colour under `broken()`, and the comments in the test
-record that AMD and Nvidia disagree about whether the draw happens at all.
+gate them. The pipelines and clear quads built for such a pass declare no
+depth or stencil format either, since Metal rejects a pipeline that names a
+format the pass has no attachment for. Same rationale as
+multisampled_depth_buffer_test 17476, and the same evidence that D3D9 never
+defined the case: every assertion here carries a second accepted colour under
+`broken()`, and the comments in the test record that AMD and Nvidia disagree
+about whether the draw happens at all.
 
 ### visual.c/test_flip
 Sites: 22053=expected 22055=expected 22064=expected 22066=expected

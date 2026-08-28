@@ -1408,8 +1408,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     } else {
         ScratchSlice::EMPTY
     };
-    let has_depth = snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH);
-    let has_stencil = snap.depth_stencil.contains(DepthStencilFlags::HAS_STENCIL);
+    // The snapshot records what the app bound; the pass records what Metal
+    // will accept. A depth surface that disagrees with render target 0 on
+    // sample count is dropped at pass open, and a pipeline built for that pass
+    // must declare neither a depth nor a stencil format or Metal rejects the
+    // draw.
+    let pass_binds_depth = enc.pass_binds_depth();
+    let has_depth = pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH);
+    let has_stencil =
+        pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_STENCIL);
     drop(t_consts);
 
     // 1. Lazily create each bound Metal texture; collect handles. Upload
