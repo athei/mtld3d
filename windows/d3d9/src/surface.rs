@@ -854,7 +854,8 @@ struct SurfaceInner {
     standalone_pool: u32,
     /// Non-null for depth-stencil standalone surfaces created via `CreateDepthStencilSurface`.
     ///
-    /// Holds the retained `MTLTexture*`.
+    /// Holds the retained `MTLTexture*`, which the surface owns: it goes on
+    /// the encoder's seq-gated retention queue when the surface finalizes.
     metal_depth_handle: MetalHandle<MTLTextureKind>,
     /// Non-null for standalone color surfaces (the backbuffer returned by `GetBackBuffer`).
     ///
@@ -1261,6 +1262,20 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         // public lifetime, so the device outlives this finalize.
         unsafe { &mut *inner.device_inner }
             .push_op(Box::new(move |enc| enc.retire_color_target(base, srgb)));
+    }
+    // A standalone depth-stencil target owns its Metal depth texture the same
+    // way, and retires it the same way. The implicit auto depth-stencil
+    // surface leaves the field null and resolves the device's handle live, so
+    // only a `CreateDepthStencilSurface` surface reaches this.
+    if inner.parent_texture.is_null()
+        && !inner.metal_depth_handle.is_null()
+        && !inner.device_inner.is_null()
+    {
+        let depth = inner.metal_depth_handle;
+        // SAFETY: a standalone surface forwards a device reference for its
+        // public lifetime, so the device outlives this finalize.
+        unsafe { &mut *inner.device_inner }
+            .push_op(Box::new(move |enc| enc.retire_depth_target(depth)));
     }
     // A cube face has nothing of the cube to give back here. The reference
     // `GetCubeMapSurface` took on it is dropped by the container forwarding in

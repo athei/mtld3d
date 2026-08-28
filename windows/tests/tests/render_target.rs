@@ -3193,3 +3193,105 @@ fn same_size_depth_bind_inherits_contents_when_aliased() {
         "right half fails: the inherited depth carries B's occluder"
     );
 }
+
+/// A depth-stencil surface created and released once per frame, 64 times over.
+///
+/// Each `CreateDepthStencilSurface` surface owns a Metal depth texture, and
+/// the device holds the surface alive while it is bound, so the texture is
+/// released one frame after the application drops its own reference: the
+/// binding of the next surface is what finalizes the previous one, while the
+/// frame that drew against it is still in flight. `make test` runs with
+/// `MTL_DEBUG_LAYER` on, so a destroy that lands before that frame retires
+/// aborts the process instead of reading freed storage. Every iteration also
+/// depth-tests through its own fresh surface, which fails if a retire took a
+/// texture the next binding still needed.
+#[test]
+fn depth_stencil_surfaces_released_across_frames_stay_sound() {
+    const ROUNDS: u32 = 64;
+
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    let quad = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    let near = quad(0.25, GREEN);
+    let far = quad(0.75, RED);
+
+    for round in 0..ROUNDS {
+        let ds = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+        let (hr, desc) = ds.desc();
+        assert_eq!(hr, 0, "round {round}: created surface describes");
+        assert_eq!(
+            (desc.width, desc.height),
+            (640, 480),
+            "round {round}: extent"
+        );
+        assert_eq!(
+            h.set_depth_stencil_surface(&ds),
+            0,
+            "round {round}: bind the fresh depth surface"
+        );
+        assert_eq!(
+            h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+            0,
+            "round {round}: clear colour and depth"
+        );
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &near), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &far), 0);
+        assert_eq!(h.end_scene(), 0);
+        // Read back on the first, a middle and the last round: the depth test
+        // has to keep working on every fresh texture, and the readback is a
+        // GPU sync, which is what lets the retention queue drain.
+        if round == 0 || round == ROUNDS / 2 || round == ROUNDS - 1 {
+            assert_eq!(
+                h.read_pixel(320, 240),
+                GREEN,
+                "round {round}: the near quad owns the pixel, so the fresh \
+                 depth surface cleared and tested"
+            );
+        }
+        assert_eq!(h.present(), 0, "round {round}: present");
+        // Dropping the surface here leaves the device's binding as its last
+        // reference; the next round's bind releases it and queues the retire.
+    }
+
+    // Unbind so the final surface retires while the device is still live,
+    // then prove the device still renders with no depth attachment at all.
+    assert_eq!(h.clear_depth_stencil_surface(), 0, "unbind depth-stencil");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &far), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "the device renders after every depth surface has retired"
+    );
+}

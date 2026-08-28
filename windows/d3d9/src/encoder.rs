@@ -2935,6 +2935,28 @@ impl FrameEncoder {
         }
     }
 
+    /// Park a standalone depth-stencil target's texture on the retention queue.
+    ///
+    /// Called when the surface that owns it finalizes. The destroy is gated
+    /// on the current submit seq, since a pass already encoded this frame may
+    /// still attach the handle, and the pass state forgets the handle here so
+    /// nothing binds or classifies it once the storage is gone.
+    pub fn retire_depth_target(&mut self, depth: MetalHandle<MTLTextureKind>) {
+        if depth.is_null() {
+            return;
+        }
+        self.pass_state.retire_depth_texture(depth);
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Texture,
+                handle: depth.raw(),
+                page_box: None,
+                staging_arc: None,
+                seq: self.current_submit_seq,
+                from_texture: true,
+            });
+    }
+
     /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.
     pub fn set_srgb_write_enabled(&mut self, enabled: bool) {
         self.pass_state.set_srgb_write_enabled(enabled);
