@@ -2722,6 +2722,58 @@ fn render_into_rgba16f_target_round_trips() {
 }
 
 #[test]
+fn lock_rect_on_a_half_float_render_target_reads_at_its_own_pitch() {
+    // A colour surface with no CPU staging serves LockRect out of a read-back
+    // page, and that page is a host-visible store like any other: it is sized
+    // and written at the row pitch its own format asks for. A half-float target
+    // is eight bytes per texel, so a page laid out at four bytes per texel
+    // reports half the stride its rows are really at and asks the blit for a
+    // copy narrower than one row of the source.
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const LANES_PER_TEXEL: usize = 4;
+    // 0xFF804020: R = 0x80/255, G = 0x40/255, B = 0x20/255, A = 1.
+    const FILL: u32 = 0xFF80_4020;
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(W, H, D3DFMT_A16B16G16R16F);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind half-float RT");
+    assert_eq!(h.clear_target(FILL), 0, "clear the half-float RT");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let locked = rt.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("non-negative pitch");
+    assert_eq!(
+        pitch,
+        W as usize * 8,
+        "a half-float row is eight bytes per texel wide",
+    );
+    let lanes_per_row = pitch / 2;
+    let lanes = locked.as_u16(lanes_per_row * H as usize);
+    let expected = [
+        f32::from(0x80u8) / 255.0,
+        f32::from(0x40u8) / 255.0,
+        f32::from(0x20u8) / 255.0,
+        1.0,
+    ];
+    for (label, texel) in [
+        ("first texel of the first row", 0),
+        (
+            "last texel of the last row",
+            lanes_per_row * (H as usize - 1) + (W as usize - 1) * LANES_PER_TEXEL,
+        ),
+    ] {
+        for (lane, want) in expected.into_iter().enumerate() {
+            let got = f16_to_f32(lanes[texel + lane]);
+            assert!(
+                (got - want).abs() < 0.01,
+                "{label} lane {lane} should hold {want}; got {got}",
+            );
+        }
+    }
+}
+
+#[test]
 fn render_to_default_pool_target_round_trips() {
     // A DEFAULT-pool render target can be bound, drawn into, and is then a valid
     // GetRenderTargetData source into a SYSTEMMEM surface — i.e. create_color_target

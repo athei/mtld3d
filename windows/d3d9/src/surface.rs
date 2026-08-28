@@ -2343,7 +2343,6 @@ fn backbuffer_lock_readback(
     rect: *const c_void,
     flags: u32,
 ) -> i32 {
-    const BPP: u32 = 4;
     let inner_ptr = obj.inner;
     // SAFETY: `inner_ptr` is the live `SurfaceInner` allocation for this
     // wrapper; surfaces are single-threaded objects in D3D9 so the
@@ -2382,10 +2381,25 @@ fn backbuffer_lock_readback(
         return D3DERR_INVALIDCALL;
     }
 
-    // BGRA8 backbuffer → 4 bytes per pixel. Backbuffer format is
-    // pinned to Bgra8Unorm by the CAMetalLayer allow-list, so 4 bytes
-    // per pixel is fixed.
-    let bytes_per_row = w.saturating_mul(BPP);
+    // The read-back page is a host-visible store, so it takes the one pitch
+    // every host-visible store of this format uses: the blit writes rows at it,
+    // `LockRect` reports it, and a `GetDC` DIB over the same page steps by it.
+    // This fn also serves a standalone non-lockable render target, whose format
+    // is its own rather than the backbuffer's pinned `X8R8G8B8`.
+    let format = inner.live_format();
+    let Some(fmt) = mtld3d_core::format::map_d3d_format(format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "colour-surface LockRect: no format mapping for {format:#x} → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    if fmt.bytes_per_pixel() == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "colour-surface LockRect: block-compressed format {format:#x} has no read-back layout → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, fmt.bytes_per_pixel());
     let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
     if bytes == 0 {
         return D3DERR_INVALIDCALL;
@@ -2445,11 +2459,11 @@ fn backbuffer_lock_readback(
 ///
 /// The page is held on `inner.readback`, returning `(width, height,
 /// bytes_per_row)` or `None` on failure. Used by `GetDC` on the backbuffer (the
-/// `LockRect` portrait path has its own sub-rect variant above). The backbuffer
-/// is pinned to `Bgra8Unorm` (4 bytes/pixel), whose byte order matches an
-/// X8R8G8B8 DIB.
+/// `LockRect` portrait path has its own sub-rect variant above). The page is
+/// what the DC's DIB wraps, so it is sized and written at the surface format's
+/// host-visible pitch, which is the stride GDI derives for a DIB of the same
+/// width and bit count.
 fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)> {
-    const BPP: u32 = 4;
     if inner.device_inner.is_null() {
         return None;
     }
@@ -2459,7 +2473,11 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
     if w == 0 || h == 0 || tex_handle.is_null() {
         return None;
     }
-    let bytes_per_row = w.saturating_mul(BPP);
+    let fmt = mtld3d_core::format::map_d3d_format(inner.live_format())?;
+    if fmt.bytes_per_pixel() == 0 {
+        return None;
+    }
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, fmt.bytes_per_pixel());
     let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
     if bytes == 0 {
         return None;
@@ -3127,8 +3145,8 @@ impl SurfaceInner {
         if self.implicit_kind == ImplicitKind::Backbuffer {
             let page = self.readback.as_ref()?;
             let format = self.live_format();
-            let bpp = mtld3d_core::format::map_d3d_format(format)?.bytes_per_pixel();
-            if bpp == 0 {
+            let fmt = mtld3d_core::format::map_d3d_format(format)?;
+            if fmt.bytes_per_pixel() == 0 {
                 return None;
             }
             let width = self.live_width();
@@ -3136,7 +3154,10 @@ impl SurfaceInner {
                 bits: page.as_ptr().cast_mut(),
                 width,
                 height: self.live_height(),
-                src_pitch: width.saturating_mul(bpp) as usize,
+                // The pitch `readback_full_backbuffer` sized and wrote the page
+                // at, which is also the DIB's `bmWidthBytes`.
+                src_pitch: mtld3d_core::format::linear_row_pitch(width, fmt.bytes_per_pixel())
+                    as usize,
                 d3d_format: format,
             });
         }
