@@ -8,6 +8,7 @@ use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
     MetalHandle,
+    mtl::ColorSpacePolicy,
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
 };
 use objc2::{
@@ -18,17 +19,39 @@ use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
-/// Whether the bound `CAMetalLayer` was configured for EDR at `AttachMetalLayer` time.
+/// Whether the bound `CAMetalLayer` currently carries the EDR configuration.
 ///
-/// Set once on the API thread (during attach, after the main-thread
-/// layer-config block runs); read on the encoder thread per present.
-/// Relaxed `AtomicBool` is enough — single writer at known time, single
-/// reader path.
+/// Written on the API thread during attach and again on the main thread
+/// whenever the bound window's screen changes its EDR capability, so it always
+/// names the configuration the layer actually has. The present route is taken
+/// from the drawable's own pixel format rather than from here, so a
+/// reconfiguration landing between two presents cannot mismatch the pass.
 ///
 /// All HDR state lives unix-side: PE has no knowledge of HDR, no wire
 /// fields beyond `SubmitFrameParams.present_view` (PE already has the
 /// `NSView*` from `AttachMetalLayer`; sending it is independent of HDR).
 static HDR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Raw `CAMetalLayer*` (as `usize`) bound at the most recent attach. `0` = none.
+///
+/// The display-follow path reconfigures this layer from the main thread, the
+/// same posture as [`BOUND_VIEW_PTR`]: re-attach re-points it, and the
+/// presenting thread never hands a Core Animation pointer across a thread
+/// boundary.
+static BOUND_LAYER_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// The `color.hdr.enable` setting the most recent attach carried.
+///
+/// Deciding the layer configuration for a screen first seen mid-session needs
+/// the user's gate, and that gate only ever arrives on the attach wire.
+static HDR_ENABLE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The `color.space` policy of the most recent attach, as `ColorSpacePolicy as u32`.
+///
+/// Latched for the same reason as [`HDR_ENABLE_REQUESTED`]: reconfiguring the
+/// layer for a new screen has to pick the colorspace family attach would have
+/// picked for it.
+static COLOR_SPACE_POLICY: AtomicU32 = AtomicU32::new(ColorSpacePolicy::Passthrough as u32);
 
 /// Whether the bound window is currently fully occluded (covered or minimised).
 ///
@@ -350,6 +373,10 @@ fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
             if !changed {
                 return;
             }
+            // A real topology or mode change is the moment a display was
+            // attached, removed or reconfigured, so reconcile the layer now
+            // rather than waiting out the present-counted poll interval.
+            refresh_headroom_on_main();
             let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
             if delegate_ptr == 0 {
                 return;
@@ -438,16 +465,6 @@ fn install_occlusion_observer_once() {
     });
 }
 
-/// Whether HDR layer config was applied at attach time.
-///
-/// `submit_frame` branches on this to choose the HDR shader vs the SDR
-/// blit-present path. Returns `false` when `color.hdr.enable` is turned
-/// off in `mtld3d.conf` or the display has no EDR potential.
-#[must_use]
-pub fn hdr_active() -> bool {
-    HDR_ACTIVE.load(Ordering::Relaxed)
-}
-
 /// Minimum seconds between presents passed to `presentDrawable:afterMinimumDuration:`.
 ///
 /// Encoded as `f64::to_bits`. `0.0` means "no throttle" — `submit_frame`
@@ -525,35 +542,44 @@ pub struct DisplayCaps {
     pub backing_scale: u32,
 }
 
-/// Layer colorspace + HDR-active decision bundled together.
+/// Which of the two `CAMetalLayer` configurations a display asks for.
+///
+/// `Sdr` is `BGRA8Unorm` with a standard-range colorspace and no EDR opt-in;
+/// `Hdr` is `RGBA16Float` with an extended-linear colorspace and
+/// `wantsExtendedDynamicRangeContent`. The three properties are one decision:
+/// a float surface tagged with a non-linear profile double-EOTFs and goes
+/// dark, and an extended-linear profile without the opt-in clamps at SDR
+/// paper white.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerMode {
+    Sdr,
+    Hdr,
+}
+
+/// Layer colorspace + layer-mode decision bundled together.
 ///
 /// Keeps `configure_metal_layer` inside clippy's `too_many_arguments`
-/// threshold. `hdr_active` drives the SDR-vs-HDR branch; `native_colorspace`
+/// threshold. `mode` drives the SDR-vs-HDR branch; `native_colorspace`
 /// is the screen's profile (SDR feeds through `copy_with_standard_range`,
 /// HDR through `extended_linearized`); `screen_name` is the logging key
 /// for fallback warns; `screen_profile_name` is the user-facing profile
 /// string surfaced in the post-config log line.
 struct LayerColorConfig {
-    hdr_active: bool,
-    color_space: mtld3d_shared::mtl::ColorSpacePolicy,
+    mode: LayerMode,
+    color_space: ColorSpacePolicy,
     native_colorspace: Option<Retained<CGColorSpace>>,
     screen_name: Option<String>,
     screen_profile_name: Option<String>,
-    /// `NSScreen.maximumFramesPerSecond` for the bound view's panel; `0.0` if unknown.
-    ///
-    /// Drives the present-throttle duration computed at attach.
-    panel_max_hz: f64,
 }
 
 /// Borrowed view of `LayerColorConfig` for the main-thread callee.
 #[derive(Clone, Copy)]
 struct LayerColorRefs<'a> {
-    hdr_active: bool,
-    color_space: mtld3d_shared::mtl::ColorSpacePolicy,
+    mode: LayerMode,
+    color_space: ColorSpacePolicy,
     native_colorspace: Option<&'a CGColorSpace>,
     screen_name: Option<&'a str>,
     screen_profile_name: Option<&'a str>,
-    panel_max_hz: f64,
 }
 
 bitflags::bitflags! {
@@ -695,8 +721,9 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
 ///
 /// Side effect: latches the unix-side `HDR_ACTIVE` global to `true`
 /// when the display has EDR potential and `hdr_enable` is set (resolved
-/// PE-side from `color.hdr.enable` in `mtld3d.conf`). `submit_frame` reads
-/// `HDR_ACTIVE` to decide HDR shader vs SDR blit.
+/// PE-side from `color.hdr.enable` in `mtld3d.conf`), and records the layer
+/// plus both user settings so the per-present poll can follow the window
+/// onto a display of the other class.
 pub fn attach_metal_layer(
     device_handle: MetalHandle<MTLDeviceKind>,
     hwnd: u64,
@@ -745,11 +772,18 @@ pub fn attach_metal_layer(
             error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
             None
         } else {
+            // Latch the layer and the two user settings the display-follow
+            // path needs: it reconfigures this layer for a screen that was
+            // not attached yet, and has to apply the same gate and the same
+            // colorspace policy attach would have applied.
+            BOUND_LAYER_PTR.store(layer as usize, Ordering::Relaxed);
+            HDR_ENABLE_REQUESTED.store(hdr_enable, Ordering::Relaxed);
+            COLOR_SPACE_POLICY.store(color_space as u32, Ordering::Relaxed);
             // Decide HDR vs SDR layer configuration from the panel's
             // static potential + the user's `color.hdr.enable` setting. Latch
-            // the result for `submit_frame` to read each present — the
+            // the result as the configuration the layer now carries — the
             // user gate stays unix-side from here on.
-            let hdr_active = resolve_hdr_active(
+            let mode = resolve_layer_mode(
                 hint.edr_potential,
                 hint.screen_name.as_deref(),
                 hint.colorspace_flags.contains(ColorspaceFlags::IS_HDR),
@@ -757,20 +791,20 @@ pub fn attach_metal_layer(
                     .contains(ColorspaceFlags::IS_WIDE_GAMUT),
                 hdr_enable,
             );
-            HDR_ACTIVE.store(hdr_active, Ordering::Relaxed);
+            HDR_ACTIVE.store(mode == LayerMode::Hdr, Ordering::Relaxed);
             configure_metal_layer(
                 layer,
                 device_handle.raw(),
                 width,
                 height,
                 pacing,
+                hint.panel_max_hz,
                 LayerColorConfig {
-                    hdr_active,
+                    mode,
                     color_space,
                     native_colorspace: hint.native_colorspace,
                     screen_name: hint.screen_name,
                     screen_profile_name: hint.screen_profile_name,
-                    panel_max_hz: hint.panel_max_hz,
                 },
             );
             // Start occlusion tracking for this window so presents skip the
@@ -1084,25 +1118,10 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     ) = screen
         .as_deref()
         .map_or((1.0_f64, 1.0_f64, None, None, None, false, false), |s| {
-            // Read the NSColorSpace once, extract the CGColorSpace (for
-            // layer setColorspace), gamut classification (for log
-            // readability), and is_hdr/is_wide_gamut flags (for the
-            // HDR-tagged-but-no-EDR asymmetry diagnostic).
-            let ns_cs = s.colorSpace();
-            let cg_cs = ns_cs.as_ref().and_then(|n| n.CGColorSpace());
-            // Classify the screen's gamut from its ICC primaries. The
-            // profile's user-visible description can be renamed by the
-            // user in ColorSync Utility, but the primaries are the
-            // actual physical thing the panel renders into.
-            let profile_name = cg_cs
-                .as_deref()
-                .and_then(classify_icc_gamut)
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    ns_cs
-                        .as_ref()
-                        .and_then(|n| n.localizedName().map(|s| s.to_string()))
-                });
+            // The CGColorSpace (for layer setColorspace) and its gamut
+            // label, plus is_hdr/is_wide_gamut flags for the
+            // HDR-tagged-but-no-EDR asymmetry diagnostic.
+            let (cg_cs, profile_name) = screen_color_profile(s);
             let is_hdr = cg_cs.as_deref().is_some_and(CGColorSpace::is_hdr);
             let is_wide = cg_cs
                 .as_deref()
@@ -1146,20 +1165,45 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     }
 }
 
-/// Decide whether to configure the layer for EDR at attach time.
+/// The layer configuration a screen's EDR ceiling and the user's setting ask for.
 ///
-/// From the panel's static potential + the user's `color.hdr.enable` setting.
-/// Returns `true` when both conditions hold; the actual per-frame BT.2446
+/// `potential` is `maximumPotentialExtendedDynamicRangeColorComponentValue`,
+/// the *static* panel ceiling rather than the live headroom: a panel that can
+/// reach EDR keeps the HDR layer through a brightness dip or a thermal
+/// throttle, and one that cannot never gets it. A non-finite or `<= 1.0`
+/// ceiling resolves to `Sdr`, and so does `color.hdr.enable = false` whatever
+/// the panel reports.
+const fn layer_mode_for(potential: f64, hdr_enable: bool) -> LayerMode {
+    if hdr_enable && potential > 1.0 && potential.is_finite() {
+        LayerMode::Hdr
+    } else {
+        LayerMode::Sdr
+    }
+}
+
+/// The configuration to re-apply when a screen no longer matches the layer.
+///
+/// `Some(mode)` when the applied configuration disagrees with what the screen
+/// asks for, `None` while the two already match, which is every poll of a
+/// session that stays on one display.
+fn layer_mode_change(applied: LayerMode, potential: f64, hdr_enable: bool) -> Option<LayerMode> {
+    let target = layer_mode_for(potential, hdr_enable);
+    (target != applied).then_some(target)
+}
+
+/// Decide the layer configuration at attach time, and say why in the log.
+///
+/// Wraps [`layer_mode_for`] with one info line per attach naming the screen,
+/// so multi-monitor reports can be triaged. The actual per-frame BT.2446
 /// target is the live dynamic headroom polled in `submit_frame`, not a
-/// function of `potential`. Logs one info line per attach naming the screen
-/// so multi-monitor reports can be triaged.
-fn resolve_hdr_active(
+/// function of `potential`.
+fn resolve_layer_mode(
     potential: f64,
     screen_name: Option<&str>,
     colorspace_is_hdr: bool,
     colorspace_is_wide_gamut: bool,
     hdr_enable: bool,
-) -> bool {
+) -> LayerMode {
     let screen = screen_name.unwrap_or("(unknown screen)");
     // Diagnostic suffix shared across all three branches. `cs_hdr=true`
     // alongside `potential=1.0` is the asymmetric case: the display is
@@ -1167,25 +1211,24 @@ fn resolve_hdr_active(
     // software fix for that case (WindowServer owns the pipeline);
     // logging it makes the failure mode visible in user reports.
     let cs = format!("cs_hdr={colorspace_is_hdr} cs_wide={colorspace_is_wide_gamut}");
+    let mode = layer_mode_for(potential, hdr_enable);
     if !hdr_enable {
         info!(
             target: LOG_TARGET,
             "hdr: disabled via mtld3d.conf color.hdr.enable=false on '{screen}' (potential={potential:.2}× {cs})",
         );
-        return false;
-    }
-    if !(potential > 1.0 && potential.is_finite()) {
+    } else if mode == LayerMode::Sdr {
         info!(
             target: LOG_TARGET,
             "hdr: '{screen}' has no EDR headroom (potential={potential:.2}× {cs}), running SDR",
         );
-        return false;
+    } else {
+        info!(
+            target: LOG_TARGET,
+            "hdr: '{screen}' reports {potential:.2}× peak headroom ({cs}) — HDR active, present peak follows live headroom",
+        );
     }
-    info!(
-        target: LOG_TARGET,
-        "hdr: '{screen}' reports {potential:.2}× peak headroom ({cs}) — HDR active, present peak follows live headroom",
-    );
-    true
+    mode
 }
 
 /// The *dynamic* `maximumExtendedDynamicRangeColorComponentValue` of the bound view's screen.
@@ -1201,6 +1244,11 @@ fn resolve_hdr_active(
 /// Reads the value the main thread last published and queues a refresh when
 /// one is due. Never touches `AppKit`, so it is safe to call from the
 /// presenting thread; see [`CURRENT_HEADROOM_BITS`] for why that matters.
+///
+/// Called every present whatever the layer is configured for, because the
+/// refresh it queues is also what notices the window moving onto a display of
+/// the other class: an SDR session that never polled would never see a panel
+/// with headroom appear under it.
 ///
 /// Returns `1.0` on any lookup failure or while macOS hasn't yet
 /// transitioned the screen into EDR mode (the first presents after
@@ -1246,6 +1294,10 @@ fn queue_headroom_refresh() {
 /// two are main-thread-only objects that the main thread rebuilds across a
 /// window or display change. Logs the drift line here too, for the same
 /// reason, since naming the screen means walking to it again.
+///
+/// The walk ends on whichever screen the window is on *now*, so it is also
+/// where the layer's own configuration is reconciled against that screen; see
+/// [`follow_screen_layer_mode`].
 fn refresh_headroom_on_main() {
     use objc2::{MainThreadMarker, rc::Retained};
     use objc2_app_kit::{NSScreen, NSView};
@@ -1281,6 +1333,12 @@ fn refresh_headroom_on_main() {
         1.0
     };
     CURRENT_HEADROOM_BITS.store(headroom.to_bits(), Ordering::Relaxed);
+    // Only reconcile against a screen we actually reached. A window mid-move
+    // between displays reports none, and the layer is better left as it is
+    // than reconfigured twice against a screen the window is leaving.
+    if let Some(screen) = screen.as_deref() {
+        follow_screen_layer_mode(screen);
+    }
     log_headroom_change_if_any(headroom, view_addr as *mut c_void);
 }
 
@@ -1345,6 +1403,7 @@ fn configure_metal_layer(
     width: u32,
     height: u32,
     pacing: PresentPacing,
+    panel_max_hz: f64,
     color: LayerColorConfig,
 ) {
     // Hop to AppKit's main thread for the entire CALayer configuration
@@ -1378,13 +1437,13 @@ fn configure_metal_layer(
             width,
             height,
             &pacing,
+            panel_max_hz,
             LayerColorRefs {
-                hdr_active: color.hdr_active,
+                mode: color.mode,
                 color_space: color.color_space,
                 native_colorspace: color.native_colorspace.as_deref(),
                 screen_name: color.screen_name.as_deref(),
                 screen_profile_name: color.screen_profile_name.as_deref(),
-                panel_max_hz: color.panel_max_hz,
             },
         );
     });
@@ -1396,21 +1455,10 @@ fn configure_metal_layer_inner(
     width: u32,
     height: u32,
     pacing: &PresentPacing,
+    panel_max_hz: f64,
     color: LayerColorRefs<'_>,
 ) {
-    use mtld3d_shared::mtl::ColorSpacePolicy;
-    use objc2_foundation::NSString;
-    use objc2_metal::MTLPixelFormat;
     use objc2_quartz_core::{CAMetalLayer, kCAGravityResizeAspect};
-
-    let LayerColorRefs {
-        hdr_active,
-        color_space,
-        native_colorspace,
-        screen_name,
-        screen_profile_name,
-        panel_max_hz,
-    } = color;
 
     // Cast the raw `*mut c_void` from Wine's macdrv into typed
     // `Retained<CAMetalLayer>`. Using typed objc2 setters means a
@@ -1428,59 +1476,7 @@ fn configure_metal_layer_inner(
 
     // layer.device = MTLDevice
     layer.setDevice(device.as_deref());
-    // layer.pixelFormat — BGRA8Unorm for SDR, RGBA16Float for HDR.
-    // The HDR surface gives the present pass linear float pixels that
-    // the compositor maps directly to the panel's EDR headroom.
-    layer.setPixelFormat(if hdr_active {
-        MTLPixelFormat::RGBA16Float
-    } else {
-        MTLPixelFormat::BGRA8Unorm
-    });
-    // layer.colorspace — policy driven by `mtld3d.conf::color.space`.
-    //
-    // `Passthrough` (default): tag the screen's own profile (SDR via
-    // `copy_with_standard_range`, HDR via `extended_linearized`). D3D9
-    // values land at the panel's native primaries — max vibrance per
-    // display. The HDR-side extended-linear variant is required because
-    // RGBA16Float on a non-linear profile produces a double-EOTF dark
-    // image.
-    //
-    // `Accurate`: tag the sRGB family for both paths (`kCGColorSpaceSRGB`
-    // for SDR, `kCGColorSpaceExtendedLinearSRGB` for HDR). D3D9 art is
-    // overwhelmingly authored against sRGB primaries, so tagging the
-    // layer as sRGB lets CoreAnimation do colour-managed conversion to
-    // the panel — designer-intended hues instead of the display's
-    // gamut stretch.
-    let cs_label = match (hdr_active, color_space) {
-        (true, ColorSpacePolicy::Passthrough) => apply_hdr_colorspace_passthrough(
-            &layer,
-            native_colorspace,
-            screen_name,
-            screen_profile_name,
-        ),
-        (true, ColorSpacePolicy::Accurate) => apply_hdr_colorspace_accurate(&layer),
-        (false, ColorSpacePolicy::Passthrough) => apply_sdr_colorspace_passthrough(
-            &layer,
-            native_colorspace,
-            screen_name,
-            screen_profile_name,
-        ),
-        (false, ColorSpacePolicy::Accurate) => apply_sdr_colorspace_accurate(&layer),
-    };
-    // EDR opt-in. macOS only routes the layer's contents through the
-    // panel's HDR headroom when this is set; without it the panel
-    // clamps to SDR paper-white even if the surface format and
-    // colorspace are HDR-capable.
-    if hdr_active {
-        layer.setWantsExtendedDynamicRangeContent(true);
-    }
-    // Label the layer so Xcode GPU captures show `mtld3d-layer-hdr` vs
-    // `mtld3d-layer-sdr` — useful when triaging HDR-specific bugs.
-    layer.setName(Some(&NSString::from_str(if hdr_active {
-        "mtld3d-layer-hdr"
-    } else {
-        "mtld3d-layer-sdr"
-    })));
+    let cs_label = apply_layer_color(&layer, color);
     // Games are fullscreen-style — no alpha blending with desktop.
     layer.setOpaque(true);
     // Gravity decides what Core Animation does when the drawable is not the
@@ -1630,6 +1626,172 @@ pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
         return;
     }
     layer.setDrawableSize(CGSize { width, height });
+}
+
+/// Apply the layer's colour configuration, and report the colorspace label it picked.
+///
+/// Pixel format, colorspace, EDR opt-in and layer name are one decision (see
+/// [`LayerMode`]), so they are written together and from one place: attach
+/// configures a fresh layer through here, and the display-follow path
+/// re-applies the other configuration through the same code when the window
+/// lands on a display of the other class.
+///
+/// The colorspace policy comes from `mtld3d.conf::color.space`.
+/// `Passthrough` (the default) tags the screen's own profile (SDR via
+/// `copy_with_standard_range`, HDR via `extended_linearized`), so D3D9 values
+/// land at the panel's native primaries, max vibrance per display.
+/// `Accurate` tags the sRGB family for both paths instead; D3D9 art is
+/// overwhelmingly authored against sRGB primaries, so an sRGB-tagged layer
+/// lets Core Animation colour-manage to the panel and render
+/// designer-intended hues rather than the display's gamut stretch.
+///
+/// **Main thread only** — these are the compositor-observed setters that have
+/// to land inside a main-thread `CATransaction` commit, or the `WindowServer`
+/// EDR-mode arbiter can sample the layer between the write and the commit.
+fn apply_layer_color(layer: &objc2_quartz_core::CAMetalLayer, color: LayerColorRefs<'_>) -> String {
+    use objc2_foundation::NSString;
+    use objc2_metal::MTLPixelFormat;
+
+    let LayerColorRefs {
+        mode,
+        color_space,
+        native_colorspace,
+        screen_name,
+        screen_profile_name,
+    } = color;
+    let hdr = mode == LayerMode::Hdr;
+    // The HDR surface gives the present pass linear float pixels that the
+    // compositor maps directly to the panel's EDR headroom.
+    layer.setPixelFormat(if hdr {
+        MTLPixelFormat::RGBA16Float
+    } else {
+        MTLPixelFormat::BGRA8Unorm
+    });
+    let cs_label = match (mode, color_space) {
+        (LayerMode::Hdr, ColorSpacePolicy::Passthrough) => apply_hdr_colorspace_passthrough(
+            layer,
+            native_colorspace,
+            screen_name,
+            screen_profile_name,
+        ),
+        (LayerMode::Hdr, ColorSpacePolicy::Accurate) => apply_hdr_colorspace_accurate(layer),
+        (LayerMode::Sdr, ColorSpacePolicy::Passthrough) => apply_sdr_colorspace_passthrough(
+            layer,
+            native_colorspace,
+            screen_name,
+            screen_profile_name,
+        ),
+        (LayerMode::Sdr, ColorSpacePolicy::Accurate) => apply_sdr_colorspace_accurate(layer),
+    };
+    // EDR opt-in. macOS only routes the layer's contents through the panel's
+    // HDR headroom when this is set; without it the panel clamps to SDR
+    // paper-white even if the surface format and colorspace are HDR-capable.
+    // Written on both paths so an HDR layer that moves onto an SDR display
+    // gives the opt-in back rather than keeping a claim it cannot honour.
+    layer.setWantsExtendedDynamicRangeContent(hdr);
+    // Label the layer so Xcode GPU captures show `mtld3d-layer-hdr` vs
+    // `mtld3d-layer-sdr` — useful when triaging HDR-specific bugs.
+    layer.setName(Some(&NSString::from_str(if hdr {
+        "mtld3d-layer-hdr"
+    } else {
+        "mtld3d-layer-sdr"
+    })));
+    cs_label
+}
+
+/// The screen-profile pair the layer colorspace appliers need.
+///
+/// `CGColorSpace` for `setColorspace`, plus the user-facing profile label the
+/// post-configuration log line carries. The label is classified from the ICC
+/// primaries where they are readable, because a profile's description can be
+/// renamed in `ColorSync` Utility while the chromaticities are the physical
+/// thing the panel renders into; it falls back to `NSColorSpace.localizedName`.
+fn screen_color_profile(
+    screen: &objc2_app_kit::NSScreen,
+) -> (Option<Retained<CGColorSpace>>, Option<String>) {
+    let ns_cs = screen.colorSpace();
+    let cg_cs = ns_cs.as_ref().and_then(|n| n.CGColorSpace());
+    let profile_name = cg_cs
+        .as_deref()
+        .and_then(classify_icc_gamut)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            ns_cs
+                .as_ref()
+                .and_then(|n| n.localizedName().map(|s| s.to_string()))
+        });
+    (cg_cs, profile_name)
+}
+
+/// Follow the bound window's screen when its EDR capability changes. **Main thread only.**
+///
+/// A session can move between displays: the window is dragged to another
+/// screen, an external monitor is attached or unplugged, or the machine is
+/// docked. Without this the layer keeps whatever the screen at attach time
+/// asked for, which leaves an HDR layer driving an SDR panel (macOS
+/// gamut-compresses it, so it looks plausible rather than broken) or an SDR
+/// layer on a panel with headroom to spare.
+///
+/// The decision is the screen's *static* EDR ceiling, never the live
+/// headroom: the live value drops with brightness and thermal state, and
+/// re-formatting the layer on a brightness step would drop the drawable pool
+/// for a value the present shader already tracks per frame. Reconfiguring is
+/// therefore rare, and each one gets a log line.
+fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
+    use objc2_quartz_core::CAMetalLayer;
+
+    let layer_addr = BOUND_LAYER_PTR.load(Ordering::Relaxed);
+    // No layer attached yet: attach itself configures the first one.
+    if layer_addr == 0 {
+        return;
+    }
+    let applied = if HDR_ACTIVE.load(Ordering::Relaxed) {
+        LayerMode::Hdr
+    } else {
+        LayerMode::Sdr
+    };
+    let potential = screen.maximumPotentialExtendedDynamicRangeColorComponentValue();
+    let hdr_enable = HDR_ENABLE_REQUESTED.load(Ordering::Relaxed);
+    // The layer already matches this screen, which is every poll of a session
+    // that stays on one display.
+    let Some(mode) = layer_mode_change(applied, potential, hdr_enable) else {
+        return;
+    };
+    // SAFETY: `layer_addr` is the `CAMetalLayer*` wine macdrv handed attach;
+    // wine retains it for the metal view's lifetime, and `Retained::retain`
+    // bumps the count for the duration of the reconfiguration.
+    let Some(layer) = (unsafe { Retained::retain(layer_addr as *mut CAMetalLayer) }) else {
+        return;
+    };
+    let raw_policy = COLOR_SPACE_POLICY.load(Ordering::Relaxed);
+    let color_space = ColorSpacePolicy::from_repr(raw_policy).unwrap_or_else(|| {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: attach latched an unknown color.space policy {raw_policy}; \
+             reconfiguring the layer as passthrough",
+        );
+        ColorSpacePolicy::Passthrough
+    });
+    let (native_colorspace, screen_profile_name) = screen_color_profile(screen);
+    let screen_name = screen.localizedName().to_string();
+    let cs_label = apply_layer_color(
+        &layer,
+        LayerColorRefs {
+            mode,
+            color_space,
+            native_colorspace: native_colorspace.as_deref(),
+            screen_name: Some(&screen_name),
+            screen_profile_name: screen_profile_name.as_deref(),
+        },
+    );
+    HDR_ACTIVE.store(mode == LayerMode::Hdr, Ordering::Relaxed);
+    let pf = layer.pixelFormat();
+    let wants = layer.wantsExtendedDynamicRangeContent();
+    info!(
+        target: LOG_TARGET,
+        "hdr: window moved onto '{screen_name}' (potential={potential:.2}×), layer reconfigured: \
+         pixelFormat={pf:?} wantsEDR={wants} colorspace={cs_label}",
+    );
 }
 
 /// Set the SDR layer colorspace under the `Passthrough` policy.

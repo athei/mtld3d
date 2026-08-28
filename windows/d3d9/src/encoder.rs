@@ -8030,9 +8030,9 @@ pub struct FrameData {
     /// `NSView*` the layer was attached to.
     ///
     /// Forwarded to `SubmitFrameParams.present_view` so the unix side can
-    /// read the screen's *dynamic* EDR headroom each present (only used when
-    /// HDR is active, which is decided unix-side and gated by the
-    /// `macdrv::hdr_active()` global).
+    /// follow the screen the window is on: its *dynamic* EDR headroom each
+    /// present, and its EDR capability across a display change. Which layer
+    /// configuration that resolves to is decided unix-side.
     view_handle: MetalHandle<NSViewKind>,
     /// Logical back-buffer width, the resolution D3D9 reports.
     ///
