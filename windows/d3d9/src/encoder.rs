@@ -42,6 +42,7 @@ use mtld3d_core::{
     shader_cache::{self, CachedKind},
     shader_compile_stats::{self, BurstTracker, CompileBucket},
     storage_policy::buffer_storage_mode,
+    stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
     visibility::{
@@ -250,6 +251,31 @@ pub struct BlitSide {
     /// sRGB twin view of that companion, NULL whenever the companion is.
     pub msaa_srgb: MetalHandle<MTLTextureKind>,
     /// Sample count of the destination, 1 when it is single-sampled.
+    pub sample_count: u8,
+}
+
+/// One back-buffer `ReleaseDC` write-back that has to change size on the way in.
+///
+/// `GetDC` hands the DIB out at the extent D3D9 reports, so under a
+/// `render.scale` below 100% the page GDI drew into is larger than the texture
+/// it belongs in. Built by `surface.rs` on the API thread, which is where the
+/// device's scale and the back buffer's extent are both reachable.
+pub struct ResampledUpload {
+    /// Destination colour `MTLTexture`.
+    pub color_handle: u64,
+    /// Metal format of the destination, and so of the staging source too.
+    pub format: PixelFormat,
+    /// Extent the `tight` rows describe, which is the extent D3D9 reports.
+    pub logical: (u32, u32),
+    /// Extent of the destination texture, at or below `logical`.
+    pub texture: (u32, u32),
+    /// Bytes per pixel of `format`.
+    pub bytes_per_pixel: u32,
+    /// Multisampled companion of the destination, null when single-sampled.
+    pub msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa`, null whenever `msaa` is.
+    pub msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the destination; 1 without a companion.
     pub sample_count: u8,
 }
 
@@ -962,6 +988,16 @@ pub struct FrameEncoder {
     /// no allocation per upload; `emit_upload_pass` takes it, fills it, hands
     /// the slice to `PassState`, and puts it back.
     upload_pass_commands: Vec<Command>,
+    /// Scratch texture the scaled back-buffer `ReleaseDC` write-back stages through.
+    ///
+    /// `NULL` until a `ReleaseDC` on a lockable back buffer has to change size
+    /// on the way in (see [`FrameEncoder::upload_bytes_resampled`]). One
+    /// texture, replaced when [`Self::dc_write_back_scratch_key`] stops
+    /// matching, because the extent it is built for is the back buffer's own
+    /// and that changes only at `Reset`.
+    dc_write_back_scratch: MetalHandle<MTLTextureKind>,
+    /// `(width, height, format)` [`Self::dc_write_back_scratch`] was built for.
+    dc_write_back_scratch_key: (u32, u32, PixelFormat),
     /// `with-color-handle → no-color-handle` side-map.
     ///
     /// Populated by `get_or_create_pipeline` whenever a draw arrives with
@@ -1443,6 +1479,8 @@ impl FrameEncoder {
             upload_pipeline_cache: FxHashMap::default(),
             upload_pass_textures: FxHashSet::default(),
             upload_pass_commands: Vec::new(),
+            dc_write_back_scratch: MetalHandle::NULL,
+            dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
             no_color_pipeline_alt: FxHashMap::default(),
             last_pipeline_memo: None,
             program_cache: FxHashMap::default(),
@@ -7124,6 +7162,153 @@ impl FrameEncoder {
                 seq: self.current_submit_seq,
                 from_texture: true,
             });
+    }
+
+    /// Upload `tight` at its own extent, then resample it into a smaller colour texture.
+    ///
+    /// The resizing counterpart of [`Self::upload_bytes_to_color_handle`], for
+    /// the back buffer's `ReleaseDC` write-back under a `render.scale` below
+    /// 100%. The rows land in a scratch texture at the extent they describe,
+    /// which the blit-quad pipeline then samples across the destination with a
+    /// linear filter, the same resample a scaling `StretchRect` runs. The
+    /// upload rides the frame's leading blit pass and the quad is a render pass
+    /// after it, so the two are ordered without a barrier of their own.
+    ///
+    /// Declines, once, when the scratch cannot be created: the destination
+    /// keeps the pixels the GPU already holds, which is what an unresampled
+    /// direct copy could not have given it either.
+    pub fn upload_bytes_resampled(&mut self, target: &ResampledUpload, tight: &[u8]) {
+        let (src_w, src_h) = target.logical;
+        let (dst_w, dst_h) = target.texture;
+        if target.color_handle == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return;
+        }
+        let scratch = self.ensure_dc_write_back_scratch(src_w, src_h, target.format);
+        if scratch == 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "ReleaseDC write-back: no {src_w}x{src_h} scratch texture to resample \
+                 through, GDI's drawing is dropped"
+            );
+            return;
+        }
+        // `tight` is packed at exactly `src_w` pixels per row.
+        self.upload_bytes_to_color_handle(
+            scratch,
+            tight,
+            src_w,
+            src_h,
+            src_w * target.bytes_per_pixel,
+        );
+        let src = BlitSide {
+            handle: scratch,
+            rect: StretchRegion {
+                x: 0,
+                y: 0,
+                w: src_w,
+                h: src_h,
+            },
+            dims: (src_w, src_h),
+            mip: 0,
+            msaa: MetalHandle::NULL,
+            msaa_srgb: MetalHandle::NULL,
+            sample_count: 1,
+        };
+        let dst = BlitSide {
+            handle: target.color_handle,
+            rect: StretchRegion {
+                x: 0,
+                y: 0,
+                w: dst_w,
+                h: dst_h,
+            },
+            dims: (dst_w, dst_h),
+            mip: 0,
+            msaa: target.msaa,
+            msaa_srgb: target.msaa_srgb,
+            sample_count: target.sample_count,
+        };
+        self.stretch_blit_scaled(
+            &src,
+            &dst,
+            target.format,
+            mtld3d_core::stretch_rect::BlitDecode::None,
+            mtld3d_types::D3DTEXF_LINEAR,
+        );
+    }
+
+    /// Get, or build, the scratch texture [`Self::upload_bytes_resampled`] stages through.
+    ///
+    /// Returns 0 when Metal declines the texture. One slot rather than a map:
+    /// the only extent asked for is the back buffer's reported one, which
+    /// changes at `Reset` and never per frame, so a replacement retires the
+    /// previous texture on the seq-gated queue instead of accumulating entries.
+    fn ensure_dc_write_back_scratch(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> u64 {
+        if self.dc_write_back_scratch_key == (width, height, format)
+            && !self.dc_write_back_scratch.is_null()
+        {
+            return self.dc_write_back_scratch.raw();
+        }
+        let desc = TextureCreateDesc {
+            tex_id: 0,
+            width,
+            height,
+            depth: 1,
+            levels: 1,
+            pixel_format: format,
+            storage_mode: StorageMode::Private,
+            flags: TextureCreateFlags::empty(),
+            swizzle_r: Swizzle::Red,
+            swizzle_g: Swizzle::Green,
+            swizzle_b: Swizzle::Blue,
+            swizzle_a: Swizzle::Alpha,
+            // Sampled by the blit quad and written by a buffer copy; neither
+            // needs the render-target usage bit, which the unix side adds only
+            // on request.
+            usage_flags: TextureUsage::empty(),
+        };
+        let mut handle = MetalHandle::<MTLTextureKind>::NULL;
+        let mut srgb_handle = MetalHandle::<MTLTextureKind>::NULL;
+        let status = self.batch_create_textures(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut handle),
+            core::slice::from_mut(&mut srgb_handle),
+        );
+        if status != 0 || handle.is_null() {
+            return 0;
+        }
+        if !srgb_handle.is_null() {
+            // The quad samples the linear view; the eager twin has no reader
+            // here, so retire it rather than leave it registered.
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: srgb_handle.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: true,
+                });
+        }
+        if !self.dc_write_back_scratch.is_null() {
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: self.dc_write_back_scratch.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: true,
+                });
+        }
+        self.dc_write_back_scratch = handle;
+        self.dc_write_back_scratch_key = (width, height, format);
+        handle.raw()
     }
 
     /// Remove a texture from the cache and park its Metal handles on the retention queue.
