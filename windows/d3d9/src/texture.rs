@@ -150,7 +150,6 @@ struct CubeStorage {
     was_uploaded: Vec<bool>,
     locked: Vec<bool>,
     update_dirty: Vec<Option<DirtyRect>>,
-    dc_lock: DcLockState,
 }
 
 impl CubeStorage {
@@ -174,7 +173,6 @@ impl CubeStorage {
                     ))
                 })
                 .collect(),
-            dc_lock: DcLockState::default(),
         }
     }
 }
@@ -366,10 +364,18 @@ pub struct TextureInner {
     /// accessors are fixed at `0`. Metal has no eviction-order hint, so this is
     /// app-visible state only and never acted upon.
     priority: u32,
-    /// Lazily allocated cube-only staging and lock state.
+    /// Per-resource `LockRect` / `GetDC` mutual-exclusion state.
     ///
-    /// This replaces the former cube-only `DcLockState` storage position, so
-    /// ordinary texture objects gain no inline face arrays or allocation.
+    /// Shared by every sub-resource shell the texture hands out: each reaches it
+    /// through `Direct3DTexture9::dc_lock_state_ptr`, so a `GetDC` held on one
+    /// level or face blocks a `LockRect` on any other. D3D9 gates the two
+    /// against the whole resource, not against the single sub-resource. See
+    /// [`DcLockState`].
+    dc_lock: DcLockState,
+    /// Lazily allocated cube-only staging and per-face lock state.
+    ///
+    /// `None` for an ordinary 2D or volume texture, which gains neither the
+    /// inline face arrays nor the allocation.
     cube: Option<Box<CubeStorage>>,
     /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
     ///
@@ -1696,6 +1702,26 @@ impl TextureInner {
             .is_some_and(|cube| cube.locked.iter().any(|locked| *locked))
     }
 
+    /// Whether any subresource of this texture currently has an outstanding `LockRect`.
+    ///
+    /// Reads the 2D/volume per-level flags and the cube per-face ones, which is
+    /// what `GetDC` gates on: D3D9 rejects it while any part of the resource is
+    /// mapped, not merely the sub-resource the call names.
+    #[must_use]
+    pub fn any_subresource_locked(&self) -> bool {
+        self.locked.iter().any(|locked| *locked) || self.cube_any_locked()
+    }
+
+    /// Whether a `GetDC` is outstanding on any subresource of this texture.
+    ///
+    /// D3D9 counts a held device context as a map of the whole resource, so
+    /// every `LockRect` entry point is rejected while one is open, whichever
+    /// level or face it was taken from.
+    #[must_use]
+    pub const fn dc_in_use(&self) -> bool {
+        self.dc_lock.dc_in_use()
+    }
+
     /// Return the CPU staging pointer and pitches for one cube subresource.
     ///
     /// Used by a parent-backed face surface's `GetDC` path. The pointer remains
@@ -2455,6 +2481,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         was_uploaded: vec![false; mip_count],
         locked: vec![false; mip_count],
         update_dirty,
+        dc_lock: DcLockState::default(),
         cube,
         private_data: PrivateDataStore::default(),
         subresources: Vec::new(),
@@ -2510,22 +2537,18 @@ impl Direct3DTexture9 {
         unsafe { &mut *self.inner }
     }
 
-    /// Raw pointer to the per-resource `LockRect`/`GetDC` state shared by cube face shells.
+    /// Raw pointer to the per-resource `LockRect`/`GetDC` state its sub-surfaces share.
     ///
-    /// Called through a raw `*mut Direct3DTexture9` from a face surface, so it
-    /// takes `&self` and points into the inner allocation: D3D9 objects are
-    /// single-threaded, so no two faces touch it concurrently. A raw pointer
-    /// (not `&mut`) so the caller can hold it alongside an unrelated borrow of
-    /// the face surface.
+    /// Called through a raw `*mut Direct3DTexture9` from a level or face
+    /// surface, so it takes `&self` and points into the inner allocation: D3D9
+    /// objects are single-threaded, so no two sub-resources touch it
+    /// concurrently. A raw pointer (not `&mut`) so the caller can hold it
+    /// alongside an unrelated borrow of the sub-surface.
     pub fn dc_lock_state_ptr(&self) -> *mut DcLockState {
         // SAFETY: `self.inner` is the live `Box::into_raw(TextureInner)` from
         // `Self::new`; single-threaded access makes the exclusive reborrow sound.
         let inner = unsafe { &mut *self.inner };
-        let cube = inner
-            .cube
-            .as_deref_mut()
-            .expect("cube face has cube storage");
-        &raw mut cube.dc_lock
+        &raw mut inner.dc_lock
     }
 
     pub fn texture_id(&self) -> TextureId {
@@ -2703,12 +2726,11 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
             unsafe { crate::surface::finalize_cached_surface(slot) };
         }
     }
-    // A cube texture finalizing with a face's `GetDC` never released would
+    // A texture finalizing with a sub-resource's `GetDC` never released would
     // otherwise leak the memory DC + DIB held on the shared state; tear it down.
-    // (The cube outlives every face referencing it, so this is the last owner.)
-    if let Some(cube) = ti_mut.cube.as_deref_mut() {
-        cube.dc_lock.teardown();
-    }
+    // (The texture outlives every shell referencing it, so this is the last
+    // owner, and the shells were freed just above.)
+    ti_mut.dc_lock.teardown();
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(TextureInner)` from `Self::new` and no other
     // reference can survive.
@@ -3190,6 +3212,15 @@ extern "system" fn texture_lock_rect(
     };
     let ti = obj.inner_mut();
     if level >= ti.app_level_count() || out_locked_rect.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // A held device context maps the whole resource, so no level of it can be
+    // locked until `ReleaseDC`. The DC is taken through a level surface and
+    // recorded on the texture, which is the only place this entry point can see
+    // it. Checked before the out-`D3DLOCKED_RECT` is written.
+    if ti.dc_in_use() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DTexture9::LockRect while a GetDC on the texture is outstanding → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
 
@@ -4596,6 +4627,13 @@ pub extern "system" fn cube_lock_rect(
     if level >= ti.app_level_count()
         || (ti.d3d_pool == D3DPOOL_DEFAULT && ti.d3d_usage & D3DUSAGE_DYNAMIC == 0)
     {
+        return D3DERR_INVALIDCALL;
+    }
+    // A held device context maps the whole cube, so no face of it can be locked
+    // until `ReleaseDC` (the same resource-wide rule the 2D entry point obeys).
+    if ti.dc_in_use() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DCubeTexture9::LockRect while a GetDC on the cube is outstanding → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     let level_u = level as usize;
