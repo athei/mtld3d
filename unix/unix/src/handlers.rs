@@ -6,11 +6,11 @@ use mtld3d_shared::{
     CompileShaderLibraryParams, CreateBackbufferParams, CreateBuffersBatchParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
-    CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, GetDeviceInfoParams,
-    GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
+    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
+    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
+    GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle,
+    SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
     mtl::{DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -399,6 +399,21 @@ pub extern "C" fn ensure_blit_pipeline_handler(args: *mut c_void) -> i32 {
         STATUS_SUCCESS
     } else {
         error!(target: LOG_TARGET, "failed to ensure {:?} quad pipeline", params.quad_kind);
+        STATUS_UNSUCCESSFUL
+    }
+}
+
+pub extern "C" fn create_texture_slice_view_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut CreateTextureSliceViewParams.
+    let Some(mut params) = (unsafe { InPtrMut::<CreateTextureSliceViewParams>::opt(args) }) else {
+        return -1;
+    };
+    let params: &mut CreateTextureSliceViewParams = &mut params;
+    if let Some(handle) = metal::create_texture_slice_view(params) {
+        params.view_handle = handle;
+        STATUS_SUCCESS
+    } else {
+        error!(target: LOG_TARGET, "failed to create a 2D view of texture slice {}", params.slice);
         STATUS_UNSUCCESSFUL
     }
 }

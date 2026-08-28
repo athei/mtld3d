@@ -58,6 +58,14 @@ fn blit_texture_to_buffer_layout() {
 }
 
 #[test]
+fn create_texture_slice_view_layout() {
+    use super::CreateTextureSliceViewParams;
+    // 2*u64 (handles) + 2*u32 = 16 + 8 = 24
+    assert_eq!(core::mem::align_of::<CreateTextureSliceViewParams>(), 8);
+    assert_eq!(core::mem::size_of::<CreateTextureSliceViewParams>(), 24);
+}
+
+#[test]
 fn wait_for_gpu_retire_layout() {
     use super::WaitForGpuRetireParams;
     // 3 * u64 = 24
