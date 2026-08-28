@@ -1937,3 +1937,49 @@ fn get_dc_on_an_odd_width_16_bit_texture_level_round_trips_a_texel() {
         "the texels GDI left alone still sample as the lock wrote them, got {untouched:?}"
     );
 }
+
+/// A single-slice default-pool volume takes a second `UpdateTexture`.
+///
+/// A `CreateVolumeTexture` of depth 1 is backed by a plain 2D Metal texture, so
+/// nothing but the creation call tells it apart from an ordinary 2D texture,
+/// and the class that releases its staging after an upload must still exclude
+/// it: the volume paths write and upload a level whole and re-create it as a
+/// single 2D slice. The first update is drawn (the point a released level would
+/// go), then a second update has to reach the GPU.
+#[test]
+fn single_slice_default_volume_takes_a_second_update_after_its_upload() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let (hr, src) =
+        h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "SYSTEMMEM volume");
+    let src = src.expect("source volume");
+    let (hr, dst) = h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "DEFAULT volume");
+    let dst = dst.expect("destination volume");
+
+    src.write_u32(0, &[RED; 4]);
+    assert_eq!(
+        h.update_volume_texture_hr(&src, &dst),
+        0,
+        "first UpdateTexture"
+    );
+    assert_eq!(h.set_volume_texture(0, &dst), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    assert_pixel_eq(sample_volume_depth(&h, 0.5), RED, "first fill");
+
+    src.write_u32(0, &[GREEN; 4]);
+    assert_eq!(
+        h.update_volume_texture_hr(&src, &dst),
+        0,
+        "second UpdateTexture"
+    );
+    assert_pixel_eq(sample_volume_depth(&h, 0.5), GREEN, "second fill");
+}

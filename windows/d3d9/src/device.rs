@@ -30,6 +30,7 @@ use mtld3d_core::{
     },
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
+    texture_flags::TextureFlags,
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
@@ -97,8 +98,8 @@ use super::{
     state_block::{RecordingStateBlock, StateOp},
     surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample, SystemMemoryDst},
     texture::{
-        CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags,
-        TextureInner, new_uninit_page_box,
+        CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureInner,
+        new_uninit_page_box,
     },
     unix_call::unix_call,
     vertex_buffer::{Direct3DVertexBuffer9, VertexBufferCreateInfo},

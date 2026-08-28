@@ -1,10 +1,12 @@
-//! Unit tests for the texture-staging Lock decision tree.
+//! Unit tests for the texture-staging decisions.
 //!
 //! Several cases per arm of `decide_lock_action`: flag priority, the uncontended shortcut,
 //! `D3DLOCK_DISCARD`, and whole-mip renames with `D3DUSAGE_DYNAMIC` dropping the CPU preserve.
 //! The partial arms mostly resolve to `WriteInPlace`; only an unaligned compressed rect forces
 //! a preserve, since the encoder widens its read to the whole mip. The `texture_lock_offset`
 //! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
+//! The `staging_droppable_class` cases walk the pool, usage and shape combinations, since every
+//! class outside the one that releases is a level whose only copy of some byte is the staging.
 
 use super::*;
 
@@ -586,6 +588,19 @@ fn a_plain_lock_of_a_released_level_reads_it_back() {
     ));
 }
 
+// ── staging_droppable_class ──
+
+/// The only class that releases: default pool, no usage bit, plain 2D.
+#[test]
+fn plain_default_pool_texture_is_droppable() {
+    assert!(staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::empty(),
+        1
+    ));
+}
+
 #[test]
 fn discard_is_the_only_flag_that_skips_the_readback() {
     assert!(!released_level_lock_needs_readback(D3DLOCK_DISCARD));
@@ -595,5 +610,89 @@ fn discard_is_the_only_flag_that_skips_the_readback() {
     ));
     assert!(!released_level_lock_needs_readback(
         D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK
+    ));
+}
+
+#[test]
+fn lockable_pools_are_never_droppable() {
+    for pool in [
+        mtld3d_types::D3DPOOL_MANAGED,
+        mtld3d_types::D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert!(
+            !staging_droppable_class(pool, NO_USAGE, TextureFlags::empty(), 1),
+            "pool {pool}"
+        );
+    }
+}
+
+#[test]
+fn lockable_or_gpu_written_usage_is_never_droppable() {
+    for usage in [
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_DEPTHSTENCIL,
+    ] {
+        assert!(
+            !staging_droppable_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+}
+
+/// A volume texture is out of the class at any depth, a single slice included.
+///
+/// `depth` alone does not identify one: `CreateVolumeTexture` with a depth of
+/// 1 is created 2D on both sides, and would otherwise pass the shape test the
+/// way an ordinary 2D texture does.
+#[test]
+fn volume_textures_are_never_droppable() {
+    for depth in [1, 2, 16] {
+        assert!(
+            !staging_droppable_class(
+                D3DPOOL_DEFAULT,
+                NO_USAGE,
+                TextureFlags::VOLUME_TEXTURE,
+                depth
+            ),
+            "depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn cube_offscreen_plain_and_depth_textures_are_never_droppable() {
+    for flag in [
+        TextureFlags::CUBE,
+        TextureFlags::OFFSCREEN_PLAIN,
+        TextureFlags::DEPTH_FORMAT,
+    ] {
+        assert!(
+            !staging_droppable_class(D3DPOOL_DEFAULT, NO_USAGE, flag, 1),
+            "flag {flag:?}"
+        );
+    }
+}
+
+/// A flag the class does not read leaves it alone.
+#[test]
+fn autogen_mipmap_alone_stays_droppable() {
+    assert!(staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::AUTOGEN_MIPMAP,
+        1
+    ));
+}
+
+/// Multi-slice depth still fails the shape test on its own.
+#[test]
+fn multi_slice_depth_is_never_droppable() {
+    assert!(!staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::empty(),
+        4
     ));
 }
