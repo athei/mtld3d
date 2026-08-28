@@ -7,7 +7,8 @@
 //! color and unknown formats stay unmapped. The colour side pins the
 //! wide-channel family (16-bit unorm and the floats): Metal format, pitch,
 //! and the missing-channel swizzle, plus `is_mapped_color_format` tracking
-//! the lookup table.
+//! the lookup table. `format_name` is pinned on both sides: a mapped name,
+//! and the fixed unknown fallback that callers log the raw code beside.
 
 use mtld3d_types::{D3DUSAGE_NONSECURE, D3DUSAGE_WRITEONLY};
 
@@ -23,7 +24,7 @@ use super::{
     D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel, is_depth_format,
+    StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel, format_name, is_depth_format,
     is_mapped_color_format, linear_row_pitch, map_d3d_depth_format, map_d3d_format,
     standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
@@ -141,6 +142,14 @@ fn is_mapped_color_format_tracks_the_lookup() {
         assert!(!is_mapped_color_format(fmt), "format {fmt}");
         assert!(map_d3d_format(fmt).is_none(), "format {fmt}");
     }
+}
+
+#[test]
+fn format_name_renders_mapped_names_and_a_fixed_unknown() {
+    assert_eq!(format_name(D3DFMT_A8R8G8B8), "A8R8G8B8");
+    // The fallback carries no code, so a caller that needs one logs it
+    // alongside the name.
+    assert_eq!(format_name(0xFFFF_FFFF), "D3DFMT_unknown");
 }
 
 #[test]
