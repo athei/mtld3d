@@ -2137,6 +2137,65 @@ fn get_dc_on_an_odd_width_16_bit_lockable_render_target_reaches_the_last_row() {
 }
 
 #[test]
+fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
+    // A lockable render target is CPU-addressable at the extent D3D9 reports,
+    // so it declines `render.scale` even at the back buffer's own size, which
+    // is what earns an ordinary render target the scale. Its staging, the
+    // read-back that fills it and the upload that pushes it back all address
+    // that one extent, and so does every path that binds or fills it, so the
+    // probes below sit on the far corner a scaled texture would not reach.
+    // Runs at any `render.scale`: the coordinates are the reported ones.
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * height) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    // Bound as a render target: the clear covers the whole texture, so the far
+    // corner carries the clear colour rather than whatever the create left.
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    assert_eq!(h.clear_target(GREEN), 0, "clear it green");
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(0, 0), GREEN, "the clear reaches the first pixel");
+    assert_eq!(
+        read(w - 1, height - 1),
+        GREEN,
+        "the clear reaches the last pixel"
+    );
+
+    // Filled on the GPU: the read-back that serves LockRect covers the same
+    // extent, pixel for pixel and with no resample in between.
+    assert_eq!(h.color_fill_hr(&rt, RED), D3D_OK, "whole-surface ColorFill");
+    assert_eq!(read(0, 0), RED, "the fill reaches the first pixel");
+    assert_eq!(
+        read(w - 1, height - 1),
+        RED,
+        "the fill reaches the last pixel"
+    );
+
+    // Written on the CPU: the unlock upload covers the same extent again, and
+    // `GetRenderTargetData` reads the colour texture back to prove it landed.
+    {
+        let mut locked = rt.lock_rect(0);
+        locked.write_u32(&vec![BLUE; (w * height) as usize]);
+    }
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 0, 0),
+        BLUE,
+        "the upload reaches the first pixel of the colour texture"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt, w - 1, height - 1),
+        BLUE,
+        "the upload reaches the last pixel of the colour texture"
+    );
+}
+
+#[test]
 fn surface_ops_contracts() {
     let h = Harness::new();
     let bb = h.back_buffer(0);

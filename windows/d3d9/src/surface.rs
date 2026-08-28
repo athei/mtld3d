@@ -2666,9 +2666,10 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         width,
         height,
         bytes_per_row,
-        // Whole-surface read. This path serves a lockable render target, which
-        // the game sized itself, so the region already equals the texture and
-        // the unix side skips the resolve.
+        // Whole-surface read. A lockable render target's texture is created at
+        // the extent D3D9 reports (it declines `render.scale`, so its staging
+        // and its texture are one size), so the region already equals the
+        // texture and the unix side skips the resolve.
         source_width: width,
         source_height: height,
     };
@@ -2687,6 +2688,10 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
 /// staging rows are *copied* into the pushed encoder op (a `Vec<u8>` the
 /// closure owns, at the staging's own row pitch) so the surface's `PageBox` is
 /// never aliased across the API/encoder boundary.
+///
+/// The copy region is the surface's reported extent, which is also the
+/// texture's: a lockable render target declines `render.scale` so the two
+/// never disagree.
 fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         return;
