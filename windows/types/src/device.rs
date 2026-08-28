@@ -338,6 +338,11 @@ pub const D3DFMT_INTZ: u32 = 0x5A54_4E49; // 'INTZ' little-endian
 pub const D3DFMT_DF24: u32 = 0x3432_4644; // 'DF24'
 pub const D3DFMT_DF16: u32 = 0x3631_4644; // 'DF16'
 
+// ── D3D9 FOURCC pseudo-formats ──
+
+/// `MAKEFOURCC('R','E','S','Z')`: probed to detect the depth-resolve hack.
+pub const D3DFMT_RESZ: u32 = 0x5A53_4552;
+
 // ── D3D9 buffer formats (vertex-/index-buffer `Format`) ──
 
 pub const D3DFMT_VERTEXDATA: u32 = 100; // what `GetDesc` reports for VBs

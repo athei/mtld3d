@@ -21,6 +21,8 @@
 use core::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use mtld3d_types::D3DSDK_VERSION;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryA(name: *const c_char) -> *mut c_void;
@@ -52,7 +54,6 @@ struct ExceptionPointers {
     context: *mut c_void,
 }
 
-const D3D_SDK_VERSION: u32 = 32;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 /// A continuable, application-defined code: nothing else in the process raises it.
@@ -84,7 +85,7 @@ fn exception_after_free_library_survives() {
     // SAFETY: the export is `Direct3DCreate9` with the documented signature.
     let create: Direct3DCreate9Fn = unsafe { core::mem::transmute(create) };
     // SAFETY: calling the resolved export with the SDK version it accepts.
-    let d3d9 = unsafe { create(D3D_SDK_VERSION) };
+    let d3d9 = unsafe { create(D3DSDK_VERSION) };
     assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
     // SAFETY: a COM object's first word is its vtable pointer.
     let vtable = unsafe { *d3d9.cast::<*const ReleaseFn>() };
