@@ -1260,6 +1260,13 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         let srgb = inner.metal_color_srgb_handle;
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
+        unsafe { &*inner.device_inner }.deregister_standalone_surface(
+            inner.standalone_width,
+            inner.standalone_height,
+            inner.standalone_format,
+        );
+        // SAFETY: a standalone surface forwards a device reference for its
+        // public lifetime, so the device outlives this finalize.
         unsafe { &mut *inner.device_inner }
             .push_op(Box::new(move |enc| enc.retire_color_target(base, srgb)));
     }
@@ -1272,6 +1279,13 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         && !inner.device_inner.is_null()
     {
         let depth = inner.metal_depth_handle;
+        // SAFETY: a standalone surface forwards a device reference for its
+        // public lifetime, so the device outlives this finalize.
+        unsafe { &*inner.device_inner }.deregister_standalone_surface(
+            inner.standalone_width,
+            inner.standalone_height,
+            inner.standalone_format,
+        );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
         unsafe { &mut *inner.device_inner }
