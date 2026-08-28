@@ -1605,8 +1605,8 @@ impl PassState {
     /// Bind or unbind render target `slot` (1..=3) for the next pass.
     ///
     /// Mirrors `set_color_render_target_subresource`: a rebind of the same
-    /// texture and subresource refreshes the size and format in place, any
-    /// other change materialises a pending colour clear and ends the pass.
+    /// texture, subresource, format and extent is a no-op, any other change
+    /// materialises a pending colour clear and ends the pass.
     /// `slot.logical_size` is the D3D9-reported extent; the stored `size` is
     /// what `slot.scale` makes of it.
     pub fn set_extra_color_render_target(&mut self, slot: usize, binding: Option<ExtraColorSlot>) {
@@ -1617,7 +1617,11 @@ impl PassState {
         );
         let index = slot - 1;
         let current = &self.current_extra_color[index];
-        if current.texture == binding.texture && current.subresource == binding.subresource {
+        if current.texture == binding.texture
+            && current.subresource == binding.subresource
+            && current.format == binding.format
+            && current.size == binding.size
+        {
             self.current_extra_color[index] = binding;
             self.recompute_extra_present_mask();
             return;
@@ -2509,8 +2513,8 @@ impl PassState {
 
     /// Rebind the color attachment for the next pass.
     ///
-    /// No-op if the new texture matches the current one (games often re-assert
-    /// the backbuffer between scenes).
+    /// No-op if the new texture, subresource, format and extent all match what
+    /// is bound (games often re-assert the backbuffer between scenes).
     ///
     /// Only flushes pending clears when a *color* clear is pending: the
     /// color attachment is about to change, so the pending color clear
@@ -2556,11 +2560,15 @@ impl PassState {
         let (width, height) = (scale.dimension(width), scale.dimension(height));
         let (slice, level) = subresource;
         let packed_subresource = slice | (level << 8);
+        // A pass freezes the attachment's format and extent when it opens, so
+        // the binding is only unchanged when both still match: a same-handle
+        // rebind that moves either one leaves the descriptor carrying one pair
+        // while the draws that follow build their pipelines against the other.
         if self.current_color_texture == texture
             && self.current_color_subresource == packed_subresource
+            && self.current_color_format == format
+            && self.current_color_size == (width, height)
         {
-            self.current_color_size = (width, height);
-            self.current_color_format = format;
             if self.has_extra_color_targets() {
                 self.recompute_extra_present_mask();
             } else {

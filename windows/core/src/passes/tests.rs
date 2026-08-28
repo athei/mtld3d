@@ -623,6 +623,43 @@ fn color_format_propagates_per_pass() {
 }
 
 #[test]
+fn rebinding_the_same_target_with_a_new_format_breaks_the_pass() {
+    const OTHER_FORMAT: PixelFormat = PixelFormat::Rgba16Float;
+    let rt = tex(0x3000);
+    // Handle and subresource unchanged, pixel format not. The open pass
+    // froze the old format in its attachment descriptor, so it has to
+    // close: otherwise the next draw builds a pipeline declaring the new
+    // format against a pass attaching the old one.
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, OTHER_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[0].color_texture(), rt);
+    assert_eq!(s.passes()[1].color_texture(), rt);
+    assert_eq!(s.passes()[0].color_format(), RT_FORMAT);
+    assert_eq!(s.passes()[1].color_format(), OTHER_FORMAT);
+}
+
+#[test]
+fn rebinding_the_same_target_with_a_new_extent_breaks_the_pass() {
+    let rt = tex(0x3000);
+    // The extent is frozen at pass open too: it sizes the attachment and
+    // decides Rule A's full-attachment-write predicate.
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 128, 128, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[0].color_size(), (256, 256));
+    assert_eq!(s.passes()[1].color_size(), (128, 128));
+}
+
+#[test]
 fn emit_scissor_enabled_uses_game_rect() {
     let mut s = fresh();
     s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
@@ -2960,6 +2997,30 @@ fn binding_an_extra_target_breaks_the_pass_and_rebinding_it_does_not() {
     s.set_extra_color_render_target(1, None);
     assert!(s.current_pass_closed(), "unbinding ends the pass");
     assert_eq!(s.extra_present_mask(), 0);
+}
+
+#[test]
+fn rebinding_an_extra_target_with_a_new_format_breaks_the_pass() {
+    // Same rule as render target 0: an extra's format is frozen into the
+    // pass at open, so a same-handle rebind that changes it closes the pass.
+    let mut s = fresh();
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
+    s.emit_command(dummy_draw());
+    let mut recoloured = slot(tex(0x3000), BB_SIZE);
+    recoloured.format = PixelFormat::Rgba16Float;
+    s.set_extra_color_render_target(1, Some(recoloured));
+    assert!(s.current_pass_closed(), "a new format ends the pass");
+    s.emit_command(dummy_draw());
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(
+        s.passes()[0].extra_color()[0].format(),
+        PixelFormat::R8Unorm
+    );
+    assert_eq!(
+        s.passes()[1].extra_color()[0].format(),
+        PixelFormat::Rgba16Float
+    );
 }
 
 #[test]
