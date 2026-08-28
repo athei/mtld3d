@@ -134,9 +134,14 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
 /// `SamplerSnapshot.max_anisotropy` → `CreateSamplerStateParams.max_anisotropy`
 /// → `setMaxAnisotropy:` on `MTLSamplerDescriptor`; without the cap bit,
 /// well-behaved games clamp to `MAXANISOTROPY=1` and never ask for it.
+/// `MIPMAPLODBIAS` advertises `D3DSAMP_MIPMAPLODBIAS`, which Metal expresses
+/// at the sample site rather than on the sampler: the bias reaches the pixel
+/// shader as a per-slot uniform and shifts the mip every implicit-LOD sample
+/// selects.
 const RASTER_DEFAULT: RasterCaps = RasterCaps::ZTEST
     .union(RasterCaps::FOGVERTEX)
     .union(RasterCaps::FOGRANGE)
+    .union(RasterCaps::MIPMAPLODBIAS)
     .union(RasterCaps::ANISOTROPY)
     .union(RasterCaps::ZFOG)
     .union(RasterCaps::SCISSORTEST)

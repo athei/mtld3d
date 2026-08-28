@@ -3,7 +3,7 @@
 //! These assert the presence of key fragments in the generated source —
 //! they do NOT invoke a Metal compiler.
 
-use mtld3d_shared::mtl::VS_POS_FIXUP_SLOT;
+use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_POS_FIXUP_SLOT};
 
 use super::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
 use crate::dxso::emit::{VariantFlags, VariantKey};
@@ -1240,5 +1240,40 @@ fn ff_point_scale_measures_the_viewport_height_in_reported_pixels() {
     assert!(
         msl.contains("psize *= ((-1.0 / pos_fixup.y) / pos_fixup.w) / sqrt(max("),
         "FF point scale must read the viewport height in reported pixels:\n{msl}"
+    );
+}
+
+#[test]
+fn lod_bias_variant_biases_the_fixed_function_sample() {
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: 2,   // D3DTOP_SELECTARG1
+        color_arg1: 2, // D3DTA_TEXTURE
+        alpha_op: 2,   // D3DTOP_SELECTARG1
+        alpha_arg1: 2, // D3DTA_TEXTURE
+        has_texture: true,
+        ..FfStage::default()
+    };
+
+    let plain = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        !plain.contains("lod_bias"),
+        "an unbiased scene keeps the shader it had:\n{plain}"
+    );
+
+    let variant = VariantKey {
+        flags: VariantFlags::LOD_BIAS,
+        ..VariantKey::default()
+    };
+    let biased = emit_ps_ff(&ps, variant);
+    assert!(
+        biased.contains(&format!(
+            "constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
+        )),
+        "the biased variant takes the per-slot bias table:\n{biased}"
+    );
+    assert!(
+        biased.contains("s0.sample(samp0, in.texcoord0.xy, bias(lod_bias[0].x))"),
+        "stage 0 samples with its own slot's bias:\n{biased}"
     );
 }

@@ -249,7 +249,11 @@ use crate::shader_compile_stats::CompileBucket;
 /// the `POINTSIZE_MIN/MAX`-clamped size by `pos_fixup.w` (render pixels per
 /// logical pixel) and the fixed-function attenuation divides the same lane
 /// back out of the viewport height, changing the MSL of every vertex shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 63;
+///
+/// `64` sampler LOD bias: `VariantFlags::LOD_BIAS` gives a pixel shader a
+/// per-slot bias uniform and puts `bias(...)` on every implicit-LOD sample,
+/// changing the MSL of both pixel-shader emitters and the PS key hash shape.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 64;
 
 /// File magic.
 ///

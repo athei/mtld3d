@@ -442,6 +442,15 @@ pub const PS_INT_CONST_SLOT: u32 = 11;
 /// constant no `defb` defines.
 pub const PS_BOOL_CONST_SLOT: u32 = 10;
 
+/// Fragment-stage buffer slot of the per-sampler LOD-bias table (`lod_bias`).
+///
+/// One `float4` row per fragment sampler slot: `.x` is `D3DSAMP_MIPMAPLODBIAS`
+/// as a clamped float, `.y` is `exp2(.x)` so an explicit-gradient sample can
+/// scale its derivatives instead of adding a bias Metal does not accept there.
+/// Metal has no sampler-level LOD bias, so the value is applied at the sample
+/// site; bound only for a draw whose bound stages carry a non-zero bias.
+pub const PS_LOD_BIAS_SLOT: u32 = 9;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

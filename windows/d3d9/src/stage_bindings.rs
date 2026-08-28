@@ -288,12 +288,6 @@ impl StageBindings {
         let default = SAMP_DEFAULTS[type_];
         match class {
             SampClass::Consumed => {} // unreachable
-            SampClass::PortCandidate(feat) => {
-                log::warn!(
-                    target: LOG_TARGET,
-                    "D3DSAMP_{type_} (sampler {sampler}) = {value:#x} (default {default:#x}) set but {feat} not implemented"
-                );
-            }
             SampClass::NotImplemented => {
                 log::warn!(
                     target: LOG_TARGET,
@@ -349,7 +343,6 @@ const fn with_bit(mask: u16, bit: u16, on: bool) -> u16 {
 
 enum SampClass {
     Consumed,
-    PortCandidate(&'static str),
     NotImplemented,
 }
 
@@ -375,12 +368,13 @@ const fn samp_classify(type_: u32) -> SampClass {
         // the nearest Metal border preset (transparent black, opaque black,
         // opaque white; other colours fall back to opaque black with a
         // once-per-colour warn from convert::d3d_border_color_to_metal).
-        | D3DSAMP_BORDERCOLOR => SampClass::Consumed,
-
-        // Known gap: Metal has no sampler-level LOD bias; bias is
-        // expressed inside the shader's sample() call, which would
-        // require DXSO→MSL emitter changes. Stays PortCandidate.
-        D3DSAMP_MIPMAPLODBIAS => SampClass::PortCandidate("LOD bias (Metal shader-only)"),
+        | D3DSAMP_BORDERCOLOR
+        // MIPMAPLODBIAS consumed at draw time: Metal has no sampler-level
+        // LOD bias, so `sampler_state::lod_bias` decodes the slot into the
+        // per-draw fragment uniform and the pixel-shader emitters put
+        // `bias(...)` on every implicit-LOD sample
+        // (`VariantFlags::LOD_BIAS`).
+        | D3DSAMP_MIPMAPLODBIAS => SampClass::Consumed,
 
         _ => SampClass::NotImplemented,
     }

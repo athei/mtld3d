@@ -21,7 +21,7 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT,
+    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT,
 };
 
 use crate::convert::{
@@ -34,6 +34,23 @@ use crate::convert::{
 /// The fixed `1000.0f` is the D3D9 convention for "no upper clamp", with
 /// Metal naturally capping selection at the texture's actual mip count.
 const LOD_MAX_CLAMP: f32 = 1000.0;
+
+/// Fragment sampler slots the LOD-bias uniform carries, one `float4` row each.
+///
+/// Matches the pixel-shader sampler slot count (`s0`..`s15`). The d3d9 side
+/// static-asserts its own stage count against this so the two cannot drift.
+pub const LOD_BIAS_SLOTS: usize = 16;
+
+/// Byte length of the fragment LOD-bias uniform.
+pub const LOD_BIAS_BYTES: usize = LOD_BIAS_SLOTS * 16;
+
+/// Magnitude `D3DSAMP_MIPMAPLODBIAS` is clamped to on decode.
+///
+/// D3D9 leaves the accepted range to the driver. The largest surface the API
+/// allows is 16384 wide (15 mip levels), so a bias past ±32 cannot select a
+/// level that exists, and clamping keeps an infinity out of the sample site's
+/// `bias()` argument.
+const LOD_BIAS_LIMIT: f32 = 32.0;
 
 bitflags::bitflags! {
     /// Sampler cache-key booleans that aren't sourced from a D3DSAMP slot.
@@ -130,6 +147,49 @@ impl SamplerKey {
 #[must_use]
 pub const fn srgb_texture_enabled(ss: &[u32; SAMPLER_STATE_COUNT]) -> bool {
     ss[D3DSAMP_SRGBTEXTURE as usize] & 1 != 0
+}
+
+/// `D3DSAMP_MIPMAPLODBIAS` decoded as the float a sample site applies.
+///
+/// The state slot holds an IEEE `f32` bit pattern. NaN decodes to no bias and
+/// the magnitude is clamped to ±32. Metal samplers carry no LOD
+/// bias, so the value reaches the GPU as a shader uniform instead; this is the
+/// single decoder for both that uniform and the "is any stage biased"
+/// predicate, so the compiled variant and the value it reads cannot disagree.
+#[must_use]
+pub fn lod_bias(ss: &[u32; SAMPLER_STATE_COUNT]) -> f32 {
+    let raw = f32::from_bits(ss[D3DSAMP_MIPMAPLODBIAS as usize]);
+    if raw.is_nan() {
+        return 0.0;
+    }
+    raw.clamp(-LOD_BIAS_LIMIT, LOD_BIAS_LIMIT)
+}
+
+/// Whether a decoded bias actually shifts mip selection.
+///
+/// Any non-zero magnitude counts; both signed zeroes and the NaN
+/// [`lod_bias`] already folded to zero read as no bias, so a draw that leaves
+/// the state at its default keeps the unbiased shader variant.
+#[must_use]
+pub fn lod_bias_active(bias: f32) -> bool {
+    bias.abs() > 0.0
+}
+
+/// Serialise a per-slot LOD-bias table into the fragment uniform's bytes.
+///
+/// Row `i` is `(bias, exp2(bias), 0, 0)`. An implicit-LOD sample adds `.x`
+/// through MSL's `bias()`; an explicit-gradient sample multiplies its
+/// derivatives by `.y` instead, which shifts the computed LOD by the same
+/// amount, because MSL accepts only one LOD option per sample call.
+#[must_use]
+pub fn build_lod_bias_bytes(biases: &[f32; LOD_BIAS_SLOTS]) -> [u8; LOD_BIAS_BYTES] {
+    let mut out = [0u8; LOD_BIAS_BYTES];
+    for (row, &bias) in biases.iter().enumerate() {
+        let base = row * 16;
+        out[base..base + 4].copy_from_slice(&bias.to_le_bytes());
+        out[base + 4..base + 8].copy_from_slice(&bias.exp2().to_le_bytes());
+    }
+    out
 }
 
 /// Build a `SamplerSnapshot` from the device's per-stage D3DSAMP array.
