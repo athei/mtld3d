@@ -846,7 +846,9 @@ impl DeviceInner {
     ///
     /// Only render targets and depth-stencils qualify. A surface the game
     /// uploads pixels into has a CPU-side layout that must keep matching what
-    /// D3D9 reports.
+    /// D3D9 reports, and a lockable render target is one of those: its CPU
+    /// staging, the read-back that fills it and the upload that pushes it back
+    /// all address the extent D3D9 reports, so its caller passes `false`.
     pub const fn scale_for_created_target(
         &self,
         width: u32,
@@ -5142,6 +5144,8 @@ fn resolve_surface_multi_sample(
 /// count plus the D3D9 type the surface reports from `GetDesc`. Above one
 /// sample the create also produces the multisampled companion the passes
 /// attach.
+/// `lockable` says the surface is getting a CPU staging buffer, which fixes its
+/// texture at the extent D3D9 reports.
 fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
@@ -5150,6 +5154,7 @@ fn create_color_target_surface(
     format: u32,
     usage: u32,
     multi_sample: SurfaceMultiSample,
+    lockable: bool,
 ) -> Option<*mut Direct3DSurface9> {
     let mapping = crate::direct3d9::map_for_device(format)?;
     if mapping.is_compressed() {
@@ -5171,13 +5176,18 @@ fn create_color_target_surface(
     // so `GetDesc` and every coordinate the game supplies stay logical.
     // `D3DUSAGE_RENDERTARGET` gates it: this fn also serves
     // `CreateOffscreenPlainSurface`, whose pixels the game reads and writes at
-    // the size it asked for.
+    // the size it asked for. `lockable` takes a render target out of the same
+    // rule for the same reason: the game reads and writes it through a CPU
+    // staging laid out at the extent D3D9 reports, so its texture is created at
+    // that extent and every blit between the two addresses one size. The scale
+    // is stored on the surface, so every consumer of it reads the answer back
+    // rather than re-deriving the rule.
     // SAFETY: `device_inner` is the live owning device, non-null for every
     // caller of this fn (they hold it from the device thunk).
     let scale = unsafe { &*device_inner }.scale_for_created_target(
         width,
         height,
-        usage & D3DUSAGE_RENDERTARGET != 0,
+        usage & D3DUSAGE_RENDERTARGET != 0 && !lockable,
     );
     let mut params = CreateColorTargetParams {
         device_handle,
@@ -5269,6 +5279,25 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
+    // A `Lockable == TRUE` render target keeps its standalone renderable colour
+    // texture (so `GetContainer`/`GetDesc`/`StretchRect` are unchanged) but also
+    // gets a CPU staging buffer: `LockRect` maps it, `UnlockRect` uploads it to
+    // the colour texture. It is sized at the same row pitch every host-visible
+    // surface store uses, so `LockRect`, the GPU read-back and the DIB a
+    // `GetDC` wraps around it all step by the same stride. The size is resolved
+    // before the create so the texture and the staging agree on what this
+    // surface is: it is a lockable render target exactly when the staging
+    // exists, and that is what decides whether the texture takes `render.scale`.
+    // A format with no CPU byte size sizes it at zero and is rejected by the
+    // create just below (a lockable render target is an uncompressed colour
+    // format), so every surface that survives the create carries the staging it
+    // asked for.
+    let staging_bytes = if lockable == 0 {
+        0
+    } else {
+        let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
+        (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
+    };
     let Some(surf_ptr) = create_color_target_surface(
         obj.inner().device_handle,
         obj.inner_ptr(),
@@ -5277,6 +5306,7 @@ extern "system" fn device_create_render_target(
         format,
         D3DUSAGE_RENDERTARGET,
         multi_sample,
+        staging_bytes != 0,
     ) else {
         warn!(
             target: LOG_TARGET,
@@ -5285,26 +5315,14 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
-    // A `Lockable == TRUE` render target keeps its standalone renderable colour
-    // texture (so `GetContainer`/`GetDesc`/`StretchRect` are unchanged) but also
-    // gets a CPU staging buffer: `LockRect` maps it, `UnlockRect` uploads it to
-    // the colour texture. It is sized at the same row pitch every host-visible
-    // surface store uses, so `LockRect`, the GPU read-back and the DIB a
-    // `GetDC` wraps around it all step by the same stride. The format mapping
-    // was already validated by `create_color_target_surface` (uncompressed
-    // colour).
-    if lockable != 0 {
-        let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
-        let bytes = (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize);
-        if bpp != 0 && bytes != 0 {
-            // Zero-initialise the staging (defence-in-depth): a `LockRect`
-            // before any render — or any path that skips the read-back fill —
-            // reads defined bytes rather than allocator garbage.
-            // SAFETY: `surf_ptr` is the freshly created, live standalone RT
-            // surface (refcount 1); no other reference exists yet, so the
-            // exclusive borrow to attach the staging is sound.
-            unsafe { &mut *surf_ptr }.set_lockable_staging(PageBox::new_zeroed(bytes));
-        }
+    if staging_bytes != 0 {
+        // Zero-initialise the staging (defence-in-depth): a `LockRect` before
+        // any render, or any path that skips the read-back fill, reads defined
+        // bytes rather than allocator garbage.
+        // SAFETY: `surf_ptr` is the freshly created, live standalone RT
+        // surface (refcount 1); no other reference exists yet, so the
+        // exclusive borrow to attach the staging is sound.
+        unsafe { &mut *surf_ptr }.set_lockable_staging(PageBox::new_zeroed(staging_bytes));
     }
     // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
