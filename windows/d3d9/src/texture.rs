@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::sync::{Arc, atomic::Ordering};
 
 use mtld3d_core::{
-    dirty_rect::DirtyRect,
+    dirty_rect::{DirtyRect, clip_copy_region},
     ids::TextureId,
     page_box::PageBox,
     render_scale::RenderScale,
@@ -749,10 +749,12 @@ impl TextureInner {
     /// Copy a sub-rectangle of `src`'s `src_level` staging into `dst_level`'s staging.
     ///
     /// Lands at `dst_point`, honouring `src_rect` (the `UpdateSurface` region
-    /// relocation). `None` rect/`(0,0)` point copy the whole mip. Caller
-    /// validates geometry via [`Self::update_region_valid`]. Block-compressed
-    /// formats copy whole blocks; origins/extents are assumed block-aligned
-    /// (the validator enforces it).
+    /// relocation). `None` rect/`(0,0)` point copy the whole mip.
+    /// `UpdateSurface` rejects a bad region up front via
+    /// [`Self::update_region_valid`]; `UpdateTexture` pairs mips by size and
+    /// has no such rejection, so the region is clipped to both levels here.
+    /// Block-compressed formats copy whole blocks: the clip rounds the region
+    /// out to the block grid and keeps it inside both mips.
     pub fn copy_sub_region_from(
         &mut self,
         dst_level: usize,
@@ -786,7 +788,32 @@ impl TextureInner {
             dst_point.0.max(0).cast_unsigned(),
             dst_point.1.max(0).cast_unsigned(),
         );
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
+        // The copy has to sit inside both levels. `UpdateTexture` pairs source
+        // and destination mips on the larger of width and height, so a source
+        // whose two dimensions are transposed relative to the destination's
+        // (4x2 into 2x4) arrives with an extent that overhangs one of them;
+        // only the part the two levels share is defined. Clipping keeps the
+        // memcpy inside both staging allocations and keeps the dirty region
+        // this records inside the destination mip, which the upload blit's
+        // copy region must never exceed.
+        let Some((src_rect, dst_rect)) = clip_copy_region(
+            DirtyRect {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            (dx, dy),
+            (sw, sh),
+            (dw, dh),
+            (bw, bh),
+        ) else {
+            return false;
+        };
+        let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
+        let (dx, dy) = (dst_rect.x, dst_rect.y);
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         // Bytes per block-column = row pitch / blocks per row.
@@ -805,7 +832,7 @@ impl TextureInner {
         // level is the single-slice case. The rectangle applies to every
         // slice the two levels share.
         let src_slice = src_pitch * (sh.div_ceil(bh) as usize);
-        let dst_slice = dst_pitch * (self.mip_height(dst_level).div_ceil(bh) as usize);
+        let dst_slice = dst_pitch * (dh.div_ceil(bh) as usize);
         let depth = (src.depth >> src_level)
             .max(1)
             .min((self.depth >> dst_level).max(1)) as usize;
@@ -843,9 +870,10 @@ impl TextureInner {
 
     /// Copy one cube face sub-rectangle between cube staging allocations.
     ///
-    /// Geometry must already have passed [`Self::update_region_valid`]. The
-    /// source and destination textures are distinct, so their face allocations
-    /// cannot overlap.
+    /// The region is clipped to both levels, so a caller that skipped
+    /// [`Self::update_region_valid`] still cannot write past either face
+    /// allocation. The source and destination textures are distinct, so their
+    /// face allocations cannot overlap.
     pub fn copy_cube_sub_region_from(
         &mut self,
         dst_subresource: (u32, usize),
@@ -886,7 +914,28 @@ impl TextureInner {
             dst_point.0.max(0).cast_unsigned(),
             dst_point.1.max(0).cast_unsigned(),
         );
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
+        // Same clip as the 2D path, so the memcpy cannot run past either
+        // face's staging allocation. Cube levels are square and the mip
+        // pairing lines the two up, which makes this a guard rather than a
+        // live correction.
+        let Some((src_rect, dst_rect)) = clip_copy_region(
+            DirtyRect {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            (dx, dy),
+            (sw, sh),
+            (dw, dh),
+            (bw, bh),
+        ) else {
+            return false;
+        };
+        let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
+        let (dx, dy) = (dst_rect.x, dst_rect.y);
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let src_blocks_per_row = sw.div_ceil(bw) as usize;
