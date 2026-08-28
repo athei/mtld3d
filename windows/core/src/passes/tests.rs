@@ -3889,3 +3889,48 @@ fn replacing_the_backbuffer_forgets_the_retired_twin() {
     );
     assert!(!s.pass_srgb_write());
 }
+
+/// A scoped internal pass attaches the base view even while the game's state is on.
+///
+/// `StretchRect` copies pixels verbatim, so no render state reaches it and
+/// its quad pipeline declares the destination's own format. If the scoped
+/// pass took the sRGB view from a leftover `D3DRS_SRGBWRITEENABLE`, the
+/// pipeline and the attachment would disagree, which Metal treats as
+/// undefined behaviour with the validation layer off.
+#[test]
+fn a_scoped_pass_with_srgb_write_off_attaches_the_base_view() {
+    let mut s = fresh();
+    let dst = tex(0x7F60);
+    let dst_twin = tex(0x7F61);
+    s.register_srgb_twin(dst_twin, dst);
+    // The game leaves sRGB writes on over its own target.
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+
+    // The scoped pass takes the device's binding, clears the state, and binds
+    // the copy destination.
+    let saved = s.take_color_attachments();
+    s.set_srgb_write_enabled(false);
+    s.set_color_render_target(dst, 128, 128, RT_FORMAT, RenderScale::IDENTITY);
+    s.ensure_pass_open();
+    assert!(!s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), RT_FORMAT);
+    let pass = s.passes().last().expect("scoped pass");
+    assert_eq!(pass.color_attachment_texture(), dst);
+    assert_eq!(pass.color_format(), RT_FORMAT);
+
+    // Putting the device's binding back leaves the next draw free to re-apply
+    // the game's state.
+    s.end_current_pass("test");
+    s.restore_color_attachments(saved);
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.ensure_pass_open();
+    assert_eq!(
+        s.passes()
+            .last()
+            .expect("device pass")
+            .color_attachment_texture(),
+        backbuffer_srgb()
+    );
+}

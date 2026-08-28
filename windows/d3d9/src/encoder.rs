@@ -3719,6 +3719,15 @@ impl FrameEncoder {
         // the caller (`get_or_create_texture` / a standalone colour handle),
         // non-zero per the guard above.
         let dst_tex = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
+        // `StretchRect` copies pixels verbatim, so no render state reaches it
+        // and `D3DRS_SRGBWRITEENABLE` must not pick sRGB views for the
+        // destination pass: encoding the copy would change the pixels it is
+        // supposed to reproduce. One decision therefore drives both halves:
+        // the pass attaches the destination's own format and the quad's
+        // pipeline declares that same format. It is applied before the
+        // destination is bound, so `ensure_pass_open` freezes the same
+        // choice, and the next draw or `Clear` re-applies the game's state.
+        self.pass_state.set_srgb_write_enabled(false);
         let pipeline = self.get_or_create_blit_pipeline(dst_format);
         if pipeline == 0 {
             return;
@@ -3790,6 +3799,14 @@ impl FrameEncoder {
             .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state
             .set_viewport(dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h, 0.0, 1.0);
+        // A pipeline whose colour format differs from the bound attachment's
+        // is undefined behaviour with the validation layer off, so pin the
+        // two together where the binding is finished.
+        debug_assert_eq!(
+            self.pass_state.current_color_format(),
+            dst_format,
+            "blit-quad pipeline format must equal the pass's attachment format"
+        );
         self.pass_state.ensure_pass_open();
         // The destination's content survives the readback that drives the
         // conformance check (and any real `GetRenderTargetData`).
