@@ -2790,12 +2790,13 @@ impl FrameEncoder {
         self.pass_state.note_caster_draw(depth_tex);
     }
 
-    /// `true` when `depth_tex` was bound as a sampleable shadow map at any point this session.
+    /// `true` when `depth_tex` is a live handle bound as a sampleable shadow map this session.
     ///
     /// Proxies `PassState::is_depth_handle_sampleable` for the
-    /// `mtld3d::d3d9::caster`/`cascade` trace probes — needed because
-    /// `current_depth_is_sampleable()` can be incorrectly false after
-    /// a `GetDepthStencilSurface` save/restore cycle.
+    /// `mtld3d::d3d9::caster`/`cascade` trace probes, which classify a draw by
+    /// the texture it targets. `current_depth_is_sampleable()` answers a
+    /// different question (whether the surface bound right now is a shadow
+    /// map) and so reads false for every draw against the scene depth.
     #[must_use]
     pub fn is_depth_handle_sampleable(&self, depth_tex: MetalHandle<MTLTextureKind>) -> bool {
         self.pass_state.is_depth_handle_sampleable(depth_tex)
@@ -5824,6 +5825,12 @@ impl FrameEncoder {
         }
         self.pass_state.unregister_srgb_twin(old_srgb);
         self.pass_state.register_srgb_twin(fresh_srgb, fresh);
+        // The renamed-away storage is retired below, so its address is no
+        // longer a sampleable depth attachment either.
+        // SAFETY: `old_handle` came out of the typed `texture_cache` via
+        // `.raw()`, so it is an `MTLTexture` handle or null.
+        self.pass_state
+            .unregister_sampleable_depth(unsafe { MetalHandle::<MTLTextureKind>::new(old_handle) });
         // The old texture (and its twin view) is read by this frame's
         // already-emitted draws — destroy only after the frame's GPU work
         // retires.
@@ -6560,6 +6567,10 @@ impl FrameEncoder {
             let seq = self.current_submit_seq;
             let mtl_texture = state.mtl_texture;
             self.pass_state.unregister_srgb_twin(state.mtl_texture_srgb);
+            // The `MTLTexture` is about to be retired, so the address may come
+            // back as an unrelated allocation: drop any sampleable-depth
+            // marking with it.
+            self.pass_state.unregister_sampleable_depth(mtl_texture);
             // `into_iter` so each slot's `keepalive` Arc moves into the
             // retention entry — the `MTLBuffer` wrapper must outlive
             // the page-backing it wraps via `bytesNoCopy`.

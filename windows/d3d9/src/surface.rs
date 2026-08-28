@@ -176,6 +176,12 @@ impl Direct3DSurface9 {
     /// the next pass; without a backing handle the bind would silently fall
     /// back to the device default depth, mismatching the color attachment's
     /// size when `WoW` renders to an offscreen RT.
+    ///
+    /// It owns no parent texture because D3D9 exposes none: a
+    /// `CreateDepthStencilSurface` surface is reachable by no `SetTexture`,
+    /// and its `MTLTexture` is allocated `RenderTarget`-only to match. That
+    /// is what `depth_is_sampleable` reports, and why binding one carries no
+    /// keep-Store exemption.
     pub fn new_depth_stencil(
         device_inner: *mut DeviceInner,
         metal_depth_handle: MetalHandle<MTLTextureKind>,
@@ -261,6 +267,10 @@ impl Direct3DSurface9 {
     /// Device-owned exactly like [`Self::new_implicit_backbuffer`]; resolves its
     /// depth handle + dimensions + format live from the device. `container` is
     /// the device wrapper `GetContainer` returns.
+    ///
+    /// The handle it resolves is the device's auto depth-stencil, allocated
+    /// `RenderTarget`-only like every standalone depth texture, so it owns no
+    /// parent texture and `depth_is_sampleable` reports false for it.
     pub fn new_implicit_depth_stencil(device_inner: *mut DeviceInner, container: u64) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
@@ -610,6 +620,35 @@ impl Direct3DSurface9 {
             return None;
         }
         Some(tex.inner().texture_info())
+    }
+
+    /// Whether binding this surface as depth/stencil attaches a texture the app can sample.
+    ///
+    /// True only for a texture-backed depth surface: `CreateTexture` with a
+    /// depth format and `D3DUSAGE_DEPTHSTENCIL`, reached through
+    /// `GetSurfaceLevel`. Its `MTLTexture` is allocated shader-readable, and
+    /// a later `SetTexture` of the parent samples the depth the pass wrote,
+    /// possibly frames later, which is what earns the attachment its
+    /// unconditional `Store`.
+    ///
+    /// Both handle-carrying shapes answer false, and answer it here rather
+    /// than by falling through a bind-path `else`: a
+    /// `CreateDepthStencilSurface` surface and the implicit depth-stencil
+    /// shell name `RenderTarget`-only Metal textures that no D3D9 call can
+    /// hand to a sampler.
+    ///
+    /// The same predicate [`Self::depth_texture_info`] answers `Some` on,
+    /// without building the `TextureInfo` the bind needs.
+    pub fn depth_is_sampleable(&self) -> bool {
+        let parent = self.inner().parent_texture;
+        if parent.is_null() {
+            return false;
+        }
+        // SAFETY: `parent` is non-null (checked above); texture-backed
+        // surfaces are created by `GetSurfaceLevel` with a live
+        // `Direct3DTexture9*`, and the parent texture's refcount keeps
+        // it alive for as long as this surface is live.
+        unsafe { (*parent).is_depth_format() }
     }
 
     /// D3D9 format the standalone surface was created with (D3DFMT_*).

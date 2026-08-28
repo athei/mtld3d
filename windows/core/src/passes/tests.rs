@@ -2790,25 +2790,24 @@ fn non_sampleable_depth_still_gets_rule_b_dontcare() {
     );
 }
 
-/// A cascade rebound with a stale `is_sampleable=false` is a no-op.
+/// A cascade rebound as the boundary reports it is a no-op.
 ///
 /// Neither the pass break nor the loss of Rule B's exemption fires.
 ///
-/// `GetDepthStencilSurface` returns a surface with `parent_texture=null`,
-/// so a save/restore cycle re-binds the same cascade handle through the
-/// `Eager` path with `is_sampleable=false`. The sticky resolve against
-/// `seen_sampleable_depth_textures` keeps the pass open and keeps Rule B's
-/// keep-Store exemption in force.
+/// A save/restore cycle re-binds the same cascade handle mid-pass. The D3D9
+/// boundary derives `is_sampleable` from the surface's owning texture, so
+/// the second bind carries the same flag as the first, and the repeat-bind
+/// early-out leaves the pass and the keep-Store exemption alone.
 #[test]
-fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
+fn cascade_rebind_with_the_same_sampleable_flag_is_a_no_op() {
     let cascade_depth = tex(0xCAFE_7000);
     let mut s = fresh();
-    // First bind as sampleable, draw into it, then rebind the SAME handle
-    // with a stale is_sampleable=false (the GetDepthStencilSurface path).
+    // Bind as sampleable, draw into it, then rebind the SAME handle the way
+    // a save/restore of the cascade surface does.
     s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, true, false);
     s.emit_command(dummy_draw());
     let passes_before = s.passes().len();
-    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, true, false);
     assert!(
         !s.current_pass_closed(),
         "a rebind of a known-sampleable cascade must not break the pass",
@@ -2820,7 +2819,7 @@ fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
     );
     assert!(
         s.current_depth_is_sampleable(),
-        "the sampleable flag stays set through the stale rebind",
+        "the sampleable flag stays set through the rebind",
     );
     s.emit_command(dummy_draw());
     s.finalize_store_actions(false);
@@ -2832,7 +2831,41 @@ fn cascade_rebind_with_stale_sampleable_flag_is_a_no_op() {
     assert_eq!(
         cascade_pass.depth_store(),
         StoreAction::Store,
-        "Rule B keeps Store through the stale rebind",
+        "Rule B keeps Store through the rebind",
+    );
+}
+
+/// A retired depth handle stops being sampleable, so its address can be reused.
+///
+/// Metal is free to hand the address of a destroyed `MTLTexture` back for the
+/// next allocation. The encoder reports the retirement, and an unrelated
+/// depth surface that lands on that address binds non-sampleable and gets
+/// Rule B's `DontCare` back rather than inheriting the cascade's `Store`.
+#[test]
+fn a_retired_depth_handle_drops_its_sampleable_marking() {
+    let handle = tex(0xCAFE_7100);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(handle, BB_SIZE, true, false);
+    s.emit_command(dummy_draw());
+    assert!(
+        s.is_depth_handle_sampleable(handle),
+        "the cascade bind marks the handle",
+    );
+    s.unregister_sampleable_depth(handle);
+    assert!(
+        !s.is_depth_handle_sampleable(handle),
+        "retiring the texture drops the marking",
+    );
+    // The address comes back as a standalone depth surface: non-sampleable,
+    // never sampled, so Rule B applies.
+    s.set_depth_stencil_attachment(handle, BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.finalize_store_actions(false);
+    let reused_pass = s.passes().last().expect("the reuse pass is present");
+    assert_eq!(
+        reused_pass.depth_store(),
+        StoreAction::DontCare,
+        "the reused address does not inherit the cascade keep-Store exemption",
     );
 }
 

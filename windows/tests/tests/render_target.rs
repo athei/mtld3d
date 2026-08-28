@@ -981,6 +981,168 @@ fn intz_depth_sample_via_fixed_function() {
     assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
 }
 
+/// A depth texture keeps its content across a standalone depth-surface bind.
+///
+/// A shadow-map pass renders into a `CreateTexture(DEPTHSTENCIL)` texture, and
+/// the engine then binds a `CreateDepthStencilSurface` surface for the rest of
+/// the frame, which ends the texture's pass. Nothing samples the texture that
+/// frame, so the only thing keeping the attachment's store action at `Store` is
+/// the `is_sampleable` flag `SetDepthStencilSurface` reports for a
+/// texture-backed depth surface. The next frame restores that surface and
+/// samples the texture: the depth written a frame earlier must still be there.
+#[test]
+fn sampleable_depth_survives_a_standalone_depth_bind() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let scratch_depth = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let backbuffer = h.render_target(0);
+
+    // ── Frame 1: write depth 0.5 into the texture, then bind the standalone
+    // depth surface, which ends the texture's pass with no sample behind it.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind the depth texture"
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        0,
+        "no sampler bound while writing depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&scratch_depth),
+        0,
+        "bind the standalone depth surface"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the standalone depth"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // ── Frame 2: restore the texture's surface, then unbind depth (the
+    // texture cannot be attachment and sampler in one Metal encoder) and
+    // sample the depth written last frame.
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "restore the depth texture"
+    );
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth for the sample pass"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZENABLE, 0),
+        0,
+        "depth off for sample"
+    );
+    assert_eq!(
+        h.set_texture(0, &depth_tex),
+        0,
+        "bind the depth texture as a sampler"
+    );
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Raw INTZ fetch of the stored 0.5 modulated by white diffuse: mid-gray.
+    // A discarded attachment reads back as the 1.0 clear (white) or garbage.
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (96..=160).contains(&center.r)
+            && (96..=160).contains(&center.g)
+            && (96..=160).contains(&center.b),
+        "the depth written before the standalone bind samples back as mid-gray, got {center:?}"
+    );
+    let corner = Rgba8::from_pixel(h.read_pixel(10, 10));
+    assert!(
+        corner.r < 40 && corner.g < 40 && corner.b < 40,
+        "corner stays cleared black, got {corner:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the depth texture");
+}
+
 #[test]
 fn intz_depth_sample_via_programmable_ps() {
     // Same INTZ create → render-depth → sample plumbing as the FF variant, but

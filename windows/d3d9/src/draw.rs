@@ -1691,10 +1691,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // `note_caster_draw` self-gates on `mtld3d::d3d9::cascade` and the
     // session's sampleable-depth set, so it stays unconditional (one cached
     // atomic load when that probe is off) — this keeps the cascade summary's
-    // caster-write counters correct regardless of the trace gate below. The
-    // unconditional call also matters because a `GetDepthStencilSurface`
-    // save/restore lands a cascade bind with `current_depth_is_sampleable =
-    // false` even though the underlying Metal handle is one we tagged earlier.
+    // caster-write counters correct regardless of the trace gate below.
     let depth_tex = enc.current_depth_texture();
     enc.note_caster_draw(depth_tex);
     // Everything else here only feeds the decal/caster trace rows. Gate the

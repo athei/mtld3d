@@ -7091,14 +7091,20 @@ extern "system" fn device_set_depth_stencil_surface(
         )
     };
     // `is_sampleable` distinguishes a sampleable shadow map
-    // (`CreateTexture(D24X8, DEPTHSTENCIL)` — the `DepthBinding::Lazy`
-    // path) from a standalone non-sampleable depth surface
-    // (`CreateDepthStencilSurface` — the `DepthBinding::Eager` path).
-    // The pass machine uses this to keep `Store` unconditionally on
-    // sampleable shadow maps (Rule B short-circuit), since they may
-    // be sampled in a future frame even if no sample lands this
-    // frame — typical of cascade-3 in CSM rotations.
-    let is_sampleable = matches!(binding, DepthBinding::Lazy(..));
+    // (`CreateTexture(D24X8, DEPTHSTENCIL)`) from a depth surface no
+    // `SetTexture` can reach (`CreateDepthStencilSurface`, the implicit
+    // depth-stencil). The pass machine uses this to keep `Store`
+    // unconditionally on sampleable shadow maps (Rule B short-circuit),
+    // since they may be sampled in a future frame even if no sample lands
+    // this frame, typical of cascade-3 in CSM rotations. The surface
+    // answers for itself rather than the bind path answering for it: the
+    // flag has to be the same for every bind of one Metal texture, and the
+    // pass state asserts as much.
+    let is_sampleable = !surf.is_null() && {
+        // SAFETY: `surf` is non-null (checked) and a live `Direct3DSurface9`
+        // (already deref'd above to build the binding).
+        unsafe { (*surf).depth_is_sampleable() }
+    };
     // Whether the bound depth attachment is a combined depth+stencil format
     // (D24S8 etc. → the combined Metal texture), so the clear-quad / draw
     // pipelines declare matching depth/stencil attachment formats. Mirrors
