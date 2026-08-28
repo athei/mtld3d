@@ -4,6 +4,7 @@ use std::sync::{Arc, atomic::Ordering};
 use mtld3d_core::{
     dirty_rect::{DirtyRect, clip_copy_region},
     ids::TextureId,
+    level_authority::{LevelAuthorityMask, WritePlan},
     page_box::PageBox,
     render_scale::RenderScale,
     staging_coverage::StagingCoverage,
@@ -301,13 +302,13 @@ pub struct TextureInner {
     /// `ReleaseDC` keeps whatever GDI drew in them, so the level holds its
     /// staging for as long as the DC does, exactly as a `LockRect` does.
     dc_open: u32,
-    /// Levels whose Metal texture holds pixels the CPU staging does not (bit N = level N).
+    /// Which copy of each level holds the pixels the level is defined by.
     ///
-    /// Set when the GPU writes a lockable level with no CPU mirror: a
-    /// `StretchRect` blit into a `D3DPOOL_DEFAULT` offscreen-plain surface. The
-    /// next `LockRect` reads the level back into staging and clears the bit, so
-    /// the two agree again.
-    gpu_authoritative: u32,
+    /// A level moves to the GPU when it is written there with no CPU mirror: a
+    /// `StretchRect` blit into a `D3DPOOL_DEFAULT` offscreen-plain surface. It
+    /// moves back at the next write of its staging, which reads the level back
+    /// from the GPU first unless the write covers the whole level.
+    level_authority: LevelAuthorityMask,
     /// `LockRect(D3DLOCK_READONLY)` stash per mip.
     ///
     /// Suppresses the upload at `UnlockRect` so a game's read-only inspection
@@ -467,26 +468,35 @@ impl TextureInner {
 
     /// Claim `level` for the GPU: its Metal texture holds pixels staging does not.
     ///
-    /// The next `LockRect` on the level reads it back before handing out a
-    /// staging pointer. A D3D9 mip chain tops out at 15 levels, so the mask
-    /// covers every level a texture can carry; the bound is a guard, not a
-    /// limit anything reaches.
+    /// The next write of the level's staging resolves the claim, reading the
+    /// level back first unless it is about to be overwritten whole.
     pub const fn mark_level_gpu_authoritative(&mut self, level: usize) {
-        if level < u32::BITS as usize {
-            self.gpu_authoritative |= 1u32 << level;
+        self.level_authority.gpu_wrote(level);
+    }
+
+    /// Make `level`'s staging the copy that defines it, before a write lands in it.
+    ///
+    /// Every path that gives the staging that role goes through here first: a
+    /// map, a `GetDC`, and each of the copies. A write covering the whole level
+    /// defines every byte of it and needs no read back; one that leaves pixels
+    /// untouched would otherwise push staging the GPU's pixels never reached
+    /// back over them.
+    fn move_level_to_staging(&mut self, level: usize, whole_level: bool) {
+        match self.level_authority.plan_write(level, whole_level) {
+            WritePlan::WriteStaging | WritePlan::Overwrite => {}
+            WritePlan::ReadBackFirst => materialize_level_from_gpu(self, level),
         }
     }
 
-    /// Whether `level`'s Metal texture holds pixels its staging does not.
-    pub const fn level_gpu_authoritative(&self, level: usize) -> bool {
-        level < u32::BITS as usize && self.gpu_authoritative & (1u32 << level) != 0
-    }
-
-    /// Release the claim once staging matches the texture again.
-    const fn clear_level_gpu_authoritative(&mut self, level: usize) {
-        if level < u32::BITS as usize {
-            self.gpu_authoritative &= !(1u32 << level);
-        }
+    /// Whether a staging write of `rect` covers every byte of `level`.
+    ///
+    /// The one predicate that decides both what the write leaves for the GPU's
+    /// copy to supply and whether the upload it schedules can stay whole-mip.
+    fn write_covers_level(&self, level: usize, rect: DirtyRect) -> bool {
+        rect.x == 0
+            && rect.y == 0
+            && rect.w >= self.mip_width(level)
+            && rect.h >= self.mip_height(level)
     }
 
     /// Whether `level`'s staging can go once its upload has retired.
@@ -661,9 +671,7 @@ impl TextureInner {
     /// holds them nowhere else at all. The level is `level` of this texture,
     /// the one its surface was handed out for.
     pub fn materialize_level_for_dc(&mut self, level: usize) {
-        if self.level_gpu_authoritative(level) {
-            materialize_level_from_gpu(self, level);
-        }
+        self.move_level_to_staging(level, false);
         self.ensure_staging_for_lock(level, 0);
     }
 
@@ -988,12 +996,6 @@ impl TextureInner {
         src_rect: Option<(i32, i32, i32, i32)>,
         dst_point: (i32, i32),
     ) -> bool {
-        self.ensure_staging(dst_level);
-        let (Some(dst_box), Some(src_box)) =
-            (self.staging.get(dst_level), src.staging.get(src_level))
-        else {
-            return false;
-        };
         let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, sw, sh),
@@ -1039,6 +1041,16 @@ impl TextureInner {
         };
         let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
         let (dx, dy) = (dst_rect.x, dst_rect.y);
+        // The copy is what defines the destination level from here on, so the
+        // level moves off the GPU before a byte of it is written.
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_level_to_staging(dst_level, whole);
+        self.ensure_staging(dst_level);
+        let (Some(dst_box), Some(src_box)) =
+            (self.staging.get(dst_level), src.staging.get(src_level))
+        else {
+            return false;
+        };
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         // Bytes per block-column = row pitch / blocks per row.
@@ -1220,12 +1232,6 @@ impl TextureInner {
         if !(is_convertible_rgb(src_fmt) || yuv_src) || !is_convertible_rgb(dst_fmt) {
             return false;
         }
-        self.ensure_staging(dst_level);
-        let (Some(dst_box), Some(src_box)) =
-            (self.staging.get(dst_level), src.staging.get(src_level))
-        else {
-            return false;
-        };
         let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, sw, sh),
@@ -1254,6 +1260,24 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // The conversion is what defines the destination level from here on, so
+        // the level moves off the GPU before a byte of it is written.
+        let whole = self.write_covers_level(
+            dst_level,
+            DirtyRect {
+                x: dx,
+                y: dy,
+                w: rw,
+                h: rh,
+            },
+        );
+        self.move_level_to_staging(dst_level, whole);
+        self.ensure_staging(dst_level);
+        let (Some(dst_box), Some(src_box)) =
+            (self.staging.get(dst_level), src.staging.get(src_level))
+        else {
+            return false;
+        };
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let (src_bpp, dst_bpp) = (rgb_bpp(src_fmt), rgb_bpp(dst_fmt));
@@ -1344,10 +1368,6 @@ impl TextureInner {
             width: src_w,
             height: src_h,
         } = src;
-        self.ensure_staging(dst_level);
-        let Some(dst_box) = self.staging.get(dst_level) else {
-            return false;
-        };
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, src_w, src_h),
             Some((l, t, r, b)) => {
@@ -1375,6 +1395,22 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // The copy is what defines the destination level from here on, so the
+        // level moves off the GPU before a byte of it is written.
+        let whole = self.write_covers_level(
+            dst_level,
+            DirtyRect {
+                x: dx,
+                y: dy,
+                w: rw,
+                h: rh,
+            },
+        );
+        self.move_level_to_staging(dst_level, whole);
+        self.ensure_staging(dst_level);
+        let Some(dst_box) = self.staging.get(dst_level) else {
+            return false;
+        };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let src_blocks_per_row = src_w.div_ceil(bw) as usize;
@@ -2160,11 +2196,7 @@ impl TextureInner {
     /// one narrows the upload to the written union. Volume levels always mark
     /// whole: the upload path has no sub-rect form for them.
     fn mark_written_region(&mut self, level: usize, rect: DirtyRect) {
-        let whole = rect.x == 0
-            && rect.y == 0
-            && rect.w >= self.mip_width(level)
-            && rect.h >= self.mip_height(level);
-        if whole || self.depth > 1 {
+        if self.write_covers_level(level, rect) || self.depth > 1 {
             self.mark_mip_dirty(level);
         } else {
             self.mark_mip_dirty_rect(level, rect);
@@ -2465,7 +2497,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         dropped_staging: 0,
         staging_coverage: Vec::new(),
         dc_open: 0,
-        gpu_authoritative: 0,
+        level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
         mip_bytes_per_row: info.mip_bytes_per_row,
@@ -3116,11 +3148,11 @@ unsafe fn hand_back_cached_surface(cached: u64, out: *mut *mut c_void) {
 /// CPU mirror (a `StretchRect` blit into a `D3DPOOL_DEFAULT` texture). Flush
 /// the frame so the write has landed, then blit the level into its staging
 /// through the same `BlitTextureToBuffer` core `GetRenderTargetData` uses; a
-/// D3D9 Lock of a GPU-written surface stalls on a real driver too. The claim is
-/// released up front, so a level whose Metal handle or staging cannot serve the
-/// read costs one warning rather than one per map, and keeps the bytes it has.
+/// D3D9 Lock of a GPU-written surface stalls on a real driver too. The caller
+/// has already released the claim, so a level whose Metal handle or staging
+/// cannot serve the read costs one warning rather than one per map, and keeps
+/// the bytes it has.
 fn materialize_level_from_gpu(ti: &mut TextureInner, level: usize) {
-    ti.clear_level_gpu_authoritative(level);
     let (width, height) = (ti.mip_width(level), ti.mip_height(level));
     let bytes_per_row = ti.mip_bytes_per_row(level);
     let block_rows = height.div_ceil(ti.block_h.max(1));
@@ -3265,10 +3297,9 @@ extern "system" fn texture_lock_rect(
     // A level the GPU wrote with no CPU mirror has to be read back before the
     // Lock hands out a pointer into staging, and before `lock_region_ptr` may
     // rename the box (a preserve then copies the fresh bytes). `D3DLOCK_DISCARD`
-    // promises a whole-level overwrite, so it skips the stall.
-    if flags & D3DLOCK_DISCARD == 0 && ti.level_gpu_authoritative(level_u) {
-        materialize_level_from_gpu(ti, level_u);
-    }
+    // promises a whole-level overwrite, so it skips the stall and the claim goes
+    // with it: the staging this Lock hands out is what the level holds next.
+    ti.move_level_to_staging(level_u, flags & D3DLOCK_DISCARD != 0);
     let dirty_rect = parse_rect(rect, mip_w, mip_h);
     let read_only = flags & D3DLOCK_READONLY != 0;
     let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
