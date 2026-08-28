@@ -10,17 +10,18 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
     D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
-    D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS,
-    D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
+    D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
+    D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
+    D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSWAPEFFECT_DISCARD,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    DevCaps, TextureCaps,
 };
 
 #[test]
@@ -325,6 +326,106 @@ fn wide_channel_family_creates_what_check_device_format_advertises() {
             "{name} CreateRenderTarget",
         );
     }
+}
+
+/// The three colour formats a Source-engine title probes for its image cache.
+///
+/// `A8B8G8R8` / `X8B8G8R8` back Metal's native `RGBA8Unorm`, so they answer
+/// yes to everything the 32-bit family does, sRGB decode included. `R8G8B8`
+/// has no Metal counterpart and is widened into a BGRA8 backing by the upload
+/// pass, which serves sampling but not rendering, so the render-target answers
+/// stay negative and `CreateRenderTarget` is rejected to match.
+#[test]
+fn check_device_format_answers_for_the_reversed_channel_and_24_bit_formats() {
+    let h = Harness::new();
+    for (fmt, name) in [
+        (D3DFMT_A8B8G8R8, "A8B8G8R8"),
+        (D3DFMT_X8B8G8R8, "X8B8G8R8"),
+        (D3DFMT_R8G8B8, "R8G8B8"),
+    ] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, fmt),
+            D3D_OK,
+            "{name} texture must be advertised",
+        );
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, fmt),
+            D3D_OK,
+            "{name} cube texture must be advertised",
+        );
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_FILTER,
+                D3DRTYPE_TEXTURE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} filters",
+        );
+        // Every one of the three is backed by an sRGB-twinned Metal format,
+        // so `D3DSAMP_SRGBTEXTURE` is a real hardware decode on all of them.
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_SRGBREAD,
+                D3DRTYPE_TEXTURE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} has an sRGB decode",
+        );
+        // The probe and the create agree, which is the whole point of the
+        // advertisement: an engine that asks first must not be told no.
+        drop(h.create_texture(32, 32, 1, 0, fmt, D3DPOOL_MANAGED));
+    }
+
+    for (fmt, name) in [(D3DFMT_A8B8G8R8, "A8B8G8R8"), (D3DFMT_X8B8G8R8, "X8B8G8R8")] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_RENDERTARGET,
+                D3DRTYPE_SURFACE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} renders",
+        );
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+                D3DRTYPE_SURFACE,
+                fmt
+            ),
+            D3D_OK,
+            "{name} encodes sRGB on write",
+        );
+        assert_eq!(
+            h.create_render_target_hr(32, 32, fmt),
+            D3D_OK,
+            "{name} CreateRenderTarget",
+        );
+    }
+
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_SURFACE,
+            D3DFMT_R8G8B8
+        ),
+        D3DERR_NOTAVAILABLE,
+        "a format widened on upload is not a render target",
+    );
+    assert_ne!(
+        h.create_render_target_hr(32, 32, D3DFMT_R8G8B8),
+        D3D_OK,
+        "CreateRenderTarget(R8G8B8) rejected to match the probe",
+    );
+    // A 24-bit system-memory surface is what a title locks to feed its
+    // texture cache, and it is the store `GetDC` wraps a 24-bit DIB around.
+    drop(h.create_offscreen_plain_surface(32, 32, D3DFMT_R8G8B8, D3DPOOL_SYSTEMMEM));
 }
 
 #[test]

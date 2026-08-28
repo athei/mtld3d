@@ -5284,15 +5284,17 @@ fn create_color_target_surface(
     if mapping.is_compressed() {
         return None;
     }
-    // On a device without native packed 16-bit formats these formats are
-    // sampling-only (BGRA8-backed): a standalone surface in one of them would
-    // pair a 16-bit CPU staging with a 32-bit texture through the
-    // lockable-RT upload/readback blits, so reject the create outright.
-    // `CheckDeviceFormat(RENDERTARGET)` already answers NOTAVAILABLE for
-    // them on such a device. On a native device the lenient accept stands.
+    // A format whose texels are widened on the way into a BGRA8 backing is
+    // sampling-only: a standalone surface in one of them would pair a
+    // narrower CPU staging with a 32-bit texture through the lockable-RT
+    // upload/readback blits, so reject the create outright. That is the
+    // packed 16-bit family on a device without the native formats, and
+    // R8G8B8 on every device. `CheckDeviceFormat(RENDERTARGET)` already
+    // answers NOTAVAILABLE for them; where the backing is native the lenient
+    // accept stands.
     if mtld3d_core::upload_pass::is_expanded_upload(format, mapping.metal_pixel_format()) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateRenderTarget(format={format}) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
+            "reject CreateRenderTarget(format={format}) → INVALIDCALL (a format widened on upload is sampling-only)");
         return None;
     }
     // A render target created at the reported back-buffer size is the game's

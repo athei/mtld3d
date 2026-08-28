@@ -752,6 +752,8 @@ pub const fn mtl_pixel_format(wire: PixelFormat) -> MTLPixelFormat {
         PixelFormat::B5G6R5Unorm => MTLPixelFormat::B5G6R5Unorm,
         PixelFormat::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
         PixelFormat::Bgr5A1Unorm => MTLPixelFormat::BGR5A1Unorm,
+        PixelFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
+        PixelFormat::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         PixelFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
         PixelFormat::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
         PixelFormat::Rgba16Unorm => MTLPixelFormat::RGBA16Unorm,

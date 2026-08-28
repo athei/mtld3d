@@ -215,6 +215,19 @@ fn color_fill_a8r8g8b8_roundtrips_the_d3dcolor() {
 }
 
 #[test]
+fn color_fill_reversed_channel_formats_store_rgba_order() {
+    // The A8B8G8R8 family stores R, G, B then alpha in ascending addresses,
+    // so the same D3DCOLOR lands in the reverse byte order of A8R8G8B8.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A8B8G8R8).unwrap();
+    assert_eq!(bytes, vec![0xad, 0xbe, 0xef, 0xde]);
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_X8B8G8R8).unwrap(),
+        bytes,
+        "the X member shares the layout; its fourth byte is ignored on read"
+    );
+}
+
+#[test]
 fn color_fill_r32f_is_red_channel_normalized() {
     // R=0xad → 0xad/255.0: ColorFill promotes the red byte to a
     // normalized float.

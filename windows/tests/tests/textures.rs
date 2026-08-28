@@ -6,15 +6,17 @@ use mtld3d_tests::{
     Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4,
-    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5,
+    D3DFMT_A4R4G4B4, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_INTZ,
+    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X1R5G5B5,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
     D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY,
     D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
     D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
     D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
     D3DUSAGE_RENDERTARGET,
 };
 
@@ -2446,4 +2448,143 @@ fn a_level_count_past_the_natural_chain_resolves_to_the_chain() {
         let (hr, _) = volume.level_desc(expected);
         assert_eq!(hr, D3DERR_INVALIDCALL, "past the chain, levels={levels}");
     }
+}
+
+/// Fill a 2x2 level with four texels of `bytes_per_texel` bytes each.
+///
+/// Row by row at the pitch the lock reports: a 2x2 level of a three-byte
+/// format holds six bytes in an eight-byte row, so a writer that packs the
+/// four texels contiguously puts the second row in the first row's padding.
+fn fill_2x2(tex: &Texture<'_>, texels: [&[u8]; 4]) {
+    let locked = tex.lock_rect(0, 0);
+    let pitch = usize::try_from(locked.pitch()).expect("a positive row pitch");
+    let bytes_per_texel = texels[0].len();
+    for (index, texel) in texels.into_iter().enumerate() {
+        assert_eq!(texel.len(), bytes_per_texel, "one texel size for the level");
+        let offset = (index / 2) * pitch + (index % 2) * bytes_per_texel;
+        // SAFETY: the lock maps two rows of `pitch` bytes and a row holds two
+        // texels, so `offset + bytes_per_texel` stays inside the mapping.
+        let dst = unsafe { locked.bits_ptr().add(offset) };
+        // SAFETY: `dst` addresses `bytes_per_texel` writable bytes of the
+        // level (above), disjoint from the caller's `texel`.
+        unsafe { core::ptr::copy_nonoverlapping(texel.as_ptr(), dst, bytes_per_texel) };
+    }
+}
+
+/// Assert the four quadrants of the back buffer read red, green, blue, white.
+fn assert_2x2_quadrants(h: &Harness, tex: &Texture<'_>, what: &str) {
+    let [tl, tr, bl, br] = sample_points(h, tex, [(160, 120), (480, 120), (160, 360), (480, 360)])
+        .map(Rgba8::from_pixel);
+    assert!(
+        tl.r > 200 && tl.g < 50 && tl.b < 50,
+        "{what} top-left red, got {tl:?}"
+    );
+    assert!(
+        tr.r < 50 && tr.g > 200 && tr.b < 50,
+        "{what} top-right green, got {tr:?}"
+    );
+    assert!(
+        bl.r < 50 && bl.g < 50 && bl.b > 200,
+        "{what} bottom-left blue, got {bl:?}"
+    );
+    assert!(
+        br.r > 200 && br.g > 200 && br.b > 200,
+        "{what} bottom-right white, got {br:?}"
+    );
+}
+
+/// The reversed-channel 32-bit pair round-trips through a lock and a sample.
+///
+/// `A8B8G8R8` and `X8B8G8R8` store R, G, B, then the alpha or padding byte in
+/// ascending addresses, the reverse of the `A8R8G8B8` family. A mapping that
+/// reused the BGRA backing would swap red and blue in every quadrant.
+#[test]
+fn reversed_channel_formats_sample_their_texels() {
+    let h = Harness::new();
+    for (format, texels) in [
+        (
+            D3DFMT_A8B8G8R8,
+            [0xFF00_00FFu32, 0xFF00_FF00, 0xFFFF_0000, 0xFFFF_FFFF],
+        ),
+        (
+            D3DFMT_X8B8G8R8,
+            [0x0000_00FFu32, 0x0000_FF00, 0x00FF_0000, 0x00FF_FFFF],
+        ),
+    ] {
+        let tex = h.create_texture(2, 2, 1, 0, format, D3DPOOL_MANAGED);
+        {
+            let mut locked = tex.lock_rect(0, 0);
+            assert_eq!(locked.pitch(), 8, "2 texels of four bytes");
+            locked.write_u32(&texels);
+        }
+        assert_2x2_quadrants(&h, &tex, &format!("{format:#x}"));
+    }
+}
+
+/// `X8B8G8R8` samples alpha as 1 whatever the padding byte holds.
+///
+/// The same rule `X8R8G8B8` follows: the fourth byte is "don't care", so a
+/// SRC_ALPHA-blended draw must come through at full strength rather than
+/// multiplying by the stored zero.
+#[test]
+fn x8b8g8r8_samples_alpha_as_one() {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_X8B8G8R8, D3DPOOL_MANAGED);
+    // R = 0xFF, G = 0x40, B = 0x20, padding byte 0x00.
+    tex.lock_rect(0, 0).write_u32(&[0x0020_40FF]);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ZERO), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        px.r > 200 && (0x30..=0x50).contains(&px.g) && (0x10..=0x30).contains(&px.b),
+        "the padding byte must not scale the draw, got {px:?}"
+    );
+}
+
+/// 24-bit `R8G8B8` round-trips through a lock, the GPU widening, and a sample.
+///
+/// No GPU family has a three-byte colour format, so the level is backed by
+/// BGRA8 and widened by the upload pass. The lock keeps the D3D9 layout: three
+/// bytes a texel in B, G, R order, at a row pitch rounded up to a dword, so a
+/// 2x2 level strides eight bytes over six bytes of texels.
+#[test]
+fn r8g8b8_expands_and_samples_its_texels() {
+    let h = Harness::new();
+    let tex = h.create_texture(2, 2, 1, 0, D3DFMT_R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(
+        tex.lock_rect(0, 0).pitch(),
+        8,
+        "2 texels of three bytes, rounded up to a dword"
+    );
+    fill_2x2(
+        &tex,
+        [
+            &[0x00, 0x00, 0xFF],
+            &[0x00, 0xFF, 0x00],
+            &[0xFF, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF],
+        ],
+    );
+    assert_2x2_quadrants(&h, &tex, "R8G8B8");
 }

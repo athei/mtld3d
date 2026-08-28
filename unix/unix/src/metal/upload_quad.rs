@@ -58,8 +58,10 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// each channel by replicating its high bits into the low ones (so 0 stays 0
 /// and the maximum maps to 255 exactly) and divide by 255, which the
 /// destination's `Bgra8Unorm` round-to-nearest conversion inverts exactly;
-/// the copy decode hands the bytes through in the destination's channel
-/// order. `mtld3d_core::upload_pass::UploadDecode` owns the numbering.
+/// the 24-bit layout already stores a whole byte per channel and only gains
+/// an opaque alpha; the copy decode hands the bytes through in the
+/// destination's channel order.
+/// `mtld3d_core::upload_pass::UploadDecode` owns the numbering.
 const UPLOAD_MSL: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -80,50 +82,61 @@ fragment float4 mtld3d_upload_ps(
     uint decode = args.z;
     uint bpp = args.w;
     uint addr = args.x + texel.y * args.y + texel.x * bpp;
-    if (decode != 3u) {
-        uint bits = uint(src[addr]) | (uint(src[addr + 1u]) << 8);
-        uint r;
-        uint g;
-        uint b;
-        uint a;
-        if (decode == 0u) {
-            // R5G6B5: R[11-15] G[5-10] B[0-4], no alpha (opaque).
-            uint r5 = (bits >> 11) & 0x1Fu;
-            uint g6 = (bits >> 5) & 0x3Fu;
-            uint b5 = bits & 0x1Fu;
-            r = (r5 << 3) | (r5 >> 2);
-            g = (g6 << 2) | (g6 >> 4);
-            b = (b5 << 3) | (b5 >> 2);
-            a = 0xFFu;
-        } else if (decode == 1u || decode == 4u) {
-            // A1R5G5B5 (decode 1): A[15] R[10-14] G[5-9] B[0-4]. X1R5G5B5
-            // (decode 4) shares the layout, with bit 15 padding that D3D9
-            // samples as opaque.
-            uint r5 = (bits >> 10) & 0x1Fu;
-            uint g5 = (bits >> 5) & 0x1Fu;
-            uint b5 = bits & 0x1Fu;
-            r = (r5 << 3) | (r5 >> 2);
-            g = (g5 << 3) | (g5 >> 2);
-            b = (b5 << 3) | (b5 >> 2);
-            a = (decode == 4u || (bits & 0x8000u) != 0u) ? 0xFFu : 0x00u;
-        } else {
-            // A4R4G4B4: A[12-15] R[8-11] G[4-7] B[0-3].
-            r = ((bits >> 8) & 0xFu) * 17u;
-            g = ((bits >> 4) & 0xFu) * 17u;
-            b = (bits & 0xFu) * 17u;
-            a = ((bits >> 12) & 0xFu) * 17u;
-        }
-        return float4(float(r), float(g), float(b), float(a)) / 255.0;
+    if (decode == 3u) {
+        // Verbatim copy of an already-native layout: four bytes per texel in
+        // BGRA memory order, which is what the destination stores, so the
+        // fragment output puts them back in RGBA logical order.
+        return float4(
+            float(src[addr + 2u]),
+            float(src[addr + 1u]),
+            float(src[addr]),
+            float(src[addr + 3u])
+        ) / 255.0;
     }
-    // Verbatim copy of an already-native layout (decode 3): four bytes per
-    // texel in BGRA memory order, which is what the destination stores, so
-    // the fragment output puts them back in RGBA logical order.
-    return float4(
-        float(src[addr + 2u]),
-        float(src[addr + 1u]),
-        float(src[addr]),
-        float(src[addr + 3u])
-    ) / 255.0;
+    if (decode == 5u) {
+        // R8G8B8: three bytes per texel in B, G, R memory order, one unorm
+        // byte each, with no stored alpha (opaque).
+        return float4(
+            float(src[addr + 2u]),
+            float(src[addr + 1u]),
+            float(src[addr]),
+            255.0
+        ) / 255.0;
+    }
+    // The packed 16-bit group (decodes 0, 1, 2 and 4): two bytes per texel.
+    uint bits = uint(src[addr]) | (uint(src[addr + 1u]) << 8);
+    uint r;
+    uint g;
+    uint b;
+    uint a;
+    if (decode == 0u) {
+        // R5G6B5: R[11-15] G[5-10] B[0-4], no alpha (opaque).
+        uint r5 = (bits >> 11) & 0x1Fu;
+        uint g6 = (bits >> 5) & 0x3Fu;
+        uint b5 = bits & 0x1Fu;
+        r = (r5 << 3) | (r5 >> 2);
+        g = (g6 << 2) | (g6 >> 4);
+        b = (b5 << 3) | (b5 >> 2);
+        a = 0xFFu;
+    } else if (decode == 1u || decode == 4u) {
+        // A1R5G5B5 (decode 1): A[15] R[10-14] G[5-9] B[0-4]. X1R5G5B5
+        // (decode 4) shares the layout, with bit 15 padding that D3D9
+        // samples as opaque.
+        uint r5 = (bits >> 10) & 0x1Fu;
+        uint g5 = (bits >> 5) & 0x1Fu;
+        uint b5 = bits & 0x1Fu;
+        r = (r5 << 3) | (r5 >> 2);
+        g = (g5 << 3) | (g5 >> 2);
+        b = (b5 << 3) | (b5 >> 2);
+        a = (decode == 4u || (bits & 0x8000u) != 0u) ? 0xFFu : 0x00u;
+    } else {
+        // A4R4G4B4: A[12-15] R[8-11] G[4-7] B[0-3].
+        r = ((bits >> 8) & 0xFu) * 17u;
+        g = ((bits >> 4) & 0xFu) * 17u;
+        b = (bits & 0xFu) * 17u;
+        a = ((bits >> 12) & 0xFu) * 17u;
+    }
+    return float4(float(r), float(g), float(b), float(a)) / 255.0;
 }
 ";
 

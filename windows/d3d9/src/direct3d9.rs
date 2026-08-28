@@ -12,15 +12,15 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A1R5G5B5,
-    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1,
-    D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1,
-    D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32,
+    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F,
+    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE,
+    D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -319,6 +319,17 @@ const fn is_cube_texture_format(fmt: u32) -> bool {
 // affects reads — render writes would land in the wrong bits — so `A4R4G4B4`
 // is a sampling-only format everywhere.
 //
+// `A8B8G8R8` and `X8B8G8R8` are the reversed-channel twins of the 32-bit
+// family and back Metal's `RGBA8Unorm`, colour-renderable on both GPU
+// families, so they are render targets everywhere. `X8B8G8R8` carries the
+// same alpha-forcing swizzle `X8R8G8B8` does, which is a sampling-only view:
+// a render-target handle is always handed out unswizzled, and the X byte is
+// "don't care" on the write side anyway. Neither is a DISPLAY format, so
+// `is_present_compatible` keeps them out of the fullscreen backbuffer answer.
+// `R8G8B8` is deliberately absent: it has no Metal counterpart at all and is
+// widened to BGRA8 by the upload pass, so rendering into it would break the
+// same Lock/readback fidelity the expanded 16-bit formats are held out for.
+//
 // The float family is renderable on every device: Metal's pixel-format
 // capability table lists R16Float / RG16Float / RGBA16Float and R32Float /
 // RG32Float / RGBA32Float as colour-renderable for both the Apple and the
@@ -335,6 +346,8 @@ pub const fn is_render_target_format(fmt: u32) -> bool {
         fmt,
         D3DFMT_A8R8G8B8
             | D3DFMT_X8R8G8B8
+            | D3DFMT_A8B8G8R8
+            | D3DFMT_X8B8G8R8
             | D3DFMT_R5G6B5
             | D3DFMT_A1R5G5B5
             | D3DFMT_G16R16
@@ -416,10 +429,24 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // — drives the answer `CheckDeviceFormat` returns for
 // `D3DUSAGE_QUERY_SRGBREAD` / `D3DUSAGE_QUERY_SRGBWRITE`. Adding a new
 // linear/sRGB pair to `PixelFormat` requires extending this list too.
+//
+// `R8G8B8` belongs here even though it is widened on upload: its backing is
+// `Bgra8Unorm` on every device, so the eager twin view exists and the decode
+// is real. The packed 16-bit formats stay out because their backing is
+// device-dependent and this predicate is pure; the SRGBWRITE arm is gated on
+// `is_render_target_format_on_device` regardless, which none of the widened
+// formats pass.
 const fn has_srgb_twin(fmt: u32) -> bool {
     matches!(
         fmt,
-        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_DXT1 | D3DFMT_DXT3 | D3DFMT_DXT5
+        D3DFMT_A8R8G8B8
+            | D3DFMT_X8R8G8B8
+            | D3DFMT_A8B8G8R8
+            | D3DFMT_X8B8G8R8
+            | D3DFMT_R8G8B8
+            | D3DFMT_DXT1
+            | D3DFMT_DXT3
+            | D3DFMT_DXT5
     )
 }
 
