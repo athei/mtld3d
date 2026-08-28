@@ -13,7 +13,7 @@ use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
     NullTextureKind, PassDescriptor, SubmitFrameParams,
     mtl::{
-        CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
+        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
         VisibilityResultMode,
     },
     mtl_handle::{
@@ -1180,6 +1180,10 @@ enum CopyRejectReason {
     SourceRegionOutOfBounds,
     /// The region leaves the addressed destination mip level.
     DestinationRegionOutOfBounds,
+    /// The source buffer is shorter than the rows and slices the copy reads.
+    SourceBufferTooShort,
+    /// The destination buffer is shorter than the rows and slices the copy writes.
+    DestinationBufferTooShort,
 }
 
 impl CopyRejectReason {
@@ -1199,20 +1203,26 @@ impl CopyRejectReason {
             Self::DestinationLevelMissing => "the destination has no such mip level",
             Self::SourceRegionOutOfBounds => "the region leaves the source mip level",
             Self::DestinationRegionOutOfBounds => "the region leaves the destination mip level",
+            Self::SourceBufferTooShort => "the source buffer is shorter than the copy reads",
+            Self::DestinationBufferTooShort => {
+                "the destination buffer is shorter than the copy writes"
+            }
         }
     }
 }
 
-/// One end of a texture-to-texture blit, as the live `MTLTexture` describes it.
+/// The texture end of a blit copy, as the live `MTLTexture` describes it.
 ///
-/// `width` and `height` are the base level's, `level` the mip level the copy
-/// addresses and `levels` the texture's level count, so the addressed extent
-/// is derived here rather than passed in alongside them.
+/// `width`, `height` and `depth` are the base level's, `level` the mip level
+/// the copy addresses and `levels` the texture's level count, so the
+/// addressed extent is derived here rather than passed in alongside them.
 struct CopyEndpoint {
     pixel_format: MTLPixelFormat,
     sample_count: usize,
     width: usize,
     height: usize,
+    /// Slice count of the base level: one outside a volume texture.
+    depth: usize,
     level: usize,
     levels: usize,
     origin_x: usize,
@@ -1229,13 +1239,22 @@ impl CopyEndpoint {
         let h = self.height >> self.level;
         Some((if w == 0 { 1 } else { w }, if h == 0 { 1 } else { h }))
     }
+
+    /// Slices in the addressed mip level, or `None` when it does not exist.
+    const fn level_depth(&self) -> Option<usize> {
+        if self.level >= self.levels {
+            return None;
+        }
+        let d = self.depth >> self.level;
+        Some(if d == 0 { 1 } else { d })
+    }
 }
 
 impl core::fmt::Display for CopyEndpoint {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "{:?} samples={} level={}/{} origin={},{} size={}x{}",
+            "{:?} samples={} level={}/{} origin={},{} size={}x{}x{}",
             self.pixel_format,
             self.sample_count,
             self.level,
@@ -1243,7 +1262,8 @@ impl core::fmt::Display for CopyEndpoint {
             self.origin_x,
             self.origin_y,
             self.width,
-            self.height
+            self.height,
+            self.depth
         )
     }
 }
@@ -1312,6 +1332,174 @@ fn copy_texture_reject(
     }
     if !region_fits((dst.origin_x, dst.origin_y), region, dst_extent) {
         return Some(CopyRejectReason::DestinationRegionOutOfBounds);
+    }
+    None
+}
+
+/// The buffer end of a blit copy between an `MTLBuffer` and an `MTLTexture`.
+///
+/// `offset` is where the first row starts, `bytes_per_row` the stride between
+/// rows of blocks and `bytes_per_image` the stride between slices, all as the
+/// copy was encoded; `length` is the live `MTLBuffer`'s own length.
+struct CopyBufferEndpoint {
+    length: usize,
+    offset: usize,
+    bytes_per_row: usize,
+    bytes_per_image: usize,
+}
+
+impl core::fmt::Display for CopyBufferEndpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "len={} offset={} bytesPerRow={} bytesPerImage={}",
+            self.length, self.offset, self.bytes_per_row, self.bytes_per_image
+        )
+    }
+}
+
+/// The region a buffer/texture copy transfers, in texture pixels.
+///
+/// `depth` is the slice count the copy walks: one for a 2D texture, the box
+/// depth for a volume.
+struct CopyRegion {
+    width: usize,
+    height: usize,
+    depth: usize,
+}
+
+impl core::fmt::Display for CopyRegion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}x{}x{}", self.width, self.height, self.depth)
+    }
+}
+
+/// Block layout of a live texture's pixel format.
+///
+/// Every format an mtld3d texture can carry is on the wire, so the fallback
+/// is unreachable; it sizes a copy as one byte per pixel, which keeps the
+/// bounds check permissive rather than refusing a copy it cannot measure.
+fn copy_block_layout(format: MTLPixelFormat) -> BlockLayout {
+    let Some(wire) = u32::try_from(format.0)
+        .ok()
+        .and_then(PixelFormat::from_repr)
+    else {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: format.0 as u64,
+            "copy guard: pixel format {format:?} is not on the mtld3d wire, \
+             sizing its blocks as one byte per pixel"
+        );
+        return BlockLayout::unmapped();
+    };
+    wire.block_layout()
+}
+
+/// Whether the region placed at the endpoint's origin stays inside its level.
+///
+/// The level extent is rounded up to the block grid first: a compressed level
+/// narrower than one block still addresses a whole block, so a copy covering
+/// it names the block extent and not the level's. On an uncompressed format
+/// the rounding is the identity.
+fn level_holds_region(
+    texture: &CopyEndpoint,
+    region: &CopyRegion,
+    extent: (usize, usize),
+    block: BlockLayout,
+) -> bool {
+    let block_w = usize::try_from(block.width()).expect("block extent fits usize");
+    let block_h = usize::try_from(block.height()).expect("block extent fits usize");
+    let bounds = (
+        extent.0.next_multiple_of(block_w),
+        extent.1.next_multiple_of(block_h),
+    );
+    region_fits(
+        (texture.origin_x, texture.origin_y),
+        (region.width, region.height),
+        bounds,
+    ) && texture.level_depth().is_some_and(|d| region.depth <= d)
+}
+
+/// Byte offset, exclusive, the copy stops at in the buffer.
+///
+/// The strides cover every row but the last one of the last slice, which is
+/// only as long as the region's own blocks: that is where the copy stops, not
+/// at the end of a padded row. `None` when the arithmetic overflows, which is
+/// itself a reason to refuse the copy.
+fn buffer_copy_end(
+    buffer: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<usize> {
+    let block_w = usize::try_from(block.width()).ok()?;
+    let block_h = usize::try_from(block.height()).ok()?;
+    let block_bytes = usize::try_from(block.bytes()).ok()?;
+    let rows = region.height.div_ceil(block_h);
+    let cols = region.width.div_ceil(block_w);
+    if rows == 0 || cols == 0 || region.depth == 0 {
+        return Some(buffer.offset);
+    }
+    let last_row = cols.checked_mul(block_bytes)?;
+    let slice = buffer
+        .bytes_per_row
+        .checked_mul(rows - 1)?
+        .checked_add(last_row)?;
+    let span = buffer
+        .bytes_per_image
+        .checked_mul(region.depth - 1)?
+        .checked_add(slice)?;
+    buffer.offset.checked_add(span)
+}
+
+/// Whether the buffer holds every byte a copy of `region` touches.
+fn buffer_holds_region(
+    buffer: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> bool {
+    buffer_copy_end(buffer, region, block).is_some_and(|end| end <= buffer.length)
+}
+
+/// Reject a buffer-to-texture copy `copyFromBuffer:` would not accept.
+///
+/// `None` means the upload is safe to encode. `block` is the destination
+/// format's, since the region and the source rows are both laid out in it.
+fn copy_buffer_to_texture_reject(
+    src: &CopyBufferEndpoint,
+    dst: &CopyEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<CopyRejectReason> {
+    let Some(extent) = dst.level_extent() else {
+        return Some(CopyRejectReason::DestinationLevelMissing);
+    };
+    if !level_holds_region(dst, region, extent, block) {
+        return Some(CopyRejectReason::DestinationRegionOutOfBounds);
+    }
+    if !buffer_holds_region(src, region, block) {
+        return Some(CopyRejectReason::SourceBufferTooShort);
+    }
+    None
+}
+
+/// Reject a texture-to-buffer copy `copyFromTexture:toBuffer:` would not accept.
+///
+/// The mirror of `copy_buffer_to_texture_reject`: the same two bounds with
+/// the roles of the two ends swapped.
+fn copy_texture_to_buffer_reject(
+    src: &CopyEndpoint,
+    dst: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<CopyRejectReason> {
+    let Some(extent) = src.level_extent() else {
+        return Some(CopyRejectReason::SourceLevelMissing);
+    };
+    if !level_holds_region(src, region, extent, block) {
+        return Some(CopyRejectReason::SourceRegionOutOfBounds);
+    }
+    if !buffer_holds_region(dst, region, block) {
+        return Some(CopyRejectReason::DestinationBufferTooShort);
     }
     None
 }
@@ -1402,6 +1590,45 @@ fn encode_leading_blits(
                     );
                     continue;
                 };
+                let region = CopyRegion {
+                    width: cmd.region_w as usize,
+                    height: cmd.region_h as usize,
+                    depth: cmd.depth as usize,
+                };
+                let source = CopyBufferEndpoint {
+                    length: buffer.length(),
+                    offset: to_usize(cmd.src_offset),
+                    bytes_per_row: to_usize(cmd.bytes_per_row),
+                    bytes_per_image: cmd.bytes_per_image as usize,
+                };
+                let destination = CopyEndpoint {
+                    pixel_format: texture.pixelFormat(),
+                    sample_count: texture.sampleCount(),
+                    width: texture.width(),
+                    height: texture.height(),
+                    depth: texture.depth(),
+                    level: cmd.mip_level as usize,
+                    levels: texture.mipmapLevelCount(),
+                    origin_x: cmd.origin_x as usize,
+                    origin_y: cmd.origin_y as usize,
+                };
+                let block = copy_block_layout(destination.pixel_format);
+                if let Some(reason) =
+                    copy_buffer_to_texture_reject(&source, &destination, &region, block)
+                {
+                    let reason_text = reason.as_str();
+                    let src_handle = cmd.src_handle;
+                    let dst_handle = cmd.dst_handle;
+                    mtld3d_shared::log_once_warn_by!(
+                        target: crate::LOG_TARGET,
+                        key: reason.key(),
+                        "encode_leading_blits: {reason_text}, upload skipped. \
+                         src handle={src_handle:#x} {source}, \
+                         dst handle={dst_handle:#x} {destination}, \
+                         region {region}"
+                    );
+                    continue;
+                }
                 mtld3d_shared::crumb!("blit:buf2tex", cmd.src_handle, cmd.dst_handle);
                 // `depth` is the slice count (1 for a 2D texture, >1 for a
                 // volume/3D texture) and `bytes_per_image` the per-slice byte
@@ -1410,8 +1637,8 @@ fn encode_leading_blits(
                 // the values this call computed implicitly before the fields
                 // existed — so the 2D copy is byte-identical.
                 // SAFETY: objc2 typed binding; `buffer` and `texture` are
-                // retained Metal objects live for the call; geometry is
-                // bounds-checked by the PE side via the wire contract.
+                // retained Metal objects live for the call; the geometry
+                // cleared `copy_buffer_to_texture_reject` above.
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         &buffer,
@@ -1470,6 +1697,7 @@ fn encode_leading_blits(
                     sample_count: src.sampleCount(),
                     width: src.width(),
                     height: src.height(),
+                    depth: src.depth(),
                     level: cmd.mip_level as usize,
                     levels: src.mipmapLevelCount(),
                     origin_x: cmd.origin_x as usize,
@@ -1480,6 +1708,7 @@ fn encode_leading_blits(
                     sample_count: dst.sampleCount(),
                     width: dst.width(),
                     height: dst.height(),
+                    depth: dst.depth(),
                     level: cmd.dst_mip_level as usize,
                     levels: dst.mipmapLevelCount(),
                     origin_x: dst_x,
@@ -2406,11 +2635,10 @@ pub struct BlitArgs {
 /// Resolve a render-resolution source up to the size the caller's coordinates assume.
 ///
 /// Returns `Some(resolved)` when a resolve happened, `None` to read the source
-/// as-is, which is both the default-scale path and the fallback when the
-/// resolve cannot be set up. Reading as-is after a declined resolve yields a
-/// smaller image than requested, so it warns rather than failing the call: a
-/// wrong-sized readback is recoverable for the game, a failed `LockRect` often
-/// is not.
+/// as-is, which is both the default-scale path and the fallback if `MetalFX`
+/// declines. At the default scale the source already holds what the caller
+/// asked for; after a declined resolve it does not, and the copy guard below
+/// refuses the read rather than letting it run off the end of the texture.
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
@@ -2575,6 +2803,45 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     let source = resolve_readback_source(&cmd_buf, &device, &texture, source_width, source_height);
     let texture = source.as_deref().unwrap_or(&*texture);
 
+    let bytes_per_image = (bytes_per_row as usize) * (height as usize);
+    let region = CopyRegion {
+        width: width as usize,
+        height: height as usize,
+        depth: 1,
+    };
+    let src_endpoint = CopyEndpoint {
+        pixel_format: texture.pixelFormat(),
+        sample_count: texture.sampleCount(),
+        width: texture.width(),
+        height: texture.height(),
+        depth: texture.depth(),
+        level: mip_level as usize,
+        levels: texture.mipmapLevelCount(),
+        origin_x: origin_x as usize,
+        origin_y: origin_y as usize,
+    };
+    let destination = CopyBufferEndpoint {
+        length: dst_buffer.length(),
+        offset: 0,
+        bytes_per_row: bytes_per_row as usize,
+        bytes_per_image,
+    };
+    let block = copy_block_layout(src_endpoint.pixel_format);
+    // Checked before the encoder exists so a rejection leaves no encoder to
+    // close. A declined `MetalFX` resolve lands here: the caller asked for
+    // more pixels than the render-resolution source holds.
+    if let Some(reason) = copy_texture_to_buffer_reject(&src_endpoint, &destination, &region, block)
+    {
+        let reason_text = reason.as_str();
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: reason.key(),
+            "blit_texture_to_buffer: {reason_text}, readback skipped. \
+             src {src_endpoint}, dst {destination}, region {region}"
+        );
+        return false;
+    }
+
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
         return false;
@@ -2584,9 +2851,9 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         blit.setLabel(Some(&label));
     }
 
-    let bytes_per_image = (bytes_per_row as usize) * (height as usize);
     // SAFETY: objc2 typed binding; `texture`/`dst_buffer` are retained Metal
-    // objects live for the call; geometry is caller-bounded.
+    // objects live for the call; the geometry cleared
+    // `copy_texture_to_buffer_reject` above.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
             texture,

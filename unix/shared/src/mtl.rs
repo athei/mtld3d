@@ -135,6 +135,109 @@ impl PixelFormat {
             _ => None,
         }
     }
+
+    /// The addressable block of this format: its pixel extent and its size.
+    ///
+    /// Uncompressed formats address one pixel per block, so the extent is
+    /// 1x1 and the size is the pixel size. The BC families address a 4x4
+    /// pixel block. A row of `w` pixels occupies `ceil(w / block width) *
+    /// block bytes`, which is what turns the pixel region of a buffer copy
+    /// into the byte footprint it reads or writes.
+    ///
+    /// The match is exhaustive on purpose: a new format has to state its
+    /// block rather than inherit a default that is wrong for a compressed
+    /// one.
+    #[must_use]
+    pub const fn block_layout(self) -> BlockLayout {
+        match self {
+            Self::A8Unorm | Self::R8Unorm => BlockLayout::pixel(1),
+            Self::R16Unorm
+            | Self::R16Float
+            | Self::Rg8Unorm
+            | Self::Rg8Snorm
+            | Self::B5G6R5Unorm
+            | Self::Abgr4Unorm
+            | Self::Bgr5A1Unorm => BlockLayout::pixel(2),
+            Self::R32Float
+            | Self::Rg16Unorm
+            | Self::Rg16Float
+            | Self::Bgra8Unorm
+            | Self::Bgra8UnormSrgb
+            | Self::Depth32Float => BlockLayout::pixel(4),
+            Self::Rg32Float
+            | Self::Rgba16Unorm
+            | Self::Rgba16Float
+            | Self::Depth32FloatStencil8 => BlockLayout::pixel(8),
+            Self::Rgba32Float => BlockLayout::pixel(16),
+            Self::Bc1Rgba | Self::Bc1RgbaSrgb | Self::Bc4RUnorm => BlockLayout::compressed(8),
+            Self::Bc2Rgba | Self::Bc2RgbaSrgb | Self::Bc3Rgba | Self::Bc3RgbaSrgb => {
+                BlockLayout::compressed(16)
+            }
+        }
+    }
+}
+
+/// The unit a pixel format addresses: its pixel extent and its byte size.
+///
+/// Sizing a copy in bytes goes through this rather than through a pixel
+/// size, because a block-compressed format has no per-pixel size: a BC1
+/// row of 3 pixels is one 8-byte block, the same as a row of 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockLayout {
+    width: u32,
+    height: u32,
+    bytes: u32,
+}
+
+impl BlockLayout {
+    /// The layout of a format that is not on the mtld3d wire.
+    ///
+    /// One byte per pixel is the smallest footprint a format can have, so a
+    /// bounds check that falls back to it stays permissive: it never rejects
+    /// a copy whose real footprint it could not compute.
+    #[must_use]
+    pub const fn unmapped() -> Self {
+        Self::pixel(1)
+    }
+
+    /// Pixels one block spans horizontally.
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Pixels one block spans vertically.
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    /// Bytes one block occupies.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.bytes
+    }
+
+    /// A format that addresses a single pixel of `bytes` bytes.
+    const fn pixel(bytes: u32) -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            bytes,
+        }
+    }
+
+    /// A format that addresses a 4x4 pixel block of `bytes` bytes.
+    ///
+    /// Every block-compressed format mtld3d plumbs is a BC family member,
+    /// and all of them are 4x4.
+    const fn compressed(bytes: u32) -> Self {
+        Self {
+            width: 4,
+            height: 4,
+            bytes,
+        }
+    }
 }
 
 /// `MTLLoadAction` wire encoding for render-pass color/depth attachments.

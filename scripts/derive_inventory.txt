@@ -13,6 +13,7 @@ unix/shared/src/lib.rs Thunks Clone,Copy,EnumCount,VariantArray
 unix/shared/src/mtl.rs AddressMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BlendFactor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BlendOperation Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs BlockLayout Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/mtl.rs BorderColor Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs BufferKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs ClearQuadFlags Clone,Copy,Debug,PartialEq,Eq,Hash

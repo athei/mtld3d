@@ -9,12 +9,19 @@
 //! `copy_texture_reject` is checked against each condition Metal validates on
 //! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
 //! mip level, and a linear format against its sRGB twin.
+//!
+//! The buffer/texture pair, `copy_buffer_to_texture_reject` and its readback mirror, is
+//! checked on both of its bounds: the region against the addressed mip level, rounded up
+//! to the block grid so a compressed level below one block still takes a whole block, and
+//! the buffer against the rows and slices the strides walk.
 
+use mtld3d_shared::mtl::{BlockLayout, PixelFormat};
 use objc2_metal::MTLPixelFormat;
 
 use super::{
-    CopyEndpoint, CopyRejectReason, PresentGeometry, PresentRoute, SETTLED_PRESENTS,
-    copy_texture_reject, geometry_settled, present_route,
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PresentGeometry, PresentRoute,
+    SETTLED_PRESENTS, copy_buffer_to_texture_reject, copy_texture_reject,
+    copy_texture_to_buffer_reject, geometry_settled, present_route,
 };
 
 /// Matching extents take the blit whether or not `MetalFX` exists.
@@ -186,6 +193,7 @@ fn endpoint(size: usize) -> CopyEndpoint {
         sample_count: 1,
         width: size,
         height: size,
+        depth: 1,
         level: 0,
         levels: 1,
         origin_x: 0,
@@ -313,10 +321,280 @@ fn every_reject_reason_has_a_distinct_key() {
         CopyRejectReason::DestinationLevelMissing,
         CopyRejectReason::SourceRegionOutOfBounds,
         CopyRejectReason::DestinationRegionOutOfBounds,
+        CopyRejectReason::SourceBufferTooShort,
+        CopyRejectReason::DestinationBufferTooShort,
     ];
     let mut keys: Vec<u64> = reasons.iter().map(|r| r.key()).collect();
     keys.sort_unstable();
     keys.dedup();
     assert_eq!(keys.len(), reasons.len());
     assert!(reasons.iter().all(|r| !r.as_str().is_empty()));
+}
+
+/// A `BGRA8` staging buffer holding `rows` tightly packed rows of `size` pixels.
+fn upload_buffer(size: usize, rows: usize) -> CopyBufferEndpoint {
+    CopyBufferEndpoint {
+        length: size * 4 * rows,
+        offset: 0,
+        bytes_per_row: size * 4,
+        bytes_per_image: size * 4 * rows,
+    }
+}
+
+/// A single-slice region of `w` by `h` pixels.
+const fn region(w: usize, h: usize) -> CopyRegion {
+    CopyRegion {
+        width: w,
+        height: h,
+        depth: 1,
+    }
+}
+
+/// The block layout every `BGRA8` upload in these tests is measured in.
+fn bgra8_block() -> BlockLayout {
+    PixelFormat::Bgra8Unorm.block_layout()
+}
+
+/// A whole-level upload out of a buffer that holds exactly the level.
+#[test]
+fn a_matching_upload_is_accepted() {
+    assert_eq!(
+        copy_buffer_to_texture_reject(
+            &upload_buffer(256, 256),
+            &endpoint(256),
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        None
+    );
+}
+
+/// An overhanging destination is rejected before Metal sees it.
+///
+/// This is the shape Metal reports as a destination origin plus a source width
+/// exceeding the level's width.
+#[test]
+fn an_upload_overhanging_the_level_is_rejected() {
+    let mut dst = endpoint(256);
+    dst.origin_x = 128;
+    assert_eq!(
+        copy_buffer_to_texture_reject(
+            &upload_buffer(256, 256),
+            &dst,
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+    // Half the width still fits at that origin.
+    assert_eq!(
+        copy_buffer_to_texture_reject(
+            &upload_buffer(256, 256),
+            &dst,
+            &region(128, 256),
+            bgra8_block(),
+        ),
+        None
+    );
+}
+
+/// Bounds are the addressed level's extent, not the base level's.
+#[test]
+fn an_upload_is_bounded_by_the_addressed_level() {
+    let mut dst = endpoint(256);
+    dst.levels = 9;
+    dst.level = 2;
+    assert_eq!(
+        copy_buffer_to_texture_reject(&upload_buffer(64, 64), &dst, &region(64, 64), bgra8_block(),),
+        None
+    );
+    assert_eq!(
+        copy_buffer_to_texture_reject(
+            &upload_buffer(128, 128),
+            &dst,
+            &region(65, 64),
+            bgra8_block(),
+        ),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+}
+
+/// A level past the end of the chain has no extent to upload into.
+#[test]
+fn an_upload_to_a_missing_level_is_rejected() {
+    let mut dst = endpoint(256);
+    dst.level = 1;
+    assert_eq!(
+        copy_buffer_to_texture_reject(&upload_buffer(1, 1), &dst, &region(1, 1), bgra8_block(),),
+        Some(CopyRejectReason::DestinationLevelMissing)
+    );
+}
+
+/// One byte short of the rows the strides walk is a reject.
+#[test]
+fn a_short_source_buffer_is_rejected() {
+    assert_eq!(
+        copy_buffer_to_texture_reject(
+            &upload_buffer(256, 256),
+            &endpoint(256),
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        None
+    );
+    let mut short = upload_buffer(256, 256);
+    short.length -= 1;
+    assert_eq!(
+        copy_buffer_to_texture_reject(&short, &endpoint(256), &region(256, 256), bgra8_block()),
+        Some(CopyRejectReason::SourceBufferTooShort)
+    );
+}
+
+/// The copy stops at the last row's own pixels, not at the end of its stride.
+///
+/// A sub-rect at the right edge of the last row of a staging buffer starts that
+/// row part-way in, so charging it a whole stride would reject an upload whose
+/// bytes the buffer holds.
+#[test]
+fn the_last_row_is_bounded_by_its_pixels_not_its_stride() {
+    let mut src = upload_buffer(256, 256);
+    src.offset = 255 * 256 * 4 + 128 * 4;
+    let mut dst = endpoint(512);
+    dst.origin_x = 128;
+    dst.origin_y = 255;
+    assert_eq!(
+        copy_buffer_to_texture_reject(&src, &dst, &region(128, 1), bgra8_block()),
+        None
+    );
+    // One pixel more than the 512 bytes left in the buffer.
+    assert_eq!(
+        copy_buffer_to_texture_reject(&src, &dst, &region(129, 1), bgra8_block()),
+        Some(CopyRejectReason::SourceBufferTooShort)
+    );
+}
+
+/// Compressed rows are counted in blocks, so a `BC1` level needs an eighth of the bytes.
+#[test]
+fn a_compressed_upload_counts_block_rows() {
+    let block = PixelFormat::Bc1Rgba.block_layout();
+    let mut dst = endpoint(128);
+    dst.pixel_format = MTLPixelFormat::BC1_RGBA;
+    // 32 block rows of 32 blocks, 8 bytes each.
+    let exact = CopyBufferEndpoint {
+        length: 256 * 32,
+        offset: 0,
+        bytes_per_row: 256,
+        bytes_per_image: 256 * 32,
+    };
+    assert_eq!(
+        copy_buffer_to_texture_reject(&exact, &dst, &region(128, 128), block),
+        None
+    );
+    let short = CopyBufferEndpoint {
+        length: 256 * 32 - 1,
+        offset: 0,
+        bytes_per_row: 256,
+        bytes_per_image: 256 * 32,
+    };
+    assert_eq!(
+        copy_buffer_to_texture_reject(&short, &dst, &region(128, 128), block),
+        Some(CopyRejectReason::SourceBufferTooShort)
+    );
+}
+
+/// A compressed level below one block still addresses a whole block.
+#[test]
+fn a_compressed_level_under_one_block_takes_a_whole_block() {
+    let block = PixelFormat::Bc1Rgba.block_layout();
+    let mut dst = endpoint(4);
+    dst.pixel_format = MTLPixelFormat::BC1_RGBA;
+    dst.levels = 3;
+    dst.level = 2;
+    let one_block = CopyBufferEndpoint {
+        length: 8,
+        offset: 0,
+        bytes_per_row: 8,
+        bytes_per_image: 8,
+    };
+    // The level is one pixel; the copy names the 4x4 block that holds it.
+    assert_eq!(
+        copy_buffer_to_texture_reject(&one_block, &dst, &region(4, 4), block),
+        None
+    );
+    // Two blocks wide is past the level however the extent is rounded.
+    assert_eq!(
+        copy_buffer_to_texture_reject(&one_block, &dst, &region(8, 4), block),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+}
+
+/// A volume upload reads one slice stride per slice past the first.
+#[test]
+fn a_volume_upload_counts_every_slice() {
+    let mut dst = endpoint(32);
+    dst.depth = 4;
+    let box_region = CopyRegion {
+        width: 32,
+        height: 32,
+        depth: 4,
+    };
+    let exact = CopyBufferEndpoint {
+        length: 32 * 4 * 32 * 4,
+        offset: 0,
+        bytes_per_row: 32 * 4,
+        bytes_per_image: 32 * 4 * 32,
+    };
+    assert_eq!(
+        copy_buffer_to_texture_reject(&exact, &dst, &box_region, bgra8_block()),
+        None
+    );
+    let three_slices = CopyBufferEndpoint {
+        length: 32 * 4 * 32 * 3,
+        offset: 0,
+        bytes_per_row: 32 * 4,
+        bytes_per_image: 32 * 4 * 32,
+    };
+    assert_eq!(
+        copy_buffer_to_texture_reject(&three_slices, &dst, &box_region, bgra8_block()),
+        Some(CopyRejectReason::SourceBufferTooShort)
+    );
+    // The same box against a texture that has one slice.
+    assert_eq!(
+        copy_buffer_to_texture_reject(&exact, &endpoint(32), &box_region, bgra8_block()),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+}
+
+/// The readback mirror reports the texture as the source and the buffer as the destination.
+#[test]
+fn a_readback_reports_the_ends_the_other_way_round() {
+    assert_eq!(
+        copy_texture_to_buffer_reject(
+            &endpoint(256),
+            &upload_buffer(256, 256),
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        None
+    );
+    // The caller asks for more pixels than the source holds, which is what a
+    // declined resolve of a render-resolution frame leaves behind.
+    assert_eq!(
+        copy_texture_to_buffer_reject(
+            &endpoint(128),
+            &upload_buffer(256, 256),
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+    assert_eq!(
+        copy_texture_to_buffer_reject(
+            &endpoint(256),
+            &upload_buffer(256, 255),
+            &region(256, 256),
+            bgra8_block(),
+        ),
+        Some(CopyRejectReason::DestinationBufferTooShort)
+    );
 }
