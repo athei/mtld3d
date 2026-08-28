@@ -1393,3 +1393,41 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
         "hidden again: WM_SETCURSOR forwarded to the class cursor",
     );
 }
+
+#[test]
+fn a_second_device_renders_after_the_first_is_destroyed() {
+    // The unix side latches the metal view, its layer and its window at
+    // CreateDevice and reconciles them against the display from the main
+    // thread. Releasing a device releases that view, so the latches go with
+    // it and the next device's own attach has to re-establish them. Both
+    // devices present past the interval at which the presenting thread asks
+    // the main thread for a reconciliation, so that walk runs on the first
+    // device's view while it is still attached and on the second device's
+    // once it replaces it.
+    const PRESENTS: u32 = 40;
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    let first = Harness::new();
+    for _ in 0..PRESENTS {
+        first.render_once(RED, |_| {});
+    }
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "first device");
+    // The window outlives the device it served: destroying it here would post
+    // WM_QUIT into the thread queue the second device then pumps.
+    assert_eq!(
+        first.release_device(),
+        0,
+        "the first device is fully released"
+    );
+
+    let second = Harness::new();
+    for _ in 0..PRESENTS {
+        second.render_once(GREEN, |_| {});
+    }
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second device after the first was released",
+    );
+}
