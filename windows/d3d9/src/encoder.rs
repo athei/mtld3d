@@ -360,6 +360,18 @@ struct SamplerResolveMemo {
 /// `mip_staging_buffers` is sized to the texture's `levels` count but
 /// entries stay unpopulated (`handle == 0`) until the first upload for
 /// that mip.
+/// A scratch texture staging a `StretchRect` whose two endpoints are one texture.
+///
+/// Sized to the largest region asked of it so far, so a game that scrolls the
+/// same surface every frame allocates once. Keyed by the source handle in
+/// `stretch_scratch`.
+struct StretchScratch {
+    handle: MetalHandle<MTLTextureKind>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+}
+
 /// A scratch copy of a depth attachment handed to draws that sample it.
 struct DepthSnapshot {
     handle: MetalHandle<MTLTextureKind>,
@@ -850,6 +862,8 @@ pub struct FrameEncoder {
     depth_write_epoch: u64,
     /// Scratch copies of depth attachments that draws sampled while bound, by source handle.
     depth_snapshots: FxHashMap<u64, DepthSnapshot>,
+    /// Scratch textures staging same-texture `StretchRect` copies, by source handle.
+    stretch_scratch: FxHashMap<u64, StretchScratch>,
 
     /// Every per-frame and rolling telemetry field.
     ///
@@ -1370,6 +1384,7 @@ impl FrameEncoder {
             depth_attachment_desc: (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
             depth_write_epoch: 0,
             depth_snapshots: FxHashMap::default(),
+            stretch_scratch: FxHashMap::default(),
             perf: EncoderPerfState::new(),
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
@@ -2865,6 +2880,101 @@ impl FrameEncoder {
             });
         }
         dst.raw()
+    }
+
+    /// Scratch texture staging a `StretchRect` whose two endpoints are one texture.
+    ///
+    /// D3D9 reads the whole source region before it writes any of the
+    /// destination, so an overlapping or scaled copy inside one texture needs
+    /// somewhere to hold the source first. The scratch is kept per source
+    /// handle and grown to the largest region ever asked of it, so a game
+    /// scrolling the same surface every frame allocates once. `src_handle` is
+    /// the copy's one texture, used as the cache key. Returns 0 when
+    /// `None` when the texture cannot be created; the caller then drops the copy
+    /// and says so. The returned dimensions are the scratch's own, which the
+    /// scaled route needs to build its texcoord transform.
+    pub fn stretch_scratch_texture(
+        &mut self,
+        src_handle: u64,
+        size: (u32, u32),
+        format: PixelFormat,
+    ) -> Option<(u64, u32, u32)> {
+        let (want_w, want_h) = size;
+        if src_handle == 0 || want_w == 0 || want_h == 0 {
+            return None;
+        }
+        let stale = match self.stretch_scratch.get(&src_handle) {
+            Some(scratch)
+                if scratch.format == format
+                    && scratch.width >= want_w
+                    && scratch.height >= want_h =>
+            {
+                return Some((scratch.handle.raw(), scratch.width, scratch.height));
+            }
+            Some(scratch) => Some((scratch.handle, scratch.width, scratch.height)),
+            None => None,
+        };
+        // Grow rather than shrink: a later call with the earlier geometry then
+        // hits the cache instead of trading one allocation for another.
+        let (width, height) =
+            stale.map_or((want_w, want_h), |(_, w, h)| (w.max(want_w), h.max(want_h)));
+        if let Some((old, _, _)) = stale {
+            self.stretch_scratch.remove(&src_handle);
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: old.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: false,
+                });
+        }
+        // `ShaderRead` comes free with every texture the unix side creates,
+        // which is all the scaled route needs: the scratch is a blit
+        // destination and then either a blit source or a sampled source.
+        let desc = TextureCreateDesc {
+            tex_id: src_handle,
+            width,
+            height,
+            depth: 1,
+            levels: 1,
+            pixel_format: format,
+            storage_mode: StorageMode::Private,
+            flags: TextureCreateFlags::empty(),
+            swizzle_r: Swizzle::Red,
+            swizzle_g: Swizzle::Green,
+            swizzle_b: Swizzle::Blue,
+            swizzle_a: Swizzle::Alpha,
+            usage_flags: TextureUsage::empty(),
+        };
+        let mut handles = [MetalHandle::<MTLTextureKind>::NULL];
+        // The scratch is never sampled through an sRGB view; the slot stays NULL.
+        let mut srgb_handles = [MetalHandle::<MTLTextureKind>::NULL];
+        let status = self.batch_create_textures(&[desc], &mut handles, &mut srgb_handles);
+        if status != 0 || handles[0].is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "StretchRect: creating a {width}x{height} {format:?} scratch for a copy inside \
+                 one texture failed ({status:#x}); the copy is dropped"
+            );
+            return None;
+        }
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "StretchRect: copying between two rects of one surface; staging through a \
+             {width}x{height} {format:?} scratch"
+        );
+        self.stretch_scratch.insert(
+            src_handle,
+            StretchScratch {
+                handle: handles[0],
+                width,
+                height,
+                format,
+            },
+        );
+        Some((handles[0].raw(), width, height))
     }
 
     #[must_use]

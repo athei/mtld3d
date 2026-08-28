@@ -76,10 +76,6 @@ pub enum RejectReason {
     UnsupportedSource,
     /// Destination surface has no Metal backing.
     UnsupportedDestination,
-    /// Source and destination resolve to the same Metal texture handle.
-    ///
-    /// Metal disallows self-overlap blits.
-    SameSurface,
 }
 
 impl RejectReason {
@@ -99,8 +95,52 @@ impl RejectReason {
             Self::Scaling => "src and dst dimensions differ (no scaling)",
             Self::UnsupportedSource => "source surface has no Metal backing",
             Self::UnsupportedDestination => "destination surface has no Metal backing",
-            Self::SameSurface => "src and dst are the same Metal texture",
         }
+    }
+}
+
+/// How a `StretchRect` whose two endpoints are one Metal texture is carried out.
+///
+/// D3D9 performs a copy between two rectangles of the same surface; only an
+/// overlapping pair is undefined. Metal's blit encoder copies within a single
+/// texture as long as the two regions do not overlap, and the render quad
+/// cannot sample the texture it draws into at all, so the cases split three
+/// ways.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SameSurfaceRoute {
+    /// The two regions name the same texels, so the copy writes what is there.
+    Skip,
+    /// Disjoint regions of equal size: one blit inside the texture.
+    Direct,
+    /// Overlapping regions, or a size change: stage through a scratch texture.
+    Scratch,
+}
+
+/// Route a `StretchRect` whose source and destination resolve to one texture.
+///
+/// Regions are in the texture's own coordinates and carry the mip level each
+/// addresses; two different levels are different texels, so they never
+/// overlap.
+#[must_use]
+pub const fn same_surface_route(
+    src_region: StretchRegion,
+    dst_region: StretchRegion,
+    src_mip: u32,
+    dst_mip: u32,
+) -> SameSurfaceRoute {
+    if src_region.w != dst_region.w || src_region.h != dst_region.h {
+        return SameSurfaceRoute::Scratch;
+    }
+    if src_mip != dst_mip {
+        return SameSurfaceRoute::Direct;
+    }
+    if src_region.x == dst_region.x && src_region.y == dst_region.y {
+        return SameSurfaceRoute::Skip;
+    }
+    if regions_overlap(src_region, dst_region) {
+        SameSurfaceRoute::Scratch
+    } else {
+        SameSurfaceRoute::Direct
     }
 }
 
@@ -191,6 +231,14 @@ pub fn decode_packed_yuv(d3d_format: u32, macropixel: [u8; 4], odd: bool) -> Opt
         _ => return None,
     };
     Some(yuv_to_rgb8(y, u, v))
+}
+
+/// Whether two half-open regions of one mip level share a texel.
+///
+/// D3D9 clamps every rect to the surface, so `x + w` and `y + h` are bounded
+/// by the 16384 maximum surface dimension and cannot overflow.
+const fn regions_overlap(a: StretchRegion, b: StretchRegion) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
 }
 
 #[cfg(test)]

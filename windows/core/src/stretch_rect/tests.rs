@@ -6,6 +6,11 @@
 //! separate check keeps every `RejectReason` key distinct, which is what makes the
 //! once-per-reason warn fire once per reason rather than collapsing to a single line.
 //!
+//! `same_surface_route` is pinned against the four shapes a within-one-surface copy
+//! takes: disjoint rects that the blit encoder can copy in place, overlapping rects and
+//! scaled rects that have to stage through a scratch texture, and an identical pair that
+//! writes each texel its own value.
+//!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
 //! against reference samples in both the full-range and reduced-range conventions, and
@@ -63,7 +68,6 @@ fn reject_keys_are_distinct() {
         RejectReason::Scaling,
         RejectReason::UnsupportedSource,
         RejectReason::UnsupportedDestination,
-        RejectReason::SameSurface,
     ]
     .iter()
     .map(|r| r.key())
@@ -72,6 +76,77 @@ fn reject_keys_are_distinct() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(keys.len(), sorted.len());
+}
+
+const fn region(x: u32, y: u32, w: u32, h: u32) -> StretchRegion {
+    StretchRegion { x, y, w, h }
+}
+
+#[test]
+fn disjoint_same_surface_rects_copy_in_place() {
+    // Side by side, corner to corner, and touching edges: none of these share
+    // a texel, so the blit encoder can copy inside the one texture.
+    for (src, dst) in [
+        (region(0, 0, 16, 16), region(16, 0, 16, 16)),
+        (region(0, 0, 16, 16), region(0, 16, 16, 16)),
+        (region(0, 0, 16, 16), region(64, 64, 16, 16)),
+        (region(32, 32, 8, 8), region(24, 24, 8, 8)),
+    ] {
+        assert_eq!(
+            same_surface_route(src, dst, 0, 0),
+            SameSurfaceRoute::Direct,
+            "{src:?} -> {dst:?}"
+        );
+    }
+    // Two mip levels are different texels whatever the rects say.
+    assert_eq!(
+        same_surface_route(region(0, 0, 16, 16), region(0, 0, 16, 16), 0, 1),
+        SameSurfaceRoute::Direct
+    );
+}
+
+#[test]
+fn overlapping_same_surface_rects_need_a_scratch() {
+    for (src, dst) in [
+        (region(0, 0, 16, 16), region(8, 0, 16, 16)),
+        (region(0, 0, 16, 16), region(0, 8, 16, 16)),
+        (region(8, 8, 16, 16), region(0, 0, 16, 16)),
+        (region(0, 0, 32, 32), region(8, 8, 32, 32)),
+    ] {
+        assert_eq!(
+            same_surface_route(src, dst, 0, 0),
+            SameSurfaceRoute::Scratch,
+            "{src:?} -> {dst:?}"
+        );
+    }
+}
+
+#[test]
+fn scaled_same_surface_rects_need_a_scratch() {
+    // The render quad cannot sample the texture it draws into, so a size
+    // change stages through a scratch even when the rects are disjoint and
+    // even across mip levels.
+    assert_eq!(
+        same_surface_route(region(0, 0, 32, 32), region(64, 64, 16, 16), 0, 0),
+        SameSurfaceRoute::Scratch
+    );
+    assert_eq!(
+        same_surface_route(region(0, 0, 16, 16), region(0, 0, 32, 16), 0, 1),
+        SameSurfaceRoute::Scratch
+    );
+}
+
+#[test]
+fn identical_same_surface_rects_are_a_no_op() {
+    assert_eq!(
+        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 2, 2),
+        SameSurfaceRoute::Skip
+    );
+    // The same rect at two levels is a real copy, not the no-op.
+    assert_eq!(
+        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 0, 2),
+        SameSurfaceRoute::Direct
+    );
 }
 
 #[test]

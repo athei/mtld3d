@@ -23,6 +23,11 @@ const WHITE: u32 = 0xFFFF_FFFF;
 const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
 
+/// `left`/`top`/`right`/`bottom` in surface coordinates.
+const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
+    D3DRECT { x1, y1, x2, y2 }
+}
+
 /// `ps_3_0 { dcl_2d s0; dcl_texcoord0 v0; texld r0, v0, s0; mov oC0, r0; }`
 ///
 /// Tokens follow the `D3DSHADER_PARAM` layout (bit 31 set; register type split
@@ -749,6 +754,96 @@ fn stretch_rect_accepts_one_to_one_same_format() {
         h.read_pixel(320, 240),
         RED,
         "the copy carries the cleared colour into the backbuffer"
+    );
+}
+
+#[test]
+fn stretch_rect_copies_between_disjoint_rects_of_one_surface() {
+    // D3D9 copies between two rectangles of one surface; titles use it to
+    // scroll or duplicate a UI region. The rects here do not overlap, so the
+    // copy rides the blit encoder inside the single texture.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 64, 64)]),
+        0,
+        "paint the source block"
+    );
+
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(256, 128, 320, 192),
+            D3DTEXF_NONE,
+        ),
+        D3D_OK,
+        "a disjoint copy inside one surface is accepted"
+    );
+    assert_eq!(
+        h.read_pixel(288, 160),
+        RED,
+        "the block reached the destination rect"
+    );
+    assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
+    assert_eq!(
+        h.read_pixel(400, 300),
+        BLACK,
+        "nothing outside the rects moved"
+    );
+}
+
+#[test]
+fn stretch_rect_shifts_an_overlapping_rect_of_one_surface() {
+    // An overlapping copy reads the whole source region before it writes any
+    // of the destination, so both halves of the source land shifted rather
+    // than being smeared by the copy's own writes.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 32, 64)]),
+        0,
+        "paint the source's left half"
+    );
+    assert_eq!(
+        h.clear_target_rects(GREEN, &[rect(32, 0, 64, 64)]),
+        0,
+        "paint the source's right half"
+    );
+
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(32, 0, 96, 64),
+            D3DTEXF_NONE,
+        ),
+        D3D_OK,
+        "an overlapping copy inside one surface is accepted"
+    );
+    assert_eq!(
+        h.read_pixel(16, 32),
+        RED,
+        "the part of the source the destination does not cover keeps its colour"
+    );
+    assert_eq!(
+        h.read_pixel(48, 32),
+        RED,
+        "the source's left half arrives 32 pixels to the right"
+    );
+    assert_eq!(
+        h.read_pixel(80, 32),
+        GREEN,
+        "the source's right half arrives 32 pixels to the right"
+    );
+    assert_eq!(
+        h.read_pixel(100, 32),
+        BLACK,
+        "nothing past the destination rect moved"
     );
 }
 

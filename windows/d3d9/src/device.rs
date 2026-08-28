@@ -6253,6 +6253,21 @@ struct StretchBlitParams {
     filter: u32,
 }
 
+/// Geometry for a `StretchRect` whose source and destination are one texture.
+///
+/// Regions and dimensions are already in the texture's own space; `src_mip`
+/// addresses the source level, while the destination level, format and
+/// surface class come from the accompanying [`StretchSurfaceInfo`].
+struct SameTextureBlitParams {
+    handle: u64,
+    src_region: mtld3d_core::stretch_rect::StretchRegion,
+    dst_region: mtld3d_core::stretch_rect::StretchRegion,
+    src_mip: u32,
+    dst_dims: (u32, u32),
+    render_quad: bool,
+    filter: u32,
+}
+
 /// Encoder-thread body of `StretchRect`.
 ///
 /// Resolves both endpoint handles via the texture cache, then either queues a
@@ -6265,7 +6280,6 @@ fn emit_stretch_rect_blit(
     dst_info: &StretchSurfaceInfo,
     params: &StretchBlitParams,
 ) {
-    use mtld3d_core::stretch_rect::RejectReason;
     use mtld3d_shared::{BlitCommand, CopyTextureSubRectInfo};
 
     let &StretchBlitParams {
@@ -6290,17 +6304,6 @@ fn emit_stretch_rect_blit(
         );
         return;
     }
-    if src_handle == dst_handle {
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: RejectReason::SameSurface.key(),
-            "StretchRect: {} (handle={:#x})",
-            RejectReason::SameSurface.as_str(),
-            src_handle
-        );
-        return;
-    }
-
     // `render.scale` shrinks the back buffer, so an endpoint that *is* the back
     // buffer has both its region and its extent converted; the ratio the blit
     // VS builds from the two is preserved, while the destination rect (which
@@ -6323,6 +6326,22 @@ fn emit_stretch_rect_blit(
     // blit encoder cannot do, so the transport choice is re-made here on the
     // sizes that actually reach Metal.
     let render_quad = render_quad || src_region.w != dst_region.w || src_region.h != dst_region.h;
+    if src_handle == dst_handle {
+        emit_same_texture_stretch(
+            enc,
+            dst_info,
+            &SameTextureBlitParams {
+                handle: src_handle,
+                src_region,
+                dst_region,
+                src_mip: mip_level,
+                dst_dims,
+                render_quad,
+                filter,
+            },
+        );
+        return;
+    }
     if render_quad
         && !dst_info
             .flags
@@ -6441,6 +6460,162 @@ fn emit_stretch_rect_blit(
         dx = dst_region.x, dy = dst_region.y,
         rw = src_region.w, rh = src_region.h,
     );
+}
+
+/// Land a `Clear` still waiting for a pass, then close the pass, before a blit.
+///
+/// D3D9 ordered the clear first, so a copy queued ahead of it would either
+/// read the pre-clear source or be wiped by the clear.
+fn flush_clears_before_stretch(enc: &mut FrameEncoder) {
+    enc.flush_pending_clears();
+    enc.end_current_pass("stretch_rect");
+}
+
+/// Encoder-thread body of a `StretchRect` between two rects of one surface.
+///
+/// D3D9 performs the copy and reads the whole source region before writing any
+/// of the destination, so an overlapping or scaled pair stages through a
+/// scratch texture. Disjoint 1:1 rects, two mip levels included, go straight
+/// through the blit encoder: Metal allows a copy inside a single texture as
+/// long as the two regions do not overlap.
+fn emit_same_texture_stretch(
+    enc: &mut FrameEncoder,
+    dst_info: &StretchSurfaceInfo,
+    params: &SameTextureBlitParams,
+) {
+    use mtld3d_core::stretch_rect::{SameSurfaceRoute, StretchRegion, same_surface_route};
+    use mtld3d_shared::{BlitCommand, CopyTextureSubRectInfo};
+
+    let &SameTextureBlitParams {
+        handle,
+        src_region,
+        dst_region,
+        src_mip,
+        dst_dims,
+        render_quad,
+        filter,
+    } = params;
+    let dst_mip = dst_info.mip_level;
+    let route = same_surface_route(src_region, dst_region, src_mip, dst_mip);
+    if route == SameSurfaceRoute::Skip {
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "StretchRect: source and destination name the same texels of one surface, \
+             so the copy leaves it as it is"
+        );
+        return;
+    }
+    if route == SameSurfaceRoute::Direct {
+        flush_clears_before_stretch(enc);
+        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
+            &CopyTextureSubRectInfo {
+                src_texture: handle,
+                dst_texture: handle,
+                mip_level: src_mip,
+                dst_mip_level: dst_mip,
+                src_origin_x: src_region.x,
+                src_origin_y: src_region.y,
+                dst_origin_x: dst_region.x,
+                dst_origin_y: dst_region.y,
+                region_w: src_region.w,
+                region_h: src_region.h,
+            },
+        ));
+        if dst_info.autogen_texture_id.is_some() {
+            enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
+        }
+        return;
+    }
+    // Device-aware mapping: the scratch has to carry the Metal format the one
+    // texture was actually created with, and the render quad keys its pipeline
+    // and colour attachment off the same value.
+    let Some(format) =
+        crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format())
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "StretchRect: format 0x{:x} unmapped → a copy inside that surface is dropped",
+            dst_info.format
+        );
+        return;
+    };
+    if render_quad
+        && !dst_info
+            .flags
+            .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
+    {
+        // Only reachable under a non-default `render.scale` that rounds a
+        // logically 1:1 pair to two different extents; the render quad would
+        // have to bind a surface that cannot be a colour attachment.
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "StretchRect: a resizing copy inside one non-render-target surface has no Metal \
+             path; the copy is dropped. Set render.scale = 1.0 if this surface's contents matter"
+        );
+        return;
+    }
+    let Some((scratch, scratch_w, scratch_h)) =
+        enc.stretch_scratch_texture(handle, (src_region.w, src_region.h), format)
+    else {
+        return;
+    };
+    flush_clears_before_stretch(enc);
+    enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
+        &CopyTextureSubRectInfo {
+            src_texture: handle,
+            dst_texture: scratch,
+            mip_level: src_mip,
+            dst_mip_level: 0,
+            src_origin_x: src_region.x,
+            src_origin_y: src_region.y,
+            dst_origin_x: 0,
+            dst_origin_y: 0,
+            region_w: src_region.w,
+            region_h: src_region.h,
+        },
+    ));
+    if render_quad {
+        enc.stretch_blit_scaled(
+            &BlitSide {
+                handle: scratch,
+                rect: StretchRegion {
+                    x: 0,
+                    y: 0,
+                    w: src_region.w,
+                    h: src_region.h,
+                },
+                dims: (scratch_w, scratch_h),
+                mip: 0,
+            },
+            &BlitSide {
+                handle,
+                rect: dst_region,
+                dims: dst_dims,
+                mip: dst_mip,
+            },
+            format,
+            mtld3d_core::stretch_rect::blit_decode(dst_info.format),
+            filter,
+        );
+    } else {
+        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
+            &CopyTextureSubRectInfo {
+                src_texture: scratch,
+                dst_texture: handle,
+                mip_level: 0,
+                dst_mip_level: dst_mip,
+                src_origin_x: 0,
+                src_origin_y: 0,
+                dst_origin_x: dst_region.x,
+                dst_origin_y: dst_region.y,
+                region_w: dst_region.w,
+                region_h: dst_region.h,
+            },
+        ));
+    }
+    if dst_info.autogen_texture_id.is_some() {
+        enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
+    }
 }
 
 bitflags::bitflags! {
