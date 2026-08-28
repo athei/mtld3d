@@ -123,7 +123,10 @@ own fallback paths instead of breaking:
 - **Non-solid fill modes** (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
   as the spec allows.
-- Depth→depth StretchRect.
+- **Scaled, sub-rect and format-converting depth→depth StretchRect**: the
+  whole-surface 1:1 copy between two same-format DEFAULT-pool depth-stencil
+  surfaces is implemented; a source or destination rect short of the full
+  surface, a size mismatch, or a differing depth format returns INVALIDCALL.
 
 ### Faster than conformant
 
