@@ -1196,6 +1196,82 @@ fn get_dc_and_lock_rect_on_a_texture_level_exclude_each_other() {
     assert_eq!(surface.unlock_rect(), 0, "UnlockRect");
 }
 
+/// `GetDC` on one level is rejected while another level of the texture is locked.
+///
+/// D3D9 gates `GetDC` on the whole resource: any outstanding map, on any
+/// sub-resource, rejects it. Each level surface is its own shell, so the state
+/// the call reads has to be the parent texture's rather than the shell's.
+#[test]
+fn get_dc_on_a_texture_level_is_rejected_while_another_level_is_locked() {
+    const SIZE: u32 = 8;
+    let sentinel = 0xdead_beef_usize as *mut core::ffi::c_void;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let level0 = tex.surface_level(0);
+
+    {
+        let _locked = tex.lock_rect(1, 0);
+        let (hr, out) = level0.get_dc(sentinel);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "GetDC on level 0 while level 1 is locked must return INVALIDCALL"
+        );
+        assert_eq!(
+            out, sentinel,
+            "a rejected GetDC must not write through the out HDC"
+        );
+    }
+
+    let dc = level0.dc();
+    assert_eq!(
+        dc.release(),
+        0,
+        "the released lock leaves the texture DC-able again"
+    );
+}
+
+/// `IDirect3DTexture9::LockRect` is rejected while a level surface holds a DC.
+///
+/// The DC is taken through a level shell and blocks the whole resource, so both
+/// the texture entry point and another level's surface have to see it. Every
+/// level is lockable again once the DC is released.
+#[test]
+fn texture_lock_rect_is_rejected_while_a_level_holds_a_dc() {
+    const SIZE: u32 = 8;
+    const LEVELS: u32 = 2;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, LEVELS, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let level0 = tex.surface_level(0);
+    let level1 = tex.surface_level(1);
+    let dc = level0.dc();
+
+    for level in 0..LEVELS {
+        let (hr, bits_null) = tex.lock_rect_probe(level, 0);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "LockRect({level}) while the texture holds a DC must return INVALIDCALL"
+        );
+        assert!(
+            !bits_null,
+            "a rejected LockRect must not write through the out D3DLOCKED_RECT"
+        );
+    }
+    let (hr, _) = level1.lock_rect_probe(0);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "another level's surface LockRect must see the DC too"
+    );
+
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+
+    for level in 0..LEVELS {
+        let (hr, bits_null) = tex.lock_rect_probe(level, 0);
+        assert_eq!(hr, 0, "the released DC leaves level {level} lockable again");
+        assert!(!bits_null, "an accepted LockRect maps the level");
+        assert_eq!(tex.unlock_rect(level), 0, "UnlockRect({level})");
+    }
+}
+
 /// `D3DLOCK_DISCARD` on a released default-pool level rewrites it whole.
 ///
 /// DISCARD declares the level's contents dead, so the lock takes the fresh

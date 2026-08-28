@@ -70,19 +70,19 @@ pub enum ImplicitKind {
 ///
 /// Tracks the D3D9 per-resource map bookkeeping: an outstanding-map count plus
 /// a DC-in-use flag. Stored on a `SurfaceInner` for a standalone surface (a
-/// single-"face" resource) and on a `TextureInner` for a cube map's six face
-/// shells, which share one per-resource state — D3D9 gates `GetDC` against the
-/// *whole* cube while still permitting two distinct faces to be
-/// `LockRect`-mapped at once.
+/// single-sub-resource resource) and on a `TextureInner` for every shell a
+/// texture hands out, which share one per-resource state — D3D9 gates `GetDC`
+/// against the *whole* texture while still permitting two distinct levels or
+/// faces to be `LockRect`-mapped at once.
 ///
-/// The per-face lock flag (`SurfaceInner::mapped`, the D3D9 per-sub-resource
-/// map count) lives on each surface; this struct holds only the
-/// resource-wide pieces:
-/// * `map_count` — number of outstanding face locks **plus** an outstanding DC.
-///   `GetDC` is rejected whenever it is non-zero.
+/// The per-sub-resource lock flag (`SurfaceFlags::MAPPED` for a standalone
+/// surface, the parent texture's own per-level / per-face flag for a shell)
+/// lives elsewhere; this struct holds only the resource-wide pieces:
+/// * `map_count` — number of outstanding standalone-surface locks **plus** an
+///   outstanding DC. `GetDC` is rejected whenever it is non-zero.
 /// * `dc_in_use` — a `GetDC` is outstanding somewhere on the resource. Blocks
-///   every `LockRect`, and turns an `UnlockRect` of an unmapped face into a
-///   no-op success (the D3D9 behavior the conformance test asserts).
+///   every `LockRect`, and turns an `UnlockRect` of an unmapped sub-resource
+///   into a no-op success (the D3D9 behavior the conformance test asserts).
 /// * `held_dc` — the GDI objects of that outstanding `GetDC`.
 pub struct DcLockState {
     map_count: u32,
@@ -101,6 +101,11 @@ impl Default for DcLockState {
 }
 
 impl DcLockState {
+    /// Whether a `GetDC` is outstanding somewhere on the resource.
+    pub const fn dc_in_use(&self) -> bool {
+        self.dc_in_use
+    }
+
     /// Tear down any GDI objects of an outstanding `GetDC` and reset to the unlocked state.
     ///
     /// Called at resource teardown (a cube texture finalizing with a face's DC
@@ -324,6 +329,9 @@ impl Direct3DSurface9 {
     /// hands the same object back on every call for that level, so
     /// `Release`-to-zero leaves the wrapper alive and only
     /// `finalize_texture` frees it. See [`SurfaceFlags::CONTAINER_CACHED`].
+    /// The owning texture is recorded twice, as `parent_texture` and as
+    /// `state_owner_texture`, so every level of one texture shares the
+    /// resource-wide lock/DC state D3D9 gates `GetDC` and `LockRect` on.
     pub fn new_texture_backed(
         device_inner: *mut DeviceInner,
         parent_texture: *mut Direct3DTexture9,
@@ -350,7 +358,7 @@ impl Direct3DSurface9 {
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
-            state_owner_texture: core::ptr::null_mut(),
+            state_owner_texture: parent_texture,
             implicit_kind: ImplicitKind::None,
             container: 0,
         }));
@@ -606,8 +614,8 @@ impl Direct3DSurface9 {
     ///
     /// D3D9 counts a held device context as a map of the surface, so a caller
     /// that rejects a mapped endpoint rejects one with an open DC too. For a
-    /// cube-map face the state is the whole cube's, matching the way `GetDC`
-    /// itself gates the six faces together.
+    /// texture level or a cube face the state is the whole texture's, matching
+    /// the way `GetDC` itself gates every sub-resource together.
     pub fn has_open_dc(&self) -> bool {
         // SAFETY: `self.inner` is this wrapper's live `SurfaceInner`; D3D9
         // objects are single-threaded, so the exclusive reborrow is sound.
@@ -967,9 +975,10 @@ struct SurfaceInner {
     container: u64,
     /// Resource-wide `LockRect`/`GetDC` state for this surface alone (see [`DcLockState`]).
     ///
-    /// For a cube-map face the *effective* resource-wide state lives on the
-    /// owning cube texture (`state_owner_texture`) and this field is unused;
-    /// the `MAPPED` flag is always this surface's own per-face flag.
+    /// For a texture level or a cube face the *effective* resource-wide state
+    /// lives on the owning texture (`state_owner_texture`) and this field is
+    /// unused; the `MAPPED` flag is always this surface's own per-sub-resource
+    /// flag.
     dc_lock: DcLockState,
     /// `D3DLOCK_*` flags captured by the most recent successful `LockRect`.
     ///
@@ -978,17 +987,19 @@ struct SurfaceInner {
     /// upload on unlock (the staging was filled by a read-back, never written,
     /// so re-uploading it would clobber the rendered pixels). `0` otherwise.
     lock_flags: u32,
-    /// Non-null for a cube-map face shell, where it equals `parent_texture`.
+    /// Non-null for a container-cached texture shell, where it equals `parent_texture`.
     ///
-    /// The owning cube `Direct3DTexture9`, whose `TextureInner` carries the
-    /// per-resource lock/DC state shared by all six faces (D3D9 gates the whole
-    /// cube, not the individual face). A face is constructed with both this
-    /// field and `parent_texture` pointing at that cube, so neither is ever null
-    /// alone. The cube outlives the face: each reference `GetCubeMapSurface`
-    /// takes on it is dropped by the container forwarding in `surface_release`,
-    /// and the face itself is freed from inside the cube's own teardown
-    /// (`finalize_texture`), so nothing is released here on the face's behalf.
-    /// Null for every other surface.
+    /// The owning `Direct3DTexture9`, whose `TextureInner` carries the
+    /// per-resource lock/DC state every shell of it shares (D3D9 gates the
+    /// whole texture, not the individual level or face). Such a shell is
+    /// constructed with both this field and `parent_texture` pointing at that
+    /// texture, so neither is ever null alone. The texture outlives the shell:
+    /// each reference `GetSurfaceLevel` / `GetCubeMapSurface` takes on it is
+    /// dropped by the container forwarding in `surface_release`, and the shell
+    /// itself is freed from inside the texture's own teardown
+    /// (`finalize_texture`), so nothing is released here on its behalf. Null for
+    /// every other surface, including the offscreen plain that owns a private
+    /// backing texture no second shell can reach.
     state_owner_texture: *mut Direct3DTexture9,
 }
 
@@ -1014,18 +1025,18 @@ impl GdiDc {
 impl SurfaceInner {
     /// Raw pointer to the effective resource-wide `DcLockState` for this surface.
     ///
-    /// The owning cube texture's shared state for a cube-map face, else this
+    /// The owning texture's shared state for a level or face shell, else this
     /// surface's own. Returned as a raw pointer so a caller can hold it
-    /// alongside a borrow of this surface's own `mapped` flag (they live in
-    /// separate allocations for a cube face, and the same one otherwise).
+    /// alongside a borrow of this surface's own `MAPPED` flag (they live in
+    /// separate allocations for a shell, and the same one otherwise).
     fn dc_lock_ptr(&mut self) -> *mut DcLockState {
         if self.state_owner_texture.is_null() {
             return &raw mut self.dc_lock;
         }
-        // SAFETY: `state_owner_texture` is the owning cube `Direct3DTexture9`,
-        // which outlives every face it hands out (a face is freed only from
-        // inside the cube's own teardown); D3D9 objects are single-threaded so
-        // the exclusive borrow of its inner state is sound for this call.
+        // SAFETY: `state_owner_texture` is the owning `Direct3DTexture9`, which
+        // outlives every shell it hands out (a shell is freed only from inside
+        // the texture's own teardown); D3D9 objects are single-threaded so the
+        // exclusive borrow of its inner state is sound for this call.
         let tex = unsafe { &*self.state_owner_texture };
         tex.dc_lock_state_ptr()
     }
@@ -1043,7 +1054,7 @@ impl SurfaceInner {
         // locking the face INVALIDCALL. Checked before this surface records
         // anything, so a rejected lock leaves the per-face flag and the shared
         // map count untouched.
-        if !self.state_owner_texture.is_null() {
+        if self.cube_face != u32::MAX && !self.state_owner_texture.is_null() {
             // SAFETY: `state_owner_texture` is the owning cube texture, set at
             // construction and outliving the face; single-threaded access is sound.
             let cube = unsafe { &*self.state_owner_texture };
@@ -1373,14 +1384,14 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         unsafe { &mut *inner.device_inner }
             .push_op(Box::new(move |enc| enc.retire_depth_target(depth)));
     }
-    // A cube face has nothing of the cube to give back here. The reference
-    // `GetCubeMapSurface` took on it is dropped by the container forwarding in
-    // `surface_release`, and the face's DC lives on the shared cube state, torn
-    // down when the cube itself finalizes. A face only ever reaches this point
-    // from inside that teardown (`finalize_texture` calls
-    // `finalize_cached_surface` with the cube's inner state borrowed and about
-    // to be freed), so calling back into the cube from here would re-enter an
-    // object mid-teardown.
+    // A texture shell has nothing of the texture to give back here. The
+    // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by
+    // the container forwarding in `surface_release`, and the shell's DC lives on
+    // the shared texture state, torn down when the texture itself finalizes. A
+    // shell only ever reaches this point from inside that teardown
+    // (`finalize_texture` calls `finalize_cached_surface` with the texture's
+    // inner state borrowed and about to be freed), so calling back into the
+    // texture from here would re-enter an object mid-teardown.
     if inner.state_owner_texture.is_null() {
         // A standalone surface released while a `GetDC` is still outstanding
         // (the app skipped `ReleaseDC`) would leak its memory DC + DIB; tear
@@ -1876,9 +1887,9 @@ extern "system" fn surface_lock_rect(
         return D3DERR_INVALIDCALL;
     };
     // A surface lock and an outstanding GDI DC are mutually exclusive: reject a
-    // `LockRect` while a `GetDC` is held anywhere on the resource (for a cube
-    // map, on any face). The systemmem path additionally tracks the per-face
-    // map flag in `systemmem_lock_rect` via `try_begin_lock`.
+    // `LockRect` while a `GetDC` is held anywhere on the resource (for a
+    // texture, on any level or face). The systemmem path additionally tracks the
+    // per-sub-resource map flag in `systemmem_lock_rect` via `try_begin_lock`.
     // SAFETY: `obj.inner` is the live `SurfaceInner`; surfaces are
     // single-threaded so the transient exclusive borrow is sound.
     let inner_mut = unsafe { &mut *obj.inner };
@@ -2917,12 +2928,15 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // A failed `GetDC` must leave the caller's out-`HDC` slot untouched, so
     // every reject below returns before writing through `hdc`.
     // `GetDC` is INVALIDCALL while any lock OR a DC is outstanding on the
-    // resource (`map_count != 0`). For a cube-map face this is the shared cube
-    // map count, so a lock on any sibling face blocks it too.
+    // resource (`map_count != 0`). A texture shell's own lock is recorded on the
+    // parent, per sub-resource, so the whole texture is consulted: a lock on any
+    // sibling level or face blocks the call too.
     if !inner.state_owner_texture.is_null() {
-        // SAFETY: the face surface holds a reference on its live parent cube.
-        let cube = unsafe { &*inner.state_owner_texture };
-        if cube.inner().cube_any_locked() {
+        // SAFETY: the shell holds a reference on its live parent texture.
+        let texture = unsafe { &*inner.state_owner_texture };
+        if texture.inner().any_subresource_locked() {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "IDirect3DSurface9::GetDC while a LockRect on the texture is outstanding → INVALIDCALL");
             return D3DERR_INVALIDCALL;
         }
     }
