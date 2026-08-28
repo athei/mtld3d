@@ -239,6 +239,7 @@ impl DeviceInner {
                         dst_ptr: buf.as_mut_ptr() as u64,
                         dst_len: len as u64,
                         level: 0,
+                        slice: 0,
                         width: t.width,
                         height: t.height,
                         bytes_per_row,

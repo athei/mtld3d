@@ -6021,7 +6021,8 @@ extern "system" fn device_get_render_target_data(
             obj.inner(),
             &SystemMemReadback::for_readback(
                 src_handle,
-                0,
+                // A standalone colour surface is one image: mip 0, slice 0.
+                (0, 0),
                 (source.width, source.height),
                 &dst_desc,
             ),
@@ -6064,7 +6065,11 @@ fn readback_from_texture_rt(
         warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
         return D3DERR_INVALIDCALL;
     };
+    // The surface names one subresource of the parent texture: a cube face
+    // rides the Metal array slice, a `GetSurfaceLevel` / `GetCubeMapSurface`
+    // level the mip.
     let level = src.mip_level();
+    let slice = src.cube_face().unwrap_or(0);
     let ti = tex.inner();
     let source = ReadbackSource {
         width: ti.mip_width(level as usize),
@@ -6099,7 +6104,7 @@ fn readback_from_texture_rt(
             // SAFETY: `h` is non-zero (checked above) and a live retained
             // MTLTexture handle from the encoder texture cache.
             unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-            level,
+            (level, slice),
             // The texture's own logical extent, which the mip extent above is
             // measured against.
             (ti.mip_width(0), ti.mip_height(0)),
@@ -6141,7 +6146,8 @@ extern "system" fn device_get_front_buffer_data(
         device_inner,
         &SystemMemReadback::for_readback(
             device_inner.backbuffer_handle,
-            0,
+            // The back-buffer texture is one image: mip 0, slice 0.
+            (0, 0),
             (source.width, source.height),
             &dst_desc,
         ),
@@ -6171,9 +6177,9 @@ fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemRea
 /// Parameters for one synchronous read of a Metal texture into system memory.
 ///
 /// The read starts at the texture's origin and covers `width` x `height` of mip
-/// `level`, so the extent belongs to that mip. `full_width` / `full_height` are
-/// the texture's own logical extent instead, which is what the source is
-/// measured against on the way out.
+/// `level` in array slice `slice`, so the extent belongs to that mip.
+/// `full_width` / `full_height` are the texture's own logical extent instead,
+/// which is what the source is measured against on the way out.
 pub struct SystemMemReadback {
     pub tex_handle: MetalHandle<MTLTextureKind>,
     /// Page-aligned PE-addressable destination.
@@ -6181,6 +6187,11 @@ pub struct SystemMemReadback {
     /// Page-multiple length of `dst_ptr`.
     pub dst_len: u64,
     pub level: u32,
+    /// Array slice the read addresses within the texture.
+    ///
+    /// A cube face index for a cube-backed source, zero for every other class,
+    /// none of which carries a second slice.
+    pub slice: u32,
     pub width: u32,
     pub height: u32,
     pub bytes_per_row: u32,
@@ -6203,10 +6214,10 @@ impl SystemMemReadback {
     /// their extents agree there, so the whole image is one region and the
     /// destination's own row stride carries it. `full_width` / `full_height`
     /// are the source texture's logical extent, which `level` is measured
-    /// against.
+    /// against. `subresource` is the `(level, slice)` the source surface names.
     const fn for_readback(
         tex_handle: MetalHandle<MTLTextureKind>,
-        level: u32,
+        (level, slice): (u32, u32),
         (full_width, full_height): (u32, u32),
         dst: &SystemMemoryDst,
     ) -> Self {
@@ -6215,6 +6226,7 @@ impl SystemMemReadback {
             dst_ptr: dst.ptr,
             dst_len: dst.len,
             level,
+            slice,
             width: dst.width,
             height: dst.height,
             bytes_per_row: dst.bytes_per_row,
@@ -6238,9 +6250,7 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         dst_ptr: read.dst_ptr,
         dst_len: read.dst_len,
         mip_level: read.level,
-        // Every readback routed through here reads a standalone colour texture
-        // or a 2D texture level, neither of which carries a second array slice.
-        slice: 0,
+        slice: read.slice,
         origin_x: 0,
         origin_y: 0,
         width: read.width,
