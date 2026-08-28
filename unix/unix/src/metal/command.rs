@@ -1687,10 +1687,9 @@ fn encode_leading_blits(
                 };
                 // Source origin lives in `origin_x`/`origin_y`;
                 // destination origin is packed into `dst_offset` as
-                // `(dst_y as u64) << 32 | dst_x as u64`, and the
-                // destination cube face in `dst_slice`. Full-mip
-                // preserve sets all of these to 0, so existing callers
-                // are unaffected.
+                // `(dst_y as u64) << 32 | dst_x as u64`, and the cube
+                // face at each end in `src_slice` / `dst_slice`. A
+                // full-mip preserve leaves all of these 0.
                 let dst_x = (cmd.dst_offset & 0xFFFF_FFFF) as usize;
                 let dst_y = ((cmd.dst_offset >> 32) & 0xFFFF_FFFF) as usize;
                 let src_endpoint = CopyEndpoint {
@@ -1743,7 +1742,7 @@ fn encode_leading_blits(
                 unsafe {
                     blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         &src,
-                        0,
+                        cmd.src_slice as usize,
                         cmd.mip_level as usize,
                         MTLOrigin {
                             x: cmd.origin_x as usize,

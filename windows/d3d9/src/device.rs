@@ -6943,6 +6943,7 @@ fn emit_stretch_rect_blit(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                src_slice: src_info.slice.unwrap_or(0),
                 dst_slice: dst_info.slice.unwrap_or(0),
                 region_w,
                 region_h,
@@ -7017,6 +7018,7 @@ fn emit_stretch_rect_blit(
             src_origin_y: src_region.y,
             dst_origin_x: dst_region.x,
             dst_origin_y: dst_region.y,
+            src_slice: src_info.slice.unwrap_or(0),
             dst_slice: dst_info.slice.unwrap_or(0),
             region_w: src_region.w,
             region_h: src_region.h,
@@ -7075,9 +7077,10 @@ fn emit_same_texture_stretch(
         filter,
     } = params;
     let dst_mip = dst_info.mip_level;
-    // Both endpoints are one texture and the copy names no source slice, so it
-    // stays on slice 0: a cube whose two surfaces name different faces needs
-    // the source slice on the wire before this path can address a face.
+    // Both endpoints are one texture and this path pins both slices to 0: the
+    // route below is picked from the two rects and the two mip levels alone,
+    // so a cube whose two surfaces name different faces has no face to route
+    // on.
     if dst_info.slice.is_some_and(|face| face != 0) {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
@@ -7106,6 +7109,7 @@ fn emit_same_texture_stretch(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                src_slice: 0,
                 dst_slice: 0,
                 region_w: src_region.w,
                 region_h: src_region.h,
@@ -7160,6 +7164,7 @@ fn emit_same_texture_stretch(
             src_origin_y: src_region.y,
             dst_origin_x: 0,
             dst_origin_y: 0,
+            src_slice: 0,
             dst_slice: 0,
             region_w: src_region.w,
             region_h: src_region.h,
@@ -7207,6 +7212,7 @@ fn emit_same_texture_stretch(
                 src_origin_y: 0,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                src_slice: 0,
                 dst_slice: 0,
                 region_w: dst_region.w,
                 region_h: dst_region.h,

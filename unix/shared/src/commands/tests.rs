@@ -4,8 +4,9 @@
 //! two-sided contract. Among those built and read back here: index count, index type and instance
 //! count share `param_d`, index offset and signed base vertex share `param_c`, and a blit
 //! destination folds its slice or its origin into `BlitCommand::dst_offset`, and a
-//! texture-to-texture copy names its destination slice in `dst_slice`. One test asserts
-//! `BlitCommand`'s 8-byte alignment and 88-byte size at run time; a layout change fails that test.
+//! texture-to-texture copy names the cube face at each end in `src_slice` / `dst_slice`. One test
+//! asserts `BlitCommand`'s 8-byte alignment and 96-byte size at run time; a layout change fails
+//! that test.
 
 use super::*;
 
@@ -114,8 +115,9 @@ fn blit_command_layout_matches_wow64() {
     // 4 cmd + 4 mip_level + 8 src_handle + 8 dst_handle + 8
     // src_offset + 8 bytes_per_row + 4 origin_x + 4 origin_y +
     // 4 region_w + 4 region_h + 8 dst_offset + 8 byte_size +
-    // 4 depth + 4 bytes_per_image + 4 dst_mip_level + 4 pad0 = 88
-    assert_eq!(core::mem::size_of::<BlitCommand>(), 88);
+    // 4 depth + 4 bytes_per_image + 4 dst_mip_level + 4 dst_slice +
+    // 4 src_slice + 4 tail padding = 96
+    assert_eq!(core::mem::size_of::<BlitCommand>(), 96);
 }
 
 #[test]
@@ -183,7 +185,7 @@ fn cube_upload_packs_face_into_existing_destination_offset() {
         bytes_per_image: 64,
     });
     assert_eq!(cmd.dst_offset, 5);
-    assert_eq!(core::mem::size_of_val(&cmd), 88);
+    assert_eq!(core::mem::size_of_val(&cmd), 96);
 }
 
 #[test]
@@ -257,6 +259,7 @@ fn copy_texture_to_texture_sub_rect_packs_dst_origin() {
         dst_texture: 0xBBBB,
         mip_level: 2,
         dst_mip_level: 1,
+        src_slice: 4,
         dst_slice: 3,
         src_origin_x: 16,
         src_origin_y: 32,
@@ -274,6 +277,7 @@ fn copy_texture_to_texture_sub_rect_packs_dst_origin() {
         cmd.dst_slice, 3,
         "the destination cube face rides its own field"
     );
+    assert_eq!(cmd.src_slice, 4, "and so does the source cube face");
     assert_eq!(cmd.origin_x, 16);
     assert_eq!(cmd.origin_y, 32);
     assert_eq!(cmd.region_w, 64);
