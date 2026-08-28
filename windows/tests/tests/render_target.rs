@@ -1881,14 +1881,18 @@ fn stretch_rect_decodes_packed_yuv_into_the_backbuffer() {
             D3D_OK,
             "StretchRect {name} {input:#010x} onto the backbuffer"
         );
+        // Each source pixel covers a 160 px band of the target; probe the
+        // middle of the first two so a reading stays clear of the colour
+        // boundary between them, where a resolved frame drifts further than
+        // the convention tolerance allows.
         assert_rgb_close(
-            h.read_pixel(1, 240),
+            h.read_pixel(80, 240),
             left,
             18,
             &format!("{name} {input:#010x} pixel 0"),
         );
         assert_rgb_close(
-            h.read_pixel(318, 240),
+            h.read_pixel(240, 240),
             right,
             18,
             &format!("{name} {input:#010x} pixel 1"),

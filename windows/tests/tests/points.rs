@@ -6,8 +6,21 @@
 //! attenuated by eye distance; `D3DRS_POINTSPRITEENABLE` textures the square
 //! as a whole quad. Every test draws one point at the screen centre and reads
 //! pixels at known offsets from it.
+//!
+//! A point's extent is the one thing this suite asserts at single-pixel
+//! resolution, which `render.scale` meets in two ways. A probe a few pixels
+//! from a square's edge picks up a level or two from the resolve that brings a
+//! smaller frame back up to the reported resolution, so it compares within
+//! `RESOLVE_TOLERANCE` there. A probe that straddles an edge, or one on a
+//! one-pixel point, reads the resolve rather than the rasterizer, so it asserts
+//! at the default scale alone (`render_scale_is_identity`). Each square's
+//! extent is checked at every scale either way, which is what pins the point
+//! size to the reported space.
 
-use mtld3d_tests::{Harness, PosColorVertex, PosVertex, TexturedVertex};
+use mtld3d_tests::{
+    Harness, PosColorVertex, PosVertex, TexturedVertex, assert_pixel_approx, assert_pixel_eq,
+    render_scale_is_identity,
+};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_PSIZE, D3DFVF_TEX1,
     D3DFVF_XYZ, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRS_POINTSCALE_A,
@@ -52,12 +65,40 @@ const fn centre_point() -> [PosColorVertex; 1] {
     }]
 }
 
+/// Levels of slack an extent probe allows once the frame is resolved.
+///
+/// A probe sits two to four pixels from the square's edge, which is inside the
+/// reach of the resolve that brings a reduced `render.scale` back up to the
+/// reported resolution: the readings drift by a level or two there. A point
+/// left at its reported size in render pixels is `1 / scale` too wide instead,
+/// which puts a whole channel between the reading and the expectation, so the
+/// slack costs the probes nothing they were pinning.
+const RESOLVE_TOLERANCE: u8 = 8;
+
+/// Compare one extent probe against the colour the square implies.
+///
+/// Exact at the default scale, within [`RESOLVE_TOLERANCE`] under a reduced
+/// one.
+fn assert_extent_probe(actual: u32, expected: u32, what: &str) {
+    if render_scale_is_identity() {
+        assert_pixel_eq(actual, expected, what);
+    } else {
+        assert_pixel_approx(actual, expected, RESOLVE_TOLERANCE, what);
+    }
+}
+
 /// Draw one green point at the centre and assert the square it covers.
 ///
 /// `inside` is an offset (in pixels, along both axes) that must be green and
 /// `outside` one that must still be background. Offsets stay a few pixels
 /// away from the square's edge so the centre's half-pixel placement does not
 /// matter.
+///
+/// An `inside` of zero means a one-pixel point, whose every probe is the
+/// centre pixel and therefore a colour boundary in each direction. That is the
+/// one extent a resolved frame cannot reproduce at all (a point that small is
+/// sub-pixel once the frame rasterizes smaller), so the draw still runs at a
+/// reduced `render.scale` and only its probes are left to the default scale.
 fn assert_point_extent(h: &Harness, inside: u32, outside: u32, what: &str) {
     h.render_once(BLACK, |d| {
         assert_eq!(
@@ -66,26 +107,29 @@ fn assert_point_extent(h: &Harness, inside: u32, outside: u32, what: &str) {
             "POINTLIST draws"
         );
     });
-    assert_eq!(h.read_pixel(CX, CY), GREEN, "{what}: centre");
-    assert_eq!(
+    if inside == 0 && !render_scale_is_identity() {
+        return;
+    }
+    assert_extent_probe(h.read_pixel(CX, CY), GREEN, &format!("{what}: centre"));
+    assert_extent_probe(
         h.read_pixel(CX + inside, CY + inside),
         GREEN,
-        "{what}: {inside} px inside the square"
+        &format!("{what}: {inside} px inside the square"),
     );
-    assert_eq!(
+    assert_extent_probe(
         h.read_pixel(CX - inside, CY - inside),
         GREEN,
-        "{what}: {inside} px inside the square (other corner)"
+        &format!("{what}: {inside} px inside the square (other corner)"),
     );
-    assert_eq!(
+    assert_extent_probe(
         h.read_pixel(CX + outside, CY),
         BLACK,
-        "{what}: {outside} px right of the square"
+        &format!("{what}: {outside} px right of the square"),
     );
-    assert_eq!(
+    assert_extent_probe(
         h.read_pixel(CX, CY - outside),
         BLACK,
-        "{what}: {outside} px above the square"
+        &format!("{what}: {outside} px above the square"),
     );
 }
 
@@ -140,6 +184,11 @@ fn untextured_xyz_point_under_an_ortho_projection_covers_its_pixels() {
     h.render_once(BLUE, |d| {
         assert_eq!(d.draw_primitive_up(D3DPT_POINTLIST, 1, &point), 0);
     });
+    // The probes sit one pixel either side of the square's edge, which is
+    // single-pixel resolution: see `render_scale_is_identity`.
+    if !render_scale_is_identity() {
+        return;
+    }
     for (x, y) in [
         (64 + 7, 64),
         (64 - 7, 64),
@@ -219,6 +268,12 @@ fn several_point_sizes_in_one_scene_each_keep_their_own() {
     set_float_rs(&h, D3DRS_POINTSIZE, 1.0);
     assert_eq!(h.draw_primitive_up(D3DPT_POINTLIST, 1, &at(320.0)), 0);
     assert_eq!(h.end_scene(), 0, "EndScene");
+    // Every probe below is one pixel either side of a square's edge, and the
+    // last point is one pixel wide: single-pixel resolution, which only the
+    // default scale reproduces (see `render_scale_is_identity`).
+    if !render_scale_is_identity() {
+        return;
+    }
     // (x, half-extent r): white out to r, blue from r + 1.
     for (x, r) in [(64u32, 7u32), (128, 15), (192, 15), (256, 31), (320, 0)] {
         for (px, py) in [(x + r, 64), (x - r, 64), (x, 64 + r), (x, 64 - r)] {

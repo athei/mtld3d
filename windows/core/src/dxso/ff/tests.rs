@@ -1204,3 +1204,41 @@ fn ff_transform_emits_half_pixel_pos_fixup() {
         "FF transform must apply the half-pixel pos_fixup epilogue:\n{msl}"
     );
 }
+
+#[test]
+fn ff_point_size_converts_the_clamped_size_to_render_pixels() {
+    // D3D9 states every point size in the resolution it reports, so the
+    // POINTSIZE_MIN/MAX clamp runs there and the result converts once, by
+    // `pos_fixup.w`, into the render pixels `[[point_size]]` is measured in.
+    let mut vs = default_vs_key();
+    for flags in [
+        vs.flags,
+        vs.flags | FfVsFlags::HAS_PSIZE,
+        vs.flags | FfVsFlags::HAS_RHW,
+    ] {
+        vs.flags = flags;
+        let msl = emit_vs_ff(&vs);
+        assert!(
+            msl.contains(
+                "out.point_size = clamp(psize, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;"
+            ),
+            "FF VS must convert the clamped point size to render pixels:\n{msl}"
+        );
+    }
+}
+
+#[test]
+fn ff_point_scale_measures_the_viewport_height_in_reported_pixels() {
+    // The attenuation factor is `Vh * Si / sqrt(A + B*De + C*De^2)` with `Vh`
+    // the viewport height D3D9 reports. `pos_fixup.y` carries the reciprocal
+    // of the height in the bound target's own space, so dividing by
+    // `pos_fixup.w` takes it back to the reported one and the epilogue's
+    // single conversion stays the only one.
+    let mut vs = default_vs_key();
+    vs.flags |= FfVsFlags::POINT_SCALE;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("psize *= ((-1.0 / pos_fixup.y) / pos_fixup.w) / sqrt(max("),
+        "FF point scale must read the viewport height in reported pixels:\n{msl}"
+    );
+}

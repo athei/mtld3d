@@ -14,12 +14,18 @@
 //! is a flat block several pixels from any colour boundary, where an edge-aware
 //! upscale reproduces the source colour exactly. Sampling *on* a boundary would
 //! be scale-dependent by construction, so the probes stay away from them.
+//!
+//! One test sets `render.scale` itself instead of inheriting the run's, because
+//! the quantity it covers (a point's rasterized diameter) converts between the
+//! two spaces rather than staying in one, so a run at the default scale would
+//! not exercise the conversion at all.
 
 use mtld3d_tests::{Harness, PosColorVertex, assert_pixel_eq};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
-    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DVIEWPORT9,
+    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
+    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -416,4 +422,64 @@ fn reset_resize_keeps_reported_coordinates() {
         "inside the post-resize scissor",
     );
     assert_pixel_eq(h.read_pixel(700, 500), BLUE, "grown area, outside scissor");
+}
+
+/// A point's diameter is a length D3D9 states in the reported space.
+///
+/// Every other primitive gets its extent from vertex positions, which the
+/// projection already carries into whatever space the frame rasterizes in. A
+/// point takes a diameter in pixels instead, and `[[point_size]]` is measured
+/// in the pixels actually rasterized, so the size has to convert on the way
+/// down or a point keeps its reported diameter in render pixels and comes back
+/// `1 / scale` too wide.
+///
+/// Pins its own scale (a clean half, so the conversion is exact) rather than
+/// inheriting the run's: at the identity the conversion is unobservable, and
+/// this must fail in the ordinary `make test` if it regresses.
+#[test]
+fn a_point_keeps_its_reported_diameter_under_the_scale() {
+    // The harness process owns its environment and no other thread runs yet;
+    // extend the suite-wide config with the scale under test. The parser keeps
+    // the last segment, so this wins over a `make test SCALE=<n>` run too.
+    let merged = format!(
+        "{};render.scale=0.5",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness
+    // and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    // 64 is `POINTSIZE_MAX`'s default, so nothing clamps it: the square spans
+    // 32 reported pixels either side of the centre, and every probe below sits
+    // 8 pixels clear of that edge.
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 64.0_f32.to_bits()),
+        0,
+        "SetRenderState(POINTSIZE)"
+    );
+    let point = [PosColorVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.5,
+        color: GREEN,
+    }];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_POINTLIST, 1, &point),
+            0,
+            "POINTLIST draws"
+        );
+    });
+
+    assert_pixel_eq(h.read_pixel(320, 240), GREEN, "the point's centre");
+    assert_pixel_eq(h.read_pixel(344, 264), GREEN, "24 px inside the square");
+    assert_pixel_eq(h.read_pixel(296, 216), GREEN, "the opposite corner");
+    // 40 px out is background for a 64 px square and inside a 128 px one, so
+    // an unconverted size fails here.
+    assert_pixel_eq(h.read_pixel(360, 240), BLACK, "40 px right of the square");
+    assert_pixel_eq(h.read_pixel(320, 200), BLACK, "40 px above the square");
 }

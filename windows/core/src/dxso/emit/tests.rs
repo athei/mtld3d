@@ -2441,7 +2441,7 @@ fn vs_writing_psize_via_opts_routes_through_storage_local() {
     );
     assert!(
         vs_msl.contains(
-            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);"
+            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;"
         ),
         "VS epilogue must extract scalar point size from storage:\n{vs_msl}"
     );
@@ -2477,7 +2477,7 @@ fn sm3_vs_writing_psize_via_dcl_routes_through_storage_local() {
     );
     assert!(
         vs_msl.contains(
-            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z);"
+            "out.point_size = clamp(_psize_storage.x, vs_draw.point.y, vs_draw.point.z) * pos_fixup.w;"
         ),
         "VS epilogue must extract scalar point size:\n{vs_msl}"
     );

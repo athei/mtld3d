@@ -15,7 +15,7 @@ mod vertex;
 mod vtbl;
 mod win32;
 
-pub use harness::{DrawIndexedUpParams, Harness, HarnessConfig};
+pub use harness::{DrawIndexedUpParams, Harness, HarnessConfig, render_scale_is_identity};
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
 pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
