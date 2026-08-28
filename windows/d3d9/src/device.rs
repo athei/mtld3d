@@ -5143,6 +5143,25 @@ extern "system" fn device_create_depth_stencil_surface(
     D3D_OK
 }
 
+/// Force the next draw to re-walk stage bindings after a staging write to `tex`.
+///
+/// Bind-time `flush_dirty_mips` only runs while the API thread rebuilds a
+/// dirty snapshot, so a write that lands in a texture's staging between two
+/// draws over otherwise-clean state has to dirty the snapshot itself or its
+/// upload is never scheduled and the next draw samples the old texels. The
+/// mark is deliberately coarse and does not ask whether the texture is bound:
+/// a redundant snapshot re-emit dedups at the encoder.
+fn schedule_staging_upload_at_next_bind(tex: &crate::texture::Direct3DTexture9) {
+    let device_inner_ptr = tex.inner().device_inner();
+    if device_inner_ptr != 0 {
+        // SAFETY: live `DeviceInner*` recorded at the texture's create; the
+        // device outlives every texture it owns (textures hold a device
+        // refcount via their COM ABI).
+        let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
+        dev.mark_snapshot_dirty_all();
+    }
+}
+
 /// Shared system-memory → default-pool staging-copy tail for `UpdateSurface` / `UpdateTexture`.
 ///
 /// `src_parent` and
@@ -5175,12 +5194,7 @@ fn copy_systemmem_to_default(
     if hr != D3D_OK {
         return hr;
     }
-    let device_inner_ptr = dst_tex.inner().device_inner();
-    if device_inner_ptr != 0 {
-        // SAFETY: live `DeviceInner*` recorded at the destination texture's create.
-        let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
-        dev.mark_snapshot_dirty_all();
-    }
+    schedule_staging_upload_at_next_bind(dst_tex);
     D3D_OK
 }
 
@@ -5266,7 +5280,11 @@ extern "system" fn device_update_surface(
             tex.inner_mut()
                 .copy_bytes_to_staging_region(dst_level, &image, rect, point)
         };
-        return if copied { D3D_OK } else { D3DERR_INVALIDCALL };
+        if !copied {
+            return D3DERR_INVALIDCALL;
+        }
+        schedule_staging_upload_at_next_bind(tex);
+        return D3D_OK;
     }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
         return D3DERR_INVALIDCALL;
