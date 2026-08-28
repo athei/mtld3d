@@ -7211,9 +7211,9 @@ struct StretchSurfaceInfo {
     flags: StretchSurfaceFlags,
     /// `Some(texture id)` when the backing texture carries `D3DUSAGE_AUTOGENMIPMAP`.
     ///
-    /// A `StretchRect` into level 0 must regenerate the
-    /// mip chain afterwards, the same way a level-0
-    /// `UnlockRect` does.
+    /// A `StretchRect` or a `ColorFill` into level 0 must
+    /// regenerate the mip chain afterwards, the same way a
+    /// level-0 `UnlockRect` does.
     autogen_texture_id: Option<TextureId>,
     /// Multisampled companion of the surface's texture, or null.
     ///
@@ -7384,8 +7384,10 @@ fn color_fill_block_aligned(region: DirtyRect, extent: (u32, u32), block: (u32, 
 ///
 /// The destination is a colour attachment on this device, so the fill is a
 /// one-off render pass through the clear machinery and the API thread writes
-/// no pixels at all. `info` is consumed because the destination kind travels
-/// into the encoder closure, which cannot reach the surface.
+/// no pixels at all. A fill into level 0 of an `D3DUSAGE_AUTOGENMIPMAP`
+/// texture carries the mip-chain regeneration with it. `info` is consumed
+/// because the destination kind travels into the encoder closure, which
+/// cannot reach the surface.
 fn color_fill_render_target(
     dev: &mut DeviceInner,
     info: StretchSurfaceInfo,
@@ -7412,6 +7414,7 @@ fn color_fill_render_target(
         subresource: (0, info.mip_level),
         rect: (region.x, region.y, region.w, region.h),
         rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
+        regenerate_mipmaps: info.autogen_texture_id.is_some(),
     };
     let kind = info.kind;
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {

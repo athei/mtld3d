@@ -299,6 +299,11 @@ pub struct ColorFillTarget {
     pub rect: (u32, u32, u32, u32),
     /// Fill colour, one `f32::to_bits` per channel in RGBA order.
     pub rgba: (u32, u32, u32, u32),
+    /// True when the destination is level 0 of a `D3DUSAGE_AUTOGENMIPMAP` texture.
+    ///
+    /// The runtime owns that texture's mip chain, so the fill is followed by a
+    /// regeneration from the level it just painted.
+    pub regenerate_mipmaps: bool,
 }
 
 /// Parameter bag for `FrameEncoder::run_texture_upload`.
@@ -4277,6 +4282,13 @@ impl FrameEncoder {
         // it lands on this destination rather than on the restored one.
         self.pass_state.ensure_pass_open();
         self.end_current_pass("color_fill");
+        // An autogen destination regenerates from the level the fill painted.
+        // The blit rides the ordered stream right behind the fill's own pass,
+        // so it reads the filled level 0 rather than leading the frame the way
+        // the upload path's `run_generate_mipmaps` does.
+        if fill.regenerate_mipmaps {
+            self.push_stretch_rect_blit(BlitCommand::generate_mipmaps(fill.texture.raw()));
+        }
 
         // Restore the device's previous attachments + viewport.
         self.pass_state.restore_color_attachments(saved_color);
