@@ -1,7 +1,7 @@
 use core::{ffi::c_void, mem::MaybeUninit, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use log::{debug, error, info, trace, warn};
@@ -9575,13 +9575,63 @@ fn draw_bound_triangle_fan(
     D3D_OK
 }
 
+/// Read a released index buffer's contents back out of its device buffer.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` index buffer keeps no CPU copy of
+/// its bytes, and Metal has no triangle-fan primitive, so the rewrite below
+/// still needs the application's indices. The device buffer holds them in
+/// `StorageModePrivate` storage at an address the 32-bit PE cannot
+/// dereference, so they come back as a GPU copy into fresh PE pages plus a
+/// mid-frame submit that waits for it. The backing that lands is pinned, so
+/// however many fans a buffer draws it stalls at most once.
+///
+/// `false`, with a warn, when the copy could not be made; the caller drops
+/// the draw rather than rewriting a fan out of zeroed pages.
+fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer9) -> bool {
+    // SAFETY: `ib` is non-null and points to a live `Direct3DIndexBuffer9`
+    // whose bound-slot reference keeps it alive for this call.
+    let inner = unsafe { &*ib }.inner();
+    let buffer_id = inner.buffer_id();
+    let mut page_box = PageBox::new_zeroed(inner.length() as usize);
+    let dst_ptr = page_box.as_mut_ptr() as u64;
+    let dst_len = page_box.len() as u64;
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "DrawIndexedPrimitive(D3DPT_TRIANGLEFAN) from an index buffer whose CPU copy was released: \
+         reading the indices back off the GPU costs one mid-frame submit and one GPU wait per buffer"
+    );
+    let read = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&read);
+    dev.push_op(Box::new(move |enc| {
+        done.store(
+            enc.readback_device_buffer(buffer_id, dst_ptr, dst_len),
+            Ordering::Release,
+        );
+    }));
+    // Submits the frame the copy rides and waits for the GPU to finish it,
+    // which is what makes the destination pages readable here.
+    dev.mid_frame_submit_for_retention();
+    if !read.load(Ordering::Acquire) {
+        warn!(
+            target: LOG_TARGET,
+            "DrawIndexedPrimitive: triangle fan could not read its indices back off the GPU"
+        );
+        return false;
+    }
+    // SAFETY: `ib` stays live for this call (see above), and the read
+    // reference taken at the top of this function has been dropped.
+    unsafe { &mut *ib }.inner_mut().adopt_device_copy(page_box);
+    true
+}
+
 /// Rewrite the fan a `DrawIndexedPrimitive` addresses in the bound index buffer.
 ///
 /// Reads the application's indices straight from the buffer's CPU-side backing,
 /// which is current under both map modes (the `Direct` box is the GPU memory
-/// itself, the `Staged` box is the copy every Lock writes), so no GPU round
-/// trip is needed. `None`, with a warn, when nothing is bound, the format is
-/// unknown, or the draw reads past the buffer.
+/// itself, the `Staged` box is the copy every Lock writes). A buffer that
+/// released its copy has it read back off the GPU first. `None`, with a warn,
+/// when nothing is bound, the format is unknown, the readback fails, or the
+/// draw reads past the buffer.
 fn bound_index_fan(
     dev: &mut DeviceInner,
     start_index: u32,
@@ -9596,10 +9646,13 @@ fn bound_index_fan(
         );
         return None;
     }
-    // SAFETY: `ptr` is non-null (checked above) and points to a live
-    // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
-    let inner = unsafe { &*ptr }.inner();
-    let index_size: u64 = match inner.format() {
+    let (format, released) = {
+        // SAFETY: `ptr` is non-null (checked above) and points to a live
+        // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
+        let inner = unsafe { &*ptr }.inner();
+        (inner.format(), inner.backing_is_released())
+    };
+    let index_size: u64 = match format {
         D3DFMT_INDEX16 => 2,
         D3DFMT_INDEX32 => 4,
         other => {
@@ -9611,6 +9664,12 @@ fn bound_index_fan(
             return None;
         }
     };
+    if released && !materialise_index_backing(dev, ptr) {
+        return None;
+    }
+    // SAFETY: `ptr` is non-null (checked above) and points to a live
+    // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
+    let inner = unsafe { &*ptr }.inner();
     let first = u64::from(start_index) * index_size;
     let len = (u64::from(primitive_count) + 2) * index_size;
     if first + len > inner.current_backing_len() {

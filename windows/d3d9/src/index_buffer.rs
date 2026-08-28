@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
-    buffer_backing::{BufferBacking, classify_backing},
+    buffer_backing::{BufferBacking, classify_backing, may_release_backing},
     buffer_rename::{
         BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
         records_dirty_range,
@@ -77,9 +77,11 @@ pub struct IndexBufferInner {
     dirty: DirtyRange,
     /// Canonical CPU backing.
     ///
-    /// Never released the way a vertex buffer's is: the triangle-fan
-    /// rewrite reads an index buffer's bytes back on the API thread
-    /// whatever its usage promised, so the copy has to stay.
+    /// Released like a vertex buffer's once an upload has carried every
+    /// byte of a buffer D3D9 promises no readback (see
+    /// `mtld3d_core::buffer_backing`). The indexed triangle-fan rewrite is
+    /// the one path that still reads these bytes on the CPU; it reads them
+    /// back off the GPU instead and pins what it installs.
     backing: BufferBacking,
     last_submit_seq: u64,
     locked: bool,
@@ -88,6 +90,50 @@ pub struct IndexBufferInner {
 impl IndexBufferInner {
     pub const fn buffer_id(&self) -> BufferId {
         self.buffer_id
+    }
+
+    /// The buffer's D3D9-visible length in bytes.
+    pub const fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// Whether the buffer holds no CPU copy of its contents.
+    ///
+    /// True only for a `D3DUSAGE_WRITEONLY` default-pool buffer whose
+    /// upload has been queued: its bytes live on the GPU alone until a
+    /// later `Lock` re-creates the backing, or the indexed triangle-fan
+    /// rewrite reads them back.
+    #[must_use]
+    pub const fn backing_is_released(&self) -> bool {
+        self.backing.is_released()
+    }
+
+    /// Adopt index bytes read back out of the device buffer.
+    ///
+    /// Installs them as the backing and pins it, so the buffer never pays
+    /// the read's GPU stall twice.
+    pub fn adopt_device_copy(&mut self, page_box: PageBox) {
+        self.backing.adopt_device_copy(page_box);
+    }
+
+    /// Give a released buffer a backing again, zeroed.
+    ///
+    /// Every write path calls this before it touches the backing. The
+    /// fresh pages hold no contents: only what is written into them from
+    /// here on matches the device buffer, which is what
+    /// `BackingState::Partial` records.
+    fn restore_backing(&mut self) {
+        if !self.backing.is_released() {
+            return;
+        }
+        self.backing
+            .restore(PageBox::new_zeroed(self.length as usize));
+        mtld3d_shared::log_once_trace_by!(
+            target: crate::LOG_TARGET,
+            key: self.buffer_id.raw(),
+            "index buffer {:#x}: backing re-created for a write",
+            self.buffer_id.raw()
+        );
     }
 
     /// Upload a still-mapped `Staged` buffer's dirty span without ending the lock.
@@ -472,6 +518,17 @@ extern "system" fn ib_lock(
         );
     }
 
+    if inner.backing.is_released() {
+        // The bytes live on the GPU alone. A read through this pointer sees
+        // zeros rather than the buffer's contents, which is why only the
+        // usages D3D9 promises no readback release their backing at all.
+        if flags & D3DLOCK_READONLY != 0 {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "ib_lock: D3DLOCK_READONLY on a D3DUSAGE_WRITEONLY buffer whose backing was released; the mapped bytes read as zero");
+        }
+        inner.restore_backing();
+    }
+
     if matches!(inner.map_mode, BufferMapMode::Staged) {
         // Separate CPU staging: record the dirtied range for the Unlock
         // upload. No rename / no `plan_lock` — the GPU reads a distinct
@@ -488,17 +545,25 @@ extern "system" fn ib_lock(
                     "ib_lock: D3DLOCK_DISCARD on a non-DYNAMIC (Staged) buffer — treating as a normal dirtied-range upload");
             }
             // `(0, 0)` is `conjoin`'s "to end of buffer"; see the twin
-            // comment in `vb_lock`.
-            let (dirty_offset, dirty_size) = if may_trust_lock_bounds(
+            // comment in `vb_lock`, which also carries the reason a
+            // re-created backing may not widen.
+            let trusted = may_trust_lock_bounds(
                 flags,
                 inner.usage,
                 inner.pool,
                 size_to_lock,
                 crate::config::CONFIG.buffer_ignore_lock_bounds,
-            ) {
-                (offset_to_lock, size_to_lock)
-            } else {
+            );
+            let discard = flags & D3DLOCK_DISCARD != 0;
+            let widen = !trusted && (inner.backing.may_widen_upload() || discard);
+            if !trusted && !widen {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "ib_lock: keeping the announced lock window on a re-created backing; a widened upload would overwrite device bytes the buffer no longer holds");
+            }
+            let (dirty_offset, dirty_size) = if widen {
                 (0, 0)
+            } else {
+                (offset_to_lock, size_to_lock)
             };
             inner.dirty.conjoin(dirty_offset, dirty_size, inner.length);
         }
@@ -539,8 +604,8 @@ extern "system" fn ib_lock(
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
                 let fresh = dev.alloc_pagebox_capped(logical_len);
-                // An index buffer never releases its backing, so the swap
-                // always hands the old one back.
+                // `Direct` buffers never release their backing (the GPU
+                // reads it), so the swap always hands the old one back.
                 let Some(old_box) = inner.backing.replace(fresh) else {
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                         "ib_lock: rename found no backing to retain");
@@ -656,8 +721,34 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
         // buffer, so clearing it on a path that queued nothing would
         // drop them silently.
         inner.dirty.clear();
+        release_backing_after_upload(inner);
     }
     D3D_OK
+}
+
+/// Release the CPU backing of an index buffer whose upload just carried every byte.
+///
+/// Same class and same guards as the vertex-buffer release: the transient
+/// the upload owns holds the bytes until the GPU has them, `D3DPOOL_DEFAULT`
+/// `D3DUSAGE_WRITEONLY` is the one class D3D9 promises no readback, and
+/// `buffer.ignoreLockBounds` names the titles whose uploads have to be able
+/// to widen out of the CPU copy. A pinned backing is the extra guard an
+/// index buffer needs: the indexed triangle-fan rewrite has already paid a
+/// GPU stall to read these bytes back, so releasing them would only buy
+/// another one.
+fn release_backing_after_upload(inner: &mut IndexBufferInner) {
+    if inner.locked
+        || inner.backing.is_pinned()
+        || crate::config::CONFIG.buffer_ignore_lock_bounds
+        || !may_release_backing(inner.usage, inner.pool)
+        || !inner.backing.may_widen_upload()
+    {
+        return;
+    }
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "releasing the CPU backing of uploaded D3DPOOL_DEFAULT D3DUSAGE_WRITEONLY index buffers; \
+         their bytes then live on the GPU alone and a device recreate cannot restore them");
+    drop(inner.backing.release());
 }
 
 extern "system" fn ib_get_desc(this: *mut c_void, desc: *mut D3DINDEXBUFFER_DESC) -> i32 {

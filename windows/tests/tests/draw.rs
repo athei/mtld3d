@@ -381,6 +381,85 @@ fn bound_indexed_triangle_fan_honours_base_vertex_and_start_index() {
     );
 }
 
+/// A second diamond, a quarter the size, off to the left of the first.
+///
+/// Its centre pixel is (160, 240) and the first diamond does not reach the
+/// screen centre once the fan draws this one instead, so one pixel read at
+/// each place says which of the two fans the index buffer described.
+fn small_left_diamond() -> [PosColorVertex; 4] {
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    [v(-0.5, 0.25), v(-0.25, 0.0), v(-0.5, -0.25), v(-0.75, 0.0)]
+}
+
+#[test]
+fn indexed_triangle_fan_draws_after_its_index_buffer_released_its_backing() {
+    // A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` index buffer keeps no CPU copy
+    // of its contents once its upload has carried every byte, so the fan
+    // rewrite has to read the application's indices back off the GPU. The
+    // buffer describes two disjoint fans over one vertex buffer; the first
+    // draw comes after the release, and the second after a `Lock` that
+    // rewrites only the second fan's four indices, so both the read-back copy
+    // and the buffer it is pinned into have to be right.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = Vec::from(fan_diamond());
+    verts.extend_from_slice(&small_left_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+
+    // Eight 16-bit indices: the first fan, then four the second `Lock` fills.
+    let ib = h.create_index_buffer(16, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    let first: [u16; 8] = [0, 1, 2, 3, 0, 0, 0, 0];
+    ib.lock(0, 0, 0).write(&first);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 4, 0, 2),
+            0,
+            "indexed TRIANGLEFAN draws with no CPU copy of the indices",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the first fan's indices survived the backing release"
+    );
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+
+    // Announce the second fan's four indices and write only those. The
+    // backing the read-back installed holds the first four, so the upload is
+    // free to carry the whole buffer or just the window; either way the fan
+    // at `StartIndex` 4 has to be the small diamond.
+    let second: [u16; 4] = [4, 5, 6, 7];
+    ib.lock(8, 8, 0).write(&second);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+            0,
+            "the second fan draws",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        MAGENTA,
+        "the refilled indices describe the small diamond"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLACK,
+        "the first fan is not drawn by the second draw"
+    );
+}
+
 #[test]
 fn indexed_primitive_up_draws() {
     // DrawIndexedPrimitiveUP feeds inline vertices + an inline index stream; the

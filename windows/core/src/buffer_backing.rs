@@ -31,6 +31,14 @@
 //! an upload covers the whole buffer, because the device buffer is then a copy
 //! of the backing whatever the backing held.
 //!
+//! One path reads a released buffer's bytes back anyway: the indexed
+//! triangle-fan rewrite needs the application's indices, and Metal has no fan
+//! primitive to hand them to. [`BufferBacking::adopt_device_copy`] takes the
+//! copy that path reads off the GPU and makes it the backing again, in
+//! `Mirrors` because it came from the device buffer itself. That read costs a
+//! GPU stall, so the backing it installs is pinned and no later upload
+//! releases it: a buffer pays the stall once however many fans it draws.
+//!
 //! The gauge is three process-wide counters keyed by [`BackingClass`], one add
 //! per allocation and one subtract per release. The address-space watch reports
 //! them split, so a 32-bit title's log says which class of buffer holds the
@@ -148,6 +156,11 @@ pub struct BufferBacking {
     logical_len: u32,
     class: BackingClass,
     state: BackingState,
+    /// Whether the backing is held for the rest of the buffer's life.
+    ///
+    /// Set by [`BufferBacking::adopt_device_copy`], the one path that has
+    /// paid a GPU stall to get these bytes back, and never cleared.
+    pinned: bool,
 }
 
 impl BufferBacking {
@@ -162,6 +175,7 @@ impl BufferBacking {
             logical_len,
             class,
             state: BackingState::Mirrors,
+            pinned: false,
         }
     }
 
@@ -244,6 +258,34 @@ impl BufferBacking {
         discharge(self.class, self.padded_len);
         self.state = BackingState::Released;
         Some(page_box)
+    }
+
+    /// Whether the backing is held for the rest of the buffer's life.
+    ///
+    /// A pinned backing has been read back off the GPU once already, so
+    /// releasing it again would only buy another stall.
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Adopt a copy of the device buffer's contents, read back off the GPU.
+    ///
+    /// The bytes come from the device buffer, so the backing mirrors it
+    /// again rather than holding only what is written next. Pins the
+    /// backing: the read that produced these bytes is a GPU stall, and a
+    /// buffer pays it once.
+    pub fn adopt_device_copy(&mut self, page_box: PageBox) {
+        if self.page_box.is_some() {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "adopt_device_copy: the buffer already holds a backing, dropping the read-back copy");
+            return;
+        }
+        self.padded_len = page_box.len();
+        charge(self.class, self.padded_len);
+        self.page_box = Some(page_box);
+        self.state = BackingState::Mirrors;
+        self.pinned = true;
     }
 
     /// Give a released buffer a backing again, holding only what is written next.

@@ -1331,6 +1331,9 @@ impl FanIndexBuffer {
 /// 7. `fan_index_buffer` growth: `Buffer` + the grown-out pattern's
 ///    handle + `page_box`, `seq = current_submit_seq`, since a draw
 ///    earlier this frame may still bind it.
+/// 8. `readback_device_buffer` destination wrapper: `Buffer` + handle,
+///    `page_box = None`. The PE pages under it belong to the index
+///    buffer that asked for the read and outlive the wrapper.
 struct PendingResourceRetention {
     kind: DestroyKind,
     handle: u64,
@@ -5735,6 +5738,82 @@ impl FrameEncoder {
         // backing was allocated. No-op on UMA via the helper's gate.
         self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, backing_len);
         handle.raw()
+    }
+
+    /// Copy a `Staged` VB/IB's device buffer into caller-owned PE memory.
+    ///
+    /// The device buffer is `StorageModePrivate` at an address Metal chose,
+    /// which the 32-bit PE cannot dereference, so the only route back to the
+    /// CPU is a GPU copy into a `Shared` wrapper over PE pages. The
+    /// destination is `Shared` on every device rather than following the
+    /// storage policy: a `Managed` one holds the GPU's write in VRAM until a
+    /// synchronize, and this copy exists to be read on the CPU.
+    ///
+    /// The caller owns `dst_ptr`, keeps it alive past this frame's submit,
+    /// and must wait for GPU completion of that submit before reading it.
+    /// `false`, with a log line, when the buffer has no device buffer to
+    /// read: the caller then has no indices and drops the draw.
+    pub fn readback_device_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        dst_ptr: u64,
+        dst_len: u64,
+    ) -> bool {
+        let Some((src, length)) = self
+            .buffer_cache
+            .get(&buffer_id)
+            .filter(|s| s.is_staged && !s.device_buffer.is_null())
+            .map(|s| (s.device_buffer.raw(), s.length))
+        else {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "readback_device_buffer: no Staged device buffer behind buffer_id {:#x}, nothing to read",
+                buffer_id.raw());
+            return false;
+        };
+        let desc = BufferCreateDesc {
+            backing_ptr: dst_ptr,
+            length: dst_len,
+            id: buffer_id.raw(),
+            storage_mode: StorageMode::Shared,
+            kind: BufferKind::VbIb,
+        };
+        let mut handle = MetalHandle::<MTLBufferKind>::NULL;
+        let status = self.batch_create_buffers(
+            core::slice::from_ref(&desc),
+            core::slice::from_mut(&mut handle),
+        );
+        if status != 0 || handle.is_null() {
+            error!(
+                target: LOG_TARGET,
+                "readback_device_buffer: CreateBuffer failed \
+                 (id={buffer_id:#x}, len={dst_len}, status={status:#x})",
+            );
+            return false;
+        }
+        self.frame_blit_commands
+            .push(BlitCommand::copy_buffer_to_buffer(
+                &CopyBufferToBufferInfo {
+                    src_buffer: src,
+                    dst_buffer: handle.raw(),
+                    src_offset: 0,
+                    dst_offset: 0,
+                    byte_size: length.min(dst_len),
+                },
+            ));
+        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        // The wrapper is this frame's alone. Retention gates its destroy on
+        // the submit that carries the copy, the same gate every other
+        // mid-frame wrapper rides.
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Buffer,
+                handle: handle.raw(),
+                page_box: None,
+                staging_arc: None,
+                seq: self.current_submit_seq,
+                from_texture: false,
+            });
+        true
     }
 
     /// Append a `NotifyBufferDidModifyRange` to `frame_blit_commands`.
