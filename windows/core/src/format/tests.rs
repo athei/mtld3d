@@ -24,10 +24,10 @@ use super::{
     D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    StandaloneSurfaceKind, Swizzle, compute_mip_size, depth_format_bytes_per_pixel, format_name,
-    is_depth_format, is_mapped_color_format, linear_mip_size, linear_row_pitch,
-    map_d3d_depth_format, map_d3d_format, standalone_surface_bytes, surface_bytes,
-    usage_allowed_for_rtype,
+    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_size,
+    depth_format_bytes_per_pixel, format_name, is_depth_format, is_mapped_color_format,
+    linear_mip_size, linear_row_pitch, map_d3d_depth_format, map_d3d_format,
+    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
 #[test]
@@ -585,6 +585,31 @@ fn a_depth_level_matches_the_colour_level_of_its_pixel_size() {
     assert_eq!(linear_mip_size(33, 33, 0, 2), (33, 33, 68 * 33, 68));
     // A 4-byte format is already dword-aligned at every width.
     assert_eq!(linear_mip_size(33, 33, 0, 4), (33, 33, 33 * 4 * 33, 33 * 4));
+}
+
+/// The block-parameter pitch answers what the `FormatMapping` one does.
+///
+/// A texture that has already unpacked its format into block parameters sizes
+/// a level through `block_row_pitch`, so it has to agree with
+/// `compute_mip_size` on both sides of the compressed/linear split or the same
+/// level measures differently depending on which entry point asked.
+#[test]
+fn the_block_pitch_agrees_with_the_format_mapping_pitch() {
+    for (fmt_code, bpp) in [(D3DFMT_A8R8G8B8, 4), (D3DFMT_R5G6B5, 2), (D3DFMT_DXT1, 0)] {
+        let fmt = map_d3d_format(fmt_code).expect("mapped");
+        for level in 0..4 {
+            let (w, _, _, pitch) = compute_mip_size(66, 66, level, &fmt);
+            assert_eq!(
+                block_row_pitch(w, fmt.block_width(), fmt.block_bytes(), bpp),
+                pitch,
+                "format {fmt_code:#x} level {level}"
+            );
+        }
+    }
+
+    // An uncompressed row rounds up to a dword; a compressed one to a block.
+    assert_eq!(block_row_pitch(33, 1, 2, 2), 68);
+    assert_eq!(block_row_pitch(33, 4, 8, 0), 72);
 }
 
 #[test]

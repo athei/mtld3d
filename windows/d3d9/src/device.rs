@@ -4586,11 +4586,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     };
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
-    // The size the mip chain is charged at against the `GetAvailableTextureMem`
-    // budget, in the application's own currency: its D3D9 format, not the
-    // wider Metal one a 24-bit depth format is promoted to, and its requested
-    // dimensions, not a render-scaled attachment's. Every format with a Metal
-    // depth mapping has an entry, so the fallback is unreachable.
+    // The per-pixel size the mip chain is charged at against the
+    // `GetAvailableTextureMem` budget, in the application's own currency: its
+    // D3D9 format, not the wider Metal one a 24-bit depth format is promoted
+    // to. Every format with a Metal depth mapping has an entry, so the
+    // fallback is unreachable.
     let bytes_per_pixel =
         mtld3d_core::format::depth_format_bytes_per_pixel(format).unwrap_or_else(|| {
             mtld3d_shared::log_once_warn_by!(
@@ -4611,7 +4611,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     // row pitch so `TextureInner::allocated_bytes` charges the chain on the
     // formula a colour chain is charged on: the host-visible stride of the
     // level's width, not a tight one. There is no CPU staging behind a depth
-    // texture, so the pitch is a size and never a lock's stride.
+    // texture, so the pitch is a size and never a lock's stride. All three stay
+    // in the dimensions the application asked for, which is what `GetLevelDesc`
+    // answers with; a chain rasterized at `render.scale` is charged at the
+    // extent its Metal levels hold instead, which `allocated_bytes` measures
+    // from the scale the texture carries.
     let mut mip_widths = Vec::with_capacity(actual_levels as usize);
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);

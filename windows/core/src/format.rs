@@ -705,6 +705,27 @@ pub fn compute_mip_size(
     }
 }
 
+/// Row pitch of one level, from the block geometry a texture carries.
+///
+/// [`compute_mip_size`] answers this from a [`FormatMapping`]; a caller that
+/// has already unpacked its format into block parameters asks here instead. A
+/// compressed row is a whole number of blocks wide, and an uncompressed one
+/// strides by [`linear_row_pitch`], so the two agree with the sizes their
+/// chains were built at.
+#[must_use]
+pub const fn block_row_pitch(
+    width: u32,
+    block_width: u32,
+    block_bytes: u32,
+    bytes_per_pixel: u32,
+) -> u32 {
+    if block_width > 1 {
+        width.div_ceil(block_width).saturating_mul(block_bytes)
+    } else {
+        linear_row_pitch(width, bytes_per_pixel)
+    }
+}
+
 /// Mip dimensions, byte size and row stride for one level of a linear format.
 ///
 /// The uncompressed half of [`compute_mip_size`], for a format carried as a
