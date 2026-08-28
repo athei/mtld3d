@@ -2352,8 +2352,8 @@ fn surface_ops_contracts() {
         D3DERR_INVALIDCALL,
         "GetFrontBufferData rejects a non-SYSTEMMEM dst",
     );
-    // D3DPOOL_SYSTEMMEM and D3DPOOL_DEFAULT offscreen plain surfaces are
-    // supported; MANAGED/SCRATCH are not.
+    // D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH and D3DPOOL_DEFAULT offscreen plain
+    // surfaces are supported; MANAGED is not.
     assert_eq!(
         h.create_offscreen_plain_surface_hr(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT),
         0,
