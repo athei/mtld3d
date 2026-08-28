@@ -2196,6 +2196,11 @@ fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
     );
 }
 
+/// A `ColorFill` into an autogen-mipmap render target regenerates its chain.
+///
+/// The fill lands on level 0 through the GPU path, so the lower levels have
+/// to be rebuilt from it before the next sample reads them.
+#[test]
 fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
     // The runtime owns a D3DUSAGE_AUTOGENMIPMAP texture's mip chain, so a
     // ColorFill into level 0 regenerates it. Seed the chain red through a
