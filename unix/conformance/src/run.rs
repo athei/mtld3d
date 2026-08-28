@@ -31,19 +31,26 @@ use crate::{
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
 
-/// How many Metal API-validation error lines a leg may log and still pass.
+/// How many Metal API-validation error messages a leg may log and still pass.
 ///
 /// Zero. The layer's warnings are filtered out (see [`run_subtest`]), so every
-/// line that survives is real API misuse and has to read as a regression
+/// message that survives is real API misuse and has to read as a regression
 /// rather than as noise. The expectation lives beside the reporting code
 /// because `baseline.txt` is machine-owned per-site counts whose parser
 /// rejects anything else.
 const MAX_VALIDATION_ERRORS: usize = 0;
 
+/// How many detail lines one validation message keeps.
+///
+/// Metal's reports run to a handful of them; the cap keeps a stderr that
+/// stopped looking like one from pasting a whole subtest into a single
+/// message. A message that hits it ends in an ellipsis.
+const MAX_DETAIL_LINES: usize = 8;
+
 /// One subtest's outcome.
 ///
 /// The parsed per-site result, plus how many distinct Metal API-validation
-/// error lines the run logged for the caller to gate on.
+/// error messages the run logged for the caller to gate on.
 pub struct SubtestRun {
     /// Failing sites, the crash bit and the marked-failure tallies.
     pub result: SubtestResult,
@@ -51,7 +58,7 @@ pub struct SubtestRun {
     pub validation_errors: usize,
 }
 
-/// Whether the Metal-validation error lines a run logged fail its leg.
+/// Whether the Metal-validation error messages a run logged fail its leg.
 #[must_use]
 pub const fn validation_gate_failed(errors: usize) -> bool {
     errors > MAX_VALIDATION_ERRORS
@@ -254,37 +261,105 @@ fn save_raw_output(arch: Arch, subtest: Subtest, combined: &str) {
 /// Print a deduplicated, number-normalised summary of any Metal API-validation messages.
 ///
 /// The subtest logged them rather than aborting — the layer runs in `nslog`
-/// mode. Returns how many distinct messages were printed, which is what the
-/// leg gates on.
+/// mode. A message prints as its opening line plus its detail lines, indented
+/// under it: the opening line names the check that fired (`Sampler Descriptor
+/// Validation`) and the detail names what failed it. Returns how many distinct
+/// messages were printed, which is what the leg gates on.
 fn report_validation_errors(arch: Arch, subtest: Subtest, stderr: &str) -> usize {
     let seen = validation_errors(stderr);
     for msg in &seen {
-        eprintln!("  [{arch}/{subtest}] metal-validation: {msg}");
+        let mut lines = msg.lines();
+        if let Some(header) = lines.next() {
+            eprintln!("  [{arch}/{subtest}] metal-validation: {header}");
+        }
+        for detail in lines {
+            eprintln!("      {detail}");
+        }
     }
     seen.len()
 }
 
 /// The distinct Metal API-validation error messages in a subtest's stderr.
 ///
-/// Volatile addresses and counts collapse to `N` so a repeated error reports
-/// once. The layer's warnings never reach here (the run switches them off), so
-/// every match is misuse.
+/// A recognised line opens a message and the lines under it are its detail,
+/// which is where the layer names the property it rejected. Volatile addresses
+/// and counts collapse to `N` so a repeated message reports once. The layer's
+/// warnings never reach here (the run switches them off), so every match is
+/// misuse.
 fn validation_errors(stderr: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = stderr.lines().collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for line in stderr.lines() {
-        let l = line.trim();
-        let is_validation = l.contains("does not match")
-            || l.contains("is missing from")
-            || l.contains("must be <=")
-            || l.contains("incorrect type of texture")
-            || l.contains("Insufficient")
-            || l.contains("exceeds the limit")
-            || (l.contains(" Validation") && !l.contains("Validation Enabled"));
-        if is_validation {
-            seen.insert(normalize_numbers(l));
+    let mut i = 0;
+    while i < lines.len() {
+        if !opens_validation_message(lines[i].trim()) {
+            i += 1;
+            continue;
         }
+        let mut msg = normalize_numbers(lines[i].trim());
+        i += 1;
+        let mut detail = 0;
+        while i < lines.len() && continues_validation_message(lines[i]) {
+            if detail < MAX_DETAIL_LINES {
+                msg.push('\n');
+                msg.push_str(&normalize_numbers(lines[i].trim()));
+            } else if detail == MAX_DETAIL_LINES {
+                msg.push_str("\n…");
+            }
+            detail += 1;
+            i += 1;
+        }
+        seen.insert(msg);
     }
     seen
+}
+
+/// Whether a line opens a Metal API-validation message.
+///
+/// The layer heads a multi-line report with the check that fired
+/// (`… Validation`) and also emits stand-alone error lines carrying no such
+/// header, so both shapes open one. Its start-up notice is not an error.
+fn opens_validation_message(line: &str) -> bool {
+    line.contains("does not match")
+        || line.contains("is missing from")
+        || line.contains("must be <=")
+        || line.contains("incorrect type of texture")
+        || line.contains("Insufficient")
+        || line.contains("exceeds the limit")
+        || (line.contains(" Validation") && !line.contains("Validation Enabled"))
+}
+
+/// Whether a line is detail under the validation message above it.
+///
+/// The layer writes its detail lines unadorned, so a message runs until
+/// something the run can attribute to another writer: the next `NSLog` line,
+/// a Wine channel line, or a blank line.
+fn continues_validation_message(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && !is_nslog_line(line) && !is_wine_channel_line(line)
+}
+
+/// Whether a line carries an `NSLog` timestamp (`YYYY-MM-DD HH:MM:SS.mmm …`).
+fn is_nslog_line(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// Whether a line is Wine's own channel output (`0000:err:d3d9:…`).
+fn is_wine_channel_line(line: &str) -> bool {
+    let Some((id, rest)) = line.split_once(':') else {
+        return false;
+    };
+    id.len() >= 4
+        && id.bytes().all(|b| b.is_ascii_hexdigit())
+        && matches!(
+            rest.split(':').next(),
+            Some("err" | "warn" | "fixme" | "trace")
+        )
 }
 
 /// Collapse hex literals (`0x…`) and decimal runs to `N`.

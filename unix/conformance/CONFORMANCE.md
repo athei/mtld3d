@@ -55,8 +55,16 @@ looked identical. A `metal-validation:` line therefore means the layer
 committed API misuse, so any of them fails the leg. The expected number is
 zero, kept as a constant in the runner next to the reporting code rather than
 in `baseline.txt`, which records machine-owned per-site counts and nothing
-else. There is no tolerance to keep in step: a leg that logs a line has started
-misusing Metal, and the fix is the misuse, not the number.
+else. There is no tolerance to keep in step: a leg that logs a message has
+started misusing Metal, and the fix is the misuse, not the number.
+
+The layer writes a report as a headline naming the check that fired
+(`Sampler Descriptor Validation`) followed by unadorned detail lines, and the
+detail is the half that names what was rejected. The runner keeps them
+together: a recognised line opens a message and the lines under it are its
+detail, up to the next `NSLog` line, Wine channel line or blank line, so the
+whole report reaches the log indented under its `metal-validation:` line
+instead of only in the raw output. One report counts once.
 
 This is **not** part of `make test`: many checks fail by design (see below), so
 it is a tracked-score tool, not a pass/fail gate on zero. The runner exits

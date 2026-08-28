@@ -10,7 +10,7 @@ use objc2_metal::{
 };
 
 use crate::metal::{
-    device::supports_sampler_border,
+    device::{supports_sampler_border, supports_sampler_mirror_clamp},
     handle::{IntoRetained, ReleaseRetain},
 };
 
@@ -35,6 +35,14 @@ pub fn create_sampler_state(
     let uses_border = matches!(params.address_u, AddressMode::ClampToBorderColor)
         || matches!(params.address_v, AddressMode::ClampToBorderColor)
         || matches!(params.address_w, AddressMode::ClampToBorderColor);
+    // A device without `MirrorClampToEdge` (D3DTADDRESS_MIRRORONCE) gets
+    // `MirrorRepeat`, which agrees with MIRRORONCE inside |coord| <= 1, where
+    // content actually samples, and only diverges beyond it — so the D3D9 cap
+    // stays advertised everywhere and no title has to check it. The
+    // substitution happens before the descriptor is built rather than after a
+    // rejected creation, because a creation the device refuses is API misuse
+    // the validation layer logs whether or not a retry then succeeds.
+    let mirror_clamp_ok = supports_sampler_mirror_clamp(&device);
     let address = |wire: AddressMode| {
         if !border_ok && matches!(wire, AddressMode::ClampToBorderColor) {
             mtld3d_shared::log_once_warn!(
@@ -42,6 +50,13 @@ pub fn create_sampler_state(
                 "sampler border addressing unsupported on this device — clamped to edge"
             );
             return MTLSamplerAddressMode::ClampToEdge;
+        }
+        if !mirror_clamp_ok && matches!(wire, AddressMode::MirrorClampToEdge) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "sampler: MirrorClampToEdge unsupported on this device — falling back to MirrorRepeat"
+            );
+            return MTLSamplerAddressMode::MirrorRepeat;
         }
         mtl_address_mode(wire)
     };
@@ -106,30 +121,7 @@ pub fn create_sampler_state(
         objc2_foundation::NSString::from_str(&format!("mtld3d-{label_kind}-{:#x}", params.id));
     desc.setLabel(Some(&label));
 
-    let mut sampler = device.newSamplerStateWithDescriptor(&desc);
-    if sampler.is_none() && uses_mirror_clamp(params) {
-        // `MirrorClampToEdge` (D3DTADDRESS_MIRRORONCE) is unimplemented on
-        // some Metal devices — a GitHub runner's paravirtual GPU rejects the
-        // descriptor outright. Retry with `MirrorRepeat`, which matches
-        // MIRRORONCE inside |coord| <= 1 (where content actually samples)
-        // and only diverges beyond it.
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "sampler: MirrorClampToEdge unsupported on this device — falling back to MirrorRepeat"
-        );
-        let fix = |mode: AddressMode| {
-            if mode == AddressMode::MirrorClampToEdge {
-                MTLSamplerAddressMode::MirrorRepeat
-            } else {
-                mtl_address_mode(mode)
-            }
-        };
-        desc.setSAddressMode(fix(params.address_u));
-        desc.setTAddressMode(fix(params.address_v));
-        desc.setRAddressMode(fix(params.address_w));
-        sampler = device.newSamplerStateWithDescriptor(&desc);
-    }
-    let Some(sampler) = sampler else {
+    let Some(sampler) = device.newSamplerStateWithDescriptor(&desc) else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "sampler: newSamplerStateWithDescriptor failed (id={:#x}) — draws with this sampler bind nothing",
@@ -139,14 +131,6 @@ pub fn create_sampler_state(
     };
     // SAFETY: Retained::into_raw transfers the retain into the typed handle.
     Some(unsafe { MetalHandle::<MTLSamplerStateKind>::new(Retained::into_raw(sampler) as u64) })
-}
-
-/// Whether any of the three address modes is `MirrorClampToEdge`.
-#[inline]
-fn uses_mirror_clamp(params: &CreateSamplerStateParams) -> bool {
-    params.address_u == AddressMode::MirrorClampToEdge
-        || params.address_v == AddressMode::MirrorClampToEdge
-        || params.address_w == AddressMode::MirrorClampToEdge
 }
 
 /// Release a Metal sampler-state handle.
