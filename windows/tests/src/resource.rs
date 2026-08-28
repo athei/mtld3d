@@ -818,6 +818,13 @@ impl Surface<'_> {
         unsafe { (self.vtbl().unlock_rect)(self.ptr) }
     }
 
+    /// `GetType` (`D3DRTYPE_*`).
+    #[must_use]
+    pub fn resource_type(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_type)(self.ptr) }
+    }
+
     /// Describe the surface. Returns `(hr, desc)`.
     #[must_use]
     pub fn desc(&self) -> (i32, D3DSURFACE_DESC) {

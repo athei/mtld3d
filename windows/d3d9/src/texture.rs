@@ -3040,7 +3040,7 @@ extern "system" fn texture_pre_load(this: *mut c_void) {
 
 extern "system" fn texture_get_type(this: *mut c_void) -> u32 {
     let _timer = tex_timer(this);
-    3 // D3DRTYPE_TEXTURE
+    D3DRTYPE_TEXTURE
 }
 
 // ── IDirect3DBaseTexture9 ──
