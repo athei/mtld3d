@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 
 use log::trace;
-use mtld3d_core::{page_box::PageBox, perf::SurfaceSubCategory};
+use mtld3d_core::{page_box::PageBox, perf::SurfaceSubCategory, render_scale::RenderScale};
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
     mtl_handle::MTLTextureKind,
@@ -140,6 +140,7 @@ impl Direct3DSurface9 {
         height: u32,
         format: u32,
         usage: u32,
+        render_scale: RenderScale,
     ) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
@@ -148,6 +149,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
+            standalone_render_scale: render_scale,
             standalone_format: format,
             standalone_usage: usage,
             standalone_pool: D3DPOOL_DEFAULT,
@@ -190,6 +192,7 @@ impl Direct3DSurface9 {
         width: u32,
         height: u32,
         format: u32,
+        render_scale: RenderScale,
     ) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
@@ -198,6 +201,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
+            standalone_render_scale: render_scale,
             standalone_format: format,
             // CreateDepthStencilSurface → a D3DUSAGE_DEPTHSTENCIL surface.
             standalone_usage: D3DUSAGE_DEPTHSTENCIL,
@@ -241,6 +245,7 @@ impl Direct3DSurface9 {
             // snapshot (`live_format` returns it for a `Backbuffer` surface).
             standalone_width: 0,
             standalone_height: 0,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: D3DFMT_X8R8G8B8,
             // The implicit backbuffer/render target.
             standalone_usage: D3DUSAGE_RENDERTARGET,
@@ -283,6 +288,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: 0,
             // The implicit depth-stencil surface.
             standalone_usage: D3DUSAGE_DEPTHSTENCIL,
@@ -326,6 +332,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: 0,
             standalone_usage: 0,
             standalone_pool: D3DPOOL_DEFAULT,
@@ -375,6 +382,7 @@ impl Direct3DSurface9 {
             cube_face: face,
             standalone_width: 0,
             standalone_height: 0,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: 0,
             standalone_usage: 0,
             standalone_pool: D3DPOOL_DEFAULT,
@@ -418,6 +426,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: 0,
             standalone_height: 0,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: 0,
             standalone_usage: 0,
             standalone_pool: D3DPOOL_DEFAULT,
@@ -463,6 +472,7 @@ impl Direct3DSurface9 {
             cube_face: u32::MAX,
             standalone_width: width,
             standalone_height: height,
+            standalone_render_scale: RenderScale::IDENTITY,
             standalone_format: format,
             standalone_usage: 0,
             standalone_pool: pool,
@@ -704,6 +714,16 @@ impl Direct3DSurface9 {
         self.inner().live_height()
     }
 
+    /// What this surface's Metal texture is rasterized at, relative to what D3D9 reports.
+    ///
+    /// Meaningful for a standalone or implicit surface; a texture-backed
+    /// surface reads its parent texture's scale instead. A caller converting a
+    /// rect or an extent for the Metal texture behind this surface takes the
+    /// answer from here rather than re-deriving it from the device.
+    pub fn render_scale(&self) -> RenderScale {
+        self.inner().live_render_scale()
+    }
+
     /// Mip level inside the parent texture.
     ///
     /// Only meaningful when `parent_texture()` is non-null.
@@ -837,6 +857,18 @@ struct SurfaceInner {
     /// Standalone-surface description; only used when `parent_texture` is null.
     standalone_width: u32,
     standalone_height: u32,
+    /// What a standalone surface's Metal texture is rasterized at.
+    ///
+    /// `standalone_width`/`standalone_height` stay logical, the size D3D9
+    /// reports and the space every game-supplied rect lives in; this converts
+    /// them to the Metal texture's own resolution. Fixed when the surface is
+    /// created, so a consumer that has to address the texture asks the surface
+    /// rather than re-deriving the answer from the device's current
+    /// back-buffer size. Identity for every surface that is not a
+    /// render-target or depth-stencil surface sized like the back buffer, and
+    /// unused by an implicit surface, which resolves the device's live scale
+    /// the way it resolves its extent.
+    standalone_render_scale: RenderScale,
     standalone_format: u32,
     /// `D3DUSAGE_*` flags a standalone surface reports from `GetDesc`.
     ///
@@ -1071,6 +1103,20 @@ impl SurfaceInner {
             unsafe { (*self.device_inner).backbuffer_height() }
         } else {
             self.standalone_height
+        }
+    }
+
+    /// Live render scale.
+    ///
+    /// The device's current scale for any implicit surface (whose Metal
+    /// texture the device recreates at that scale on a `Reset` or a window
+    /// resize), else the stored snapshot.
+    fn live_render_scale(&self) -> RenderScale {
+        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+            // SAFETY: `device_inner` is the live owning device (see above).
+            unsafe { (*self.device_inner).render_scale() }
+        } else {
+            self.standalone_render_scale
         }
     }
 
