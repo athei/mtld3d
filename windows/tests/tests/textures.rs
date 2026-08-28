@@ -9,11 +9,11 @@ use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_NO_DIRTY_UPDATE,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP,
-    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -413,6 +413,128 @@ fn scratch_extension_cubes_are_cpu_only_resources() {
             "GPU extension cube remains unsupported",
         );
     }
+}
+
+/// A `D3DPOOL_SYSTEMMEM` texture is created CPU-side and samples once bound.
+///
+/// The pool allocates no Metal texture, so a texture an application only locks
+/// or copies from never reaches the GPU. D3D9 does sample one that is bound at
+/// a texture stage, so the bind is what gives it a Metal texture, carrying
+/// everything written by then; a later write reaches it like any other.
+#[test]
+fn systemmem_texture_samples_once_bound_at_a_stage() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let tex = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    tex.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        GREEN,
+        "the first bind uploads what was already written",
+    );
+    tex.lock_rect(0, 0).write_u32(&[BLUE; 4]);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        BLUE,
+        "a later write reaches the same texture",
+    );
+}
+
+/// A `D3DPOOL_SYSTEMMEM` texture reads back through `LockRect` what it wrote.
+///
+/// The pool's whole contract: the texels live in system memory, so a second
+/// lock sees the first lock's write with no device involved.
+#[test]
+fn systemmem_texture_lock_roundtrips_its_texels() {
+    const TEXELS: [u32; 4] = [0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+    let h = Harness::new();
+    let tex = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    tex.lock_rect(0, 0).write_u32(&TEXELS);
+    let locked = tex.lock_rect(0, D3DLOCK_READONLY);
+    assert_eq!(locked.pitch(), 8, "2 px * 4 bytes/px row pitch");
+    assert_eq!(
+        locked.as_u32(TEXELS.len()),
+        &TEXELS[..],
+        "the second lock reads the first lock's write",
+    );
+}
+
+/// A `D3DPOOL_SYSTEMMEM` texture keeps its texels across a `Reset`.
+///
+/// It neither blocks the reset nor is lost by it, so it is still a usable
+/// `UpdateTexture` source afterwards.
+#[test]
+fn systemmem_texture_survives_reset() {
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::new();
+    let src = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write_u32(&[RED; 4]);
+    assert_eq!(h.reset(512, 384), 0, "resize Reset with the texture alive");
+    {
+        let locked = src.lock_rect(0, D3DLOCK_READONLY);
+        assert_eq!(locked.as_u32(4), &[RED; 4][..], "texels survive the Reset");
+    }
+    assert_eq!(h.reset(640, 480), 0, "Reset back to the sampling size");
+    let dst = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        0,
+        "UpdateTexture after the Reset"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        RED,
+        "the post-Reset copy reaches the GPU",
+    );
+}
+
+/// A block-compressed volume texture exists only as a `D3DPOOL_SCRATCH` resource.
+///
+/// Metal has no 3D block-compressed texture, so a DXT volume is representable
+/// at all only because the scratch pool allocates none: it is created, locked
+/// and written entirely CPU-side. Every GPU-resident pool rejects the format.
+#[test]
+fn scratch_block_compressed_volume_is_cpu_only() {
+    let h = Harness::new();
+    let (hr, volume) = h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, D3DPOOL_SCRATCH);
+    assert_eq!(hr, 0, "SCRATCH DXT1 volume creates");
+    let volume = volume.expect("SCRATCH DXT1 volume");
+    let (hr, bits_null) = volume.lock_box_probe(0, 0);
+    assert_eq!(hr, 0, "LockBox on a scratch volume");
+    assert!(!bits_null, "a successful lock hands out a pointer");
+    assert_eq!(volume.unlock_box(0), 0, "UnlockBox");
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+        let (hr, _) = h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, pool);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "DXT1 volume in pool {pool}");
+    }
+    // The device still renders after the scratch volume has been created.
+    h.render_once(BLACK, |_| {});
+    assert_eq!(h.read_pixel(320, 240), BLACK, "the frame after the create");
+}
+
+/// No system-memory surface can be a render target.
+///
+/// `SetRenderTarget` requires a destination carrying `D3DUSAGE_RENDERTARGET`,
+/// which neither CPU-only pool can, whether the surface is a standalone
+/// offscreen-plain one or a texture level.
+#[test]
+fn system_memory_surfaces_are_rejected_as_render_targets() {
+    let h = Harness::new();
+    for pool in [D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+        let surface = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(
+            h.set_render_target(0, &surface),
+            D3DERR_INVALIDCALL,
+            "offscreen-plain surface in pool {pool}",
+        );
+    }
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.set_render_target(0, &tex.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "SYSTEMMEM texture level",
+    );
 }
 
 #[test]

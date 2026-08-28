@@ -72,7 +72,12 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Resources**: DXT1–5 and ATI1 compressed textures, the common uncompressed
   integer and float formats, cube and volume textures, mipmap auto-generation,
   managed-pool dirty-region uploads, StretchRect (including cross-format blits
-  via a conversion pass and YUY2/UYVY to RGB decoding), GetDC read-back.
+  via a conversion pass and YUY2/UYVY to RGB decoding), GetDC read-back. The
+  two system-memory pools, `D3DPOOL_SYSTEMMEM` and `D3DPOOL_SCRATCH`, hold
+  their bytes CPU-side and allocate no Metal texture, so a resource that
+  only Locks, feeds `UpdateTexture` / `UpdateSurface` or receives
+  `GetRenderTargetData` costs no video memory; binding one for sampling,
+  which D3D9 permits, allocates one then.
 - **Depth**: sampleable depth textures (INTZ, DF16, DF24) with hardware
   shadow-compare PCF, depth bias and slope-scale bias, depth clamp for
   pre-transformed geometry.
