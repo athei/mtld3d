@@ -123,9 +123,11 @@ impl FormatMapping {
 
 /// Friendly name for a D3DFMT_* code.
 ///
-/// Returns `"D3DFMT_<code>"` for formats not in the canonical mtld3d mapping
-/// table — keeps log lines readable for both supported and unmapped formats
-/// without callers needing to special-case "unknown".
+/// A mapped format renders as its bare name (`"A8R8G8B8"`); anything outside
+/// the canonical mtld3d mapping table renders as the fixed string
+/// `"D3DFMT_unknown"`. The function is `const` and returns a `&'static str`,
+/// so it cannot render the code itself: a log line that has to identify an
+/// unmapped format prints the raw code beside the name.
 #[must_use]
 pub const fn format_name(d3d_format: u32) -> &'static str {
     match d3d_format {
