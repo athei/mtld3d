@@ -4627,3 +4627,78 @@ fn a_clear_only_pass_does_not_fold_past_a_depth_resolve_into_its_target() {
         "the draw after the resolve loads what it wrote"
     );
 }
+
+/// A multisampled extra-target binding sized like the back buffer.
+fn msaa_slot(
+    texture: MetalHandle<MTLTextureKind>,
+    msaa_texture: MetalHandle<MTLTextureKind>,
+    size: (u32, u32),
+) -> ExtraColorSlot {
+    ExtraColorSlot {
+        texture,
+        msaa_texture,
+        msaa_srgb_texture: MetalHandle::NULL,
+        sample_count: 4,
+        subresource: 0,
+        size: (0, 0),
+        logical_size: size,
+        format: BB_FORMAT,
+        scale: RenderScale::IDENTITY,
+        has_alpha: false,
+    }
+}
+
+#[test]
+fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
+    // Clear(rt) -> a pass that resolves its multisampled companion into rt ->
+    // draw into rt. Rule E may not move the clear into the last pass's load
+    // action: the resolve lands between them, and a clear moved past it would
+    // wipe what it wrote.
+    let rt = tex(0x3200);
+    let rt_msaa = tex(0x3201);
+    let scene = tex(0x3202);
+    let scene_msaa = tex(0x3203);
+    let mut s = fresh();
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(rt_msaa, MetalHandle::NULL, 4);
+    s.clear_color(1, 2, 3, 4);
+    // Switching the target materialises the clear as a pass of its own.
+    s.set_color_render_target(
+        scene,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(scene_msaa, MetalHandle::NULL, 4);
+    s.set_extra_color_render_target(1, Some(msaa_slot(rt, rt_msaa, BB_SIZE)));
+    s.emit_command(dummy_draw());
+    // The read a `StretchRect` out of rt performs takes the resolve on the
+    // pass that last rendered into its companion.
+    s.note_msaa_read(rt);
+    s.set_extra_color_render_target(1, None);
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(rt_msaa, MetalHandle::NULL, 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(
+        s.passes()[1].extra_color()[0].resolve_texture(),
+        rt,
+        "the middle pass resolves into the cleared target"
+    );
+    s.coalesce_clear_only_passes();
+
+    assert_eq!(
+        s.passes().len(),
+        3,
+        "the clear-only pass stays where it was"
+    );
+    assert!(
+        matches!(s.passes()[0].color_load(), ColorLoad::Clear { .. }),
+        "the clear lands before the resolve"
+    );
+    assert!(
+        matches!(s.passes()[2].color_load(), ColorLoad::Load),
+        "the draw after the resolve loads what it wrote"
+    );
+}
