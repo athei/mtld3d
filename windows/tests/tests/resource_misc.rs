@@ -10,8 +10,8 @@ use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
     D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
     D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
-    E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY,
+    D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -458,6 +458,44 @@ fn available_texture_mem_tracks_standalone_surfaces() {
         h.available_texture_mem(),
         base,
         "releasing the render target gives its bytes back"
+    );
+}
+
+/// A `D3DUSAGE_DEPTHSTENCIL` texture is charged like a colour texture.
+///
+/// `CreateTexture` with a depth format hands out a `D3DPOOL_DEFAULT` texture
+/// (a sampleable shadow map), which the texture registry charges from its mip
+/// chain's row pitches. A single 2048x2048 D24S8 level is 16 MiB in the
+/// application's own format, whatever the Metal texture behind it is.
+#[test]
+fn available_texture_mem_tracks_depth_textures() {
+    const TEXTURE_BYTES: u32 = 2048 * 2048 * 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(
+        base > TEXTURE_BYTES,
+        "budget {base} leaves room for the depth texture"
+    );
+    {
+        let _tex = h.create_texture(
+            2048,
+            2048,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D24S8,
+            D3DPOOL_DEFAULT,
+        );
+        assert_eq!(
+            h.available_texture_mem(),
+            base - TEXTURE_BYTES,
+            "a depth-stencil texture costs its own bytes"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the depth-stencil texture gives its bytes back"
     );
 }
 

@@ -629,8 +629,11 @@ pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
 /// that has a Metal depth mapping has a size here, so a depth surface is
 /// never charged zero bytes. The Metal texture behind it is wider for the
 /// 24-bit family, which is a substitution of ours and not part of the budget
-/// an application sizes from.
-const fn depth_format_bytes_per_pixel(d3d_format: u32) -> Option<u32> {
+/// an application sizes from. Both the standalone-surface charge in
+/// `surface_bytes` and the per-level row pitch a depth texture is sized with
+/// read this one table.
+#[must_use]
+pub const fn depth_format_bytes_per_pixel(d3d_format: u32) -> Option<u32> {
     match d3d_format {
         D3DFMT_D16 | D3DFMT_D16_LOCKABLE | D3DFMT_D15S1 | D3DFMT_DF16 => Some(2),
         D3DFMT_D32 | D3DFMT_D32F_LOCKABLE | D3DFMT_D24X8 | D3DFMT_D24S8 | D3DFMT_D24X4S4
