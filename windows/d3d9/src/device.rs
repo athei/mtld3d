@@ -5645,16 +5645,26 @@ extern "system" fn device_update_surface(
         // SAFETY: `dst_parent` is a live `Direct3DTexture9` whose refcount keeps
         // it alive while the destination surface is alive.
         let tex = unsafe { &mut *dst_parent };
-        // An `UpdateSurface` destination is a `D3DPOOL_DEFAULT` surface of the
-        // source's format. The copy below reinterprets the source bytes in the
-        // destination's mip layout rather than converting them, so a format
-        // mismatch would land decoded-as-garbage pixels; a managed or
-        // system-memory destination has its own upload path and never takes
-        // this one.
-        if tex.d3d_pool() != D3DPOOL_DEFAULT || tex.d3d_format() != src_fmt {
+        // An `UpdateSurface` destination is a `D3DPOOL_DEFAULT` surface; a
+        // managed or system-memory destination has its own upload path and
+        // never takes this one.
+        if tex.d3d_pool() != D3DPOOL_DEFAULT {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
-                "reject UpdateSurface: destination pool/format mismatch → INVALIDCALL"
+                "reject UpdateSurface: destination pool is not D3DPOOL_DEFAULT → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        }
+        // D3D9 accepts a source and a destination of different formats and
+        // converts. The copy below re-encodes such a pair through the CPU
+        // codec, which covers the simple uncompressed colour formats; a pair
+        // outside it has no conversion to run, so it is the one mismatch still
+        // rejected.
+        let dst_fmt = tex.d3d_format();
+        if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert(src_fmt, dst_fmt) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: no conversion for src=0x{src_fmt:x} into dst=0x{dst_fmt:x} → INVALIDCALL"
             );
             return D3DERR_INVALIDCALL;
         }
@@ -5663,13 +5673,14 @@ extern "system" fn device_update_surface(
             pitch: src_pitch,
             width: src_w,
             height: src_h,
+            format: src_fmt,
         };
         let copied = if let Some(face) = dst_surf.cube_face() {
             tex.inner_mut()
-                .copy_bytes_to_cube_staging_region(face, dst_level, &image, rect, point)
+                .update_bytes_to_cube_staging_region(face, dst_level, &image, rect, point)
         } else {
             tex.inner_mut()
-                .copy_bytes_to_staging_region(dst_level, &image, rect, point)
+                .update_bytes_to_staging_region(dst_level, &image, rect, point)
         };
         if !copied {
             mtld3d_shared::log_once_warn!(
