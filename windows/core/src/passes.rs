@@ -1042,15 +1042,19 @@ pub struct PassState {
     /// map for its command scans. Maintained by the encoder's texture
     /// create / rename / destroy paths.
     srgb_twin_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
-    /// Session-wide set of texture handles that were EVER bound as a sampleable depth attachment.
+    /// Live texture handles that were bound as a sampleable depth attachment.
     ///
-    /// The bind runs via
-    /// `set_depth_stencil_attachment(_, is_sampleable=true)`. The
-    /// `mtld3d::d3d9::cascade=trace` end-of-frame summary uses this to
-    /// classify fragment-sample binds: a `SetFragmentTexture` of a
-    /// handle in this set is a cascade-depth read, and is counted
-    /// into `frame_cascade_samples`. Persistent across frames
-    /// (textures are stable resource identities).
+    /// The bind runs via `set_depth_stencil_attachment(_,
+    /// is_sampleable=true)`. The `mtld3d::d3d9::cascade=trace` end-of-frame
+    /// summary uses this to classify fragment-sample binds: a
+    /// `SetFragmentTexture` of a handle in this set is a cascade-depth read,
+    /// and is counted into `frame_cascade_samples`.
+    ///
+    /// Entries outlive the frame that made them, because a cascade is
+    /// sampled frames after it was rendered, but not the texture itself:
+    /// `unregister_sampleable_depth` drops a handle when the encoder retires
+    /// the `MTLTexture` behind it, so a later allocation that lands on the
+    /// same address is not mistaken for the cascade that used to live there.
     seen_sampleable_depth_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Per-frame counter: how many caster draws targeted each cascade depth handle.
     ///
@@ -1417,15 +1421,29 @@ impl PassState {
             .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
     }
 
-    /// `true` when `depth_tex` was bound as a sampleable shadow map at any point this session.
+    /// `true` when `depth_tex` is a live handle bound as a sampleable shadow map this session.
     ///
-    /// Built for diagnostic probes that want to identify cascade-depth writes
-    /// regardless of the current `is_sampleable` flag, which can be
-    /// incorrectly `false` after a `GetDepthStencilSurface` save/restore cycle
-    /// on a cascade surface (see `note_caster_draw` doc).
+    /// Built for diagnostic probes that classify a handle by what it is,
+    /// independently of what the current bind says: `is_sampleable` describes
+    /// the surface bound right now, so it reads `false` for every draw that
+    /// runs while the scene depth rather than a cascade is attached.
     #[must_use]
     pub fn is_depth_handle_sampleable(&self, depth_tex: MetalHandle<MTLTextureKind>) -> bool {
         self.seen_sampleable_depth_textures.contains(&depth_tex)
+    }
+
+    /// Drop `texture` from the sampleable-depth set as its `MTLTexture` is retired.
+    ///
+    /// Called by the encoder from every path that hands a texture handle to
+    /// the retention queue (resource release and rename-at-overlap), so the
+    /// set never names an address Metal is free to hand back for an unrelated
+    /// allocation. A no-op for a handle that was never a sampleable depth
+    /// attachment, which is the common case.
+    pub fn unregister_sampleable_depth(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if texture.is_null() {
+            return;
+        }
+        self.seen_sampleable_depth_textures.remove(&texture);
     }
 
     #[must_use]
@@ -1782,15 +1800,11 @@ impl PassState {
     ///
     /// Increments the per-frame caster-writes counter iff the handle was ever
     /// bound as a sampleable shadow map this session — i.e. it's a known
-    /// cascade texture. Filtering on the persistent
-    /// `seen_sampleable_depth_textures` set rather than the per-binding
-    /// `current_depth_is_sampleable` flag is intentional:
-    /// `GetDepthStencilSurface` returns a surface with `parent_texture: null`,
-    /// so a save/restore cycle of a cascade depth surface lands in the `Eager`
-    /// branch of `device_set_depth_stencil_surface` with `is_sampleable=false`
-    /// — but the underlying Metal handle is the same cascade we marked
-    /// earlier. Caller can therefore unconditionally call this with the
-    /// current depth handle; non-cascade binds filter out here.
+    /// cascade texture. Filtering on `seen_sampleable_depth_textures` rather
+    /// than the per-binding `current_depth_is_sampleable` flag is what makes
+    /// the counter a property of the texture: the caller has one depth handle
+    /// and no idea whether it names a cascade, so it calls unconditionally
+    /// and non-cascade binds filter out here.
     pub fn note_caster_draw(&mut self, depth_tex: MetalHandle<MTLTextureKind>) {
         if !log_enabled!(target: CASCADE_PROBE_TARGET, Level::Trace) {
             return;
@@ -2348,19 +2362,22 @@ impl PassState {
         is_sampleable: bool,
         has_stencil: bool,
     ) {
+        // Sampleability is a property of the texture, so the caller must
+        // report the same answer for every bind of one handle: the D3D9
+        // boundary derives the flag from the surface's owning texture, not
+        // from which bind path the surface took. Were a handle to come back
+        // with the flag cleared, the rebind would break the pass (an encoder
+        // close/open, Load+Store of every attachment) and drop Rule B's
+        // keep-Store exemption for a cascade that is still sampled later.
+        debug_assert!(
+            is_sampleable
+                || texture.is_null()
+                || !self.seen_sampleable_depth_textures.contains(&texture),
+            "depth handle {texture:#x} rebound as non-sampleable after a sampleable bind",
+        );
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
-        // A cascade depth surface saved and restored through
-        // `GetDepthStencilSurface` comes back via the `Eager` bind path with
-        // `is_sampleable = false` — the returned surface carries
-        // `parent_texture = null` — even though the underlying Metal texture is
-        // the same sampleable shadow map. Resolve the flag against the
-        // session-wide "ever sampleable" set so such a rebind neither breaks
-        // the pass (an encoder close/open, Load+Store of every attachment) nor
-        // clears Rule B's keep-Store exemption for the cascade.
-        let is_sampleable = is_sampleable
-            || (!texture.is_null() && self.seen_sampleable_depth_textures.contains(&texture));
         // `has_stencil` is a property of the bound texture's format, so a
         // repeat bind of the same texture carries the same value — fold it
         // before the no-change early-out below.
