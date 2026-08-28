@@ -6,6 +6,7 @@ use mtld3d_core::{
     ids::TextureId,
     page_box::PageBox,
     render_scale::RenderScale,
+    staging_coverage::StagingCoverage,
     texture_staging::{LockAction, MipShape, PreserveKind, decide_lock_action},
 };
 use mtld3d_shared::{
@@ -275,6 +276,15 @@ pub struct TextureInner {
     /// [`TextureInner::staging_droppable`]; `staging[N]` then holds the
     /// shared placeholder page until a write re-creates the level.
     dropped_staging: u32,
+    /// Per-level union of the writes that landed since the level's staging was allocated.
+    ///
+    /// The staging can only be released once the GPU holds every byte of the
+    /// level, which several partial writes reach as surely as one whole-level
+    /// one, so the drop reads the accumulated union rather than the rect of a
+    /// single upload. Empty for a texture whose class can never release its
+    /// staging ([`TextureInner::staging_droppable_class`]), which pays neither
+    /// the memory nor the bookkeeping.
+    staging_coverage: Vec<StagingCoverage>,
     /// `LockRect(D3DLOCK_READONLY)` stash per mip.
     ///
     /// Suppresses the upload at `UnlockRect` so a game's read-only inspection
@@ -427,6 +437,27 @@ impl TextureInner {
     /// textures, cubes and volumes keep theirs (their copies serve other
     /// paths); so do the lockable pools.
     fn staging_droppable(&self, level: usize) -> bool {
+        self.staging_droppable_class()
+            && self.dropped_staging & (1u32 << level) == 0
+            && !self.locked[level]
+    }
+
+    /// Whether every texel of `level` has been written since its staging was allocated.
+    ///
+    /// A level that still holds bytes the GPU never received keeps its staging:
+    /// releasing it would leave the level's only copy of them nowhere.
+    fn staging_fully_written(&self, level: usize) -> bool {
+        self.staging_coverage
+            .get(level)
+            .is_some_and(StagingCoverage::is_full)
+    }
+
+    /// The texture-wide half of [`Self::staging_droppable`]: pool, usage and shape.
+    ///
+    /// None of it changes after creation except the offscreen-plain mark, which
+    /// only ever narrows the class, so a texture outside it at creation stays
+    /// outside it and needs no coverage tracking at all.
+    const fn staging_droppable_class(&self) -> bool {
         self.d3d_pool == D3DPOOL_DEFAULT
             && self.d3d_usage
                 & (D3DUSAGE_DYNAMIC
@@ -437,8 +468,6 @@ impl TextureInner {
             && !self.flags.contains(TextureFlags::OFFSCREEN_PLAIN)
             && !self.flags.contains(TextureFlags::DEPTH_FORMAT)
             && self.depth <= 1
-            && self.dropped_staging & (1u32 << level) == 0
-            && !self.locked[level]
     }
 
     /// Mark the texture as the backing of an offscreen-plain surface.
@@ -450,6 +479,17 @@ impl TextureInner {
     fn drop_staging(&mut self, level: usize) {
         self.staging[level] = dropped_staging_placeholder();
         self.dropped_staging |= 1u32 << level;
+        self.reset_staging_coverage(level);
+    }
+
+    /// Forget what the level's staging held, because it no longer holds it.
+    ///
+    /// A released, re-created or unpreserved-renamed allocation carries none of
+    /// the pixels the recorded rects describe, so the union starts empty again.
+    fn reset_staging_coverage(&mut self, level: usize) {
+        if let Some(coverage) = self.staging_coverage.get_mut(level) {
+            coverage.reset();
+        }
     }
 
     /// Give `level` a staging buffer again before a write lands in it.
@@ -465,6 +505,7 @@ impl TextureInner {
         let len = (self.mip_bytes_per_row[level] as usize).saturating_mul(block_rows as usize);
         self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
         self.dropped_staging &= !(1u32 << level);
+        self.reset_staging_coverage(level);
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET,
             key: self.texture_id.raw(),
@@ -1623,6 +1664,9 @@ impl TextureInner {
                         // Explicit DISCARD or whole-mip DYNAMIC:
                         // game promised it won't read, and the
                         // encoder's blit only reads the locked rect.
+                        // The fresh allocation carries none of the old
+                        // pixels, so the written union starts over.
+                        self.reset_staging_coverage(level);
                         if perf_attached {
                             DeviceInner::from_ptr(dev_inner_raw)
                                 .perf_mut()
@@ -1714,6 +1758,9 @@ impl TextureInner {
             if let Some(slot) = self.pending_upload_rects.get_mut(level) {
                 *slot = None;
             }
+            if let Some(coverage) = self.staging_coverage.get_mut(level) {
+                coverage.mark_full();
+            }
         }
     }
 
@@ -1724,6 +1771,10 @@ impl TextureInner {
     pub fn mark_mip_dirty_rect(&mut self, level: usize, rect: DirtyRect) {
         if level >= (self.levels as usize).min(32) {
             return;
+        }
+        let (level_w, level_h) = (self.mip_widths[level], self.mip_heights[level]);
+        if let Some(coverage) = self.staging_coverage.get_mut(level) {
+            coverage.add(rect, level_w, level_h);
         }
         let already_full = self.dirty_mask & (1 << level) != 0
             && self
@@ -2037,6 +2088,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         priority: 0,
         staging,
         dropped_staging: 0,
+        staging_coverage: Vec::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
         mip_bytes_per_row: info.mip_bytes_per_row,
@@ -2056,6 +2108,13 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         private_data: PrivateDataStore::default(),
         subresources: Vec::new(),
     });
+    // Only a texture whose class can release its staging tracks what has been
+    // written into it; every other one keeps an empty Vec.
+    if boxed.staging_droppable_class() {
+        boxed.staging_coverage = core::iter::repeat_with(StagingCoverage::new)
+            .take(boxed.staging.len())
+            .collect();
+    }
     // A default-pool static texture's staging only carries writes to the
     // GPU, and a streaming engine creates far more textures than it ever
     // writes through this device. Release the pages now and let
@@ -3053,14 +3112,11 @@ fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rec
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
     ti.last_submit_seq[level as usize] = dev.current_seq();
     ti.was_uploaded[level as usize] = true;
-    // A whole-level upload of a texture the game cannot lock again: the job
-    // holds its own `Arc` of the staging, so the texture's copy can go now.
-    if rect.x == 0
-        && rect.y == 0
-        && rect.w == ti.mip_widths[level_u]
-        && rect.h == ti.mip_heights[level_u]
-        && ti.staging_droppable(level_u)
-    {
+    // Every byte of a level the game cannot lock again is now on the GPU: each
+    // write since the staging was allocated was uploaded by the flush that
+    // followed it, this one included, and together they cover the level. The
+    // job holds its own `Arc` of the staging, so the texture's copy can go now.
+    if ti.staging_droppable(level_u) && ti.staging_fully_written(level_u) {
         ti.drop_staging(level_u);
     }
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {

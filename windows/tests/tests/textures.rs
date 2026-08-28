@@ -2,15 +2,18 @@
 //!
 //! Plus cube and volume texture contracts.
 
-use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq};
+use mtld3d_tests::{
+    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq,
+};
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE,
-    D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_NO_DIRTY_UPDATE,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP,
+    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -648,6 +651,110 @@ fn default_pool_texture_takes_a_second_update_after_its_upload() {
     src.lock_rect(0, 0).write::<u32>(&[GREEN; 4]);
     assert_eq!(h.update_texture_hr(&src, &dst), 0, "second UpdateTexture");
     assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "second fill");
+}
+
+/// Fill `w` x `h` texels of a locked sub-rect with `color`, honouring its row pitch.
+fn fill_locked_rect(locked: &LockedRect<'_>, w: usize, h: usize, color: u32) {
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+    let base = locked.bits_ptr();
+    let row = vec![color; w];
+    for y in 0..h {
+        // SAFETY: the lock maps `h` rows of at least `w` texels at `base` with
+        // `pitch` row stride, so row `y` starts inside the mapping.
+        let dst = unsafe { base.add(y * pitch) };
+        // SAFETY: `w` texels are 4 bytes each and fit in the locked row above.
+        unsafe { core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, w * 4) };
+    }
+}
+
+/// Bind `tex`, sample it across the backbuffer, return the four quadrant centres.
+///
+/// Clockwise from the top left, the order [`QUADRANTS`] lists them in.
+fn sample_quadrants(h: &Harness, tex: &Texture<'_>) -> [u32; 4] {
+    assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample draw"
+        );
+    });
+    [
+        h.read_pixel(160, 120),
+        h.read_pixel(480, 120),
+        h.read_pixel(480, 360),
+        h.read_pixel(160, 360),
+    ]
+}
+
+/// The four quadrants of a 64x64 level: colour, source rect, name.
+const QUADRANTS: [(u32, [i32; 4], &str); 4] = [
+    (0xFFFF_0000, [0, 0, 32, 32], "top left"),
+    (0xFF00_FF00, [32, 0, 64, 32], "top right"),
+    (0xFF00_00FF, [32, 32, 64, 64], "bottom right"),
+    (0xFFFF_FF00, [0, 32, 32, 64], "bottom left"),
+];
+
+/// Partial updates that together cover a default-pool level leave it whole.
+///
+/// Each `UpdateTexture` carries one quadrant, so no single upload covers the
+/// level and the staging is only released once the four of them do. What
+/// samples back afterwards must still be the four quadrants, and a fifth
+/// partial update landing after the release must reach the GPU without
+/// disturbing the three quadrants it does not touch.
+#[test]
+fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
+    const SIZE: u32 = 64;
+    const BASE: u32 = 0xFF80_8080;
+    const REPAINT: u32 = 0xFF00_FFFF;
+    let h = Harness::new();
+    let src = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    src.lock_rect(0, 0)
+        .write_u32(&[BASE; (SIZE * SIZE) as usize]);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        0,
+        "whole-level UpdateTexture"
+    );
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), BASE, "base fill");
+
+    for (color, rect, name) in QUADRANTS {
+        {
+            let locked = src.lock_rect_partial(0, &rect, D3DLOCK_NO_DIRTY_UPDATE);
+            fill_locked_rect(&locked, 32, 32, color);
+        }
+        assert_eq!(src.add_dirty_rect_partial(&rect), 0, "AddDirtyRect {name}");
+        assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture {name}");
+    }
+    let sampled = sample_quadrants(&h, &dst);
+    for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate() {
+        assert_pixel_eq(sampled[i], color, name);
+    }
+
+    // The four writes covered the level, so its staging is gone. A fifth
+    // partial update re-creates it and must upload only its own rect: the
+    // pixels the GPU already holds are the only copy of the other three.
+    let (_, rect, name) = QUADRANTS[0];
+    {
+        let locked = src.lock_rect_partial(0, &rect, D3DLOCK_NO_DIRTY_UPDATE);
+        fill_locked_rect(&locked, 32, 32, REPAINT);
+    }
+    assert_eq!(src.add_dirty_rect_partial(&rect), 0, "AddDirtyRect repaint");
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture repaint");
+    let repainted = sample_quadrants(&h, &dst);
+    assert_pixel_eq(repainted[0], REPAINT, name);
+    for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(repainted[i], color, name);
+    }
 }
 
 #[test]
