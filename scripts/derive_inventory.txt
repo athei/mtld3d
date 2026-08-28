@@ -103,6 +103,7 @@ windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs ProgramId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs TextureId Clone,Copy,PartialEq,Eq,Hash,Debug
+windows/core/src/level_authority.rs WritePlan Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/multisample.rs MultiSampleReject Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
