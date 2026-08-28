@@ -94,7 +94,7 @@ use super::{
     shader_bindings::{CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT, ShaderBindings},
     stage_bindings::{STAGE_COUNT, StageBindings, TextureSwapDelta},
     state_block::{RecordingStateBlock, StateOp},
-    surface::Direct3DSurface9,
+    surface::{ColorTargetCreateInfo, Direct3DSurface9},
     texture::{
         CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags,
         TextureInner, new_uninit_page_box,
@@ -4944,16 +4944,16 @@ fn create_color_target_surface(
     if unix_call(&mut params) != 0 || params.texture_handle.is_null() {
         return None;
     }
-    let surf = Direct3DSurface9::new_color_target(
+    let surf = Direct3DSurface9::new_color_target(&ColorTargetCreateInfo {
         device_inner,
-        params.texture_handle,
-        params.srgb_texture_handle,
+        metal_color_handle: params.texture_handle,
+        metal_color_srgb_handle: params.srgb_texture_handle,
         width,
         height,
         format,
         usage,
-        scale,
-    );
+        render_scale: scale,
+    });
     // The surface owns a DEFAULT-pool Metal texture no `TextureInner` covers,
     // so charge it here; `finalize_surface`'s colour retire arm refunds it.
     // SAFETY: `device_inner` is the live owning device, non-null for every

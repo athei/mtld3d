@@ -128,6 +128,25 @@ pub struct Direct3DSurface9 {
     inner: *mut SurfaceInner,
 }
 
+/// Everything `Direct3DSurface9::new_color_target` needs to build the surface.
+///
+/// `metal_color_srgb_handle` is the eager sRGB twin view of
+/// `metal_color_handle` and is null when the format has no sRGB counterpart.
+/// `width` and `height` are the logical extent `GetDesc` reports;
+/// `render_scale` is the factor the Metal texture was allocated at. `usage` is
+/// `D3DUSAGE_RENDERTARGET` for a render target and `0` for an offscreen-plain
+/// `D3DPOOL_DEFAULT` surface.
+pub struct ColorTargetCreateInfo {
+    pub device_inner: *mut DeviceInner,
+    pub metal_color_handle: MetalHandle<MTLTextureKind>,
+    pub metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub usage: u32,
+    pub render_scale: RenderScale,
+}
+
 impl Direct3DSurface9 {
     /// Standalone color render-target surface.
     ///
@@ -135,32 +154,21 @@ impl Direct3DSurface9 {
     /// with `D3DPOOL_DEFAULT`. Wraps a persistent render-target-capable
     /// `MTLTexture` via `metal_color_handle`, identical to the backbuffer
     /// surface, so `StretchRect` and `GetRenderTargetData` resolve it for free.
-    /// `usage` is `D3DUSAGE_RENDERTARGET` for a render target, `0` for an
-    /// offscreen-plain `D3DPOOL_DEFAULT` surface.
-    pub fn new_color_target(
-        device_inner: *mut DeviceInner,
-        metal_color_handle: MetalHandle<MTLTextureKind>,
-        metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
-        width: u32,
-        height: u32,
-        format: u32,
-        usage: u32,
-        render_scale: RenderScale,
-    ) -> Self {
+    pub fn new_color_target(info: &ColorTargetCreateInfo) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
-            device_inner,
+            device_inner: info.device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
             cube_face: u32::MAX,
-            standalone_width: width,
-            standalone_height: height,
-            standalone_render_scale: render_scale,
-            standalone_format: format,
-            standalone_usage: usage,
+            standalone_width: info.width,
+            standalone_height: info.height,
+            standalone_render_scale: info.render_scale,
+            standalone_format: info.format,
+            standalone_usage: info.usage,
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
-            metal_color_handle,
-            metal_color_srgb_handle,
+            metal_color_handle: info.metal_color_handle,
+            metal_color_srgb_handle: info.metal_color_srgb_handle,
             readback: None,
             dc_shim: None,
             system_memory: None,
