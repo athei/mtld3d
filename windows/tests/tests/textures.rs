@@ -414,7 +414,12 @@ fn default_pool_texture_lock_splits_by_entry_point() {
         hr, D3DERR_INVALIDCALL,
         "surface LockRect on a static DEFAULT level"
     );
-    assert!(bits_null, "the rejected surface lock hands out no pointer");
+    // A rejected lock leaves the struct untouched, so the garbage seed the
+    // probe plants is still there and reads as a non-null pointer.
+    assert!(
+        !bits_null,
+        "the rejected surface lock leaves pBits untouched"
+    );
     let (hr, bits_null) = tex.lock_rect_probe(0, 0);
     assert_eq!(hr, 0, "texture LockRect serves the same level");
     assert!(!bits_null, "the served lock hands out a pointer");
