@@ -6,16 +6,18 @@
 //! the packed key layout by bit position, the 1:1 filter mapping (no implicit
 //! promote), and that `params_from_snapshot` agrees with the key it was given.
 
+use mtld3d_types::{D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_NONE};
+
 use super::*;
 
 fn base() -> SamplerSnapshot {
     SamplerSnapshot {
-        min_filter: 2, // D3DTEXF_LINEAR
-        mag_filter: 2, // D3DTEXF_LINEAR
-        mip_filter: 2, // D3DTEXF_LINEAR
-        address_u: 1,  // D3DTADDRESS_WRAP
-        address_v: 1,  // D3DTADDRESS_WRAP
-        address_w: 1,  // D3DTADDRESS_WRAP
+        min_filter: D3DTEXF_LINEAR,
+        mag_filter: D3DTEXF_LINEAR,
+        mip_filter: D3DTEXF_LINEAR,
+        address_u: D3DTADDRESS_WRAP,
+        address_v: D3DTADDRESS_WRAP,
+        address_w: D3DTADDRESS_WRAP,
         max_anisotropy: 1,
         max_mip_level: 0,
         border_color: 0,
@@ -96,8 +98,8 @@ fn raw_filters_pass_through_1_to_1() {
     // Sampler translation is identity — no LINEAR→ANISO or NONE→LINEAR
     // promote. Verify each raw filter value lands unchanged in the key.
     let mut s = base();
-    s.min_filter = 2; // D3DTEXF_LINEAR
-    s.mip_filter = 0; // D3DTEXF_NONE
+    s.min_filter = D3DTEXF_LINEAR;
+    s.mip_filter = D3DTEXF_NONE;
     s.max_anisotropy = 1;
     let k = key_from_snapshot(&s);
     assert_eq!(k.raw() & 0xF, 2, "min_filter raw=LINEAR preserved");

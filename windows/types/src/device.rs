@@ -1,6 +1,9 @@
 use core::ffi::c_void;
 
-use super::Guid;
+use super::{
+    Guid,
+    ff::{D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL},
+};
 
 // ── D3D9 render state indices ──
 
@@ -373,6 +376,36 @@ pub const D3DSTENCILOP_INVERT: u32 = 6;
 pub const D3DSTENCILOP_INCR: u32 = 7;
 pub const D3DSTENCILOP_DECR: u32 = 8;
 
+// ── D3D9 depth-buffer types (`D3DRS_ZENABLE` value space) ──
+
+pub const D3DZB_FALSE: u32 = 0;
+pub const D3DZB_TRUE: u32 = 1;
+pub const D3DZB_USEW: u32 = 2;
+
+// ── D3D9 fog modes (`D3DRS_FOGTABLEMODE` / `D3DRS_FOGVERTEXMODE`) ──
+
+pub const D3DFOG_NONE: u32 = 0;
+pub const D3DFOG_EXP: u32 = 1;
+pub const D3DFOG_EXP2: u32 = 2;
+pub const D3DFOG_LINEAR: u32 = 3;
+
+// ── D3D9 patch edge styles (`D3DRS_PATCHEDGESTYLE`) ──
+
+pub const D3DPATCHEDGE_DISCRETE: u32 = 0;
+pub const D3DPATCHEDGE_CONTINUOUS: u32 = 1;
+
+// ── D3D9 debug monitor tokens (`D3DRS_DEBUGMONITORTOKEN`) ──
+
+pub const D3DDMT_ENABLE: u32 = 0;
+pub const D3DDMT_DISABLE: u32 = 1;
+
+// ── D3D9 N-patch degrees (`D3DRS_POSITIONDEGREE` / `D3DRS_NORMALDEGREE`) ──
+
+pub const D3DDEGREE_LINEAR: u32 = 1;
+pub const D3DDEGREE_QUADRATIC: u32 = 2;
+pub const D3DDEGREE_CUBIC: u32 = 3;
+pub const D3DDEGREE_QUINTIC: u32 = 5;
+
 // ── Render state count ──
 
 pub const RENDER_STATE_COUNT: usize = 210;
@@ -586,7 +619,7 @@ impl StateBlockType {
 pub const fn render_state_defaults() -> [u32; RENDER_STATE_COUNT] {
     let mut rs = [0u32; RENDER_STATE_COUNT];
 
-    rs[D3DRS_ZENABLE as usize] = 1; // D3DZB_TRUE (when depth buffer present)
+    rs[D3DRS_ZENABLE as usize] = D3DZB_TRUE; // when a depth buffer is present
     rs[D3DRS_FILLMODE as usize] = D3DFILL_SOLID;
     rs[D3DRS_SHADEMODE as usize] = D3DSHADE_GOURAUD;
     rs[D3DRS_ZWRITEENABLE as usize] = 1; // TRUE
@@ -603,7 +636,7 @@ pub const fn render_state_defaults() -> [u32; RENDER_STATE_COUNT] {
     rs[D3DRS_FOGENABLE as usize] = 0; // FALSE
     rs[D3DRS_SPECULARENABLE as usize] = 0; // FALSE
     rs[D3DRS_FOGCOLOR as usize] = 0;
-    rs[D3DRS_FOGTABLEMODE as usize] = 0; // D3DFOG_NONE
+    rs[D3DRS_FOGTABLEMODE as usize] = D3DFOG_NONE;
     rs[D3DRS_FOGSTART as usize] = 0; // 0.0f
     rs[D3DRS_FOGEND as usize] = f32::to_bits(1.0);
     rs[D3DRS_FOGDENSITY as usize] = f32::to_bits(1.0);
@@ -624,14 +657,14 @@ pub const fn render_state_defaults() -> [u32; RENDER_STATE_COUNT] {
     // when the game affirmatively sets CLIPPING=TRUE at startup.
     rs[D3DRS_LIGHTING as usize] = 1; // TRUE
     rs[D3DRS_AMBIENT as usize] = 0;
-    rs[D3DRS_FOGVERTEXMODE as usize] = 0; // D3DFOG_NONE
+    rs[D3DRS_FOGVERTEXMODE as usize] = D3DFOG_NONE;
     rs[D3DRS_COLORVERTEX as usize] = 1; // TRUE
     rs[D3DRS_LOCALVIEWER as usize] = 1; // TRUE
     rs[D3DRS_NORMALIZENORMALS as usize] = 0; // FALSE
-    rs[D3DRS_DIFFUSEMATERIALSOURCE as usize] = 1; // D3DMCS_COLOR1
-    rs[D3DRS_SPECULARMATERIALSOURCE as usize] = 2; // D3DMCS_COLOR2
-    rs[D3DRS_AMBIENTMATERIALSOURCE as usize] = 0; // D3DMCS_MATERIAL
-    rs[D3DRS_EMISSIVEMATERIALSOURCE as usize] = 0; // D3DMCS_MATERIAL
+    rs[D3DRS_DIFFUSEMATERIALSOURCE as usize] = D3DMCS_COLOR1;
+    rs[D3DRS_SPECULARMATERIALSOURCE as usize] = D3DMCS_COLOR2;
+    rs[D3DRS_AMBIENTMATERIALSOURCE as usize] = D3DMCS_MATERIAL;
+    rs[D3DRS_EMISSIVEMATERIALSOURCE as usize] = D3DMCS_MATERIAL;
     rs[D3DRS_VERTEXBLEND as usize] = D3DVBF_DISABLE;
     rs[D3DRS_CLIPPLANEENABLE as usize] = 0;
     rs[D3DRS_POINTSIZE as usize] = f32::to_bits(1.0);
@@ -643,15 +676,15 @@ pub const fn render_state_defaults() -> [u32; RENDER_STATE_COUNT] {
     rs[D3DRS_POINTSCALE_C as usize] = 0; // 0.0f
     rs[D3DRS_MULTISAMPLEANTIALIAS as usize] = 1; // TRUE
     rs[D3DRS_MULTISAMPLEMASK as usize] = 0xFFFF_FFFF;
-    rs[D3DRS_PATCHEDGESTYLE as usize] = 0; // D3DPATCHEDGE_DISCRETE
-    rs[D3DRS_DEBUGMONITORTOKEN as usize] = 0; // D3DDMT_ENABLE
+    rs[D3DRS_PATCHEDGESTYLE as usize] = D3DPATCHEDGE_DISCRETE;
+    rs[D3DRS_DEBUGMONITORTOKEN as usize] = D3DDMT_ENABLE;
     rs[D3DRS_POINTSIZE_MAX as usize] = f32::to_bits(MAX_POINT_SIZE);
     rs[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = 0; // FALSE
     rs[D3DRS_COLORWRITEENABLE as usize] = 0x0000_000F; // all channels
     rs[D3DRS_TWEENFACTOR as usize] = 0; // 0.0f
     rs[D3DRS_BLENDOP as usize] = D3DBLENDOP_ADD;
-    rs[D3DRS_POSITIONDEGREE as usize] = 3; // D3DDEGREE_CUBIC
-    rs[D3DRS_NORMALDEGREE as usize] = 1; // D3DDEGREE_LINEAR
+    rs[D3DRS_POSITIONDEGREE as usize] = D3DDEGREE_CUBIC;
+    rs[D3DRS_NORMALDEGREE as usize] = D3DDEGREE_LINEAR;
     rs[D3DRS_SCISSORTESTENABLE as usize] = 0; // FALSE
     rs[D3DRS_SLOPESCALEDEPTHBIAS as usize] = 0; // 0.0f
     rs[D3DRS_ANTIALIASEDLINEENABLE as usize] = 0; // FALSE

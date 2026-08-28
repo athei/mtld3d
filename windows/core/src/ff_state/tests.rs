@@ -7,10 +7,10 @@
 //! emitter reads, and `inverse` round-tripping affine matrices while rejecting singular ones.
 
 use mtld3d_types::{
-    D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
-    D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_TEXTUREFACTOR, D3DTOP_MODULATE,
-    D3DTSS_BUMPENVMAT00, D3DTSS_COLOROP, D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT,
-    render_state_defaults,
+    D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
+    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
+    D3DRS_TEXTUREFACTOR, D3DTOP_MODULATE, D3DTSS_BUMPENVMAT00, D3DTSS_COLOROP,
+    D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{FfState, FfVsLayout, VariantFlags, VariantKey, build_fog_color_bytes};
@@ -73,8 +73,8 @@ fn projection_is_ortho_treats_negative_zero_as_zero() {
 fn table_fog_wins_over_vertex_mode_and_keys_source_on_projection() {
     let mut states = rs();
     states[D3DRS_FOGENABLE as usize] = 1;
-    states[D3DRS_FOGVERTEXMODE as usize] = 1; // D3DFOG_EXP
-    states[D3DRS_FOGTABLEMODE as usize] = 3; // D3DFOG_LINEAR
+    states[D3DRS_FOGVERTEXMODE as usize] = D3DFOG_EXP;
+    states[D3DRS_FOGTABLEMODE as usize] = D3DFOG_LINEAR;
 
     // Identity projection (4th column (0,0,0,1)) = orthographic → Z source.
     let mut ff = FfState::new();

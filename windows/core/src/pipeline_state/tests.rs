@@ -6,7 +6,17 @@
 //! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
 //! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
 
+use mtld3d_types::{
+    D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD,
+};
+
 use super::*;
+
+/// D3D enum constant at the snapshot's narrow width.
+fn narrow(v: u32) -> u8 {
+    u8::try_from(v).expect("D3D9 enum render-state value ≤ u8::MAX")
+}
 
 /// Default snapshot with sane non-zero values.
 ///
@@ -42,12 +52,12 @@ fn base() -> PipelineSnapshot {
             | PipelineAttachFlags::COLOR_HAS_ALPHA,
         rs: PipelineRsBits {
             flags: PipelineRsFlags::BLEND_ENABLE,
-            src_blend: 5,       // D3DBLEND_SRCALPHA
-            dst_blend: 6,       // D3DBLEND_INVSRCALPHA
-            blend_op: 1,        // D3DBLENDOP_ADD
-            src_blend_alpha: 2, // D3DBLEND_ONE
-            dst_blend_alpha: 1, // D3DBLEND_ZERO
-            blend_op_alpha: 1,  // D3DBLENDOP_ADD
+            src_blend: narrow(D3DBLEND_SRCALPHA),
+            dst_blend: narrow(D3DBLEND_INVSRCALPHA),
+            blend_op: narrow(D3DBLENDOP_ADD),
+            src_blend_alpha: narrow(D3DBLEND_ONE),
+            dst_blend_alpha: narrow(D3DBLEND_ZERO),
+            blend_op_alpha: narrow(D3DBLENDOP_ADD),
             color_write_mask: 0xF,
             color_write_mask_ext: [0xF; 3],
         },
@@ -131,8 +141,8 @@ fn unwritten_extra_target_gets_an_empty_write_mask() {
 #[test]
 fn extra_target_blend_factors_clamp_on_their_own_alpha() {
     let mut s = with_rt1();
-    s.rs.src_blend = 7; // D3DBLEND_DESTALPHA
-    s.rs.dst_blend = 8; // D3DBLEND_INVDESTALPHA
+    s.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    s.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
     s.extra.has_alpha_mask = 0; // RT1 is alpha-less, RT0 keeps alpha
     let attrs: [VertexAttrDesc; 0] = [];
     let layouts = vertex_layouts_from_snapshot(&s);
@@ -289,8 +299,8 @@ fn key_changes_on_every_field() {
 #[test]
 fn destination_alpha_clamps_on_no_alpha_rt() {
     let mut with_alpha = base();
-    with_alpha.rs.src_blend = 7; // D3DBLEND_DESTALPHA
-    with_alpha.rs.dst_blend = 8; // D3DBLEND_INVDESTALPHA
+    with_alpha.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    with_alpha.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
     let k_alpha = key_from_snapshot(&with_alpha);
     assert_eq!(k_alpha.src_blend, BlendFactor::DestinationAlpha);
     assert_eq!(k_alpha.dst_blend, BlendFactor::OneMinusDestinationAlpha);
@@ -306,7 +316,7 @@ fn destination_alpha_clamps_on_no_alpha_rt() {
 
     // Non-destination-alpha factors are unaffected by the RT alpha bit.
     let mut src_alpha = base();
-    src_alpha.rs.src_blend = 5; // D3DBLEND_SRCALPHA
+    src_alpha.rs.src_blend = narrow(D3DBLEND_SRCALPHA);
     let k_src = key_from_snapshot(&src_alpha);
     let mut src_alpha_no_a = src_alpha;
     src_alpha_no_a

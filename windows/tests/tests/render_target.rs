@@ -3977,7 +3977,7 @@ fn intz_carries_a_working_stencil_plane() {
     assert_eq!(
         h.set_render_state(
             mtld3d_types::D3DRS_STENCILPASS,
-            1 // D3DSTENCILOP_KEEP
+            mtld3d_types::D3DSTENCILOP_KEEP
         ),
         0
     );
