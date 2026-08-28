@@ -133,6 +133,50 @@ fn srgb_twin_table() {
     assert_eq!(ColorSpacePolicy::from_repr(2), None);
 }
 
+/// Block layouts: the BC families address 4x4 pixels, everything else one.
+#[test]
+fn block_layout_table() {
+    for (format, bytes) in [
+        (PixelFormat::A8Unorm, 1),
+        (PixelFormat::R8Unorm, 1),
+        (PixelFormat::B5G6R5Unorm, 2),
+        (PixelFormat::Bgra8Unorm, 4),
+        (PixelFormat::Bgra8UnormSrgb, 4),
+        (PixelFormat::Depth32Float, 4),
+        (PixelFormat::Rgba16Float, 8),
+        (PixelFormat::Rgba32Float, 16),
+    ] {
+        let block = format.block_layout();
+        assert_eq!(block.width(), 1, "{format:?} addresses one pixel");
+        assert_eq!(block.height(), 1, "{format:?} addresses one pixel");
+        assert_eq!(block.bytes(), bytes, "{format:?} pixel size");
+    }
+
+    // BC1 and BC4 pack a 4x4 block into 8 bytes, BC2 and BC3 into 16.
+    for (format, bytes) in [
+        (PixelFormat::Bc1Rgba, 8),
+        (PixelFormat::Bc1RgbaSrgb, 8),
+        (PixelFormat::Bc4RUnorm, 8),
+        (PixelFormat::Bc2Rgba, 16),
+        (PixelFormat::Bc2RgbaSrgb, 16),
+        (PixelFormat::Bc3Rgba, 16),
+        (PixelFormat::Bc3RgbaSrgb, 16),
+    ] {
+        let block = format.block_layout();
+        assert_eq!(block.width(), 4, "{format:?} spans four pixels");
+        assert_eq!(block.height(), 4, "{format:?} spans four pixels");
+        assert_eq!(block.bytes(), bytes, "{format:?} block size");
+    }
+
+    // A format the wire does not carry sizes as the smallest thing it could
+    // be, so a bounds check built on it never rejects a legal copy.
+    let unmapped = BlockLayout::unmapped();
+    assert_eq!(
+        (unmapped.width(), unmapped.height(), unmapped.bytes()),
+        (1, 1, 1)
+    );
+}
+
 #[test]
 fn texture_usage_bits_match_legacy_wire() {
     // Wire-encoding pin: RENDER_TARGET is bit 0, DEPTH_STENCIL is bit 1.
