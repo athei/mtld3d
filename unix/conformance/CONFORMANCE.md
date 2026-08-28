@@ -166,14 +166,17 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **2 `real` · 91 `expected` ·
+re-checked before retagging. Headline: **0 `real` · 92 `expected` ·
 2 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
-newly-running `srgbtexture_test` passes.) Only two tags change what the gate tolerates:
-`flaky` (count changes in either direction) and `ceiling` (reads below the
-pin). Every other tag is documentation, so a correction between `real`,
+newly-running `srgbtexture_test` passes. 2026-08-28: honouring
+`D3DCREATE_NOWINDOWCHANGES` dropped test_window_style 5215, and test_wndproc
+4551 was re-derived from the raw capture and corrected from `real` to
+`expected`, which empties the `real` backlog.) Only two tags change what the
+gate tolerates: `flaky` (count changes in either direction) and `ceiling`
+(reads below the pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
 
 #### Desktop mode switching, and how fullscreen honors the requested size
@@ -234,11 +237,13 @@ walk further):
   test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
   the sites asserting the mode follows a Reset stay `expected`.
 
-### The `real` backlog (1 distinct defect behind the 2 sites)
+### The `real` backlog (empty)
 
-| defect | cluster(s) | sites |
-|---|---|---:|
-| Windowed Reset emits the wrong WINDOWPOS / does not re-show a cleared WS_VISIBLE | test_wndproc, test_window_style | 2 |
+No site is currently classified `real`. Every failing site is a recorded
+decision (`expected`), a capability we do not advertise (`caps`), a pin that
+reads zero on other hardware (`ceiling`), or a known flap (`flaky`), each with
+its rationale in the per-cluster section below. A site returns to `real` the
+moment a divergence is found that we intend to close.
 
 The `device` subtest used to die silently inside test_volume_get_container
 (a `GetContainer` that answered E_NOINTERFACE with a null container, which
@@ -260,7 +265,7 @@ Sites: 4207=expected 4212=expected 4214=expected 4219=expected
 Sites: 4223=expected 4248=expected 4257=expected 4293=expected
 Sites: 4298=expected 4319=expected 4340=expected 4410=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
-Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=real 4475=flaky
+Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=expected 4475=flaky
 Sites: 4480=flaky
 
 4161/4231 are the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
@@ -274,12 +279,33 @@ window subclass (4223/4572), no WM_* activation/mode message generation
 (4420), device-never-lost TestCooperativeLevel (4257/4298/4424/4487).
 Caveat on 4219: it fails because OUR cursor wndproc subclass replaced the
 device window's proc — a deliberate, load-bearing hook we keep (cursor
-realization), not a missing feature. 4551 is `real`: a windowed Reset must
-emit exactly one `WM_WINDOWPOSCHANGING` on the device window carrying
-`SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE` and a zeroed rect; the
-`SetWindowPos` our fullscreen restore issues carries different flags. The
-WS_VISIBLE re-show on the same path now passes because leaving fullscreen
-re-shows the window. 4475/4480 are flaky macdrv window-message timing sites;
+realization), not a missing feature.
+
+4257/4298/4424/4487 are the kept device-loss divergence, not an unwritten
+stub: no exclusive mode is ever taken, so nothing is ever lost, and
+`TestCooperativeLevel` answers `D3D_OK` across a focus change. The
+transition is detectable (the device window's subclass already handles
+`WM_ACTIVATEAPP` for the registry-mode restore), so this is a decision
+rather than a gap: reporting a loss that did not happen sends every
+fullscreen game through releasing and rebuilding its whole `D3DPOOL_DEFAULT`
+working set on each activation change, which costs frame time and risks the
+game's own recreate path, for a device that lost nothing. The
+`D3DERR_DEVICENOTRESET` half is real and implemented: a failed `Reset`
+latches it until one succeeds. Also listed in the README's kept divergences.
+
+4551 is `expected`, and follows from the same no-modeset decision as the
+message sites above. It reads a `WINDOWPOS` the test's wndproc only captures
+once the expected-message walk reaches the fifth entry of
+`mode_change_messages_hidden`, and the walk stops one entry earlier, on the
+`WM_SIZE` the device window never receives: a fullscreen mode-change `Reset`
+resizes the back buffer, not the window, which already covers the monitor
+and keeps covering it, so its client rect is unchanged and user32 sends no
+`WM_SIZE`. 4525/4545 record that stall directly (both raw failures read
+`Expected message 0x5`), which leaves the capture zeroed and the assertion
+comparing against a null HWND. Reaching it needs a real mode-set, so the
+line moves only with that decision.
+
+4475/4480 are flaky macdrv window-message timing sites;
 mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths.
 
 ### device.c/test_reset
@@ -349,7 +375,7 @@ i686 only. Native D3D9 rewrites the x87 control word to single precision
 touch the FPU control word. On x86_64 the same checks are todo_wine (free).
 
 ### device.c/test_window_style
-Sites: 5220=expected 5215=real
+Sites: 5220=expected
 
 5220 is `expected`: the fullscreen extended style must carry `WS_EX_TOPMOST`.
 We deliberately leave the z-order alone, because raising a window to the
@@ -360,8 +386,12 @@ another thread and the process deadlocks. Reproduced in the `visual` subtest.
 A borderless window covering the monitor already presents as fullscreen, so
 the z-order buys nothing. (5200, the window-rect adoption, now passes.)
 
-5215 is a separate defect: the windowed-Reset re-show contract (WS_VISIBLE)
-— same one as test_wndproc 4551.
+5215 passes since `D3DCREATE_NOWINDOWCHANGES` is honoured: a device created
+with that flag leaves the device window's style, rect and visibility to the
+app, in fullscreen as in windowed mode, so a window the app kept hidden is
+still hidden after the fullscreen round trip. The three todo_wine lines that
+the flag also covers (5179/5197/5238) now succeed inside their todo blocks,
+which the runner does not count.
 
 ### device.c/test_mode_change
 Sites: 5509=ceiling 5533=ceiling 5537=ceiling 5542=expected 5584=ceiling

@@ -35,6 +35,8 @@ pub struct HarnessConfig {
     pub visible: bool,
     /// `D3DPRESENT_PARAMETERS.Windowed`, in its wire encoding (1 = windowed).
     pub windowed: u32,
+    /// `CreateDevice` behaviour flags (`D3DCREATE_*`).
+    pub behavior_flags: u32,
 }
 
 impl Default for HarnessConfig {
@@ -46,6 +48,7 @@ impl Default for HarnessConfig {
             depth_format: None,
             visible: false,
             windowed: 1,
+            behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
         }
     }
 }
@@ -189,7 +192,7 @@ impl Harness {
                 0,
                 D3DDEVTYPE_HAL,
                 core::ptr::null_mut(),
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                cfg.behavior_flags,
                 (&raw mut pp).cast::<c_void>(),
                 &raw mut device,
             )
@@ -2153,6 +2156,7 @@ impl Harness {
             depth_format: self.depth_format,
             visible: false,
             windowed: 1,
+            ..HarnessConfig::default()
         };
         let mut pp = present_params(&cfg, self.hwnd);
         // SAFETY: vtable thunk; `&mut pp` is writable.

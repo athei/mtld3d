@@ -1254,11 +1254,14 @@ extern "system" fn d3d9_create_device(
         return D3DERR_INVALIDCALL;
     }
 
-    // A fullscreen device owns its window. Take it over first: the back-buffer
-    // size is resolved from the resulting client rect, and the metal view is
-    // sized from the window Wine hands us at attach time, so both have to see
-    // the window already covering the monitor.
-    let fullscreen = (pp.windowed == 0).then(|| crate::fullscreen::enter(hwnd as *mut c_void));
+    // A fullscreen device owns its window unless the app kept it
+    // (`D3DCREATE_NOWINDOWCHANGES`). Take it over first: the back-buffer size
+    // is resolved from the resulting client rect, and the metal view is sized
+    // from the window Wine hands us at attach time, so both have to see the
+    // window already covering the monitor.
+    let manage_window = behavior_flags & mtld3d_types::D3DCREATE_NOWINDOWCHANGES == 0;
+    let fullscreen =
+        (pp.windowed == 0).then(|| crate::fullscreen::enter(hwnd as *mut c_void, manage_window));
 
     // Resolve the logical backbuffer size against the window now that its
     // geometry is final, before any Metal resource is sized from it.
