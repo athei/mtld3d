@@ -1071,8 +1071,10 @@ pub struct PassState {
     /// and by `finalize_store_actions` to skip `StoreAction::DontCare` on
     /// the same. Closes a hole in the original load/store optimiser that
     /// discarded CSM cascade content between the caster pass that wrote
-    /// it and the scene pass that sampled it. Reset each frame in
-    /// `reset_frame`.
+    /// it and the scene pass that sampled it. Kept across `reset_frame`,
+    /// because a cascade written in one frame is sampled in the next; an
+    /// entry leaves only through `unregister_texture`, when the `MTLTexture`
+    /// behind the handle is destroyed.
     seen_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Texture handles bound as a fragment sampler input so far THIS frame, in op-stream order.
     ///
@@ -1142,9 +1144,9 @@ pub struct PassState {
     ///
     /// Entries outlive the frame that made them, because a cascade is
     /// sampled frames after it was rendered, but not the texture itself:
-    /// `unregister_sampleable_depth` drops a handle when the encoder retires
-    /// the `MTLTexture` behind it, so a later allocation that lands on the
-    /// same address is not mistaken for the cascade that used to live there.
+    /// `unregister_texture` drops a handle when the `MTLTexture` behind it is
+    /// destroyed, so a later allocation that lands on the same address is not
+    /// mistaken for the cascade that used to live there.
     seen_sampleable_depth_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Per-frame counter: how many caster draws targeted each cascade depth handle.
     ///
@@ -1416,10 +1418,9 @@ impl PassState {
         // correct trade.
         //
         // Memory cost: bounded by the number of distinct texture
-        // handles ever used as a sampler input over the session
-        // (~100s for WoW). Cleared only at device-reset (when the
-        // game might destroy and reissue textures with the same
-        // handles).
+        // handles sampled by a live texture (~100s for WoW), because
+        // `unregister_texture` takes a handle back out when the
+        // `MTLTexture` behind it is destroyed.
     }
 
     #[must_use]
@@ -1551,18 +1552,45 @@ impl PassState {
         self.seen_sampleable_depth_textures.contains(&depth_tex)
     }
 
-    /// Drop `texture` from the sampleable-depth set as its `MTLTexture` is retired.
+    /// Drop every record keyed on `texture` as its `MTLTexture` is destroyed.
     ///
-    /// Called by the encoder from every path that hands a texture handle to
-    /// the retention queue (resource release and rename-at-overlap), so the
-    /// set never names an address Metal is free to hand back for an unrelated
-    /// allocation. A no-op for a handle that was never a sampleable depth
-    /// attachment, which is the common case.
-    pub fn unregister_sampleable_depth(&mut self, texture: MetalHandle<MTLTextureKind>) {
+    /// A handle is an allocation address, so Metal is free to hand the same
+    /// value back for the next texture once this one is gone. Every set and
+    /// map here is keyed on that address, and an entry that outlives the
+    /// texture makes the load/store rules answer for the wrong resource:
+    /// Rules A, C and D would keep `Load`/`Store` on an attachment nothing
+    /// samples, Rule B would refuse a first-use `DontCare` on a fresh depth
+    /// surface, and rename-at-overlap would copy a texture no draw has read.
+    ///
+    /// Covers `seen_color_rts` and `seen_depth_rts` with their segment twins,
+    /// `blit_written_rts`, `seen_sampled_textures`, `frame_sampled_textures`,
+    /// `seen_sampleable_depth_textures`, and the two cascade-probe counters.
+    /// `srgb_twin_to_base` is not one of them: it mirrors the encoder's live
+    /// texture cache through `register_srgb_twin` / `unregister_srgb_twin`
+    /// rather than accumulating what passes did. `backbuffer_texture` and the
+    /// current-attachment handles are single bindings that every
+    /// [`Self::reset_frame`] reseeds.
+    ///
+    /// The caller is the encoder's retention drain, which runs when the GPU
+    /// has retired the submission that last named the handle. Pruning where
+    /// the D3D9 object is released would be too early: the passes that
+    /// reference the texture are built and their store actions are not
+    /// finalised until submit.
+    pub fn unregister_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
         if texture.is_null() {
             return;
         }
+        self.seen_color_rts.retain(|&(handle, _)| handle != texture);
+        self.seen_color_rts_segment
+            .retain(|&(handle, _)| handle != texture);
+        self.seen_depth_rts.remove(&texture);
+        self.seen_depth_rts_segment.remove(&texture);
+        self.blit_written_rts.remove(&texture);
+        self.seen_sampled_textures.remove(&texture);
+        self.frame_sampled_textures.remove(&texture);
         self.seen_sampleable_depth_textures.remove(&texture);
+        self.frame_caster_writes.remove(&texture);
+        self.frame_cascade_samples.remove(&texture);
     }
 
     /// Metal pixel format the next pass binds for colour attachment 0.
