@@ -2279,8 +2279,10 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     // SAFETY: `inner.device_inner` is non-null (checked above) and points to
     // the live owning device, a different allocation from the page above.
     let device_inner = unsafe { &mut *inner.device_inner };
+    // The snapshot page is tightly packed, so a row is exactly `width` pixels.
+    let src_stride = width * bpp;
     device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, bpp);
+        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, src_stride);
     }));
 }
 
