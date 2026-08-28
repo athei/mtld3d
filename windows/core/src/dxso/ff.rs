@@ -1363,7 +1363,18 @@ fn resolve_mat(source: u8, mat_slot: u32, flags: MatColorFlags) -> String {
 fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // Discover which stages sample a texture so we know which textures+samplers
     // to declare in the entry-point signature.
-    let _ = writeln!(out, "fragment float4 {entry}(");
+    // `D3DRS_MULTISAMPLEMASK` has no pipeline-state equivalent on Metal, so a
+    // masked draw returns a struct carrying the coverage instead of a bare
+    // colour. The fixed-function pipeline writes one colour output, so the
+    // struct exists only for this.
+    let writes_sample_mask = variant.flags.contains(VariantFlags::SAMPLE_MASK);
+    if writes_sample_mask {
+        out.push_str("struct FfPsOut {\n    float4 oC0 [[color(0)]];\n");
+        out.push_str("    uint oMask [[sample_mask]];\n};\n\n");
+        let _ = writeln!(out, "fragment FfPsOut {entry}(");
+    } else {
+        let _ = writeln!(out, "fragment float4 {entry}(");
+    }
     let point_sprite = variant.flags.contains(VariantFlags::POINT_SPRITE);
     if point_sprite {
         // See `emit::write_point_sprite_prologue`.
@@ -1559,7 +1570,15 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         out.push_str("    oC0.rgb = mtld3d_linear_to_srgb(oC0.rgb);\n");
     }
-    out.push_str("    return oC0;\n");
+    if writes_sample_mask {
+        let _ = writeln!(
+            out,
+            "    return FfPsOut {{ oC0, {}u }};",
+            variant.sample_mask
+        );
+    } else {
+        out.push_str("    return oC0;\n");
+    }
     out.push_str("}\n");
 }
 

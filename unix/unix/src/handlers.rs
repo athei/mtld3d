@@ -282,29 +282,49 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateBackbufferParams = &mut params;
 
-    if let Some((handle, srgb_handle)) = metal::create_backbuffer(
+    let Some((handle, srgb_handle)) = metal::create_backbuffer(
         params.device_handle,
         params.queue_handle,
         params.width,
         params.height,
-    ) {
-        params.texture_handle = handle;
-        // SAFETY: `create_backbuffer` transfers a retain into `srgb_handle`
-        // (0 when the format has no sRGB twin).
-        params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
-        // debug, not info — fires per-frame during a Reset-driven
-        // window drag. The CreateDevice + AttachMetalLayer info
-        // lines already cover the boot-time milestone.
-        debug!(
-            target: LOG_TARGET,
-            "created backbuffer {}x{}",
-            params.width, params.height
-        );
-        STATUS_SUCCESS
-    } else {
+    ) else {
         error!(target: LOG_TARGET, "failed to create backbuffer");
-        STATUS_UNSUCCESSFUL
+        return STATUS_UNSUCCESSFUL;
+    };
+    let msaa = metal::create_msaa_companion(
+        params.device_handle,
+        params.width,
+        params.height,
+        mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+        params.sample_count,
+        "mtld3d-backbuffer-msaa",
+    );
+    if params.sample_count > 1 && msaa.is_none() {
+        error!(
+            target: LOG_TARGET,
+            "failed to create {}x multisampled backbuffer companion", params.sample_count
+        );
+        return STATUS_UNSUCCESSFUL;
     }
+    params.texture_handle = handle;
+    // SAFETY: `create_backbuffer` transfers a retain into `srgb_handle`
+    // (0 when the format has no sRGB twin).
+    params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
+    let (msaa_handle, msaa_srgb_handle) = msaa.unwrap_or((MetalHandle::NULL, 0));
+    params.msaa_texture_handle = msaa_handle;
+    // SAFETY: `create_msaa_companion` transfers a retain into
+    // `msaa_srgb_handle` (0 when the companion has no sRGB twin).
+    params.msaa_srgb_texture_handle =
+        unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
+    // debug, not info: it fires per-frame during a Reset-driven
+    // window drag. The CreateDevice + AttachMetalLayer info
+    // lines already cover the boot-time milestone.
+    debug!(
+        target: LOG_TARGET,
+        "created backbuffer {}x{} samples={}",
+        params.width, params.height, params.sample_count
+    );
+    STATUS_SUCCESS
 }
 
 pub extern "C" fn create_render_pipeline_handler(args: *mut c_void) -> i32 {
@@ -480,6 +500,7 @@ pub extern "C" fn create_depth_texture_handler(args: *mut c_void) -> i32 {
         params.width,
         params.height,
         params.pixel_format,
+        params.sample_count,
     ) {
         params.texture_handle = handle;
         STATUS_SUCCESS
@@ -496,21 +517,41 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateColorTargetParams = &mut params;
 
-    if let Some((handle, srgb_handle)) = metal::create_color_target(
+    let Some((handle, srgb_handle)) = metal::create_color_target(
         params.device_handle,
         params.width,
         params.height,
         params.pixel_format,
-    ) {
-        params.texture_handle = handle;
-        // SAFETY: `create_color_target` transfers a retain into `srgb_handle`
-        // (0 when the format has no sRGB twin).
-        params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
-        STATUS_SUCCESS
-    } else {
+    ) else {
         error!(target: LOG_TARGET, "failed to create color target texture");
-        STATUS_UNSUCCESSFUL
+        return STATUS_UNSUCCESSFUL;
+    };
+    let msaa = metal::create_msaa_companion(
+        params.device_handle,
+        params.width,
+        params.height,
+        params.pixel_format,
+        params.sample_count,
+        "mtld3d-color-target-msaa",
+    );
+    if params.sample_count > 1 && msaa.is_none() {
+        error!(
+            target: LOG_TARGET,
+            "failed to create {}x multisampled color target companion", params.sample_count
+        );
+        return STATUS_UNSUCCESSFUL;
     }
+    params.texture_handle = handle;
+    // SAFETY: `create_color_target` transfers a retain into `srgb_handle`
+    // (0 when the format has no sRGB twin).
+    params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
+    let (msaa_handle, msaa_srgb_handle) = msaa.unwrap_or((MetalHandle::NULL, 0));
+    params.msaa_texture_handle = msaa_handle;
+    // SAFETY: `create_msaa_companion` transfers a retain into
+    // `msaa_srgb_handle` (0 when the companion has no sRGB twin).
+    params.msaa_srgb_texture_handle =
+        unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
+    STATUS_SUCCESS
 }
 
 pub extern "C" fn create_depth_stencil_state_handler(args: *mut c_void) -> i32 {

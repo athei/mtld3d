@@ -555,6 +555,7 @@ fn emits_alpha_test_discard() {
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
+        sample_mask: 0,
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
@@ -583,6 +584,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
+        sample_mask: 0,
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
@@ -693,6 +695,7 @@ fn omits_alpha_test_when_always() {
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
+        sample_mask: 0,
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
@@ -1276,4 +1279,34 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         biased.contains("s0.sample(samp0, in.texcoord0.xy, bias(lod_bias[0].x))"),
         "stage 0 samples with its own slot's bias:\n{biased}"
     );
+}
+
+#[test]
+fn ff_ps_writes_the_sample_mask_when_the_variant_carries_one() {
+    // The fixed-function pixel pipeline returns one colour, so the struct
+    // exists only to carry the `[[sample_mask]]` output Metal needs for
+    // `D3DRS_MULTISAMPLEMASK`.
+    let vs = default_vs_key();
+    let ps = default_ps_key();
+    let variant = VariantKey {
+        sample_mask: 0b0001,
+        flags: VariantFlags::SAMPLE_MASK,
+        ..VariantKey::default()
+    };
+    let msl = emit_pair_for_tests(&vs, &ps, variant);
+    assert!(
+        msl.contains("uint oMask [[sample_mask]];"),
+        "the FF PS output struct must declare the mask:\n{msl}"
+    );
+    assert!(
+        msl.contains("return FfPsOut { oC0, 1u };"),
+        "and write the variant's value:\n{msl}"
+    );
+}
+
+#[test]
+fn ff_ps_returns_a_bare_colour_without_a_sample_mask() {
+    let msl = emit_pair_for_tests(&default_vs_key(), &default_ps_key(), VariantKey::default());
+    assert!(!msl.contains("sample_mask"), "{msl}");
+    assert!(msl.contains("    return oC0;"), "{msl}");
 }

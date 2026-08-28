@@ -203,6 +203,13 @@ pub struct PipelineSnapshot {
     /// its contents survive the draw (Metal leaves an unwritten colour
     /// output undefined). Fixed-function and SM1 shaders report bit 0.
     pub ps_color_out_mask: u8,
+    /// Multisample count of the render pass this draw lands in, 1 for none.
+    ///
+    /// Metal requires the pipeline's `rasterSampleCount` to equal the sample
+    /// count of the pass's attachment textures, so two draws that differ only
+    /// in the target they are bound to still need distinct pipelines. `u8`
+    /// because D3D9 caps the enum at 16 samples.
+    pub sample_count: u8,
 }
 
 impl PipelineSnapshot {
@@ -319,6 +326,7 @@ pub struct PipelineKey {
     extra_has_alpha_mask: u8,
     extra_formats: [PixelFormat; 3],
     extra_write_masks: [ColorWriteMask; 3],
+    sample_count: u8,
 }
 
 /// Per-draw thunk-params builder input.
@@ -415,6 +423,7 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
         extra_has_alpha_mask: s.extra.has_alpha_mask & s.extra.present_mask,
         extra_formats: core::array::from_fn(|i| s.extra_format(i)),
         extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
+        sample_count: s.sample_count.max(1),
     }
 }
 
@@ -454,6 +463,7 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         color_format: s.color_format,
         has_color_output: u32::from(s.has_color_output()),
         extra_present_mask: u32::from(s.extra.present_mask),
+        sample_count: u32::from(s.sample_count.max(1)),
         extra: core::array::from_fn(|i| {
             let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) = s.extra_blend_factors(i);
             ExtraColorAttachmentParams {

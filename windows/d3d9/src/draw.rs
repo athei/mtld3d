@@ -1130,6 +1130,14 @@ pub struct RenderStateSnapshot {
     /// on the encoder, so folding it into the state key would mint one
     /// `MTLDepthStencilState` per reference value.
     pub stencil_ref: u32,
+    /// `D3DRS_MULTISAMPLEMASK` narrowed against the bound render target.
+    ///
+    /// `mtld3d_core::multisample::SAMPLE_MASK_ALL` when the state has no
+    /// effect, which is every single-sampled draw. Resolved here rather than
+    /// on the encoder thread because it needs the target's
+    /// `D3DMULTISAMPLE_TYPE`, and the render-state section is re-snapshotted
+    /// whenever the render target changes.
+    pub sample_mask: u8,
 }
 
 impl RenderStateSnapshot {
@@ -1295,6 +1303,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     }
     // Both emitters honour the bias, so the flag rides on the shared PS key.
     ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_bias);
+    // `D3DRS_MULTISAMPLEMASK`: Metal has no pipeline-state sample mask, so a
+    // narrowed mask becomes a `[[sample_mask]]` output in a pixel-shader
+    // variant. The API thread already resolved the state against the bound
+    // target, so a full mask (the default) never mints a variant.
+    if render_state.sample_mask != mtld3d_core::multisample::SAMPLE_MASK_ALL {
+        ps_variant.flags.insert(VariantFlags::SAMPLE_MASK);
+        ps_variant.sample_mask = render_state.sample_mask;
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -1563,6 +1579,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         rs: render_state.pipeline_rs,
         extra: extra_attachments,
         ps_color_out_mask,
+        sample_count: enc.current_color_sample_count(),
     };
     let pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref);
     if pipeline == 0 {

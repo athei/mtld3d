@@ -306,6 +306,24 @@ pub enum ColorClearOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExtraColorSlot {
     pub texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `texture`, NULL when the target is single-sampled.
+    ///
+    /// When set it is what the pass attaches; `texture` becomes the resolve
+    /// target and stays the identity every rule, every sampler bind and every
+    /// blit sees.
+    pub msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa_texture`, NULL when it has none.
+    ///
+    /// Carried beside the companion rather than looked up, because the twin
+    /// map answers for the single-sample handles every identity question is
+    /// asked with and a multisampled companion is never one of them.
+    pub msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Sample count of the target; 1 when it is single-sampled.
+    ///
+    /// A target whose count differs from render target 0's takes no part in
+    /// the pass, the same way a differently-sized one does not: Metal takes a
+    /// pass's sample count from its attachments and rejects a disagreement.
+    pub sample_count: u8,
     /// `slice | (level << 8)`, as on [`Pass`].
     pub subresource: u32,
     pub size: (u32, u32),
@@ -320,6 +338,9 @@ impl ExtraColorSlot {
     /// The unbound slot.
     pub const NONE: Self = Self {
         texture: MetalHandle::NULL,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        sample_count: 1,
         subresource: 0,
         size: (0, 0),
         logical_size: (0, 0),
@@ -347,6 +368,18 @@ pub struct PassColorAttachment {
     /// uses it: every identity question (seen sets, load/store rules) is
     /// asked with `texture`, since the two views share one Metal texture.
     srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion the pass actually attaches, NULL when there is none.
+    msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa_texture`, null when the pass writes linear.
+    ///
+    /// Metal takes the resolve destination's pixel format from the
+    /// attachment's, so a pass that attaches this resolves into
+    /// `srgb_texture` rather than into `texture`.
+    msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// The view a resolve writes, set by `finalize_store_actions` on the pass that takes it.
+    ///
+    /// Null on every other pass, and never set unless `msaa_texture` is.
+    resolve_texture: MetalHandle<MTLTextureKind>,
     subresource: u32,
     size: (u32, u32),
     format: PixelFormat,
@@ -373,6 +406,9 @@ impl PassColorAttachment {
     pub const NONE: Self = Self {
         texture: MetalHandle::NULL,
         srgb_texture: MetalHandle::NULL,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        resolve_texture: MetalHandle::NULL,
         subresource: 0,
         size: (0, 0),
         format: PixelFormat::Bgra8Unorm,
@@ -388,9 +424,31 @@ impl PassColorAttachment {
     pub const fn texture(&self) -> MetalHandle<MTLTextureKind> {
         self.texture
     }
-    /// The view the render pass binds: the sRGB twin, or the base texture.
+    /// The view the render pass binds.
+    ///
+    /// The multisampled companion where the target has one, and in either
+    /// case the sRGB twin of it when the pass encodes on write.
     #[must_use]
     pub const fn attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.msaa_texture.is_null() {
+            if self.srgb_texture.is_null() {
+                self.texture
+            } else {
+                self.srgb_texture
+            }
+        } else if self.msaa_srgb_texture.is_null() {
+            self.msaa_texture
+        } else {
+            self.msaa_srgb_texture
+        }
+    }
+    /// The single-sample view the pass resolves into, NULL when it takes no resolve.
+    #[must_use]
+    pub const fn resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.resolve_texture
+    }
+    /// The view a resolve of this attachment writes, whether or not it takes one.
+    const fn resolve_view(&self) -> MetalHandle<MTLTextureKind> {
         if self.srgb_texture.is_null() {
             self.texture
         } else {
@@ -459,6 +517,9 @@ impl BoundColorAttachments {
 /// back exactly, extras and alpha bit included.
 pub struct SavedColorAttachments {
     texture: MetalHandle<MTLTextureKind>,
+    msaa_texture: MetalHandle<MTLTextureKind>,
+    msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    sample_count: u8,
     slice: u32,
     level: u32,
     logical_size: (u32, u32),
@@ -479,6 +540,9 @@ impl SavedColorAttachments {
         if slot == 0 {
             return Some(ExtraColorSlot {
                 texture: self.texture,
+                msaa_texture: self.msaa_texture,
+                msaa_srgb_texture: self.msaa_srgb_texture,
+                sample_count: self.sample_count,
                 subresource: self.slice | (self.level << 8),
                 size: (
                     self.scale.dimension(self.logical_size.0),
@@ -493,6 +557,9 @@ impl SavedColorAttachments {
         let extra = &self.extra[slot - 1];
         extra.is_bound().then_some(ExtraColorSlot {
             texture: extra.texture,
+            msaa_texture: extra.msaa_texture,
+            msaa_srgb_texture: extra.msaa_srgb_texture,
+            sample_count: extra.sample_count,
             subresource: extra.subresource,
             size: extra.size,
             logical_size: extra.logical_size,
@@ -527,6 +594,26 @@ pub struct Pass {
     /// [`PassColorAttachment::srgb_texture`] for why identity stays on the
     /// base handle.
     color_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `color_texture`, NULL when it is single-sampled.
+    ///
+    /// The pass attaches this and resolves into `color_texture`; every rule,
+    /// every sampler bind and every blit keeps keying on `color_texture`,
+    /// which is the D3D9 surface's identity and the only one anything but a
+    /// render pass ever touches.
+    color_msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `color_msaa_texture`, null when the pass writes linear.
+    ///
+    /// See [`PassColorAttachment::msaa_srgb_texture`] for why the two views
+    /// have to be chosen together.
+    color_msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Non-NULL on the pass that takes the multisample resolve.
+    ///
+    /// Set by `finalize_store_actions` on the last pass of the submission
+    /// that binds `color_msaa_texture`, and by `note_msaa_read` when
+    /// something reads the resolved content earlier than that. Carries the
+    /// view the resolve writes: `color_srgb_texture` when the pass encodes on
+    /// write, else `color_texture`.
+    color_resolve_texture: MetalHandle<MTLTextureKind>,
     color_subresource: u32,
     color_size: (u32, u32),
     color_format: PixelFormat,
@@ -618,9 +705,29 @@ impl Pass {
     }
     /// The view the render pass binds for colour attachment 0.
     ///
-    /// The sRGB twin when the pass encodes on write, else the base texture.
+    /// The multisampled companion where render target 0 has one, and in
+    /// either case the sRGB twin of it when the pass encodes on write.
     #[must_use]
     pub const fn color_attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.color_msaa_texture.is_null() {
+            if self.color_srgb_texture.is_null() {
+                self.color_texture
+            } else {
+                self.color_srgb_texture
+            }
+        } else if self.color_msaa_srgb_texture.is_null() {
+            self.color_msaa_texture
+        } else {
+            self.color_msaa_srgb_texture
+        }
+    }
+    /// The single-sample view the pass resolves render target 0 into, NULL for none.
+    #[must_use]
+    pub const fn color_resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.color_resolve_texture
+    }
+    /// The view a resolve of render target 0 writes, whether or not this pass takes one.
+    const fn color_resolve_view(&self) -> MetalHandle<MTLTextureKind> {
         if self.color_srgb_texture.is_null() {
             self.color_texture
         } else {
@@ -885,6 +992,15 @@ pub struct FrameReset {
     /// and Metal encodes after the blender. Re-supplied per frame because
     /// `Reset` and an auto-resize replace the pair together.
     pub backbuffer_srgb: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the back buffer, NULL when it is single-sampled.
+    pub backbuffer_msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_msaa`, or null when there is none.
+    ///
+    /// Registered as that companion's twin every frame, for the same reason
+    /// `backbuffer_srgb` is.
+    pub backbuffer_msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the back buffer and of the frame's default depth surface.
+    pub backbuffer_sample_count: u8,
     /// Logical back-buffer size, the resolution D3D9 reports.
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
@@ -913,6 +1029,30 @@ pub struct PassState {
     current_pass_closed: bool,
 
     current_color_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the bound render target 0, NULL for none.
+    ///
+    /// Set in lockstep with the colour binding by [`PassState::set_color_msaa`],
+    /// the way `COLOR_HAS_ALPHA` is set by `set_color_rt_has_alpha`: the
+    /// colour setters clear it, so a target bound without one can never
+    /// inherit the previous target's.
+    current_color_msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the bound render target 0's companion, NULL for none.
+    ///
+    /// Set with the companion by [`PassState::set_color_msaa`]. A
+    /// multisampled pass writing sRGB attaches this and resolves into
+    /// `current_color_srgb_texture`, which Metal requires to share its
+    /// pixel format.
+    current_color_msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Sample count of the bound render target 0; 1 when it is single-sampled.
+    ///
+    /// Read per draw into the pipeline key, and by the clear-quad and blit
+    /// pipelines, which Metal requires to match the pass.
+    current_color_sample_count: u8,
+    /// Sample count of the bound depth attachment; 1 when there is none.
+    ///
+    /// Metal rejects a pass whose attachments disagree, so `ensure_pass_open`
+    /// drops a depth attachment that does not match the colour one.
+    current_depth_sample_count: u8,
     current_color_subresource: u32,
     current_color_size: (u32, u32),
     current_color_format: PixelFormat,
@@ -1214,6 +1354,10 @@ impl PassState {
             passes: Vec::with_capacity(4),
             current_pass_closed: true,
             current_color_texture: MetalHandle::NULL,
+            current_color_msaa_texture: MetalHandle::NULL,
+            current_color_msaa_srgb_texture: MetalHandle::NULL,
+            current_color_sample_count: 1,
+            current_depth_sample_count: 1,
             current_color_subresource: 0,
             current_color_size: (0, 0),
             // Placeholder; `reset_frame` always overwrites this before any
@@ -1300,6 +1444,9 @@ impl PassState {
         let &FrameReset {
             backbuffer,
             backbuffer_srgb,
+            backbuffer_msaa,
+            backbuffer_msaa_srgb,
+            backbuffer_sample_count,
             backbuffer_size,
             backbuffer_format,
             depth_texture,
@@ -1335,6 +1482,12 @@ impl PassState {
         self.current_color_logical_size = backbuffer_size;
         self.backbuffer_logical_size = backbuffer_size;
         self.current_color_texture = backbuffer;
+        self.current_color_msaa_texture = backbuffer_msaa;
+        self.current_color_msaa_srgb_texture = backbuffer_msaa_srgb;
+        // The implicit depth surface is created at the back buffer's count,
+        // which is the only pairing `CreateDevice` and `Reset` produce.
+        self.current_color_sample_count = backbuffer_sample_count.max(1);
+        self.current_depth_sample_count = backbuffer_sample_count.max(1);
         self.current_color_subresource = 0;
         self.current_color_size = (
             render_scale.dimension(backbuffer_size.0),
@@ -1609,6 +1762,62 @@ impl PassState {
     /// Called by the encoder's colour-RT bind in lockstep with
     /// `set_color_render_target` so the two never desync — the Metal pixel
     /// format alone can't distinguish X8R8G8B8 (no alpha) from A8R8G8B8.
+    /// Attach `msaa` as render target 0's multisampled companion.
+    ///
+    /// Called in lockstep with `set_color_render_target*`, which clears both
+    /// fields first, so a single-sampled bind needs no call at all. `msaa`
+    /// NULL with a `sample_count` above 1 is the caller saying the target is
+    /// multisampled but its companion could not be created; the pass then
+    /// renders single-sampled into the resolve texture, which is visually
+    /// wrong only in that it is not antialiased.
+    pub fn set_color_msaa(
+        &mut self,
+        msaa: MetalHandle<MTLTextureKind>,
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+        sample_count: u8,
+    ) {
+        self.current_color_msaa_texture = msaa;
+        self.current_color_msaa_srgb_texture = if msaa.is_null() {
+            MetalHandle::NULL
+        } else {
+            msaa_srgb
+        };
+        self.current_color_sample_count = if msaa.is_null() {
+            1
+        } else {
+            sample_count.max(1)
+        };
+        // The companion carries its own sRGB view, so gaining or losing one
+        // can change whether the pass can encode through the attachment.
+        self.apply_srgb_write_change();
+    }
+
+    /// Sample count of the currently bound render target 0.
+    #[must_use]
+    pub const fn current_color_sample_count(&self) -> u8 {
+        self.current_color_sample_count
+    }
+
+    /// Sample count declared for the currently bound depth attachment.
+    ///
+    /// Read by callers that bind their own attachments for a scoped pass and
+    /// put the device's binding back afterwards: the depth setters reset the
+    /// count, so it has to be carried across the swap with the handle.
+    #[must_use]
+    pub const fn current_depth_sample_count(&self) -> u8 {
+        self.current_depth_sample_count
+    }
+
+    /// Declare the sample count of the depth attachment bound alongside the colour one.
+    ///
+    /// Called in lockstep with `set_depth_stencil_attachment*`, which reset it
+    /// to 1. A depth attachment whose count does not match render target 0's
+    /// is dropped at pass open rather than handed to Metal, which rejects the
+    /// pass outright.
+    pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
+        self.current_depth_sample_count = if sample_count == 0 { 1 } else { sample_count };
+    }
+
     pub fn set_color_rt_has_alpha(&mut self, has_alpha: bool) {
         self.current_attachments
             .set(CurrentAttachmentFlags::COLOR_HAS_ALPHA, has_alpha);
@@ -1705,6 +1914,9 @@ impl PassState {
     pub fn take_color_attachments(&mut self) -> SavedColorAttachments {
         let saved = SavedColorAttachments {
             texture: self.current_color_texture,
+            msaa_texture: self.current_color_msaa_texture,
+            msaa_srgb_texture: self.current_color_msaa_srgb_texture,
+            sample_count: self.current_color_sample_count,
             slice: self.current_color_subresource & 0xff,
             level: self.current_color_subresource >> 8,
             logical_size: self.current_color_logical_size,
@@ -1738,6 +1950,11 @@ impl PassState {
             (saved.slice, saved.level),
         );
         self.set_color_rt_has_alpha(saved.has_alpha);
+        self.set_color_msaa(
+            saved.msaa_texture,
+            saved.msaa_srgb_texture,
+            saved.sample_count,
+        );
         if self.current_extra_color != saved.extra {
             if self.pending_color_clear.is_some() {
                 self.flush_pending_clears();
@@ -1759,7 +1976,16 @@ impl PassState {
             if !slot.is_bound() {
                 continue;
             }
-            if slot.size == self.current_color_size {
+            if slot.sample_count != self.current_color_sample_count {
+                mtld3d_shared::log_once_warn_by!(
+                    target: crate::LOG_TARGET,
+                    key: slot.texture.raw(),
+                    "render target {} is {}x multisampled but render target 0 is {}x: draws skip it",
+                    i + 1,
+                    slot.sample_count,
+                    self.current_color_sample_count,
+                );
+            } else if slot.size == self.current_color_size {
                 mask |= 1 << i;
             } else {
                 mtld3d_shared::log_once_warn_by!(
@@ -1944,10 +2170,30 @@ impl PassState {
     fn srgb_write_is_attachable(&self) -> bool {
         !self.current_color_texture.is_null()
             && !self.twin_of(self.current_color_texture).is_null()
+            && Self::companion_twin_present(
+                self.current_color_msaa_texture,
+                self.current_color_msaa_srgb_texture,
+            )
             && (0..3).all(|i| {
                 self.current_extra_present_mask & (1 << i) == 0
-                    || !self.twin_of(self.current_extra_color[i].texture).is_null()
+                    || (!self.twin_of(self.current_extra_color[i].texture).is_null()
+                        && Self::companion_twin_present(
+                            self.current_extra_color[i].msaa_texture,
+                            self.current_extra_color[i].msaa_srgb_texture,
+                        ))
             })
+    }
+
+    /// Whether a multisampled companion, if there is one, has an sRGB twin.
+    ///
+    /// A pass attaching a companion without one would have to resolve a
+    /// linear attachment into an sRGB destination, which Metal rejects, so
+    /// such a target keeps `D3DRS_SRGBWRITEENABLE` on the shader path.
+    const fn companion_twin_present(
+        msaa: MetalHandle<MTLTextureKind>,
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        msaa.is_null() || !msaa_srgb.is_null()
     }
 
     /// Metal pixel format of the view bound for colour attachment 0.
@@ -2353,6 +2599,13 @@ impl PassState {
                 } else {
                     MetalHandle::NULL
                 },
+                msaa_texture: slot.msaa_texture,
+                msaa_srgb_texture: if self.pass_srgb_write {
+                    slot.msaa_srgb_texture
+                } else {
+                    MetalHandle::NULL
+                },
+                resolve_texture: MetalHandle::NULL,
                 subresource: slot.subresource,
                 size: slot.size,
                 format: self.extra_attachment_format(i),
@@ -2360,6 +2613,28 @@ impl PassState {
                 store: StoreAction::Store,
             }
         });
+        // Metal takes the sample count of a render pass from its attachments
+        // and rejects one where they disagree, so a depth surface that does
+        // not match render target 0 is dropped instead of crashing the pass.
+        // D3D9 calls the pairing invalid too, but returns an error from
+        // `SetDepthStencilSurface` rather than failing the draw, and titles do
+        // reach here after switching render targets without rebinding depth.
+        let depth_texture = if !self.current_depth_texture.is_null()
+            && self.current_depth_sample_count != self.current_color_sample_count
+        {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: self.current_depth_texture.raw(),
+                "depth attachment {:#x} is {}x multisampled but render target 0 is {}x: \
+                 dropping depth for this pass",
+                self.current_depth_texture,
+                self.current_depth_sample_count,
+                self.current_color_sample_count,
+            );
+            MetalHandle::NULL
+        } else {
+            self.current_depth_texture
+        };
         // The depth texture's first use this frame under a viewport that
         // covers it: the Rule A predicate, shared by the depth plane and the
         // stencil plane because both live in that one texture. Coverage is
@@ -2367,15 +2642,13 @@ impl PassState {
         // because D3D9 clips the viewport to the render target, so an oversized
         // viewport still covers everything the pass can write.
         let depth_first_use = self.viewport_covers_depth_attachment()
-            && !self.current_depth_texture.is_null()
+            && !depth_texture.is_null()
             && !self
                 .current_attachments
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
-            && !self.seen_depth_rts.contains(&self.current_depth_texture)
-            && !self
-                .seen_sampled_textures
-                .contains(&self.current_depth_texture)
-            && !self.blit_written_rts.contains(&self.current_depth_texture);
+            && !self.seen_depth_rts.contains(&depth_texture)
+            && !self.seen_sampled_textures.contains(&depth_texture)
+            && !self.blit_written_rts.contains(&depth_texture);
         let depth_load = match self.pending_depth_clear.take() {
             Some(value) => DepthLoad::Clear { value },
             None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
@@ -2396,10 +2669,9 @@ impl PassState {
             self.seen_color_rts.insert(key);
             self.seen_color_rts_segment.insert(key);
         }
-        if !self.current_depth_texture.is_null() {
-            self.seen_depth_rts.insert(self.current_depth_texture);
-            self.seen_depth_rts_segment
-                .insert(self.current_depth_texture);
+        if !depth_texture.is_null() {
+            self.seen_depth_rts.insert(depth_texture);
+            self.seen_depth_rts_segment.insert(depth_texture);
         }
 
         // Reuse a `Vec<Command>` recycled from a previous frame's pass
@@ -2417,12 +2689,19 @@ impl PassState {
             } else {
                 MetalHandle::NULL
             },
+            color_msaa_texture: self.current_color_msaa_texture,
+            color_msaa_srgb_texture: if self.pass_srgb_write {
+                self.current_color_msaa_srgb_texture
+            } else {
+                MetalHandle::NULL
+            },
+            color_resolve_texture: MetalHandle::NULL,
             color_subresource: self.current_color_subresource,
             color_size: self.current_color_size,
             color_format: self.color_attachment_format(),
             color_load,
             color_store: StoreAction::Store,
-            depth_texture: self.current_depth_texture,
+            depth_texture,
             depth_level: self.current_depth_level,
             depth_load,
             stencil_load,
@@ -2520,6 +2799,11 @@ impl PassState {
             // The quad writes the expanded texels bit-exactly, so the pass
             // never renders through the sRGB twin.
             color_srgb_texture: MetalHandle::NULL,
+            // An upload target is a D3D9 texture, which cannot be
+            // multisampled, so the pass has no companion and takes no resolve.
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
             color_subresource: subresource,
             color_size: target.size,
             color_format: target.format,
@@ -2687,6 +2971,13 @@ impl PassState {
         scale: RenderScale,
         subresource: (u32, u32),
     ) {
+        // A target binds without multisampling unless the caller says
+        // otherwise in the same breath, so a single-sampled target can never
+        // inherit the previous one's companion. Mirrors how
+        // `set_color_rt_has_alpha` is paired with this setter.
+        self.current_color_msaa_texture = MetalHandle::NULL;
+        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
+        self.current_color_sample_count = 1;
         // `width`/`height` arrive logical, the size D3D9 reports for this
         // target; `scale` says what it is actually rasterized at.
         // `current_color_size` is the real texture extent.
@@ -2780,6 +3071,9 @@ impl PassState {
                 || !self.seen_sampleable_depth_textures.contains(&texture),
             "depth handle {texture:#x} rebound as non-sampleable after a sampleable bind",
         );
+        // A depth surface binds single-sampled unless the caller declares
+        // otherwise in the same breath, exactly as a colour target does.
+        self.current_depth_sample_count = 1;
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
@@ -3586,7 +3880,9 @@ impl PassState {
                 continue;
             }
             for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
-                if matches!(attachment.store, StoreAction::DontCare) {
+                if matches!(attachment.store, StoreAction::DontCare)
+                    && attachment.resolve_texture.is_null()
+                {
                     if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                         trace!(
                             target: TRACE_TARGET,
@@ -3599,6 +3895,7 @@ impl PassState {
             }
             if !pass.color_texture.is_null()
                 && matches!(pass.color_store, StoreAction::DontCare)
+                && pass.color_resolve_texture.is_null()
                 && !pass.depth_texture.is_null()
             {
                 let stripped = pass.color_texture;
@@ -3675,6 +3972,11 @@ impl PassState {
             if pass.color_writes_observed
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
+                // The resolve writes the single-sample twin every later reader
+                // looks at, so the attachment is not dead even with no colour
+                // write in the pass.
+                || !pass.color_resolve_texture.is_null()
+                || pass.extra_color.iter().any(|a| !a.resolve_texture.is_null())
                 // A folded color Clear (`color_load == Clear`) is a real color
                 // write even with no draw to tag `color_writes_observed` — e.g.
                 // a backbuffer color Clear that shares a pass with a cross-pass
@@ -3802,10 +4104,15 @@ impl PassState {
             if has_draw || !p.leading_blits.is_empty() {
                 return true;
             }
-            let color_writes = p
-                .bound_color_attachments()
-                .iter()
-                .any(|a| matches!(a.store, StoreAction::Store));
+            // A pass whose only remaining effect is a multisample resolve
+            // still writes the twin every later reader looks at, so it is not
+            // dead work.
+            let resolves = !p.color_resolve_texture.is_null()
+                || p.extra_color.iter().any(|a| !a.resolve_texture.is_null());
+            let color_writes = resolves
+                || p.bound_color_attachments()
+                    .iter()
+                    .any(|a| matches!(a.store, StoreAction::Store));
             let depth_writes =
                 !p.depth_texture.is_null() && matches!(p.depth_store, StoreAction::Store);
             color_writes || depth_writes
@@ -4276,6 +4583,65 @@ impl PassState {
                             }
                         }
                     }
+                }
+            }
+        }
+        self.assign_multisample_resolves();
+    }
+
+    /// Give each multisampled attachment its resolve on the submission's last use of it.
+    ///
+    /// Everything outside a render pass (Present, `StretchRect`,
+    /// `GetRenderTargetData`, `LockRect`, a sampler bind) reads the
+    /// single-sample twin, so the twin has to hold the frame's result by the
+    /// time the command buffer ends. Taking the resolve on the last pass
+    /// rather than on every pass keeps the multisample content live for the
+    /// passes in between (a scene drawn in several passes before the interface
+    /// goes over it) and pays for one resolve per target per submission.
+    ///
+    /// Runs on a mid-frame flush too: a flush is the boundary a readback and
+    /// a synchronous blit observe, so the twin must be current there as well.
+    /// A read that happens between two passes of the same submission is
+    /// covered by [`Self::note_msaa_read`] instead.
+    fn assign_multisample_resolves(&mut self) {
+        let mut resolved: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
+            FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
+        for pass in self.passes.iter_mut().rev() {
+            if !pass.color_msaa_texture.is_null()
+                && resolved.insert((pass.color_texture, pass.color_subresource))
+            {
+                pass.color_resolve_texture = pass.color_resolve_view();
+            }
+            for attachment in &mut pass.extra_color {
+                if !attachment.msaa_texture.is_null()
+                    && resolved.insert((attachment.texture, attachment.subresource))
+                {
+                    attachment.resolve_texture = attachment.resolve_view();
+                }
+            }
+        }
+    }
+
+    /// Resolve `texture` now, because something is about to read it mid-submission.
+    ///
+    /// `texture` is the single-sample twin, the handle every reader knows.
+    /// The most recent pass that rendered into its multisampled companion
+    /// takes the resolve; a target with no multisampled companion, or one no
+    /// pass has touched yet, is a no-op. Called from the `StretchRect` path,
+    /// which orders its blit after the passes already recorded.
+    pub fn note_msaa_read(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if texture.is_null() {
+            return;
+        }
+        for pass in self.passes.iter_mut().rev() {
+            if pass.color_texture == texture && !pass.color_msaa_texture.is_null() {
+                pass.color_resolve_texture = pass.color_resolve_view();
+                return;
+            }
+            for attachment in &mut pass.extra_color {
+                if attachment.texture == texture && !attachment.msaa_texture.is_null() {
+                    attachment.resolve_texture = attachment.resolve_view();
+                    return;
                 }
             }
         }

@@ -94,7 +94,7 @@ use super::{
     shader_bindings::{CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT, ShaderBindings},
     stage_bindings::{STAGE_COUNT, StageBindings, TextureSwapDelta},
     state_block::{RecordingStateBlock, StateOp},
-    surface::{ColorTargetCreateInfo, Direct3DSurface9},
+    surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample},
     texture::{
         CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags,
         TextureInner, new_uninit_page_box,
@@ -308,8 +308,31 @@ pub struct DeviceInner {
     /// Created with the back buffer and destroyed with it, so the two always
     /// name the same storage.
     backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the back buffer, NULL when it is single-sampled.
+    ///
+    /// Every pass on the back buffer attaches this and resolves into
+    /// `backbuffer_handle`, which stays the texture Present, `StretchRect`
+    /// and `LockRect` read.
+    backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_msaa_handle`, NULL whenever that is.
+    ///
+    /// Attached in the companion's place under `D3DRS_SRGBWRITEENABLE`; the
+    /// pass then resolves into `backbuffer_srgb_handle`, which Metal requires
+    /// to carry the attachment's pixel format.
+    backbuffer_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
     depth_stencil_handle: MetalHandle<MTLTextureKind>,
     depth_stencil_format: u32,
+    /// `D3DMULTISAMPLE_TYPE` the swap chain was created with.
+    ///
+    /// Reported by `GetDesc` on the implicit back buffer and depth-stencil
+    /// surfaces, and by the implicit swap chain's present parameters. Also
+    /// decides whether `D3DRS_MULTISAMPLEMASK` applies: D3D9 defines the mask
+    /// only for the maskable levels.
+    backbuffer_multi_sample_type: u32,
+    /// `MultiSampleQuality` the swap chain was created with.
+    backbuffer_multi_sample_quality: u32,
+    /// Sample count the back buffer and the implicit depth surface carry, 1 for none.
+    backbuffer_sample_count: u8,
     /// Scene / depth-binding boolean state (`DEPTH_EXPLICITLY_UNBOUND` / `IN_SCENE`).
     ///
     /// See [`DeviceFlags`].
@@ -596,7 +619,8 @@ pub struct DeviceInner {
     /// `SetDepthStencilSurface(NULL)` + readback would then carry a depth
     /// attachment the pipeline declares no format for (Metal rejects the
     /// pipeline-vs-framebuffer depth/stencil mismatch and drops the draw).
-    last_depth_binding: Option<(DepthBinding, bool, bool)>,
+    /// `(binding, is_sampleable, has_stencil, sample_count)`.
+    last_depth_binding: Option<(DepthBinding, bool, bool, u8)>,
     /// Live `IDirect3DTexture9` objects.
     ///
     /// Populated in `texture_create` after `Box::into_raw`; entries removed in
@@ -1316,6 +1340,9 @@ impl DeviceInner {
             queue_handle: self.queue_handle,
             backbuffer_handle: self.backbuffer_handle,
             backbuffer_srgb_handle: self.backbuffer_srgb_handle,
+            backbuffer_msaa_handle: self.backbuffer_msaa_handle,
+            backbuffer_msaa_srgb_handle: self.backbuffer_msaa_srgb_handle,
+            backbuffer_sample_count: self.backbuffer_sample_count,
             layer_handle: self.layer_handle,
             view_handle: self.view_handle,
             // Logical, paired with the scale: `PassState::reset_frame` derives
@@ -1399,8 +1426,10 @@ impl DeviceInner {
                 self.push_color_rt_binding_op(slot, info, scale);
             }
         }
-        if let Some((binding, is_sampleable, has_stencil)) = self.last_depth_binding.clone() {
-            self.push_depth_binding_op(binding, is_sampleable, has_stencil);
+        if let Some((binding, is_sampleable, has_stencil, sample_count)) =
+            self.last_depth_binding.clone()
+        {
+            self.push_depth_binding_op(binding, is_sampleable, has_stencil, sample_count);
         }
         frame
     }
@@ -1427,6 +1456,7 @@ impl DeviceInner {
         binding: DepthBinding,
         is_sampleable: bool,
         depth_has_stencil: bool,
+        sample_count: u8,
     ) {
         self.push_op(Box::new(move |enc| {
             let (depth_texture, level, desc) = match binding {
@@ -1465,6 +1495,10 @@ impl DeviceInner {
                 is_sampleable,
                 depth_has_stencil,
             );
+            // In lockstep with the bind, which resets the count: a depth
+            // surface that disagrees with render target 0 is dropped at pass
+            // open rather than handed to Metal.
+            enc.set_depth_sample_count(sample_count);
         }));
     }
 
@@ -1483,62 +1517,93 @@ impl DeviceInner {
         scale: mtld3d_core::render_scale::RenderScale,
     ) {
         self.push_op(Box::new(move |enc| {
-            let (handle, w, h, fmt, has_alpha, slice, level) = match info {
-                RtBinding::Backbuffer {
-                    handle,
-                    width,
-                    height,
-                } => (
-                    handle,
-                    width,
-                    height,
-                    mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
-                    // The backbuffer is an alpha-bearing A8R8G8B8 target
-                    // (see `PassState::reset_frame`), so its destination-alpha
-                    // blend factors resolve unclamped.
-                    true,
-                    0,
-                    0,
-                ),
-                RtBinding::StandaloneColor {
-                    handle,
-                    srgb,
-                    format,
-                    has_alpha,
-                    width,
-                    height,
-                } => {
-                    enc.register_srgb_twin(srgb, handle);
-                    (handle, width, height, format, has_alpha, 0, 0)
-                }
-                RtBinding::Texture {
-                    info,
-                    has_alpha,
-                    width,
-                    height,
-                    slice,
-                    level,
-                } => {
-                    let fmt = info.pixel_format;
-                    let h = enc.get_or_create_texture(&info);
-                    // SAFETY: `get_or_create_texture` returns a Metal texture
-                    // handle from the encoder's typed `texture_cache` via `.raw()`.
-                    (
-                        unsafe { MetalHandle::<MTLTextureKind>::new(h) },
+            let (handle, msaa, msaa_srgb, sample_count, w, h, fmt, has_alpha, slice, level) =
+                match info {
+                    RtBinding::Backbuffer {
+                        handle,
+                        msaa,
+                        msaa_srgb,
+                        sample_count,
                         width,
                         height,
-                        fmt,
+                    } => (
+                        handle,
+                        msaa,
+                        msaa_srgb,
+                        sample_count,
+                        width,
+                        height,
+                        mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+                        // The backbuffer is an alpha-bearing A8R8G8B8 target
+                        // (see `PassState::reset_frame`), so its destination-alpha
+                        // blend factors resolve unclamped.
+                        true,
+                        0,
+                        0,
+                    ),
+                    RtBinding::StandaloneColor {
+                        handle,
+                        srgb,
+                        msaa,
+                        msaa_srgb,
+                        sample_count,
+                        format,
                         has_alpha,
+                        width,
+                        height,
+                    } => {
+                        enc.register_srgb_twin(srgb, handle);
+                        (
+                            handle,
+                            msaa,
+                            msaa_srgb,
+                            sample_count,
+                            width,
+                            height,
+                            format,
+                            has_alpha,
+                            0,
+                            0,
+                        )
+                    }
+                    RtBinding::Texture {
+                        info,
+                        has_alpha,
+                        width,
+                        height,
                         slice,
                         level,
-                    )
-                }
-            };
+                    } => {
+                        let fmt = info.pixel_format;
+                        let h = enc.get_or_create_texture(&info);
+                        // SAFETY: `get_or_create_texture` returns a Metal texture
+                        // handle from the encoder's typed `texture_cache` via `.raw()`.
+                        (
+                            unsafe { MetalHandle::<MTLTextureKind>::new(h) },
+                            // D3D9 has no multisampled texture: only a surface
+                            // from `CreateRenderTarget` or the swap chain can
+                            // carry samples, so a texture-backed bind is always
+                            // single-sampled.
+                            MetalHandle::NULL,
+                            MetalHandle::NULL,
+                            1,
+                            width,
+                            height,
+                            fmt,
+                            has_alpha,
+                            slice,
+                            level,
+                        )
+                    }
+                };
             if slot != 0 {
                 enc.set_extra_color_render_target(
                     slot,
                     Some(ExtraColorSlot {
                         texture: handle,
+                        msaa_texture: msaa,
+                        msaa_srgb_texture: msaa_srgb,
+                        sample_count,
                         subresource: slice | (level << 8),
                         // Derived from `logical_size` and `scale` by the setter.
                         size: (0, 0),
@@ -1548,17 +1613,18 @@ impl DeviceInner {
                         has_alpha,
                     }),
                 );
-            } else if slice == 0 && level == 0 {
-                enc.set_color_render_target(handle, w, h, fmt, has_alpha, scale);
             } else {
-                enc.set_color_render_target_subresource(
-                    handle,
-                    (w, h),
-                    fmt,
+                enc.set_color_render_target(&crate::encoder::ColorRtBinding {
+                    texture: handle,
+                    msaa_texture: msaa,
+                    msaa_srgb_texture: msaa_srgb,
+                    sample_count,
+                    logical_size: (w, h),
+                    format: fmt,
                     has_alpha,
                     scale,
-                    (slice, level),
-                );
+                    subresource: (slice, level),
+                });
             }
         }));
     }
@@ -2081,6 +2147,35 @@ impl DeviceInner {
         self.backbuffer_srgb_handle = srgb_handle;
     }
 
+    /// Update the back buffer's multisampled companion alongside its resolve texture.
+    ///
+    /// NULL when the swap chain is single-sampled. Set in the same step as
+    /// [`Self::set_backbuffer_handle`] on every recreate path.
+    pub const fn set_backbuffer_msaa_handle(
+        &mut self,
+        handle: MetalHandle<MTLTextureKind>,
+        srgb_handle: MetalHandle<MTLTextureKind>,
+    ) {
+        self.backbuffer_msaa_handle = handle;
+        self.backbuffer_msaa_srgb_handle = srgb_handle;
+    }
+
+    /// Adopt the multisample configuration a `Reset` re-specified.
+    ///
+    /// Set before the back buffer and implicit depth surface are recreated, so
+    /// both are made at the new count, and read by `GetDesc` on the implicit
+    /// surfaces afterwards.
+    pub const fn set_backbuffer_multi_sample(
+        &mut self,
+        multi_sample_type: u32,
+        multi_sample_quality: u32,
+        sample_count: u8,
+    ) {
+        self.backbuffer_multi_sample_type = multi_sample_type;
+        self.backbuffer_multi_sample_quality = multi_sample_quality;
+        self.backbuffer_sample_count = sample_count;
+    }
+
     /// Update the implicit depth/stencil Metal handle after `device_reset` recreates it.
     ///
     /// Same lifecycle as `set_backbuffer_handle`.
@@ -2225,9 +2320,11 @@ impl DeviceInner {
         self.flush_current_frame_blocking();
         self.encoder_reset();
 
-        let old_handles: [u64; 3] = [
+        let old_handles: [u64; 5] = [
             self.backbuffer_handle.raw(),
             self.backbuffer_srgb_handle.raw(),
+            self.backbuffer_msaa_handle.raw(),
+            self.backbuffer_msaa_srgb_handle.raw(),
             self.depth_stencil_handle.raw(),
         ];
         let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
@@ -2236,7 +2333,7 @@ impl DeviceInner {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
                 pad0: 0,
                 handles_ptr: live.as_ptr() as u64,
-                count: u32::try_from(live.len()).expect("at most 3 handles"),
+                count: u32::try_from(live.len()).expect("at most 5 handles"),
                 pad1: 0,
             };
             unix_call(&mut destroy);
@@ -2249,8 +2346,12 @@ impl DeviceInner {
             queue_handle: self.queue_handle,
             width: self.render_scale.dimension(new_width),
             height: self.render_scale.dimension(new_height),
+            sample_count: u32::from(self.backbuffer_sample_count),
+            pad0: 0,
             texture_handle: MetalHandle::NULL,
             srgb_texture_handle: MetalHandle::NULL,
+            msaa_texture_handle: MetalHandle::NULL,
+            msaa_srgb_texture_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut bb_params);
         if status != 0 || bb_params.texture_handle.is_null() {
@@ -2259,10 +2360,15 @@ impl DeviceInner {
                 "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) — device unusable",
             );
             self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
+            self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_depth_stencil_handle(MetalHandle::NULL);
             return;
         }
         self.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
+        self.set_backbuffer_msaa_handle(
+            bb_params.msaa_texture_handle,
+            bb_params.msaa_srgb_texture_handle,
+        );
 
         if self.depth_stencil_format != 0 {
             let Some(pixel_format) =
@@ -2282,7 +2388,7 @@ impl DeviceInner {
                 width: bb_params.width,
                 height: bb_params.height,
                 pixel_format,
-                pad0: 0,
+                sample_count: u32::from(self.backbuffer_sample_count),
                 texture_handle: MetalHandle::NULL,
             };
             let status = unix_call(&mut ds_params);
@@ -2327,8 +2433,14 @@ pub struct DeviceCreateInfo {
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of `backbuffer_handle`; see `DeviceInner`.
     pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the back buffer; see `DeviceInner`.
+    pub backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of that companion; see `DeviceInner`.
+    pub backbuffer_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
     pub depth_stencil_handle: MetalHandle<MTLTextureKind>,
     pub depth_stencil_format: u32,
+    /// Sample count of the back buffer and the implicit depth surface, 1 for none.
+    pub backbuffer_sample_count: u8,
     pub backbuffer_width: u32,
     pub backbuffer_height: u32,
     /// Resolved `render.scale`, already forced to identity where unusable.
@@ -2397,6 +2509,11 @@ impl Direct3DDevice9 {
             layer_handle: info.layer_handle,
             backbuffer_handle: info.backbuffer_handle,
             backbuffer_srgb_handle: info.backbuffer_srgb_handle,
+            backbuffer_msaa_handle: info.backbuffer_msaa_handle,
+            backbuffer_msaa_srgb_handle: info.backbuffer_msaa_srgb_handle,
+            backbuffer_multi_sample_type: info.present_params.multi_sample_type,
+            backbuffer_multi_sample_quality: info.present_params.multi_sample_quality,
+            backbuffer_sample_count: info.backbuffer_sample_count,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
             flags: DeviceFlags::empty(),
@@ -2541,6 +2658,36 @@ impl DeviceInner {
     #[must_use]
     pub const fn backbuffer_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
         self.backbuffer_srgb_handle
+    }
+
+    /// Multisampled companion of the back buffer, NULL when it is single-sampled.
+    #[must_use]
+    pub const fn backbuffer_msaa_handle(&self) -> MetalHandle<MTLTextureKind> {
+        self.backbuffer_msaa_handle
+    }
+
+    /// sRGB twin view of that companion, NULL whenever the companion is.
+    #[must_use]
+    pub const fn backbuffer_msaa_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
+        self.backbuffer_msaa_srgb_handle
+    }
+
+    /// Sample count of the back buffer and the implicit depth surface, 1 for none.
+    #[must_use]
+    pub const fn backbuffer_sample_count(&self) -> u8 {
+        self.backbuffer_sample_count
+    }
+
+    /// `D3DMULTISAMPLE_TYPE` the swap chain was created with.
+    #[must_use]
+    pub const fn backbuffer_multi_sample_type(&self) -> u32 {
+        self.backbuffer_multi_sample_type
+    }
+
+    /// `MultiSampleQuality` the swap chain was created with.
+    #[must_use]
+    pub const fn backbuffer_multi_sample_quality(&self) -> u32 {
+        self.backbuffer_multi_sample_quality
     }
 
     pub const fn backbuffer_width(&self) -> u32 {
@@ -2723,6 +2870,11 @@ impl DeviceInner {
 enum RtBinding {
     Backbuffer {
         handle: MetalHandle<MTLTextureKind>,
+        /// Multisampled companion of the back buffer, NULL when there is none.
+        msaa: MetalHandle<MTLTextureKind>,
+        /// sRGB twin view of that companion, NULL whenever the companion is.
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+        sample_count: u8,
         width: u32,
         height: u32,
     },
@@ -2740,6 +2892,11 @@ enum RtBinding {
         /// Registered with the pass state when the target is bound, so a
         /// `D3DRS_SRGBWRITEENABLE` draw onto it attaches the twin.
         srgb: MetalHandle<MTLTextureKind>,
+        /// Multisampled companion of the surface, NULL when there is none.
+        msaa: MetalHandle<MTLTextureKind>,
+        /// sRGB twin view of that companion, NULL whenever the companion is.
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+        sample_count: u8,
         format: mtld3d_shared::mtl::PixelFormat,
         /// Whether the surface's D3D format has a real alpha channel.
         ///
@@ -3004,6 +3161,10 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             pipeline_handle: MetalHandle::NULL, // pipelines managed by encoder cache
             depth_texture_handle: device_inner.depth_stencil_handle,
         };
+        // The back buffer's multisampled companion has no slot on the destroy
+        // thunk; it goes out with the bulk release, issued below once the
+        // encoder shutdown has waited for the GPU.
+        let backbuffer_msaa_handle = device_inner.backbuffer_msaa_handle;
         let parent = device_inner.direct3d as *mut c_void;
 
         // Hand the window back before the subclass goes: the restore issues a
@@ -3062,6 +3223,17 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
 
         drop(device_inner);
 
+        if !backbuffer_msaa_handle.is_null() {
+            let handles = [backbuffer_msaa_handle.raw()];
+            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                pad0: 0,
+                handles_ptr: handles.as_ptr() as u64,
+                count: 1,
+                pad1: 0,
+            };
+            unix_call(&mut destroy);
+        }
         unix_call(&mut params);
 
         // Intentionally LEAK the small wrapper shell (vtbl ptr + refcount +
@@ -3521,8 +3693,34 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     pp_in.back_buffer_count = pp.back_buffer_count;
     pp_in.back_buffer_format = pp.back_buffer_format;
 
+    // `Reset` re-specifies the swap chain, multisample configuration
+    // included, so resolve it against the device before anything is recreated
+    // and treat a change as a resize: the back buffer and the implicit depth
+    // surface both have to be rebuilt at the new count.
+    let Ok(new_sample_count) = mtld3d_core::multisample::resolve_sample_count(
+        pp.multi_sample_type,
+        pp.multi_sample_quality,
+        pp.back_buffer_format,
+        crate::direct3d9::device_caps_flags(),
+    )
+    .map(|count| u8::try_from(count).expect("sample count ≤ 16 fits u8")) else {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset: MultiSampleType={} Quality={} on back-buffer format {} is not available",
+            pp.multi_sample_type, pp.multi_sample_quality, pp.back_buffer_format,
+        );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return D3DERR_INVALIDCALL;
+    };
+    let multi_sample_changed = new_sample_count != dev.backbuffer_sample_count;
+    dev.set_backbuffer_multi_sample(
+        pp.multi_sample_type,
+        pp.multi_sample_quality,
+        new_sample_count,
+    );
     let resized = pp.back_buffer_width != dev.backbuffer_width
-        || pp.back_buffer_height != dev.backbuffer_height;
+        || pp.back_buffer_height != dev.backbuffer_height
+        || multi_sample_changed;
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -3649,9 +3847,11 @@ fn reset_recreate_resources(
 
     // 2. Destroy the old backbuffer + depth/stencil. Bulk thunk so the
     //    two handles cross the PE/Unix boundary in one call.
-    let old_handles: [u64; 3] = [
+    let old_handles: [u64; 5] = [
         dev.backbuffer_handle.raw(),
         dev.backbuffer_srgb_handle.raw(),
+        dev.backbuffer_msaa_handle.raw(),
+        dev.backbuffer_msaa_srgb_handle.raw(),
         dev.depth_stencil_handle.raw(),
     ];
     let live_count = old_handles.iter().filter(|&&h| h != 0).count();
@@ -3661,7 +3861,7 @@ fn reset_recreate_resources(
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
             pad0: 0,
             handles_ptr: live.as_ptr() as u64,
-            count: u32::try_from(live.len()).expect("at most 3 handles"),
+            count: u32::try_from(live.len()).expect("at most 5 handles"),
             pad1: 0,
         };
         unix_call(&mut destroy);
@@ -3682,17 +3882,26 @@ fn reset_recreate_resources(
         queue_handle: dev.queue_handle,
         width: dev.render_scale.dimension(pp.back_buffer_width),
         height: dev.render_scale.dimension(pp.back_buffer_height),
+        sample_count: u32::from(dev.backbuffer_sample_count),
+        pad0: 0,
         texture_handle: MetalHandle::NULL,
         srgb_texture_handle: MetalHandle::NULL,
+        msaa_texture_handle: MetalHandle::NULL,
+        msaa_srgb_texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
     if status != 0 || bb_params.texture_handle.is_null() {
         error!(target: LOG_TARGET, "Reset: CreateBackbuffer failed (0x{status:08X}) — device unusable");
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
+        dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
         return Err(D3DERR_INVALIDCALL);
     }
     dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
+    dev.set_backbuffer_msaa_handle(
+        bb_params.msaa_texture_handle,
+        bb_params.msaa_srgb_texture_handle,
+    );
 
     // 5. Recreate depth/stencil if the device had one. Format is taken
     //    from the saved depth_stencil_format captured at CreateDevice;
@@ -3716,7 +3925,7 @@ fn reset_recreate_resources(
             width: bb_params.width,
             height: bb_params.height,
             pixel_format,
-            pad0: 0,
+            sample_count: u32::from(dev.backbuffer_sample_count),
             texture_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut ds_params);
@@ -3779,7 +3988,7 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
             width: dev.render_scale.dimension(dev.backbuffer_width),
             height: dev.render_scale.dimension(dev.backbuffer_height),
             pixel_format,
-            pad0: 0,
+            sample_count: u32::from(dev.backbuffer_sample_count),
             texture_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut ds_params);
@@ -4889,6 +5098,38 @@ extern "system" fn device_create_index_buffer(
     D3D_OK
 }
 
+/// Resolve a surface create's `(multi_sample, quality)` against the device.
+///
+/// The same predicate `CheckDeviceMultiSampleType` answers with, so a game
+/// that asked first gets the same verdict at create time. A create says
+/// `INVALIDCALL` for every rejection, malformed or merely unavailable: the
+/// query is where D3D9 draws that distinction, and the create's contract is
+/// the single "these parameters do not describe a surface I can make".
+fn resolve_surface_multi_sample(
+    multi_sample_type: u32,
+    multi_sample_quality: u32,
+    format: u32,
+    site: &str,
+) -> Result<SurfaceMultiSample, i32> {
+    let Ok(sample_count) = mtld3d_core::multisample::resolve_sample_count(
+        multi_sample_type,
+        multi_sample_quality,
+        format,
+        crate::direct3d9::device_caps_flags(),
+    ) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject {site}: multi_sample={multi_sample_type} quality={multi_sample_quality} on format {format} is not creatable on this device → INVALIDCALL"
+        );
+        return Err(D3DERR_INVALIDCALL);
+    };
+    Ok(SurfaceMultiSample {
+        multi_sample_type,
+        multi_sample_quality,
+        sample_count: u8::try_from(sample_count).expect("sample count ≤ 16 fits u8"),
+    })
+}
+
 /// Create a persistent render-target-capable color `MTLTexture` and wrap it as a surface.
 ///
 /// The wrapper is a standalone `Direct3DSurface9`, mirroring the depth path. Shared by
@@ -4896,6 +5137,11 @@ extern "system" fn device_create_index_buffer(
 /// `CreateOffscreenPlainSurface(D3DPOOL_DEFAULT)` (usage = 0). Returns the boxed
 /// wrapper pointer, or `None` (caller maps to `INVALIDCALL`) for an unmappable or
 /// compressed color format, or if the Metal allocation fails.
+///
+/// `multi_sample` is the already-resolved `(type, quality)` pair: the sample
+/// count plus the D3D9 type the surface reports from `GetDesc`. Above one
+/// sample the create also produces the multisampled companion the passes
+/// attach.
 fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
@@ -4903,6 +5149,7 @@ fn create_color_target_surface(
     height: u32,
     format: u32,
     usage: u32,
+    multi_sample: SurfaceMultiSample,
 ) -> Option<*mut Direct3DSurface9> {
     let mapping = crate::direct3d9::map_for_device(format)?;
     if mapping.is_compressed() {
@@ -4937,9 +5184,11 @@ fn create_color_target_surface(
         width: scale.dimension(width),
         height: scale.dimension(height),
         pixel_format: mapping.metal_pixel_format(),
-        pad0: 0,
+        sample_count: u32::from(multi_sample.sample_count),
         texture_handle: MetalHandle::NULL,
         srgb_texture_handle: MetalHandle::NULL,
+        msaa_texture_handle: MetalHandle::NULL,
+        msaa_srgb_texture_handle: MetalHandle::NULL,
     };
     if unix_call(&mut params) != 0 || params.texture_handle.is_null() {
         return None;
@@ -4948,11 +5197,14 @@ fn create_color_target_surface(
         device_inner,
         metal_color_handle: params.texture_handle,
         metal_color_srgb_handle: params.srgb_texture_handle,
+        metal_msaa_handle: params.msaa_texture_handle,
+        metal_msaa_srgb_handle: params.msaa_srgb_texture_handle,
         width,
         height,
         format,
         usage,
         render_scale: scale,
+        multi_sample,
     });
     // The surface owns a DEFAULT-pool Metal texture no `TextureInner` covers,
     // so charge it here; `finalize_surface`'s colour retire arm refunds it.
@@ -4972,7 +5224,7 @@ extern "system" fn device_create_render_target(
     height: u32,
     format: u32,
     multi_sample: u32,
-    _multi_sample_quality: u32,
+    multi_sample_quality: u32,
     lockable: i32,
     surface: *mut *mut c_void,
     shared_handle: *mut c_void,
@@ -4988,10 +5240,26 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return E_NOTIMPL;
     }
-    if multi_sample != 0 {
+    let multi_sample = match resolve_surface_multi_sample(
+        multi_sample,
+        multi_sample_quality,
+        format,
+        "CreateRenderTarget",
+    ) {
+        Ok(ms) => ms,
+        Err(hr) => {
+            null_out(surface);
+            return hr;
+        }
+    };
+    // A lockable multisampled render target has no meaning: D3D9 defines the
+    // lock against a single-sample surface, and the samples are the point of
+    // the multisampled one.
+    if lockable != 0 && multi_sample.sample_count > 1 {
         warn!(
             target: LOG_TARGET,
-            "reject CreateRenderTarget({width}x{height}, ms={multi_sample}) → INVALIDCALL (MSAA not supported)"
+            "reject CreateRenderTarget({width}x{height}, ms={}) → INVALIDCALL (a multisampled render target cannot be lockable)",
+            multi_sample.multi_sample_type
         );
         null_out(surface);
         return D3DERR_INVALIDCALL;
@@ -5008,6 +5276,7 @@ extern "system" fn device_create_render_target(
         height,
         format,
         D3DUSAGE_RENDERTARGET,
+        multi_sample,
     ) else {
         warn!(
             target: LOG_TARGET,
@@ -5048,7 +5317,7 @@ extern "system" fn device_create_depth_stencil_surface(
     height: u32,
     format: u32,
     multi_sample: u32,
-    _multi_sample_quality: u32,
+    multi_sample_quality: u32,
     _discard: i32,
     surface: *mut *mut c_void,
     shared_handle: *mut c_void,
@@ -5072,14 +5341,18 @@ extern "system" fn device_create_depth_stencil_surface(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    if multi_sample != 0 {
-        warn!(
-            target: LOG_TARGET,
-            "reject CreateDepthStencilSurface({width}x{height}, ms={multi_sample}) → INVALIDCALL (MSAA not supported)"
-        );
-        null_out(surface);
-        return D3DERR_INVALIDCALL;
-    }
+    let multi_sample = match resolve_surface_multi_sample(
+        multi_sample,
+        multi_sample_quality,
+        format,
+        "CreateDepthStencilSurface",
+    ) {
+        Ok(ms) => ms,
+        Err(hr) => {
+            null_out(surface);
+            return hr;
+        }
+    };
     let Some(pixel_format) = mtld3d_core::format::map_d3d_depth_format(format) else {
         warn!(
             target: LOG_TARGET,
@@ -5104,7 +5377,7 @@ extern "system" fn device_create_depth_stencil_surface(
         width: scale.dimension(width),
         height: scale.dimension(height),
         pixel_format,
-        pad0: 0,
+        sample_count: u32::from(multi_sample.sample_count),
         texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut params);
@@ -5128,6 +5401,7 @@ extern "system" fn device_create_depth_stencil_surface(
         height,
         format,
         scale,
+        multi_sample,
     );
     // Same accounting as a standalone colour target: a real Metal depth
     // texture with no `TextureInner` behind it, refunded by
@@ -5523,6 +5797,14 @@ extern "system" fn device_get_render_target_data(
             frame_dump::surface_label(rt),
             frame_dump::surface_label(dst)
         ));
+    }
+    // A multisampled source has no per-pixel value to hand back: D3D9 makes
+    // the application resolve it with `StretchRect` into a single-sampled
+    // surface first, and rejects the call outright.
+    if src.multi_sample().sample_count > 1 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "GetRenderTargetData: source is multisampled → INVALIDCALL (StretchRect it into a single-sampled surface first)");
+        return D3DERR_INVALIDCALL;
     }
     let Some((dst_ptr, dst_len)) = dst_surf.system_memory_blit_dst() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -6321,6 +6603,13 @@ fn emit_stretch_rect_blit(
         StretchKind::Texture(info) => enc.get_or_create_texture(info),
         StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),
     };
+    // D3D9 resolves implicitly when a `StretchRect` reads a multisampled
+    // surface. The blit runs after the passes recorded so far, so the last of
+    // them that rendered into the multisampled companion takes the resolve;
+    // for a single-sampled source this finds nothing and does nothing.
+    // SAFETY: `src_handle` came from the encoder's texture cache or from a
+    // surface's retained handle, both of which are `MTLTexture` handles.
+    enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
     let dst_handle = match &dst_info.kind {
         StretchKind::Texture(info) => enc.get_or_create_texture(info),
         StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),
@@ -6353,7 +6642,14 @@ fn emit_stretch_rect_blit(
     // endpoint can turn a logically 1:1 copy into a physical resize, which the
     // blit encoder cannot do, so the transport choice is re-made here on the
     // sizes that actually reach Metal.
-    let render_quad = render_quad || src_region.w != dst_region.w || src_region.h != dst_region.h;
+    // A multisampled destination has to go through the render quad whatever
+    // the sizes: `MTLBlitCommandEncoder` cannot write a multisampled texture,
+    // and the quad writes every sample of each pixel it covers, which is the
+    // spread D3D9 defines for a copy into a multisampled surface.
+    let render_quad = render_quad
+        || dst_info.sample_count > 1
+        || src_region.w != dst_region.w
+        || src_region.h != dst_region.h;
     if src_handle == dst_handle {
         emit_same_texture_stretch(
             enc,
@@ -6437,12 +6733,18 @@ fn emit_stretch_rect_blit(
                 rect: src_region,
                 dims: src_dims,
                 mip: src_info.mip_level,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count: 1,
             },
             &BlitSide {
                 handle: dst_handle,
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_info.mip_level,
+                msaa: dst_info.msaa,
+                msaa_srgb: dst_info.msaa_srgb,
+                sample_count: dst_info.sample_count,
             },
             dst_format,
             mtld3d_core::stretch_rect::blit_decode(src_info.format),
@@ -6614,12 +6916,18 @@ fn emit_same_texture_stretch(
                 },
                 dims: (scratch_w, scratch_h),
                 mip: 0,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count: 1,
             },
             &BlitSide {
                 handle,
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_mip,
+                msaa: dst_info.msaa,
+                msaa_srgb: dst_info.msaa_srgb,
+                sample_count: dst_info.sample_count,
             },
             format,
             mtld3d_core::stretch_rect::blit_decode(dst_info.format),
@@ -6704,6 +7012,16 @@ struct StretchSurfaceInfo {
     /// mip chain afterwards, the same way a level-0
     /// `UnlockRect` does.
     autogen_texture_id: Option<TextureId>,
+    /// Multisampled companion of the surface's texture, or null.
+    ///
+    /// A multisampled source is read through the single-sample texture the
+    /// resolve fills; a multisampled destination is written through this one
+    /// by the render-quad path and resolved back at pass end.
+    msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of that companion, or null whenever the companion is.
+    msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the surface, 1 when it is single-sampled.
+    sample_count: u8,
 }
 
 enum StretchKind {
@@ -6760,6 +7078,10 @@ fn resolve_stretch_surface(
             flags,
             autogen_texture_id: (tex.inner().autogen_mipmap() && level == 0)
                 .then(|| tex.texture_id()),
+            // D3D9 has no multisampled texture: only a surface carries samples.
+            msaa: MetalHandle::NULL,
+            msaa_srgb: MetalHandle::NULL,
+            sample_count: 1,
         });
     }
     let color = s.metal_color_handle();
@@ -6779,6 +7101,9 @@ fn resolve_stretch_surface(
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_RENDER_TARGET,
             autogen_texture_id: None,
+            msaa: s.metal_msaa_handle(),
+            msaa_srgb: s.metal_msaa_srgb_handle(),
+            sample_count: s.multi_sample().sample_count,
         });
     }
     let depth = s.metal_depth_handle();
@@ -6798,6 +7123,14 @@ fn resolve_stretch_surface(
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_DEPTH_STENCIL,
             autogen_texture_id: None,
+            // A multisampled depth surface has no resolve: D3D9 offers no way
+            // to read one, and a depth-to-depth `StretchRect` between two of
+            // them would be a same-sample-count copy Metal's blit encoder
+            // cannot make. Reported single-sampled so the pair is rejected by
+            // the format/size checks rather than mis-copied.
+            msaa: MetalHandle::NULL,
+            msaa_srgb: MetalHandle::NULL,
+            sample_count: 1,
         });
     }
     None
@@ -7262,6 +7595,9 @@ extern "system" fn device_set_render_target(
             RtBinding::StandaloneColor {
                 handle: standalone_color,
                 srgb: surface_ref.metal_color_srgb_handle(),
+                msaa: surface_ref.metal_msaa_handle(),
+                msaa_srgb: surface_ref.metal_msaa_srgb_handle(),
+                sample_count: surface_ref.multi_sample().sample_count,
                 format: fmt,
                 has_alpha,
                 width: desc.width,
@@ -7271,6 +7607,9 @@ extern "system" fn device_set_render_target(
             // The implicit backbuffer render target.
             RtBinding::Backbuffer {
                 handle: dev.backbuffer_handle,
+                msaa: dev.backbuffer_msaa_handle,
+                msaa_srgb: dev.backbuffer_msaa_srgb_handle,
+                sample_count: dev.backbuffer_sample_count,
                 width: dev.backbuffer_width,
                 height: dev.backbuffer_height,
             }
@@ -7600,8 +7939,26 @@ extern "system" fn device_set_depth_stencil_surface(
     // encoder's pass state re-attaches the implicit auto-depth each frame; a
     // D3D9 depth bind — including an explicit unbind — outlives an internal
     // flush, see `last_depth_binding`).
-    dev.last_depth_binding = Some((binding.clone(), is_sampleable, depth_has_stencil));
-    dev.push_depth_binding_op(binding, is_sampleable, depth_has_stencil);
+    // A texture-backed depth surface is never multisampled: D3D9 has no
+    // multisampled texture, only a multisampled surface.
+    let depth_sample_count = if surf.is_null() {
+        1
+    } else {
+        // SAFETY: `surf` is non-null (checked) and a live `Direct3DSurface9`.
+        unsafe { (*surf).multi_sample() }.sample_count
+    };
+    dev.last_depth_binding = Some((
+        binding.clone(),
+        is_sampleable,
+        depth_has_stencil,
+        depth_sample_count,
+    ));
+    dev.push_depth_binding_op(
+        binding,
+        is_sampleable,
+        depth_has_stencil,
+        depth_sample_count,
+    );
     // A depth-attachment change ends the current Metal render pass; the next FF
     // draw runs on a fresh encoder, so its FF vertex constants (`vs_c`, buffer
     // 15) must be re-emitted. `SetRenderTarget` gets this for free via its
@@ -9544,6 +9901,22 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             u16::try_from(sr[3]).expect("D3D9 scissor h ≤ 16384"),
         ];
 
+        // `D3DRS_MULTISAMPLEMASK` only means anything against a maskable
+        // multisampled target, and which target is bound is API-thread
+        // knowledge; `SetRenderTarget` re-dirties this section, so the
+        // narrowing cannot go stale.
+        let rt0 = dev.bound_rt().render_target(0);
+        let rt0_multi_sample = if rt0.is_null() {
+            SurfaceMultiSample {
+                multi_sample_type: dev.backbuffer_multi_sample_type(),
+                multi_sample_quality: dev.backbuffer_multi_sample_quality(),
+                sample_count: dev.backbuffer_sample_count(),
+            }
+        } else {
+            // SAFETY: non-null check passed; the bound-slot refcount holds
+            // the surface live.
+            unsafe { (*rt0).multi_sample() }
+        };
         Some(RenderStateSnapshot {
             pipeline_rs,
             depth_scissor,
@@ -9554,6 +9927,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             depth_bias: rs[D3DRS_DEPTHBIAS as usize],
             slope_scale_depth_bias: rs[D3DRS_SLOPESCALEDEPTHBIAS as usize],
             stencil_ref: rs[D3DRS_STENCILREF as usize],
+            sample_mask: mtld3d_core::multisample::effective_sample_mask(
+                rs[D3DRS_MULTISAMPLEMASK as usize],
+                rt0_multi_sample.sample_count,
+                rt0_multi_sample.multi_sample_type,
+            ),
         })
     } else {
         None
@@ -11822,7 +12200,11 @@ const fn rs_classify(index: u32) -> RsClass {
         | D3DRS_CCW_STENCILFAIL
         | D3DRS_CCW_STENCILZFAIL
         | D3DRS_CCW_STENCILPASS
-        | D3DRS_CCW_STENCILFUNC => RsClass::Consumed,
+        | D3DRS_CCW_STENCILFUNC
+        // MULTISAMPLEMASK narrows the samples a draw covers; the pixel-shader
+        // variant writes it to a `[[sample_mask]]` output, which is where
+        // Metal takes a coverage mask.
+        | D3DRS_MULTISAMPLEMASK => RsClass::Consumed,
 
         // Bucket B — not yet implemented → port-target candidates.
         D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
@@ -11833,8 +12215,12 @@ const fn rs_classify(index: u32) -> RsClass {
         // Bucket D — obsolete / no Metal analog. Info-level (not warn)
         // because the no-op IS the correct behaviour on every modern
         // driver.
-        D3DRS_MULTISAMPLEANTIALIAS | D3DRS_MULTISAMPLEMASK => {
-            RsClass::Obsolete("MSAA not supported (caps reject multisample formats)")
+        // MULTISAMPLEANTIALIAS asks the rasterizer to drop to one sample for
+        // a draw on a multisampled target. Metal ties the pipeline's
+        // `rasterSampleCount` to the attachment's, so there is no per-draw
+        // switch to honour it with.
+        D3DRS_MULTISAMPLEANTIALIAS => {
+            RsClass::Obsolete("Metal has no per-draw multisample toggle (D3DPRASTERCAPS_MULTISAMPLE_TOGGLE is not advertised)")
         }
         D3DRS_PATCHEDGESTYLE | D3DRS_POSITIONDEGREE | D3DRS_NORMALDEGREE => {
             RsClass::Obsolete("N-patch tessellation is obsolete — every modern driver ignores")
@@ -12003,18 +12389,6 @@ pub fn warn_present_params_fields_once(pp: &mtld3d_types::D3DPRESENT_PARAMETERS)
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "CreateDevice: back_buffer_count={} requested but only single back-buffer supported",
             pp.back_buffer_count
-        );
-    }
-    if pp.multi_sample_type != 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "CreateDevice: multi_sample_type={} requested but MSAA not implemented",
-            pp.multi_sample_type
-        );
-    }
-    if pp.multi_sample_quality != 0 {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "CreateDevice: multi_sample_quality={} requested but MSAA not implemented",
-            pp.multi_sample_quality
         );
     }
     if pp.swap_effect != 0 && pp.swap_effect != 1 {

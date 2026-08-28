@@ -72,10 +72,11 @@ fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::align_of::<CreateTexturesBatchParams>(), 8);
     assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
 
-    // PassDescriptor: 5 * u64 + 14 * u32 + 3 * ExtraColorDesc = 40 + 56 + 72 = 168.
-    assert_eq!(core::mem::size_of::<PassDescriptor>(), 168);
-    // ExtraColorDesc: 8 texture + 4 subresource + 4 load + 4 store + 4 reserved = 24.
-    assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 24);
+    // PassDescriptor: 6 * u64 + 14 * u32 + 3 * ExtraColorDesc = 48 + 56 + 96 = 200.
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 200);
+    // ExtraColorDesc: 8 texture + 8 resolve + 4 subresource + 4 load + 4 store
+    // + 4 reserved = 32.
+    assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 32);
 
     // SubmitFrameParams:
     //   8 queue_handle
@@ -110,5 +111,5 @@ fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
         PassDescriptor::pack_flags(true, 5, 9, 3),
         1 | (5 << 1) | (9 << 4) | (3 << 8)
     );
-    assert_eq!(core::mem::size_of::<PassDescriptor>(), 168);
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 200);
 }

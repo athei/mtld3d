@@ -96,6 +96,16 @@ bitflags::bitflags! {
         /// shader and binds nothing, so the common case costs nothing.
         /// Folded into the PS cache key.
         const LOD_BIAS = 1 << 5;
+        /// `D3DRS_MULTISAMPLEMASK` selects fewer than all samples.
+        ///
+        /// When set, the fragment function returns a struct carrying a
+        /// `[[sample_mask]]` member and writes `VariantKey::sample_mask` to
+        /// it, which is the only per-draw sample coverage control Metal
+        /// offers: there is no equivalent of Vulkan's `pSampleMask` on the
+        /// pipeline descriptor. Set only for a maskable multisampled render
+        /// target whose mask is not already all-ones, so single-sampled draws
+        /// keep their existing libraries. Folded into the PS cache key.
+        const SAMPLE_MASK = 1 << 6;
     }
 }
 
@@ -170,6 +180,13 @@ pub struct VariantKey {
     /// `Default` (0) still means "render target 0 only" and the FF PS, which
     /// writes one output, keys on the default. Part of the PS cache key.
     pub color_out_mask: u8,
+    /// `D3DRS_MULTISAMPLEMASK` narrowed to the pass's sample count.
+    ///
+    /// Bit `i` selects sample `i`. Only read when
+    /// [`VariantFlags::SAMPLE_MASK`] is set, and held at 0 otherwise so a
+    /// render state a single-sampled draw ignores cannot fragment the cache.
+    /// `u8` because Metal caps a texture at 8 samples.
+    pub sample_mask: u8,
     /// Packed boolean features — pixel-fog source, flat shade, sRGB write.
     ///
     /// See [`VariantFlags`].
@@ -893,7 +910,8 @@ fn emit_ps_function(
     let written_colors = ps.color_out_mask();
     let exported_colors = (written_colors & variant.color_out_mask) | 1;
     let color_local_count = 8 - written_colors.leading_zeros().min(7);
-    let returns_struct = exports_depth || exported_colors != 1;
+    let writes_sample_mask = variant.flags.contains(VariantFlags::SAMPLE_MASK);
+    let returns_struct = exports_depth || exported_colors != 1 || writes_sample_mask;
     if returns_struct {
         w(out, "struct PsOut {\n");
         for i in 0..4u32 {
@@ -903,6 +921,9 @@ fn emit_ps_function(
         }
         if exports_depth {
             w(out, "    float oDepth [[depth(any)]];\n");
+        }
+        if writes_sample_mask {
+            w(out, "    uint oMask [[sample_mask]];\n");
         }
         w(out, "};\n\n");
     }
@@ -1151,6 +1172,9 @@ fn emit_ps_function(
         }
         if exports_depth {
             w(out, "    _ps_out.oDepth = _depth_storage.x;\n");
+        }
+        if writes_sample_mask {
+            let _ = writeln!(out, "    _ps_out.oMask = {}u;", variant.sample_mask);
         }
         w(out, "    return _ps_out;\n");
     } else {

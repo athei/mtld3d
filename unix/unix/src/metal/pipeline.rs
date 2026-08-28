@@ -68,6 +68,10 @@ pub fn create_render_pipeline(
     desc.setVertexFunction(Some(&vertex_function));
     desc.setFragmentFunction(Some(&fragment_function));
     desc.setVertexDescriptor(Some(&vertex_desc));
+    // Metal validates this against the sample count of every attachment
+    // texture of the pass the pipeline is bound in, so the PE side keys the
+    // pipeline cache on it.
+    desc.setRasterSampleCount(params.sample_count.max(1) as usize);
 
     // Pipeline-state label = `<vs_name> + <ps_name>`. Surfaces in Xcode's
     // Frame Capture timeline + pipeline-state list views as the per-shader

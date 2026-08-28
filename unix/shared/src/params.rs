@@ -45,10 +45,10 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 64);
-    assert!(core::mem::size_of::<CreateBackbufferParams>() == 40);
+    assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
-    assert!(core::mem::size_of::<PassDescriptor>() == 168);
+    assert!(core::mem::size_of::<PassDescriptor>() == 200);
 };
 
 /// One-shot "register `env_logger` on the unix side" thunk.
@@ -298,6 +298,16 @@ pub struct CreateBackbufferParams {
     pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
     pub width: u32,                                // in
     pub height: u32,                               // in
+    /// Multisample count of the back buffer, 1 for none.
+    ///
+    /// Above 1 the thunk creates a second, multisampled texture beside the
+    /// single-sample one and returns it in `msaa_texture_handle`. The
+    /// single-sample texture stays the one Present, `StretchRect` and
+    /// `LockRect` read; the multisampled one is the colour attachment every
+    /// pass renders into and resolves from.
+    pub sample_count: u32, // in
+    // allow: FFI struct padding; pub for cross-crate field-init.
+    pub pad0: u32,
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
     /// Eagerly-created sRGB twin view of `texture_handle`.
     ///
@@ -307,6 +317,15 @@ pub struct CreateBackbufferParams {
     /// gives the encode its D3D9 position, after the blender. Destroyed
     /// with the base texture.
     pub srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Multisampled companion of `texture_handle`, NULL when `sample_count` is 1.
+    pub msaa_texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Eagerly-created sRGB twin view of `msaa_texture_handle`.
+    ///
+    /// A multisampled pass writing sRGB attaches this and resolves into
+    /// `srgb_texture_handle`: Metal requires the resolve texture to carry the
+    /// attachment's pixel format, so the two views have to agree. NULL
+    /// whenever `msaa_texture_handle` is.
+    pub msaa_srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 
 impl Thunk for CreateBackbufferParams {
@@ -366,6 +385,12 @@ pub struct CreateRenderPipelineParams {
                            * machine for cascade caster passes where every draw has
                            * color_write_mask=0 (eliminates Apple "Unused Texture"). */
     pub extra_present_mask: u32, // in: bit i = colorAttachments[i + 1] is declared
+    /// `rasterSampleCount` of the pipeline, 1 for a single-sampled pass.
+    ///
+    /// Metal requires it to equal the sample count of every attachment
+    /// texture of the render pass the pipeline is bound in, so it is part of
+    /// the pipeline cache key on the PE side.
+    pub sample_count: u32, // in
     pub extra: [ExtraColorAttachmentParams; 3], // in: colorAttachments[1..=3]
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
 }
@@ -425,6 +450,11 @@ pub struct EnsureClearQuadPipelineParams {
     /// slot 0 under `COLOR_FORMAT_NO_WRITE`. Zero on a single-target pass.
     pub extra_present_mask: u32, // in
     pub extra_formats: [PixelFormat; 3],           // in (ignored where the mask bit is clear)
+    /// `rasterSampleCount` of the pass the quad draws into, 1 for none.
+    ///
+    /// Part of the unix-side cache key: a quad pipeline built for a
+    /// single-sampled pass cannot be bound in a multisampled one.
+    pub sample_count: u32, // in
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
 }
 
@@ -458,6 +488,11 @@ pub struct EnsureBlitPipelineParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
     pub color_format: PixelFormat,                 // in: destination colour format
     pub quad_kind: crate::mtl::QuadPipelineKind,   // in: which fragment function to link
+    /// `rasterSampleCount` of the destination pass, 1 for none.
+    ///
+    /// A `StretchRect` into a multisampled render target opens a
+    /// multisampled pass, and Metal rejects a single-sampled pipeline there.
+    pub sample_count: u32, // in
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
 }
 
@@ -513,10 +548,16 @@ impl Thunk for CompileShaderLibraryParams {
 /// `StretchRect` lands after the last draw of the frame.
 ///
 /// Fields are ordered u64s-first then u32s so the natural struct layout
-/// is padding-free; size is 168 bytes on both 32- and 64-bit PE.
+/// is padding-free on both 32- and 64-bit PE.
 #[repr(C, align(8))]
 pub struct PassDescriptor {
     pub color_texture: MetalHandle<MTLTextureKind>, // in
+    /// Single-sample texture `color_texture` resolves into, NULL when it is not multisampled.
+    ///
+    /// Non-NULL only alongside a `color_store_action` that carries a resolve;
+    /// it takes the same slice and level as the colour attachment, because it
+    /// is the same D3D9 surface seen without multisampling.
+    pub color_resolve_texture: MetalHandle<MTLTextureKind>, // in (NULL = no resolve)
     pub depth_texture: MetalHandle<MTLTextureKind>, // in (NULL = none)
     pub commands_ptr: u64,                          // in: *const Command
     pub visibility_result_buffer: MetalHandle<MTLBufferKind>, // in (NULL = no visibility tracking)
@@ -612,6 +653,8 @@ impl PassDescriptor {
 #[repr(C)]
 pub struct ExtraColorDesc {
     pub texture: MetalHandle<MTLTextureKind>, // in (NULL = unbound)
+    /// See [`PassDescriptor::color_resolve_texture`].
+    pub resolve_texture: MetalHandle<MTLTextureKind>, // in (NULL = no resolve)
     pub subresource: u32,                     // in: slice | (level << 8)
     pub load_action: LoadAction,              // in
     pub store_action: StoreAction,            // in
@@ -622,6 +665,7 @@ impl ExtraColorDesc {
     /// The unbound attachment.
     pub const NONE: Self = Self {
         texture: MetalHandle::NULL,
+        resolve_texture: MetalHandle::NULL,
         subresource: 0,
         load_action: LoadAction::DontCare,
         store_action: StoreAction::DontCare,
@@ -737,8 +781,12 @@ pub struct CreateDepthTextureParams {
     pub width: u32,                                // in
     pub height: u32,                               // in
     pub pixel_format: PixelFormat, // in (resolved via mtld3d_core::format::map_d3d_depth_format)
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
+    /// Multisample count of the depth attachment, 1 for none.
+    ///
+    /// D3D9 offers no way to read a multisampled depth surface, so there is
+    /// no resolve companion here: the texture the thunk returns is itself the
+    /// multisampled one, and it must match the colour attachment's count.
+    pub sample_count: u32, // in
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 
@@ -752,14 +800,24 @@ pub struct CreateColorTargetParams {
     pub width: u32,                                // in
     pub height: u32,                               // in
     pub pixel_format: PixelFormat, // in (resolved via mtld3d_core::format::map_d3d_format)
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
+    /// Multisample count of the render target, 1 for none.
+    ///
+    /// Above 1 the thunk creates a multisampled companion beside the
+    /// single-sample texture and returns it in `msaa_texture_handle`; see
+    /// [`CreateBackbufferParams::sample_count`].
+    pub sample_count: u32, // in
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
     /// Eagerly-created sRGB twin view of `texture_handle`.
     ///
     /// NULL when the format has no sRGB counterpart. Same role as
     /// `CreateBackbufferParams::srgb_texture_handle`.
     pub srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Multisampled companion of `texture_handle`, NULL when `sample_count` is 1.
+    pub msaa_texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Eagerly-created sRGB twin view of `msaa_texture_handle`.
+    ///
+    /// Same role as `CreateBackbufferParams::msaa_srgb_texture_handle`.
+    pub msaa_srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 
 impl Thunk for CreateColorTargetParams {

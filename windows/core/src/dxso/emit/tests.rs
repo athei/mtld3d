@@ -827,6 +827,7 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
+        sample_mask: 0,
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
         tt_projected_mask: 0,
@@ -3938,4 +3939,36 @@ fn lod_bias_variant_scales_texldd_gradients() {
         "the gradient sample carries no second LOD option:\n{biased}"
     );
     metal_compile_or_fail(&biased);
+}
+
+#[test]
+fn programmable_ps_writes_the_sample_mask_when_the_variant_carries_one() {
+    // Metal takes a coverage mask only from a `[[sample_mask]]` fragment
+    // output, so `D3DRS_MULTISAMPLEMASK` turns the bare `float4` return into a
+    // struct carrying the mask beside the colour.
+    let variant = VariantKey {
+        sample_mask: 0b0011,
+        flags: VariantFlags::SAMPLE_MASK,
+        ..VariantKey::default()
+    };
+    let msl = emit_pair_for_tests(&trivial_passthrough_vs(), &red_constant_ps(), variant);
+    assert!(
+        msl.contains("uint oMask [[sample_mask]];"),
+        "the PS output struct must declare the mask:\n{msl}"
+    );
+    assert!(
+        msl.contains("_ps_out.oMask = 3u;"),
+        "and write the variant's value:\n{msl}"
+    );
+}
+
+#[test]
+fn programmable_ps_keeps_the_bare_return_without_a_sample_mask() {
+    let msl = emit_pair_for_tests(
+        &trivial_passthrough_vs(),
+        &red_constant_ps(),
+        VariantKey::default(),
+    );
+    assert!(!msl.contains("sample_mask"), "{msl}");
+    assert!(!msl.contains("struct PsOut"), "{msl}");
 }

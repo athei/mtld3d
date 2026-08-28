@@ -131,7 +131,8 @@ const PS_NAME: &str = "mtld3d_blit_ps";
 struct BlitCache {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
-    pipelines: Mutex<FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>>,
+    /// Keyed by `(destination colour format, pass sample count)`.
+    pipelines: Mutex<FxHashMap<(PixelFormat, u32), MetalHandle<MTLRenderPipelineStateKind>>>,
 }
 
 static CACHE: OnceLock<Option<BlitCache>> = OnceLock::new();
@@ -150,16 +151,17 @@ pub fn ensure_blit_pipeline(
         .get_or_init(|| build_library_and_functions(&device))
         .as_ref()?;
 
+    let key = (params.color_format, params.sample_count.max(1));
     {
         let pipelines = cache.pipelines.lock().ok()?;
-        if let Some(&handle) = pipelines.get(&params.color_format) {
+        if let Some(&handle) = pipelines.get(&key) {
             return Some(handle);
         }
     }
 
-    let handle = build_pipeline(&device, cache, params.color_format)?;
+    let handle = build_pipeline(&device, cache, key)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
-    Some(*pipelines.entry(params.color_format).or_insert(handle))
+    Some(*pipelines.entry(key).or_insert(handle))
 }
 
 fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option<BlitCache> {
@@ -205,14 +207,16 @@ fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option
 fn build_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     cache: &BlitCache,
-    color_format: PixelFormat,
+    key: (PixelFormat, u32),
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
+    let (color_format, sample_count) = key;
     let vs = cache.vs_fn.into_retained()?;
     let ps = cache.ps_fn.into_retained()?;
 
     let desc = MTLRenderPipelineDescriptor::new();
     desc.setVertexFunction(Some(&vs));
     desc.setFragmentFunction(Some(&ps));
+    desc.setRasterSampleCount(sample_count as usize);
     // SAFETY: `colorAttachments()` returns a non-null
     // `MTLRenderPipelineColorAttachmentDescriptorArray`; subscript 0 is always
     // valid.
@@ -223,7 +227,7 @@ fn build_pipeline(
     // depth format here would make Metal reject the pipeline against the
     // depth-less render pass.
 
-    let label = format!("mtld3d-blit-quad c={color_format:?}");
+    let label = format!("mtld3d-blit-quad c={color_format:?} s={sample_count}");
     desc.setLabel(Some(&NSString::from_str(&label)));
 
     let pipeline = match device.newRenderPipelineStateWithDescriptor_error(&desc) {

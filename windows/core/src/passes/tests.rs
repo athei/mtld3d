@@ -40,6 +40,9 @@ fn fresh() -> PassState {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -57,6 +60,9 @@ fn fresh_scaled() -> PassState {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -180,6 +186,9 @@ fn frame_sampled_textures_clears_on_reset_frame() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -511,6 +520,9 @@ fn reset_frame_drops_pending_clears() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1189,6 +1201,9 @@ fn rule_a_reset_frame_re_arms_dontcare() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1285,6 +1300,9 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -2908,6 +2926,9 @@ fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3062,6 +3083,9 @@ fn clear_depth_with_visibility_query_active_falls_back_to_pass_break() {
 fn slot(texture: MetalHandle<MTLTextureKind>, size: (u32, u32)) -> ExtraColorSlot {
     ExtraColorSlot {
         texture,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        sample_count: 1,
         subresource: 0,
         size: (0, 0),
         logical_size: size,
@@ -3515,6 +3539,9 @@ fn blit_written_set_resets_with_the_frame() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3623,6 +3650,9 @@ fn continuation_loads_targets_drawn_before_the_flush() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3655,6 +3685,9 @@ fn a_real_present_still_dontcares_first_use() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3689,6 +3722,9 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3871,6 +3907,9 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3962,6 +4001,9 @@ fn an_extra_target_without_a_twin_keeps_the_whole_set_linear() {
         1,
         Some(ExtraColorSlot {
             texture: extra,
+            msaa_texture: MetalHandle::NULL,
+            msaa_srgb_texture: MetalHandle::NULL,
+            sample_count: 1,
             subresource: 0,
             size: (256, 256),
             logical_size: (256, 256),
@@ -4047,6 +4089,9 @@ fn replacing_the_backbuffer_forgets_the_retired_twin() {
     s.reset_frame(&FrameReset {
         backbuffer: fresh_bb,
         backbuffer_srgb: fresh_twin,
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -4159,4 +4204,227 @@ fn retiring_an_unbound_depth_texture_keeps_the_binding() {
     assert_eq!(s.current_depth_texture(), depth());
     assert_eq!(s.passes().len(), passes_before);
     assert!(!s.current_pass_closed(), "the open pass survives");
+}
+
+// ── Multisample resolve ──
+
+/// A frame whose back buffer is 4x multisampled.
+fn fresh_multisampled() -> PassState {
+    let mut s = PassState::new();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: msaa_backbuffer(),
+        backbuffer_msaa_srgb: msaa_backbuffer_srgb(),
+        backbuffer_sample_count: 4,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s
+}
+
+fn msaa_backbuffer() -> MetalHandle<MTLTextureKind> {
+    tex(0x1001)
+}
+
+fn msaa_backbuffer_srgb() -> MetalHandle<MTLTextureKind> {
+    tex(0x1002)
+}
+
+#[test]
+fn a_multisampled_pass_attaches_the_companion_and_resolves_into_the_twin() {
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.color_attachment_texture(),
+        msaa_backbuffer(),
+        "the pass renders into the multisampled companion"
+    );
+    assert_eq!(
+        pass.color_texture(),
+        backbuffer(),
+        "the identity every rule keys on stays the single-sample twin"
+    );
+    assert_eq!(
+        pass.color_resolve_texture(),
+        backbuffer(),
+        "and the twin is what the pass resolves into"
+    );
+}
+
+#[test]
+fn only_the_last_pass_of_a_submission_takes_the_resolve() {
+    // Two passes on the multisampled back buffer with an offscreen target in
+    // between: the multisample content lives on across the middle pass and is
+    // resolved once, at the end.
+    let rt = tex(0x3000);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 3);
+    assert!(
+        s.passes()[0].color_resolve_texture().is_null(),
+        "the first pass keeps its multisample content for the third"
+    );
+    assert!(
+        s.passes()[1].color_resolve_texture().is_null(),
+        "the single-sampled target in between resolves nothing"
+    );
+    assert_eq!(
+        s.passes()[2].color_resolve_texture(),
+        backbuffer(),
+        "the last use takes the resolve"
+    );
+}
+
+#[test]
+fn a_read_between_passes_pulls_the_resolve_forward() {
+    // A `StretchRect` out of the multisampled target lands between the two
+    // passes, so the twin has to be current before the second one runs.
+    let rt = tex(0x3000);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    s.note_msaa_read(backbuffer());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    assert_eq!(
+        s.passes()[0].color_resolve_texture(),
+        backbuffer(),
+        "the pass the read followed resolves"
+    );
+    assert_eq!(
+        s.passes()[2].color_resolve_texture(),
+        backbuffer(),
+        "and the last use still resolves"
+    );
+}
+
+#[test]
+fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
+    // The depth surface is single-sampled while render target 0 is 4x: Metal
+    // rejects such a pass outright, so the attachment goes rather than the
+    // draw.
+    let mut s = fresh_multisampled();
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert!(
+        s.passes()[0].depth_texture().is_null(),
+        "the mismatched depth attachment is dropped"
+    );
+
+    // Declared at the matching count it binds normally.
+    let mut s = fresh_multisampled();
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes()[0].depth_texture(), depth());
+}
+
+#[test]
+fn a_resolving_clear_only_pass_survives_the_cull() {
+    // The pass has no draw and its multisample content is dead, but the
+    // resolve still writes the twin every later reader looks at.
+    let mut s = fresh_multisampled();
+    s.clear_color(1, 1, 1, 1);
+    s.ensure_pass_open();
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 1, "the resolving pass is not dead work");
+    assert_eq!(s.passes()[0].color_resolve_texture(), backbuffer());
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        msaa_backbuffer(),
+        "and it keeps its colour attachment"
+    );
+}
+
+/// `D3DRS_SRGBWRITEENABLE` on a multisampled target attaches both sRGB views.
+///
+/// Metal takes the resolve destination's pixel format from the attachment's,
+/// so a pass that renders through the companion's twin has to resolve into
+/// the single-sample twin rather than into the base texture.
+#[test]
+fn a_multisampled_srgb_pass_attaches_and_resolves_through_the_twins() {
+    let mut s = fresh_multisampled();
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.color_attachment_texture(),
+        msaa_backbuffer_srgb(),
+        "the pass renders through the companion's sRGB view"
+    );
+    assert_eq!(
+        pass.color_resolve_texture(),
+        backbuffer_srgb(),
+        "and resolves into the single-sample view of the same format"
+    );
+    assert_eq!(
+        pass.color_texture(),
+        backbuffer(),
+        "identity still keys on the base texture"
+    );
+}
+
+/// A companion without an sRGB twin keeps the whole pass on the shader path.
+///
+/// Attaching the linear companion and resolving into the sRGB twin is a
+/// format mismatch Metal rejects, so the encode falls back to the pixel
+/// shader's OETF variant exactly as a target with no twin at all does.
+#[test]
+fn a_multisampled_target_without_a_companion_twin_keeps_the_linear_attachment() {
+    let mut s = fresh_multisampled();
+    s.set_color_msaa(msaa_backbuffer(), MetalHandle::NULL, 4);
+    s.set_srgb_write_enabled(true);
+    assert!(!s.pass_srgb_write());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), msaa_backbuffer());
+    assert_eq!(pass.color_resolve_texture(), backbuffer());
 }

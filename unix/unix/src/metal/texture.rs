@@ -12,7 +12,7 @@ use objc2_metal::{
     MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat,
     MTLRenderPassDescriptor, MTLResource, MTLStencilDescriptor, MTLStencilOperation,
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle,
-    MTLTextureSwizzleChannels, MTLTextureUsage,
+    MTLTextureSwizzleChannels, MTLTextureType, MTLTextureUsage,
 };
 
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
@@ -181,6 +181,7 @@ pub fn create_depth_texture(
     width: u32,
     height: u32,
     pixel_format: PixelFormat,
+    sample_count: u32,
 ) -> Option<MetalHandle<MTLTextureKind>> {
     let device = device_handle.into_retained()?;
     let mtl_format = mtl_pixel_format(pixel_format);
@@ -196,6 +197,12 @@ pub fn create_depth_texture(
         )
     };
     desc.setUsage(MTLTextureUsage::RenderTarget);
+    if sample_count > 1 {
+        desc.setTextureType(MTLTextureType::Type2DMultisample);
+        // SAFETY: objc2 typed binding; the count was validated against
+        // `supportsTextureSampleCount:` before it crossed the boundary.
+        unsafe { desc.setSampleCount(sample_count as usize) };
+    }
 
     // Depth textures must be in private storage on Apple Silicon
     desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
@@ -311,6 +318,66 @@ fn create_color_texture(
     let label = objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&label));
     Some(texture)
+}
+
+/// Creates the multisampled companion of a single-sample render target.
+///
+/// The result is the colour attachment every pass renders into; the
+/// single-sample texture it was made for is its resolve target and stays the
+/// only one anything samples, blits, reads back or presents. `Private`
+/// storage rather than `Memoryless` because a D3D9 frame can render into the
+/// same target across several passes before the content is consumed, and only
+/// the last of those passes takes the resolve; the passes in between store
+/// the multisample content, which a memoryless texture cannot do.
+///
+/// The second element is the companion's sRGB twin view, or 0 when the format
+/// has no sRGB counterpart. A multisampled pass writing sRGB attaches that
+/// view and resolves into the single-sample texture's own twin, which Metal
+/// requires to carry the attachment's pixel format.
+///
+/// Returns `None` when `sample_count` is 1 (nothing to create) or when Metal
+/// declines the descriptor; the caller knows which by its own `sample_count`
+/// and reports the second case as a failed create.
+pub fn create_msaa_companion(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    sample_count: u32,
+    label: &str,
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
+    if sample_count <= 1 {
+        return None;
+    }
+    let device = device_handle.into_retained()?;
+    let mtl_format = mtl_pixel_format(pixel_format);
+    // SAFETY: objc2 typed binding; class-method constructor on
+    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            mtl_format,
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    desc.setTextureType(MTLTextureType::Type2DMultisample);
+    // SAFETY: objc2 typed binding; the count was validated against
+    // `supportsTextureSampleCount:` before it crossed the boundary.
+    unsafe { desc.setSampleCount(sample_count as usize) };
+    desc.setUsage(MTLTextureUsage::RenderTarget);
+    desc.setStorageMode(MTLStorageMode::Private);
+
+    let texture = device.newTextureWithDescriptor(&desc)?;
+    let ns_label = objc2_foundation::NSString::from_str(label);
+    texture.setLabel(Some(&ns_label));
+    let srgb_handle = srgb_twin_view(&texture, pixel_format, 1, 1, IDENTITY_SWIZZLE, label);
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        srgb_handle,
+    ))
 }
 
 /// Creates an `MTLDepthStencilState` object.
