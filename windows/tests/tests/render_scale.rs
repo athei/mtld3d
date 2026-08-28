@@ -15,10 +15,11 @@
 //! resample reproduces the source colour exactly. Sampling *on* a boundary would
 //! be scale-dependent by construction, so the probes stay away from them.
 //!
-//! One test sets `render.scale` itself instead of inheriting the run's, because
-//! the quantity it covers (a point's rasterized diameter) converts between the
-//! two spaces rather than staying in one, so a run at the default scale would
-//! not exercise the conversion at all.
+//! A few tests set `render.scale` themselves instead of inheriting the run's,
+//! because the quantities they cover (a point's rasterized diameter, and the
+//! memory a resource created at the reported back-buffer size occupies) convert
+//! between the two spaces rather than staying in one, so a run at the default
+//! scale would not exercise the conversion at all.
 
 use mtld3d_tests::{Harness, PosColorVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
