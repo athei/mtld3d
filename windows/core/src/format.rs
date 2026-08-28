@@ -789,8 +789,13 @@ pub fn standalone_surface_bytes(
 /// the Metal format the surface is really backed by. Both substitutions
 /// underneath (a render-scaled attachment, a 24-bit depth format promoted to
 /// `Depth32Float`) are ours, and an application sizing its resource budget
-/// from this call reasons in the units it passed in. Returns 0 for a format
-/// with neither a colour nor a depth mapping.
+/// from this call reasons in the units it passed in. Both branches measure
+/// level 0 of the format's own mip chain, so a standalone surface and the top
+/// level of a texture of the same size and format are charged the same bytes:
+/// a colour format through [`compute_mip_size`], a depth format, which has no
+/// [`FormatMapping`] to hand over, through [`linear_mip_size`] on its bare
+/// pixel size. Returns 0 for a format with neither a colour nor a depth
+/// mapping.
 #[must_use]
 pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
     if let Some(fmt) = lookup_d3d_format(d3d_format) {
@@ -798,9 +803,8 @@ pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
         return u64::from(byte_size);
     }
     if let Some(bpp) = depth_format_bytes_per_pixel(d3d_format) {
-        return u64::from(width)
-            .saturating_mul(u64::from(height))
-            .saturating_mul(u64::from(bpp));
+        let (_, _, byte_size, _) = linear_mip_size(width, height, 0, bpp);
+        return u64::from(byte_size);
     }
     mtld3d_shared::log_once_warn!(
         target: LOG_TARGET,
