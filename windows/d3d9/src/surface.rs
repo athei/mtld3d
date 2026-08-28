@@ -40,6 +40,28 @@ static DIRECT3D_SURFACE9_VTBL: IDirect3DSurface9Vtbl = IDirect3DSurface9Vtbl {
     release_dc: surface_release_dc,
 };
 
+/// The system-memory bytes a read-back blit writes into.
+///
+/// Resolved from the destination surface of `GetRenderTargetData` /
+/// `GetFrontBufferData` by [`Direct3DSurface9::system_memory_blit_dst`]. The
+/// blit takes the whole backing as its Metal buffer and writes `height` rows
+/// of `bytes_per_row` from its start, which is the layout the destination's
+/// own `LockRect` reports.
+pub struct SystemMemoryDst {
+    /// Address of the destination's first row.
+    pub ptr: u64,
+    /// Page-aligned length of the backing, the length the Metal wrapper takes.
+    pub len: u64,
+    /// Width the destination reports from `GetDesc` / `GetLevelDesc`.
+    pub width: u32,
+    /// Height the destination reports from `GetDesc` / `GetLevelDesc`.
+    pub height: u32,
+    /// Row stride the destination's own `LockRect` reports.
+    pub bytes_per_row: u32,
+    /// Byte layout of the destination's D3D9 format.
+    pub format: mtld3d_shared::mtl::PixelFormat,
+}
+
 /// Marks a surface as one of the device's **implicit** (device-owned) surfaces.
 ///
 /// `None` marks an ordinary app-owned surface.
@@ -895,17 +917,19 @@ impl Direct3DSurface9 {
         self.inner().live_multi_sample()
     }
 
-    /// Raw `(ptr, len)` of a system-memory offscreen surface's backing buffer.
+    /// This surface as a `BlitTextureToBuffer` destination, or `None`.
     ///
-    /// For use as a `BlitTextureToBuffer` destination. `None` for GPU-backed
-    /// surfaces. The pointer stays valid for the surface's lifetime.
+    /// The two system-memory shapes D3D9 accepts as the destination of
+    /// `GetRenderTargetData` / `GetFrontBufferData`: a `D3DPOOL_SYSTEMMEM` or
+    /// `D3DPOOL_SCRATCH` offscreen-plain surface, whose backing is its own,
+    /// and a level of a texture in either pool, whose backing is that level's
+    /// staging. The pointer stays valid for the surface's lifetime.
     ///
     /// A lockable render target also owns a CPU staging buffer, but it is a
     /// `D3DPOOL_DEFAULT` render target (it keeps its renderable colour handle),
-    /// which D3D9 rejects as a `GetRenderTargetData` destination — so this
-    /// returns `None` for it, leaving only a true `D3DPOOL_SYSTEMMEM`
-    /// offscreen-plain surface (CPU backing, no colour handle) as a valid dest.
-    pub fn system_memory_blit_dst(&self) -> Option<(u64, u64)> {
+    /// which D3D9 rejects as a destination, so this returns `None` for it, as
+    /// it does for a level of a `D3DPOOL_DEFAULT` or `D3DPOOL_MANAGED` texture.
+    pub fn system_memory_blit_dst(&self) -> Option<SystemMemoryDst> {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
         // surfaces are single-threaded D3D9 objects, so the transient
         // exclusive borrow taken to read the buffer pointer is sound.
@@ -913,10 +937,65 @@ impl Direct3DSurface9 {
         if !inner.metal_color_handle.is_null() {
             return None;
         }
-        inner
-            .system_memory
-            .as_mut()
-            .map(|p| (p.as_mut_ptr() as u64, p.len() as u64))
+        if inner.system_memory.is_some() {
+            let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
+            let width = inner.standalone_width;
+            let height = inner.standalone_height;
+            // The stride the surface was allocated at and `LockRect` reports.
+            let bytes_per_row = mtld3d_core::format::linear_row_pitch(width, fmt.bytes_per_pixel());
+            let page = inner.system_memory.as_mut()?;
+            return Some(SystemMemoryDst {
+                ptr: page.as_mut_ptr() as u64,
+                len: page.len() as u64,
+                width,
+                height,
+                bytes_per_row,
+                format: fmt.metal_pixel_format(),
+            });
+        }
+        if inner.parent_texture.is_null() {
+            return None;
+        }
+        // SAFETY: `parent_texture` is non-null (checked) and a live
+        // `Direct3DTexture9` whose refcount keeps it alive while this surface
+        // is alive; it is a distinct allocation from the `SurfaceInner`.
+        let texture = unsafe { (*inner.parent_texture).inner_mut() };
+        // Only the two system-memory pools keep their bytes CPU-side; a level
+        // of a GPU-resident texture has no backing to blit into.
+        if !mtld3d_core::pool::is_cpu_only(texture.d3d_pool()) {
+            return None;
+        }
+        let level = inner.mip_level as usize;
+        let face = (inner.cube_face != u32::MAX).then_some(inner.cube_face);
+        let (ptr, len, bytes_per_row) = texture.readback_staging(face, level)?;
+        let fmt = mtld3d_core::format::map_d3d_format(texture.d3d_format())?;
+        Some(SystemMemoryDst {
+            ptr,
+            len,
+            width: texture.mip_width(level),
+            height: texture.mip_height(level),
+            bytes_per_row,
+            format: fmt.metal_pixel_format(),
+        })
+    }
+
+    /// Record that a read-back rewrote this surface's system-memory bytes.
+    ///
+    /// A standalone offscreen surface needs nothing: `LockRect` reads the
+    /// backing the blit just wrote. A texture level re-arms the level's dirty
+    /// state, so a later `UpdateTexture` from it copies the new content and a
+    /// bind for sampling uploads it.
+    pub fn note_system_memory_written(&self) {
+        let inner = self.inner();
+        if inner.parent_texture.is_null() {
+            return;
+        }
+        let face = (inner.cube_face != u32::MAX).then_some(inner.cube_face);
+        // SAFETY: `parent_texture` is non-null (checked) and a live
+        // `Direct3DTexture9` whose refcount keeps it alive while this surface
+        // is alive; it is a distinct allocation from the `SurfaceInner`.
+        unsafe { (*inner.parent_texture).inner_mut() }
+            .mark_readback_written(face, inner.mip_level as usize);
     }
 
     /// CPU backing of a standalone offscreen surface.

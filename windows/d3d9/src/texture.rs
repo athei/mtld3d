@@ -448,6 +448,16 @@ impl TextureInner {
         self.d3d_usage
     }
 
+    /// D3DFMT_* the texture was created with.
+    ///
+    /// The format the application declared, which is what a byte-layout
+    /// comparison against another D3D9 resource is made on: the Metal format
+    /// alone would call a packed 16-bit level expanded to BGRA8 on a device
+    /// without the native format the same layout as a real BGRA8 one.
+    pub const fn d3d_format(&self) -> u32 {
+        self.d3d_format
+    }
+
     /// Bytes of staging this texture still holds in the 32-bit address space.
     pub fn resident_staging_bytes(&self) -> u64 {
         self.staging
@@ -1735,6 +1745,33 @@ impl TextureInner {
         self.staging[level].len() as u64
     }
 
+    /// Base, page-aligned length and row stride of one subresource's staging.
+    ///
+    /// `face` selects a cube subresource, `None` the 2D mip chain. The
+    /// destination of a `GetRenderTargetData` / `GetFrontBufferData` copy: the
+    /// blit wraps the whole page as its Metal buffer and writes `mip_height`
+    /// rows at the returned stride from offset zero, because every subresource
+    /// owns its own allocation. The staging is materialized first, so a level
+    /// whose backing was released still receives the copy. `None` when the
+    /// subresource does not exist.
+    pub fn readback_staging(&mut self, face: Option<u32>, level: usize) -> Option<(u64, u64, u32)> {
+        let bytes_per_row = *self.mip_bytes_per_row.get(level)?;
+        if let Some(face) = face {
+            let index = self.cube_subresource_index(face, level)?;
+            let page = self.cube.as_deref()?.staging.get(index)?;
+            return Some((page.as_ptr() as u64, page.len() as u64, bytes_per_row));
+        }
+        if level >= self.staging.len() {
+            return None;
+        }
+        self.ensure_staging(level);
+        Some((
+            self.staging[level].as_ptr() as u64,
+            self.staging[level].len() as u64,
+            bytes_per_row,
+        ))
+    }
+
     const fn cube_subresource_index(&self, face: u32, level: usize) -> Option<usize> {
         if face >= CUBE_FACE_COUNT || level >= self.levels as usize {
             return None;
@@ -2243,6 +2280,21 @@ impl TextureInner {
                 h: bottom - y,
             }
         }));
+    }
+
+    /// Record that a read-back rewrote one subresource's staging.
+    ///
+    /// `face` selects a cube subresource, `None` the 2D mip chain. The bytes
+    /// changed CPU-side and nothing else observed the write, so both consumers
+    /// of a level's contents are re-armed: a later `UpdateTexture` from this
+    /// texture copies the level again, and a bind for sampling uploads it.
+    pub fn mark_readback_written(&mut self, face: Option<u32>, level: usize) {
+        if let Some(face) = face {
+            self.mark_cube_surface_dirty(face, level);
+            return;
+        }
+        self.mark_update_dirty(level, None);
+        self.mark_mip_dirty(level);
     }
 
     /// The source dirty region for `level` (`None` = clean).

@@ -8024,6 +8024,16 @@ impl FrameData {
         self.ops.reserve(count);
     }
 
+    /// Byte layout of the frame's back-buffer texture.
+    ///
+    /// Read by `GetFrontBufferData` to check its destination against the image
+    /// it copies: the back buffer is created `Bgra8Unorm` whatever format the
+    /// swap chain was asked for, so this is the layout, not the declared
+    /// `D3DFMT_*`.
+    pub const fn backbuffer_format(&self) -> PixelFormat {
+        self.backbuffer_format
+    }
+
     pub const fn perf(&self) -> &FramePerfPayload {
         &self.perf
     }

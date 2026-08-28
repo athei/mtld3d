@@ -136,6 +136,7 @@ windows/core/src/pipeline_state.rs PipelineRsFlags Clone,Copy,Debug,Default,Part
 windows/core/src/pipeline_state.rs PipelineSnapshot Clone,PartialEq,Eq
 windows/core/src/pipeline_state.rs StreamLayout Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/readback.rs ReadbackReject Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerKey Clone,Copy,PartialEq,Eq,Hash,Debug
