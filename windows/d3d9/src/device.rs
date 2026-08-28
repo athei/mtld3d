@@ -3907,6 +3907,57 @@ extern "system" fn device_create_texture(
     shared_handle: *mut c_void,
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    create_texture_path(&TextureCreateArgs {
+        this,
+        width,
+        height,
+        levels,
+        usage,
+        format,
+        pool,
+        texture,
+        shared_handle,
+        offscreen_plain: false,
+    })
+}
+
+/// Vtable-shaped args bundle for [`create_texture_path`].
+#[derive(Clone, Copy)]
+struct TextureCreateArgs {
+    this: *mut c_void,
+    width: u32,
+    height: u32,
+    levels: u32,
+    usage: u32,
+    format: u32,
+    pool: u32,
+    texture: *mut *mut c_void,
+    shared_handle: *mut c_void,
+    /// The texture backs a `CreateOffscreenPlainSurface` surface.
+    ///
+    /// Carried in by the caller rather than stamped on the finished texture:
+    /// the flag gates the staging-drop loop that runs inside the texture
+    /// constructor, and a plain keeps its staging because the game may lock it.
+    offscreen_plain: bool,
+}
+
+/// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
+///
+/// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
+/// texture created through here, so both entry points share one create path.
+fn create_texture_path(info: &TextureCreateArgs) -> i32 {
+    let TextureCreateArgs {
+        this,
+        width,
+        height,
+        levels,
+        usage,
+        format,
+        pool,
+        texture,
+        shared_handle,
+        offscreen_plain,
+    } = *info;
     trace!(
         target: LOG_TARGET,
         "IDirect3DDevice9::CreateTexture({width}x{height}, levels={levels}, usage={usage:#x}, format={format})"
@@ -4098,6 +4149,7 @@ extern "system" fn device_create_texture(
 
     let mut flags = TextureFlags::empty();
     flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
+    flags.set(TextureFlags::OFFSCREEN_PLAIN, offscreen_plain);
     // A render target the game created at the reported back-buffer size is its
     // main view and shares the back buffer's scale. A texture it uploads pixels
     // into never does: its staging layout is keyed to the reported size.
@@ -6729,17 +6781,18 @@ extern "system" fn device_create_offscreen_plain_surface(
     // D3DUSAGE_* (offscreen plain), single mip.
     if pool == D3DPOOL_DEFAULT {
         let mut tex_out: *mut c_void = core::ptr::null_mut();
-        let hr = device_create_texture(
+        let hr = create_texture_path(&TextureCreateArgs {
             this,
             width,
             height,
-            1,
-            0,
+            levels: 1,
+            usage: 0,
             format,
-            D3DPOOL_DEFAULT,
-            &raw mut tex_out,
-            core::ptr::null_mut(),
-        );
+            pool: D3DPOOL_DEFAULT,
+            texture: &raw mut tex_out,
+            shared_handle: core::ptr::null_mut(),
+            offscreen_plain: true,
+        });
         if hr != D3D_OK || tex_out.is_null() {
             warn!(target: LOG_TARGET,
                 "reject CreateOffscreenPlainSurface({width}x{height}, format={format}, DEFAULT) → INVALIDCALL (internal texture create failed)");
@@ -6747,9 +6800,6 @@ extern "system" fn device_create_offscreen_plain_surface(
             return D3DERR_INVALIDCALL;
         }
         let tex_ptr = tex_out.cast::<crate::texture::Direct3DTexture9>();
-        // SAFETY: `device_create_texture` just returned this live texture at
-        // refcount 1; nothing else holds it yet.
-        unsafe { (*tex_ptr).inner_mut().mark_offscreen_plain() };
         let surf = Direct3DSurface9::new_owned_texture_backed(device_inner, tex_ptr);
         // The internal texture (created just above) forwards the device
         // reference, so this owned surface is NOT registered (no double-count).
