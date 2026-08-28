@@ -62,14 +62,14 @@ use mtld3d_types::{
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
     D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_STENCILWRITEMASK,
     D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR, D3DRS_TWOSIDEDSTENCILMODE,
-    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTSS_BUMPENVLOFFSET,
-    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY,
-    D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
-    TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
+    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DRTYPE_CUBETEXTURE,
+    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
+    D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES,
+    D3DUSAGE_POINTS, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
+    SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -5755,18 +5755,24 @@ extern "system" fn device_update_texture(
         obj.inner()
             .frame_dump_event(&format!("UpdateTexture(src={src_id:?}, dst={dst_id:?})"));
     }
+    // D3D9 pairs the two resources by type: a 2D texture only updates a 2D
+    // texture, a cube a cube, a volume a volume. The container reports the
+    // type it was created as, which is not the kind of the backing Metal
+    // texture: a single-slice volume texture is backed 2D and is still a
+    // volume here.
     // SAFETY: both pointers are non-null live base-texture wrappers. All three
     // texture interfaces share the same wrapper layout.
-    let src_is_cube = unsafe { (*src_parent).is_cube() };
+    let src_type = unsafe { (*src_parent).d3d_resource_type() };
     // SAFETY: same invariant as the source pointer above.
-    let dst_is_cube = unsafe { (*dst_parent).is_cube() };
-    if src_is_cube != dst_is_cube {
+    let dst_type = unsafe { (*dst_parent).d3d_resource_type() };
+    if src_type != dst_type {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "reject UpdateTexture: cube and non-cube endpoints mixed → INVALIDCALL"
+            "reject UpdateTexture: source and destination resource types differ → INVALIDCALL"
         );
         return D3DERR_INVALIDCALL;
     }
+    let src_is_cube = src_type == D3DRTYPE_CUBETEXTURE;
     if src_is_cube {
         let hr = copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
             let mut s = src.mip_width(0);
