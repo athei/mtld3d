@@ -728,7 +728,7 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
     assert_eq!(h.clear_texture(257), 0, "unbind slot");
 }
 
-/// `ps_2_0`: `def c0, 0, 0, 1, 1; mov oC0, c0;` — opaque blue with no buffer read.
+/// `ps_2_0`: `def c0, 0, 0, 1, 1; mov oC0, c0;`, opaque blue with no buffer read.
 ///
 /// A `def`-declared row is translated into a shader-local literal, so this
 /// program never reads the pixel constant buffer whatever the game uploads
