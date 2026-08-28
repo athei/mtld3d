@@ -913,13 +913,15 @@ struct EncoderFrameCounters {
     /// `gpu_caps.min_linear_texture_align`. Subset of
     /// `texture_blit_uploads`.
     texture_blit_padded_uploads: u32,
-    /// Per-frame count of uploads taking the packed 16-bit expansion path.
+    /// Per-frame count of uploads written by the GPU upload pass.
     ///
-    /// Taken when the texture's D3D format is packed 16-bit but its Metal
-    /// backing is BGRA8 (a device without the native packed formats, or
-    /// `debug.expandPacked16`): the staging texels are widened on the CPU
-    /// into a transient buffer before the blit. Subset of
-    /// `texture_blit_uploads`, disjoint from the padded counter.
+    /// Taken when a blit copy cannot express the upload: the texture's D3D
+    /// format is packed 16-bit over a BGRA8 backing (a device without the
+    /// native packed formats, or `debug.expandPacked16`), or the staging row
+    /// pitch is under the device's linear texture alignment. The staging is
+    /// read by a fragment function instead. One per upload, whatever the
+    /// pass count (a volume upload opens one per slice), so the row still
+    /// splits `texture_blit_uploads`. Disjoint from the padded counter.
     texture_expand_uploads: u32,
     /// Per-frame count of texture rename-at-overlap.
     ///
@@ -4196,13 +4198,14 @@ impl<'a> Summary<'a> {
             )),
             "API: rename + sync memcpy (non-DISCARD non-DYNAMIC contended)",
         );
-        // `uploads = raw + padded + expand` — every Unlock takes one of the
+        // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
         // around the game's PageBox). `padded` is a blit too, but its
         // source had to be repacked into a transient widened-stride buffer
-        // (extra alloc + memcpy + sync `CreateBuffer` thunk). `expand` is
-        // the packed 16-bit CPU widening into a transient buffer (non-Apple
-        // devices or `debug.expandPacked16`).
+        // (extra alloc + memcpy + sync `CreateBuffer` thunk). `pass` is the
+        // GPU upload pass: the staging is read by a fragment function, which
+        // is the only form a packed 16-bit widening has and the cheaper form
+        // for a row pitch under the linear texture alignment.
         let raw_blits = w
             .texture_blit_uploads
             .sum
@@ -4213,7 +4216,7 @@ impl<'a> Summary<'a> {
             "uploads",
             &format!("{t}", t = w.texture_blit_uploads.sum),
             None,
-            "encoder: total texture uploads (raw + padded + expand)",
+            "encoder: total texture uploads (raw + padded + pass)",
         );
         self.res_row(
             out,
@@ -4227,14 +4230,14 @@ impl<'a> Summary<'a> {
             "  padded",
             &format!("{p}", p = w.texture_blit_padded_uploads.sum),
             None,
-            "encoder: blit; source repacked into transient buffer (alloc + memcpy + extra unix_call)",
+            "encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)",
         );
         self.res_row(
             out,
-            "  expand",
+            "  pass",
             &format!("{e}", e = w.texture_expand_uploads.sum),
             None,
-            "encoder: blit; packed 16-bit source widened to BGRA8 into a transient buffer",
+            "encoder: render pass; staging read by a fragment function (16-bit widening, sub-alignment pitch)",
         );
         self.res_row(
             out,

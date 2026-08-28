@@ -11,7 +11,7 @@ use mtld3d_shared::{
     GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, SetDisplaySyncEnabledParams,
     StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
     VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
-    mtl::DestroyKind,
+    mtl::{DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
@@ -370,11 +370,15 @@ pub extern "C" fn ensure_blit_pipeline_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let params: &mut EnsureBlitPipelineParams = &mut params;
-    if let Some(handle) = metal::ensure_blit_pipeline(params) {
+    let resolved = match params.quad_kind {
+        QuadPipelineKind::StretchBlit => metal::ensure_blit_pipeline(params),
+        QuadPipelineKind::TextureUpload => metal::ensure_upload_pipeline(params),
+    };
+    if let Some(handle) = resolved {
         params.pipeline_handle = handle;
         STATUS_SUCCESS
     } else {
-        error!(target: LOG_TARGET, "failed to ensure blit pipeline");
+        error!(target: LOG_TARGET, "failed to ensure {:?} quad pipeline", params.quad_kind);
         STATUS_UNSUCCESSFUL
     }
 }

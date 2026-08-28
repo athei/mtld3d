@@ -29,6 +29,7 @@ use mtld3d_core::{
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, ExtraColorSlot, LastBoundCache,
         Pass, PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
+        UploadPassTarget,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -41,6 +42,7 @@ use mtld3d_core::{
     shader_cache::{self, CachedKind},
     shader_compile_stats::{self, BurstTracker, CompileBucket},
     storage_policy::buffer_storage_mode,
+    upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
     visibility::{
         MAX_SLOTS, RetiredVisibilityBuffer, SLOT_BYTES, VisibilityQueryCore, VisibilityQueryState,
@@ -55,8 +57,8 @@ use mtld3d_shared::{
     TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
-        StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage,
-        VisibilityResultMode,
+        QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
+        TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -414,10 +416,34 @@ impl PendingBlitArc {
     }
 }
 
+/// Inputs every slice of one texture upload's passes shares.
+///
+/// `mip_size` is the destination mip's extent, `level` its mip index;
+/// `src_pitch` is the staging row stride in bytes and `decode` the source
+/// layout the upload quad's fragment function reads it with.
+struct UploadPassInputs {
+    pipeline: u64,
+    depth_state: u64,
+    staging_buffer_handle: u64,
+    texture_handle: u64,
+    format: PixelFormat,
+    level: u32,
+    mip_size: (u32, u32),
+    src_pitch: u32,
+    decode: UploadDecode,
+}
+
 /// Texture metadata captured from the API thread for deferred Metal creation.
 #[derive(Clone)]
 pub struct TextureInfo {
     pub texture_id: TextureId,
+    /// `D3DFMT_*` the game created the texture with.
+    ///
+    /// Kept alongside `pixel_format` because the pair is what decides how an
+    /// upload reaches the texture: the same `Bgra8Unorm` backs an
+    /// `A8R8G8B8` source verbatim and a packed 16-bit source through the
+    /// widening upload pass.
+    pub d3d_format: u32,
     pub width: u32,
     pub height: u32,
     /// Slice count: 1 for 2D textures, >1 for a volume (3D) texture.
@@ -871,6 +897,26 @@ pub struct FrameEncoder {
     /// encoder can't scale. Process-lifetime, same posture as
     /// `clear_quad_pipeline_cache`.
     blit_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
+    /// Per-destination-format "upload-quad" pipeline handles.
+    ///
+    /// One entry per destination colour `PixelFormat`. Used by the GPU
+    /// texture-upload pass, which reads the staging slab as a fragment
+    /// buffer argument. Process-lifetime, same posture as
+    /// `blit_pipeline_cache`.
+    upload_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
+    /// Textures whose content the GPU upload pass wrote this frame.
+    ///
+    /// Those writes land in render passes spliced into the head of the
+    /// frame, after the leading blit stream, so an `AUTOGENMIPMAP` regen
+    /// that follows one has to run in the ordered blit stream instead of the
+    /// leading one or it would read a stale level 0.
+    upload_pass_textures: FxHashSet<TextureId>,
+    /// Reusable command buffer for one texture-upload pass.
+    ///
+    /// Held on the encoder so the six commands an upload pass carries cost
+    /// no allocation per upload; `emit_upload_pass` takes it, fills it, hands
+    /// the slice to `PassState`, and puts it back.
+    upload_pass_commands: Vec<Command>,
     /// `with-color-handle → no-color-handle` side-map.
     ///
     /// Populated by `get_or_create_pipeline` whenever a draw arrives with
@@ -1332,6 +1378,9 @@ impl FrameEncoder {
             pipeline_cache: FxHashMap::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
             blit_pipeline_cache: FxHashMap::default(),
+            upload_pipeline_cache: FxHashMap::default(),
+            upload_pass_textures: FxHashSet::default(),
+            upload_pass_commands: Vec::new(),
             no_color_pipeline_alt: FxHashMap::default(),
             last_pipeline_memo: None,
             program_cache: FxHashMap::default(),
@@ -1433,7 +1482,7 @@ impl FrameEncoder {
     /// The single source for both the load-phase warmup batch
     /// (`drain_texture_warmups`) and the one-off lazy fallback
     /// (`get_or_create_texture`), so both emit byte-identical descriptors.
-    const fn texture_desc_from_info(info: &TextureInfo) -> TextureCreateDesc {
+    fn texture_desc_from_info(&self, info: &TextureInfo) -> TextureCreateDesc {
         // Every texture created here is `Private`. Nothing CPU-writes a
         // texture directly: render targets are GPU output, and all uploads
         // (including the A4R4G4B4 / R5G6B5 / A1R5G5B5 → BGRA8 expansion path)
@@ -1443,6 +1492,22 @@ impl FrameEncoder {
         // texture needs a CPU-writable mode. Only the staging *buffers* (blit
         // sources) follow `buffer_storage_mode`.
         let storage_mode = StorageMode::Private;
+        // Uploads that cannot ride a blit copy (a packed 16-bit source
+        // widened to BGRA8, or a mip whose row pitch is under the linear
+        // texture alignment) are written by a render pass, which needs the
+        // destination to be an attachment. The predicate is a superset of
+        // what the upload path selects per upload, so an upload never finds a
+        // texture without the usage.
+        let mut usage_flags = info.usage_flags;
+        if mtld3d_core::upload_pass::needs_render_target(
+            info.d3d_format,
+            info.pixel_format,
+            info.width,
+            info.levels,
+            self.gpu_caps.min_linear_texture_align,
+        ) {
+            usage_flags |= TextureUsage::RENDER_TARGET;
+        }
         TextureCreateDesc {
             tex_id: info.texture_id.raw(),
             width: info.width,
@@ -1456,7 +1521,7 @@ impl FrameEncoder {
             swizzle_g: info.swizzle[1],
             swizzle_b: info.swizzle[2],
             swizzle_a: info.swizzle[3],
-            usage_flags: info.usage_flags,
+            usage_flags,
         }
     }
 
@@ -1483,8 +1548,10 @@ impl FrameEncoder {
         if infos.is_empty() {
             return;
         }
-        let descs: Vec<TextureCreateDesc> =
-            infos.iter().map(Self::texture_desc_from_info).collect();
+        let descs: Vec<TextureCreateDesc> = infos
+            .iter()
+            .map(|info| self.texture_desc_from_info(info))
+            .collect();
         let mut handles = vec![MetalHandle::<MTLTextureKind>::NULL; descs.len()];
         let mut srgb_handles = vec![MetalHandle::<MTLTextureKind>::NULL; descs.len()];
         let status = self.batch_create_textures(&descs, &mut handles, &mut srgb_handles);
@@ -2043,6 +2110,7 @@ impl FrameEncoder {
         // from the persistent mirror.
         self.ff_vs_const_scratch_cache = None;
         self.frame_blit_commands.clear();
+        self.upload_pass_textures.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         mtld3d_shared::crumb!("phase:BfRecl");
         self.reclaim_retired_blit_retention();
@@ -3645,7 +3713,7 @@ impl FrameEncoder {
         let mut params = EnsureBlitPipelineParams {
             device_handle: self.device_handle,
             color_format,
-            pad0: 0,
+            quad_kind: QuadPipelineKind::StretchBlit,
             pipeline_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut params);
@@ -3660,6 +3728,36 @@ impl FrameEncoder {
             return 0;
         }
         self.blit_pipeline_cache.insert(color_format, pipeline);
+        pipeline.raw()
+    }
+
+    /// Lazy create-or-fetch of the per-destination-format "upload-quad" pipeline.
+    ///
+    /// Used by the GPU texture-upload pass. Returns 0 on a unix-side compile
+    /// / pipeline-create failure; the caller then falls back to the blit
+    /// upload where the source layout allows one.
+    fn get_or_create_upload_pipeline(&mut self, color_format: PixelFormat) -> u64 {
+        if let Some(&handle) = self.upload_pipeline_cache.get(&color_format) {
+            return handle.raw();
+        }
+        let mut params = EnsureBlitPipelineParams {
+            device_handle: self.device_handle,
+            color_format,
+            quad_kind: QuadPipelineKind::TextureUpload,
+            pipeline_handle: MetalHandle::NULL,
+        };
+        let status = unix_call(&mut params);
+        let pipeline = params.pipeline_handle;
+        if status != 0 || pipeline.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "upload-quad: EnsureBlitPipeline failed status={status:#x} → texture upload pass dropped"
+            );
+            self.upload_pipeline_cache
+                .insert(color_format, MetalHandle::NULL);
+            return 0;
+        }
+        self.upload_pipeline_cache.insert(color_format, pipeline);
         pipeline.raw()
     }
 
@@ -5182,7 +5280,7 @@ impl FrameEncoder {
             return state.mtl_texture.raw();
         }
 
-        let desc = Self::texture_desc_from_info(info);
+        let desc = self.texture_desc_from_info(info);
         let mut handle = MetalHandle::<MTLTextureKind>::NULL;
         let mut srgb_handle = MetalHandle::<MTLTextureKind>::NULL;
         let status = self.batch_create_textures(
@@ -5919,17 +6017,18 @@ impl FrameEncoder {
 
     /// Full upload flow for one dirty sub-rect of a texture mip.
     ///
-    /// The non-expansion paths wrap the staging Box in a Shared
-    /// `MTLBuffer` (lazy on first upload, cached per mip) and emit a
+    /// Every path wraps the staging Box in a Shared `MTLBuffer` (lazy on
+    /// first upload, cached per mip); the blit paths emit a
     /// `BlitCopyBufferToTexture` into `frame_blit_commands`. The
     /// `job.arc` clone is retained in `current_blit_retention` so the
     /// Box stays alive until the GPU retires the frame — blit reads
     /// happen at command-buffer execution time, long after this
     /// function returns.
     ///
-    /// The expansion path (A4R4G4B4 / R5G6B5 / A1R5G5B5 → BGRA8) also
-    /// blits: it expands into a fresh page-aligned staging `PageBox`,
-    /// then emits the same `copyFromBuffer:toTexture:`. Every upload is
+    /// The uploads a blit cannot express (A4R4G4B4 / R5G6B5 / A1R5G5B5 →
+    /// BGRA8, and any mip whose row pitch is under the linear texture
+    /// alignment) are written by a render pass over the same wrapped
+    /// staging instead, spliced into the head of the frame. Every upload is
     /// on the command stream — there is deliberately no CPU-timeline
     /// `replaceRegion` path, which would race a texture referenced by an
     /// in-flight frame.
@@ -6016,7 +6115,7 @@ impl FrameEncoder {
     /// 0 only if the caller should abort.
     fn rename_sampled_texture(&mut self, job: &TextureUploadJob, old_handle: u64) -> u64 {
         let info = &job.info;
-        let desc = Self::texture_desc_from_info(info);
+        let desc = self.texture_desc_from_info(info);
         let mut fresh = MetalHandle::<MTLTextureKind>::NULL;
         let mut fresh_srgb = MetalHandle::<MTLTextureKind>::NULL;
         let status = self.batch_create_textures(
@@ -6107,8 +6206,17 @@ impl FrameEncoder {
     /// trigger). The blit is appended to `frame_blit_commands` right after
     /// the mip-0 `CopyBufferToTexture`, so the unix side replays
     /// `generateMipmapsForTexture` inside the frame's own shared
-    /// leading-blit encoder — no per-texture command buffer.
+    /// leading-blit encoder, no per-texture command buffer. A level 0 the
+    /// GPU upload pass wrote instead is not in that stream, so it diverts to
+    /// the ordered form.
     pub fn run_generate_mipmaps(&mut self, texture_id: TextureId) {
+        // A GPU upload pass writes level 0 from a render pass at the head of
+        // the frame, which is *after* the leading blit stream; the regen has
+        // to follow it in the ordered stream instead.
+        if self.upload_pass_textures.contains(&texture_id) {
+            self.run_generate_mipmaps_ordered(texture_id);
+            return;
+        }
         let Some(state) = self.texture_cache.get(&texture_id) else {
             // Texture has no MTL backing yet (no draw has bound it) —
             // mipgen will run on the upload that precedes the first
@@ -6148,15 +6256,13 @@ impl FrameEncoder {
 
     /// Blit-based 2D upload.
     ///
-    /// A packed 16-bit expansion job diverts to `run_texture_upload_expand`
-    /// up front; the remaining formats reuse the per-mip staging `MTLBuffer`
-    /// (wrapping the game's staging `PageBox`) and emit a
-    /// `BlitCopyBufferToTexture` against the frame's leading blit pass.
+    /// A job the GPU upload pass takes diverts to it up front; the rest
+    /// reuse the per-mip staging `MTLBuffer` (wrapping the game's staging
+    /// `PageBox`) and emit a `BlitCopyBufferToTexture` against the frame's
+    /// leading blit pass.
     fn run_texture_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
-        if let Some(kind) =
-            mtld3d_core::packed16::expansion_kind(job.src_d3d_format, job.info.pixel_format)
-        {
-            return self.run_texture_upload_expand(job, texture_handle, kind);
+        if let Some(outcome) = self.try_texture_upload_pass(job, texture_handle) {
+            return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
@@ -6319,15 +6425,14 @@ impl FrameEncoder {
     /// no inter-slice gap, so the slices are contiguous in the box — a
     /// single `depth`-slice `copyFromBuffer` with `bytesPerImage =
     /// slice_pitch` reads them all. When `row_pitch` is below Metal's
-    /// `minimumLinearTextureAlignmentForPixelFormat`, every row across
-    /// every slice is repacked to the padded stride (the rows being
-    /// contiguous makes this a single `region_rows * depth` repack), and
-    /// `bytes_per_image` widens to `padded_pitch * region_rows`.
+    /// `minimumLinearTextureAlignmentForPixelFormat`, a format the upload
+    /// pass cannot write (compressed, or carrying a sampler swizzle) has
+    /// every row across every slice repacked to the padded stride (the rows
+    /// being contiguous makes this a single `region_rows * depth` repack),
+    /// and `bytes_per_image` widens to `padded_pitch * region_rows`.
     fn run_volume_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
-        if let Some(kind) =
-            mtld3d_core::packed16::expansion_kind(job.src_d3d_format, job.info.pixel_format)
-        {
-            return self.run_texture_upload_expand(job, texture_handle, kind);
+        if let Some(outcome) = self.try_texture_upload_pass(job, texture_handle) {
+            return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.arc.len() as u64;
@@ -6394,176 +6499,196 @@ impl FrameEncoder {
         true
     }
 
-    /// Packed 16-bit expansion upload: widen staging texels to BGRA8, then blit.
+    /// Which upload-pass decode this job takes, or `None` for the blit path.
     ///
-    /// Serves the textures `map_d3d_format_device` backed with `Bgra8Unorm`
-    /// because this device lacks the native packed 16-bit formats. The
-    /// texture's 16-bit staging stays authoritative (Lock semantics and
-    /// upload-abort replay both read it); every upload expands the dirty
-    /// region into a fresh page-aligned `PageBox` via `packed16::expand_rows`
-    /// and emits the same `copyFromBuffer:toTexture:` as the raw path. The
-    /// staging is never wrapped in a cached `MTLBuffer` here (see the warmup
-    /// skip in `push_texture_warmups`), and the expanded pitch is already at
-    /// or above `min_linear_texture_align`, so the padded repack never
-    /// applies. Handles both the 2D dirty-rect shape and the volume
-    /// whole-box shape (`job.depth > 1`).
-    fn run_texture_upload_expand(
+    /// An expansion has no blit form and always takes the pass. A verbatim
+    /// copy takes it only when the staging row pitch is under Metal's linear
+    /// texture alignment, which is what a blit copy cannot accept; above it
+    /// the blit is the cheaper write.
+    fn upload_pass_decode(&self, job: &TextureUploadJob) -> Option<UploadDecode> {
+        let decode =
+            mtld3d_core::upload_pass::upload_decode(job.src_d3d_format, job.info.pixel_format)?;
+        (mtld3d_core::upload_pass::is_expansion(decode)
+            || job.src_pitch < self.gpu_caps.min_linear_texture_align)
+            .then_some(decode)
+    }
+
+    /// Run the upload as a GPU pass when it takes one, reporting whether the caller is done.
+    ///
+    /// `None` means the job belongs on the blit path: either it never took
+    /// the pass, or the pass declined a verbatim copy (a pipeline-create
+    /// failure) and the blit's CPU repack can still write it. `Some` is the
+    /// result the caller returns; a declined expansion is `Some(false)`,
+    /// because no blit can widen those texels.
+    fn try_texture_upload_pass(
         &mut self,
         job: &TextureUploadJob,
         texture_handle: u64,
-        kind: mtld3d_core::packed16::Packed16Kind,
+    ) -> Option<bool> {
+        let decode = self.upload_pass_decode(job)?;
+        if self.run_texture_upload_pass(job, texture_handle, decode) {
+            return Some(true);
+        }
+        if mtld3d_core::upload_pass::is_expansion(decode) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "run_texture_upload: the upload pass declined a packed 16-bit expansion; no \
+                 blit can widen those texels, so the mip keeps its previous contents",
+            );
+            return Some(false);
+        }
+        None
+    }
+
+    /// GPU upload pass: write one dirty region into the texture with a render quad.
+    ///
+    /// Serves the two upload shapes `copyFromBuffer:toTexture:` cannot take.
+    /// A packed 16-bit source (A4R4G4B4 / R5G6B5 / A1R5G5B5) feeding the
+    /// `Bgra8Unorm` texture `map_d3d_format_device` gave it on a device
+    /// without the native formats has no verbatim copy at all: the widening
+    /// happens in the fragment function, which writes D3D channel order and
+    /// forces alpha opaque for the alpha-less R5G6B5. A mip whose row pitch
+    /// is below `min_linear_texture_align` has no legal blit source pitch:
+    /// the fragment function addresses the staging by texel, so the pitch is
+    /// just a multiplier.
+    ///
+    /// The staging keeps its D3D layout (Lock semantics and upload-abort
+    /// replay both read it) and is wrapped in the same cached per-mip
+    /// `MTLBuffer` the blit path uses. Handles the 2D dirty-rect shape and
+    /// a cube face in one pass, and the volume whole-box shape
+    /// (`job.depth > 1`) in one pass per slice.
+    fn run_texture_upload_pass(
+        &mut self,
+        job: &TextureUploadJob,
+        texture_handle: u64,
+        decode: UploadDecode,
     ) -> bool {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        if job.arc.is_empty() || job.bytes_per_pixel != 2 {
+        let backing_length = job.arc.len() as u64;
+        if backing_length == 0 || job.bytes_per_pixel != decode.bytes_per_texel() {
             return false;
         }
-        let src_pitch = job.src_pitch as usize;
+        let pipeline = self.get_or_create_upload_pipeline(job.info.pixel_format);
+        if pipeline == 0 {
+            return false;
+        }
+        let staging_buffer_handle =
+            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
+        if staging_buffer_handle == 0 {
+            return false;
+        }
+        // Non-UMA: the game wrote these pages on the CPU. The notify rides
+        // the frame-head blit stream, which runs before every pass.
+        self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
+
         let mip_w = (job.info.width.max(1) >> job.level).max(1);
         let mip_h = (job.info.height.max(1) >> job.level).max(1);
         let depth = job.depth.max(1);
-        // 2D uploads expand exactly the dirty sub-rect; volumes re-upload the
-        // whole contiguous box on Unlock (matching `run_volume_upload_blit`),
-        // so the expansion covers `rows_per_slice * depth` contiguous rows.
-        let (width_px, rows_per_slice, src_offset) = if depth > 1 {
-            let rows_per_slice = (job.slice_pitch as usize)
-                .checked_div(src_pitch)
-                .unwrap_or(0);
-            (mip_w as usize, rows_per_slice, 0usize)
-        } else {
-            (
-                job.region_w as usize,
-                job.region_h as usize,
-                job.origin_y as usize * src_pitch + job.origin_x as usize * 2,
-            )
+        let emit = UploadPassInputs {
+            pipeline,
+            depth_state: self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert()),
+            staging_buffer_handle,
+            texture_handle,
+            format: job.info.pixel_format,
+            level: job.level,
+            mip_size: (mip_w, mip_h),
+            src_pitch: job.src_pitch,
+            decode,
         };
-        let total_rows = rows_per_slice * depth as usize;
-        if width_px == 0 || total_rows == 0 {
-            return false;
-        }
-        let src_needed = (total_rows - 1) * src_pitch + width_px * 2;
-        let Some(src) = job
-            .arc
-            .as_slice()
-            .get(src_offset..)
-            .filter(|s| s.len() >= src_needed)
-        else {
-            error!(
-                target: LOG_TARGET,
-                "run_texture_upload_expand: staging {} too short for offset {src_offset} + \
-                 {total_rows} rows × pitch {src_pitch}",
-                job.arc.len(),
-            );
-            return false;
-        };
-
-        let dst_pitch = (width_px * 4).max(self.gpu_caps.min_linear_texture_align as usize);
-        let Some(expanded_size) = dst_pitch.checked_mul(total_rows) else {
-            error!(target: LOG_TARGET, "run_texture_upload_expand: expanded size overflow");
-            return false;
-        };
-        let mut expanded = PageBox::new_uninit(expanded_size);
-        // Zero the row-tail padding `expand_rows` leaves untouched — the blit
-        // reads whole `dst_pitch` rows and uninitialised bytes must not cross
-        // the wire (they land outside the region, but keep the buffer defined).
-        if dst_pitch > width_px * 4 {
-            expanded.as_mut_slice().fill(0);
-        }
-        mtld3d_core::packed16::expand_rows(
-            kind,
-            src,
-            src_pitch,
-            expanded.as_mut_slice(),
-            dst_pitch,
-            width_px,
-            total_rows,
-        );
-
-        let expanded_ptr = expanded.as_ptr() as u64;
-        let expanded_len = expanded.len() as u64;
-        let desc = BufferCreateDesc {
-            backing_ptr: expanded_ptr,
-            length: expanded_len,
-            id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
-            kind: BufferKind::Repack,
-        };
-        let mut expanded_handle = MetalHandle::<MTLBufferKind>::NULL;
-        let status = self.batch_create_buffers(
-            core::slice::from_ref(&desc),
-            core::slice::from_mut(&mut expanded_handle),
-        );
-        if status != 0 || expanded_handle.is_null() {
-            error!(
-                target: LOG_TARGET,
-                "run_texture_upload_expand: CreateBuffer failed (status={status:#x}, \
-                 len={expanded_len})",
-            );
-            return false;
-        }
-        // Non-UMA: the CPU just wrote the whole expanded slab.
-        self.enqueue_notify_buffer_did_modify_range(expanded_handle.raw(), 0, expanded_len);
-
-        let bytes_per_row =
-            u32::try_from(dst_pitch).expect("expanded pitch fits u32 (mip width bounded)");
-        let bytes_per_image = bytes_per_row.saturating_mul(
-            u32::try_from(rows_per_slice).expect("rows per slice fits u32 (mip height bounded)"),
-        );
-        let info = if depth > 1 {
-            CopyBufferToTextureInfo {
-                buffer_handle: expanded_handle.raw(),
-                buffer_offset: 0,
-                bytes_per_row,
-                texture_handle,
-                destination_slice: 0,
-                mip_level: job.level,
-                origin_x: 0,
-                origin_y: 0,
-                region_w: mip_w,
-                region_h: mip_h,
-                depth,
-                bytes_per_image,
+        if depth > 1 {
+            // Volumes re-upload the whole box on Unlock and their slices are
+            // contiguous in it, so slice `s` starts `s * slice_pitch` in.
+            for slice in 0..depth {
+                self.emit_upload_pass(
+                    &emit,
+                    slice,
+                    (0, 0, mip_w, mip_h),
+                    slice.saturating_mul(job.slice_pitch),
+                );
             }
         } else {
-            CopyBufferToTextureInfo {
-                buffer_handle: expanded_handle.raw(),
-                buffer_offset: 0,
-                bytes_per_row,
-                texture_handle,
-                destination_slice: job.destination_slice,
-                mip_level: job.level,
-                origin_x: job.origin_x,
-                origin_y: job.origin_y,
-                region_w: job.region_w,
-                region_h: job.region_h,
-                depth: 1,
-                bytes_per_image,
-            }
-        };
-        self.frame_blit_commands
-            .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+            // Clamp the dirty rect into the mip: the viewport is not clamped
+            // on the unix side the way the scissor is.
+            let w = job.region_w.min(mip_w.saturating_sub(job.origin_x));
+            let h = job.region_h.min(mip_h.saturating_sub(job.origin_y));
+            self.emit_upload_pass(
+                &emit,
+                job.destination_slice,
+                (job.origin_x, job.origin_y, w, h),
+                0,
+            );
+        }
+
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "texture upload pass in use: uploads a blit cannot express (packed 16-bit widening, \
+             row pitch under the {}-byte linear texture alignment) render into the destination",
+            self.gpu_caps.min_linear_texture_align,
+        );
+        self.upload_pass_textures.insert(job.info.texture_id);
         self.perf.bump_texture_blit_upload();
         self.perf.bump_texture_expand_upload();
-
-        // Retire the wrapper + expanded PageBox after the GPU retires this
-        // frame's blit — wrapper first, so Metal releases its `bytesNoCopy`
-        // pointer before the PageBox frees (the canonical disposal order).
-        self.perf.bump_vbib_retained_add(expanded.len());
-        self.add_retained_bytes(expanded.len());
-        self.pending_resource_retention
-            .push_back(PendingResourceRetention {
-                kind: DestroyKind::Buffer,
-                handle: expanded_handle.raw(),
-                page_box: Some(expanded),
-                staging_arc: None,
-                seq: self.current_submit_seq,
-                from_texture: true,
-            });
-        // The GPU never reads the 16-bit staging on this path, but retaining
-        // the Arc keeps the "every emitted upload retains its staging"
-        // invariant uniform with the raw/padded paths (cost: one Arc clone).
+        // The pass reads the staging at command-buffer execution time, long
+        // after this returns; hold the Box for the GPU's view of the frame.
         self.current_blit_retention.push(Arc::clone(&job.arc));
         true
+    }
+
+    /// Splice one slice's upload pass into the frame.
+    ///
+    /// `rect` is the dirty region in destination texels, `base_offset` the
+    /// byte offset of the slice inside the staging slab. A 2D upload writes
+    /// the rect at the coordinates it already occupies in the staging, so
+    /// the fragment function derives its source address from the destination
+    /// position alone and `base_offset` is zero; a volume slice carries its
+    /// own base.
+    fn emit_upload_pass(
+        &mut self,
+        emit: &UploadPassInputs,
+        slice: u32,
+        rect: (u32, u32, u32, u32),
+        base_offset: u32,
+    ) {
+        let (x, y, w, h) = rect;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut args = [0u8; RGBA_BYTE_LEN as usize];
+        for (i, v) in [
+            base_offset,
+            emit.src_pitch,
+            emit.decode.wire(),
+            emit.decode.bytes_per_texel(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            args[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let args_ptr = self.scratch.alloc(&args);
+        let mut cmds = core::mem::take(&mut self.upload_pass_commands);
+        cmds.clear();
+        cmds.push(Command::set_render_pipeline_state(emit.pipeline));
+        cmds.push(Command::set_depth_stencil_state(emit.depth_state));
+        cmds.push(Command::set_scissor_rect(x, y, w, h));
+        cmds.push(Command::set_fragment_bytes_at(args_ptr, RGBA_BYTE_LEN, 0));
+        cmds.push(Command::set_fragment_buffer(
+            emit.staging_buffer_handle,
+            0,
+            1,
+        ));
+        cmds.push(Command::draw_primitives(PrimitiveType::Triangle, 0, 3));
+        let target = UploadPassTarget {
+            // SAFETY: `texture_handle` is the live MTLTexture address the
+            // caller resolved out of the texture cache.
+            texture: unsafe { MetalHandle::<MTLTextureKind>::new(emit.texture_handle) },
+            subresource: (slice, emit.level),
+            size: emit.mip_size,
+            format: emit.format,
+            rect,
+        };
+        self.pass_state.push_upload_pass(&target, &cmds);
+        self.upload_pass_commands = cmds;
     }
 
     /// Repack `num_blit_rows` source rows from `staging` into a transient `PageBox`.
@@ -7608,6 +7733,12 @@ pub struct EncoderThread {
     sender: mpsc::SyncSender<EncoderMessage>,
     prewarm_tx: mpsc::SyncSender<PrewarmPayload>,
     handle: Option<thread::JoinHandle<()>>,
+    /// The device capabilities the encoder was spawned with.
+    ///
+    /// Kept here so API-thread callers that have to predict an encoder
+    /// decision (which upload path a mip takes, and therefore which command
+    /// buffer reads its staging) read the same values the encoder does.
+    gpu_caps: GpuCaps,
 }
 
 /// Pre-warm completion payload.
@@ -7669,7 +7800,14 @@ impl EncoderThread {
             sender,
             prewarm_tx,
             handle: Some(handle),
+            gpu_caps,
         }
+    }
+
+    /// The device capabilities this encoder translates against.
+    #[must_use]
+    pub const fn gpu_caps(&self) -> GpuCaps {
+        self.gpu_caps
     }
 
     pub fn send_frame(&self, frame: FrameData) {

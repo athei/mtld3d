@@ -443,18 +443,21 @@ impl Thunk for EnsureClearQuadPipelineParams {
 /// destination rect; the source rect is mapped to `[0,1]` texcoords via a
 /// `setVertexBytes` transform). This pipeline is the VS/PS pair for that quad.
 ///
-/// One pipeline per destination `color_format` (the source is bound as a
-/// fragment texture, not declared in the pipeline), cached unix-side for
-/// process lifetime in a `HashMap<color_format, MTLRenderPipelineState*>`.
-/// Mirrors `EnsureClearQuadPipelineParams`. No depth attachment: the blit
-/// quad never writes depth, and the PE side opens the destination pass with
-/// `SetDepthStencilSurface(NULL)` so no depth format is declared.
+/// `quad_kind` selects the fragment function: `StretchBlit` samples the bound
+/// source texture, `TextureUpload` decodes packed staging bytes read out of a
+/// bound `MTLBuffer` (the texture-upload quad, which serves the packed 16-bit
+/// expansion and the sub-alignment-pitch mip copy).
+///
+/// One pipeline per (`quad_kind`, destination `color_format`) pair (sources
+/// are bound as fragment arguments, not declared in the pipeline), cached
+/// unix-side for process lifetime. Mirrors `EnsureClearQuadPipelineParams`.
+/// No depth attachment: neither quad writes depth, and the PE side opens the
+/// destination pass with no depth texture, so no depth format is declared.
 #[repr(C, align(8))]
 pub struct EnsureBlitPipelineParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
     pub color_format: PixelFormat,                 // in: destination colour format
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32, // align next field to 8
+    pub quad_kind: crate::mtl::QuadPipelineKind,   // in: which fragment function to link
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
 }
 

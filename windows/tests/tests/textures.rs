@@ -267,6 +267,47 @@ fn mip_chain_levels_and_dimensions() {
 }
 
 #[test]
+fn low_mips_below_the_linear_alignment_sample_their_own_texels() {
+    // 8x8 A8R8G8B8, full chain: 8, 4, 2 and 1 texels wide, so row pitches of
+    // 32, 16, 8 and 4 bytes. The bottom two are below the 16-byte linear
+    // texture alignment a blit source must meet on Apple Silicon (every mip
+    // below 64 texels wide is, on the 256-byte Mac2 floor), which routes
+    // their uploads through the GPU upload pass instead. Each level must
+    // still carry exactly the texels written into it.
+    let h = Harness::new();
+    let tex = h.create_texture(8, 8, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(tex.level_count(), 4, "8x8 full mip chain");
+    let colors = [0xFFFF_0000u32, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+    for (level, color) in colors.iter().enumerate() {
+        let level = u32::try_from(level).expect("mip index fits u32");
+        let side = (8 >> level) as usize;
+        let locked = tex.lock_rect(level, 0);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+        let row = vec![*color; side];
+        for y in 0..side {
+            // SAFETY: the lock maps `side` rows at `pitch` stride.
+            let dst = unsafe { locked.bits_ptr().add(y * pitch) };
+            // SAFETY: `side` texels fit in the locked row per above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, side * 4);
+            }
+        }
+    }
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    for (level, color) in colors.iter().enumerate() {
+        let level = u32::try_from(level).expect("mip index fits u32");
+        // The quad magnifies, so the most-detailed-level clamp is the level
+        // every fragment reads.
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_center(&h, &tex).to_pixel(),
+            *color,
+            &format!("mip {level}"),
+        );
+    }
+}
+
+#[test]
 fn level_desc_reports_surface_type() {
     let h = Harness::new();
     let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, 0);

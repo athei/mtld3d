@@ -354,6 +354,20 @@ pub struct PassColorAttachment {
     store: StoreAction,
 }
 
+/// Attachment and scope of one texture-upload pass.
+///
+/// `size` is the destination mip's own extent (what the load action's
+/// full-coverage test measures `rect` against), `subresource` is
+/// `(slice, level)` where `slice` is the cube face or volume depth plane.
+pub struct UploadPassTarget {
+    pub texture: MetalHandle<MTLTextureKind>,
+    pub subresource: (u32, u32),
+    pub size: (u32, u32),
+    pub format: PixelFormat,
+    /// `(x, y, width, height)` of the dirty rect, in destination texels.
+    pub rect: (u32, u32, u32, u32),
+}
+
 impl PassColorAttachment {
     /// The unbound attachment.
     pub const NONE: Self = Self {
@@ -1169,6 +1183,15 @@ pub struct PassState {
     /// entries) so a one-off heavy frame can't grow the pool unboundedly.
     command_vec_pool: Vec<Vec<Command>>,
 
+    /// Index one past the last texture-upload pass inserted this frame.
+    ///
+    /// Upload passes are spliced into the front of `passes` rather than
+    /// appended, so they run before every draw of the frame exactly as the
+    /// frame-head upload blits do, and so an upload between two draws never
+    /// breaks the open pass. Insertions land here and bump it, which keeps
+    /// two uploads of the same mip in the order they were issued.
+    upload_pass_end: usize,
+
     /// Per-pass VB/IB read-range tracker driving rename-at-overlap.
     ///
     /// Also feeds the `reorder` perf counter.
@@ -1245,6 +1268,7 @@ impl PassState {
             frame_seq: 0,
             cmd_vec_realloc_bytes: 0,
             command_vec_pool: Vec::with_capacity(MAX_CMD_VEC_POOL),
+            upload_pass_end: 0,
             drawn_ranges: DrawnRangeTracker::new(),
             #[cfg(debug_assertions)]
             debug_emitted: DebugBoundShadow::default(),
@@ -1299,6 +1323,7 @@ impl PassState {
         }
         // Belt-and-braces in case the break-on-cap fired mid-drain.
         self.passes.clear();
+        self.upload_pass_end = 0;
         self.current_pass_closed = true;
         // No pass open → no viewport emitted yet; the next pass's open
         // reseeds this. (`set_viewport` only reads it inside an open pass.)
@@ -2421,6 +2446,89 @@ impl PassState {
                 color_load,
                 depth_load,
                 self.current_extra_present_mask,
+            );
+        }
+    }
+
+    /// Splice one texture-upload pass into the front of the frame.
+    ///
+    /// `commands` is the upload quad's binding + draw sequence; the viewport
+    /// scoping the pass to `rect` is prepended here so the pass carries it as
+    /// its first command, the way `ensure_pass_open` does. The pass takes no
+    /// depth attachment and is never the current pass, so the caller's own
+    /// render-target binding, viewport and per-draw dedup cache are all
+    /// untouched.
+    ///
+    /// The upload lands at the head of the frame, where the blit uploads it
+    /// replaces already land: a draw earlier in the frame that sampled the
+    /// destination is served by the encoder's texture rename, exactly as
+    /// before. The load action discards only when `rect` covers the whole
+    /// mip, which the quad then fully overwrites.
+    ///
+    /// The destination is also entered into the read/write model the
+    /// load/store rules reason over: `blit_written_rts` so a later pass loads
+    /// the attachment instead of discarding it (Rule A), and the sampled set
+    /// so the pass's own colour store survives (Rules C/D) even in a frame
+    /// where nothing samples the texture.
+    pub fn push_upload_pass(&mut self, target: &UploadPassTarget, commands: &[Command]) {
+        let (x, y, w, h) = target.rect;
+        let covers = x == 0 && y == 0 && w == target.size.0 && h == target.size.1;
+        let color_load = if ENABLE_FIRST_USE_DONTCARE && covers {
+            ColorLoad::DontCare
+        } else {
+            ColorLoad::Load
+        };
+        let (slice, level) = target.subresource;
+        let subresource = slice | (level << 8);
+        let mut cmds = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(16));
+        cmds.clear();
+        cmds.push(Command::set_viewport(x, y, w, h, 0.0, 1.0));
+        cmds.extend_from_slice(commands);
+        let pass = Pass {
+            color_texture: target.texture,
+            // The quad writes the expanded texels bit-exactly, so the pass
+            // never renders through the sRGB twin.
+            color_srgb_texture: MetalHandle::NULL,
+            color_subresource: subresource,
+            color_size: target.size,
+            color_format: target.format,
+            color_load,
+            color_store: StoreAction::Store,
+            depth_texture: MetalHandle::NULL,
+            depth_level: 0,
+            depth_load: DepthLoad::DontCare,
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::DontCare,
+            viewport: (x, y, w, h),
+            commands: cmds,
+            leading_blits: Vec::new(),
+            has_counting_visibility: false,
+            depth_is_sampleable: false,
+            // The quad writes colour, so Rule H must not strip the attachment
+            // it renders into.
+            color_writes_observed: true,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: [PassColorAttachment::NONE; 3],
+        };
+        self.passes.insert(self.upload_pass_end, pass);
+        self.upload_pass_end += 1;
+        self.seen_color_rts.insert((target.texture, subresource));
+        self.seen_color_rts_segment
+            .insert((target.texture, subresource));
+        self.blit_written_rts.insert(target.texture);
+        self.seen_sampled_textures.insert(target.texture);
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "upload-pass idx={} color={:#x} slice={slice} level={level} \
+                 size={}x{} rect={x},{y}+{w}x{h} load={color_load:?}",
+                self.upload_pass_end - 1,
+                target.texture,
+                target.size.0,
+                target.size.1,
             );
         }
     }

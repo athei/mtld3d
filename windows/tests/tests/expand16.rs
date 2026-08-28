@@ -1,8 +1,8 @@
 //! The packed 16-bit expansion path, forced on via `debug.expandPacked16`.
 //!
 //! On devices without Metal's packed 16-bit pixel formats (Intel/AMD Mac2),
-//! A4R4G4B4 / R5G6B5 / A1R5G5B5 textures are backed by BGRA8 and expanded on
-//! the CPU at upload, and the 16-bit render-target formats stop being
+//! A4R4G4B4 / R5G6B5 / A1R5G5B5 textures are backed by BGRA8 and widened by
+//! the GPU upload pass, and the 16-bit render-target formats stop being
 //! advertised. These tests run that whole path on Apple Silicon by forcing
 //! the config key, so it cannot rot between rare Intel-hardware runs.
 
@@ -11,8 +11,8 @@ use mtld3d_types::{
     D3D_OK, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -71,6 +71,51 @@ fn point_clamp(h: &Harness) {
     }
 }
 
+/// Fill the whole of mip `level` with one packed 16-bit texel.
+///
+/// Writes row by row against the pitch the lock reports: a low mip's row
+/// stride is not the tight `width * 2`.
+fn fill_level(tex: &Texture<'_>, level: u32, side: u32, texel: u16) {
+    let locked = tex.lock_rect(level, 0);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+    let row: Vec<u16> = vec![texel; side as usize];
+    for y in 0..side as usize {
+        // SAFETY: the lock maps `side` rows at `pitch` stride, and each row
+        // holds `side` texels.
+        let dst = unsafe { locked.bits_ptr().add(y * pitch) };
+        // SAFETY: `side` texels fit in the locked row per above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, side as usize * 2);
+        }
+    }
+}
+
+/// Bind `tex`, sample mip `level` across the backbuffer, return the centre pixel.
+///
+/// `D3DSAMP_MAXMIPLEVEL` pins the most detailed level the sampler may use;
+/// the quad magnifies, so that is the level every fragment reads.
+fn sample_level(h: &Harness, tex: &Texture<'_>, level: u32) -> u32 {
+    assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample draw"
+        );
+    });
+    h.read_pixel(320, 240)
+}
+
 /// Bind `tex`, sample it across the backbuffer, return the pixel at `(x, y)`.
 fn sample_at(h: &Harness, tex: &Texture<'_>, x: u32, y: u32) -> Rgba8 {
     assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
@@ -117,9 +162,9 @@ fn expanded_color_formats_sample_red() {
 fn expanded_partial_lock_updates_only_the_dirty_rect() {
     // 4×4 A4R4G4B4, MANAGED so partial locks track a dirty sub-rect. Fill
     // green everywhere, sample once (uploads the whole mip), then rewrite the
-    // centre 2×2 red through a partial lock. The re-upload takes the 2 bpp →
-    // 4 bpp sub-rect repack: origin offset, differing pitches, and the
-    // untouched border texels must survive.
+    // centre 2×2 red through a partial lock. The re-upload scopes the pass to
+    // that sub-rect, so the origin offset must reach the right staging texels
+    // and the untouched border texels must survive the pass's load action.
     const GREEN16: u16 = 0xF0F0; // A=F R=0 G=F B=0
     const RED16: u16 = 0xFF00; // A=F R=F G=0 B=0
     force_expand();
@@ -156,6 +201,37 @@ fn expanded_partial_lock_updates_only_the_dirty_rect() {
         outside.g > 200 && outside.r < 60,
         "texel outside the dirty rect keeps green, got {outside:?}"
     );
+}
+
+#[test]
+fn expanded_mip_chain_samples_every_level() {
+    // 8x8 R5G6B5, full chain: 8, 4, 2 and 1 texels wide. Their tight row
+    // pitches are 16, 8, 4 and 2 bytes, so every mip but the top is below
+    // the 16-byte linear texture alignment a blit source has to meet on
+    // Apple Silicon. The upload reads the staging by texel instead, so the
+    // pitch is unconstrained and each level lands on its own mip.
+    force_expand();
+    let h = Harness::new();
+    let tex = h.create_texture(8, 8, 0, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
+    assert_eq!(tex.level_count(), 4, "8x8 full mip chain");
+    let levels: [(u16, u32); 4] = [
+        (0xF800, RED),
+        (0x07E0, GREEN),
+        (0x001F, BLUE),
+        (0xFFFF, WHITE),
+    ];
+    for (level, (texel, _)) in levels.iter().enumerate() {
+        let level = u32::try_from(level).expect("mip index fits u32");
+        fill_level(&tex, level, 8 >> level, *texel);
+    }
+    for (level, (_, expected)) in levels.iter().enumerate() {
+        let level = u32::try_from(level).expect("mip index fits u32");
+        assert_pixel_eq(
+            sample_level(&h, &tex, level),
+            *expected,
+            &format!("expanded mip {level}"),
+        );
+    }
 }
 
 #[test]

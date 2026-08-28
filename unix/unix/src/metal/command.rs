@@ -1484,7 +1484,15 @@ fn encode_pass(
         // subscript 0 is always valid.
         let color0 = unsafe { rp_desc.colorAttachments().objectAtIndexedSubscript(0) };
         color0.setTexture(Some(&texture));
-        color0.setSlice(pass.color_slice() as usize);
+        // A 3D texture addresses its slices through `depthPlane`; `slice`
+        // stays 0 there and selects the array/cube face everywhere else.
+        // The PE side packs both into one subresource field because the
+        // texture's own type is what decides which one Metal wants.
+        if texture.textureType() == objc2_metal::MTLTextureType::Type3D {
+            color0.setDepthPlane(pass.color_slice() as usize);
+        } else {
+            color0.setSlice(pass.color_slice() as usize);
+        }
         color0.setLevel(pass.color_level() as usize);
         rt_width = rt_width.min((texture.width() >> pass.color_level()).max(1));
         rt_height = rt_height.min((texture.height() >> pass.color_level()).max(1));
@@ -1958,6 +1966,23 @@ fn encode_pass(
                     // the duration of the binding (encoder retains).
                     unsafe {
                         encoder.setVertexBuffer_offset_atIndex(
+                            Some(&buffer),
+                            to_usize(cmd.param_c),
+                            cmd.param_a as usize,
+                        );
+                    }
+                }
+                Some(CommandType::SetFragmentBuffer) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
+                    let Some(buffer) =
+                        (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) }).into_retained()
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; `buffer` is retained for
+                    // the duration of the binding (encoder retains).
+                    unsafe {
+                        encoder.setFragmentBuffer_offset_atIndex(
                             Some(&buffer),
                             to_usize(cmd.param_c),
                             cmd.param_a as usize,

@@ -168,10 +168,9 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     assert_eq!(r5g6b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
     assert_eq!(r5g6b5.bytes_per_pixel(), 2);
     assert_eq!(r5g6b5.block_bytes(), 2);
-    assert_eq!(
-        r5g6b5.swizzle(),
-        Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One])
-    );
+    // No swizzle on any of the three: the upload pass writes D3D channel
+    // order and an opaque alpha, and a swizzled view cannot be an attachment.
+    assert_eq!(r5g6b5.swizzle(), None, "upload pass forces alpha opaque");
     assert!(!r5g6b5.has_alpha());
 
     let a1r5g5b5 = map_d3d_format_device(D3DFMT_A1R5G5B5, false).expect("mapped");
@@ -183,7 +182,11 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     let a4r4g4b4 = map_d3d_format_device(D3DFMT_A4R4G4B4, false).expect("mapped");
     assert_eq!(a4r4g4b4.metal_pixel_format(), PixelFormat::Bgra8Unorm);
     assert_eq!(a4r4g4b4.bytes_per_pixel(), 2);
-    assert_eq!(a4r4g4b4.swizzle(), None, "repack writes D3D channel order");
+    assert_eq!(
+        a4r4g4b4.swizzle(),
+        None,
+        "upload pass writes D3D channel order"
+    );
     assert!(a4r4g4b4.has_alpha());
 
     // Non-packed formats are untouched by the flag.
