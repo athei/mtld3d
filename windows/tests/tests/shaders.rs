@@ -5,8 +5,11 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, PosVertex};
-use mtld3d_types::{D3DERR_INVALIDCALL, D3DFVF_XYZ, D3DPT_TRIANGLELIST};
+use mtld3d_tests::{Harness, PosVertex, VolumeVertex};
+use mtld3d_types::{
+    D3DERR_INVALIDCALL, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
+    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+};
 
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
 const VS_BC: [u32; 8] = [
@@ -867,6 +870,162 @@ fn constant_reader_after_a_non_reader_sees_the_current_row() {
         "second reader draw picks up the row set between the draws"
     );
 
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// `vs_3_0`: pass the position and a three-component texcoord through.
+#[rustfmt::skip]
+const VS_TEXCOORD_PASSTHROUGH: [u32; 20] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0005, 0x900F_0001,              // dcl_texcoord0 v1
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE00F_0001,              // dcl_texcoord0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0x90E4_0001,              // mov o1, v1
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_texcoord0 v0.xy; dcl_2d s0; texld r0, v0, s0; mov oC0, r0; }`.
+#[rustfmt::skip]
+const PS_SAMPLE_2D: [u32; 15] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// [`PS_SAMPLE_2D`] with `dcl_texcoord0 v0.xyz` and `dcl_volume s0`.
+#[rustfmt::skip]
+const PS_SAMPLE_VOLUME: [u32; 15] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9007_0000,              // dcl_texcoord0 v0.xyz
+    0x0200_001F, 0xA000_0000, 0xA00F_0800,              // dcl_volume s0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn a_sampler_reads_the_bound_texture_kind_not_the_declared_one() {
+    // D3D9 samples the texture the application bound, whatever dimensionality
+    // the pixel shader's `dcl` names, and titles ship both mismatches: a
+    // `dcl_volume` slot carrying a 2D texture reads that texture, and a
+    // `dcl_2d` slot carrying a volume reads the volume slice the coordinate's
+    // third component selects. Binding the declared kind instead leaves the
+    // sample undefined (Metal rejects the mismatched MTLTexture) and the
+    // rendered quad reads back as the shader's zero-sample result.
+    let h = Harness::new();
+
+    let flat = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut locked = flat.lock_rect(0, 0);
+        locked.write_u32(&[0xFF70_7070; 4]);
+    }
+    let (hr, volume) = h.try_create_volume_texture(
+        [2, 2, 2],
+        1,
+        0,
+        mtld3d_types::D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(hr, 0, "CreateVolumeTexture");
+    let volume = volume.expect("volume texture");
+    // Slice 0 dark grey, slice 1 mid grey: the sampled slice names itself.
+    volume.write_u32(
+        0,
+        &[
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF40_4040,
+            0xFF40_4040,
+            0xFF40_4040,
+            0xFF40_4040,
+        ],
+    );
+
+    for (state, value) in [
+        (mtld3d_types::D3DSAMP_MINFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MAGFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MIPFILTER, mtld3d_types::D3DTEXF_NONE),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSU,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSV,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSW,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+
+    let vs = h.create_vertex_shader(&VS_TEXCOORD_PASSTHROUGH);
+    let ps_2d = h.create_pixel_shader(&PS_SAMPLE_2D);
+    let ps_volume = h.create_pixel_shader(&PS_SAMPLE_VOLUME);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+
+    // The coordinate names texel (0.5, 0.5) of slice 0 under point filtering:
+    // a volume of depth 2 puts its slice centres at w = 0.25 and w = 0.75.
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 0.5,
+        v: 0.5,
+        w: 0.25,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+
+    // Each case names the bound texture, the shader's declaration, and the
+    // colour the bound texture holds at the sampled point. The two mismatched
+    // rows are the ones the fix is about; the matched rows pin that reading
+    // the binding did not disturb the agreeing case.
+    for (bind_volume, ps, expected, name) in [
+        (false, &ps_2d, 0xFF70_7070u32, "2d texture, dcl_2d"),
+        (true, &ps_volume, 0xFF20_2020, "volume texture, dcl_volume"),
+        (false, &ps_volume, 0xFF70_7070, "2d texture, dcl_volume"),
+        (true, &ps_2d, 0xFF20_2020, "volume texture, dcl_2d"),
+    ] {
+        if bind_volume {
+            assert_eq!(h.set_volume_texture(0, &volume), 0, "bind volume");
+        } else {
+            assert_eq!(h.set_texture(0, &flat), 0, "bind 2d");
+        }
+        assert_eq!(h.set_pixel_shader(ps), 0, "SetPixelShader");
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "draw {name}"
+            );
+        });
+        assert_eq!(h.read_pixel(320, 240), expected, "{name}");
+    }
+
+    assert_eq!(h.clear_texture(0), 0, "unbind stage 0");
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
 }
