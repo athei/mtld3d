@@ -6,6 +6,7 @@
 //! runner owns where a Wine install keeps its loader and its test binaries.
 
 use std::{
+    collections::BTreeSet,
     fs,
     io::Read,
     os::unix::process::ExitStatusExt,
@@ -29,6 +30,32 @@ use crate::{
 /// finish in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
+
+/// How many Metal API-validation error lines a leg may log and still pass.
+///
+/// Zero. The layer's warnings are filtered out (see [`run_subtest`]), so every
+/// line that survives is real API misuse and has to read as a regression
+/// rather than as noise. The expectation lives beside the reporting code
+/// because `baseline.txt` is machine-owned per-site counts whose parser
+/// rejects anything else.
+const MAX_VALIDATION_ERRORS: usize = 0;
+
+/// One subtest's outcome.
+///
+/// The parsed per-site result, plus how many distinct Metal API-validation
+/// error lines the run logged for the caller to gate on.
+pub struct SubtestRun {
+    /// Failing sites, the crash bit and the marked-failure tallies.
+    pub result: SubtestResult,
+    /// Distinct Metal API-validation error messages the subtest logged.
+    pub validation_errors: usize,
+}
+
+/// Whether the Metal-validation error lines a run logged fail its leg.
+#[must_use]
+pub const fn validation_gate_failed(errors: usize) -> bool {
+    errors > MAX_VALIDATION_ERRORS
+}
 
 fn subtest_timeout() -> Duration {
     let secs = std::env::var("MTLD3D_CONFORMANCE_TIMEOUT_SECS")
@@ -70,7 +97,7 @@ pub fn run_subtest(
     exe: &Path,
     arch: Arch,
     subtest: Subtest,
-) -> Result<SubtestResult, String> {
+) -> Result<SubtestRun, String> {
     if !exe.is_file() {
         return Err(format!(
             "test exe not found: {}; a Wine SDK bundle carries these under \
@@ -167,9 +194,10 @@ pub fn run_subtest(
 
     // Surface Metal API-validation failures (the layer runs in `nslog` mode, so
     // these are logged rather than aborting). Deduplicated, address/number
-    // normalised, prefixed with the subtest — a standing watch for Metal misuse
-    // that the per-site pass/fail counts don't capture.
-    report_validation_errors(arch, subtest, &String::from_utf8_lossy(&stderr));
+    // normalised, prefixed with the subtest. The count is what gates the leg:
+    // the per-site pass/fail counts never capture Metal misuse.
+    let validation_errors =
+        report_validation_errors(arch, subtest, &String::from_utf8_lossy(&stderr));
 
     // A timeout is a hang — treat it like a fatal signal so it surfaces as a
     // crash (and a regression vs a clean baseline) rather than a silent count.
@@ -193,7 +221,10 @@ pub fn run_subtest(
     // set; a write failure is reported but never fails the run.
     save_raw_output(arch, subtest, &combined);
 
-    Ok(scan::parse_subtest_output(&combined, signaled))
+    Ok(SubtestRun {
+        result: scan::parse_subtest_output(&combined, signaled),
+        validation_errors,
+    })
 }
 
 /// Persist a subtest's raw output to `$MTLD3D_CONFORMANCE_RAW_DIR/<arch>-<subtest>.log`.
@@ -223,10 +254,23 @@ fn save_raw_output(arch: Arch, subtest: Subtest, combined: &str) {
 /// Print a deduplicated, number-normalised summary of any Metal API-validation messages.
 ///
 /// The subtest logged them rather than aborting — the layer runs in `nslog`
-/// mode. Volatile addresses and counts collapse to `N` so a repeated error
-/// reports once.
-fn report_validation_errors(arch: Arch, subtest: Subtest, stderr: &str) {
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+/// mode. Returns how many distinct messages were printed, which is what the
+/// leg gates on.
+fn report_validation_errors(arch: Arch, subtest: Subtest, stderr: &str) -> usize {
+    let seen = validation_errors(stderr);
+    for msg in &seen {
+        eprintln!("  [{arch}/{subtest}] metal-validation: {msg}");
+    }
+    seen.len()
+}
+
+/// The distinct Metal API-validation error messages in a subtest's stderr.
+///
+/// Volatile addresses and counts collapse to `N` so a repeated error reports
+/// once. The layer's warnings never reach here (the run switches them off), so
+/// every match is misuse.
+fn validation_errors(stderr: &str) -> BTreeSet<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for line in stderr.lines() {
         let l = line.trim();
         let is_validation = l.contains("does not match")
@@ -240,9 +284,7 @@ fn report_validation_errors(arch: Arch, subtest: Subtest, stderr: &str) {
             seen.insert(normalize_numbers(l));
         }
     }
-    for msg in &seen {
-        eprintln!("  [{arch}/{subtest}] metal-validation: {msg}");
-    }
+    seen
 }
 
 /// Collapse hex literals (`0x…`) and decimal runs to `N`.
@@ -272,3 +314,6 @@ fn normalize_numbers(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests;
