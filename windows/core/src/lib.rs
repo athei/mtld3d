@@ -49,6 +49,7 @@ pub mod state_trace;
 pub mod storage_policy;
 pub mod streams;
 pub mod stretch_rect;
+pub mod surface_lock;
 pub mod texture_flags;
 pub mod texture_staging;
 pub mod upload_pass;

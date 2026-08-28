@@ -1,7 +1,12 @@
 use core::ffi::c_void;
 
 use log::trace;
-use mtld3d_core::{page_box::PageBox, perf::SurfaceSubCategory, render_scale::RenderScale};
+use mtld3d_core::{
+    page_box::PageBox,
+    perf::SurfaceSubCategory,
+    render_scale::RenderScale,
+    surface_lock::{ColorSurfaceLock, classify_color_surface_lock},
+};
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, ValueIn, VtableThis,
     mtl_handle::MTLTextureKind,
@@ -2216,17 +2221,31 @@ extern "system" fn surface_lock_rect(
             )
         };
     }
-    // A lockable standalone render target (`CreateRenderTarget` with
-    // `Lockable == TRUE`) carries BOTH a renderable colour handle AND a CPU
-    // staging buffer. `LockRect` maps the staging (so the app can write source
-    // pixels); `UnlockRect` uploads it to the colour texture. Checked before
-    // the backbuffer read-back path, which only services read-only locks of a
-    // staging-less colour surface.
+    // A standalone colour surface is one of three things, and only two of them
+    // have bytes a lock can hand back: a lockable render target
+    // (`CreateRenderTarget` with `Lockable == TRUE`) carries BOTH a renderable
+    // colour handle AND a CPU staging buffer, and the implicit back buffer is
+    // read back on demand. A `Lockable == FALSE` render target has neither.
     if !obj.inner().live_color_handle().is_null() {
-        if obj.inner().system_memory.is_some() {
-            return lockable_rt_lock_rect(&obj, locked_rect, rect, flags);
-        }
-        return backbuffer_lock_readback(&obj, locked_rect, rect, flags);
+        let route = {
+            let inner = obj.inner();
+            classify_color_surface_lock(
+                inner.system_memory.is_some(),
+                inner.implicit_kind == ImplicitKind::Backbuffer,
+            )
+        };
+        return match route {
+            ColorSurfaceLock::Staging => lockable_rt_lock_rect(&obj, locked_rect, rect, flags),
+            ColorSurfaceLock::BackBufferReadback => {
+                backbuffer_lock_readback(&obj, locked_rect, rect, flags)
+            }
+            ColorSurfaceLock::Reject => {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a non-lockable render target → INVALIDCALL"
+                );
+                D3DERR_INVALIDCALL
+            }
+        };
     }
     if obj.inner().system_memory.is_some() {
         return systemmem_lock_rect(&obj, locked_rect, rect);
@@ -2350,19 +2369,10 @@ fn backbuffer_lock_readback(
     let inner = unsafe { &mut *inner_ptr };
 
     // A backbuffer created with D3DPRESENTFLAG_LOCKABLE_BACKBUFFER accepts a
-    // LockRect with any flags (e.g. D3DLOCK_DISCARD);
-    // a non-lockable backbuffer rejects a non-READONLY lock. The portrait
-    // read-back path (WoW) always locks D3DLOCK_READONLY, so it is unaffected
-    // either way. The relaxation applies ONLY to the implicit backbuffer surface
-    // (this fn also serves standalone non-lockable render targets, whose lock
-    // rules are independent of the backbuffer's lockable flag).
-    let lockable = inner.implicit_kind == ImplicitKind::Backbuffer
-        && !inner.device_inner.is_null()
-        // SAFETY: `device_inner` is non-null (checked) and points to the live
-        // owning device, which outlives its child surfaces.
-        && (unsafe { (*inner.device_inner).present_params() }.flags
-            & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER)
-            != 0;
+    // LockRect with any flags (e.g. D3DLOCK_DISCARD); a non-lockable backbuffer
+    // rejects a non-READONLY lock. The portrait read-back path (WoW) always
+    // locks D3DLOCK_READONLY, so it is unaffected either way.
+    let lockable = inner.is_lockable_backbuffer();
     if flags & D3DLOCK_READONLY == 0 && !lockable {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "backbuffer LockRect without D3DLOCK_READONLY (flags={flags:#x}) on a non-lockable backbuffer → INVALIDCALL"
@@ -2384,8 +2394,8 @@ fn backbuffer_lock_readback(
     // The read-back page is a host-visible store, so it takes the one pitch
     // every host-visible store of this format uses: the blit writes rows at it,
     // `LockRect` reports it, and a `GetDC` DIB over the same page steps by it.
-    // This fn also serves a standalone non-lockable render target, whose format
-    // is its own rather than the backbuffer's pinned `X8R8G8B8`.
+    // A back buffer is not pinned to `X8R8G8B8`, so the pitch comes from the
+    // surface's own format rather than a fixed four bytes per texel.
     let format = inner.live_format();
     let Some(fmt) = mtld3d_core::format::map_d3d_format(format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -3079,9 +3089,9 @@ impl SurfaceInner {
     /// True for the implicit backbuffer surface only when it is lockable.
     ///
     /// That is, when the backbuffer was created/Reset with
-    /// `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`. Mirrors the gate in
-    /// [`backbuffer_lock_readback`]; `LockRect`/`GetDC` on a non-lockable
-    /// backbuffer are rejected.
+    /// `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`. It is the gate both CPU readers
+    /// of the backbuffer take: `GetDC` is rejected without it, and so is a
+    /// `LockRect` asking for anything but `D3DLOCK_READONLY`.
     fn is_lockable_backbuffer(&self) -> bool {
         self.implicit_kind == ImplicitKind::Backbuffer
             && !self.device_inner.is_null()

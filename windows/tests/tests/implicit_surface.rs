@@ -8,7 +8,7 @@
 //! re-allocating the surface.
 
 use mtld3d_tests::{Harness, SurfaceDc};
-use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
+use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, D3DLOCK_READONLY};
 
 #[test]
 fn implicit_render_target_is_cached_and_aliases_backbuffer() {
@@ -195,6 +195,48 @@ fn release_dc_on_a_lockable_backbuffer_resamples_under_a_render_scale() {
         h.read_pixel(320, 240),
         GREEN,
         "the pixels GDI left alone still hold the clear colour",
+    );
+}
+
+#[test]
+fn read_only_lock_rect_on_a_non_lockable_backbuffer_reads_the_rendered_pixels() {
+    // D3D9 gives a backbuffer created without `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`
+    // no CPU access at all and rejects every `LockRect` of it. A read-only lock
+    // is accepted here and served by a GPU read-back instead, because that is
+    // the shape of the screenshot and character-portrait paths titles drive
+    // through the backbuffer. A lock that asks to write is still rejected, and
+    // so is a lock of any other non-lockable render target.
+    const WIDTH: u32 = 640;
+    const FILL: u32 = 0xFF20_4080;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(FILL), 0, "clear the backbuffer");
+    let backbuffer = h.back_buffer(0);
+
+    let (hr, bits_null) = backbuffer.lock_rect_probe(0);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "a writable lock of a non-lockable backbuffer must return INVALIDCALL"
+    );
+    assert!(
+        !bits_null,
+        "a rejected LockRect must leave the caller's D3DLOCKED_RECT untouched"
+    );
+    assert_eq!(
+        backbuffer.unlock_rect(),
+        D3DERR_INVALIDCALL,
+        "UnlockRect without a lock held must return INVALIDCALL"
+    );
+
+    let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+    assert_eq!(
+        locked.pitch().cast_unsigned(),
+        WIDTH * 4,
+        "the read-back page steps by the backbuffer format's row pitch"
+    );
+    assert_eq!(
+        locked.as_u32(1)[0],
+        FILL,
+        "the read-back must show the cleared backbuffer"
     );
 }
 

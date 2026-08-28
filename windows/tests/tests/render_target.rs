@@ -2722,13 +2722,50 @@ fn render_into_rgba16f_target_round_trips() {
 }
 
 #[test]
+fn lock_rect_on_a_non_lockable_render_target_is_rejected() {
+    // `CreateRenderTarget` with `Lockable == FALSE` is a GPU-only colour
+    // surface with no CPU bytes behind it, so D3D9 answers every `LockRect` of
+    // it with `INVALIDCALL`, read-only locks included, and `UnlockRect` with no
+    // lock held answers the same. Reading such a target back is what
+    // `GetRenderTargetData` is for. The same surface created lockable locks.
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    for flags in [0, D3DLOCK_READONLY] {
+        let (hr, bits_null) = rt.lock_rect_probe(flags);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "LockRect(flags={flags:#x}) on a non-lockable render target must be rejected"
+        );
+        assert!(
+            !bits_null,
+            "a rejected LockRect must leave the caller's D3DLOCKED_RECT untouched"
+        );
+        assert_eq!(
+            rt.unlock_rect(),
+            D3DERR_INVALIDCALL,
+            "UnlockRect with no lock held must be rejected"
+        );
+    }
+
+    let lockable = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let (hr, bits_null) = lockable.lock_rect_probe(D3DLOCK_READONLY);
+    assert_eq!(hr, D3D_OK, "a lockable render target still locks");
+    assert!(!bits_null, "an accepted LockRect hands back a pointer");
+    assert_eq!(
+        lockable.unlock_rect(),
+        D3D_OK,
+        "UnlockRect closes the lockable render target's lock"
+    );
+}
+
+#[test]
 fn lock_rect_on_a_half_float_render_target_reads_at_its_own_pitch() {
-    // A colour surface with no CPU staging serves LockRect out of a read-back
-    // page, and that page is a host-visible store like any other: it is sized
-    // and written at the row pitch its own format asks for. A half-float target
-    // is eight bytes per texel, so a page laid out at four bytes per texel
-    // reports half the stride its rows are really at and asks the blit for a
-    // copy narrower than one row of the source.
+    // A lockable render target's staging is a host-visible store like any
+    // other: it is sized, filled from the GPU and reported at the row pitch its
+    // own format asks for. A half-float target is eight bytes per texel, so a
+    // store laid out at four bytes per texel reports half the stride its rows
+    // are really at and asks the read-back for a copy narrower than one row of
+    // the source.
     const W: u32 = 64;
     const H: u32 = 64;
     const LANES_PER_TEXEL: usize = 4;
@@ -2736,7 +2773,7 @@ fn lock_rect_on_a_half_float_render_target_reads_at_its_own_pitch() {
     const FILL: u32 = 0xFF80_4020;
     let h = Harness::new();
     let backbuffer = h.render_target(0);
-    let rt = h.create_render_target(W, H, D3DFMT_A16B16G16R16F);
+    let rt = h.create_lockable_render_target(W, H, D3DFMT_A16B16G16R16F);
     assert_eq!(h.set_render_target(0, &rt), 0, "bind half-float RT");
     assert_eq!(h.clear_target(FILL), 0, "clear the half-float RT");
     assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
