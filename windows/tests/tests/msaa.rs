@@ -11,7 +11,7 @@ use mtld3d_tests::{
     Harness, HarnessConfig, Rgba8, RhwVertex, Surface, Texture, TexturedVertex, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DERR_INVALIDCALL,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DERR_INVALIDCALL,
     D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ,
     D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
     D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
@@ -872,4 +872,104 @@ fn resz_resolves_a_multisampled_depth_surface() {
     );
 
     assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+// ── StretchRect from a multisampled depth surface ──
+
+#[test]
+fn stretch_rect_resolves_a_multisampled_depth_surface() {
+    // A depth-to-depth StretchRect out of a multisampled surface is a resolve,
+    // not a copy: Metal's blit encoder refuses the sample-count change, so the
+    // pass machinery has to take it. The destination is observed through the
+    // depth test rather than read back, which D3D9 does not allow on a depth
+    // surface.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
+
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("4x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ss_ds = h.create_depth_stencil_surface(RT_SIZE, RT_SIZE, D3DFMT_D24S8);
+
+    // The destination starts at the far plane, so a resolve that never runs
+    // lets the probe draw through and paints the target white.
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ss_ds),
+        0,
+        "SetDepthStencilSurface(prime)"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the destination to the far plane"
+    );
+
+    // Write one constant depth into the multisampled surface.
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(
+        h.stretch_rect(&ms_ds, &ss_ds, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the multisampled depth into the single-sampled surface"
+    );
+
+    // Probe the resolved depth: a draw behind it is rejected, so the target
+    // keeps its clear colour. Without the resolve the destination still holds
+    // the far plane and the probe paints over it.
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(probe)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ss_ds),
+        0,
+        "SetDepthStencilSurface(probe)"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the probe target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH + 0.25)),
+        0,
+        "probe draw behind the resolved depth",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_pixel_eq(
+        surface_row(&h, &ss_rt, (RT_SIZE, RT_SIZE))[(RT_SIZE / 2) as usize],
+        BLUE,
+        "the resolved depth rejects the draw behind it",
+    );
 }

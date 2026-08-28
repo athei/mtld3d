@@ -6338,7 +6338,8 @@ extern "system" fn device_stretch_rect(
     // depth-stencil, BOTH must be — and they must share the Metal depth format
     // and dimensions, sit in D3DPOOL_DEFAULT, and be copied 1:1 over the whole
     // surface (no sub-rect, scale, or flip). Anything else is INVALIDCALL. The
-    // copy is a same-format Private→Private depth blit.
+    // copy is a same-format Private→Private depth blit, or a depth resolve
+    // when the source carries samples the destination does not.
     if src_info
         .flags
         .contains(StretchSurfaceFlags::IS_DEPTH_STENCIL)
@@ -6361,6 +6362,22 @@ extern "system" fn device_stretch_rect(
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "reject StretchRect: depth-stencil pair must match format/size and be both depth → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        }
+        // Sample counts decide the transport. An equal pair is a copy. A
+        // multisampled source into a single-sampled destination is the resolve
+        // D3D9 defines for reading a multisampled surface. Neither remaining
+        // pair has a Metal shape: the blit encoder cannot change the sample
+        // count, and the resolve unit only ever reduces to one sample.
+        let resolve = src_info.sample_count > 1 && dst_info.sample_count == 1;
+        if src_info.sample_count != dst_info.sample_count && !resolve {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject StretchRect: depth-stencil sample counts {} → {} are neither equal nor a \
+                 resolve → INVALIDCALL",
+                src_info.sample_count,
+                dst_info.sample_count
             );
             return D3DERR_INVALIDCALL;
         }
@@ -6388,6 +6405,33 @@ extern "system" fn device_stretch_rect(
         // Past every depth-stencil gate, so the endpoints' pending uploads are
         // work this call will use.
         flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
+        if resolve {
+            // The samples are reduced on a render pass of the source, which
+            // also enters the destination into the load/store model as
+            // written. Both endpoints are standalone depth surfaces, the only
+            // shape that carries `IS_DEPTH_STENCIL`.
+            let (StretchKind::DepthStencil(src_handle), StretchKind::DepthStencil(dst_handle)) =
+                (&src_info.kind, &dst_info.kind)
+            else {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "reject StretchRect: a depth-stencil endpoint has no depth texture → INVALIDCALL"
+                );
+                return D3DERR_INVALIDCALL;
+            };
+            let (src_handle, dst_handle) = (*src_handle, *dst_handle);
+            let (width, height) = (
+                src_info.scale.dimension(src_info.width),
+                src_info.scale.dimension(src_info.height),
+            );
+            if dev.frame_dump.active {
+                dev.frame_dump_event("StretchRect: multisampled depth resolve queued");
+            }
+            dev.push_op(Box::new(move |enc| {
+                enc.resolve_depth_surface(src_handle, dst_handle, width, height);
+            }));
+            return D3D_OK;
+        }
         // Same-format Private→Private depth copy on the 1:1 blit path. The
         // blit is entered into the load/store model like a colour copy: the
         // source counts as read (its last pass keeps its depth store) and the
@@ -7400,14 +7444,13 @@ fn resolve_stretch_surface(
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_DEPTH_STENCIL,
             autogen_texture_id: None,
-            // A multisampled depth surface has no resolve: D3D9 offers no way
-            // to read one, and a depth-to-depth `StretchRect` between two of
-            // them would be a same-sample-count copy Metal's blit encoder
-            // cannot make. Reported single-sampled so the pair is rejected by
-            // the format/size checks rather than mis-copied.
+            // A depth surface carries its samples in its own texture: there is
+            // no single-sample companion to resolve into, because D3D9 offers
+            // no way to sample one. `StretchRect` reads the sample count to
+            // tell a plain depth copy from the resolve.
             msaa: MetalHandle::NULL,
             msaa_srgb: MetalHandle::NULL,
-            sample_count: 1,
+            sample_count: s.multi_sample().sample_count,
         });
     }
     None

@@ -125,8 +125,9 @@ own fallback paths instead of breaking:
   as the spec allows.
 - **Scaled, sub-rect and format-converting depth→depth StretchRect**: the
   whole-surface 1:1 copy between two same-format DEFAULT-pool depth-stencil
-  surfaces is implemented; a source or destination rect short of the full
-  surface, a size mismatch, or a differing depth format returns INVALIDCALL.
+  surfaces is implemented, including the resolve out of a multisampled source;
+  a source or destination rect short of the full surface, a size mismatch, a
+  differing depth format, or a multisampled destination returns INVALIDCALL.
 
 ### Faster than conformant
 

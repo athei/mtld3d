@@ -174,7 +174,7 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **4 `real` · 93 `expected` ·
+re-checked before retagging. Headline: **0 `real` · 92 `expected` ·
 3 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
@@ -188,11 +188,15 @@ zeroed `D3DPRESENT_PARAMETERS` is rejected for its `D3DFMT_UNKNOWN`
 back-buffer format. Seven `visual.c` tests stopped skipping (every one of
 them gates on `CheckDeviceMultiSampleType`) and five of the seven pass
 outright; the clusters below cover what the other two and the tests they
-unblocked leave failing, including the four `real` sites they add.) Only two
-tags change what the gate tolerates: `flaky` (count changes in either
-direction) and `ceiling` (reads below the pin). Every other tag is
-documentation, so a correction between `real`, `expected` and `caps` is never
-a gate change.
+unblocked leave failing. The four `real` sites they added are since fixed,
+test_multisample_get_front_buffer_data 17179 and 17181 by the system-memory
+read-back destinations and resz_test 17724 and 17862 by the RESZ depth
+resolve, and multisampled_depth_buffer_test 17476 went with them once the
+depth-to-depth `StretchRect` resolved a multisampled source, so its cluster
+leaves this document too.) Only two tags change what the gate tolerates:
+`flaky` (count changes in either direction) and `ceiling` (reads below the
+pin). Every other tag is documentation, so a correction between `real`,
+`expected` and `caps` is never a gate change.
 
 #### Desktop mode switching, and how fullscreen honors the requested size
 
@@ -617,18 +621,6 @@ results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
 GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
 result matching no vendor's encoding. Matching a specific vendor is neither
 feasible nor desirable. No capability involved (old `caps` tag incoherent).
-
-### visual.c/multisampled_depth_buffer_test
-Sites: 17476=expected
-
-The second half of the test binds a 2x multisampled depth surface while
-render target 0 is the single-sampled back buffer. Metal takes a render
-pass's sample count from its attachments and rejects a pass where they
-disagree, so mtld3d drops the mismatched depth attachment and the draw runs
-untested. D3D9 leaves this case to the driver, and the test says so itself:
-it accepts one result from AMD and a different one from Nvidia, and does not
-require depth testing to work at all. The matched half of the test (a 2x
-depth surface beside a 2x render target) passes.
 
 ### visual.c/add_dirty_rect_test
 Sites: 19210=expected 19217=expected 19232=expected
