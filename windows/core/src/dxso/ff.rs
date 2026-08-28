@@ -33,11 +33,11 @@ use mtld3d_types::{
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DTA_ALPHAREPLICATE,
-    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTA_TFACTOR,
-    D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA,
-    D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_DISABLE,
-    D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1,
-    D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
+    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK, D3DTA_SPECULAR,
+    D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X,
+    D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA,
+    D3DTOP_BLENDTEXTUREALPHA, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE,
+    D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
 use super::emit::{
@@ -352,6 +352,51 @@ pub struct FfPsKey {
     /// (`tex_coord_dims` transform), so this is a per-pixel divide. `.w == 0`
     /// samples at the origin (D3D9 returns the `(0,0)` texel there).
     pub tt_projected_mask: u8,
+}
+
+impl FfPsKey {
+    /// Stages the emitted fragment function declares a texture and sampler for.
+    ///
+    /// Bit `i` is set for every stage ahead of the first `D3DTOP_DISABLE` that
+    /// carries a bound texture, which is exactly the set `emit_ps` writes
+    /// `[[texture(i)]]` / `[[sampler(i)]]` arguments for. A stage outside the
+    /// mask is one the shader never samples, so binding the game's texture
+    /// there costs encoder work no draw reads.
+    #[must_use]
+    pub fn sampled_stage_mask(&self) -> u16 {
+        let mut mask = 0u16;
+        for (i, stage) in self.stages.iter().enumerate() {
+            if u32::from(stage.color_op) == D3DTOP_DISABLE {
+                break;
+            }
+            if stage.has_texture {
+                mask |= 1u16 << i;
+            }
+        }
+        mask
+    }
+
+    /// Whether any active stage reads the texture-factor row.
+    ///
+    /// `D3DTA_TFACTOR` on an argument and the `D3DTOP_BLENDFACTORALPHA` op are
+    /// the only readers of the fixed-function pixel constant buffer, whose sole
+    /// row holds `D3DRS_TEXTUREFACTOR`. A key with neither leaves the whole
+    /// buffer unread, so the draw binds nothing to the slot. Over-approximates
+    /// on the argument an op discards (`D3DTOP_SELECTARG1` ignoring arg2), which
+    /// only costs a bind that would otherwise be skipped.
+    #[must_use]
+    pub fn reads_texture_factor(&self) -> bool {
+        self.stages
+            .iter()
+            .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
+            .any(|s| {
+                u32::from(s.color_op) == D3DTOP_BLENDFACTORALPHA
+                    || u32::from(s.alpha_op) == D3DTOP_BLENDFACTORALPHA
+                    || [s.color_arg1, s.color_arg2, s.alpha_arg1, s.alpha_arg2]
+                        .iter()
+                        .any(|a| u32::from(*a) & D3DTA_SELECTMASK == D3DTA_TFACTOR)
+            })
+    }
 }
 
 /// Fixed-function attribute convention used by `emit_vertex_in`.

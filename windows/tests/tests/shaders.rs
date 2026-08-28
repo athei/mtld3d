@@ -727,3 +727,146 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
     assert_eq!(h.clear_texture(257), 0, "unbind slot");
 }
+
+/// `ps_2_0`: `def c0, 0, 0, 1, 1; mov oC0, c0;` — opaque blue with no buffer read.
+///
+/// A `def`-declared row is translated into a shader-local literal, so this
+/// program never reads the pixel constant buffer whatever the game uploads
+/// into it.
+const PS_DEF_BLUE: [u32; 11] = [
+    0xFFFF_0200,
+    // def c0, 0.0, 0.0, 1.0, 1.0
+    0x0051 | (5 << 24),
+    0xA00F_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    // mov oC0, c0
+    (1) | (2 << 24),
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+/// Triangle centred on `cx` in NDC, tall enough to cover the sample row.
+fn triangle_at(cx: f32) -> [PosVertex; 3] {
+    [
+        PosVertex {
+            x: cx,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: cx + 0.25,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: cx - 0.25,
+            y: -0.5,
+            z: 0.5,
+        },
+    ]
+}
+
+#[test]
+fn defined_pixel_constant_ignores_the_constant_buffer() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_DEF_BLUE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+
+    // Nothing uploaded yet: the literal is the only source of the colour.
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_00FF,
+        "def c0 colours the triangle blue"
+    );
+
+    // c0 = red in the constant buffer. The shader still reads its literal, so
+    // the colour does not move even though the row now holds something else.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(red)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_00FF,
+        "an upload into c0 does not reach a def-declared register"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn constant_reader_after_a_non_reader_sees_the_current_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let reader = h.create_pixel_shader(&PS_BC);
+    let literal = h.create_pixel_shader(&PS_DEF_BLUE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let left = triangle_at(-0.5);
+    let middle = triangle_at(0.0);
+    let right = triangle_at(0.5);
+
+    // Three draws in one pass: a buffer reader, then a program that reads no
+    // float constant while the row changes underneath it, then the reader
+    // again. The middle draw must neither bind the row nor claim it did, or
+    // the third draw dedups against a value the encoder never bound.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(red)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.set_pixel_shader(&reader), 0, "bind reader");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0, "left");
+        assert_eq!(
+            d.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(green)"
+        );
+        assert_eq!(d.set_pixel_shader(&literal), 0, "bind literal");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &middle),
+            0,
+            "middle"
+        );
+        assert_eq!(d.set_pixel_shader(&reader), 0, "rebind reader");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right),
+            0,
+            "right"
+        );
+    });
+
+    assert_eq!(
+        h.read_pixel(160, 264),
+        0xFFFF_0000,
+        "first reader draw is red"
+    );
+    assert_eq!(h.read_pixel(320, 264), 0xFF00_00FF, "literal draw is blue");
+    assert_eq!(
+        h.read_pixel(480, 264),
+        0xFF00_FF00,
+        "second reader draw picks up the row set between the draws"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
