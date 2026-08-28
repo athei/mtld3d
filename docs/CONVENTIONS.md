@@ -22,6 +22,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
 | Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
+| Every `windows/tests/tests/*.rs` file has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -113,6 +114,12 @@ Carry the cfg predicate verbatim. `perf.rs` declares `#[cfg(all(test, perf_track
 Two things do not move. A `#[cfg(test)]` helper that is an inherent method on a production type stays in the parent next to that type (`passes.rs` keeps a test-only `emit_scissor`), as does a `#[cfg(test)] pub fn` the tests import through `super::` (`log_helpers.rs` keeps `first_seen`).
 
 Watch relative paths on the way out: `include_str!` resolves against the containing file, so a path that was `../tests/fixtures/x.txt` inline becomes `../../tests/fixtures/x.txt` one directory down.
+
+## End-to-end tests are listed in `COVERAGE.md`
+
+`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per file in `windows/tests/tests/`, saying what that file pins. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against the directory in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands with its row in the same change, and a deleted one takes its row with it.
+
+The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
 
 ## No `pub(crate)` — use module hierarchy
 
