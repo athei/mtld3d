@@ -1601,6 +1601,107 @@ fn color_fill_render_target_overwrites_earlier_draws() {
 }
 
 #[test]
+fn color_fill_lockable_render_target_is_visible_to_lock_rect() {
+    // A lockable CreateRenderTarget surface serves LockRect out of CPU staging
+    // while ColorFill paints its Metal texture, so the lock has to read the
+    // texture back: the whole-surface fill, then a sub-rect that leaves the
+    // rest of the surface on the colour the fill before it left.
+    let h = Harness::new();
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    assert_eq!(
+        h.color_fill_hr(&rt, GREEN),
+        D3D_OK,
+        "whole-surface ColorFill"
+    );
+    assert_eq!(read(32, 32), GREEN, "LockRect reads the fill colour");
+
+    assert_eq!(
+        h.color_fill_rect_hr(&rt, (16, 16, 48, 48), BLUE),
+        D3D_OK,
+        "sub-rect ColorFill",
+    );
+    assert_eq!(read(32, 32), BLUE, "inside the filled sub-rect");
+    assert_eq!(read(16, 16), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(read(47, 47), BLUE, "the sub-rect's bottom-right corner");
+    assert_eq!(
+        read(8, 8),
+        GREEN,
+        "outside the sub-rect keeps the first fill"
+    );
+    assert_eq!(read(48, 48), GREEN, "one pixel past the sub-rect");
+}
+
+#[test]
+fn draw_into_a_lockable_render_target_is_visible_to_lock_rect() {
+    // Same contract for the other GPU writer of a lockable CreateRenderTarget
+    // surface: a Clear and a draw land in its Metal texture, and the LockRect
+    // that follows reports them rather than the staging they never touched.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    assert_eq!(h.clear_target(GREEN), 0, "clear it green");
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(32, 32), GREEN, "LockRect reads the clear colour");
+
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT again");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(32, 32), RED, "LockRect reads the drawn colour");
+}
+
+#[test]
+fn get_dc_on_a_lockable_render_target_round_trips_through_the_gpu() {
+    // GetDC hands out a DIB over the same CPU staging LockRect serves, so it
+    // owes the surface the same coherence in both directions: the DC shows
+    // what the GPU painted before it, and what GDI draws into the DC reaches
+    // the colour texture at ReleaseDC.
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+
+    assert_eq!(h.color_fill_hr(&rt, GREEN), D3D_OK, "ColorFill green");
+    let dc = rt.dc();
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        GREEN_COLORREF,
+        "the DC reads the fill the GPU painted, not the staging under it",
+    );
+    assert_eq!(
+        dc.set_pixel(10, 10, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel into the DC stores the colour it was handed",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    // GDI knows no alpha: SetPixel stores the three colour bytes and leaves
+    // the fourth at zero, so the pixel comes back as red with no alpha.
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 10, 10),
+        0x00FF_0000,
+        "what GDI drew into the DC reaches the colour texture",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 32, 32),
+        GREEN,
+        "the pixels GDI left alone still hold the fill",
+    );
+}
+
+#[test]
 fn surface_ops_contracts() {
     let h = Harness::new();
     let bb = h.back_buffer(0);

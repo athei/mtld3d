@@ -794,6 +794,25 @@ impl Surface<'_> {
         (hr, out)
     }
 
+    /// `GetDC`, asserting success and returning a guard over the memory DC.
+    ///
+    /// The guard reads and writes pixels through GDI and releases the DC on
+    /// request; use [`Self::get_dc`] instead to observe the raw hr.
+    ///
+    /// # Panics
+    /// Panics if the call fails or hands back a null `HDC`.
+    #[must_use]
+    pub fn dc(&self) -> SurfaceDc<'_> {
+        let (hr, hdc) = self.get_dc(core::ptr::null_mut());
+        expect_ok(hr, "Surface GetDC");
+        assert!(!hdc.is_null(), "GetDC returned a null HDC");
+        SurfaceDc {
+            surface: self.ptr,
+            hdc,
+            _marker: PhantomData,
+        }
+    }
+
     /// Give up this wrapper's reference without releasing it.
     ///
     /// For a test that hands a surface's last reference to the device (a bound
@@ -831,6 +850,45 @@ impl Drop for Surface<'_> {
     fn drop(&mut self) {
         // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
         unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+/// A held `IDirect3DSurface9::GetDC` memory DC.
+///
+/// Reads and writes pixels through GDI, which is how a test observes the
+/// surface exactly as a game's GDI drawing does. [`Self::release`] hands back
+/// the `ReleaseDC` hr; a dropped guard leaves the DC held, which the next
+/// `LockRect` / `GetDC` on the surface then rejects.
+pub struct SurfaceDc<'a> {
+    surface: *mut c_void,
+    hdc: *mut c_void,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl SurfaceDc<'_> {
+    /// Read one pixel as a `COLORREF` (`0x00BBGGRR`).
+    #[must_use]
+    pub fn get_pixel(&self, x: i32, y: i32) -> u32 {
+        crate::win32::dc_get_pixel(self.hdc.addr(), x, y)
+    }
+
+    /// Paint one pixel; `color` is a `COLORREF` (`0x00BBGGRR`).
+    ///
+    /// Returns the colour GDI stored, which for a DIB of a lower-precision
+    /// format is the nearest representable one.
+    #[must_use]
+    pub fn set_pixel(&self, x: i32, y: i32, color: u32) -> u32 {
+        crate::win32::dc_set_pixel(self.hdc.addr(), x, y, color)
+    }
+
+    /// `ReleaseDC`, returning the hr.
+    #[must_use]
+    pub fn release(self) -> i32 {
+        // SAFETY: `self.surface` is the live surface the DC was taken from.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(self.surface) };
+        // SAFETY: vtable thunk; `self.hdc` is the handle the surface's own
+        // `GetDC` returned and has not been released yet.
+        unsafe { (vtbl.release_dc)(self.surface, self.hdc) }
     }
 }
 
