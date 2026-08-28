@@ -68,7 +68,7 @@ pub fn supports_sampler_border(device: &ProtocolObject<dyn MTLDevice>) -> bool {
 /// in Metal's pixel-format capability table; the Mac2 Bronze driver
 /// (Intel/AMD) raises a validation abort when a texture descriptor names one.
 /// When false, the PE side backs the corresponding D3D formats with
-/// `Bgra8Unorm` and expands texels on the CPU at upload time.
+/// `Bgra8Unorm` and widens their texels in the GPU upload pass.
 pub fn supports_native_packed16(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.supportsFamily(MTLGPUFamily::Apple2)
 }
