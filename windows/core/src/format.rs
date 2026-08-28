@@ -18,6 +18,7 @@ use mtld3d_types::{
 };
 
 use super::LOG_TARGET;
+use crate::render_scale::RenderScale;
 
 // Usage bits `usage_allowed_for_rtype` weighs. The named D3D9 usage flags
 // outside this set are the ones the runtime strips before it validates:
@@ -825,6 +826,11 @@ pub enum StandaloneSurfaceKind {
 /// there is nothing to resolve into), so it is charged `sample_count` times.
 /// The sRGB twin of either is a view of a texture already charged and costs
 /// no memory of its own.
+///
+/// `width`/`height` are the logical dimensions the surface reports, and
+/// `render_scale` the factor its Metal textures were created at: a surface
+/// rasterized below the size it reports occupies the smaller extent, so that
+/// is what it is charged, on the pitch its own width gives.
 #[must_use]
 pub fn standalone_surface_bytes(
     width: u32,
@@ -832,6 +838,7 @@ pub fn standalone_surface_bytes(
     d3d_format: u32,
     sample_count: u32,
     kind: StandaloneSurfaceKind,
+    render_scale: RenderScale,
 ) -> u64 {
     let copies = match kind {
         StandaloneSurfaceKind::ColorTarget if sample_count > 1 => {
@@ -840,7 +847,12 @@ pub fn standalone_surface_bytes(
         StandaloneSurfaceKind::ColorTarget => 1,
         StandaloneSurfaceKind::DepthStencil => u64::from(sample_count.max(1)),
     };
-    surface_bytes(width, height, d3d_format).saturating_mul(copies)
+    let bytes = surface_bytes(
+        render_scale.dimension(width),
+        render_scale.dimension(height),
+        d3d_format,
+    );
+    bytes.saturating_mul(copies)
 }
 
 /// Bytes one single-level `width` x `height` surface of `d3d_format` occupies.
@@ -849,18 +861,18 @@ pub fn standalone_surface_bytes(
 /// the two standalone-surface entry points, `CreateRenderTarget` and
 /// `CreateDepthStencilSurface`, so a surface is charged and refunded from
 /// identical inputs. Multisampling multiplies it in
-/// [`standalone_surface_bytes`]. The figure is in the application's own
-/// currency: the dimensions it asked for, and its own D3D9 format rather than
-/// the Metal format the surface is really backed by. Both substitutions
-/// underneath (a render-scaled attachment, a 24-bit depth format promoted to
-/// `Depth32Float`) are ours, and an application sizing its resource budget
-/// from this call reasons in the units it passed in. Both branches measure
-/// level 0 of the format's own mip chain, so a standalone surface and the top
-/// level of a texture of the same size and format are charged the same bytes:
-/// a colour format through [`compute_mip_size`], a depth format, which has no
-/// [`FormatMapping`] to hand over, through [`linear_mip_size`] on its bare
-/// pixel size. Returns 0 for a format with neither a colour nor a depth
-/// mapping.
+/// [`standalone_surface_bytes`], which is also where the extent the Metal
+/// textures were created at enters; this measures whatever extent it is
+/// handed. The format is the application's own D3D9 one rather than the Metal
+/// format the surface is really backed by: a 24-bit depth format promoted to
+/// `Depth32Float` is a substitution of ours, and an application sizing its
+/// resource budget from this call reasons in the units it passed in. Both
+/// branches measure level 0 of the format's own mip chain, so a standalone
+/// surface and the top level of a texture of the same size and format are
+/// charged the same bytes: a colour format through [`compute_mip_size`], a
+/// depth format, which has no [`FormatMapping`] to hand over, through
+/// [`linear_mip_size`] on its bare pixel size. Returns 0 for a format with
+/// neither a colour nor a depth mapping.
 #[must_use]
 pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
     if let Some(fmt) = lookup_d3d_format(d3d_format) {
