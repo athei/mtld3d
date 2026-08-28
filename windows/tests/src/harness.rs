@@ -37,6 +37,8 @@ pub struct HarnessConfig {
     pub windowed: u32,
     /// `CreateDevice` behaviour flags (`D3DCREATE_*`).
     pub behavior_flags: u32,
+    /// `D3DPRESENT_PARAMETERS.Flags`, e.g. `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`.
+    pub present_flags: u32,
 }
 
 impl Default for HarnessConfig {
@@ -49,6 +51,7 @@ impl Default for HarnessConfig {
             visible: false,
             windowed: 1,
             behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
+            present_flags: 0,
         }
     }
 }
@@ -107,6 +110,7 @@ pub struct Harness {
     height: Cell<u32>,
     back_buffer_format: u32,
     depth_format: Option<u32>,
+    present_flags: u32,
 }
 
 impl Harness {
@@ -124,6 +128,18 @@ impl Harness {
     pub fn with_depth() -> Self {
         Self::create(&HarnessConfig {
             depth_format: Some(mtld3d_types::D3DFMT_D24S8),
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// A 640×480 device whose back buffer carries `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`.
+    ///
+    /// The only configuration in which `LockRect` and `GetDC` on the implicit
+    /// back buffer are accepted.
+    #[must_use]
+    pub fn with_lockable_back_buffer() -> Self {
+        Self::create(&HarnessConfig {
+            present_flags: mtld3d_types::D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
             ..HarnessConfig::default()
         })
     }
@@ -162,6 +178,7 @@ impl Harness {
             height: Cell::new(0),
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
+            present_flags: 0,
         }
     }
 
@@ -208,6 +225,7 @@ impl Harness {
             height: Cell::new(cfg.height),
             back_buffer_format: cfg.back_buffer_format,
             depth_format: cfg.depth_format,
+            present_flags: cfg.present_flags,
         }
     }
 
@@ -2191,6 +2209,7 @@ impl Harness {
             depth_format: self.depth_format,
             visible: false,
             windowed: 1,
+            present_flags: self.present_flags,
             ..HarnessConfig::default()
         };
         let mut pp = present_params(&cfg, self.hwnd);
@@ -2373,7 +2392,7 @@ fn present_params(cfg: &HarnessConfig, hwnd: usize) -> D3DPRESENT_PARAMETERS {
         windowed: cfg.windowed,
         enable_auto_depth_stencil: u32::from(cfg.depth_format.is_some()),
         auto_depth_stencil_format: cfg.depth_format.unwrap_or(0),
-        flags: 0,
+        flags: cfg.present_flags,
         full_screen_refresh_rate_in_hz: 0,
         presentation_interval: 0,
     }

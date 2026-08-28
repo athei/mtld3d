@@ -8,7 +8,7 @@
 //! re-allocating the surface.
 
 use mtld3d_tests::Harness;
-use mtld3d_types::D3DERR_INVALIDCALL;
+use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL};
 
 #[test]
 fn implicit_render_target_is_cached_and_aliases_backbuffer() {
@@ -98,6 +98,47 @@ fn get_dc_on_non_lockable_backbuffer_rejects_and_preserves_out() {
     assert_eq!(
         out, sentinel,
         "a rejected GetDC must not write through the out HDC"
+    );
+}
+
+#[test]
+fn release_dc_on_a_lockable_backbuffer_reaches_the_back_buffer() {
+    // The DC over a lockable back buffer wraps a read-back snapshot rather than
+    // the back buffer's own pixels, so it owes the surface coherence in both
+    // directions: it shows what the GPU painted before it, and what GDI draws
+    // into it reaches the back buffer at `ReleaseDC`, with no Present in
+    // between.
+    const GREEN: u32 = 0xFF00_FF00;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::with_lockable_back_buffer();
+
+    assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the back buffer green");
+    let bb = h.back_buffer(0);
+    let dc = bb.dc();
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        GREEN_COLORREF,
+        "the DC reads the colour the Clear painted",
+    );
+    assert_eq!(
+        dc.set_pixel(10, 10, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel into the DC stores the colour it was handed",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    // GDI knows no alpha: `SetPixel` stores the three colour bytes and leaves
+    // the fourth at zero, so the read-back reports red with no alpha.
+    assert_eq!(
+        h.read_pixel(10, 10),
+        0x00FF_0000,
+        "what GDI drew into the DC reaches the back buffer",
+    );
+    assert_eq!(
+        h.read_pixel(32, 32),
+        GREEN,
+        "the pixels GDI left alone still hold the clear colour",
     );
 }
 
