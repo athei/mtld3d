@@ -11,6 +11,7 @@
 use core::ffi::c_void;
 
 use log::info;
+use mtld3d_core::page_box::PageBox;
 use mtld3d_shared::MetalHandle;
 use mtld3d_types::{
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_BLENDOP,
@@ -229,7 +230,10 @@ impl DeviceInner {
                 }
                 let bytes_per_row = t.width * bpp;
                 let len = bytes_per_row as usize * t.height as usize;
-                let mut buf = vec![0u8; len];
+                // The unix side wraps the destination in `newBufferWithBytesNoCopy`,
+                // which takes a page-aligned base and a page-multiple length, so the
+                // destination is a `PageBox` and the wrapper sees its padded length.
+                let mut buf = PageBox::new_zeroed(len);
                 let hr = super::blit_handle_to_systemmem(
                     self,
                     &super::SystemMemReadback {
@@ -237,7 +241,7 @@ impl DeviceInner {
                         // MTLTexture handle from the encoder texture cache.
                         tex_handle: unsafe { MetalHandle::new(h) },
                         dst_ptr: buf.as_mut_ptr() as u64,
-                        dst_len: len as u64,
+                        dst_len: buf.len() as u64,
                         level: 0,
                         slice: 0,
                         width: t.width,
@@ -255,10 +259,13 @@ impl DeviceInner {
                     continue;
                 }
                 let full = format!("{label}{what}");
+                // The blit writes the image rows from the start of the backing; the
+                // page padding past them is not part of the texture.
+                let image = &buf.as_slice()[..len];
                 if bpp == 2 {
-                    frame_dump_log_readback_f16(&full, &buf);
+                    frame_dump_log_readback_f16(&full, image);
                 } else {
-                    frame_dump_log_readback(&full, t, &buf);
+                    frame_dump_log_readback(&full, t, image);
                 }
             }
         }
