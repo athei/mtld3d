@@ -19,11 +19,12 @@ use mtld3d_types::{
     D3DBOX, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
     D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DLOCKED_BOX,
     D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE,
-    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
-    IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
-    IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9,
-    IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9, IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid,
+    IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl,
+    IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9,
+    IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
+    IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
@@ -932,6 +933,13 @@ impl TextureInner {
     /// is empty/inverted, the region does not fit the destination mip, or (for
     /// block-compressed formats) the origins/extents are not block-aligned (and
     /// not full). Enforces the D3D9 `UpdateSurface` block-alignment rules.
+    ///
+    /// `UpdateSurface` only: the region is the application's there, so a bad one
+    /// is rejected. `UpdateTexture` takes no region, deriving one per mip from
+    /// the source's dirty rectangle and the size-based mip pairing, and D3D9
+    /// accepts pairings this would reject (a 2x4 source level against a 4x2
+    /// destination level). Clipping in [`Self::copy_sub_region_from`] is what
+    /// bounds that copy.
     pub fn update_region_valid(
         &self,
         dst_level: usize,
@@ -2697,6 +2705,24 @@ impl Direct3DTexture9 {
 
     pub fn is_cube(&self) -> bool {
         self.inner().flags.contains(TextureFlags::CUBE)
+    }
+
+    /// The `D3DRESOURCETYPE` this container was created as.
+    ///
+    /// Read from the creation flags, not from the backing Metal texture, so it
+    /// answers what the application asked for: a `CreateVolumeTexture` resource
+    /// with a single depth slice is backed 2D and still reports
+    /// `D3DRTYPE_VOLUMETEXTURE`. `UpdateTexture` pairs its two resources on
+    /// this.
+    pub fn d3d_resource_type(&self) -> u32 {
+        let flags = self.inner().flags;
+        if flags.contains(TextureFlags::CUBE) {
+            D3DRTYPE_CUBETEXTURE
+        } else if flags.contains(TextureFlags::VOLUME_TEXTURE) {
+            D3DRTYPE_VOLUMETEXTURE
+        } else {
+            D3DRTYPE_TEXTURE
+        }
     }
 }
 

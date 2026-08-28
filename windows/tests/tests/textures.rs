@@ -1533,6 +1533,81 @@ fn update_texture_copies_every_volume_slice() {
     }
 }
 
+/// `UpdateTexture` rejects a source and destination of different resource types.
+///
+/// D3D9 pairs the two resources by type, and the vtable slot takes an
+/// `IDirect3DBaseTexture9` on both sides, so a 2D texture and a volume texture
+/// reach the same entry point. Separating only cube from non-cube lets a 2D
+/// source write the first slice of a volume destination and report success,
+/// leaving the deeper slices holding whatever was there.
+#[test]
+fn update_texture_rejects_a_resource_type_mismatch() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::new();
+    let (hr, primer) =
+        h.try_create_volume_texture([2, 2, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "SYSTEMMEM volume");
+    let primer = primer.expect("source volume");
+    primer.write_u32(0, &[GREEN; 16]);
+    let (hr, dst) = h.try_create_volume_texture([2, 2, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "DEFAULT volume");
+    let dst = dst.expect("destination volume");
+    assert_eq!(
+        h.update_volume_texture_hr(&primer, &dst),
+        0,
+        "priming UpdateTexture"
+    );
+
+    let flat_src = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    flat_src.lock_rect(0, 0).write::<u32>(&[RED; 4]);
+    assert_eq!(
+        h.update_texture_into_volume_hr(&flat_src, &dst),
+        D3DERR_INVALIDCALL,
+        "2D source into a volume destination"
+    );
+    let flat_dst = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_volume_into_texture_hr(&primer, &flat_dst),
+        D3DERR_INVALIDCALL,
+        "volume source into a 2D destination"
+    );
+
+    assert_eq!(h.set_volume_texture(0, &dst), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    assert_pixel_eq(
+        sample_volume_depth(&h, 0.125),
+        GREEN,
+        "first slice after the rejected update",
+    );
+}
+
+/// `UpdateTexture` accepts a volume pair whose levels hold a single depth slice.
+///
+/// A `CreateVolumeTexture` resource one slice deep is backed by a 2D Metal
+/// texture, so pairing the two resources on the backing kind rejects a pair
+/// D3D9 accepts. The type is the one the create call asked for.
+#[test]
+fn update_texture_accepts_a_single_slice_volume_pair() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let (hr, src) =
+        h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "SYSTEMMEM volume");
+    let src = src.expect("source volume");
+    src.write_u32(0, &[GREEN; 4]);
+    let (hr, dst) = h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "DEFAULT volume");
+    let dst = dst.expect("destination volume");
+    assert_eq!(h.update_volume_texture_hr(&src, &dst), 0, "UpdateTexture");
+}
+
 /// `D3DFMT_V8U8` must sample its content, not black.
 ///
 /// Signed two-channel, → `Rg8Snorm` with {R,G,1,1} swizzle. A 1x1 texel of

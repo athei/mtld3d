@@ -2183,6 +2183,23 @@ impl Harness {
         unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
     }
 
+    /// `UpdateTexture` from a 2D texture into a volume texture. Returns the hr.
+    ///
+    /// A resource-type mismatch, which D3D9 rejects; the vtable slot takes
+    /// `IDirect3DBaseTexture9` on both sides, so an application can express it.
+    pub fn update_texture_into_volume_hr(&self, src: &Texture<'_>, dst: &VolumeTexture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` from a volume texture into a 2D texture. Returns the hr.
+    ///
+    /// The other half of the resource-type mismatch above.
+    pub fn update_volume_into_texture_hr(&self, src: &VolumeTexture<'_>, dst: &Texture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
     /// `UpdateTexture` between two volume textures. Returns the hr.
     pub fn update_volume_texture_hr(
         &self,
