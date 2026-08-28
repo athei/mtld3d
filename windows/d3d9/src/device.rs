@@ -2305,15 +2305,19 @@ impl DeviceInner {
             .map(crate::fullscreen::SavedWindow::window)
     }
 
-    /// Take `hwnd` fullscreen: borderless, covering the monitor.
+    /// Take `hwnd` fullscreen: set `mode`, then borderless, covering the monitor.
     ///
-    /// No display mode is set and the z-order is left alone. The window
-    /// covering the monitor is what makes the image fill the screen; the back
-    /// buffer keeps the resolution the game asked for and present scales it.
-    /// A device created with `D3DCREATE_NOWINDOWCHANGES` leaves the window
-    /// untouched instead, which is what the flag asks for.
-    pub fn enter_fullscreen(&mut self, hwnd: *mut c_void) {
-        self.fullscreen = Some(crate::fullscreen::enter(hwnd, self.manages_window()));
+    /// The z-order is left alone. The mode-set keeps the client rect and the
+    /// back buffer in one space; present scales the back buffer to the
+    /// display. A device created with `D3DCREATE_NOWINDOWCHANGES` leaves the
+    /// window untouched, which is what the flag asks for, and still sets the
+    /// mode.
+    pub fn enter_fullscreen(
+        &mut self,
+        hwnd: *mut c_void,
+        mode: Option<mtld3d_core::display_mode::ModeRequest>,
+    ) {
+        self.fullscreen = Some(crate::fullscreen::enter(hwnd, self.manages_window(), mode));
     }
 
     /// `true` unless the app took window management over itself.
@@ -2324,13 +2328,24 @@ impl DeviceInner {
         self.creation_behavior_flags & mtld3d_types::D3DCREATE_NOWINDOWCHANGES == 0
     }
 
-    /// Re-apply the window rect for a device that stays fullscreen across a `Reset`.
+    /// Re-apply mode and window rect for a device that stays fullscreen across a `Reset`.
     ///
-    /// No-op for a device that is not fullscreen — the caller decides the
+    /// No-op for a device that is not fullscreen: the caller decides the
     /// transition, this only carries it out.
-    pub fn update_fullscreen(&mut self) {
+    pub fn update_fullscreen(&mut self, mode: Option<mtld3d_core::display_mode::ModeRequest>) {
         if let Some(saved) = self.fullscreen.as_mut() {
-            crate::fullscreen::update(saved);
+            crate::fullscreen::update(saved, mode);
+        }
+    }
+
+    /// Re-assert the mode and re-cover the monitor after the app is activated.
+    ///
+    /// The deferred half of the cursor subclass's `WM_ACTIVATEAPP TRUE`
+    /// handling, run when the posted message is processed; a no-op when the
+    /// device is no longer fullscreen.
+    pub fn reactivate_fullscreen(&mut self) {
+        if let Some(saved) = self.fullscreen.as_mut() {
+            crate::fullscreen::reactivate(saved);
         }
     }
 
@@ -3889,12 +3904,13 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
     } else {
         pp.device_window
     } as *mut c_void;
+    let mode = crate::direct3d9::fullscreen_mode_request(pp);
     if dev.fullscreen_window() == Some(target) {
-        dev.update_fullscreen();
+        dev.update_fullscreen(mode);
         return;
     }
     dev.leave_fullscreen();
-    dev.enter_fullscreen(target);
+    dev.enter_fullscreen(target, mode);
 }
 
 /// Steps 1-6 of the Reset protocol.

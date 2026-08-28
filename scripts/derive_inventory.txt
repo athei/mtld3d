@@ -73,6 +73,7 @@ windows/core/src/depth_stencil_state.rs DepthStencilSnapshot Clone,Copy,Debug,Pa
 windows/core/src/depth_stencil_state.rs StencilFaceState Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
 windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/display_mode.rs ModeRequest Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/emit.rs EmitContextFlags Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/emit.rs VariantFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/dxso/emit.rs VariantKey Clone,Copy,Debug,Default,PartialEq,Eq,Hash
@@ -186,6 +187,7 @@ windows/d3d9/src/encoder.rs StageLibHandles Clone,Copy
 windows/d3d9/src/encoder.rs SubmitMode Clone,Copy,PartialEq,Eq
 windows/d3d9/src/encoder.rs TextureInfo Clone
 windows/d3d9/src/encoder.rs VbibWarmupEntry Clone,Copy
+windows/d3d9/src/fullscreen.rs DisplayModeInfo Clone,Copy
 windows/d3d9/src/fullscreen.rs Rect Clone,Copy
 windows/d3d9/src/pixel_shader.rs PsUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,PartialEq,Eq

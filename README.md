@@ -218,17 +218,27 @@ memory headroom, or the games that rely on the looser behaviour:
   The extended interface is a different contract (device removal, OS-managed
   memory) built for the Vista+ compositor; the games this project targets are
   plain D3D9.
-- **Display-mode switching**: a fullscreen device owns its window but never the
-  desktop mode, which Wine's mac driver would set through
-  `CGDisplaySetDisplayMode`, rearranging every other window on the screen. The
-  window goes borderless over the monitor instead, while the back buffer keeps
-  the display mode the game picked, exactly as a real mode-set would leave it,
-  and present scales the frame to the display (MetalFX when enlarging). A
-  request matching no enumerable mode, which a real mode-set would reject,
-  follows the window instead: games that ask for such sizes derived them from
-  their window and keep sizing their rendering and input from it.
+- **Physical display-mode switching**: a fullscreen device sets the display
+  mode the game picked through user32, as native D3D9 does, but that mode is
+  meant to stay virtual. Set `HKCU\Software\Wine\X11 Driver\EmulateModeset`
+  to `Y` in the prefix (win32u reads this key whatever the driver; the
+  launcher and the test prefix set it): win32u then leaves the physical
+  display alone, scales the game window onto it and maps mouse input into the
+  mode, so a game's clicks land where its UI is drawn, while the back buffer
+  is the mode and present scales the frame to the display (MetalFX when
+  enlarging). A mode of another aspect than the display's is letterboxed, with
+  the desktop showing in the bars and the menu bar staying, since the window no
+  longer covers the screen; the game's resolution list carries the display's
+  own modes, which fill it. Without the key Wine's mac driver hands the
+  mode-set to `CGDisplaySetDisplayMode` and the whole desktop switches
+  resolution. A request matching no enumerable mode, which a mode-set would
+  reject, follows the window instead: games that ask for such sizes derived
+  them from their window and keep sizing their rendering and input from it.
 - **The fullscreen focus lifecycle**: no device loss on deactivation, no
-  focus-window subclassing, no synthesized activation messages. Presentation is
+  focus-window subclassing, no synthesized activation messages, no minimise.
+  What the device does answer is the mode contract: deactivation puts the
+  registry display mode back and activation sets the game's mode and re-covers
+  the monitor again, both as native does. Presentation is
   a composited Metal layer and no exclusive mode is ever taken, so a lost
   display is never a lost device: `TestCooperativeLevel` reports `D3D_OK`
   across a focus change and only ever reports `D3DERR_DEVICENOTRESET`, which is

@@ -9,6 +9,16 @@
 
 [test-groups]
 gpu = { max-threads = 4 }
+# A fullscreen device sets a display mode, and a mode is global to the
+# wineserver session every e2e process attaches to, so two of these running at
+# once would see each other's mode. They take turns; the override has to come
+# before the package-wide one because nextest applies the first match.
+modeset = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "package(mtld3d-tests) & (test(/fullscreen/) | test(/nowindowchanges/))"
+test-group = "modeset"
+slow-timeout = { period = "30s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 filter = "package(mtld3d-tests)"
@@ -27,6 +37,11 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [profile.ci]
 fail-fast = false
 test-threads = 1
+
+[[profile.ci.overrides]]
+filter = "package(mtld3d-tests) & (test(/fullscreen/) | test(/nowindowchanges/))"
+test-group = "modeset"
+slow-timeout = { period = "120s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
 filter = "package(mtld3d-tests)"
