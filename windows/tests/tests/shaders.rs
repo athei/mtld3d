@@ -688,8 +688,8 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
     assert_eq!(
         h.check_device_format(
             mtld3d_types::D3DFMT_X8R8G8B8,
-            0x0010_0000, // D3DUSAGE_QUERY_VERTEXTEXTURE
-            3,           // D3DRTYPE_TEXTURE
+            mtld3d_types::D3DUSAGE_QUERY_VERTEXTEXTURE,
+            mtld3d_types::D3DRTYPE_TEXTURE,
             mtld3d_types::D3DFMT_A8R8G8B8,
         ),
         0,

@@ -4,9 +4,19 @@
 //! they do NOT invoke a Metal compiler.
 
 use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_types::{
+    D3DCMP_ALWAYS, D3DCMP_GREATER, D3DFOG_LINEAR, D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL,
+    D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE,
+    D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+};
 
 use super::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
 use crate::dxso::emit::{VariantFlags, VariantKey};
+
+/// D3D enum constant at the key's narrow width.
+fn narrow(v: u32) -> u8 {
+    u8::try_from(v).expect("D3D9 fixed-function enum value ≤ u8::MAX")
+}
 
 fn emit_pair_for_tests(vs_key: &FfVsKey, ps_key: &FfPsKey, variant: VariantKey) -> String {
     let vs = emit_vs_ff(vs_key);
@@ -16,7 +26,7 @@ fn emit_pair_for_tests(vs_key: &FfVsKey, ps_key: &FfPsKey, variant: VariantKey) 
 
 fn stage_disable() -> FfStage {
     FfStage {
-        color_op: 1, // D3DTOP_DISABLE
+        color_op: narrow(D3DTOP_DISABLE),
         ..FfStage::default()
     }
 }
@@ -29,10 +39,11 @@ fn default_vs_key() -> FfVsKey {
         light_active_mask: 0,
         light_directional_mask: 0,
         light_spot_mask: 0,
-        diffuse_source: 1,  // D3DMCS_COLOR1 (spec default)
-        ambient_source: 0,  // D3DMCS_MATERIAL (spec default)
-        specular_source: 2, // D3DMCS_COLOR2 (spec default)
-        emissive_source: 0, // D3DMCS_MATERIAL (spec default)
+        // D3D9 spec defaults for the four material-source render states.
+        diffuse_source: narrow(D3DMCS_COLOR1),
+        ambient_source: narrow(D3DMCS_MATERIAL),
+        specular_source: narrow(D3DMCS_COLOR2),
+        emissive_source: narrow(D3DMCS_MATERIAL),
         fog_mode: 0,
         tci_modes: [0; 8],
         tci_coord_indices: [0; 8],
@@ -274,10 +285,10 @@ fn ps_specular_add_absent_when_disabled() {
 fn d3dta_specular_resolves_to_color1() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
-        color_op: 2,   // D3DTOP_SELECTARG1
-        color_arg1: 4, // D3DTA_SPECULAR
-        alpha_op: 2,   // D3DTOP_SELECTARG1
-        alpha_arg1: 0, // D3DTA_DIFFUSE
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_SPECULAR),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
     let msl = emit_ps_ff(&ps, VariantKey::default());
@@ -288,10 +299,10 @@ fn d3dta_specular_resolves_to_color1() {
 fn d3dta_specular_alpha_replicate_broadcasts() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
-        color_op: 2,      // D3DTOP_SELECTARG1
-        color_arg1: 0x24, // D3DTA_SPECULAR | D3DTA_ALPHAREPLICATE
-        alpha_op: 2,      // D3DTOP_SELECTARG1
-        alpha_arg1: 0,    // D3DTA_DIFFUSE
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_SPECULAR | D3DTA_ALPHAREPLICATE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
     let msl = emit_ps_ff(&ps, VariantKey::default());
@@ -373,12 +384,12 @@ fn emits_texture_sample_and_modulate() {
     vs.input_tex_coord_count = 1;
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
-        color_op: 4,   // D3DTOP_MODULATE
-        color_arg1: 2, // TEXTURE
-        color_arg2: 1, // CURRENT
-        alpha_op: 4,   // D3DTOP_MODULATE
-        alpha_arg1: 2,
-        alpha_arg2: 1,
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_MODULATE),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
         has_texture: true,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
@@ -550,7 +561,7 @@ fn emits_alpha_test_discard() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
-        alpha_func: 5, // D3DCMP_GREATER
+        alpha_func: narrow(D3DCMP_GREATER),
         fog_mode: 0,
         fog_table_mode: 0,
         depth_sampler_mask: 0,
@@ -576,7 +587,7 @@ fn emits_alpha_test_discard() {
 #[test]
 fn emits_fog_blend_on_buffer_13_when_enabled() {
     let mut vs = default_vs_key();
-    vs.fog_mode = 3; // D3DFOG_LINEAR
+    vs.fog_mode = narrow(D3DFOG_LINEAR);
     let ps = default_ps_key();
     let variant = VariantKey {
         alpha_func: 0,
@@ -690,7 +701,7 @@ fn omits_alpha_test_when_always() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
-        alpha_func: 8, // D3DCMP_ALWAYS
+        alpha_func: narrow(D3DCMP_ALWAYS),
         fog_mode: 0,
         fog_table_mode: 0,
         depth_sampler_mask: 0,
@@ -1250,10 +1261,10 @@ fn ff_point_scale_measures_the_viewport_height_in_reported_pixels() {
 fn lod_bias_variant_biases_the_fixed_function_sample() {
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
-        color_op: 2,   // D3DTOP_SELECTARG1
-        color_arg1: 2, // D3DTA_TEXTURE
-        alpha_op: 2,   // D3DTOP_SELECTARG1
-        alpha_arg1: 2, // D3DTA_TEXTURE
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
         has_texture: true,
         ..FfStage::default()
     };

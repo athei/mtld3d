@@ -30,7 +30,7 @@ pub const D3DDECL_END: D3DVERTEXELEMENT9 = D3DVERTEXELEMENT9 {
     stream: D3DDECL_END_STREAM,
     offset: 0,
     type_: D3DDECLTYPE_UNUSED,
-    method: 0,
+    method: D3DDECLMETHOD_DEFAULT,
     usage: 0,
     usage_index: 0,
 };
@@ -70,6 +70,16 @@ pub const D3DDECLUSAGE_COLOR: u8 = 10;
 pub const D3DDECLUSAGE_FOG: u8 = 11;
 pub const D3DDECLUSAGE_DEPTH: u8 = 12;
 pub const D3DDECLUSAGE_SAMPLE: u8 = 13;
+
+// D3DDECLMETHOD values (d3d9types.h). Everything but DEFAULT is a tessellator
+// method, which this layer does not implement.
+pub const D3DDECLMETHOD_DEFAULT: u8 = 0;
+pub const D3DDECLMETHOD_PARTIALU: u8 = 1;
+pub const D3DDECLMETHOD_PARTIALV: u8 = 2;
+pub const D3DDECLMETHOD_CROSSUV: u8 = 3;
+pub const D3DDECLMETHOD_UV: u8 = 4;
+pub const D3DDECLMETHOD_LOOKUP: u8 = 5;
+pub const D3DDECLMETHOD_LOOKUPPRESAMPLED: u8 = 6;
 
 #[repr(C)]
 pub struct IDirect3DVertexDeclaration9Vtbl {

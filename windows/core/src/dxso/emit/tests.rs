@@ -11,12 +11,20 @@ use mtld3d_shared::mtl::{
     PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_FLOAT_CONST_SLOT,
     VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
+use mtld3d_types::{
+    D3DFOG_LINEAR, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTOP_DISABLE, D3DTOP_SELECTARG1,
+};
 
 use super::{
     VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
     emit_vs_programmable_named,
 };
 use crate::dxso::{ir::TextureType, parser::parse};
+
+/// D3D enum constant at the key's narrow width.
+fn narrow(v: u32) -> u8 {
+    u8::try_from(v).expect("D3D9 fixed-function enum value ≤ u8::MAX")
+}
 
 const VS_HEADER: u32 = 0xFFFE_0200;
 const PS_HEADER: u32 = 0xFFFF_0200;
@@ -823,7 +831,7 @@ fn ps2_vreg_input_maps_to_color_not_position() {
 fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
     let variant = VariantKey {
         alpha_func: 0,
-        fog_mode: 3, // D3DFOG_LINEAR
+        fog_mode: narrow(D3DFOG_LINEAR),
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
@@ -1499,7 +1507,7 @@ fn fog_msl_compiles_under_metal() {
     // must all be valid MSL on both the FF and programmable PS emitters.
     let ps_key = FfPsKey {
         stages: [FfStage {
-            color_op: 1, // D3DTOP_DISABLE
+            color_op: narrow(D3DTOP_DISABLE),
             ..FfStage::default()
         }; 8],
         specular_add: false,
@@ -2959,14 +2967,14 @@ fn ff_ps_specular_add_msl_compiles_under_metal() {
     // End-of-cascade specular add plus a D3DTA_SPECULAR stage argument,
     // through a real Metal compile.
     let mut stages = [FfStage {
-        color_op: 1, // D3DTOP_DISABLE
+        color_op: narrow(D3DTOP_DISABLE),
         ..FfStage::default()
     }; 8];
     stages[0] = FfStage {
-        color_op: 2,   // D3DTOP_SELECTARG1
-        color_arg1: 4, // D3DTA_SPECULAR
-        alpha_op: 2,   // D3DTOP_SELECTARG1
-        alpha_arg1: 0, // D3DTA_DIFFUSE
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_SPECULAR),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
         ..FfStage::default()
     };
     let key = FfPsKey {
