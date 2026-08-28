@@ -1925,6 +1925,32 @@ impl Harness {
         }
     }
 
+    /// `StretchRect` between two explicit rectangles. Returns the hr.
+    ///
+    /// Rectangles are `left`/`top`/`right`/`bottom` in the surface's own
+    /// coordinates, the same layout `D3DRECT` carries.
+    pub fn stretch_rect_regions(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        dst_rect: &D3DRECT,
+        filter: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live and both rects are
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                core::ptr::from_ref(dst_rect).cast(),
+                filter,
+            )
+        }
+    }
+
     /// `ColorFill` over the whole surface (null rect). Returns the hr.
     ///
     /// Only a `D3DPOOL_DEFAULT` render target or offscreen-plain surface is a
