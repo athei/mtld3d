@@ -212,3 +212,42 @@ fn write_pointers_land_inside_the_backing_and_stop_at_its_end() {
     drop(b.release());
     assert!(b.write_ptr_at(0).is_none());
 }
+
+// ── the read-back copy the indexed triangle-fan rewrite installs ──
+
+#[test]
+fn a_read_back_copy_mirrors_the_device_buffer_and_pins_the_backing() {
+    let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
+    assert!(!b.is_pinned());
+    drop(b.release());
+    b.adopt_device_copy(PageBox::new_zeroed(SMALL as usize));
+    assert_eq!(
+        b.state(),
+        BackingState::Mirrors,
+        "the copy came out of the device buffer, so it holds every byte"
+    );
+    assert!(b.may_widen_upload());
+    assert!(
+        b.is_pinned(),
+        "the read cost a GPU stall, so it is paid once"
+    );
+    assert_ne!(b.ptr(), 0);
+}
+
+#[test]
+fn a_read_back_copy_is_dropped_when_the_buffer_still_holds_a_backing() {
+    let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
+    let live = b.ptr();
+    b.adopt_device_copy(PageBox::new_zeroed(SMALL as usize));
+    assert_eq!(b.ptr(), live, "the live backing stands");
+    assert!(!b.is_pinned());
+}
+
+#[test]
+fn a_pinned_backing_keeps_the_pin_across_an_upload() {
+    let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
+    drop(b.release());
+    b.adopt_device_copy(PageBox::new_zeroed(SMALL as usize));
+    b.note_upload(0, SMALL);
+    assert!(b.is_pinned());
+}
