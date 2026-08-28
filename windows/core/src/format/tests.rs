@@ -9,14 +9,23 @@
 //! and the missing-channel swizzle, plus `is_mapped_color_format` tracking
 //! the lookup table.
 
+use mtld3d_types::{D3DUSAGE_NONSECURE, D3DUSAGE_WRITEONLY};
+
 use super::{
     D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D15S1,
     D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
     D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16,
     D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_X8R8G8B8, PixelFormat, StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel,
-    is_depth_format, is_mapped_color_format, linear_row_pitch, map_d3d_depth_format,
-    map_d3d_format, standalone_surface_bytes, surface_bytes,
+    D3DFMT_X8R8G8B8, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
+    StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel, is_depth_format,
+    is_mapped_color_format, linear_row_pitch, map_d3d_depth_format, map_d3d_format,
+    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
 #[test]
@@ -393,6 +402,115 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
     );
 }
 
+// ── Per-resource-type usage validation ──
+
+/// Every usage bit `usage_allowed_for_rtype` weighs, with a readable name.
+const VALIDATED_BITS: [(u32, &str); 17] = [
+    (D3DUSAGE_RENDERTARGET, "RENDERTARGET"),
+    (D3DUSAGE_DEPTHSTENCIL, "DEPTHSTENCIL"),
+    (D3DUSAGE_SOFTWAREPROCESSING, "SOFTWAREPROCESSING"),
+    (D3DUSAGE_DONOTCLIP, "DONOTCLIP"),
+    (D3DUSAGE_POINTS, "POINTS"),
+    (D3DUSAGE_RTPATCHES, "RTPATCHES"),
+    (D3DUSAGE_NPATCHES, "NPATCHES"),
+    (D3DUSAGE_DYNAMIC, "DYNAMIC"),
+    (D3DUSAGE_AUTOGENMIPMAP, "AUTOGENMIPMAP"),
+    (D3DUSAGE_DMAP, "DMAP"),
+    (D3DUSAGE_QUERY_LEGACYBUMPMAP, "QUERY_LEGACYBUMPMAP"),
+    (D3DUSAGE_QUERY_SRGBREAD, "QUERY_SRGBREAD"),
+    (D3DUSAGE_QUERY_FILTER, "QUERY_FILTER"),
+    (D3DUSAGE_QUERY_SRGBWRITE, "QUERY_SRGBWRITE"),
+    (
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        "QUERY_POSTPIXELSHADER_BLENDING",
+    ),
+    (D3DUSAGE_QUERY_VERTEXTEXTURE, "QUERY_VERTEXTEXTURE"),
+    (D3DUSAGE_QUERY_WRAPANDMIP, "QUERY_WRAPANDMIP"),
+];
+
+/// Assert the exact set of single bits `rtype` accepts on its own.
+fn assert_accepts_exactly(rtype: u32, accepted: &[u32]) {
+    for (bit, name) in VALIDATED_BITS {
+        assert_eq!(
+            usage_allowed_for_rtype(bit, rtype),
+            accepted.contains(&bit),
+            "rtype {rtype} and {name} disagree with the allowed-usage table"
+        );
+    }
+}
+
+#[test]
+fn surface_rejects_the_sampling_only_usage_queries() {
+    // A plain surface is never bound as a shader resource, so no sampling
+    // question has an answer on it: filtering, the sRGB decode, the vertex
+    // fetch and the wrap/mip report all reject whatever the format.
+    for (bit, name) in [
+        (D3DUSAGE_QUERY_FILTER, "QUERY_FILTER"),
+        (D3DUSAGE_QUERY_SRGBREAD, "QUERY_SRGBREAD"),
+        (D3DUSAGE_QUERY_VERTEXTEXTURE, "QUERY_VERTEXTEXTURE"),
+        (D3DUSAGE_QUERY_WRAPANDMIP, "QUERY_WRAPANDMIP"),
+        (D3DUSAGE_DYNAMIC, "DYNAMIC"),
+        (D3DUSAGE_SOFTWAREPROCESSING, "SOFTWAREPROCESSING"),
+    ] {
+        assert!(
+            !usage_allowed_for_rtype(bit, D3DRTYPE_SURFACE),
+            "{name} is not expressible by a plain surface"
+        );
+        assert!(
+            usage_allowed_for_rtype(bit, D3DRTYPE_TEXTURE),
+            "{name} is a texture question"
+        );
+        // Combining it with a bit the surface does express does not rescue it.
+        assert!(
+            !usage_allowed_for_rtype(bit | D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE),
+            "{name} beside RENDERTARGET is still not a surface question"
+        );
+    }
+}
+
+#[test]
+fn surface_expresses_the_binding_and_blend_bits() {
+    assert_accepts_exactly(
+        D3DRTYPE_SURFACE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        ],
+    );
+    // SRGBWRITE is a property of the render pass, so it is a question only
+    // once the query asks about a render target.
+    assert!(usage_allowed_for_rtype(
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+        D3DRTYPE_SURFACE
+    ));
+    assert!(!usage_allowed_for_rtype(
+        D3DUSAGE_QUERY_SRGBWRITE,
+        D3DRTYPE_SURFACE
+    ));
+}
+
+#[test]
+fn texture_expresses_every_bit_but_the_vertex_processing_hints() {
+    assert_accepts_exactly(
+        D3DRTYPE_TEXTURE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_SOFTWAREPROCESSING,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_LEGACYBUMPMAP,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ],
+    );
+}
+
 #[test]
 fn linear_row_pitch_rounds_up_to_a_dword() {
     // 32-bit rows are already a multiple of 4 at every width.
@@ -407,4 +525,63 @@ fn linear_row_pitch_rounds_up_to_a_dword() {
     assert_eq!(linear_row_pitch(5, 1), 8);
     assert_eq!(linear_row_pitch(8, 1), 8);
     assert_eq!(linear_row_pitch(0, 2), 0);
+}
+
+#[test]
+fn cube_texture_drops_depth_stencil_and_the_legacy_bump_map_query() {
+    assert_accepts_exactly(
+        D3DRTYPE_CUBETEXTURE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_SOFTWAREPROCESSING,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ],
+    );
+}
+
+#[test]
+fn volumes_are_sampling_only() {
+    // No render-target or depth binding on a 3D resource, and no mip
+    // generation; the volume and its container answer alike.
+    let accepted = [
+        D3DUSAGE_SOFTWAREPROCESSING,
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_QUERY_VERTEXTEXTURE,
+        D3DUSAGE_QUERY_WRAPANDMIP,
+    ];
+    assert_accepts_exactly(D3DRTYPE_VOLUMETEXTURE, &accepted);
+    assert_accepts_exactly(D3DRTYPE_VOLUME, &accepted);
+}
+
+#[test]
+fn buffers_express_only_the_dynamic_bit() {
+    assert_accepts_exactly(D3DRTYPE_VERTEXBUFFER, &[D3DUSAGE_DYNAMIC]);
+    assert_accepts_exactly(D3DRTYPE_INDEXBUFFER, &[D3DUSAGE_DYNAMIC]);
+}
+
+#[test]
+fn unvalidated_bits_and_unknown_resource_types() {
+    // WRITEONLY and NONSECURE are not capability questions: they ride
+    // through any query without changing the answer.
+    for rtype in [D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER] {
+        assert!(usage_allowed_for_rtype(
+            D3DUSAGE_WRITEONLY | D3DUSAGE_NONSECURE,
+            rtype
+        ));
+    }
+    // An unrecognised resource type expresses nothing, but an empty query
+    // still has to reach the per-format arms that reject it.
+    assert!(usage_allowed_for_rtype(0, 0));
+    assert!(!usage_allowed_for_rtype(D3DUSAGE_RENDERTARGET, 0));
 }

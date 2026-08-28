@@ -858,6 +858,19 @@ extern "system" fn d3d9_check_device_format(
             D3DERR_NOTAVAILABLE
         };
     }
+    // A query may only carry the usage bits its resource type expresses.
+    // The sampling-only group (FILTER, SRGBREAD, VERTEXTEXTURE, WRAPANDMIP,
+    // DYNAMIC, SOFTWAREPROCESSING) presumes a shader-resource binding, so it
+    // answers NOTAVAILABLE on a plain D3DRTYPE_SURFACE whatever the format
+    // is: a surface is never sampled, so filtering is not a question it can
+    // say yes to.
+    if !mtld3d_core::format::usage_allowed_for_rtype(usage, rtype) {
+        trace!(
+            target: LOG_TARGET,
+            "reject CheckDeviceFormat(usage={usage:#x}, rtype={rtype}, check_fmt={check_format}) → usage not expressible by the resource type"
+        );
+        return D3DERR_NOTAVAILABLE;
+    }
     // Vertex texture fetch: any sampleable texture format can be read from
     // the vertex stage (Metal binds textures to vertex functions natively),
     // matching the non-zero `VertexTextureFilterCaps`. Strip the bit and
@@ -872,17 +885,6 @@ extern "system" fn d3d9_check_device_format(
     } else {
         usage
     };
-    // D3DUSAGE_QUERY_SRGBWRITE asks whether a format works as an sRGB-encoding
-    // render target. On a plain offscreen SURFACE — which can never be a render
-    // target without D3DUSAGE_RENDERTARGET — the combination is invalid. (A
-    // TEXTURE is a meaningful SRGBWRITE query even without the bit, since it can
-    // later be bound as a render target, so it falls through to the cap check.)
-    if rtype == D3DRTYPE_SURFACE
-        && usage & D3DUSAGE_QUERY_SRGBWRITE != 0
-        && usage & D3DUSAGE_RENDERTARGET == 0
-    {
-        return D3DERR_NOTAVAILABLE;
-    }
     // D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING asks whether the format blends
     // as a render target. Every colour attachment blends on Metal, so the
     // answer is the render-target question itself, whether or not the caller
