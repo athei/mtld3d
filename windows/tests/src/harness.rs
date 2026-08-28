@@ -105,6 +105,7 @@ pub fn render_scale_is_identity() -> bool {
 pub struct Harness {
     d3d9: *mut c_void,
     device: *mut c_void,
+    device_released: Cell<bool>,
     hwnd: usize,
     width: Cell<u32>,
     height: Cell<u32>,
@@ -173,6 +174,7 @@ impl Harness {
         Self {
             d3d9,
             device: core::ptr::null_mut(),
+            device_released: Cell::new(false),
             hwnd: 0,
             width: Cell::new(0),
             height: Cell::new(0),
@@ -220,6 +222,7 @@ impl Harness {
         Self {
             d3d9,
             device,
+            device_released: Cell::new(false),
             hwnd,
             width: Cell::new(cfg.width),
             height: Cell::new(cfg.height),
@@ -285,6 +288,27 @@ impl Harness {
         // SAFETY: balances the reference `GetDevice` took, per the contract
         // above, so the device stays live.
         unsafe { (self.dev_vtbl().release)(device) }
+    }
+
+    /// Release the harness's own reference to the device.
+    ///
+    /// What an application dropping its last device reference does. Returns
+    /// the count after the decrement, so a caller can see what the resources
+    /// it still holds are keeping alive. [`Self::device`] keeps naming the
+    /// device for a `GetDevice` comparison, and `Drop` no longer releases it,
+    /// so every later call goes through a reference some child resource holds:
+    /// a harness whose device count reached zero here must not be used again.
+    ///
+    /// # Panics
+    /// Panics if the harness's device reference has already been released.
+    pub fn release_device(&self) -> u32 {
+        assert!(
+            !self.device_released.replace(true),
+            "the device reference is released once"
+        );
+        // SAFETY: vtable thunk; this releases the reference `CreateDevice`
+        // handed the harness, which `Drop` now skips.
+        unsafe { (self.dev_vtbl().release)(self.device) }
     }
 
     /// The device's current public refcount.
@@ -2393,7 +2417,7 @@ impl Default for Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        if !self.device.is_null() {
+        if !self.device.is_null() && !self.device_released.get() {
             // SAFETY: vtable thunk; `self.device` is live and released exactly once.
             unsafe { (self.dev_vtbl().release)(self.device) };
         }
