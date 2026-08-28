@@ -963,15 +963,21 @@ fn fullscreen_window_reasserts_monitor_rect_after_external_resize() {
         "the app-set rect survives its own SetWindowPos call",
     );
 
+    // Coverage, not equality: this is the first rect in the test the window
+    // manager has had a chance to answer, and its answer can be a pixel
+    // larger than the monitor when a monitor dimension does not land on its
+    // coordinate grid. Such a window covers the display, which is what a
+    // fullscreen window owes, so the assertion reads the same rule the
+    // re-cover does.
     assert!(h.pump(), "no WM_QUIT expected");
     let rect = h.window_rect();
-    assert_eq!(
-        (
-            u32::try_from(rect.right - rect.left).expect("width is positive"),
-            u32::try_from(rect.bottom - rect.top).expect("height is positive")
-        ),
-        (screen_w, screen_h),
-        "processing window events re-covers the monitor",
+    let covered = (
+        u32::try_from(rect.right - rect.left).expect("width is positive"),
+        u32::try_from(rect.bottom - rect.top).expect("height is positive"),
+    );
+    assert!(
+        mtld3d_core::fullscreen_resize::covers_monitor(covered, (screen_w, screen_h)),
+        "processing window events re-covers the monitor: {covered:?} against ({screen_w}, {screen_h})",
     );
     let (bb_hr, bb) = h.back_buffer(0).desc();
     assert_eq!(bb_hr, D3D_OK, "GetDesc after the external resize");
