@@ -401,6 +401,43 @@ fn autogen_mipmap_texture_rejects_sub_level_unlock() {
 }
 
 #[test]
+fn default_pool_texture_lock_splits_by_entry_point() {
+    let h = Harness::new();
+    // D3D9 makes a `D3DPOOL_DEFAULT` texture without `D3DUSAGE_DYNAMIC`
+    // unlockable through either entry point. The level surface answers that
+    // contract; `IDirect3DTexture9::LockRect` serves the lock out of the
+    // level's CPU staging instead, so a title that streams into a DEFAULT
+    // texture it never marked DYNAMIC keeps working.
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let (hr, bits_null) = tex.surface_level(0).lock_rect_probe(0);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "surface LockRect on a static DEFAULT level"
+    );
+    assert!(bits_null, "the rejected surface lock hands out no pointer");
+    let (hr, bits_null) = tex.lock_rect_probe(0, 0);
+    assert_eq!(hr, 0, "texture LockRect serves the same level");
+    assert!(!bits_null, "the served lock hands out a pointer");
+    assert_eq!(tex.unlock_rect(0), 0, "UnlockRect after the served lock");
+
+    // `D3DUSAGE_DYNAMIC` is what makes the level lockable in D3D9, and both
+    // entry points then agree.
+    let dynamic = h.create_texture(
+        16,
+        16,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let surface = dynamic.surface_level(0);
+    let (hr, bits_null) = surface.lock_rect_probe(0);
+    assert_eq!(hr, 0, "surface LockRect on a DYNAMIC DEFAULT level");
+    assert!(!bits_null, "the DYNAMIC surface lock hands out a pointer");
+    assert_eq!(surface.unlock_rect(), 0, "UnlockRect through the surface");
+}
+
+#[test]
 fn cube_textures_create_in_all_pools() {
     let h = Harness::new();
     for (pool, name) in [
