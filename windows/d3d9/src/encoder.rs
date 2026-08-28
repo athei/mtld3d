@@ -3107,6 +3107,16 @@ impl FrameEncoder {
         self.pass_state.current_depth_texture()
     }
 
+    /// Whether the live pass carries the bound depth attachment.
+    ///
+    /// Proxies [`PassState::pass_binds_depth`] for the draw and clear-quad
+    /// paths, which build the pipelines that have to agree with the pass on
+    /// whether a depth and a stencil format are declared.
+    #[must_use]
+    pub const fn pass_binds_depth(&self) -> bool {
+        self.pass_state.pass_binds_depth()
+    }
+
     /// Record a caster draw against the currently-bound cascade depth handle.
     ///
     /// Called from `draw.rs::emit_draw`. The `PassState` implementation
@@ -4580,12 +4590,14 @@ impl FrameEncoder {
         // format validation against the depth-only descriptor).
         let block_start = self.pass_state.open_color_clear_quad_block();
         // A color clear-quad must declare a depth attachment ONLY when the live
-        // pass has one. On a no-depth pass (e.g. after an explicit
-        // `SetDepthStencilSurface(NULL)`) a pipeline that declares depth is
-        // rejected by Metal ("depth attachment pixelFormat must be Invalid, as
-        // no texture is set"), so gate `HAS_DEPTH` on the bound attachment.
+        // pass has one. On a no-depth pass (an explicit
+        // `SetDepthStencilSurface(NULL)`, or a depth surface the pass drops
+        // for disagreeing with render target 0 on sample count) a pipeline
+        // that declares depth is rejected by Metal ("depth attachment
+        // pixelFormat must be Invalid, as no texture is set"), so gate
+        // `HAS_DEPTH` on the attachment the pass actually takes.
         let mut flags = ClearQuadFlags::HAS_COLOR;
-        let has_depth = !self.current_depth_texture().is_null();
+        let has_depth = self.pass_binds_depth();
         flags.set(ClearQuadFlags::HAS_DEPTH, has_depth);
         // Match the bound depth attachment's stencil-ness (see the depth
         // clear-quad above) so the pipeline's depth/stencil formats agree with

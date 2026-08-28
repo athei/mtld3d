@@ -4262,6 +4262,45 @@ fn a_multisampled_pass_attaches_the_companion_and_resolves_into_the_twin() {
 }
 
 #[test]
+fn pass_binds_depth_answers_for_the_attachment_the_pass_takes() {
+    // Every pipeline built for a pass reads this predicate to decide whether
+    // to declare a depth and a stencil format, and Metal rejects a draw whose
+    // pipeline declares one the pass has no attachment for. So it has to
+    // answer for the attachment the pass takes, not for the binding the app
+    // made: a single-sampled depth surface under a 4x target is dropped, and a
+    // clear of its planes has nothing to paint.
+    let mut s = fresh_multisampled();
+    assert!(
+        s.pass_binds_depth(),
+        "the frame's own depth companion matches the target"
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    assert!(
+        !s.pass_binds_depth(),
+        "a single-sampled depth surface under a 4x target is dropped"
+    );
+    assert_eq!(
+        s.clear_depth(0),
+        DepthClearOutcome::NoOp,
+        "a depth clear has no attachment to paint"
+    );
+    assert_eq!(
+        s.clear_stencil(0),
+        StencilClearOutcome::NoOp,
+        "and neither has a stencil clear"
+    );
+    s.set_depth_sample_count(4);
+    assert!(
+        s.pass_binds_depth(),
+        "a depth surface at the target's own count binds again"
+    );
+    assert!(
+        !PassState::new().pass_binds_depth(),
+        "and no depth surface at all binds nothing"
+    );
+}
+
+#[test]
 fn only_the_last_pass_of_a_submission_takes_the_resolve() {
     // Two passes on the multisampled back buffer with an offscreen target in
     // between: the multisample content lives on across the middle pass and is

@@ -1828,6 +1828,21 @@ impl PassState {
         self.current_depth_sample_count
     }
 
+    /// Whether a pass opened now carries the bound depth attachment.
+    ///
+    /// Metal takes a render pass's sample count from its attachments and
+    /// rejects a pass whose attachments disagree, so a depth surface that does
+    /// not match render target 0 is dropped from the descriptor. Every
+    /// pipeline built for such a pass then has to declare no depth and no
+    /// stencil format, and a clear of the depth or stencil plane has no
+    /// attachment to paint. One predicate so those decisions cannot drift
+    /// apart from the attachment the pass actually gets.
+    #[must_use]
+    pub const fn pass_binds_depth(&self) -> bool {
+        !self.current_depth_texture.is_null()
+            && self.current_depth_sample_count == self.current_color_sample_count
+    }
+
     /// Declare the sample count of the depth attachment bound alongside the colour one.
     ///
     /// Called in lockstep with `set_depth_stencil_attachment*`, which reset it
@@ -2639,21 +2654,21 @@ impl PassState {
         // D3D9 calls the pairing invalid too, but returns an error from
         // `SetDepthStencilSurface` rather than failing the draw, and titles do
         // reach here after switching render targets without rebinding depth.
-        let depth_texture = if !self.current_depth_texture.is_null()
-            && self.current_depth_sample_count != self.current_color_sample_count
-        {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: self.current_depth_texture.raw(),
-                "depth attachment {:#x} is {}x multisampled but render target 0 is {}x: \
-                 dropping depth for this pass",
-                self.current_depth_texture,
-                self.current_depth_sample_count,
-                self.current_color_sample_count,
-            );
-            MetalHandle::NULL
-        } else {
+        let depth_texture = if self.pass_binds_depth() {
             self.current_depth_texture
+        } else {
+            if !self.current_depth_texture.is_null() {
+                mtld3d_shared::log_once_warn_by!(
+                    target: crate::LOG_TARGET,
+                    key: self.current_depth_texture.raw(),
+                    "depth attachment {:#x} is {}x multisampled but render target 0 is {}x: \
+                     dropping depth for this pass",
+                    self.current_depth_texture,
+                    self.current_depth_sample_count,
+                    self.current_color_sample_count,
+                );
+            }
+            MetalHandle::NULL
         };
         // The depth texture's first use this frame under a viewport that
         // covers it: the Rule A predicate, shared by the depth plane and the
@@ -3346,9 +3361,10 @@ impl PassState {
     /// actions. The caller then paints one scissored clear-quad per clipped
     /// rect. Returns whether the pass carries a colour attachment and its
     /// format, which the quad pipeline key needs; `None` when no
-    /// depth-stencil is bound (nothing to clear).
+    /// depth-stencil is bound, or the pass will drop the one that is
+    /// (nothing to clear).
     pub fn begin_region_depth_stencil_clear(&mut self) -> Option<(bool, PixelFormat)> {
-        if self.current_depth_texture.is_null() {
+        if !self.pass_binds_depth() {
             return None;
         }
         if self.current_pass_has_counting_visibility() {
@@ -3396,9 +3412,10 @@ impl PassState {
     /// 4. No open pass → stash as `pending_depth_clear`.
     pub fn clear_depth(&mut self, value: u32) -> DepthClearOutcome {
         let depth_texture = self.current_depth_texture;
-        if depth_texture.is_null() {
+        if !self.pass_binds_depth() {
             // Nothing is attached to clear. Folding would carry the clear
-            // onto whatever texture the next pass attaches.
+            // onto whatever texture the next pass attaches, and a quad would
+            // want a depth-declaring pipeline the pass has no attachment for.
             return DepthClearOutcome::NoOp;
         }
         if self.current_pass_has_work()
@@ -3477,9 +3494,10 @@ impl PassState {
     /// the depth plane the two share.
     pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
         let depth_texture = self.current_depth_texture;
-        if depth_texture.is_null() {
+        if !self.pass_binds_depth() {
             // Nothing is attached to clear. Folding would carry the clear
-            // onto whatever texture the next pass attaches.
+            // onto whatever texture the next pass attaches, and a quad would
+            // want a depth-declaring pipeline the pass has no attachment for.
             return StencilClearOutcome::NoOp;
         }
         if self.current_pass_has_work()
