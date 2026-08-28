@@ -1560,7 +1560,9 @@ fn metal_compile_or_fail(msl: &str) {
 #[test]
 fn texldd_uses_gradientcube_for_cube_sampler() {
     // ps_3_0 { dcl_cube s0; dcl t0; texldd r0, t0, s0, r1, r2; mov oC0, r0; }
-    // Cube samplers consume float3 coord + float3 gradients.
+    // Cube samplers consume float3 coord + float3 gradients. The cube form is
+    // selected by the cube texture bound to the slot, so the variant carries
+    // the binding the declaration expects.
     let bc = vec![
         PS3_HEADER,
         opcode_token(OP_DCL, 2),
@@ -1581,7 +1583,11 @@ fn texldd_uses_gradientcube_for_cube_sampler() {
         END_TOKEN,
     ];
     let ps = parse(&bc).expect("PS3 parse");
-    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    let cube_bound = VariantKey {
+        cube_sampler_mask: 0b0001,
+        ..VariantKey::default()
+    };
+    let ps_msl = emit_ps_programmable(&ps, cube_bound).expect("emit PS3");
     assert!(
         ps_msl.contains("(in.texcoord0).xyz"),
         "cube samplers need .xyz coord:\n{ps_msl}"
@@ -3979,4 +3985,155 @@ fn programmable_ps_keeps_the_bare_return_without_a_sample_mask() {
     );
     assert!(!msl.contains("sample_mask"), "{msl}");
     assert!(!msl.contains("struct PsOut"), "{msl}");
+}
+
+/// `ps_3_0 { dcl_<dim> s0; dcl t0; texld r0, t0, s0; mov oC0, r0; }`.
+///
+/// `sampler_usage` is the `dcl` usage token whose bits 27..30 carry the
+/// declared texture type: `0x9000_0000` for `dcl_2d`, `0xA000_0000` for
+/// `dcl_volume`, `0x9800_0000` for `dcl_cube`.
+fn single_sampler_ps(sampler_usage: u32) -> crate::dxso::DxsoProgram {
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        sampler_usage,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(66 /* OP_TEXLD */, 3),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    parse(&bc).expect("PS3 parse")
+}
+
+#[test]
+fn a_2d_declared_slot_bound_to_a_volume_binds_texture3d() {
+    // D3D9 samples the texture the application bound, not the kind the
+    // shader's `dcl` names, so a `dcl_2d` slot carrying a volume texture
+    // reads the volume with a three-component coordinate.
+    let ps = single_sampler_ps(0x9000_0000);
+    assert_eq!(
+        declared_ps_samplers(&ps).get(&0),
+        Some(&TextureType::Texture2D),
+        "the declaration itself stays 2D"
+    );
+
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit plain");
+    assert!(
+        plain.contains("texture2d<float> s0 [[texture(0)]]"),
+        "an unbound or 2D-bound slot keeps the 2D binding:\n{plain}"
+    );
+    assert!(
+        plain.contains("s0.sample(samp0, (in.texcoord0).xy)"),
+        "and samples with .xy:\n{plain}"
+    );
+
+    let volume = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            volume_sampler_mask: 0b0001,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit volume");
+    assert!(
+        volume.contains("texture3d<float> s0 [[texture(0)]]"),
+        "a volume-bound slot binds texture3d whatever it declared:\n{volume}"
+    );
+    assert!(
+        !volume.contains("texture2d<float>"),
+        "and nothing keeps the 2D binding:\n{volume}"
+    );
+    assert!(
+        volume.contains("s0.sample(samp0, (in.texcoord0).xyz)"),
+        "a texture3d sample takes a float3 coordinate:\n{volume}"
+    );
+    metal_compile_or_fail(&volume);
+
+    let cube = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            cube_sampler_mask: 0b0001,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit cube");
+    assert!(
+        cube.contains("texturecube<float> s0 [[texture(0)]]"),
+        "a cube-bound slot binds texturecube whatever it declared:\n{cube}"
+    );
+    assert!(
+        cube.contains("s0.sample(samp0, (in.texcoord0).xyz)"),
+        "a texturecube sample takes a float3 direction:\n{cube}"
+    );
+    metal_compile_or_fail(&cube);
+}
+
+#[test]
+fn a_volume_declared_slot_bound_to_a_2d_texture_binds_texture2d() {
+    // The reverse mismatch, which Star Wars: The Old Republic renders water
+    // with: the shader declares `dcl_volume` and the application binds a 2D
+    // texture, which D3D9 samples with the coordinate's first two components.
+    let ps = single_sampler_ps(0xA000_0000);
+    assert_eq!(
+        declared_ps_samplers(&ps).get(&0),
+        Some(&TextureType::Texture3D),
+        "the declaration itself stays a volume"
+    );
+
+    let flat = emit_ps_programmable(&ps, VariantKey::default()).expect("emit flat");
+    assert!(
+        flat.contains("texture2d<float> s0 [[texture(0)]]"),
+        "a 2D-bound slot binds texture2d whatever it declared:\n{flat}"
+    );
+    assert!(
+        !flat.contains("texture3d<float>"),
+        "and nothing keeps the 3D binding:\n{flat}"
+    );
+    assert!(
+        flat.contains("s0.sample(samp0, (in.texcoord0).xy)"),
+        "a texture2d sample takes a float2 coordinate:\n{flat}"
+    );
+    metal_compile_or_fail(&flat);
+
+    let volume = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            volume_sampler_mask: 0b0001,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit volume");
+    assert!(
+        volume.contains("texture3d<float> s0 [[texture(0)]]"),
+        "the matching binding still emits texture3d:\n{volume}"
+    );
+}
+
+#[test]
+fn a_depth_bound_slot_stays_depth2d_over_the_volume_and_cube_masks() {
+    // Every depth-format texture is 2D, so the depth binding outranks the
+    // other kinds rather than leaving a slot typed from a mask that cannot
+    // apply to it.
+    let ps = single_sampler_ps(0xA000_0000);
+    let depth = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            depth_sampler_mask: 0b0001,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit depth");
+    assert!(
+        depth.contains("depth2d<float> s0 [[texture(0)]]"),
+        "a depth-bound volume-declared slot binds depth2d:\n{depth}"
+    );
+    metal_compile_or_fail(&depth);
 }

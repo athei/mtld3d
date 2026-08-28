@@ -258,7 +258,13 @@ use crate::shader_compile_stats::CompileBucket;
 /// multisampled render target under a narrowed mask returns a struct with a
 /// `[[sample_mask]]` member, which is a new PS variant bit and new MSL for
 /// both the fixed-function and the programmable emitter.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 65;
+///
+/// `66` types a programmable pixel shader's sampler slots from the texture
+/// bound to each slot (`VariantKey::{volume_sampler_mask, cube_sampler_mask}`)
+/// instead of from its `dcl_<dim>`, so the `[[texture(n)]]` argument type and
+/// the coordinate swizzle of any shader whose declaration disagrees with the
+/// binding change.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 66;
 
 /// File magic.
 ///

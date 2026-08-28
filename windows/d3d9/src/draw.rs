@@ -15,7 +15,7 @@ use mtld3d_core::{
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
-    dxso::{FfPsKey, FfVsKey, VariantFlags, VariantKey},
+    dxso::{FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, bound_sampler_type},
     ids::{BufferId, ProgramId},
     passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
@@ -26,7 +26,7 @@ use mtld3d_core::{
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, build_vs_draw_bytes},
 };
 use mtld3d_shared::{
-    Command, VertexAttrDesc,
+    Command, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, PrimitiveType,
         VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
@@ -1934,7 +1934,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         while unbound != 0 {
             let stage = unbound.trailing_zeros();
             unbound &= unbound - 1;
-            let kind = decls.kind(stage);
+            // The fragment function types every slot from the bound texture,
+            // not from its `dcl_<dim>`, so the fallback follows the same rule:
+            // an unbound slot has no mask bit set and takes the 2D black
+            // texture whatever the shader declared.
+            let slot = u16::try_from(stage).expect("declared sampler slot is below STAGE_COUNT");
+            let kind = match bound_sampler_type(variant, slot) {
+                TextureType::Texture3D => NullTextureKind::Texture3D,
+                TextureType::TextureCube => NullTextureKind::TextureCube,
+                TextureType::Texture2D | TextureType::Unknown => NullTextureKind::Texture2D,
+            };
             let tex_sentinel = null_texture_tex_sentinel(kind as u64);
             if enc
                 .last_bound()

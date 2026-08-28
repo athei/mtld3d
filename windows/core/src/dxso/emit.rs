@@ -134,8 +134,9 @@ pub struct VariantKey {
     /// The PS emitter outputs `depth2d<float>` for that slot and wraps
     /// `s{i}.sample(...)` in `float4(...)` (the depth sampler returns a
     /// single-channel scalar; downstream code reads `.x/.y/.z/.w` and would
-    /// otherwise miscompile). Folded into the PS shader cache key so different
-    /// bind shapes get distinct compiled libraries.
+    /// otherwise miscompile). Every depth-format texture is 2D, so this wins
+    /// over the volume and cube masks. Folded into the PS shader cache key so
+    /// different bind shapes get distinct compiled libraries.
     pub depth_sampler_mask: u16,
     /// Bit `i` set ⇒ sampler slot `i` is a "readable raw depth" FOURCC texture.
     ///
@@ -149,16 +150,15 @@ pub struct VariantKey {
     /// Bit `i` set ⇒ sampler slot `i` is bound to a volume (3D) texture.
     ///
     /// A `CreateVolumeTexture` resource with `depth > 1`, which the unix
-    /// side creates as `MTLTextureType3D`. The FIXED-FUNCTION PS declares
-    /// `texture3d<float>` and samples with the texcoord's `.xyz` for such
+    /// side creates as `MTLTextureType3D`. Both pixel-shader emitters declare
+    /// `texture3d<float>` and sample with the texcoord's `.xyz` for such
     /// slots; declaring `texture2d<float>` would fail Metal's binding
-    /// type-check and sample black.
-    /// The programmable path ignores this — SM2/SM3 carry the sampler
-    /// dimensionality in their `dcl` tokens. Part of the PS cache key.
+    /// type-check and sample black. Part of the PS cache key.
     pub volume_sampler_mask: u16,
-    /// Bit `i` set when fixed-function sampling slot `i` is a cube texture.
+    /// Bit `i` set when sampling slot `i` is bound to a cube texture.
     ///
-    /// Programmable shaders keep using declaration-driven sampler types.
+    /// Both pixel-shader emitters declare `texturecube<float>` and sample with
+    /// the texcoord's `.xyz` for such slots. Part of the PS cache key.
     pub cube_sampler_mask: u16,
     /// Bit `i` set ⇒ texture stage `i` has `D3DTTFF_PROJECTED`.
     ///
@@ -800,6 +800,55 @@ pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
     samplers
 }
 
+/// The texture kind sampler slot `idx` reads, taken from the live bindings.
+///
+/// D3D9 samples the texture the application bound rather than the kind the
+/// shader's `dcl_<dim>` names: a `dcl_2d` slot carrying a volume texture reads
+/// the volume, and a `dcl_volume` slot carrying a 2D texture reads the 2D
+/// texture. The declaration therefore decides only which slots exist. A slot
+/// with nothing bound leaves every mask bit clear and reads the 1x1 black
+/// texture the encoder binds for it, which is 2D for the same reason.
+#[must_use]
+pub const fn bound_sampler_type(variant: VariantKey, idx: u16) -> TextureType {
+    if idx >= 16 {
+        return TextureType::Texture2D;
+    }
+    let bit = 1u16 << idx;
+    if (variant.volume_sampler_mask & bit) != 0 {
+        TextureType::Texture3D
+    } else if (variant.cube_sampler_mask & bit) != 0 {
+        TextureType::TextureCube
+    } else {
+        TextureType::Texture2D
+    }
+}
+
+/// The PS sampler slots the shader declares, typed by the bound texture.
+///
+/// The single source of truth for the fragment function's `[[texture(n)]]`
+/// arguments: which slots exist comes from the `dcl_<dim>` set, each slot's
+/// type from [`bound_sampler_type`]. Drives the argument list, the coordinate
+/// swizzle at every sample site, and the gradient overload `texldd` picks.
+fn bound_ps_samplers(ps: &DxsoProgram, variant: VariantKey) -> BTreeMap<u16, TextureType> {
+    let mut samplers = declared_ps_samplers(ps);
+    for (idx, ty) in &mut samplers {
+        let bound = bound_sampler_type(variant, *idx);
+        if *ty == TextureType::Unknown {
+            mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
+                "dxso: sampler s{idx} declares an unknown TextureType → binding {bound:?}"
+            );
+        } else if *ty != bound {
+            mtld3d_shared::log_once_info_by!(target: super::LOG_TARGET,
+                key: u64::from(*idx),
+                "dxso: sampler s{idx} declares {ty:?} but is bound to {bound:?} → sampling the \
+                 bound texture"
+            );
+        }
+        *ty = bound;
+    }
+    samplers
+}
+
 fn emit_ps_function(
     out: &mut String,
     ps: &DxsoProgram,
@@ -855,10 +904,11 @@ fn emit_ps_function(
         }
     }
 
-    // The declared sampler set drives the fragment-function signature.
-    // Shared with the encoder's unbound-slot fallback so the MSL and the
-    // bind side cannot disagree on which slots exist or their type.
-    let samplers = declared_ps_samplers(ps);
+    // The declared sampler set drives the fragment-function signature, typed
+    // by the texture each slot is bound to. Shared with the encoder's
+    // unbound-slot fallback so the MSL and the bind side cannot disagree on
+    // which slots exist or their type.
+    let samplers = bound_ps_samplers(ps, variant);
 
     // SM3 PS dedicated registers: `MiscType` reg 0 = vPos (screen-space
     // pixel coord), reg 1 = vFace (front-facing flag). Identified by
@@ -988,34 +1038,21 @@ fn emit_ps_function(
         );
     }
     for (idx, ty) in &samplers {
-        // Depth-format binding (sampleable shadow map): the texture
-        // slot must be `depth2d<float>` even if the shader's `dcl_2d`
-        // declared a regular 2D sampler — the underlying MTLTexture
-        // is `Depth32Float` and binding via `texture2d<float>` would
-        // fail Metal validation. Cube/3D depth maps aren't a thing
-        // mtld3d routes today; if `depth_sampler_mask` is set on a
-        // non-2D slot the type stays as the declared one and Metal
-        // validation will surface the mismatch.
+        // Depth-format binding (sampleable shadow map): the texture slot must
+        // be `depth2d<float>`, because the underlying MTLTexture is
+        // `Depth32Float` and `texture2d<float>` would fail Metal validation.
+        // Every depth-format texture is 2D, so this outranks the volume and
+        // cube kinds, which cannot be set on the same slot.
         let depth_bound = (variant.depth_sampler_mask & (1u16 << *idx)) != 0;
-        let tex_ty = match ty {
-            TextureType::TextureCube => "texturecube<float>",
-            TextureType::Texture3D => "texture3d<float>",
-            TextureType::Texture2D => {
-                if depth_bound {
-                    "depth2d<float>"
-                } else {
-                    "texture2d<float>"
-                }
-            }
-            other @ TextureType::Unknown => {
-                mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
-                    "dxso: unknown sampler TextureType={other:?} → defaulting to texture2d<float>"
-                );
-                if depth_bound {
-                    "depth2d<float>"
-                } else {
-                    "texture2d<float>"
-                }
+        let tex_ty = if depth_bound {
+            "depth2d<float>"
+        } else {
+            match ty {
+                TextureType::TextureCube => "texturecube<float>",
+                TextureType::Texture3D => "texture3d<float>",
+                // `bound_ps_samplers` resolves every slot to one of the three
+                // bound kinds, so `Unknown` never reaches here.
+                TextureType::Texture2D | TextureType::Unknown => "texture2d<float>",
             }
         };
         let _ = write!(
@@ -1331,7 +1368,7 @@ struct EmitContext<'a> {
     shader_major: u8,
     shader_minor: u8,
     ps_input_map: Option<&'a BTreeMap<u16, String>>,
-    /// PS only: per-sampler texture type from the `dcl_*` declarations.
+    /// PS only: per-sampler texture type of the texture bound to each declared slot.
     ///
     /// Picks the coord-swizzle for `texld` (`.xy` for 2D, `.xyz` for
     /// cube and 3D). VS leaves this `None`.
@@ -1765,9 +1802,9 @@ fn translate_instruction(
         }
         Opcode::TexLd => {
             // SM2/SM3 `texld dst, coord, sampler` — srcs[1] is the sampler
-            // register ref. The coord swizzle depends on the sampler's declared
-            // dimensionality: 2D → `.xy` (float2), Cube/3D → `.xyz` (float3,
-            // used as both a 3D coord and a cube direction vector).
+            // register ref. The coord swizzle depends on the dimensionality of
+            // the texture bound to the slot: 2D → `.xy` (float2), Cube/3D →
+            // `.xyz` (float3, both a 3D coord and a cube direction vector).
             let sampler_idx = inst.srcs[1].reg.index;
             // `texldp` (D3DSI_TEXLD_PROJECT) divides the coordinate by its `.w`
             // before sampling. The divisor is always `.w` for SM2+ (unlike the
@@ -2729,7 +2766,7 @@ fn register_write_target(reg: Register, ctx: &EmitContext) -> String {
     }
 }
 
-/// Picks the coord swizzle for a sample call based on the sampler's declared texture type.
+/// Picks the coord swizzle for a sample call based on the bound texture's type.
 ///
 /// 2D → `xy`, Cube / 3D → `xyz`. Shared by the plain `texld`, `texldl`, and
 /// `texldd` translations so future texture-dimensionality work has one site
