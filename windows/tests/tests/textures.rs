@@ -8,12 +8,12 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_NO_DIRTY_UPDATE,
-    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
+    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -1008,6 +1008,67 @@ fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
     assert_pixel_eq(inside, RED, "texel inside the updated rectangle");
     assert_pixel_eq(right_of_rect, GREEN, "texel right of the updated rectangle");
     assert_pixel_eq(below_rect, GREEN, "texel below the updated rectangle");
+}
+
+/// A plain lock of a released default-pool level hands back the level's texels.
+///
+/// The whole-level write reaches the GPU at the next draw and the staging goes
+/// with it, so a second lock has nothing left in system memory. D3D9 promises
+/// that lock the level's current contents, which leaves reading them back from
+/// the GPU as the only honest answer; the pages alone read as garbage.
+#[test]
+fn lock_of_a_released_default_pool_level_reads_the_level_back() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    // One distinct texel per position, so an uninitialised page cannot pass.
+    let written: Vec<u32> = (0..SIZE * SIZE).map(|i| 0xFF00_0000 | i).collect();
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        assert_eq!(locked.pitch(), 256, "64 texels * 4 bytes/texel row pitch");
+        locked.write_u32(&written);
+    }
+    // The draw is what uploads the level and releases its staging; which texel
+    // the centre sample lands on is not what this pins.
+    let _sampled = sample_center(&h, &tex);
+
+    let locked = tex.lock_rect(0, 0);
+    assert_eq!(
+        locked.as_u32(TEXELS),
+        written.as_slice(),
+        "the lock reads the texels the level holds"
+    );
+}
+
+/// `D3DLOCK_DISCARD` on a released default-pool level rewrites it whole.
+///
+/// DISCARD declares the level's contents dead, so the lock takes the fresh
+/// pages as they are and skips the read back. What the application writes
+/// through them is what the level holds afterwards.
+#[test]
+fn discard_lock_of_a_released_default_pool_level_rewrites_it() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const FIRST: u32 = 0xFFFF_0000;
+    const SECOND: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[FIRST; TEXELS]);
+    }
+    assert_pixel_eq(sample_center(&h, &tex).to_pixel(), FIRST, "first fill");
+
+    {
+        let mut locked = tex.lock_rect(0, D3DLOCK_DISCARD);
+        locked.write_u32(&[SECOND; TEXELS]);
+    }
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        SECOND,
+        "discard rewrite",
+    );
 }
 
 #[test]

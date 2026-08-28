@@ -191,6 +191,25 @@ pub const fn decide_lock_action(
     LockAction::WriteInPlace
 }
 
+/// Whether a Lock of a released level has to read the level back from the GPU.
+///
+/// A default-pool level whose staging was released keeps its only copy on the
+/// GPU, and D3D9 hands a `LockRect` the level's current contents. So the
+/// released staging is re-created and refilled from the GPU before the pointer
+/// goes out, unless the caller has declared the contents dead.
+///
+/// `D3DLOCK_DISCARD` is that declaration and the only flag that qualifies: it
+/// is defined for a whole-level lock and promises the caller reads nothing it
+/// did not just write. `D3DLOCK_READONLY` is the opposite promise, and
+/// `D3DLOCK_NOOVERWRITE` constrains only where the caller writes, not what it
+/// may read. D3D9 has no write-only lock flag: the "no readback expected" hint
+/// for a texture is `D3DUSAGE_DYNAMIC` at create time, and a dynamic texture
+/// keeps its staging for its whole life, so no usage bit reaches this decision.
+#[must_use]
+pub const fn released_level_lock_needs_readback(flags: u32) -> bool {
+    flags & D3DLOCK_DISCARD == 0
+}
+
 /// Byte offset into a mip's staging Box for the start of the locked rect.
 ///
 /// `pitch` is `mip_bytes_per_row` — for compressed formats this is

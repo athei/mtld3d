@@ -232,14 +232,19 @@ impl DeviceInner {
                 let mut buf = vec![0u8; len];
                 let hr = super::blit_handle_to_systemmem(
                     self,
-                    // SAFETY: `h` is non-zero (checked above) and a live retained
-                    // MTLTexture handle from the encoder texture cache.
-                    unsafe { MetalHandle::new(h) },
-                    buf.as_mut_ptr() as u64,
-                    len as u64,
-                    t.width,
-                    t.height,
-                    bytes_per_row,
+                    &super::SystemMemReadback {
+                        // SAFETY: `h` is non-zero (checked above) and a live retained
+                        // MTLTexture handle from the encoder texture cache.
+                        tex_handle: unsafe { MetalHandle::new(h) },
+                        dst_ptr: buf.as_mut_ptr() as u64,
+                        dst_len: len as u64,
+                        level: 0,
+                        width: t.width,
+                        height: t.height,
+                        bytes_per_row,
+                        full_width: t.width,
+                        full_height: t.height,
+                    },
                 );
                 if hr != 0 {
                     info!(

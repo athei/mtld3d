@@ -5548,14 +5548,19 @@ extern "system" fn device_get_render_target_data(
                 }
                 return blit_handle_to_systemmem(
                     obj.inner(),
-                    // SAFETY: `h` is non-zero (checked above) and a live
-                    // retained MTLTexture handle from the encoder's RT slot.
-                    unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-                    dst_ptr,
-                    dst_len,
-                    width,
-                    height,
-                    bytes_per_row,
+                    &SystemMemReadback {
+                        // SAFETY: `h` is non-zero (checked above) and a live
+                        // retained MTLTexture handle from the encoder's RT slot.
+                        tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(h) },
+                        dst_ptr,
+                        dst_len,
+                        level: 0,
+                        width,
+                        height,
+                        bytes_per_row,
+                        full_width: width,
+                        full_height: height,
+                    },
                 );
             }
         }
@@ -5637,47 +5642,69 @@ fn blit_texture_to_systemmem(
     device_inner.flush_current_frame_blocking();
     blit_handle_to_systemmem(
         device_inner,
-        src,
-        dst_ptr,
-        dst_len,
-        width,
-        height,
-        bytes_per_row,
+        &SystemMemReadback {
+            tex_handle: src,
+            dst_ptr,
+            dst_len,
+            level: 0,
+            width,
+            height,
+            bytes_per_row,
+            full_width: width,
+            full_height: height,
+        },
     )
+}
+
+/// Parameters for one synchronous read of a Metal texture into system memory.
+///
+/// The read starts at the texture's origin and covers `width` x `height` of mip
+/// `level`, so the extent belongs to that mip. `full_width` / `full_height` are
+/// the texture's own logical extent instead, which is what the source is
+/// measured against on the way out.
+pub struct SystemMemReadback {
+    pub tex_handle: MetalHandle<MTLTextureKind>,
+    /// Page-aligned PE-addressable destination.
+    pub dst_ptr: u64,
+    /// Page-multiple length of `dst_ptr`.
+    pub dst_len: u64,
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    /// Logical width of the texture the read is measured against.
+    ///
+    /// Equal to `width` for a mip-0 read. A scaled back buffer's texture is
+    /// smaller than this and the unix side resolves it up first; every other
+    /// source matches and the resolve is skipped.
+    pub full_width: u32,
+    /// Logical height of the texture the read is measured against.
+    ///
+    /// See [`Self::full_width`].
+    pub full_height: u32,
 }
 
 /// Synchronous `MTLTexture`→system-memory blit.
 ///
 /// Emits `copyFromTexture:toBuffer:` + `waitUntilCompleted`. The caller must
 /// have already noted the source for read-back and flushed the frame, so this
-/// is the bare data-movement step shared by the standalone-colour-handle path
-/// and the texture-RT path.
-fn blit_handle_to_systemmem(
-    device_inner: &DeviceInner,
-    tex_handle: MetalHandle<MTLTextureKind>,
-    dst_ptr: u64,
-    dst_len: u64,
-    width: u32,
-    height: u32,
-    bytes_per_row: u32,
-) -> i32 {
+/// is the bare data-movement step shared by the standalone-colour-handle path,
+/// the texture-RT path and the released-staging refill.
+pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemReadback) -> i32 {
     let mut params = BlitTextureToBufferParams {
         queue_handle: device_inner.queue_handle(),
         device_handle: device_inner.device_handle(),
-        tex_handle,
-        dst_ptr,
-        dst_len,
-        mip_level: 0,
+        tex_handle: read.tex_handle,
+        dst_ptr: read.dst_ptr,
+        dst_len: read.dst_len,
+        mip_level: read.level,
         origin_x: 0,
         origin_y: 0,
-        width,
-        height,
-        bytes_per_row,
-        // A whole-image read from the origin, so the region *is* the logical
-        // extent. If the source is a scaled back buffer its texture is
-        // smaller than this and the unix side resolves it up first.
-        source_width: width,
-        source_height: height,
+        width: read.width,
+        height: read.height,
+        bytes_per_row: read.bytes_per_row,
+        source_width: read.full_width,
+        source_height: read.full_height,
     };
     let status = unix_call(&mut params);
     if status != 0 {
