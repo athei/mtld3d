@@ -7,13 +7,14 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
+    D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
     D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
     D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
     D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -2253,4 +2254,95 @@ fn update_surface_rejects_a_standalone_source_into_a_compressed_destination() {
         D3DERR_INVALIDCALL,
         "UpdateSurface into a block-compressed destination"
     );
+}
+
+/// A `Levels` past the chain the extent allows resolves to that chain.
+///
+/// D3D9 measures a mip chain at `floor(log2(max_dim)) + 1` levels, counting
+/// depth for a volume, and every level past it would only repeat the last
+/// one. A create that asks for more gets the chain its dimensions do have,
+/// through the same resolution the colour, depth, cube and volume paths share;
+/// the request at exactly the natural count is unchanged. All four are
+/// `D3DPOOL_DEFAULT`, the pool that backs the create with a real Metal
+/// texture, whose level count is the one an over-long request would exceed.
+#[test]
+fn a_level_count_past_the_natural_chain_resolves_to_the_chain() {
+    let h = Harness::new();
+
+    // 64x64: seven levels, 64 down to 1.
+    for (levels, expected) in [(8u32, 7u32), (7, 7)] {
+        let tex = h.create_texture(64, 64, levels, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(tex.level_count(), expected, "CreateTexture levels={levels}");
+        let (hr, _) = tex.level_desc(expected - 1);
+        assert_eq!(hr, 0, "last level of the chain, levels={levels}");
+        let (hr, _) = tex.level_desc(expected);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "past the chain, levels={levels}");
+    }
+
+    // The chain the resolution settles on has to be one Metal will allocate,
+    // which is what an over-long request handed straight through would not be:
+    // fill level 0 of a managed texture created that way and sample it, so the
+    // bind creates the backing texture the request would have failed.
+    let tex = h.create_texture(64, 64, 8, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(tex.level_count(), 7, "managed CreateTexture levels=8");
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        assert_eq!(locked.pitch(), 64 * 4, "64px * 4 bytes/px row pitch");
+        locked.write_u32(&[0xFFFF_0000u32; 64 * 64]);
+    }
+    let center = sample_center(&h, &tex);
+    assert!(
+        center.r > 200 && center.g < 50 && center.b < 50,
+        "the clamped chain samples level 0, got {center:?}"
+    );
+
+    // A 64x64 depth texture measures the same chain as its colour twin.
+    for (levels, expected) in [(8u32, 7u32), (7, 7)] {
+        let tex = h.create_texture(
+            64,
+            64,
+            levels,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        );
+        assert_eq!(
+            tex.level_count(),
+            expected,
+            "depth CreateTexture levels={levels}"
+        );
+    }
+
+    // A 32-texel cube face: six levels.
+    for (levels, expected) in [(7u32, 6u32), (6, 6)] {
+        let cube = h.create_cube_texture_owned(32, levels, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(
+            cube.level_count(),
+            expected,
+            "CreateCubeTexture levels={levels}"
+        );
+    }
+
+    // 8x4x2: the chain runs on the 8-texel width, four levels, and the depth
+    // halves with it.
+    for (levels, expected) in [(5u32, 4u32), (4, 4)] {
+        let (hr, volume) =
+            h.try_create_volume_texture([8, 4, 2], levels, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(hr, 0, "CreateVolumeTexture levels={levels}");
+        let volume = volume.expect("volume texture");
+        assert_eq!(
+            volume.level_count(),
+            expected,
+            "CreateVolumeTexture levels={levels}"
+        );
+        let (hr, desc) = volume.level_desc(expected - 1);
+        assert_eq!(hr, 0, "last level of the chain, levels={levels}");
+        assert_eq!(
+            (desc.width, desc.height, desc.depth),
+            (1, 1, 1),
+            "the chain ends at one texel in every extent"
+        );
+        let (hr, _) = volume.level_desc(expected);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "past the chain, levels={levels}");
+    }
 }
