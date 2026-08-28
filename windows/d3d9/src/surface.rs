@@ -1151,13 +1151,12 @@ struct SurfaceInner {
     /// Page-aligned DIB the held `GetDC` draws into when the store is too tight.
     ///
     /// GDI steps a DIB by the row length rounded up to a dword and rejects a
-    /// pitch below it, so a store whose rows are tighter than that (a texture
-    /// level's staging, allocated at the `width * bpp` stride its upload steps
-    /// by) cannot be handed to GDI as it stands. `GetDC` then seeds this page
-    /// with the store's rows at the DIB stride and wraps it instead;
-    /// `ReleaseDC` copies the rows back and drops it. `None` whenever the
-    /// store's own pitch already carries the DIB stride, which is every
-    /// surface kind with a dedicated backing buffer.
+    /// pitch below it, so a store whose rows are tighter than that cannot be
+    /// handed to GDI as it stands. `GetDC` then seeds this page with the
+    /// store's rows at the DIB stride and wraps it instead; `ReleaseDC` copies
+    /// the rows back and drops it. `None` whenever the store's own pitch
+    /// already carries the DIB stride, which every store a surface resolves
+    /// through `linear_row_pitch` does.
     dc_shim: Option<PageBox>,
     /// Backing store for a `D3DPOOL_SYSTEMMEM` offscreen plain surface.
     ///
@@ -3338,11 +3337,9 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
         return D3DERR_INVALIDCALL;
     }
     // GDI rejects a pitch below the DIB stride outright, so a store on a
-    // tighter one (a texture level's staging, allocated at the tight stride its
-    // GPU upload steps by) gets a page of its own at the DIB stride, seeded
-    // from its rows. `ReleaseDC` copies whatever GDI drew back into the store.
-    // Every other surface kind already carries the DIB stride and is aliased
-    // directly, no copy either way.
+    // tighter one gets a page of its own at the DIB stride, seeded from its
+    // rows, and `ReleaseDC` copies whatever GDI drew back into it. A store
+    // already carrying the DIB stride is aliased directly, no copy either way.
     let mut shim = None;
     let (bits, pitch) = if px.src_pitch < dib_pitch as usize {
         let Some(mut page) = dc_shim_page(&px, dib_pitch as usize) else {

@@ -24,9 +24,9 @@ use super::{
     D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel, format_name, is_depth_format,
-    is_mapped_color_format, linear_row_pitch, map_d3d_depth_format, map_d3d_format,
-    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
+    StandaloneSurfaceKind, Swizzle, compute_mip_size, depth_format_bytes_per_pixel, format_name,
+    is_depth_format, is_mapped_color_format, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
 #[test]
@@ -534,6 +534,39 @@ fn linear_row_pitch_rounds_up_to_a_dword() {
     assert_eq!(linear_row_pitch(5, 1), 8);
     assert_eq!(linear_row_pitch(8, 1), 8);
     assert_eq!(linear_row_pitch(0, 2), 0);
+}
+
+#[test]
+fn a_mip_level_is_sized_and_strided_at_the_host_visible_pitch() {
+    // A 16-bit level at an odd width: the same 68-byte stride an offscreen
+    // surface of that width reports, and a size that holds every row at it.
+    let r5g6b5 = map_d3d_format(D3DFMT_R5G6B5).expect("mapped");
+    let (w, h, size, pitch) = compute_mip_size(33, 4, 0, &r5g6b5);
+    assert_eq!((w, h), (33, 4));
+    assert_eq!(pitch, linear_row_pitch(33, 2));
+    assert_eq!(pitch, 68);
+    assert_eq!(size, 68 * 4);
+
+    // Sub-levels round on their own width, not on level 0's.
+    let (w, h, size, pitch) = compute_mip_size(33, 4, 1, &r5g6b5);
+    assert_eq!((w, h), (16, 2));
+    assert_eq!(pitch, 32);
+    assert_eq!(size, 64);
+}
+
+#[test]
+fn a_compressed_mip_level_is_sized_in_block_rows() {
+    let dxt1 = map_d3d_format(D3DFMT_DXT1).expect("mapped");
+    let (w, h, size, pitch) = compute_mip_size(64, 64, 0, &dxt1);
+    assert_eq!((w, h), (64, 64));
+    assert_eq!(pitch, 128);
+    assert_eq!(size, 128 * 16);
+
+    // A 1x1 level still occupies one whole block.
+    let (w, h, size, pitch) = compute_mip_size(64, 64, 6, &dxt1);
+    assert_eq!((w, h), (1, 1));
+    assert_eq!(pitch, 8);
+    assert_eq!(size, 8);
 }
 
 #[test]
