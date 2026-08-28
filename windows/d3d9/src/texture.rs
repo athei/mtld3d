@@ -12,7 +12,8 @@ use mtld3d_core::{
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
-        LockAction, MipShape, PreserveKind, decide_lock_action, staging_droppable_class,
+        LockAction, MipShape, PreserveKind, decide_lock_action, honoured_lock_flags, is_in_flight,
+        staging_droppable_class,
     },
 };
 use mtld3d_shared::{
@@ -22,12 +23,12 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DBOX, D3DFMT_UYVY, D3DFMT_YUY2, D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE,
-    D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_DYNAMIC,
-    D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl,
-    IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9,
-    IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
+    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9,
+    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
     IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
@@ -48,6 +49,14 @@ use super::{
 /// `EvictManagedResources` action. Mirrors `device.rs::TEX_TRACE_TARGET`; both
 /// files key the same `RUST_LOG=mtld3d::d3d9::tex=trace` switch.
 const TEX_TRACE_TARGET: &str = "mtld3d::d3d9::tex";
+
+/// The word the lock-rename trace line uses for a [`PreserveKind`].
+const fn preserve_label(preserve: PreserveKind) -> &'static str {
+    match preserve {
+        PreserveKind::None => "none",
+        PreserveKind::Cpu => "cpu",
+    }
+}
 
 /// Cube-map face count; `D3DCUBEMAP_FACE_*` are `0..=5`.
 pub const CUBE_FACE_COUNT: u32 = 6;
@@ -98,6 +107,15 @@ struct CubeStorage {
     dirty_masks: [u32; CUBE_FACE_COUNT as usize],
     current_lock_readonly: Vec<bool>,
     current_lock_no_dirty: Vec<bool>,
+    /// The rect each subresource's open `LockRect` named (`None` = whole face level).
+    ///
+    /// Read back at `UnlockRect` to publish only what the lock covered.
+    current_lock_rect: Vec<Option<DirtyRect>>,
+    /// Sub-rect a dirty face level's upload may narrow to (`None` = whole level).
+    ///
+    /// The cube form of `TextureInner::pending_upload_rects`, indexed by
+    /// subresource; whole-level writes reset the entry to `None`.
+    pending_upload_rects: Vec<Option<DirtyRect>>,
     last_submit_seq: Vec<u64>,
     was_uploaded: Vec<bool>,
     locked: Vec<bool>,
@@ -113,6 +131,8 @@ impl CubeStorage {
             dirty_masks: [0; CUBE_FACE_COUNT as usize],
             current_lock_readonly: vec![false; count],
             current_lock_no_dirty: vec![false; count],
+            current_lock_rect: vec![None; count],
+            pending_upload_rects: vec![None; count],
             last_submit_seq: vec![0; count],
             was_uploaded: vec![false; count],
             locked: vec![false; count],
@@ -159,8 +179,11 @@ pub struct TextureInner {
     usage_flags: TextureUsage,
     /// Raw D3D9 `D3DUSAGE_*` bits.
     ///
-    /// Read by `lock_region_ptr` to detect the full-mip
-    /// non-{DISCARD,READONLY,WRITEONLY} correctness gap.
+    /// Read by the lock entry points to tell the default-pool texture D3D9
+    /// lets the game lock (`D3DUSAGE_DYNAMIC`) from the one it does not, and
+    /// by the staging-release class. A Lock's preserve decision does not read
+    /// it: D3D9 keeps a level's contents across a plain Lock whatever the
+    /// usage says.
     d3d_usage: u32,
     /// What the backing Metal texture is rasterized at relative to `width`/`height`.
     ///
@@ -231,8 +254,10 @@ pub struct TextureInner {
     /// upload re-creates the staging uninitialized outside the copied
     /// region; a whole-mip upload would then push that garbage over GPU
     /// content the copy never touched. Tracking the written union lets the
-    /// flush upload only what the copies wrote. Whole-mip writes reset the
-    /// entry to `None`.
+    /// flush upload only what the copies wrote. A partial `LockRect` narrows
+    /// the same way: its `UnlockRect` publishes the rect the lock named, so a
+    /// glyph written into a font atlas costs a glyph-sized blit. Whole-mip
+    /// writes reset the entry to `None`.
     pending_upload_rects: Vec<Option<DirtyRect>>,
     /// Levels whose staging was released after their upload retired (bit N = level N).
     ///
@@ -274,6 +299,11 @@ pub struct TextureInner {
     /// Its `UnlockRect` must NOT add a source dirty rect, so a later
     /// `UpdateTexture` ignores it, per the D3D9 spec.
     current_lock_no_dirty: Vec<bool>,
+    /// The rect each mip's open `LockRect` named (`None` = whole mip).
+    ///
+    /// Read back at `UnlockRect`, which publishes only what the lock covered
+    /// and adds only that to the `UpdateTexture` source dirty region.
+    current_lock_rect: Vec<Option<DirtyRect>>,
     /// Per-mip submit seq of the most recent GPU-visible reference to this staging.
     ///
     /// Stamped by `schedule_upload` on the API thread. Compared against
@@ -2129,20 +2159,37 @@ impl TextureInner {
             coherent_seq,
             last_submit_seq,
             flags,
-            self.d3d_usage,
+            self.d3d_pool,
             rect,
-            MipShape {
-                mip_w: self.mip_widths[level],
-                mip_h: self.mip_heights[level],
-                block_w: self.block_w,
-                block_h: self.block_h,
-            },
+            self.mip_shape(level),
         );
         let device_inner = self.device_inner;
+        let texture_id = self.texture_id;
         let cube = self.cube.as_deref_mut()?;
         let base = match action {
-            LockAction::WriteInPlace => cube.staging[index].as_ptr().cast_mut(),
+            LockAction::WriteInPlace => {
+                // The kept divergence, counted like its VB/IB twin: a
+                // contended partial Lock handed back over bytes an upload
+                // may still be reading (README, "Faster than conformant").
+                if flags & D3DLOCK_NOOVERWRITE == 0
+                    && is_in_flight(last_submit_seq, coherent_seq)
+                    && device_inner != 0
+                {
+                    DeviceInner::from_ptr(device_inner)
+                        .perf_mut()
+                        .bump_texture_write_in_place_contended();
+                }
+                cube.staging[index].as_ptr().cast_mut()
+            }
             LockAction::FreshBox { preserve } => {
+                mtld3d_shared::log_once_trace_by!(
+                    target: TEX_TRACE_TARGET,
+                    key: (texture_id.raw() << 8)
+                        | (index as u64 & 0x7f)
+                        | (u64::from(preserve == PreserveKind::Cpu) << 7),
+                    "cube {texture_id:#x} face {face} mip {level} lock rename preserve={}",
+                    preserve_label(preserve)
+                );
                 let mip_len = cube.staging[index].logical_len();
                 let old = core::mem::replace(
                     &mut cube.staging[index],
@@ -2174,17 +2221,32 @@ impl TextureInner {
         Some((unsafe { base.add(offset) }, pitch))
     }
 
-    fn cube_stash_lock(&mut self, face: u32, level: usize, read_only: bool, no_dirty: bool) {
+    fn cube_stash_lock(
+        &mut self,
+        face: u32,
+        level: usize,
+        read_only: bool,
+        no_dirty: bool,
+        rect: Option<DirtyRect>,
+    ) {
         let index = self
             .cube_subresource_index(face, level)
             .expect("validated cube subresource");
         let cube = self.cube.as_deref_mut().expect("cube storage");
         cube.current_lock_readonly[index] = read_only;
         cube.current_lock_no_dirty[index] = no_dirty;
+        cube.current_lock_rect[index] = rect;
         cube.locked[index] = true;
     }
 
-    fn cube_take_lock(&mut self, face: u32, level: usize) -> (bool, bool, bool, bool) {
+    /// Consume the state `cube_stash_lock` left for one face level.
+    ///
+    /// Returns `(read_only, no_dirty, was_locked, was_uploaded, lock_rect)`.
+    fn cube_take_lock(
+        &mut self,
+        face: u32,
+        level: usize,
+    ) -> (bool, bool, bool, bool, Option<DirtyRect>) {
         let index = self
             .cube_subresource_index(face, level)
             .expect("validated cube subresource");
@@ -2192,19 +2254,56 @@ impl TextureInner {
         let was_locked = core::mem::take(&mut cube.locked[index]);
         let read_only = core::mem::take(&mut cube.current_lock_readonly[index]);
         let no_dirty = core::mem::take(&mut cube.current_lock_no_dirty[index]);
+        let rect = core::mem::take(&mut cube.current_lock_rect[index]);
         let was_uploaded = cube.was_uploaded[index];
-        (read_only, no_dirty, was_locked, was_uploaded)
+        (read_only, no_dirty, was_locked, was_uploaded, rect)
     }
 
     fn mark_cube_dirty(&mut self, face: u32, level: usize) {
         if level >= (self.levels as usize).min(32) || face >= CUBE_FACE_COUNT {
             return;
         }
+        let index = self.cube_subresource_index(face, level);
         let cube = self.cube.as_deref_mut().expect("cube storage");
         cube.dirty_masks[face as usize] |= 1 << level;
+        if let Some(index) = index {
+            cube.pending_upload_rects[index] = None;
+        }
         // Preserve the established single-load fast gate. Face selection is
         // deferred to `flush_dirty_mips_slow` after this aggregate bit fires.
         self.dirty_mask |= 1 << level;
+    }
+
+    /// The cube form of `mark_mip_dirty_rect`: dirty one face level for `rect` of it.
+    ///
+    /// A face level already dirty for its whole extent stays whole; partial
+    /// marks union. Cubes never release their staging, so there is no coverage
+    /// to feed.
+    fn mark_cube_dirty_rect(&mut self, face: u32, level: usize, rect: DirtyRect) {
+        if level >= (self.levels as usize).min(32) || face >= CUBE_FACE_COUNT {
+            return;
+        }
+        let Some(index) = self.cube_subresource_index(face, level) else {
+            return;
+        };
+        let cube = self.cube.as_deref_mut().expect("cube storage");
+        let already_full = cube.dirty_masks[face as usize] & (1 << level) != 0
+            && cube.pending_upload_rects[index].is_none();
+        cube.dirty_masks[face as usize] |= 1 << level;
+        if !already_full {
+            cube.pending_upload_rects[index] =
+                Some(cube.pending_upload_rects[index].map_or(rect, |cur| cur.union(rect)));
+        }
+        self.dirty_mask |= 1 << level;
+    }
+
+    /// The cube form of `mark_written_region`.
+    fn mark_cube_written_region(&mut self, face: u32, level: usize, rect: DirtyRect) {
+        if self.write_covers_level(level, rect) {
+            self.mark_cube_dirty(face, level);
+        } else {
+            self.mark_cube_dirty_rect(face, level, rect);
+        }
     }
 
     fn mark_cube_update_dirty(&mut self, face: u32, level: usize, rect: Option<DirtyRect>) {
@@ -2214,18 +2313,7 @@ impl TextureInner {
         let add =
             rect.unwrap_or_else(|| DirtyRect::full(self.mip_width(level), self.mip_height(level)));
         let cube = self.cube.as_deref_mut().expect("cube storage");
-        cube.update_dirty[index] = Some(cube.update_dirty[index].map_or(add, |cur| {
-            let x = cur.x.min(add.x);
-            let y = cur.y.min(add.y);
-            let right = (cur.x + cur.w).max(add.x + add.w);
-            let bottom = (cur.y + cur.h).max(add.y + add.h);
-            DirtyRect {
-                x,
-                y,
-                w: right - x,
-                h: bottom - y,
-            }
-        }));
+        cube.update_dirty[index] = Some(cube.update_dirty[index].map_or(add, |cur| cur.union(add)));
     }
 
     /// Return a pointer into the staging buffer for `LockRect`.
@@ -2318,14 +2406,9 @@ impl TextureInner {
             coherent_seq,
             self.last_submit_seq[level],
             flags,
-            self.d3d_usage,
+            self.d3d_pool,
             rect,
-            MipShape {
-                mip_w: self.mip_widths[level],
-                mip_h: self.mip_heights[level],
-                block_w: self.block_w,
-                block_h: self.block_h,
-            },
+            self.mip_shape(level),
         );
 
         let base: *mut u8 = match action {
@@ -2342,9 +2425,32 @@ impl TextureInner {
                 // well-behaved-game no-overlap contract the locked
                 // sub-rect doesn't overlap any in-flight read range.
                 // Same model `vb_lock` now uses (see `plan_lock` doc).
+                //
+                // Counted when it is the kept divergence: a contended
+                // partial Lock without NOOVERWRITE handed back over
+                // bytes an upload may still be reading (README, "Faster
+                // than conformant"). READONLY returned above and an
+                // uncontended Lock is the specified behaviour.
+                if flags & D3DLOCK_NOOVERWRITE == 0
+                    && is_in_flight(self.last_submit_seq[level], coherent_seq)
+                    && self.device_inner != 0
+                {
+                    DeviceInner::from_ptr(self.device_inner)
+                        .perf_mut()
+                        .bump_texture_write_in_place_contended();
+                }
                 self.staging[level].as_ptr().cast_mut()
             }
             LockAction::FreshBox { preserve } => {
+                mtld3d_shared::log_once_trace_by!(
+                    target: TEX_TRACE_TARGET,
+                    key: (self.texture_id.raw() << 8)
+                        | (level as u64 & 0x7f)
+                        | (u64::from(preserve == PreserveKind::Cpu) << 7),
+                    "tex {:#x} mip {level} lock rename preserve={}",
+                    self.texture_id.raw(),
+                    preserve_label(preserve)
+                );
                 // Logical mip-byte length, not the page-padded total
                 // — the memcpy below moves exactly the bytes the game
                 // can read.
@@ -2358,10 +2464,9 @@ impl TextureInner {
                 let perf_attached = dev_inner_raw != 0;
                 match preserve {
                     PreserveKind::None => {
-                        // Explicit DISCARD or whole-mip DYNAMIC:
-                        // game promised it won't read, and the
-                        // encoder's blit only reads the locked rect.
-                        // The fresh allocation carries none of the old
+                        // A whole-level DISCARD: the game promised to
+                        // rewrite every byte before reading any. The
+                        // fresh allocation carries none of the old
                         // pixels, so the written union starts over.
                         self.reset_staging_coverage(level);
                         if perf_attached {
@@ -2372,13 +2477,12 @@ impl TextureInner {
                     }
                     PreserveKind::Cpu => {
                         // Game might read old bytes through the Lock
-                        // pointer (whole-mip non-WRITEONLY), OR the
-                        // encoder's compressed full-mip-fallback will
-                        // read bytes outside the locked rect. Either
-                        // way: carry the old bytes across synchronously
-                        // on the API thread. The `old` Arc keeps the
-                        // source bytes live for the duration of the
-                        // copy.
+                        // pointer (whole-mip lock), OR the encoder's
+                        // compressed full-mip-fallback will read bytes
+                        // outside the locked rect. Either way: carry the
+                        // old bytes across synchronously on the API
+                        // thread. The `old` Arc keeps the source bytes
+                        // live for the duration of the copy.
                         if perf_attached {
                             DeviceInner::from_ptr(dev_inner_raw)
                                 .perf_mut()
@@ -2420,20 +2524,63 @@ impl TextureInner {
         (ptr, pitch, offset)
     }
 
-    fn stash_lock(&mut self, level: usize, read_only: bool, no_dirty: bool) {
+    fn stash_lock(
+        &mut self,
+        level: usize,
+        read_only: bool,
+        no_dirty: bool,
+        rect: Option<DirtyRect>,
+    ) {
         self.current_lock_readonly[level] = read_only;
         self.current_lock_no_dirty[level] = no_dirty;
+        self.current_lock_rect[level] = rect;
         self.locked[level] = true;
     }
 
     /// Consume the state stashed by `stash_lock` at `UnlockRect` time.
     ///
-    /// Returns `(was_read_only, was_properly_locked)`.
-    fn take_lock(&mut self, level: usize) -> (bool, bool) {
-        let was_locked = self.locked[level];
-        self.locked[level] = false;
+    /// Returns `(was_read_only, no_dirty_update, was_properly_locked, lock_rect)`.
+    fn take_lock(&mut self, level: usize) -> (bool, bool, bool, Option<DirtyRect>) {
+        let was_locked = core::mem::take(&mut self.locked[level]);
         let read_only = core::mem::take(&mut self.current_lock_readonly[level]);
-        (read_only, was_locked)
+        let no_dirty = core::mem::take(&mut self.current_lock_no_dirty[level]);
+        let rect = core::mem::take(&mut self.current_lock_rect[level]);
+        (read_only, no_dirty, was_locked, rect)
+    }
+
+    /// The `D3DLOCK_*` bits a Lock of `level` is served with.
+    ///
+    /// See `honoured_lock_flags`. A dropped `D3DLOCK_DISCARD` is logged once
+    /// per texture: the game asked for a discard it does not get, which is
+    /// what D3D9 gives it too, but the line is where to look when its writes
+    /// come out wrong.
+    fn served_lock_flags(&self, level: usize, rect: Option<DirtyRect>, flags: u32) -> u32 {
+        let served = honoured_lock_flags(flags, self.d3d_pool, rect, self.mip_shape(level));
+        if served != flags {
+            let shape = if self.d3d_pool == D3DPOOL_DEFAULT {
+                "partial"
+            } else {
+                "non-default-pool"
+            };
+            mtld3d_shared::log_once_info_by!(
+                target: TEX_TRACE_TARGET,
+                key: self.texture_id.raw(),
+                "tex {:#x}: D3DLOCK_DISCARD on a {shape} lock is ignored, the level keeps its \
+                 contents",
+                self.texture_id.raw()
+            );
+        }
+        served
+    }
+
+    /// The mip and block dimensions of `level`, as the lock decision reads them.
+    fn mip_shape(&self, level: usize) -> MipShape {
+        MipShape {
+            mip_w: self.mip_widths[level],
+            mip_h: self.mip_heights[level],
+            block_w: self.block_w,
+            block_h: self.block_h,
+        }
     }
 
     /// Whether `level` is currently mapped (`LockRect` held).
@@ -2485,18 +2632,7 @@ impl TextureInner {
             return;
         }
         if let Some(slot) = self.pending_upload_rects.get_mut(level) {
-            *slot = Some(slot.map_or(rect, |cur| {
-                let x = cur.x.min(rect.x);
-                let y = cur.y.min(rect.y);
-                let right = (cur.x + cur.w).max(rect.x + rect.w);
-                let bottom = (cur.y + cur.h).max(rect.y + rect.h);
-                DirtyRect {
-                    x,
-                    y,
-                    w: right - x,
-                    h: bottom - y,
-                }
-            }));
+            *slot = Some(slot.map_or(rect, |cur| cur.union(rect)));
         }
     }
 
@@ -2522,18 +2658,7 @@ impl TextureInner {
         }
         let add =
             rect.unwrap_or_else(|| DirtyRect::full(self.mip_width(level), self.mip_height(level)));
-        self.update_dirty[level] = Some(self.update_dirty[level].map_or(add, |cur| {
-            let x = cur.x.min(add.x);
-            let y = cur.y.min(add.y);
-            let right = (cur.x + cur.w).max(add.x + add.w);
-            let bottom = (cur.y + cur.h).max(add.y + add.h);
-            DirtyRect {
-                x,
-                y,
-                w: right - x,
-                h: bottom - y,
-            }
-        }));
+        self.update_dirty[level] = Some(self.update_dirty[level].map_or(add, |cur| cur.union(add)));
     }
 
     /// Record that a read-back rewrote one subresource's staging.
@@ -2630,9 +2755,10 @@ pub struct TextureCreateInfo {
     pub usage_flags: TextureUsage,
     /// Raw D3D9 `D3DUSAGE_*` bits as passed to `CreateTexture`.
     ///
-    /// Kept on `TextureInner` alongside the Metal `usage_flags` so
-    /// `lock_region_ptr` can gate the non-WRITEONLY CPU-memcpy preserve on the
-    /// contended-rename path.
+    /// Kept on `TextureInner` alongside the Metal `usage_flags`: the lock
+    /// entry points read `D3DUSAGE_DYNAMIC` to tell a lockable default-pool
+    /// texture from one D3D9 rejects, and the staging-release class reads the
+    /// render-target and depth bits.
     pub d3d_usage: u32,
     /// Scale for the backing Metal texture; see [`TextureInner::render_scale`].
     pub render_scale: RenderScale,
@@ -2762,6 +2888,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         pending_upload_rects: vec![None; mip_count],
         current_lock_readonly: vec![false; mip_count],
         current_lock_no_dirty: vec![false; mip_count],
+        current_lock_rect: vec![None; mip_count],
         last_submit_seq: vec![0; mip_count],
         was_uploaded: vec![false; mip_count],
         locked: vec![false; mip_count],
@@ -3583,18 +3710,23 @@ extern "system" fn texture_lock_rect(
             return D3DERR_INVALIDCALL;
         }
     }
+    let dirty_rect = parse_rect(rect, mip_w, mip_h);
+    // A `D3DLOCK_DISCARD` the lock cannot honour (partial rect, CPU pool) is
+    // dropped here, so every consumer below sees the flags the lock is served
+    // with.
+    let flags = ti.served_lock_flags(level_u, dirty_rect, flags);
     // A level the GPU wrote with no CPU mirror has to be read back before the
     // Lock hands out a pointer into staging, and before `lock_region_ptr` may
-    // rename the box (a preserve then copies the fresh bytes). `D3DLOCK_DISCARD`
-    // promises a whole-level overwrite, so it skips the stall and the claim goes
-    // with it: the staging this Lock hands out is what the level holds next.
+    // rename the box (a preserve then copies the fresh bytes). A surviving
+    // `D3DLOCK_DISCARD` is a whole-level one and promises a whole-level
+    // overwrite, so it skips the stall and the claim goes with it: the staging
+    // this Lock hands out is what the level holds next.
     ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0);
-    let dirty_rect = parse_rect(rect, mip_w, mip_h);
     let read_only = flags & D3DLOCK_READONLY != 0;
     let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
 
     let (ptr, pitch, _offset) = ti.lock_region_ptr(level_u, dirty_rect, flags);
-    ti.stash_lock(level_u, read_only, no_dirty);
+    ti.stash_lock(level_u, read_only, no_dirty, dirty_rect);
 
     // SAFETY: `out_locked_rect` is non-null (checked above) and per the
     // D3D9 ABI points to a writable `D3DLOCKED_RECT` slot owned by the
@@ -3637,7 +3769,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     }
     let level_u = level as usize;
-    let (read_only, was_locked) = ti.take_lock(level_u);
+    let (read_only, no_dirty, was_locked, lock_rect) = ti.take_lock(level_u);
     if !was_locked {
         // A texture-level surface's (and IDirect3DTexture9::UnlockRect's)
         // Unlock-without-Lock / double-Unlock returns S_OK in D3D9 for a
@@ -3659,20 +3791,25 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     if read_only && ti.was_uploaded[level_u] {
         return 0;
     }
-    // A non-READONLY Unlock marks the whole mip dirty as an UpdateTexture source
-    // (the game wrote it via Lock); a later UpdateTexture from this texture then
-    // copies it and clears the dirty flag. A
+    // A non-READONLY Unlock adds the locked rect (the whole mip for a rect-less
+    // Lock) to the UpdateTexture source dirty region; a later UpdateTexture
+    // from this texture then copies it and clears the region. A
     // D3DLOCK_NO_DIRTY_UPDATE lock is excluded — UpdateTexture must ignore it. A
     // READONLY first lock wrote nothing, so it adds no UpdateTexture dirty rect;
     // it only triggers the one-time initial upload below.
-    if !read_only && !ti.current_lock_no_dirty[level_u] {
-        ti.mark_update_dirty(level_u, None);
+    if !read_only && !no_dirty {
+        ti.mark_update_dirty(level_u, lock_rect);
     }
     // Lazy upload: flag the mip dirty and return. Bind-time
     // `flush_dirty_mips` dispatches the actual upload via
     // `schedule_upload` — Unlock is now a single byte write, the
-    // Box+Arc+Vec work happens at first bind after this Unlock.
-    ti.mark_mip_dirty(level_u);
+    // Box+Arc+Vec work happens at first bind after this Unlock. A writing
+    // Lock publishes the rect it named and nothing more; the initial upload a
+    // READONLY first lock triggers carries the whole mip.
+    match lock_rect {
+        Some(rect) if !read_only => ti.mark_written_region(level_u, rect),
+        _ => ti.mark_mip_dirty(level_u),
+    }
     let texture_id = ti.texture_id;
     let device_inner_ptr = ti.device_inner;
     mtld3d_shared::log_once_trace_by!(
@@ -3896,6 +4033,18 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
     ti.last_submit_seq[level as usize] = dev.current_seq();
     ti.was_uploaded[level as usize] = true;
+    // Once per (texture, level, whole-or-partial), so a log shows which levels
+    // publish sub-rects and which always go whole.
+    let partial = !ti.write_covers_level(level_u, rect);
+    mtld3d_shared::log_once_trace_by!(
+        target: TEX_TRACE_TARGET,
+        key: (texture_id.raw() << 8) | (level_u as u64 & 0x7f) | (u64::from(partial) << 7),
+        "tex {texture_id:#x} mip {level} upload {},{} {}x{}",
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h
+    );
     // Every byte of a level the game cannot lock again is now on the GPU: each
     // write since the staging was allocated was uploaded by the flush that
     // followed it, this one included, and together they cover the level. The
@@ -3924,6 +4073,17 @@ fn schedule_cube_upload(
         .expect("validated cube subresource");
     let block_rows = ti.mip_height(level_u).div_ceil(ti.block_h.max(1));
     let slice_pitch = ti.mip_bytes_per_row(level_u).saturating_mul(block_rows);
+    let partial = !ti.write_covers_level(level_u, rect);
+    let texture_id = ti.texture_id;
+    mtld3d_shared::log_once_trace_by!(
+        target: TEX_TRACE_TARGET,
+        key: (texture_id.raw() << 8) | (index as u64 & 0x7f) | (u64::from(partial) << 7),
+        "cube {texture_id:#x} face {face} mip {level} upload {},{} {}x{}",
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h
+    );
     let cube = ti.cube.as_deref_mut().expect("cube storage");
     let arc = Arc::clone(&cube.staging[index]);
     cube.last_submit_seq[index] = dev.current_seq();
@@ -4128,7 +4288,18 @@ fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
                 let level = mask.trailing_zeros();
                 mask &= mask - 1;
                 let level_u = level as usize;
-                let rect = DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]);
+                let index = ti
+                    .cube_subresource_index(face, level_u)
+                    .expect("validated cube subresource");
+                let rect = ti
+                    .cube
+                    .as_deref_mut()
+                    .expect("cube storage")
+                    .pending_upload_rects[index]
+                    .take()
+                    .unwrap_or_else(|| {
+                        DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u])
+                    });
                 schedule_cube_upload(ti, dev, face, level, rect);
                 regenerate_mipmaps |= ti.autogen_mipmap() && level == 0;
                 dirty_count += 1;
@@ -4401,7 +4572,7 @@ extern "system" fn volume_lock_box(
     };
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.
-    inner.stash_lock(lvl, false, false);
+    inner.stash_lock(lvl, false, false, None);
     // SAFETY: `offset` lands inside the level's allocation — the box is
     // validated above against the level dimensions and `lock_box` sized the
     // backing as `slice_pitch * depth`.
@@ -4427,7 +4598,7 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
     if lvl >= inner.levels as usize {
         return D3DERR_INVALIDCALL;
     }
-    let (read_only, was_locked) = inner.take_lock(lvl);
+    let (read_only, _, was_locked, _) = inner.take_lock(lvl);
     if !was_locked {
         // UnlockBox without a matching LockBox (or a double-Unlock) is INVALIDCALL.
         return D3DERR_INVALIDCALL;
@@ -4965,12 +5136,14 @@ pub extern "system" fn cube_lock_rect(
             return D3DERR_INVALIDCALL;
         }
     }
+    let dirty_rect = parse_rect(rect, mip_w, mip_h);
+    let flags = ti.served_lock_flags(level_u, dirty_rect, flags);
     // A face the GPU wrote with no CPU mirror has to be read back before the
     // Lock hands out a pointer into its staging, and before `cube_lock_region_ptr`
-    // may rename the box. `D3DLOCK_DISCARD` promises a whole-level overwrite, so
-    // it skips the stall and the claim goes with it.
+    // may rename the box. A surviving `D3DLOCK_DISCARD` is a whole-level one and
+    // promises a whole-level overwrite, so it skips the stall and the claim goes
+    // with it.
     ti.move_subresource_to_staging(face, level_u, flags & D3DLOCK_DISCARD != 0);
-    let dirty_rect = parse_rect(rect, mip_w, mip_h);
     let Some((ptr, pitch)) = ti.cube_lock_region_ptr(face, level_u, dirty_rect, flags) else {
         return D3DERR_INVALIDCALL;
     };
@@ -4979,6 +5152,7 @@ pub extern "system" fn cube_lock_rect(
         level_u,
         flags & D3DLOCK_READONLY != 0,
         flags & D3DLOCK_NO_DIRTY_UPDATE != 0,
+        dirty_rect,
     );
     // SAFETY: checked non-null and points to a writable ABI out-param.
     let out = unsafe { &mut *locked_rect };
@@ -5001,7 +5175,8 @@ pub extern "system" fn cube_unlock_rect(this: *mut c_void, face: u32, level: u32
         return D3DERR_INVALIDCALL;
     }
     let level_u = level as usize;
-    let (read_only, no_dirty, was_locked, was_uploaded) = ti.cube_take_lock(face, level_u);
+    let (read_only, no_dirty, was_locked, was_uploaded, lock_rect) =
+        ti.cube_take_lock(face, level_u);
     if !was_locked {
         return D3D_OK;
     }
@@ -5009,9 +5184,14 @@ pub extern "system" fn cube_unlock_rect(this: *mut c_void, face: u32, level: u32
         return D3D_OK;
     }
     if !read_only && !no_dirty {
-        ti.mark_cube_update_dirty(face, level_u, None);
+        ti.mark_cube_update_dirty(face, level_u, lock_rect);
     }
-    ti.mark_cube_dirty(face, level_u);
+    // The 2D rule: a writing Lock publishes the rect it named, a READONLY
+    // first lock triggers the whole face level's initial upload.
+    match lock_rect {
+        Some(rect) if !read_only => ti.mark_cube_written_region(face, level_u, rect),
+        _ => ti.mark_cube_dirty(face, level_u),
+    }
     let device_inner = ti.device_inner;
     if device_inner != 0 {
         // SAFETY: the cube's device back-reference remains live while attached.

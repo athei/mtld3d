@@ -11,27 +11,28 @@
 //! Decision tree:
 //! - `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY`, or uncontended
 //!   (`last_submit_seq <= coherent_seq`): `WriteInPlace`.
-//! - `D3DLOCK_DISCARD`: Rename, no preserve (game promised the old
-//!   bytes are gone).
-//! - Whole-mip contended: Rename. `D3DUSAGE_DYNAMIC` → no preserve;
-//!   non-DYNAMIC → CPU-memcpy preserve (game might read all bytes
-//!   through the Lock pointer — only possible when the Lock covers
-//!   the full mip).
+//! - `D3DLOCK_DISCARD` on a whole-mip Lock of a `D3DPOOL_DEFAULT`
+//!   texture: Rename, no preserve (game promised the old bytes are
+//!   gone). Every other DISCARD is dropped first, see
+//!   [`honoured_lock_flags`].
+//! - Whole-mip contended: Rename + CPU-memcpy preserve. The game may
+//!   read every byte through the Lock pointer, and D3D9 hands it the
+//!   level's current contents whatever the texture's usage says.
 //! - Partial contended, compressed AND not block-aligned: Rename + Cpu
-//!   preserve (always Cpu, even with DYNAMIC) — see
-//!   `rect_block_aligned` for the formula and why preserve is forced.
+//!   preserve — see `rect_block_aligned` for the formula and why
+//!   preserve is forced.
 //! - Partial contended, otherwise (uncompressed or block-aligned):
 //!   `WriteInPlace`. Relies on the well-behaved-game no-overlap contract.
 //!
-//! Why DYNAMIC and not WRITEONLY: `plan_lock` keys the buffer
-//! equivalent on `D3DUSAGE_WRITEONLY` because that's the
-//! spec-documented "no readback" hint for `CreateVertexBuffer` /
-//! `CreateIndexBuffer`. Microsoft does not document
-//! `D3DUSAGE_WRITEONLY` for `CreateTexture`; `D3DUSAGE_DYNAMIC` is the
-//! texture-side "frequently updated, no readback expected" hint
-//! instead. It is also the prerequisite for legally passing
-//! `D3DLOCK_DISCARD` on a texture, so games that care about the fast
-//! path opt in via `DYNAMIC` either way.
+//! Why `D3DUSAGE_DYNAMIC` has no say: `plan_lock` keys the buffer
+//! equivalent on `D3DUSAGE_WRITEONLY`, the spec-documented "no readback"
+//! hint for `CreateVertexBuffer` / `CreateIndexBuffer`. `CreateTexture`
+//! documents no such hint. DYNAMIC only makes a default-pool level
+//! lockable and DISCARD legal on it; a plain Lock of a dynamic texture
+//! still sees the level's contents, as D3D9 specifies for every lockable
+//! resource. A game that locks a whole dynamic page and rewrites a few
+//! blocks of it (a lightmap page under animated light styles) relies on
+//! exactly that, so the whole-mip arm preserves regardless of usage.
 //!
 //! Why no GPU preserve path: `copyFromBuffer:toTexture:` only writes
 //! the locked sub-rect, leaving prior `MTLTexture` pixels intact. The
@@ -61,17 +62,16 @@ use crate::{dirty_rect::DirtyRect, texture_flags::TextureFlags};
 pub enum PreserveKind {
     /// No preserve needed.
     ///
-    /// Either `D3DLOCK_DISCARD` was set, or the caller is a whole-mip
-    /// `D3DUSAGE_DYNAMIC` Lock (the texture-side "no readback
-    /// expected" hint; the encoder's blit only reads the locked rect).
+    /// `D3DLOCK_DISCARD` on a whole-mip Lock of a default-pool texture:
+    /// the game promised to rewrite every byte before it reads any.
     None,
     /// Caller must synchronously memcpy the old `PageBox` into the fresh allocation.
     ///
     /// The copy happens before returning the Lock pointer. Two cases:
-    /// (a) whole-mip non-DYNAMIC contended (game might read all bytes
-    /// through the pointer); (b) partial-but-unaligned compressed
-    /// contended (encoder will fall back to a full-mip blit;
-    /// outside-rect bytes must be valid).
+    /// (a) whole-mip contended (game might read all bytes through the
+    /// pointer); (b) partial-but-unaligned compressed contended (encoder
+    /// will fall back to a full-mip blit; outside-rect bytes must be
+    /// valid).
     Cpu,
 }
 
@@ -109,8 +109,46 @@ pub struct MipShape {
 
 /// Is the slot's last write still potentially being read by the GPU?
 #[inline]
-const fn is_in_flight(slot_last_submit_seq: u64, coherent_seq: u64) -> bool {
+#[must_use]
+pub const fn is_in_flight(slot_last_submit_seq: u64, coherent_seq: u64) -> bool {
     slot_last_submit_seq > coherent_seq
+}
+
+/// Whether `rect` covers the whole mip (`None` is a whole-mip Lock).
+///
+/// `>=` for tolerance; `parse_rect` already clamps so equality is typical.
+#[inline]
+#[must_use]
+pub const fn is_whole_mip(rect: Option<DirtyRect>, shape: MipShape) -> bool {
+    match rect {
+        None => true,
+        Some(r) => r.x == 0 && r.y == 0 && r.w >= shape.mip_w && r.h >= shape.mip_h,
+    }
+}
+
+/// The `D3DLOCK_*` bits a Lock is served with: `flags` less a `D3DLOCK_DISCARD` it cannot honour.
+///
+/// DISCARD is honoured on a whole-mip Lock of a `D3DPOOL_DEFAULT` texture only,
+/// the one shape where "the contents are dead" can be taken literally. The
+/// staging is the CPU mirror of the whole level and a later re-upload (device
+/// recreate, managed eviction) publishes all of it, so a partial DISCARD would
+/// leave the bytes outside the rect undefined in what gets published. The
+/// managed and system-memory pools are served from that mirror for their whole
+/// life, so the same holds for every Lock of theirs. The game's writes then
+/// land on preserved contents, which is what D3D9 hands a lock that carries no
+/// usable discard.
+#[must_use]
+pub const fn honoured_lock_flags(
+    flags: u32,
+    pool: u32,
+    rect: Option<DirtyRect>,
+    shape: MipShape,
+) -> u32 {
+    if pool == D3DPOOL_DEFAULT && is_whole_mip(rect, shape) {
+        flags
+    } else {
+        flags & !D3DLOCK_DISCARD
+    }
 }
 
 /// Block-aligned in the sense the encoder requires.
@@ -138,9 +176,10 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 /// - `slot_last_submit_seq` is the submit seq at which this mip's
 ///   staging was last referenced by a GPU-visible command. Zero if
 ///   never uploaded.
-/// - `flags` is the raw `D3DLOCK_*` bitfield from the game.
-/// - `usage` is the texture's `D3DUSAGE_*` bitfield captured at
-///   `CreateTexture`.
+/// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A DISCARD the
+///   Lock cannot honour is dropped here as well as in the caller (see
+///   [`honoured_lock_flags`]), so a verdict never rests on one.
+/// - `pool` is the texture's `D3DPOOL` captured at `CreateTexture`.
 /// - `rect` is the locked sub-rect. `None` ⇒ full-mip Lock.
 /// - `shape` carries the mip + block dimensions (see [`MipShape`]).
 ///
@@ -151,10 +190,11 @@ pub const fn decide_lock_action(
     coherent_seq: u64,
     slot_last_submit_seq: u64,
     flags: u32,
-    usage: u32,
+    pool: u32,
     rect: Option<DirtyRect>,
     shape: MipShape,
 ) -> LockAction {
+    let flags = honoured_lock_flags(flags, pool, rect, shape);
     if flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE) != 0 {
         return LockAction::WriteInPlace;
     }
@@ -167,26 +207,19 @@ pub const fn decide_lock_action(
         };
     }
 
-    // `>=` for tolerance; `parse_rect` already clamps so equality is
-    // typical.
-    let whole_mip = match rect {
-        None => true,
-        Some(r) => r.x == 0 && r.y == 0 && r.w >= shape.mip_w && r.h >= shape.mip_h,
-    };
-    if whole_mip {
-        let preserve = if usage & D3DUSAGE_DYNAMIC != 0 {
-            PreserveKind::None
-        } else {
-            PreserveKind::Cpu
+    // The game may read every byte of the mip through the pointer, and
+    // D3D9 hands it the current contents whatever the usage says.
+    if is_whole_mip(rect, shape) {
+        return LockAction::FreshBox {
+            preserve: PreserveKind::Cpu,
         };
-        return LockAction::FreshBox { preserve };
     }
 
     // Partial. Force the rename when the compressed alignment
     // formula would push the encoder into its full-mip-fallback path
     // — the GPU's read range becomes "all bytes" rather than the
     // rect, so we can't trust no-overlap and must preserve outside-
-    // rect bytes regardless of DYNAMIC.
+    // rect bytes.
     if let Some(r) = rect
         && !rect_block_aligned(r, shape)
     {
@@ -207,7 +240,9 @@ pub const fn decide_lock_action(
 ///
 /// `D3DLOCK_DISCARD` is that declaration and the only flag that qualifies: it
 /// is defined for a whole-level lock and promises the caller reads nothing it
-/// did not just write. `D3DLOCK_READONLY` is the opposite promise, and
+/// did not just write. The caller passes the flags through
+/// [`honoured_lock_flags`] first, so a DISCARD on a partial lock never reaches
+/// this decision. `D3DLOCK_READONLY` is the opposite promise, and
 /// `D3DLOCK_NOOVERWRITE` constrains only where the caller writes, not what it
 /// may read. D3D9 has no write-only lock flag: the "no readback expected" hint
 /// for a texture is `D3DUSAGE_DYNAMIC` at create time, and a dynamic texture

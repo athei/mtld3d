@@ -18,6 +18,25 @@ impl DirtyRect {
         Self { x: 0, y: 0, w, h }
     }
 
+    /// The bounding box of `self` and `other`.
+    ///
+    /// The upload and source-dirty trackers keep one rect per level, so two
+    /// writes merge into the box enclosing both: the texels between them are
+    /// copied once more than they had to be, never skipped.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Self {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
+    }
+
     /// Clamp to `(mip_w, mip_h)`.
     ///
     /// Returns `None` when the rect falls entirely outside the mip, so the

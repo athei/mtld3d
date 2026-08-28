@@ -657,14 +657,14 @@ struct FrameCounters {
     texture_renames: u32,
     /// Subset of `texture_renames` that took the no-preserve branch.
     ///
-    /// Either explicit `D3DLOCK_DISCARD`, or a whole-mip
-    /// `D3DUSAGE_DYNAMIC` contended Lock (the texture-side
-    /// "no readback expected" hint; `WRITEONLY` is the analog for
-    /// VB/IB but not documented for `CreateTexture`).
+    /// A whole-level `D3DLOCK_DISCARD` on a `D3DPOOL_DEFAULT` texture, the
+    /// only DISCARD the lock honours (`honoured_lock_flags`). The usage
+    /// plays no part: a plain Lock of a `D3DUSAGE_DYNAMIC` texture
+    /// preserves like any other.
     texture_discards: u32,
     /// Count of texture `LockRect` calls this frame that synchronously preserved the staging Box.
     ///
-    /// The non-DISCARD non-READONLY non-DYNAMIC contended-rename path
+    /// The non-DISCARD non-READONLY contended-rename path
     /// **synchronously memcpied** the old staging Box forward on
     /// the API thread. No GPU-blit variant exists because texture
     /// staging is PE-side `Box<[u8]>`, not an `MTLBuffer` — a GPU blit
@@ -672,6 +672,17 @@ struct FrameCounters {
     /// rename, so there's nothing for a `copyFromTexture:toTexture:`
     /// path to preserve.
     texture_preserve_cpu: u32,
+    /// Contended partial texture Locks this frame that were handed back in place.
+    ///
+    /// The texture twin of `vbib_write_in_place_contended`: a plain (no
+    /// `DISCARD`, no `NOOVERWRITE`) partial Lock of a level whose upload
+    /// the GPU may still be reading, served over the same staging on the
+    /// strength of the no-overlap contract rather than renamed. The arm
+    /// has no other side effect, so this count is the only signal that a
+    /// game leans on it. `NOOVERWRITE` / `READONLY` and uncontended Locks
+    /// are excluded: handing those back in place is the specified
+    /// behaviour.
+    texture_write_in_place_contended: u32,
     /// Count of `AddDirtyRect` calls this frame (`texture_add_dirty_rect` thunk).
     ///
     /// With `texture_add_dirty_partial` and
@@ -801,6 +812,7 @@ impl FrameCounters {
             texture_renames: 0,
             texture_discards: 0,
             texture_preserve_cpu: 0,
+            texture_write_in_place_contended: 0,
             texture_add_dirty_calls: 0,
             texture_add_dirty_partial: 0,
             texture_add_dirty_area_bp: 0,
@@ -1300,10 +1312,23 @@ impl ApiPerfState {
 
     /// Bump the CPU-memcpy preserve counter.
     ///
-    /// Called from the non-WRITEONLY non-DISCARD non-READONLY contended
-    /// texture `LockRect` branch.
+    /// Called from the non-DISCARD non-READONLY contended texture
+    /// `LockRect` rename branch.
     pub const fn bump_texture_preserve_cpu(&mut self) {
         self.counters.texture_preserve_cpu = self.counters.texture_preserve_cpu.saturating_add(1);
+    }
+
+    /// Contended partial Lock of a texture level handed back in place.
+    ///
+    /// The kept divergence, counted like its VB/IB twin: no rename, no
+    /// preserve, no stall, so the count is the only trace the arm leaves.
+    /// Texels wrong for a frame with nothing in the log is its symptom,
+    /// and this row is where to look for whether it fired.
+    pub const fn bump_texture_write_in_place_contended(&mut self) {
+        self.counters.texture_write_in_place_contended = self
+            .counters
+            .texture_write_in_place_contended
+            .saturating_add(1);
     }
 
     /// Feed the `AddDirtyRect` probe: one call this frame.
@@ -1331,7 +1356,7 @@ impl ApiPerfState {
 
     /// Subset of `bump_texture_rename` that took the no-preserve branch.
     ///
-    /// Explicit `D3DLOCK_DISCARD` or whole-mip `D3DUSAGE_DYNAMIC`
+    /// A whole-level `D3DLOCK_DISCARD` on a default-pool texture,
     /// contended.
     pub const fn bump_texture_discard(&mut self) {
         self.counters.texture_discards = self.counters.texture_discards.saturating_add(1);
@@ -1438,6 +1463,8 @@ impl ApiPerfState {
     pub const fn bump_ib_discard(&mut self) {}
     #[inline]
     pub const fn bump_texture_preserve_cpu(&mut self) {}
+    #[inline]
+    pub const fn bump_texture_write_in_place_contended(&mut self) {}
     #[inline]
     pub const fn bump_texture_add_dirty_rect(&mut self, _partial: bool, _area_bp: u32) {}
     #[inline]
@@ -2504,6 +2531,11 @@ struct PerfWindow {
     texture_discards: Stat,
     /// No GPU analog (texture staging is PE-side, `MTLTexture` handles aren't swapped on rename).
     texture_preserve_cpu: Stat,
+    /// Contended partial texture Locks handed back in place (sum only).
+    ///
+    /// Counts the kept divergence firing, not work done: the arm
+    /// allocates nothing and stalls nothing.
+    texture_write_in_place_contended: Stat,
     /// `AddDirtyRect` probe (see `FrameCounters::texture_add_dirty_*`).
     ///
     /// `area_bp` sum / `calls` sum at render gives average mip coverage.
@@ -2694,6 +2726,8 @@ impl PerfWindow {
             .add(u64::from(s.counters.texture_discards));
         self.texture_preserve_cpu
             .add(u64::from(s.counters.texture_preserve_cpu));
+        self.texture_write_in_place_contended
+            .add(u64::from(s.counters.texture_write_in_place_contended));
         self.texture_add_dirty_calls
             .add(u64::from(s.counters.texture_add_dirty_calls));
         self.texture_add_dirty_partial
@@ -4186,7 +4220,7 @@ impl<'a> Summary<'a> {
             "  discards",
             &format!("{d}", d = w.texture_discards.sum),
             None,
-            "API: rename, no preserve (DISCARD or D3DUSAGE_DYNAMIC)",
+            "API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)",
         );
         self.res_row(
             out,
@@ -4196,7 +4230,16 @@ impl<'a> Summary<'a> {
                 "peak/frame {pk_cpu}",
                 pk_cpu = w.texture_preserve_cpu.max,
             )),
-            "API: rename + sync memcpy (non-DISCARD non-DYNAMIC contended)",
+            "API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)",
+        );
+        // Not a rename child: this arm allocates nothing, so it stays
+        // outside the `rename = discards + preserve` partition.
+        self.res_row(
+            out,
+            "in-place",
+            &format!("{c}", c = w.texture_write_in_place_contended.sum),
+            None,
+            "API: contended partial Lock handed back live (kept divergence; no rename, no stall)",
         );
         // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
