@@ -2974,6 +2974,39 @@ fn stretch_rect_decodes_packed_yuv_into_an_offscreen_plain_surface() {
     assert_rgb_close(px[3], 0x00ff_ffff, 18, "pixel 3");
 }
 
+/// A converting `StretchRect` out of a source level larger than the destination.
+///
+/// The CPU converter takes a source rectangle and a destination origin, so the
+/// extent it writes has to come from what both levels hold rather than from the
+/// source alone: a 4x1 source feeding a 2x1 destination is the pair whose
+/// unclipped extent would run the row loop past the destination staging.
+#[test]
+fn stretch_rect_converts_a_sub_rect_into_a_smaller_offscreen_surface() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_UYVY, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        // Pixels 0/1: red; pixels 2/3: white.
+        locked.write(&[0x4cff_4c54u32, 0xff80_ff80]);
+    }
+    let dst = h.create_offscreen_plain_surface(2, 1, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let rect = D3DRECT {
+        x1: 2,
+        y1: 0,
+        x2: 4,
+        y2: 1,
+    };
+    assert_eq!(
+        h.stretch_rect_region_hr(&src, &rect, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "UYVY sub-rect -> X8R8G8B8 into a smaller offscreen-plain surface"
+    );
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    let px = locked.as_u32(2);
+    assert_rgb_close(px[0], 0x00ff_ffff, 18, "pixel 0");
+    assert_rgb_close(px[1], 0x00ff_ffff, 18, "pixel 1");
+}
+
 #[test]
 fn stretch_rect_converts_r5g6b5_into_x8r8g8b8() {
     // CheckDeviceFormatConversion(R5G6B5, X8R8G8B8) answers S_OK; the scaling

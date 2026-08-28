@@ -1215,10 +1215,14 @@ impl TextureInner {
     /// plus the packed YUV formats YUY2 / UYVY (decoded per macropixel, the
     /// CPU twin of the render quad's decode); destinations are the RGB three.
     /// Returns false for any other pair (caller falls back to a
-    /// best-effort no-op) or an out-of-bounds region. Same-size only
-    /// (`src_rect` extent equals the destination extent) — the caller rejects
-    /// scaling upstream. Marks the written rectangle of `dst_level` dirty on
-    /// success so a later `flush_dirty_mips` uploads the converted pixels.
+    /// best-effort no-op) or a region no part of which lies in both levels.
+    /// Same-size only (`src_rect` extent equals the destination extent), the
+    /// caller rejects scaling upstream. The region is clipped to the source and
+    /// the destination level, so a caller that paired a source with a smaller
+    /// destination converts only what the two share instead of running the row
+    /// loop off the destination staging. Marks the written rectangle of
+    /// `dst_level` dirty on success so a later `flush_dirty_mips` uploads the
+    /// converted pixels.
     pub fn convert_sub_region_from(
         &mut self,
         dst_level: usize,
@@ -1247,19 +1251,34 @@ impl TextureInner {
                 )
             }
         };
-        if rx + rw > sw || ry + rh > sh {
-            return false;
-        }
         let (dx, dy) = (
             dst_point.0.max(0).cast_unsigned(),
             dst_point.1.max(0).cast_unsigned(),
         );
-        // The region has to land inside the destination mip: a row that ran
-        // past its right edge would wrap into the next one, and the dirty
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
+        let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
+        // The same clip the two raw-copy paths run, so neither half of the
+        // conversion reaches past its own level: a row running off the
+        // destination's right edge would wrap into the next one, and the dirty
         // rectangle recorded below has to describe a real part of the level.
-        if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
+        // Every format this path accepts is one pixel per block, so the clip
+        // reduces to trimming both rectangles to the extent the levels share.
+        let Some((src_rect, dst_rect)) = clip_copy_region(
+            DirtyRect {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            (dx, dy),
+            (sw, sh),
+            (dw, dh),
+            (bw, bh),
+        ) else {
             return false;
-        }
+        };
+        let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
+        let (dx, dy) = (dst_rect.x, dst_rect.y);
         // The conversion is what defines the destination level from here on, so
         // the level moves off the GPU before a byte of it is written.
         let whole = self.write_covers_level(

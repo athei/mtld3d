@@ -9,9 +9,12 @@
 //! overhanging the bottom edge, a block-compressed rect whose rounding out to the 4x4 block grid
 //! would reach past a level that stops mid-block, and one that misses the level entirely.
 //!
-//! Two drive `clip_copy_region`: a region that fits both levels comes back with only its origins,
-//! and a transposed pair (a 2x4 source level into a 4x2 destination level, which `UpdateTexture`
-//! accepts because the two agree on their larger dimension) comes back as the 2x2 they share.
+//! Four drive `clip_copy_region`: a region that fits both levels comes back with only its
+//! origins; a transposed pair (a 2x4 source level into a 4x2 destination level, which
+//! `UpdateTexture` accepts because the two agree on their larger dimension) comes back as the
+//! 2x2 they share; a source level twice the destination's in both dimensions comes back halved;
+//! and a region whose destination origin sits mid-level comes back as the part that still fits,
+//! which is the shape the format-converting copy takes.
 
 use super::{DirtyRect, clip_copy_region};
 
@@ -195,5 +198,52 @@ fn clip_copy_region_trims_a_transposed_pair_to_what_they_share() {
     assert_eq!(
         clip_copy_region(region, (0, 0), (2, 4), (4, 2), (1, 1)),
         Some((shared, shared))
+    );
+}
+
+#[test]
+fn clip_copy_region_trims_a_source_larger_than_the_destination_level() {
+    let region = DirtyRect {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 4,
+    };
+    let shared = DirtyRect {
+        x: 0,
+        y: 0,
+        w: 2,
+        h: 2,
+    };
+    assert_eq!(
+        clip_copy_region(region, (0, 0), (4, 4), (2, 2), (1, 1)),
+        Some((shared, shared))
+    );
+}
+
+#[test]
+fn clip_copy_region_trims_a_region_landing_mid_destination_level() {
+    let region = DirtyRect {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 4,
+    };
+    assert_eq!(
+        clip_copy_region(region, (2, 2), (4, 4), (4, 4), (1, 1)),
+        Some((
+            DirtyRect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            DirtyRect {
+                x: 2,
+                y: 2,
+                w: 2,
+                h: 2,
+            }
+        ))
     );
 }
