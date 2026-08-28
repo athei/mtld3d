@@ -20,18 +20,21 @@
 //! two spaces rather than staying in one, so a run at the default scale would
 //! not exercise the conversion at all.
 
-use mtld3d_tests::{Harness, PosColorVertex, assert_pixel_eq};
+use mtld3d_tests::{Harness, PosColorVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
-    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DVIEWPORT9,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_POINTLIST,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
 const BLACK: u32 = 0xFF00_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
 
 /// The sub-rect every viewport-bound test narrows to, in reported coordinates.
 ///
@@ -46,6 +49,62 @@ const NARROW: D3DVIEWPORT9 = D3DVIEWPORT9 {
     min_z: 0.0,
     max_z: 1.0,
 };
+
+/// Two triangles covering the whole viewport, sampling all of stage 0's texture.
+///
+/// Under the default identity transforms clip `[-1, 1]` is the viewport, so the
+/// texture's `[0, 1]` maps onto the whole frame and a region of the texture
+/// lands on the same fraction of the frame whatever either one is rasterized at.
+const FULLSCREEN_TEXTURED_QUAD: [TexturedVertex; 6] = [
+    TexturedVertex {
+        x: -1.0,
+        y: 1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 0.0,
+        v: 0.0,
+    },
+    TexturedVertex {
+        x: 1.0,
+        y: 1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 1.0,
+        v: 0.0,
+    },
+    TexturedVertex {
+        x: -1.0,
+        y: -1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 0.0,
+        v: 1.0,
+    },
+    TexturedVertex {
+        x: 1.0,
+        y: 1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 1.0,
+        v: 0.0,
+    },
+    TexturedVertex {
+        x: 1.0,
+        y: -1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 1.0,
+        v: 1.0,
+    },
+    TexturedVertex {
+        x: -1.0,
+        y: -1.0,
+        z: 0.5,
+        color: WHITE,
+        u: 0.0,
+        v: 1.0,
+    },
+];
 
 /// One triangle covering the whole viewport at a constant `z`, coloured `GREEN`.
 ///
@@ -482,4 +541,105 @@ fn a_point_keeps_its_reported_diameter_under_the_scale() {
     // an unconverted size fails here.
     assert_pixel_eq(h.read_pixel(360, 240), BLACK, "40 px right of the square");
     assert_pixel_eq(h.read_pixel(320, 200), BLACK, "40 px above the square");
+}
+
+#[test]
+fn color_fill_of_a_target_at_the_backbuffer_size_uses_reported_coordinates() {
+    // A render target created at the reported back-buffer size belongs to the
+    // same image and rasterizes at the same scale, so a `ColorFill` sub-rect
+    // has to be converted the way a viewport or a scissor is. Both the fill
+    // rect and the probes are reported coordinates, so the result is the same
+    // at every scale.
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let rt = h.create_texture(
+        width,
+        height,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let surface = rt.surface_level(0);
+    assert_eq!(h.set_render_target(0, &surface), 0, "bind the target");
+    assert_eq!(h.clear_target(BLUE), 0, "seed the whole target");
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (128, 96, 512, 384), RED),
+        0,
+        "ColorFill a sub-rect of the target",
+    );
+
+    assert_pixel_eq(h.read_pixel(320, 240), RED, "the middle of the fill rect");
+    assert_pixel_eq(h.read_pixel(180, 140), RED, "inside, near the top-left");
+    assert_pixel_eq(h.read_pixel(460, 340), RED, "inside, near the bottom-right");
+    assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside, above and left");
+    assert_pixel_eq(h.read_pixel(600, 440), BLUE, "outside, below and right");
+}
+
+#[test]
+fn color_fill_of_a_scaled_targets_mip_level_addresses_that_level() {
+    // A mip level of such a target is rasterized at the scale as well, so its
+    // extent is not the halved reported extent its descriptor carries. The
+    // fill rect is given in the level's reported coordinates and read back by
+    // sampling the level over the whole frame, where a fill that covered the
+    // wrong fraction of the level lands at the wrong fraction of the frame.
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let rt = h.create_texture(
+        width,
+        height,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level1 = rt.surface_level(1);
+    let (hr, desc) = level1.desc();
+    assert_eq!(hr, 0, "GetDesc on level 1");
+    assert_eq!(
+        (desc.width, desc.height),
+        (width / 2, height / 2),
+        "level 1 reports half the reported size whatever the scale",
+    );
+
+    assert_eq!(h.color_fill_hr(&level1, BLUE), 0, "seed the whole level");
+    assert_eq!(
+        h.color_fill_rect_hr(&level1, (0, 0, 160, 120), RED),
+        0,
+        "fill the level's top-left quarter",
+    );
+
+    // Sample level 1 across the whole frame: `MAXMIPLEVEL` clamps the level of
+    // detail up so the magnified draw reads level 1 rather than level 0.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the target as a texture");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAXMIPLEVEL, 1),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler state");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &FULLSCREEN_TEXTURED_QUAD),
+            0,
+            "sample level 1 over the whole frame",
+        );
+    });
+
+    // The filled quarter is the top-left quarter of the level, so it covers the
+    // top-left quarter of the frame: (320, 240) is the corner it stops at.
+    assert_pixel_eq(h.read_pixel(160, 120), RED, "inside the filled quarter");
+    assert_pixel_eq(
+        h.read_pixel(370, 280),
+        BLUE,
+        "just past the filled quarter on both axes",
+    );
+    assert_pixel_eq(h.read_pixel(560, 400), BLUE, "the opposite corner");
 }
