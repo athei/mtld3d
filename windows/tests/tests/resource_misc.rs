@@ -706,6 +706,55 @@ fn available_texture_mem_charges_a_depth_chain_like_a_colour_chain() {
     );
 }
 
+/// A standalone depth surface is charged like the depth texture level it matches.
+///
+/// `CreateDepthStencilSurface` and a one-level `D3DUSAGE_DEPTHSTENCIL` texture
+/// allocate the same single depth attachment, so at the same width and height
+/// they have to cost the same bytes. At an odd width a two-byte format is the
+/// case that separates the host-visible row pitch from the tight one, and a
+/// surface charged on the tight stride reads 66 bytes per row against the
+/// texture level's 68.
+#[test]
+fn available_texture_mem_charges_a_depth_surface_like_a_depth_level() {
+    // 33 wide: a 16-bit row is 66 bytes tight and 68 host-visible.
+    const WIDTH: u32 = 33;
+    const LEVEL_BYTES: u32 = 68 * 33;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(base > 2 * LEVEL_BYTES, "budget {base} leaves room for both");
+
+    let surface_cost = {
+        let _ds = h.create_depth_stencil_surface(WIDTH, WIDTH, D3DFMT_D16);
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        surface_cost, LEVEL_BYTES,
+        "a standalone depth surface costs its host-visible row pitch"
+    );
+
+    let texture_cost = {
+        let _tex = h.create_texture(
+            WIDTH,
+            WIDTH,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D16,
+            D3DPOOL_DEFAULT,
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        texture_cost, surface_cost,
+        "a one-level depth texture costs what the standalone surface costs"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing both gives their bytes back"
+    );
+}
+
 #[test]
 fn evict_managed_resources_succeeds() {
     let h = Harness::new();

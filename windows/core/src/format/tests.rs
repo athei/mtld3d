@@ -324,6 +324,14 @@ fn surface_bytes_charges_colour_and_depth_surfaces() {
     assert_eq!(surface_bytes(256, 128, D3DFMT_R5G6B5), 256 * 128 * 2);
     assert_eq!(surface_bytes(1024, 1024, D3DFMT_D24S8), 4 * 1024 * 1024);
     assert_eq!(surface_bytes(1024, 1024, D3DFMT_D16), 2 * 1024 * 1024);
+    // An odd-width 16-bit depth surface strides at the dword-rounded
+    // host-visible pitch, the same one the equivalent texture level is
+    // measured on, so the two surface kinds are charged alike.
+    assert_eq!(surface_bytes(33, 16, D3DFMT_D16), 68 * 16);
+    assert_eq!(
+        surface_bytes(33, 16, D3DFMT_D16),
+        surface_bytes(33, 16, D3DFMT_R5G6B5)
+    );
     // Block-compressed formats are charged by block: DXT1 is 8 bytes per
     // 4x4 block, so half a byte per texel.
     assert_eq!(surface_bytes(64, 64, D3DFMT_DXT1), 64 * 64 / 2);
