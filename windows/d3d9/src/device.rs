@@ -5132,6 +5132,22 @@ fn resolve_surface_multi_sample(
     })
 }
 
+/// The D3D9 description of one standalone colour surface to create.
+///
+/// `multi_sample` is the already-resolved `(type, quality)` pair: the sample
+/// count plus the D3D9 type the surface reports from `GetDesc`. Above one
+/// sample the create also produces the multisampled companion the passes
+/// attach. `lockable` says the surface is getting a CPU staging buffer, which
+/// fixes its texture at the extent D3D9 reports.
+struct ColorTargetSpec {
+    width: u32,
+    height: u32,
+    format: u32,
+    usage: u32,
+    multi_sample: SurfaceMultiSample,
+    lockable: bool,
+}
+
 /// Create a persistent render-target-capable color `MTLTexture` and wrap it as a surface.
 ///
 /// The wrapper is a standalone `Direct3DSurface9`, mirroring the depth path. Shared by
@@ -5139,23 +5155,19 @@ fn resolve_surface_multi_sample(
 /// `CreateOffscreenPlainSurface(D3DPOOL_DEFAULT)` (usage = 0). Returns the boxed
 /// wrapper pointer, or `None` (caller maps to `INVALIDCALL`) for an unmappable or
 /// compressed color format, or if the Metal allocation fails.
-///
-/// `multi_sample` is the already-resolved `(type, quality)` pair: the sample
-/// count plus the D3D9 type the surface reports from `GetDesc`. Above one
-/// sample the create also produces the multisampled companion the passes
-/// attach.
-/// `lockable` says the surface is getting a CPU staging buffer, which fixes its
-/// texture at the extent D3D9 reports.
 fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
-    width: u32,
-    height: u32,
-    format: u32,
-    usage: u32,
-    multi_sample: SurfaceMultiSample,
-    lockable: bool,
+    spec: &ColorTargetSpec,
 ) -> Option<*mut Direct3DSurface9> {
+    let &ColorTargetSpec {
+        width,
+        height,
+        format,
+        usage,
+        multi_sample,
+        lockable,
+    } = spec;
     let mapping = crate::direct3d9::map_for_device(format)?;
     if mapping.is_compressed() {
         return None;
@@ -5301,12 +5313,14 @@ extern "system" fn device_create_render_target(
     let Some(surf_ptr) = create_color_target_surface(
         obj.inner().device_handle,
         obj.inner_ptr(),
-        width,
-        height,
-        format,
-        D3DUSAGE_RENDERTARGET,
-        multi_sample,
-        staging_bytes != 0,
+        &ColorTargetSpec {
+            width,
+            height,
+            format,
+            usage: D3DUSAGE_RENDERTARGET,
+            multi_sample,
+            lockable: staging_bytes != 0,
+        },
     ) else {
         warn!(
             target: LOG_TARGET,
