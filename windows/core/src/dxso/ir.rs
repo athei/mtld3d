@@ -427,16 +427,30 @@ impl DxsoProgram {
             || over(self.max_const_index(RegKind::ConstBool), int_bool_limit)
     }
 
+    /// Every instruction the emitter walks: the main body first, then each subroutine body.
+    ///
+    /// A `call` inline-expands at emit time, so an instruction inside a
+    /// subroutine lands in the emitted function exactly like one in the main
+    /// body. Any question of the form "does this shader use X" has to ask
+    /// both lists, or a shader that only reaches X through a `call` answers
+    /// no.
+    fn all_instructions(&self) -> impl Iterator<Item = &Instruction> {
+        self.instructions
+            .iter()
+            .chain(self.subroutines.values().flatten())
+    }
+
     /// Whether any instruction reads a constant via relative addressing (`c[a0.<swiz> + N]`).
     ///
     /// Such shaders — notably `WoW` M2 skinning VSes that index a bone-matrix
     /// palette by per-vertex `BLENDINDICES` — read slots beyond what
     /// `max_const_reg` can see statically. Draws that bind these shaders must
     /// upload the full populated constant-buffer prefix (tracked on the d3d9
-    /// side), not a statically-bounded prefix.
+    /// side), not a statically-bounded prefix. Subroutine bodies count for the
+    /// same reason they do in `max_const_reg`.
     #[must_use]
     pub fn uses_relative_const_addressing(&self) -> bool {
-        self.instructions.iter().any(|inst| {
+        self.all_instructions().any(|inst| {
             inst.srcs
                 .iter()
                 .any(|s| s.reg.kind == RegKind::Const && s.rel_addr.is_some())
