@@ -88,6 +88,15 @@ fn point_clamp(h: &Harness) {
 
 /// Bind `tex`, sample it across the backbuffer, return the centre pixel.
 fn sample_center(h: &Harness, tex: &Texture<'_>) -> Rgba8 {
+    sample_at(h, tex, 320, 240)
+}
+
+/// Bind `tex`, sample it across the backbuffer, return the pixel at `(x, y)`.
+///
+/// The quad spans the unit square, so the read point picks which texel the
+/// returned pixel came from: a test that asserts on one texel of a texture
+/// coarser than the target reads a point well inside that texel's band.
+fn sample_at(h: &Harness, tex: &Texture<'_>, x: u32, y: u32) -> Rgba8 {
     assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
     h.select_texture_stage(0);
     point_clamp(h);
@@ -104,7 +113,7 @@ fn sample_center(h: &Harness, tex: &Texture<'_>) -> Rgba8 {
             "sample draw"
         );
     });
-    Rgba8::from_pixel(h.read_pixel(320, 240))
+    Rgba8::from_pixel(h.read_pixel(x, y))
 }
 
 /// Bind `tex`, sample it across the backbuffer, return the pixels at `points`.
@@ -1318,5 +1327,78 @@ fn update_texture_from_a_transposed_source_copies_the_shared_region() {
         sample_texel(&h, &dst, 0.875, 0.75),
         GREEN,
         "texel (3,1) kept",
+    );
+}
+
+#[test]
+fn get_dc_on_an_odd_width_16_bit_texture_level_round_trips_a_texel() {
+    // A row of an odd number of 2-byte texels is not a whole number of dwords,
+    // and GDI steps a DIB by the row length rounded up to four bytes, rejecting
+    // any pitch below that. A texture level's staging is allocated at the tight
+    // `width * bpp` stride its GPU upload steps by, which for this level is two
+    // bytes short, so `GetDC` has to hand GDI a DIB of its own at the rounded
+    // stride and copy back what GDI drew.
+    const W: u32 = 33;
+    const H: u32 = 4;
+    const GREEN_565: u16 = 0x07E0;
+    const RED_565: u16 = 0xF800;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let tex = h.create_texture(W, H, 1, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        assert_eq!(
+            locked.pitch(),
+            (W * 2).cast_signed(),
+            "the level locks at its own tight row stride"
+        );
+        locked.write(&[GREEN_565; (W * H) as usize]);
+    }
+
+    // The last texel of the last row is the one a DIB over the tighter staging
+    // never reaches: its row starts two bytes late and runs off the end.
+    let (last_x, last_y) = ((W - 1).cast_signed(), (H - 1).cast_signed());
+    let surface = tex.surface_level(0);
+    let dc = surface.dc();
+    assert_eq!(
+        dc.get_pixel(last_x, last_y),
+        GREEN_COLORREF,
+        "the DC reads the texels the lock wrote, last row included",
+    );
+    assert_eq!(
+        dc.set_pixel(last_x, last_y, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel stores full-scale channels exactly in a 5-6-5 DIB",
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+
+    {
+        let locked = tex.lock_rect(0, mtld3d_types::D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() as usize / 2;
+        let texels = locked.as_u16(pitch_px * H as usize);
+        assert_eq!(
+            texels[pitch_px * (H as usize - 1) + W as usize - 1],
+            RED_565,
+            "what GDI drew into the last texel reached the level's staging",
+        );
+        assert_eq!(
+            texels[0], GREEN_565,
+            "the texels GDI left alone kept the lock's own pixels",
+        );
+    }
+
+    // The quad spans the unit square over a 640x480 target, so texel (32, 3)
+    // covers roughly x 621..640, y 360..480: read the middle of that band, well
+    // clear of its edges.
+    let last = sample_at(&h, &tex, 630, 420);
+    assert!(
+        last.r > 200 && last.g < 50 && last.b < 50,
+        "a draw samples the last texel GDI drew, so the level reached the GPU, got {last:?}"
+    );
+    let untouched = sample_at(&h, &tex, 10, 60);
+    assert!(
+        untouched.r < 50 && untouched.g > 200 && untouched.b < 50,
+        "the texels GDI left alone still sample as the lock wrote them, got {untouched:?}"
     );
 }
