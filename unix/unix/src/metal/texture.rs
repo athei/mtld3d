@@ -1,5 +1,6 @@
 use mtld3d_shared::{
-    CreateDepthStencilStateParams, MetalHandle, StencilFaceParams, TextureCreateDesc,
+    CreateDepthStencilStateParams, CreateTextureSliceViewParams, MetalHandle, StencilFaceParams,
+    TextureCreateDesc,
     mtl::{
         BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StencilOp, StorageMode, Swizzle,
         TextureCreateFlags, TextureUsage,
@@ -666,6 +667,44 @@ pub fn create_texture(
     texture.setLabel(Some(&label));
 
     Some((Retained::into_raw(texture) as u64, srgb_handle))
+}
+
+/// Create a single-slice, 2D view of one array slice of a texture.
+///
+/// The scaling `StretchRect` fragment function declares its source as
+/// `texture2d<float>`. A cube-map source therefore has to reach it as a 2D view
+/// of the face the D3D9 call named: the cube texture binds as a `texturecube`
+/// and the sample lands on face 0 whichever face the blit addressed. The view
+/// keeps the base format and spans every mip level, so it needs no
+/// `PixelFormatView` usage on the base texture and the explicit `level()` the
+/// fragment function passes still selects the source mip.
+///
+/// The returned view is a fresh object whose retain the caller owns; the PE
+/// side destroys it once the frame that binds it has retired.
+pub fn create_texture_slice_view(
+    params: &CreateTextureSliceViewParams,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    let texture = params.texture_handle.into_retained()?;
+    let levels = texture.mipmapLevelCount();
+    // SAFETY: objc2 typed binding; `texture` is retained for the call, the
+    // format is the base texture's own, and the level range covers exactly the
+    // levels it declares.
+    let view = unsafe {
+        texture.newTextureViewWithPixelFormat_textureType_levels_slices(
+            texture.pixelFormat(),
+            MTLTextureType::Type2D,
+            objc2_foundation::NSRange::new(0, levels),
+            objc2_foundation::NSRange::new(params.slice as usize, 1),
+        )
+    }?;
+    let label = objc2_foundation::NSString::from_str(&format!(
+        "mtld3d-sliceview-{:#x}-{}",
+        params.texture_handle, params.slice
+    ));
+    view.setLabel(Some(&label));
+    // SAFETY: `Retained::into_raw` hands over the view's only retain, which
+    // the typed handle carries to the PE side.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(view) as u64) })
 }
 
 /// Release a Metal texture handle.

@@ -26,12 +26,12 @@ pub use params::{
     CompileShaderLibraryParams, CreateBackbufferParams, CreateBuffersBatchParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
-    CreateTexturesBatchParams, DestroyCommandQueueParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorAttachmentParams,
-    ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, PassDescriptor,
-    SetDisplaySyncEnabledParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
-    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
-    WaitForGpuRetireParams, WriteLogParams,
+    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
+    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
+    ExtraColorAttachmentParams, ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams,
+    InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams, StartGpuCaptureParams,
+    StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams,
 };
 
 #[repr(u32)]
@@ -60,6 +60,7 @@ pub enum Thunks {
     StopGpuCapture,
     EnsureClearQuadPipeline,
     EnsureBlitPipeline,
+    CreateTextureSliceView,
     GetTaskFaults,
     WriteLog,
 }

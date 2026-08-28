@@ -2,7 +2,9 @@
 //!
 //! The round-trip renders to a texture, then samples it.
 
-use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex};
+use mtld3d_tests::{
+    CubeTexture, Harness, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex, VolumeVertex,
+};
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
@@ -1861,6 +1863,135 @@ fn stretch_rect_into_a_cube_face_is_visible_to_that_face_get_dc() {
         "the blit into face 3 left face 0 alone"
     );
     assert_eq!(dc.release(), 0, "ReleaseDC on face 0");
+}
+
+/// Bind `cube`, sample it across the back buffer along `direction`, return the centre pixel.
+///
+/// The direction is constant across the quad, so every pixel reads the one cube
+/// face that direction names and the face's own orientation drops out. The
+/// three-component texcoord `VolumeVertex` carries is the direction the
+/// fixed-function cube lookup takes.
+fn sample_cube_face(h: &Harness, cube: &CubeTexture<'_>, direction: (f32, f32, f32)) -> u32 {
+    assert_eq!(h.set_cube_texture(0, cube), 0, "bind the cube");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler state");
+    }
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+        0,
+        "SetFVF with a three-component texcoord"
+    );
+    let vertex = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u: direction.0,
+        v: direction.1,
+        w: direction.2,
+    };
+    let quad = [
+        vertex(-1.0, 1.0),
+        vertex(1.0, 1.0),
+        vertex(-1.0, -1.0),
+        vertex(1.0, 1.0),
+        vertex(1.0, -1.0),
+        vertex(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "cube sample draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 240);
+    assert_eq!(h.clear_texture(0), 0, "unbind the cube");
+    pixel
+}
+
+#[test]
+fn scaling_stretch_rect_into_a_cube_face_writes_that_face() {
+    // A scaling StretchRect runs the render quad, which attaches the
+    // destination as a colour target: a cube destination has to attach the face
+    // the call named as the attachment's slice, or the quad lands on face 0.
+    // Face 0 is filled red and a 32x32 green source is scaled onto face 3, so a
+    // quad without a face reads green where face 0's own fill belongs.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let src = h.create_render_target(EDGE / 2, EDGE / 2, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&src, GREEN),
+        D3D_OK,
+        "fill the source green"
+    );
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(
+        h.stretch_rect(&src, &face3, D3DTEXF_POINT),
+        D3D_OK,
+        "scaling StretchRect from a render target into a cube face",
+    );
+
+    assert_eq!(
+        sample_cube_face(&h, &cube, (0.0, -1.0, 0.0)),
+        GREEN,
+        "face 3 carries the scaled blit",
+    );
+    assert_eq!(
+        sample_cube_face(&h, &cube, (1.0, 0.0, 0.0)),
+        RED,
+        "the blit into face 3 left face 0 alone",
+    );
+}
+
+#[test]
+fn scaling_stretch_rect_out_of_a_cube_face_reads_that_face() {
+    // The render quad's fragment function samples a 2D texture, so a cube
+    // source reaches it as a view of the face the call named. Bound as a cube
+    // it samples face 0 instead, so face 0 and face 2 are filled differently
+    // and the blit out of face 2 must carry face 2's colour.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face2 = cube.surface(2, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face2, BLUE), D3D_OK, "fill face 2 blue");
+
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.stretch_rect(&face2, &backbuffer, D3DTEXF_POINT),
+        D3D_OK,
+        "scaling StretchRect from a cube face onto the back buffer",
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLUE,
+        "the blit sampled face 2, not face 0",
+    );
 }
 
 #[test]

@@ -52,10 +52,11 @@ use mtld3d_core::{
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType,
     CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
-    CreateBuffersBatchParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
-    MetalHandle, NullTextureKind, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
+    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
+    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, NullTextureKind, PassDescriptor,
+    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
         QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
@@ -241,11 +242,13 @@ pub struct BlitSide {
     pub dims: (u32, u32),
     /// Mip level of `handle` the blit reads or writes.
     pub mip: u32,
-    /// Array slice of `handle` the quad renders into.
+    /// Array slice of `handle` the blit reads or writes.
     ///
-    /// A cube face's `D3DCUBEMAP_FACES` index, zero for every other texture
-    /// kind. Read on the destination side only: the source is sampled whole.
-    pub slice: u32,
+    /// `Some(face)` when the endpoint is one face of a cube map, `None` when
+    /// its backing texture holds a single slice. The destination attaches the
+    /// face as the colour attachment's slice; the source is sampled through a
+    /// 2D view of it, since a `texturecube` binding would read face 0.
+    pub slice: Option<u32>,
     /// Multisampled companion of `handle`, NULL when there is none.
     ///
     /// Read on the destination side only: the quad renders into the
@@ -1349,7 +1352,8 @@ struct PendingResourceRetention {
     /// `true` when the entry comes from the texture lifecycle.
     ///
     /// The sites are `MTLTexture` destroy, mip-staging `MTLBuffer`
-    /// wrapper destroy on rename, and padded-blit transient wrapper. At
+    /// wrapper destroy on rename, padded-blit transient wrapper, and the
+    /// single-slice view a scaling blit out of a cube face binds. At
     /// drain time the destroy is attributed to the textures `destroys`
     /// row instead of VB/IB. Default `false` covers VB/IB rename/intake
     /// and visibility-pool eviction — those stay on the VB/IB row.
@@ -4014,6 +4018,45 @@ impl FrameEncoder {
         self.get_or_create_sampler(0, &ss, false, false)
     }
 
+    /// A 2D view of one array slice of `handle`, retired with the frame that binds it.
+    ///
+    /// The scaling-`StretchRect` fragment function samples a `texture2d`, so a
+    /// cube-map source is bound through a view of the single face it
+    /// addresses. The view is a fresh Metal object: it goes on the retention
+    /// queue at the current submit seq, so it outlives the replay of the pass
+    /// that binds it and is destroyed once the GPU has retired that frame.
+    /// Returns 0 when the unix side cannot create it, which drops the blit.
+    fn slice_view_for_frame(&mut self, handle: u64, slice: u32) -> u64 {
+        let mut params = CreateTextureSliceViewParams {
+            // SAFETY: `handle` is a live Metal texture address resolved by the
+            // caller from the texture cache, non-zero per its own guard.
+            texture_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
+            view_handle: MetalHandle::NULL,
+            slice,
+            pad0: 0,
+        };
+        let status = unix_call(&mut params);
+        let view = params.view_handle;
+        if status != 0 || view.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "blit-quad: CreateTextureSliceView failed status={status:#x}, a scaling \
+                 StretchRect out of a cube face is dropped"
+            );
+            return 0;
+        }
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Texture,
+                handle: view.raw(),
+                page_box: None,
+                staging_arc: None,
+                seq: self.current_submit_seq,
+                from_texture: true,
+            });
+        view.raw()
+    }
+
     /// Scaling `StretchRect`: render the source texture onto a quad covering the destination rect.
     ///
     /// Metal's blit encoder can only do 1:1 copies, so a size-mismatch
@@ -4049,6 +4092,7 @@ impl FrameEncoder {
             rect: src_rect,
             dims: src_dims,
             mip: src_mip,
+            slice: src_slice,
             ..
         } = src;
         let &BlitSide {
@@ -4083,6 +4127,20 @@ impl FrameEncoder {
         if sampler == 0 {
             return;
         }
+
+        // The fragment function declares `texture2d<float>`, so a cube-map
+        // source reaches it through a 2D view of the face the call named;
+        // binding the cube itself is a `texturecube` binding that reads face 0.
+        let src_bind = match src_slice {
+            Some(face) => {
+                let view = self.slice_view_for_frame(src_handle, face);
+                if view == 0 {
+                    return;
+                }
+                view
+            }
+            None => src_handle,
+        };
 
         // Source-rect → [0,1] texcoord transform, applied per-vertex in the
         // blit VS: `texcoord = q * scale + offset`, where `q` is the quad's
@@ -4141,7 +4199,7 @@ impl FrameEncoder {
             dst_dims.1,
             dst_format,
             RenderScale::IDENTITY,
-            (dst_slice, dst_mip),
+            (dst_slice.unwrap_or(0), dst_mip),
         );
         // A multisampled destination is written through its companion and
         // resolved into `dst_tex` at pass end, which is what every later read
@@ -4181,9 +4239,9 @@ impl FrameEncoder {
         self.emit_scissor_rect_resolved((dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h));
         // Bind the source texture + sampler at fragment slot 0, and the
         // texcoord transform at vertex bytes slot 0.
-        if self.last_bound.fragment_texture_changed(0, src_handle) {
+        if self.last_bound.fragment_texture_changed(0, src_bind) {
             self.pass_state
-                .emit_command(Command::set_fragment_texture(src_handle, 0));
+                .emit_command(Command::set_fragment_texture(src_bind, 0));
         }
         if self.last_bound.fragment_sampler_changed(0, sampler) {
             self.pass_state
@@ -7228,7 +7286,7 @@ impl FrameEncoder {
             },
             dims: (src_w, src_h),
             mip: 0,
-            slice: 0,
+            slice: None,
             msaa: MetalHandle::NULL,
             msaa_srgb: MetalHandle::NULL,
             sample_count: 1,
@@ -7243,7 +7301,7 @@ impl FrameEncoder {
             },
             dims: (dst_w, dst_h),
             mip: 0,
-            slice: 0,
+            slice: None,
             msaa: target.msaa,
             msaa_srgb: target.msaa_srgb,
             sample_count: target.sample_count,

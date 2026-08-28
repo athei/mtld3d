@@ -6598,7 +6598,10 @@ fn claim_dst_subresource_for_gpu(
     // kept alive by the destination surface's reference.
     unsafe { &mut *dst_parent }
         .inner_mut()
-        .mark_subresource_gpu_authoritative(dst_info.slice, dst_info.mip_level as usize);
+        .mark_subresource_gpu_authoritative(
+            dst_info.slice.unwrap_or(0),
+            dst_info.mip_level as usize,
+        );
 }
 
 /// CPU-side cross-format `StretchRect` into an offscreen-plain destination.
@@ -6939,7 +6942,7 @@ fn emit_stretch_rect_blit(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
-                dst_slice: dst_info.slice,
+                dst_slice: dst_info.slice.unwrap_or(0),
                 region_w,
                 region_h,
             },
@@ -6975,7 +6978,7 @@ fn emit_stretch_rect_blit(
                 rect: src_region,
                 dims: src_dims,
                 mip: src_info.mip_level,
-                slice: 0,
+                slice: src_info.slice,
                 msaa: MetalHandle::NULL,
                 msaa_srgb: MetalHandle::NULL,
                 sample_count: 1,
@@ -7013,7 +7016,7 @@ fn emit_stretch_rect_blit(
             src_origin_y: src_region.y,
             dst_origin_x: dst_region.x,
             dst_origin_y: dst_region.y,
-            dst_slice: dst_info.slice,
+            dst_slice: dst_info.slice.unwrap_or(0),
             region_w: src_region.w,
             region_h: src_region.h,
         },
@@ -7074,7 +7077,7 @@ fn emit_same_texture_stretch(
     // Both endpoints are one texture and the copy names no source slice, so it
     // stays on slice 0: a cube whose two surfaces name different faces needs
     // the source slice on the wire before this path can address a face.
-    if dst_info.slice != 0 {
+    if dst_info.slice.is_some_and(|face| face != 0) {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "StretchRect: a copy inside one cube texture reads and writes face 0, \
@@ -7173,7 +7176,7 @@ fn emit_same_texture_stretch(
                 },
                 dims: (scratch_w, scratch_h),
                 mip: 0,
-                slice: 0,
+                slice: None,
                 msaa: MetalHandle::NULL,
                 msaa_srgb: MetalHandle::NULL,
                 sample_count: 1,
@@ -7183,7 +7186,7 @@ fn emit_same_texture_stretch(
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_mip,
-                slice: 0,
+                slice: None,
                 msaa: dst_info.msaa,
                 msaa_srgb: dst_info.msaa_srgb,
                 sample_count: dst_info.sample_count,
@@ -7259,9 +7262,9 @@ struct StretchSurfaceInfo {
     mip_level: u32,
     /// Array slice the surface addresses within its backing texture.
     ///
-    /// A cube face's `D3DCUBEMAP_FACES` index; zero for every other surface
-    /// kind, which occupies one slice.
-    slice: u32,
+    /// `Some(face)` is a cube face's `D3DCUBEMAP_FACES` index; `None` is every
+    /// other surface kind, whose backing texture holds a single slice.
+    slice: Option<u32>,
     /// D3DPOOL_* of the backing resource.
     ///
     /// `StretchRect` requires both surfaces in `D3DPOOL_DEFAULT`.
@@ -7339,7 +7342,7 @@ fn resolve_stretch_surface(
             scale: tex.inner().render_scale(),
             format: tex.d3d_format(),
             mip_level: level,
-            slice: s.cube_face().unwrap_or(0),
+            slice: s.cube_face(),
             pool: tex.d3d_pool(),
             flags,
             autogen_texture_id: (tex.inner().autogen_mipmap() && level == 0)
@@ -7364,7 +7367,7 @@ fn resolve_stretch_surface(
             scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
-            slice: 0,
+            slice: None,
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_RENDER_TARGET,
             autogen_texture_id: None,
@@ -7387,7 +7390,7 @@ fn resolve_stretch_surface(
             scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
-            slice: 0,
+            slice: None,
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_DEPTH_STENCIL,
             autogen_texture_id: None,
@@ -7476,7 +7479,7 @@ fn color_fill_render_target(
         logical_size: (info.width, info.height),
         format,
         scale: info.scale,
-        subresource: (info.slice, info.mip_level),
+        subresource: (info.slice.unwrap_or(0), info.mip_level),
         rect: (region.x, region.y, region.w, region.h),
         rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
         regenerate_mipmaps: info.autogen_texture_id.is_some(),

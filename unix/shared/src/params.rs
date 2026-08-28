@@ -500,6 +500,31 @@ impl Thunk for EnsureBlitPipelineParams {
     const CODE: u32 = Thunks::EnsureBlitPipeline as u32;
 }
 
+/// Create a single-slice, 2D `MTLTexture` view of one array slice of a texture.
+///
+/// The scaling `StretchRect` fragment function declares its source as
+/// `texture2d<float>`, so a cube-map source has to be bound as a 2D view of the
+/// face it addresses: the cube texture itself binds as a `texturecube` and
+/// reads face 0 whatever face the D3D9 call named. The view spans every mip
+/// level of the base texture, so the explicit `level()` the fragment function
+/// passes still selects the source mip.
+///
+/// The view is a fresh object the caller owns: the PE side parks it on the
+/// resource-retention queue and destroys it through `DestroyResourcesBulk` once
+/// the frame that binds it has retired.
+#[repr(C, align(8))]
+pub struct CreateTextureSliceViewParams {
+    pub texture_handle: MetalHandle<MTLTextureKind>, // in: base texture
+    pub view_handle: MetalHandle<MTLTextureKind>,    // out: single-slice 2D view
+    pub slice: u32,                                  // in: array slice to expose
+    // allow: FFI struct padding; pub for cross-crate field-init.
+    pub pad0: u32,
+}
+
+impl Thunk for CreateTextureSliceViewParams {
+    const CODE: u32 = Thunks::CreateTextureSliceView as u32;
+}
+
 /// Compile one stage's MSL source into an `MTLLibrary` and resolve its single entry point.
 ///
 /// A pipeline can mix an `MTLFunction` from a VS library with one from a PS
