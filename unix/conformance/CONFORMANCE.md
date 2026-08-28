@@ -562,7 +562,7 @@ answer to the second create is the cap-blind step; our responses are each
 the conformant one for the capability set we advertise.
 
 ### device.c/test_cursor_clipping
-Sites: 14930=expected
+Sites: 14930=ceiling
 
 After a fullscreen device is created at a mode of another aspect than the
 display's, the cursor clip must equal the virtual screen, i.e. the mode.
@@ -570,7 +570,9 @@ Under Wine's emulated mode-set win32u clips the foreground fullscreen window
 to the physical monitor and reports that rect mapped back into the mode,
 which for 640x480 on a 3:2 panel reads "(-51,0)-(691,480)": the letterbox
 bars are inside the clip. That is win32u's mapping, not ours; the device
-sets the mode exactly as native does.
+sets the mode exactly as native does. `ceiling` because it reads zero on a
+display whose aspect the mode matches (the CI runner's 4:3 virtual display
+has no letterbox for 640x480).
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=ceiling
