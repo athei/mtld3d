@@ -2779,23 +2779,17 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     fn device_forward_target(&self) -> *mut c_void {
         let inner = self.inner();
         // Managed textures do not pin the device (they outlive it and migrate),
-        // a detached texture (device_inner == 0, "between devices") has no
-        // device to forward to, and a CPU-only cube shell has no device object
-        // that must not keep the device alive.
-        if inner.d3d_pool == mtld3d_types::D3DPOOL_MANAGED
-            || inner.device_inner == 0
-            || (inner.flags.contains(TextureFlags::CUBE)
-                && matches!(
-                    inner.d3d_pool,
-                    mtld3d_types::D3DPOOL_SYSTEMMEM | mtld3d_types::D3DPOOL_SCRATCH
-                ))
-        {
+        // and a detached texture (device_inner == 0, "between devices") has no
+        // device to forward to. Every other texture pins, whatever its shape
+        // and wherever its pixels live: the two system-memory pools keep no
+        // Metal texture, and still hold the device that created them.
+        if inner.d3d_pool == mtld3d_types::D3DPOOL_MANAGED || inner.device_inner == 0 {
             return core::ptr::null_mut();
         }
         self.owning_device()
     }
     fn owning_device(&self) -> *mut c_void {
-        // Every pool answers here, including the managed and cube-shell cases
+        // Every pool answers here, including the managed and detached cases
         // the forwarding target excludes: those opt out of pinning the device,
         // not out of having one. Null only once the device is gone, which
         // `detach_from_device` zeroes at teardown.

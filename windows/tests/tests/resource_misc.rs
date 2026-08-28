@@ -10,8 +10,9 @@ use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
     D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
     D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY,
-    D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9,
+    IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -87,6 +88,34 @@ fn child_resources_balance_device_refcount() {
         assert_eq!(h.device_refcount(), base + 1, "texture forwards +1");
     }
     assert_eq!(h.device_refcount(), base, "texture release balances");
+
+    {
+        let _tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        assert_eq!(
+            h.device_refcount(),
+            base + 1,
+            "system-memory texture forwards +1"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "system-memory texture release balances"
+    );
+
+    {
+        let _cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        assert_eq!(
+            h.device_refcount(),
+            base + 1,
+            "system-memory cube forwards +1"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "system-memory cube release balances"
+    );
 
     {
         let _rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
@@ -239,8 +268,8 @@ fn resource_get_device_returns_the_creating_device() {
     }
     // The cube and volume vtables share the 2D texture's thunk, which reads
     // the wrapper through one type and only holds because the three share a
-    // layout. A SCRATCH cube is the CPU-only shell: no Metal texture behind
-    // it, and no forwarded reference either.
+    // layout. A SCRATCH cube holds no Metal texture, which is why it is worth
+    // asking separately.
     for (pool, label) in [
         (D3DPOOL_DEFAULT, "cube (DEFAULT)"),
         (D3DPOOL_SCRATCH, "cube (SCRATCH)"),
@@ -295,6 +324,68 @@ fn resource_get_device_returns_the_creating_device() {
         .create_query(D3DQUERYTYPE_EVENT)
         .expect("an event query is always available");
     check("query", &|| query.get_device());
+}
+
+/// The shared body of the test below, run once per resource shape.
+///
+/// `base` is the device's public refcount taken before the resource was
+/// created, and `get_device` asks the created resource. Releases the
+/// harness's own device reference, so the caller must hold the resource
+/// across the call and drop it afterwards.
+fn check_holds_device_past_app_reference(
+    h: &Harness,
+    base: u32,
+    label: &str,
+    get_device: &dyn Fn() -> (i32, *mut c_void),
+) {
+    assert_eq!(
+        h.device_refcount(),
+        base + 1,
+        "{label}: the resource forwards one device reference"
+    );
+    assert_eq!(
+        h.release_device(),
+        base,
+        "{label}: the resource's reference is what the device is left holding"
+    );
+    let (hr, dev) = get_device();
+    assert_eq!(hr, D3D_OK, "{label}: GetDevice past the app reference");
+    assert_eq!(dev, h.device(), "{label}: the device that created it");
+    // SAFETY: `dev` is the reference `GetDevice` just handed out, and the
+    // resource still holds one of its own, so the device stays live.
+    let back = unsafe { h.release_device_ref(dev) };
+    assert_eq!(
+        back, base,
+        "{label}: the reference handed out is the one given back"
+    );
+}
+
+/// A system-memory resource holds its device past the application's last reference.
+///
+/// Every D3D9 resource holds one reference on the device that created it, so
+/// the device is destroyed by the last of them to go and not by the
+/// application's own `Release`. The two system-memory pools change where the
+/// pixels live, not who owns whom: a `D3DPOOL_SCRATCH` cube, which keeps no
+/// Metal texture at all, answers `GetDevice` with a live device after the
+/// application has dropped its reference, exactly as the `D3DPOOL_SYSTEMMEM`
+/// 2D texture beside it does. Each case releases the device it was created
+/// from, so each gets its own harness, and each drops its resource last: a run
+/// that reaches the end tore device and resource down in that order without
+/// faulting.
+#[test]
+fn a_system_memory_resource_holds_the_device_past_the_app_reference() {
+    {
+        let h = Harness::new();
+        let base = h.device_refcount();
+        let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        check_holds_device_past_app_reference(&h, base, "SCRATCH cube", &|| cube.get_device());
+    }
+    {
+        let h = Harness::new();
+        let base = h.device_refcount();
+        let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        check_holds_device_past_app_reference(&h, base, "SYSTEMMEM texture", &|| tex.get_device());
+    }
 }
 
 /// The two ways a `GetDevice` call can be malformed, neither of them fatal.
