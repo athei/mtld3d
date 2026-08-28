@@ -5966,12 +5966,21 @@ extern "system" fn device_stretch_rect(
     }
     let render_quad = scaling || cross_format;
 
-    // The blit below writes only the destination's Metal texture, and a
+    // Both transports below write only the destination's Metal texture, and a
     // texture-backed destination (an offscreen plain or a render-target texture
     // level) reads its pixels back through the CPU staging a `LockRect` or a
-    // `GetDC` maps. Claim the level for the GPU so the next map reads the blit
-    // rather than the staging it left behind.
-    if !render_quad && matches!(dst_info.kind, StretchKind::Texture(_)) {
+    // `GetDC` maps. Claim the level for the GPU so the next map reads the copy
+    // rather than the staging it left behind. The render quad binds the
+    // destination as a colour attachment, so it claims only a destination that
+    // carries `D3DUSAGE_RENDERTARGET`: claiming one the quad cannot write would
+    // trade stale pixels for uninitialised ones. Every render-quad pair that
+    // gets this far has such a destination, the rejections above having
+    // answered `INVALIDCALL` (a scale into one that is not a render target) or
+    // taken the CPU converter (a cross-format copy into an offscreen plain).
+    let dst_renderable = dst_info
+        .flags
+        .contains(StretchSurfaceFlags::IS_RENDER_TARGET);
+    if matches!(dst_info.kind, StretchKind::Texture(_)) && (!render_quad || dst_renderable) {
         claim_stretch_dst_for_gpu(dst_surf, &dst_info);
     }
 
@@ -6005,10 +6014,11 @@ extern "system" fn device_stretch_rect(
 
 /// Claim a `StretchRect` destination level for the GPU.
 ///
-/// A texture-backed destination carries CPU staging, and the blit writes only
-/// its Metal texture, so a `LockRect` or a `GetDC` of the level has to read it
-/// back instead of serving the staging the blit never touched. Every source
-/// kind lands here, including one with no CPU staging of its own to copy from.
+/// A texture-backed destination carries CPU staging, and both the 1:1 blit and
+/// the render quad write only its Metal texture, so a `LockRect` or a `GetDC`
+/// of the level has to read it back instead of serving the staging the copy
+/// never touched. Every source kind lands here, including one with no CPU
+/// staging of its own to copy from.
 /// Marking is all this does; the read happens at the next map.
 fn claim_stretch_dst_for_gpu(
     dst_surf: *mut crate::surface::Direct3DSurface9,

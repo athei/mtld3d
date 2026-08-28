@@ -1746,6 +1746,167 @@ fn color_fill_render_target_overwrites_earlier_draws() {
 }
 
 #[test]
+fn scaled_stretch_rect_into_a_texture_level_is_visible_to_lock_rect() {
+    // A scaling StretchRect cannot go through Metal's blit encoder, so it
+    // renders the source onto a quad covering the destination's render-target
+    // texture level, writing that level's Metal texture alone. A LockRect on
+    // the level reads CPU staging, so it has to take the read back the claim on
+    // the level makes. The lock seeds the staging with a colour the quad never
+    // writes, so a lock that skips the read back reads green where the quad
+    // left red.
+    const SIZE: u32 = 32;
+    let h = Harness::new();
+    let src = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, RED), D3D_OK, "fill the source red");
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * SIZE) as usize]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_POINT),
+        D3D_OK,
+        "64x64 render target into a 32x32 render-target texture level",
+    );
+
+    let locked = dst.lock_rect(0, D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let texels = locked.as_u32((pitch_px * SIZE) as usize);
+    for (x, y, name) in [(0, 0, "first texel"), (SIZE - 1, SIZE - 1, "last texel")] {
+        assert_eq!(
+            texels[(y * pitch_px + x) as usize],
+            RED,
+            "the lock reads the scaled copy's {name}"
+        );
+    }
+}
+
+#[test]
+fn cross_format_stretch_rect_into_a_texture_level_is_visible_to_lock_rect() {
+    // Same-size but cross-format, which the blit encoder cannot convert, so it
+    // takes the same render quad a scale does and the same claim has to follow.
+    // The R5G6B5 source is a DEFAULT offscreen plain, whose Metal format
+    // differs from the A8R8G8B8 destination's.
+    const SIZE: u32 = 32;
+    const RED_565: u16 = 0xF800;
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 2;
+        locked.write(&vec![RED_565; (pitch_px * SIZE) as usize]);
+    }
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * SIZE) as usize]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_POINT),
+        D3D_OK,
+        "R5G6B5 offscreen plain into an A8R8G8B8 render-target texture level",
+    );
+
+    let locked = dst.lock_rect(0, D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let texels = locked.as_u32((pitch_px * SIZE) as usize);
+    for (x, y, name) in [(0, 0, "first texel"), (SIZE - 1, SIZE - 1, "last texel")] {
+        assert_eq!(
+            texels[(y * pitch_px + x) as usize],
+            RED,
+            "the lock reads the converted copy's {name}"
+        );
+    }
+}
+
+#[test]
+fn color_fill_render_target_overwrites_earlier_draws() {
+    // ColorFill on a render target is ordered against the draws around it: it
+    // wipes what the frame already drew, and the draw after it blends against
+    // the fill colour rather than against what the fill replaced.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture bound");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.clear_target(BLACK), 0, "clear RT black");
+
+    // An opaque red triangle over the whole target, which the fill must erase.
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(RED)),
+        0,
+        "pre-fill draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_eq!(h.color_fill_hr(&rt_surface, BLUE), D3D_OK, "ColorFill blue");
+
+    // A half-transparent red triangle blended over the fill.
+    for (state, value) in [
+        (D3DRS_ALPHABLENDENABLE, 1),
+        (D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+    ] {
+        assert_eq!(h.set_render_state(state, value), 0, "blend state");
+    }
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(0x80FF_0000)),
+        0,
+        "blended draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt_surface, &sysmem),
+        0,
+        "read the render target back",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (32 * pitch_px + 32) as usize;
+    let center = Rgba8::from_pixel(locked.as_u32(idx + 1)[idx]);
+    assert!(
+        (96..=160).contains(&center.r) && center.g < 40 && (96..=160).contains(&center.b),
+        "half-alpha red over the blue fill, got {center:?}",
+    );
+}
+
+#[test]
 fn color_fill_lockable_render_target_is_visible_to_lock_rect() {
     // A lockable CreateRenderTarget surface serves LockRect out of CPU staging
     // while ColorFill paints its Metal texture, so the lock has to read the
