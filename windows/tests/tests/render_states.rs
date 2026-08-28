@@ -2,21 +2,28 @@
 //!
 //! Plus get/set round-trips and spec-default verification.
 
-use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8};
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, Rgba8, Surface, Texture, TexturedVertex,
+    assert_pixel_approx,
+};
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCULL_CCW, D3DCULL_CW,
-    D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST,
-    D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE,
-    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND,
+    D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND, D3DRS_FILLMODE,
+    D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE,
     D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
-    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, render_state_defaults,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
+    D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+    render_state_defaults,
 };
 
 const BLACK: u32 = 0xFF00_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
 const RED: u32 = 0xFFFF_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
 
 fn arm_diffuse(h: &Harness) {
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
@@ -538,4 +545,152 @@ fn clear_after_a_draw_in_the_same_pass_is_not_culled() {
         BLUE,
         "background is the clear colour"
     );
+}
+
+/// A full clip-space quad (two triangles) sampling a texture over 0..1 UVs.
+fn textured_fill_quad(color: u32) -> [TexturedVertex; 6] {
+    let v = |x: f32, y: f32, u: f32, vt: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+        u,
+        v: vt,
+    };
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+/// Copy `rt` onto the back buffer unchanged, so `read_pixel` sees its stored bytes.
+///
+/// Point-sampled with `D3DSAMP_SRGBTEXTURE` left at 0, so the texel arrives
+/// raw: whatever the sRGB-write test wrote into the target is what lands.
+fn blit_rt_to_backbuffer(h: &Harness, rt: &Texture<'_>, backbuffer: &Surface<'_>) {
+    assert_eq!(h.set_render_target(0, backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+    assert_eq!(h.set_texture(0, rt), 0, "bind RT as texture");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_fill_quad(WHITE)),
+        0,
+        "RT copy draw"
+    );
+}
+
+/// An sRGB-capable render target for the `D3DRS_SRGBWRITEENABLE` tests.
+fn srgb_render_target(h: &Harness) -> Texture<'_> {
+    h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    )
+}
+
+/// `D3DRS_SRGBWRITEENABLE` encodes an opaque draw's colour on write.
+///
+/// Linear 0x80 (0.502) leaves the target holding 0xBC, the value Windows
+/// produces for the same draw. Pins the encode itself, independent of where
+/// in the pipeline it happens.
+#[test]
+fn srgb_write_encodes_an_opaque_draw() {
+    let h = Harness::new();
+    let rt = srgb_render_target(&h);
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(BLACK), 0, "clear RT");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0xFF80_8080)),
+        0,
+        "sRGB-write draw"
+    );
+    blit_rt_to_backbuffer(&h, &rt, &backbuffer);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xFFBC_BCBC,
+        3,
+        "linear 0x80 must be stored sRGB-encoded as ~0xBC",
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
+}
+
+/// `D3DRS_SRGBWRITEENABLE` blends in linear space and encodes afterwards.
+///
+/// The D3D9 order the `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises:
+/// the destination is decoded to linear, the blend runs there, and the
+/// result is encoded on write. Over a stored 0x80 (linear 0.216), white at
+/// half alpha gives linear 0.608, which encodes to ~0xCD. Encoding in the
+/// pixel shader instead blends 1.0 against the stored 0.502 in gamma space
+/// and lands on ~0xC0.
+#[test]
+fn srgb_write_blends_in_linear_then_encodes() {
+    let h = Harness::new();
+    let rt = srgb_render_target(&h);
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    // The destination is written with sRGB writes off, so the target holds
+    // 0x80 verbatim: the gamma-space encoding of linear 0.216.
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear RT mid-grey");
+
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    blit_rt_to_backbuffer(&h, &rt, &backbuffer);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Alpha carries no transfer function, so it blends to 0.75 either way.
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xBFCD_CDCD,
+        3,
+        "the blend must run on linear values, not on the encoded ones",
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
 }

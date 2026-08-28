@@ -347,7 +347,9 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// the eagerly-created sRGB twin view when the format has one
 /// (`PixelFormat::srgb_twin`), else 0. The draw-time bind picks the twin
 /// when the stage's sampler has `D3DSAMP_SRGBTEXTURE=1`, giving the
-/// hardware sRGB→linear decode D3D9 promises for that state.
+/// hardware sRGB→linear decode D3D9 promises for that state, and the render
+/// pass attaches it in place of the base texture under
+/// `D3DRS_SRGBWRITEENABLE`, giving the post-blend encode.
 pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
@@ -442,8 +444,10 @@ pub fn create_texture(
     // neither an extra usage flag nor the texture's lossless compression.
     // The twin mirrors the base handle's swizzle (when the base is handed out
     // as a swizzle view below) so the two views only ever differ in transfer
-    // function; it is sampled only, never bound as an attachment, so the
-    // render-target swizzle restriction doesn't apply to it.
+    // function. A render target never takes the swizzle branch, so the twin
+    // of one carries the identity swizzle and stays legal as a colour
+    // attachment; a view inherits its base texture's usage, so the twin of a
+    // render target is render-targetable too.
     let srgb_handle = if is_depth {
         0
     } else if let Some(srgb_format) = desc.pixel_format.srgb_twin() {

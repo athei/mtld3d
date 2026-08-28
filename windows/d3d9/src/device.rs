@@ -685,11 +685,9 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
             .union(SnapshotDirty::VS_CONST),
         D3DRS_TEXTUREFACTOR => rs.union(SnapshotDirty::PS_CONST),
         // FLAT vs GOURAUD flips the PS `[[flat]]` varying qualifier (VariantKey
-        // flat_shade), SRGBWRITEENABLE toggles the in-shader linear→sRGB OETF
-        // (VariantKey srgb_write) and POINTSPRITEENABLE flips
+        // flat_shade), SRGBWRITEENABLE carries `D3DRS_SRGBWRITEENABLE` to the
+        // encoder (VariantKey srgb_write) and POINTSPRITEENABLE flips
         // VariantFlags::POINT_SPRITE; all rebuild the PS source + variant key.
-        // (SRGBWRITEENABLE also retains its RS bit elsewhere, keeping the
-        // pipeline's SRGB_WRITE flag current.)
         D3DRS_SHADEMODE | D3DRS_SRGBWRITEENABLE | D3DRS_POINTSPRITEENABLE => rs
             .union(SnapshotDirty::VARIANT)
             .union(SnapshotDirty::PS_SOURCE),
@@ -7358,13 +7356,13 @@ extern "system" fn device_clear(
         // D3DCOLOR is ARGB; unpack to normalized float bits so the encoder
         // can fold them into a Metal `MTLLoadAction::Clear` at pass-begin.
         // D3DRS_SRGBWRITEENABLE applies to the clear colour exactly as it
-        // applies to a draw's output: the draw path encodes in the pixel
-        // shader, so the clear colour is encoded here before it reaches the
-        // load action or the clear quad.
-        let mut rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
-        if dev.render_state(D3DRS_SRGBWRITEENABLE as usize) != 0 {
-            rgba = mtld3d_core::convert::linear_to_srgb_rgba(rgba);
-        }
+        // applies to a draw's output, but which of the two encodes it is a
+        // property of the attachment the encoder will bind: an sRGB view
+        // converts the clear value itself, and only a target without one
+        // needs the curve applied to the value on the way in. The bit rides
+        // along and the encoder decides.
+        let srgb_write = dev.render_state(D3DRS_SRGBWRITEENABLE as usize) != 0;
+        let rgba = mtld3d_core::convert::d3dcolor_to_rgba_f32(color);
         let r_bits = f32::to_bits(rgba[0]);
         let g_bits = f32::to_bits(rgba[1]);
         let b_bits = f32::to_bits(rgba[2]);
@@ -7377,13 +7375,13 @@ extern "system" fn device_clear(
         // this Clear names, exactly as the depth side below is.
         match &regions {
             None => dev.push_op(Box::new(move |enc| {
-                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits);
+                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits, srgb_write);
             })),
             Some(list) if list.is_empty() => {}
             Some(list) => {
                 let rects = list.clone();
                 dev.push_op(Box::new(move |enc| {
-                    enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, &rects);
+                    enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, srgb_write, &rects);
                 }));
             }
         }
@@ -9048,10 +9046,6 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         prs_flags.set(
             PipelineRsFlags::SEPARATE_ALPHA_BLEND,
             rs[D3DRS_SEPARATEALPHABLENDENABLE as usize] != 0,
-        );
-        prs_flags.set(
-            PipelineRsFlags::SRGB_WRITE,
-            rs[D3DRS_SRGBWRITEENABLE as usize] != 0,
         );
         let pipeline_rs = PipelineRsBits {
             flags: prs_flags,
@@ -11274,10 +11268,11 @@ const fn rs_classify(index: u32) -> RsClass {
         | D3DRS_SEPARATEALPHABLENDENABLE
         | D3DRS_SRCBLENDALPHA
         | D3DRS_DESTBLENDALPHA
-        // SRGBWRITEENABLE is consumed as a pixel-shader variant: the
-        // emitter appends the exact sRGB OETF to every exported colour
-        // output (`VariantFlags::SRGB_WRITE`, windows/core/src/dxso/emit.rs)
-        // and `Clear` converts its colour through the same curve.
+        // SRGBWRITEENABLE binds the colour attachment's sRGB twin view for
+        // the pass, so Metal encodes after the blender. A target with no
+        // sRGB Metal view falls back to the pixel-shader OETF variant
+        // (`VariantFlags::SRGB_WRITE`, windows/core/src/dxso/emit.rs) with
+        // `Clear` converting its colour through the same curve.
         | D3DRS_SRGBWRITEENABLE
         | D3DRS_COLORWRITEENABLE
         | D3DRS_COLORWRITEENABLE1

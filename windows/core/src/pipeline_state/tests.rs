@@ -238,11 +238,6 @@ fn key_changes_on_every_field() {
     );
     assert_ne!(
         k0,
-        mutate(|s| s.rs.flags.insert(PipelineRsFlags::SRGB_WRITE)),
-        "srgb_write_enable"
-    );
-    assert_ne!(
-        k0,
         mutate(|s| s.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT)),
         "has_color_output"
     );
@@ -350,7 +345,6 @@ fn params_match_key_on_default_snapshot() {
     assert_eq!(p.dst_blend_alpha, k.dst_blend_alpha);
     assert_eq!(p.blend_op_alpha, k.blend_op_alpha);
     assert_eq!(p.separate_alpha_blend_enable, k.separate_alpha_blend_enable);
-    assert_eq!(p.srgb_write_enable, k.srgb_write_enable);
     assert_eq!(p.color_write_mask, k.color_write_mask);
     assert_eq!(p.has_depth, k.has_depth);
     assert_eq!(p.has_stencil, k.has_stencil);

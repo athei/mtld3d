@@ -99,15 +99,11 @@ pub fn create_render_pipeline(
         // The pipeline's color format MUST equal the render pass's bound
         // texture format — Metal validates this and the mismatch is undefined
         // behaviour with the layer off (it corrupts the heap, surfacing as a
-        // crash in an unrelated later teardown). The render pass binds the RT
-        // texture at its own (`color_format`) format, so the pipeline matches
-        // it. `D3DRS_SRGBWRITEENABLE` is intentionally NOT honoured by swapping
-        // to the sRGB twin format here: the D3D9 semantics ("encode the shader
-        // output linear→sRGB on write") need an sRGB render target or
-        // attachment view, but we bind the plain texture — swapping only the
-        // pipeline desynced the formats. Correct sRGB-write encoding (a
-        // pixel-shader OETF variant) is the proper follow-up; until then
-        // `SRGBWRITEENABLE` writes linear instead of corrupting the heap.
+        // crash in an unrelated later teardown). `color_format` therefore
+        // arrives as the format of the view the pass binds, never as the
+        // render target's own: under `D3DRS_SRGBWRITEENABLE` the PE side
+        // attaches the target's sRGB twin view and keys the pipeline on the
+        // sRGB format in the same decision, so the two cannot desync.
         color0.setPixelFormat(mtl_pixel_format(params.color_format));
 
         let mask = MTLColorWriteMask::from_bits_truncate(params.color_write_mask.bits() as usize);

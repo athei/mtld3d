@@ -31,7 +31,6 @@ bitflags::bitflags! {
     pub struct PipelineRsFlags: u8 {
         const BLEND_ENABLE = 1 << 0;
         const SEPARATE_ALPHA_BLEND = 1 << 1;
-        const SRGB_WRITE = 1 << 2;
     }
 }
 
@@ -152,11 +151,6 @@ impl PipelineRsBits {
     #[must_use]
     pub const fn separate_alpha_blend_enable(&self) -> bool {
         self.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn srgb_write_enable(&self) -> bool {
-        self.flags.contains(PipelineRsFlags::SRGB_WRITE)
     }
 }
 
@@ -315,7 +309,6 @@ pub struct PipelineKey {
     has_depth: u32,
     has_stencil: u32,
     color_format: PixelFormat,
-    srgb_write_enable: u32,
     has_color_output: u32,
     /// Render targets 1..3: presence, format, effective write mask, alpha clamp.
     ///
@@ -416,7 +409,6 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
         has_depth: u32::from(s.has_depth()),
         has_stencil: u32::from(s.has_stencil()),
         color_format: s.color_format,
-        srgb_write_enable: u32::from(s.rs.srgb_write_enable()),
         has_color_output: u32::from(s.has_color_output()),
         extra_present_mask: s.extra.present_mask,
         // Absent slots drop their alpha bit so the key stays canonical.
@@ -456,7 +448,6 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         dst_blend_alpha: d3d_to_metal_blend_rt(dst_a, s.color_has_alpha()),
         blend_op_alpha: d3d_to_metal_blend_op(op_a),
         separate_alpha_blend_enable: u32::from(s.rs.separate_alpha_blend_enable()),
-        srgb_write_enable: u32::from(s.rs.srgb_write_enable()),
         color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
         has_depth: u32::from(s.has_depth()),
         has_stencil: u32::from(s.has_stencil()),

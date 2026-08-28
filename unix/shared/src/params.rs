@@ -348,7 +348,6 @@ pub struct CreateRenderPipelineParams {
     pub dst_blend_alpha: BlendFactor, // in: dest alpha (only if separate_alpha_blend_enable)
     pub blend_op_alpha: BlendOperation, // in: alpha blend op (D3DRS_BLENDOPALPHA)
     pub separate_alpha_blend_enable: u32, // in: non-zero = use *_alpha fields; else mirror RGB
-    pub srgb_write_enable: u32,       // in: non-zero = upgrade color_format to its sRGB twin
     pub color_write_mask: ColorWriteMask, // in
     pub has_depth: u32,               // in: non-zero = pipeline declares depth attachment
     pub has_stencil: u32, // in: non-zero = depth attachment format carries stencil (D24S8/D24FS8)

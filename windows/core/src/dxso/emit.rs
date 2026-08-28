@@ -57,16 +57,18 @@ bitflags::bitflags! {
         /// perspective-interpolated. Folded into the PS cache key so FLAT and
         /// GOURAUD draws get distinct libraries.
         const FLAT_SHADE = 1 << 1;
-        /// `D3DRS_SRGBWRITEENABLE != 0`.
+        /// `D3DRS_SRGBWRITEENABLE != 0` on a colour target with no sRGB Metal view.
         ///
         /// When set, the PS applies the linear→sRGB OETF to the final colour
         /// rgb (alpha untouched) just before output, after
-        /// fog/specular/alpha-test. D3D9 semantics are "encode the shader
-        /// output linear→sRGB on write to an sRGB-capable render target"; the
-        /// Metal RT/pipeline format stays PLAIN (so formats without an sRGB
-        /// twin, e.g. R5G6B5, still work) and the encode happens in-shader.
-        /// Folded into the PS cache key so sRGB-write and plain draws get
-        /// distinct libraries.
+        /// fog/specular/alpha-test. This is the fallback path: where the
+        /// bound colour target has an sRGB twin the render pass attaches it
+        /// instead and the hardware encodes after the blender, which is what
+        /// D3D9 does; the encoder clears this flag for such a draw. It stays
+        /// set for a target whose format has no sRGB twin (e.g. R5G6B5),
+        /// where the encode can only happen in-shader and therefore lands
+        /// before the blender. Folded into the PS cache key so sRGB-write and
+        /// plain draws get distinct libraries.
         const SRGB_WRITE = 1 << 2;
         /// `D3DRS_POINTSPRITEENABLE != 0` on a point-list draw.
         ///
@@ -314,10 +316,10 @@ fn w(out: &mut String, s: &str) {
 
 /// Emit the linear→sRGB OETF helper for `D3DRS_SRGBWRITEENABLE`.
 ///
-/// The RT is kept at its plain (non-`_srgb`) Metal pixel format — required for
-/// formats without an sRGB twin such as `R5G6B5` — so the encode happens in the
-/// pixel shader on the final colour rgb (alpha is left linear). Per channel this
-/// is the standard sRGB transfer function:
+/// Emitted only for a colour target with no sRGB Metal twin (`R5G6B5` and the
+/// float formats), where the RT stays at its plain pixel format and the encode
+/// can only happen in the pixel shader, on the final colour rgb (alpha is left
+/// linear). Per channel this is the standard sRGB transfer function:
 /// `c <= 0.0031308 ? 12.92*c : 1.055*c^(1/2.4) - 0.055`.
 /// `select(hi, lo, cond)` returns `cond ? lo : hi` per component; the `pow`
 /// domain is guarded with `max(c, 0)` so a negative lane never yields a NaN

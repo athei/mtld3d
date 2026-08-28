@@ -1250,6 +1250,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             any_lod_bias = true;
         }
     }
+    // `D3DRS_SRGBWRITEENABLE` picks the pass's colour attachment views, so it
+    // has to reach the pass state before anything this draw emits opens a
+    // pass. A change ends the current one, since the views are frozen at
+    // pass open.
+    enc.set_srgb_write_enabled(variant.flags.contains(VariantFlags::SRGB_WRITE));
     // The render pass decides which colour outputs the PS may export, and
     // that is only known here on the encoder thread. Patch a PS-only copy so
     // the VS key, which shares `variant`, is untouched; the FF PS writes one
@@ -1270,6 +1275,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // drops it here and keeps its non-sprite library.
     if metal_prim != PrimitiveType::Point {
         ps_variant.flags.remove(VariantFlags::POINT_SPRITE);
+    }
+    // With sRGB attachment views bound, Metal applies the linear → sRGB OETF
+    // after the blender, which is the D3D9 order. The in-shader encode is the
+    // fallback for a colour target with no sRGB Metal view, and it must not
+    // run as well or the colour is encoded twice.
+    if enc.color_attachment_is_srgb() {
+        ps_variant.flags.remove(VariantFlags::SRGB_WRITE);
     }
     // A fragment function declaring a depth output against a pass with no
     // depth attachment is a Metal pipeline error, so a programmable PS drops

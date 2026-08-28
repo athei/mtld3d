@@ -114,13 +114,13 @@ impl PixelFormat {
     /// sRGB pairs in mtld3d's wire today. Depth formats, single-channel
     /// formats (A8/R8) and float formats have no sRGB encoding.
     ///
-    /// Drives the `D3DSAMP_SRGBTEXTURE=1` decode: `create_texture` eagerly
-    /// creates a view of the sRGB twin next to every colour texture whose
-    /// format has one, and the draw-time bind selects that view when the
-    /// sampling stage sets the state. (`D3DRS_SRGBWRITEENABLE=1` is NOT
-    /// view-based — it is a pixel-shader OETF variant; see
-    /// `unix/unix/src/metal/pipeline.rs` for why the attachment-format
-    /// upgrade was rejected.)
+    /// Drives both sRGB render states. `create_texture` eagerly creates a
+    /// view of the sRGB twin next to every colour texture whose format has
+    /// one; `D3DSAMP_SRGBTEXTURE=1` selects it as the sampled view, and
+    /// `D3DRS_SRGBWRITEENABLE=1` attaches it as the render pass's colour
+    /// attachment so the hardware encodes after the blender. A colour target
+    /// whose format returns `None` here keeps the pixel-shader OETF variant,
+    /// which encodes before the blender.
     ///
     /// Returning `None` means the linear format is the only thing mtld3d
     /// supports — callers fall back to the linear view with a once-per-id
