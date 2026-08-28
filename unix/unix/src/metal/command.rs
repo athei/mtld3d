@@ -2163,10 +2163,11 @@ pub struct BlitArgs {
 /// Resolve a render-resolution source up to the size the caller's coordinates assume.
 ///
 /// Returns `Some(resolved)` when a resolve happened, `None` to read the source
-/// as-is — which is both the default-scale path and the fallback if `MetalFX`
-/// declines. Reading as-is after a declined resolve yields a smaller image than
-/// requested, so it warns rather than failing the call: a wrong-sized readback
-/// is recoverable for the game, a failed `LockRect` often is not.
+/// as-is, which is both the default-scale path and the fallback when the
+/// resolve cannot be set up. Reading as-is after a declined resolve yields a
+/// smaller image than requested, so it warns rather than failing the call: a
+/// wrong-sized readback is recoverable for the game, a failed `LockRect` often
+/// is not.
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
@@ -2181,8 +2182,7 @@ fn resolve_readback_source(
     if tex_w == source_width as usize && tex_h == source_height as usize {
         return None;
     }
-    let resolved =
-        super::upscale::resolve_for_readback(cmd_buf, device, texture, source_width, source_height);
+    let resolved = encode_readback_resolve(cmd_buf, device, texture, source_width, source_height);
     if resolved.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -2191,6 +2191,52 @@ fn resolve_readback_source(
         );
     }
     resolved
+}
+
+/// Resample `src` to `out_w` x `out_h` for a CPU readback, returning the target.
+///
+/// `GetRenderTargetData`, a back-buffer `LockRect` and `GetDC` all owe the game
+/// pixels at the resolution D3D9 reports, but under `render.scale` the back
+/// buffer is rasterized smaller. The present pass resamples it into a scratch
+/// texture of the reported size, encoded onto `cmd_buf` ahead of the caller's
+/// blit encoder so the resolve and the readback are one command buffer and one
+/// wait.
+///
+/// The present pass rather than the `MTLFXSpatialScaler` the display path runs:
+/// the scaler writes an opaque alpha, and a game reading the back buffer back
+/// is owed the alpha it drew. A plain filtered resample carries all four
+/// channels, and reproduces the source exactly wherever the source is flat,
+/// which is where a readback is compared against a known colour.
+///
+/// Returns `None` when the scratch or the pipeline is unavailable, leaving the
+/// caller to read `src` directly.
+fn encode_readback_resolve(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    out_w: u32,
+    out_h: u32,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    // The resolve target has to match the source's format, and the only source
+    // that ever needs resolving is the back buffer, which is pinned to
+    // `BGRA8Unorm`. Gating on that declines rather than guessing if it ever
+    // does vary.
+    if src.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
+        return None;
+    }
+    let target = super::upscale::scratch_target(device, out_w, out_h, PixelFormat::Bgra8Unorm);
+    let Some(target) = target else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve target {out_w}x{out_h} could not be created; readback reads \
+             the render-resolution frame instead and will be the wrong size"
+        );
+        return None;
+    };
+    if !encode_present_copy(cmd_buf, src, &target) {
+        return None;
+    }
+    Some(target)
 }
 
 /// Synchronous texture→buffer readback into PE-addressable memory.
@@ -2279,10 +2325,10 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         cmd_buf.setLabel(Some(&label));
     }
     // Under `render.scale` the source is rasterized smaller than the resolution
-    // the caller's coordinates are in, so resolve it up first — on this same
-    // command buffer, ahead of the blit encoder, since the scaler cannot be
-    // encoded while an encoder is open. The readback then reads the same image
-    // the display shows. Sizes match at the default scale and this is skipped.
+    // the caller's coordinates are in, so resolve it up first, on this same
+    // command buffer and ahead of the blit encoder: the resolve opens a render
+    // pass of its own and Metal allows one encoder at a time. Sizes match at
+    // the default scale and this is skipped.
     let source = resolve_readback_source(&cmd_buf, &device, &texture, source_width, source_height);
     let texture = source.as_deref().unwrap_or(&*texture);
 

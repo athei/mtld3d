@@ -72,11 +72,11 @@ struct ScalerKey {
 ///
 /// A scaler is not a cheap thing to hold: measured on an M-series GPU, one at
 /// `1920x1200 → 2560x1600` costs **~16 MiB** of device memory for its
-/// intermediates. Steady-state play needs three at most (the present pair, the
-/// readback resolve, and the HDR float scratch), so this never evicts during a
-/// game. What it bounds is a *window being resized*, which walks through a new
-/// geometry for every size the user rests at: twelve of them in forty seconds
-/// of dragging, measured, which unbounded is ~190 MiB that never comes back.
+/// intermediates. Steady-state play needs two at most (the present pair and
+/// the HDR float scratch), so this never evicts during a game. What it bounds
+/// is a *window being resized*, which walks through a new geometry for every
+/// size the user rests at: twelve of them in forty seconds of dragging,
+/// measured, which unbounded is ~190 MiB that never comes back.
 const MAX_CACHED_SCALERS: usize = 8;
 
 /// Scaler cache, `None` once the device is known unsupported.
@@ -379,7 +379,7 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
 
 /// Cache key for a scratch target: one texture per size and format.
 ///
-/// Two callers share the cache — [`resolve_for_readback`] wants a `BGRA8Unorm`
+/// Two callers share the cache: the readback resolve wants a `BGRA8Unorm`
 /// target at the reported back-buffer size, the HDR present path wants an
 /// `Rgba16Float` one at render size — so the format is what tells their
 /// entries apart.
@@ -430,62 +430,6 @@ pub fn scratch_target(
     // SAFETY: the handle came from `create_upscale_target`, which adopted the
     // texture's canonical retain; the cache holds it for process lifetime.
     unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()
-}
-
-/// Resolve `src` to `out_w` x `out_h` for a CPU readback, returning the resolved texture.
-///
-/// `GetRenderTargetData`, a back-buffer `LockRect` and `GetDC` all owe the game
-/// pixels at the resolution D3D9 reports, but under `render.scale` the back
-/// buffer is rasterized smaller. Running the *same* upscale the display path
-/// runs, into a scratch texture of the reported size, is what makes a readback
-/// agree with what is on screen; resampling on the CPU instead would be both
-/// slower and visibly worse.
-///
-/// Encodes onto `cmd_buf` ahead of the caller's blit encoder, so the resolve
-/// and the readback are one command buffer and one wait. Returns `None` when
-/// `MetalFX` cannot serve the pair, leaving the caller to read `src` directly.
-///
-/// In SDR the scaler cache key is the same one present uses, so a readback at
-/// the frame's own scale reuses an already-built scaler. In HDR present scales
-/// a float texture instead, so the two keys diverge and this path builds its
-/// own — which is right, because the back buffer it reads is still `BGRA8Unorm`
-/// and still wants `Perceptual`.
-pub fn resolve_for_readback(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    device: &ProtocolObject<dyn MTLDevice>,
-    src: &ProtocolObject<dyn MTLTexture>,
-    out_w: u32,
-    out_h: u32,
-) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
-    // The resolve target has to match the source's format, and the only source
-    // that ever needs resolving is the back buffer, which is pinned to
-    // `BGRA8Unorm`. Gating on that declines rather than guessing if it ever
-    // does vary.
-    if src.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
-        return None;
-    }
-    let target = scratch_target(device, out_w, out_h, PixelFormat::Bgra8Unorm);
-    let Some(target) = target else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "readback resolve target {out_w}x{out_h} could not be created — readback reads \
-             the render-resolution frame instead and will be the wrong size"
-        );
-        return None;
-    };
-    // The back buffer is sRGB-encoded, the same input the display path feeds
-    // the scaler, so the readback resolve shares its colour mode and its
-    // cached scaler.
-    if !encode(
-        cmd_buf,
-        device,
-        src,
-        &target,
-        MTLFXSpatialScalerColorProcessingMode::Perceptual,
-    ) {
-        return None;
-    }
-    Some(target)
 }
 
 /// Narrow a Metal texture dimension to the `u32` the cache key stores.
