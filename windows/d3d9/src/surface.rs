@@ -241,7 +241,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle,
             multi_sample,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
@@ -299,7 +298,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
@@ -347,7 +345,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
@@ -394,7 +391,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
@@ -444,7 +440,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
@@ -498,7 +493,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
             private_data: PrivateDataStore::default(),
@@ -546,7 +540,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: None,
             flags: SurfaceFlags::OWNS_PARENT_TEXTURE,
             private_data: PrivateDataStore::default(),
@@ -596,7 +589,6 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            dc_shim: None,
             system_memory: Some(backing),
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
@@ -1148,16 +1140,6 @@ struct SurfaceInner {
     /// `UnlockRect`. Persists across the Lock so the game can read the returned
     /// pointer.
     readback: Option<PageBox>,
-    /// Page-aligned DIB the held `GetDC` draws into when the store is too tight.
-    ///
-    /// GDI steps a DIB by the row length rounded up to a dword and rejects a
-    /// pitch below it, so a store whose rows are tighter than that cannot be
-    /// handed to GDI as it stands. `GetDC` then seeds this page with the
-    /// store's rows at the DIB stride and wraps it instead; `ReleaseDC` copies
-    /// the rows back and drops it. `None` whenever the store's own pitch
-    /// already carries the DIB stride, which every store a surface resolves
-    /// through `linear_row_pitch` does.
-    dc_shim: Option<PageBox>,
     /// Backing store for a `D3DPOOL_SYSTEMMEM` offscreen plain surface.
     ///
     /// From `CreateOffscreenPlainSurface`. Allocated full-size at creation;
@@ -3019,71 +3001,6 @@ fn dc_dib_pitch(px: &SurfacePixels) -> Option<u32> {
     ))
 }
 
-/// Seed a page at the DIB stride from a pixel store on a tighter one.
-///
-/// `height` rows `dib_pitch` bytes apart, each carrying that row's
-/// `src_pitch` bytes from the store. Zero-filled, so the padding past the end
-/// of a row reads as black instead of as whatever the allocator left there.
-/// `None` for an empty geometry or a byte size that overflows.
-fn dc_shim_page(px: &SurfacePixels, dib_pitch: usize) -> Option<PageBox> {
-    let rows = px.height as usize;
-    let len = dib_pitch.checked_mul(rows)?;
-    if len == 0 || px.src_pitch == 0 {
-        return None;
-    }
-    let mut page = PageBox::new_zeroed(len);
-    for row in 0..rows {
-        // SAFETY: `bits` is a live store of `height` rows of `src_pitch` bytes
-        // (the caller checked it non-null), so row `row` starts in bounds.
-        let src_ptr = unsafe { px.bits.add(row * px.src_pitch) };
-        // SAFETY: `page` holds `rows * dib_pitch` bytes, so row `row` starts in
-        // bounds and `src_pitch <= dib_pitch` bytes of it are addressable.
-        let dst_ptr = unsafe { page.as_mut_ptr().add(row * dib_pitch) };
-        // SAFETY: both rows are in bounds (above), and the store and the page
-        // are distinct allocations, so the ranges cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, px.src_pitch) };
-    }
-    Some(page)
-}
-
-/// Copy a shim page's rows back into the store its DC stood in for.
-///
-/// The reverse of [`dc_shim_page`], `src_pitch` bytes per row, leaving the
-/// DIB's row padding behind. A surface that can no longer resolve the store or
-/// its DIB stride keeps the pixels it has: the drawing is lost either way, and
-/// a partial copy would be worse.
-fn dc_shim_write_back(inner: &SurfaceInner, page: &PageBox) {
-    let resolved = inner
-        .dc_pixels()
-        .and_then(|px| dc_dib_pitch(&px).map(|pitch| (px, pitch as usize)));
-    let Some((px, dib_pitch)) = resolved else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "IDirect3DSurface9::ReleaseDC: no pixel store left to copy the DIB back into");
-        return;
-    };
-    let rows = px.height as usize;
-    if px.bits.is_null()
-        || px.src_pitch > dib_pitch
-        || page.logical_len() < dib_pitch.saturating_mul(rows)
-    {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "IDirect3DSurface9::ReleaseDC: the DIB no longer covers the surface store, drawing dropped");
-        return;
-    }
-    for row in 0..rows {
-        // SAFETY: `page` holds `rows * dib_pitch` bytes (checked above), so row
-        // `row` starts in bounds and `src_pitch <= dib_pitch` bytes of it are
-        // addressable.
-        let src_ptr = unsafe { page.as_ptr().add(row * dib_pitch) };
-        // SAFETY: `bits` is a live store of `rows` rows of `src_pitch` bytes,
-        // so row `row` starts in bounds.
-        let dst_ptr = unsafe { px.bits.add(row * px.src_pitch) };
-        // SAFETY: both rows are in bounds (above), and the page and the store
-        // are distinct allocations, so the ranges cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, px.src_pitch) };
-    }
-}
-
 impl SurfaceInner {
     /// True for the implicit backbuffer surface only when it is lockable.
     ///
@@ -3336,25 +3253,17 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     if px.bits.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    // GDI rejects a pitch below the DIB stride outright, so a store on a
-    // tighter one gets a page of its own at the DIB stride, seeded from its
-    // rows, and `ReleaseDC` copies whatever GDI drew back into it. A store
-    // already carrying the DIB stride is aliased directly, no copy either way.
-    let mut shim = None;
-    let (bits, pitch) = if px.src_pitch < dib_pitch as usize {
-        let Some(mut page) = dc_shim_page(&px, dib_pitch as usize) else {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "IDirect3DSurface9::GetDC: no page for the DIB the store is too tight for → INVALIDCALL");
-            return D3DERR_INVALIDCALL;
-        };
-        let bits = page.as_mut_ptr();
-        shim = Some(page);
-        (bits, dib_pitch)
-    } else {
-        let Ok(pitch) = u32::try_from(px.src_pitch) else {
-            return D3DERR_INVALIDCALL;
-        };
-        (px.bits, pitch)
+    // Every store a surface resolves is sized and strided by
+    // `linear_row_pitch`, the rounding GDI derives the DIB stride from, so the
+    // store's own pitch is the DIB's and the DIB aliases it directly. GDI
+    // rejects a pitch below the DIB stride outright, so a store that ever came
+    // in tighter would have to be copied through a page of its own.
+    debug_assert!(
+        px.src_pitch >= dib_pitch as usize,
+        "a device context resolved a pixel store tighter than its DIB stride"
+    );
+    let Ok(pitch) = u32::try_from(px.src_pitch) else {
+        return D3DERR_INVALIDCALL;
     };
 
     // Wrap the pixel store resolved above in a memory DC + DIB via
@@ -3367,7 +3276,7 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // `D3DKMTCreateDCFromMemory` reports the real failure via its status).
     let device_dc = unsafe { CreateCompatibleDC(core::ptr::null_mut()) };
     let mut desc = D3DKMT_CREATEDCFROMMEMORY {
-        p_memory: bits.cast::<c_void>(),
+        p_memory: px.bits.cast::<c_void>(),
         format: px.d3d_format,
         width: px.width,
         height: px.height,
@@ -3390,10 +3299,6 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
         return D3DERR_INVALIDCALL;
     }
 
-    // The DIB the call wrapped is the shim page, so it has to outlive the DC:
-    // park it on the surface, where `ReleaseDC` finds it. A rejected call above
-    // dropped it on the way out, leaving the surface's slot empty.
-    inner.dc_shim = shim;
     // The DC now maps the level, so nothing may release the staging under it
     // until `ReleaseDC` drops the pin.
     pin_dc_texture_level(inner, true);
@@ -3467,11 +3372,6 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
         }
     }
     teardown_gdi_dc(held);
-    // A store too tight for a DIB was drawn into through a shim page, so what
-    // GDI drew lives there alone: copy the rows back before the page goes.
-    if let Some(page) = inner.dc_shim.take() {
-        dc_shim_write_back(inner, &page);
-    }
     // The DC's DIB aliased a lockable render target's CPU staging, so whatever
     // GDI drew is in the staging alone: push it to the colour texture the way
     // `UnlockRect` does, or the next read-back overwrites it with the pixels
