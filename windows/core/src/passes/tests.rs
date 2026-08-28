@@ -2882,6 +2882,123 @@ fn cascade_rebind_with_the_same_sampleable_flag_is_a_no_op() {
     );
 }
 
+/// Drive a sample-then-reuse pair of frames, optionally retiring the texture between them.
+///
+/// Frame N renders into `rt` and samples it, which puts the handle in the
+/// session-wide sampled set. Frame N+1 binds the same address as a colour
+/// target nothing reads. Returns that pass's load and store actions.
+fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
+    let rt = tex(0xCAFE_8000);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    if retire {
+        s.unregister_texture(rt);
+    }
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    let reuse = s
+        .passes()
+        .iter()
+        .find(|p| p.color_texture() == rt)
+        .expect("the reuse pass is present");
+    (reuse.color_load(), reuse.color_store())
+}
+
+/// A retired colour handle stops looking sampled, so its address can be reused.
+///
+/// `seen_sampled_textures` deliberately outlives the frame that filled it, so
+/// every rule that consults it keeps `Load` and `Store` on the handle for as
+/// long as the entry stands. That is right while the texture lives and wrong
+/// the moment Metal is free to hand its address to an unrelated allocation.
+#[test]
+fn a_retired_colour_handle_drops_its_sampled_marking() {
+    assert_eq!(
+        colour_reuse_after_sample(true),
+        (ColorLoad::DontCare, StoreAction::DontCare),
+        "the reused address is a first use nothing reads: Rule A discards the load, \
+         Rule D drops the store",
+    );
+    assert_eq!(
+        colour_reuse_after_sample(false),
+        (ColorLoad::Load, StoreAction::Store),
+        "a live texture sampled last frame keeps both, which is what the prune must \
+         not weaken",
+    );
+}
+
+/// Retiring a texture re-arms every frame-scoped record keyed on its handle.
+///
+/// The colour seen-set is keyed on `(handle, subresource)` and the sampled
+/// set on the handle alone, so a destroy and a same-frame reallocation onto
+/// the same address must leave both answering for the new texture.
+#[test]
+fn unregister_texture_re_arms_the_frame_scoped_sets() {
+    let rt = tex(0xCAFE_8100);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
+    s.emit_command(dummy_draw());
+    assert!(
+        s.texture_sampled_this_frame(rt),
+        "the bind marks the handle sampled this frame",
+    );
+    s.unregister_texture(rt);
+    assert!(
+        !s.texture_sampled_this_frame(rt),
+        "an upload into the reallocated address must not trigger a rename",
+    );
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    assert_eq!(
+        s.passes()
+            .last()
+            .expect("the reuse pass is present")
+            .color_load(),
+        ColorLoad::DontCare,
+        "the reused address is a first use again, so Rule A discards its load",
+    );
+}
+
 /// A retired depth handle stops being sampleable, so its address can be reused.
 ///
 /// Metal is free to hand the address of a destroyed `MTLTexture` back for the
@@ -2898,7 +3015,7 @@ fn a_retired_depth_handle_drops_its_sampleable_marking() {
         s.is_depth_handle_sampleable(handle),
         "the cascade bind marks the handle",
     );
-    s.unregister_sampleable_depth(handle);
+    s.unregister_texture(handle);
     assert!(
         !s.is_depth_handle_sampleable(handle),
         "retiring the texture drops the marking",

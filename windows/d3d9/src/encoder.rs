@@ -5793,6 +5793,20 @@ impl FrameEncoder {
         }
     }
 
+    /// Prune the pass state's handle-keyed records for a texture being destroyed.
+    ///
+    /// The retention drains are the one point where an `MTLTexture` handle
+    /// stops naming this resource: the GPU has retired every submission that
+    /// referenced it, so no pass under construction can name it either, and
+    /// the address is about to become available to the next allocation.
+    fn retire_texture_handle(&mut self, handle: u64) {
+        // SAFETY: a `DestroyKind::Texture` retention entry carries the `.raw()`
+        // of a `MetalHandle<MTLTextureKind>`, so the value is an `MTLTexture`
+        // handle. `unregister_texture` only hashes it.
+        self.pass_state
+            .unregister_texture(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
+    }
+
     /// Drain resource-retention entries whose seq has retired on the GPU.
     ///
     /// Partitions popped entries by `DestroyKind`, destroys each kind's
@@ -5840,6 +5854,7 @@ impl FrameEncoder {
                     DestroyKind::Texture => {
                         textures.push(entry.handle);
                         self.perf.bump_texture_destroy();
+                        self.retire_texture_handle(entry.handle);
                     }
                     other => {
                         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
@@ -6171,12 +6186,6 @@ impl FrameEncoder {
         }
         self.pass_state.unregister_srgb_twin(old_srgb);
         self.pass_state.register_srgb_twin(fresh_srgb, fresh);
-        // The renamed-away storage is retired below, so its address is no
-        // longer a sampleable depth attachment either.
-        // SAFETY: `old_handle` came out of the typed `texture_cache` via
-        // `.raw()`, so it is an `MTLTexture` handle or null.
-        self.pass_state
-            .unregister_sampleable_depth(unsafe { MetalHandle::<MTLTextureKind>::new(old_handle) });
         // The old texture (and its twin view) is read by this frame's
         // already-emitted draws — destroy only after the frame's GPU work
         // retires.
@@ -6939,10 +6948,6 @@ impl FrameEncoder {
             let seq = self.current_submit_seq;
             let mtl_texture = state.mtl_texture;
             self.pass_state.unregister_srgb_twin(state.mtl_texture_srgb);
-            // The `MTLTexture` is about to be retired, so the address may come
-            // back as an unrelated allocation: drop any sampleable-depth
-            // marking with it.
-            self.pass_state.unregister_sampleable_depth(mtl_texture);
             // `into_iter` so each slot's `keepalive` Arc moves into the
             // retention entry — the `MTLBuffer` wrapper must outlive
             // the page-backing it wraps via `bytesNoCopy`.
@@ -7242,11 +7247,14 @@ impl FrameEncoder {
         for entry in self.pending_texture_uploads.drain_all() {
             held.staging_arcs.push(entry.into_payload().arc);
         }
-        for entry in self.pending_resource_retention.drain(..) {
+        while let Some(entry) = self.pending_resource_retention.pop_front() {
             if entry.handle != 0 {
                 match entry.kind {
                     DestroyKind::Buffer => buffers.push(entry.handle),
-                    DestroyKind::Texture => textures.push(entry.handle),
+                    DestroyKind::Texture => {
+                        textures.push(entry.handle);
+                        self.retire_texture_handle(entry.handle);
+                    }
                     other => {
                         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                             "drain_retention_and_wait: unexpected kind {other:?} \
