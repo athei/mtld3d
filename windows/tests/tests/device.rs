@@ -15,10 +15,10 @@ use mtld3d_types::{
     D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
+    D3DRTYPE_TEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
 #[test]
@@ -596,7 +596,7 @@ fn reset_bad_dims_rejected() {
         back_buffer_count: 1,
         multi_sample_type: 0,
         multi_sample_quality: 0,
-        swap_effect: 1, // D3DSWAPEFFECT_DISCARD (irrelevant — rejected on dims first)
+        swap_effect: D3DSWAPEFFECT_DISCARD,
         device_window: 0,
         windowed: 0,
         enable_auto_depth_stencil: 0,
@@ -746,7 +746,7 @@ const fn fullscreen_params(hwnd: usize, width: u32, height: u32) -> D3DPRESENT_P
         back_buffer_count: 1,
         multi_sample_type: 0,
         multi_sample_quality: 0,
-        swap_effect: 1, // D3DSWAPEFFECT_DISCARD
+        swap_effect: D3DSWAPEFFECT_DISCARD,
         device_window: hwnd,
         windowed: 0,
         enable_auto_depth_stencil: 0,
