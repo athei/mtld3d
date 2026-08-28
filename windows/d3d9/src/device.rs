@@ -5756,7 +5756,6 @@ extern "system" fn device_stretch_rect(
     let src_surf = src.cast::<Direct3DSurface9>();
     let dst_surf = dst.cast::<Direct3DSurface9>();
 
-    flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
     let dev = obj.inner();
     if dev.frame_dump.active {
         dev.frame_dump_event(&format!(
@@ -5836,6 +5835,9 @@ extern "system" fn device_stretch_rect(
             );
             return D3DERR_INVALIDCALL;
         }
+        // Past every depth-stencil gate, so the endpoints' pending uploads are
+        // work this call will use.
+        flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
         // Same-format Private→Private depth copy on the 1:1 blit path. The
         // blit is entered into the load/store model like a colour copy: the
         // source counts as read (its last pass keeps its depth store) and the
@@ -5932,6 +5934,9 @@ extern "system" fn device_stretch_rect(
         );
         return D3DERR_INVALIDCALL;
     }
+    // Past every gate that can reject the call, so the endpoints' pending
+    // uploads are work this call will use.
+    flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
     // A cross-Metal-format same-size copy also needs the render-quad path (the
     // 1:1 blit can't convert). `check_stretch_rect_formats` guaranteed a
     // cross-format destination is a render target or an offscreen-plain surface
@@ -6118,6 +6123,9 @@ fn convert_stretch_dst_staging(
 /// The `StretchRect` blit then operates on the latest
 /// CPU-uploaded content. Render targets never carry a `dirty` flag
 /// (RTs aren't Lock+Unlocked), so this is a no-op for them.
+///
+/// Every caller sits below the gates that return `D3DERR_INVALIDCALL`, so a
+/// rejected `StretchRect` schedules no upload for either endpoint.
 fn flush_dirty_mips_for_stretch(
     obj: &Direct3DDevice9,
     src_surf: *mut crate::surface::Direct3DSurface9,
