@@ -127,9 +127,19 @@ own fallback paths instead of breaking:
 
 ### Faster than conformant
 
-Divergences from D3D9 kept on purpose, because closing them costs frame time or
-memory headroom and no tested game depends on them:
+Divergences from D3D9 kept on purpose, because closing them costs frame time,
+memory headroom, or the games that rely on the looser behaviour:
 
+- **`IDirect3DTexture9::LockRect` serves a level of a `D3DPOOL_DEFAULT` 2D
+  texture created without `D3DUSAGE_DYNAMIC`**, which D3D9 rejects through that
+  entry point as well as through the level's `IDirect3DSurface9::LockRect`
+  (here only the surface entry point rejects it; cube and volume locks reject
+  it as D3D9 does), because a game that streams into a DEFAULT texture it never
+  marked `D3DUSAGE_DYNAMIC` would otherwise lose every upload it makes that
+  way. The cost is system memory: that texture class is the one whose per-level
+  staging is released once its upload retires, so serving the lock re-creates
+  the buffer, and a *partial* lock taken after such a release leaves the pixels
+  outside its rect no longer matching the GPU copy (warned once per texture).
 - **`GetData(D3DGETDATA_FLUSH)` returns `S_OK` immediately** for a pending
   occlusion query instead of blocking until the GPU has the count. Games use
   that poll loop as a fence against 2004-era drivers without hazard tracking,
