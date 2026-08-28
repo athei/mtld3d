@@ -224,7 +224,12 @@ const FILTER_DEFAULT: FilterCaps = FilterCaps::MINFPOINT
 /// All six, including `MIRRORONCE` (`D3DTADDRESS_MIRRORONCE`), which
 /// `convert::d3d_to_metal_address_mode` maps to
 /// `AddressMode::MirrorClampToEdge` through the same code path as the other
-/// four modes.
+/// four modes. `MIRRORONCE` stays advertised on a device that does not
+/// implement that Metal address mode (the paravirtualized one a CI runner
+/// exposes): the sampler path substitutes `MirrorRepeat`, which agrees with
+/// MIRRORONCE wherever content samples. `BORDER` is the one mode that comes
+/// back out below, because clamping to edge instead is visible in the image a
+/// title that asked for a border colour gets.
 const ADDRESS_DEFAULT: AddressCaps = AddressCaps::WRAP
     .union(AddressCaps::MIRROR)
     .union(AddressCaps::CLAMP)

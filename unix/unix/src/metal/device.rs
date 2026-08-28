@@ -57,9 +57,30 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
 ///
 /// On paper a Mac2-family feature, but the paravirtualized device on CI
 /// runners claims Mac2 and still aborts sampler creation on a border
-/// colour, so the device name is checked as well.
+/// colour, so the device is checked for that as well.
 pub fn supports_sampler_border(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    device.supportsFamily(MTLGPUFamily::Mac2) && !device.name().to_string().contains("Paravirtual")
+    device.supportsFamily(MTLGPUFamily::Mac2) && !is_paravirtual(device)
+}
+
+/// True when the device implements the `MirrorClampToEdge` address mode.
+///
+/// Every GPU family macOS runs on implements it and Metal offers no query for
+/// it, so the paravirtualized device is the whole predicate: it rejects the
+/// descriptor with `MTLSamplerAddressModeMirrorClampToEdge is not supported on
+/// this device`. The sampler path substitutes `MirrorRepeat` when this is
+/// false, up front, because the rejected creation is API misuse the validation
+/// layer logs whether or not a retry succeeds.
+pub fn supports_sampler_mirror_clamp(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    !is_paravirtual(device)
+}
+
+/// True when the Metal device is the paravirtualized one a CI runner exposes.
+///
+/// It answers `supportsFamily:` like the Mac2 device it stands in for while
+/// implementing less than one, so a feature it is known to reject is gated on
+/// its name instead.
+fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    device.name().to_string().contains("Paravirtual")
 }
 
 /// True when the packed 16-bit pixel formats exist natively on this device.

@@ -138,15 +138,15 @@ fn real_main() -> Result<ExitCode, String> {
 ///
 /// Three independent verdicts, each fatal on its own: a regression vs the
 /// baseline, a baseline that overstates reality, and any Metal API-validation
-/// error line the leg logged. The validation gate is orthogonal to the per-site
-/// counts: a leg that starts misusing Metal while every count holds still has
-/// to fail.
+/// error message the leg logged. The validation gate is orthogonal to the
+/// per-site counts: a leg that starts misusing Metal while every count holds
+/// still has to fail.
 fn verdict(report: &diff::Report, validation_errors: usize) -> ExitCode {
     let validation_failed = run::validation_gate_failed(validation_errors);
     if validation_failed {
         println!(
-            "conformance: METAL VALIDATION - {validation_errors} error line(s) logged; every \
-             metal-validation: line above is API misuse to fix"
+            "conformance: METAL VALIDATION - {validation_errors} error message(s) logged; every \
+             metal-validation: line above, with the detail indented under it, is API misuse to fix"
         );
     }
     if report.regressed {
