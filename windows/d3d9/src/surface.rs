@@ -1597,6 +1597,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
             inner.standalone_format,
             u32::from(inner.multi_sample.sample_count),
             mtld3d_core::format::StandaloneSurfaceKind::ColorTarget,
+            inner.standalone_render_scale,
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
@@ -1620,6 +1621,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
             inner.standalone_format,
             u32::from(inner.multi_sample.sample_count),
             mtld3d_core::format::StandaloneSurfaceKind::DepthStencil,
+            inner.standalone_render_scale,
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.

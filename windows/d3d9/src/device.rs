@@ -1874,7 +1874,8 @@ impl DeviceInner {
     /// figure `GetAvailableTextureMem` reports. `standalone_surface_bytes` is
     /// the same formula [`Self::deregister_standalone_surface`] refunds with,
     /// fed the dimensions, format and sample count the surface reports through
-    /// `GetDesc`, so a multisampled surface gives back exactly what it took.
+    /// `GetDesc` plus the `render.scale` its Metal textures were created at,
+    /// so a multisampled or scaled surface gives back exactly what it took.
     pub fn register_standalone_surface(
         &self,
         width: u32,
@@ -1882,6 +1883,7 @@ impl DeviceInner {
         d3d_format: u32,
         sample_count: u32,
         kind: mtld3d_core::format::StandaloneSurfaceKind,
+        render_scale: mtld3d_core::render_scale::RenderScale,
     ) {
         self.vram_bytes_used.fetch_add(
             mtld3d_core::format::standalone_surface_bytes(
@@ -1890,6 +1892,7 @@ impl DeviceInner {
                 d3d_format,
                 sample_count,
                 kind,
+                render_scale,
             ),
             Ordering::AcqRel,
         );
@@ -1899,7 +1902,8 @@ impl DeviceInner {
     ///
     /// Called from the colour and depth retire arms of `finalize_surface`,
     /// which are gated exactly as the two creation sites that charged the
-    /// surface, so the total returns to where it started.
+    /// surface and read the scale back off the surface those sites stored it
+    /// on, so the total returns to where it started.
     pub fn deregister_standalone_surface(
         &self,
         width: u32,
@@ -1907,6 +1911,7 @@ impl DeviceInner {
         d3d_format: u32,
         sample_count: u32,
         kind: mtld3d_core::format::StandaloneSurfaceKind,
+        render_scale: mtld3d_core::render_scale::RenderScale,
     ) {
         self.vram_bytes_used.fetch_sub(
             mtld3d_core::format::standalone_surface_bytes(
@@ -1915,6 +1920,7 @@ impl DeviceInner {
                 d3d_format,
                 sample_count,
                 kind,
+                render_scale,
             ),
             Ordering::AcqRel,
         );
@@ -5337,7 +5343,9 @@ fn create_color_target_surface(
     // The surface owns DEFAULT-pool Metal textures no `TextureInner` covers,
     // so charge them here; `finalize_surface`'s colour retire arm refunds
     // them. Above one sample that is the single-sample texture plus the
-    // multisampled companion beside it.
+    // multisampled companion beside it. The charge measures the memory, so it
+    // goes in at the extent the textures were created at while `width`/
+    // `height` stay the logical pair `GetDesc` reports.
     // SAFETY: `device_inner` is the live owning device, non-null for every
     // caller of this fn.
     unsafe { &*device_inner }.register_standalone_surface(
@@ -5346,6 +5354,7 @@ fn create_color_target_surface(
         format,
         u32::from(multi_sample.sample_count),
         mtld3d_core::format::StandaloneSurfaceKind::ColorTarget,
+        scale,
     );
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
@@ -5550,15 +5559,17 @@ extern "system" fn device_create_depth_stencil_surface(
         multi_sample,
     );
     // Same accounting as a standalone colour target: a real Metal depth
-    // texture with no `TextureInner` behind it, refunded by
-    // `finalize_surface`'s depth retire arm. There is no resolve companion
-    // here, so above one sample the one texture is simply that much larger.
+    // texture with no `TextureInner` behind it, charged at the extent it was
+    // created at and refunded by `finalize_surface`'s depth retire arm. There
+    // is no resolve companion here, so above one sample the one texture is
+    // simply that much larger.
     obj.inner().register_standalone_surface(
         width,
         height,
         format,
         u32::from(multi_sample.sample_count),
         mtld3d_core::format::StandaloneSurfaceKind::DepthStencil,
+        scale,
     );
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone depth-stencil

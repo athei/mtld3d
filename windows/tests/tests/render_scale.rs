@@ -15,10 +15,11 @@
 //! resample reproduces the source colour exactly. Sampling *on* a boundary would
 //! be scale-dependent by construction, so the probes stay away from them.
 //!
-//! One test sets `render.scale` itself instead of inheriting the run's, because
-//! the quantity it covers (a point's rasterized diameter) converts between the
-//! two spaces rather than staying in one, so a run at the default scale would
-//! not exercise the conversion at all.
+//! A few tests set `render.scale` themselves instead of inheriting the run's,
+//! because the quantities they cover (a point's rasterized diameter, and the
+//! memory a resource created at the reported back-buffer size occupies) convert
+//! between the two spaces rather than staying in one, so a run at the default
+//! scale would not exercise the conversion at all.
 
 use mtld3d_tests::{Harness, PosColorVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
@@ -782,5 +783,96 @@ fn a_depth_texture_at_the_backbuffer_size_is_charged_its_scaled_chain() {
         own_cost,
         OWN_SIZE * OWN_SIZE * 4,
         "a shadow map costs the size it asked for"
+    );
+}
+
+/// A standalone surface at the back-buffer size is charged what it occupies.
+///
+/// `CreateRenderTarget` and `CreateDepthStencilSurface` at the reported
+/// back-buffer size hand out the main view's own attachments, so their Metal
+/// textures are created at `render.scale` while `GetDesc` keeps answering with
+/// the size the application asked for. The texture-memory budget follows the
+/// memory, not the descriptor, and the refund on release follows the charge. A
+/// surface of any other size is an intermediate the game picked a resolution
+/// for and costs what it asked for at every scale.
+///
+/// Pins its own scale (a clean half, so both extents are exact) rather than
+/// inheriting the run's: at the identity there is nothing to convert, and this
+/// has to fail in the ordinary `make test` if it regresses.
+#[test]
+fn a_standalone_surface_at_the_backbuffer_size_is_charged_its_scaled_extent() {
+    // A size that is not the back buffer's, for the surface that keeps its own.
+    const OWN_SIZE: u32 = 256;
+
+    // The harness process owns its environment and no other thread runs yet;
+    // extend the suite-wide config with the scale under test. The parser keeps
+    // the last segment, so this wins over a `make test SCALE=<n>` run too.
+    let merged = format!(
+        "{};render.scale=0.5",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness
+    // and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    // Both formats are four bytes a texel, at half of each reported edge.
+    let scaled_bytes = (width / 2) * 4 * (height / 2);
+    let base = h.available_texture_mem();
+    assert!(base > 8 * scaled_bytes, "budget {base} leaves room");
+
+    let color_cost = {
+        let rt = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+        let (hr, desc) = rt.desc();
+        assert_eq!(hr, 0, "GetDesc on the render target");
+        assert_eq!(
+            (desc.width, desc.height),
+            (width, height),
+            "the surface reports the requested size whatever the scale",
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        color_cost, scaled_bytes,
+        "a back-buffer-sized render target costs the texture it holds"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing it gives those bytes back"
+    );
+
+    let depth_cost = {
+        let ds = h.create_depth_stencil_surface(width, height, D3DFMT_D24S8);
+        let (hr, desc) = ds.desc();
+        assert_eq!(hr, 0, "GetDesc on the depth-stencil surface");
+        assert_eq!(
+            (desc.width, desc.height),
+            (width, height),
+            "the surface reports the requested size whatever the scale",
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        depth_cost, scaled_bytes,
+        "a back-buffer-sized depth-stencil surface costs the texture it holds"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing it gives those bytes back"
+    );
+
+    // A size of its own is not the main view, so such a surface keeps its
+    // resolution and is charged all of it.
+    let own_cost = {
+        let _offscreen = h.create_render_target(OWN_SIZE, OWN_SIZE, D3DFMT_X8R8G8B8);
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        own_cost,
+        OWN_SIZE * OWN_SIZE * 4,
+        "an intermediate target costs the size it asked for"
     );
 }

@@ -24,11 +24,11 @@ use super::{
     D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count, compute_mip_size,
-    compute_volume_mip_count, depth_format_bytes_per_pixel, format_name, is_depth_format,
-    is_mapped_color_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
-    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
-    usage_allowed_for_rtype,
+    RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
+    compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
+    is_depth_format, is_mapped_color_format, linear_mip_size, linear_row_pitch,
+    map_d3d_depth_format, map_d3d_format, resolve_mip_levels, standalone_surface_bytes,
+    surface_bytes, usage_allowed_for_rtype,
 };
 
 #[test]
@@ -390,7 +390,8 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_A8R8G8B8,
             1,
-            StandaloneSurfaceKind::ColorTarget
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
         ),
         BASE
     );
@@ -400,7 +401,8 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_D24S8,
             1,
-            StandaloneSurfaceKind::DepthStencil
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
         ),
         BASE
     );
@@ -411,7 +413,8 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_A8R8G8B8,
             4,
-            StandaloneSurfaceKind::ColorTarget
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
         ),
         5 * BASE
     );
@@ -421,7 +424,8 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_A8R8G8B8,
             2,
-            StandaloneSurfaceKind::ColorTarget
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
         ),
         3 * BASE
     );
@@ -433,7 +437,8 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_D24S8,
             4,
-            StandaloneSurfaceKind::DepthStencil
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
         ),
         4 * BASE
     );
@@ -444,14 +449,96 @@ fn standalone_surface_bytes_charges_the_multisampled_companion() {
             2048,
             D3DFMT_D24S8,
             0,
-            StandaloneSurfaceKind::DepthStencil
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
         ),
         BASE
     );
     // A format with no mapping stays at zero however many samples it claims.
     assert_eq!(
-        standalone_surface_bytes(64, 64, 0, 4, StandaloneSurfaceKind::ColorTarget),
+        standalone_surface_bytes(
+            64,
+            64,
+            0,
+            4,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
+        ),
         0
+    );
+}
+
+/// A scaled standalone surface is charged the extent its Metal textures hold.
+///
+/// The dimensions are the logical ones the surface reports; the charge
+/// measures the memory, so it converts them and takes the pitch from the
+/// converted width. Multisampling still multiplies whatever that comes to.
+#[test]
+fn standalone_surface_bytes_charges_the_scaled_extent() {
+    let half = RenderScale::from_percent(50);
+
+    // Half of each edge of a 640x480 four-byte surface is a quarter the bytes.
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        320 * 240 * 4
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_D24S8,
+            1,
+            StandaloneSurfaceKind::DepthStencil,
+            half,
+        ),
+        320 * 240 * 4
+    );
+    // The sample-count multipliers apply to the scaled figure, not the
+    // reported one.
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_A8R8G8B8,
+            4,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        5 * 320 * 240 * 4
+    );
+    // The pitch follows the scaled width: a 16-bit surface 66 texels wide
+    // rounds its 33-texel half up to the dword-aligned 68 bytes, which is not
+    // half of the 132 bytes the reported width strides at.
+    assert_eq!(
+        standalone_surface_bytes(
+            66,
+            16,
+            D3DFMT_R5G6B5,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        68 * 8
+    );
+    // A scale that rounds an edge to nothing still charges a texel row: the
+    // Metal texture it describes was created at one.
+    assert_eq!(
+        standalone_surface_bytes(
+            1,
+            1,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::from_percent(1),
+        ),
+        4
     );
 }
 
