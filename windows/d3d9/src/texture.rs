@@ -1174,11 +1174,12 @@ impl TextureInner {
     /// Fill a sub-rectangle of `level`'s CPU staging with a repeated `pixel`.
     ///
     /// The `ColorFill` path for a lockable `D3DPOOL_DEFAULT` offscreen-plain
-    /// surface — its read-back is a `LockRect` into this CPU staging. The
-    /// caller also issues the GPU-side fill upload, so this does not mark the
-    /// level dirty. Uncompressed formats only (`pixel.len()` == bytes/pixel;
-    /// block-compressed `ColorFill` is rejected upstream). Returns false on a
-    /// missing level or an out-of-bounds region.
+    /// surface: its read-back is a `LockRect` into this CPU staging, which no
+    /// path re-reads from the GPU, so the fill has to land here on the calling
+    /// thread. One row is splatted at memcpy rate and the rest of the region
+    /// copies from it. Uncompressed formats only (`pixel.len()` ==
+    /// bytes/pixel; block-compressed `ColorFill` is rejected upstream).
+    /// Returns false on a missing level or an out-of-bounds region.
     pub fn fill_staging_region(
         &mut self,
         level: usize,
@@ -1201,22 +1202,20 @@ impl TextureInner {
         let pitch = self.mip_bytes_per_row(level) as usize;
         let logical = box_.logical_len();
         let base = box_.as_ptr().cast_mut();
+        let run = w as usize * bpp;
         for row in oy..oy.saturating_add(h) {
             let row_off = row as usize * pitch + ox as usize * bpp;
-            for col in 0..w as usize {
-                let off = row_off + col * bpp;
-                if off + bpp > logical {
-                    return false;
-                }
-                // SAFETY: `off + bpp <= logical` (checked), so `off` is within
-                // the allocation.
-                let dst = unsafe { base.add(off) };
-                // SAFETY: `dst..dst+bpp` is in-bounds (above); D3D9 objects are
-                // single-threaded so the write has exclusive access.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(pixel.as_ptr(), dst, bpp);
-                }
+            if row_off + run > logical {
+                return false;
             }
+            // SAFETY: `row_off + run <= logical` (checked), so `row_off` is
+            // within the allocation.
+            let row_ptr = unsafe { base.add(row_off) };
+            // SAFETY: `row_ptr..row_ptr+run` is in-bounds (above); D3D9 objects
+            // are single-threaded, so the write has exclusive access and no
+            // other slice aliases this run.
+            let dst = unsafe { core::slice::from_raw_parts_mut(row_ptr, run) };
+            mtld3d_core::convert::splat_pixel_pattern(dst, pixel);
         }
         true
     }
@@ -3071,7 +3070,7 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
 /// Caller passes `dev` explicitly to avoid lifting a second `&mut
 /// DeviceInner` from `ti.device_inner` when a parent caller (e.g.
 /// `snapshot_stage_bindings`) already holds one.
-fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rect: DirtyRect) {
+pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rect: DirtyRect) {
     let level_u = level as usize;
     if ti.dropped_staging & (1u32 << level_u) != 0 {
         // Nothing to upload from: the level's bytes live on the GPU only. A

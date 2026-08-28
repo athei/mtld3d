@@ -4,7 +4,8 @@
 //! have no second source of truth: D3DCOLOR byte order and the `ColorFill` encodings, FVF
 //! expansion into `D3DVERTEXELEMENT9`, attribute resolution against declared VS semantics and
 //! the fixed-function convention, triangle-fan rewriting, and the depth-bias scale with its
-//! decal heuristic. A wrong mapping here reaches the screen as wrong pixels, not a crash.
+//! decal heuristic, and the `ColorFill` pattern splat. A wrong mapping here reaches the
+//! screen as wrong pixels, not a crash.
 
 use super::*;
 use crate::dxso::DeclUsage;
@@ -1006,4 +1007,32 @@ fn border_addressing_and_colour_presets() {
         d3d_border_color_to_metal(0x00FF_FFFF),
         BorderColor::OpaqueBlack
     );
+}
+
+#[test]
+fn splat_pattern_repeats_across_the_slice() {
+    let mut dst = [0u8; 12];
+    splat_pixel_pattern(&mut dst, &[1, 2, 3, 4]);
+    assert_eq!(dst, [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
+}
+
+#[test]
+fn splat_pattern_fills_a_partial_trailing_pixel() {
+    let mut dst = [0u8; 6];
+    splat_pixel_pattern(&mut dst, &[9, 8, 7, 6]);
+    assert_eq!(dst, [9, 8, 7, 6, 9, 8]);
+}
+
+#[test]
+fn splat_pattern_truncates_a_pattern_wider_than_the_slice() {
+    let mut dst = [0u8; 2];
+    splat_pixel_pattern(&mut dst, &[4, 5, 6, 7]);
+    assert_eq!(dst, [4, 5]);
+}
+
+#[test]
+fn splat_pattern_leaves_the_slice_alone_for_an_empty_pattern() {
+    let mut dst = [7u8; 3];
+    splat_pixel_pattern(&mut dst, &[]);
+    assert_eq!(dst, [7, 7, 7]);
 }

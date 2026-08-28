@@ -4,16 +4,17 @@
 
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL,
-    D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_ZENABLE,
-    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
+    D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
+    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ,
+    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_LIGHTING,
+    D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE,
+    D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+    D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -38,6 +39,30 @@ const PS_SAMPLE_DEPTH: [u32; 15] = [
     0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
     0x0000_FFFF,                                        // end
 ];
+
+/// A single triangle covering the whole viewport, in `color`.
+const fn fullscreen_triangle(color: u32) -> [PosColorVertex; 3] {
+    [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+    ]
+}
 
 #[test]
 fn render_to_texture_then_sample() {
@@ -1307,6 +1332,119 @@ fn color_fill_render_target_texture_succeeds() {
         h.color_fill_hr(&plain.surface_level(0), 0xFF80_4020),
         D3DERR_INVALIDCALL,
         "ColorFill on a non-RT texture → INVALIDCALL",
+    );
+}
+
+#[test]
+fn color_fill_sub_rect_of_offscreen_plain_reads_back() {
+    // A lockable DEFAULT offscreen-plain surface reads its fill back through
+    // LockRect, so the fill has to be visible to the very next lock: inside the
+    // rect it is the fill colour, outside it the seed the lock before wrote.
+    // A rect hanging over the edge fills the part that lands on the surface.
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+
+    {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let seed = vec![GREEN; (pitch_px * 64) as usize];
+        locked.write_u32(&seed);
+    }
+
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (16, 16, 48, 48), BLUE),
+        D3D_OK,
+        "ColorFill of a sub-rect on a DEFAULT offscreen-plain surface",
+    );
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (56, 56, 96, 96), RED),
+        D3D_OK,
+        "ColorFill of a rect hanging over the surface edge is clipped, not rejected",
+    );
+
+    let locked = surface.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((pitch_px * 64) as usize);
+    let at = |x: u32, y: u32| pixels[(y * pitch_px + x) as usize];
+    assert_eq!(at(32, 32), BLUE, "inside the filled sub-rect");
+    assert_eq!(at(16, 16), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(at(47, 47), BLUE, "the sub-rect's bottom-right corner");
+    assert_eq!(at(8, 8), GREEN, "outside the sub-rect keeps the seed");
+    assert_eq!(
+        at(48, 48),
+        GREEN,
+        "one pixel past the sub-rect keeps the seed"
+    );
+    assert_eq!(at(60, 60), RED, "inside the clipped overhanging rect");
+    assert_eq!(at(55, 55), GREEN, "outside the clipped overhanging rect");
+}
+
+#[test]
+fn color_fill_render_target_overwrites_earlier_draws() {
+    // ColorFill on a render target is ordered against the draws around it: it
+    // wipes what the frame already drew, and the draw after it blends against
+    // the fill colour rather than against what the fill replaced.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture bound");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.clear_target(BLACK), 0, "clear RT black");
+
+    // An opaque red triangle over the whole target, which the fill must erase.
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(RED)),
+        0,
+        "pre-fill draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_eq!(h.color_fill_hr(&rt_surface, BLUE), D3D_OK, "ColorFill blue");
+
+    // A half-transparent red triangle blended over the fill.
+    for (state, value) in [
+        (D3DRS_ALPHABLENDENABLE, 1),
+        (D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+    ] {
+        assert_eq!(h.set_render_state(state, value), 0, "blend state");
+    }
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(0x80FF_0000)),
+        0,
+        "blended draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt_surface, &sysmem),
+        0,
+        "read the render target back",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (32 * pitch_px + 32) as usize;
+    let center = Rgba8::from_pixel(locked.as_u32(idx + 1)[idx]);
+    assert!(
+        (96..=160).contains(&center.r) && center.g < 40 && (96..=160).contains(&center.b),
+        "half-alpha red over the blue fill, got {center:?}",
     );
 }
 
