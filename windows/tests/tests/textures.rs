@@ -1152,6 +1152,50 @@ fn a_draw_under_a_held_device_context_keeps_the_level_staging() {
     );
 }
 
+/// A texture level is either mapped or holds a DC, never both.
+///
+/// A level's `LockRect` is recorded on the parent texture, so nothing about the
+/// lock is visible on the surface shell itself; `GetDC` has to consult the
+/// parent to see it. Each call succeeds once the other side has been given up.
+#[test]
+fn get_dc_and_lock_rect_on_a_texture_level_exclude_each_other() {
+    const SIZE: u32 = 8;
+    let sentinel = 0xdead_beef_usize as *mut core::ffi::c_void;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let surface = tex.surface_level(0);
+
+    {
+        let _locked = surface.lock_rect(0);
+        let (hr, out) = surface.get_dc(sentinel);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "GetDC while the level's LockRect is outstanding must return INVALIDCALL"
+        );
+        assert_eq!(
+            out, sentinel,
+            "a rejected GetDC must not write through the out HDC"
+        );
+    }
+    let dc = surface.dc();
+
+    let (hr, bits_null) = surface.lock_rect_probe(0);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "LockRect while the level's DC is open must return INVALIDCALL"
+    );
+    assert!(
+        !bits_null,
+        "a rejected LockRect must not write through the out D3DLOCKED_RECT"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+
+    let (hr, bits_null) = surface.lock_rect_probe(0);
+    assert_eq!(hr, 0, "the released DC leaves the level lockable again");
+    assert!(!bits_null, "an accepted LockRect maps the level");
+    assert_eq!(surface.unlock_rect(), 0, "UnlockRect");
+}
+
 /// `D3DLOCK_DISCARD` on a released default-pool level rewrites it whole.
 ///
 /// DISCARD declares the level's contents dead, so the lock takes the fresh

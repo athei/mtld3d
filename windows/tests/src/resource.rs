@@ -772,6 +772,32 @@ impl Surface<'_> {
         }
     }
 
+    /// `LockRect` over the whole surface. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The struct is seeded with a garbage pointer first, so a rejected lock
+    /// that leaves it untouched reads as non-null. For a test that expects the
+    /// lock to fail; a successful one leaves the surface mapped until
+    /// [`Self::unlock_rect`].
+    #[must_use]
+    pub fn lock_rect_probe(&self, flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null rect locks the whole surface.
+        let hr =
+            unsafe { (self.vtbl().lock_rect)(self.ptr, &raw mut locked, core::ptr::null(), flags) };
+        (hr, locked.bits.is_null())
+    }
+
+    /// `UnlockRect`. Returns the hr.
+    #[must_use]
+    pub fn unlock_rect(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr) }
+    }
+
     /// Describe the surface. Returns `(hr, desc)`.
     #[must_use]
     pub fn desc(&self) -> (i32, D3DSURFACE_DESC) {
