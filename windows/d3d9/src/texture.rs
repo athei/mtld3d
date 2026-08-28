@@ -413,6 +413,17 @@ fn dropped_staging_placeholder() -> Arc<PageBox> {
     Arc::clone(&PLACEHOLDER)
 }
 
+/// Whether `bits` is the page every released level's staging points at.
+///
+/// One page stands in for the staging of every released level of every
+/// texture, so a CPU mapping built over it reads whatever the page holds and
+/// writes into every other released level. A mapping re-materialises its level
+/// first; this answers whether it did.
+#[must_use]
+pub fn is_dropped_staging_page(bits: *const u8) -> bool {
+    core::ptr::eq(dropped_staging_placeholder().as_ptr(), bits)
+}
+
 impl TextureInner {
     /// D3DPOOL_* the texture was created in.
     pub const fn d3d_pool(&self) -> u32 {
@@ -603,6 +614,17 @@ impl TextureInner {
              back of it failed; the lock sees uninitialised pixels",
             self.texture_id.raw()
         );
+    }
+
+    /// Re-materialise `level`'s released staging for a `GetDC`.
+    ///
+    /// A device context is a read-write mapping of the level: GDI reads the
+    /// pixels through it and `ReleaseDC` keeps whatever GDI drew, which is what
+    /// a `LockRect` without `D3DLOCK_DISCARD` asks for, so it takes the same
+    /// GPU read back. The level is `level` of this texture, the one its
+    /// surface was handed out for.
+    pub fn ensure_staging_for_dc(&mut self, level: usize) {
+        self.ensure_staging_for_lock(level, 0);
     }
 
     /// Fill `level`'s staging from the GPU copy of the texture.
