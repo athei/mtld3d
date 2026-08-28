@@ -527,9 +527,11 @@ impl TextureInner {
 
     /// Give `level` a staging buffer again before a write lands in it.
     ///
-    /// The fresh buffer holds no pixels: a full-level write follows in
-    /// every path that calls this, and a partial one is logged, since the
-    /// pixels outside its region then no longer match the GPU copy.
+    /// The fresh buffer holds no pixels, so a partial write into it leaves
+    /// everything outside its region not matching the GPU copy; the upload that
+    /// write schedules is narrowed to the written rect for exactly that reason.
+    /// A `LockRect`, which D3D9 promises the level's current contents, goes
+    /// through [`Self::ensure_staging_for_lock`] instead.
     fn ensure_staging(&mut self, level: usize) {
         if self.dropped_staging & (1u32 << level) == 0 {
             return;
@@ -539,12 +541,124 @@ impl TextureInner {
         self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
         self.dropped_staging &= !(1u32 << level);
         self.reset_staging_coverage(level);
+        // The allocation is fresh, so no GPU-visible command references it and
+        // nothing about it is contended. Same reset the `FreshBox` rename does
+        // for the same reason.
+        self.last_submit_seq[level] = 0;
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET,
             key: self.texture_id.raw(),
             "texture {:#x}: staging re-created for level {level} after a write",
             self.texture_id.raw()
         );
+    }
+
+    /// Re-materialise `level`'s released staging for a `LockRect`.
+    ///
+    /// D3D9 hands a lock the level's current contents, and a released level
+    /// holds them on the GPU alone, so the fresh pages are filled from there
+    /// before the pointer goes out. The read costs a synchronous flush and blit
+    /// per lock, which the warning names. `D3DLOCK_DISCARD` and a level the GPU
+    /// never received skip it and take the pages as allocated: the first
+    /// because the caller declared the old contents dead, the second because
+    /// there are none to read.
+    fn ensure_staging_for_lock(&mut self, level: usize, flags: u32) {
+        if self.dropped_staging & (1u32 << level) == 0 {
+            return;
+        }
+        let readback = mtld3d_core::texture_staging::released_level_lock_needs_readback(flags)
+            && self.was_uploaded[level];
+        self.ensure_staging(level);
+        if !readback {
+            mtld3d_shared::log_once_info_by!(
+                target: crate::LOG_TARGET,
+                key: self.texture_id.raw(),
+                "texture {:#x}: lock of level {level} after its staging was released hands out \
+                 uninitialised pixels; the lock discards the level's contents or the GPU never \
+                 received them",
+                self.texture_id.raw()
+            );
+            return;
+        }
+        if self.read_level_from_gpu(level) {
+            // The staging is a byte-for-byte copy of what the GPU holds, so
+            // every texel of the level is accounted for and the next upload may
+            // release it again.
+            if let Some(coverage) = self.staging_coverage.get_mut(level) {
+                coverage.mark_full();
+            }
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: self.texture_id.raw(),
+                "texture {:#x}: lock of level {level} after its staging was released; the level \
+                 is read back from the GPU, one blocking flush and blit per lock",
+                self.texture_id.raw()
+            );
+            return;
+        }
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: self.texture_id.raw(),
+            "texture {:#x}: lock of level {level} after its staging was released and the read \
+             back of it failed; the lock sees uninitialised pixels",
+            self.texture_id.raw()
+        );
+    }
+
+    /// Fill `level`'s staging from the GPU copy of the texture.
+    ///
+    /// Flushes the frame so every pending upload has landed, resolves the
+    /// texture's Metal handle on the encoder thread, then blits the level into
+    /// the staging pages and waits for it. Returns false when the texture sits
+    /// between devices, has no Metal texture yet, or the blit fails, all of
+    /// which leave the pages as they were allocated.
+    ///
+    /// Takes `&self`: the pages are written through the `PageBox` raw-pointer
+    /// accessors, the same way every other staging writer in this file reaches
+    /// them, and no field of the texture changes.
+    fn read_level_from_gpu(&self, level: usize) -> bool {
+        if self.device_inner == 0 {
+            return false;
+        }
+        let bytes_per_row = self.mip_bytes_per_row[level];
+        let block_rows = self.mip_heights[level].div_ceil(self.block_h.max(1));
+        let needed = u64::from(bytes_per_row).saturating_mul(u64::from(block_rows));
+        let dst_len = self.staging[level].len() as u64;
+        if needed == 0 || dst_len < needed {
+            return false;
+        }
+        let texture_id = self.texture_id;
+        let dev = DeviceInner::from_ptr(self.device_inner);
+        let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let slot_op = Arc::clone(&slot);
+        dev.push_op(Box::new(move |enc| {
+            slot_op.store(enc.get_texture_handle_by_id(texture_id), Ordering::Release);
+        }));
+        dev.flush_current_frame_blocking();
+        let handle = slot.load(Ordering::Acquire);
+        if handle == 0 {
+            return false;
+        }
+        crate::device::blit_handle_to_systemmem(
+            dev,
+            &crate::device::SystemMemReadback {
+                // SAFETY: `handle` is non-zero (checked above) and a live
+                // retained MTLTexture handle from the encoder texture cache.
+                tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
+                dst_ptr: self.staging[level].as_ptr() as u64,
+                dst_len,
+                level: u32::try_from(level).expect("D3D9 mip level fits u32"),
+                width: self.mip_widths[level],
+                height: self.mip_heights[level],
+                bytes_per_row,
+                // The mip extent above addresses the level; these two carry the
+                // texture's own logical extent, which the read is measured
+                // against. They match the Metal texture for every class that
+                // can release its staging, so nothing is resolved.
+                full_width: self.width,
+                full_height: self.height,
+            },
+        ) == D3D_OK
     }
 
     pub fn mip_width(&self, level: usize) -> u32 {
@@ -1717,16 +1831,7 @@ impl TextureInner {
         if self.d3d_pool == D3DPOOL_DEFAULT && self.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
             DEFAULT_STATIC_LOCKS.fetch_add(1, Ordering::Relaxed);
         }
-        if self.dropped_staging & (1u32 << level) != 0 && rect.is_some() {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: self.texture_id.raw(),
-                "texture {:#x}: partial lock of level {level} after its staging was released; \
-                 pixels outside the rect no longer match the GPU copy",
-                self.texture_id.raw()
-            );
-        }
-        self.ensure_staging(level);
+        self.ensure_staging_for_lock(level, flags);
         let pitch = self.mip_bytes_per_row[level];
         let offset = mtld3d_core::texture_staging::texture_lock_offset(
             rect,

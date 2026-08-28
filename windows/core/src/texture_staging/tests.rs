@@ -575,3 +575,25 @@ fn block_aligned_lock_origin_is_unchanged_under_division() {
     let pixel = texture_lock_offset(Some(off_rect(16, 8, 16, 4)), pitch, 4, 4, 16);
     assert_eq!(pixel, (8 / 4) * 2048 + (16 / 4) * 16);
 }
+
+#[test]
+fn a_plain_lock_of_a_released_level_reads_it_back() {
+    assert!(released_level_lock_needs_readback(DEFAULT_FLAGS));
+    assert!(released_level_lock_needs_readback(D3DLOCK_READONLY));
+    assert!(released_level_lock_needs_readback(D3DLOCK_NOOVERWRITE));
+    assert!(released_level_lock_needs_readback(
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE
+    ));
+}
+
+#[test]
+fn discard_is_the_only_flag_that_skips_the_readback() {
+    assert!(!released_level_lock_needs_readback(D3DLOCK_DISCARD));
+    // Companion bits ride along with DISCARD without reviving the read.
+    assert!(!released_level_lock_needs_readback(
+        D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE
+    ));
+    assert!(!released_level_lock_needs_readback(
+        D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK
+    ));
+}
