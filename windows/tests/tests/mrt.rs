@@ -596,3 +596,104 @@ fn four_targets_with_an_r32f_extra_written_and_sampled() {
     assert_eq!(h.clear_pixel_shader(), D3D_OK);
     assert_eq!(h.clear_texture(0), D3D_OK);
 }
+
+/// A clip-space triangle covering the bottom-left corner only.
+const fn corner_cover() -> [PosColorVertex; 3] {
+    [
+        PosColorVertex {
+            x: -1.0,
+            y: -0.5,
+            z: 0.5,
+            color: RED,
+        },
+        PosColorVertex {
+            x: -0.5,
+            y: -1.0,
+            z: 0.5,
+            color: RED,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: RED,
+        },
+    ]
+}
+
+#[test]
+fn a_clear_stays_ahead_of_a_pass_that_draws_into_its_target_as_an_extra() {
+    // Clear(rt) with nothing drawn, then an MRT pass that carries rt at slot 1
+    // and writes `oC1` into it, then a pass that rebinds rt at slot 0 and draws
+    // into a corner. The clear must land before the MRT writes, not on top of
+    // them: the centre pixel belongs to the MRT pass.
+    let h = Harness::new();
+    let make = || {
+        h.create_texture(
+            64,
+            64,
+            1,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let (rt, other) = (make(), make());
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+    assert_eq!(
+        h.set_render_target(0, &rt.surface_level(0)),
+        D3D_OK,
+        "bind rt at slot 0"
+    );
+    assert_eq!(h.clear_target(RED), D3D_OK, "clear rt");
+
+    assert_eq!(
+        h.set_render_target(0, &other.surface_level(0)),
+        D3D_OK,
+        "bind the other target at slot 0"
+    );
+    assert_eq!(
+        h.set_render_target(1, &rt.surface_level(0)),
+        D3D_OK,
+        "bind rt at slot 1"
+    );
+    let two = h.create_pixel_shader(&PS_TWO_TARGETS);
+    assert_eq!(h.set_pixel_shader(&two), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+        D3D_OK,
+        "MRT draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+
+    assert_eq!(h.clear_render_target(1), D3D_OK, "unbind slot 1");
+    assert_eq!(
+        h.set_render_target(0, &rt.surface_level(0)),
+        D3D_OK,
+        "rebind rt at slot 0"
+    );
+    let one = h.create_pixel_shader(&PS_ONE_TARGET);
+    assert_eq!(h.set_pixel_shader(&one), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner_cover()),
+        D3D_OK,
+        "corner draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+
+    let surface = rt.surface_level(0);
+    assert_color(
+        read_rt_pixel(&h, &surface, 32, 32),
+        BLUE,
+        "the MRT pass's oC1 survives",
+    );
+    assert_color(
+        read_rt_pixel(&h, &surface, 4, 60),
+        GREEN,
+        "the corner draw lands on top",
+    );
+    assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}

@@ -4293,10 +4293,11 @@ impl PassState {
     /// The target color/depth must come back with `Load` so we can move
     /// Rule E's Clear into it. Bail on any intervening pass that reads
     /// the target as a fragment sampler input, as a blit source, or
-    /// attaches it with `Clear` itself (that pass already overwrites
-    /// whatever we'd move), and on any intervening leading blit or
-    /// multisample resolve that writes the target: the copy landed after the
-    /// clear, so a clear moved past it would wipe it.
+    /// attaches it in any colour slot without being the merge target (such a
+    /// pass either overwrites whatever we'd move or draws content the move
+    /// would wipe), and on any intervening leading blit or multisample
+    /// resolve that writes the target: the copy landed after the clear, so a
+    /// clear moved past it would wipe it.
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
@@ -4424,20 +4425,24 @@ impl PassState {
             if color_ok && depth_ok && stencil_ok {
                 return Some(j);
             }
-            // This pass consumes (Loads) one of the to-be-cleared attachments
-            // but is NOT a full merge target (the other side doesn't match).
+            // This pass consumes one of the to-be-cleared attachments but is
+            // NOT a full merge target (the other side doesn't match).
             // Folding the combined Clear into a later pass would let it
             // leapfrog this consumer, which then loads uninitialised content
             // (a render-to-texture pass that depth-tests against the auto-DS
             // sits between the clear-only pass and the final backbuffer pass).
-            // Bail so the
-            // clear-only pass materialises and this consumer loads the real
-            // cleared content. WoW's pattern is unaffected — its first
-            // Load pass matches BOTH sides and returns above.
+            // Bail so the clear-only pass materialises and this consumer
+            // loads the real cleared content. WoW's pattern is unaffected:
+            // its first Load pass matches BOTH sides and returns above.
+            //
+            // The colour side asks the question of every slot, not just
+            // render target 0. A pass that attaches one of the cleared
+            // textures as an extra render target draws into it there, so a
+            // clear moved past that pass wipes those writes.
             let consumes_color = needs_color
-                && cand.color_texture == target_color
-                && cand.color_subresource == target_color_subresource
-                && matches!(cand.color_load, ColorLoad::Load);
+                && core::iter::once((target_color, target_color_subresource))
+                    .chain(target_extra)
+                    .any(|(tex, sub)| pass_attaches_color(cand, tex, sub));
             let consumes_depth = needs_depth
                 && cand.depth_texture == target_depth
                 && matches!(cand.depth_load, DepthLoad::Load);
@@ -4887,6 +4892,31 @@ fn pass_resolves_into(
             !view.is_null()
                 && (view == target_handle || srgb_twin_to_base.get(&view) == Some(&target_handle))
         })
+}
+
+/// True if `pass` binds `(texture, subresource)` as one of its colour attachments.
+///
+/// Render target 0 and the extras 1..3 answer the same question: whichever
+/// slot the texture sits in, the pass draws into that subresource. Identity
+/// is asked with the attachment's base handle, the one every rule, sampler
+/// bind and blit sees; the sRGB twin view a pass may write through is
+/// carried beside it and never stands in for it.
+///
+/// `texture == 0` is treated as "not attached" since 0 is the unset sentinel
+/// for texture handles.
+fn pass_attaches_color(
+    pass: &Pass,
+    texture: MetalHandle<MTLTextureKind>,
+    subresource: u32,
+) -> bool {
+    if texture.is_null() {
+        return false;
+    }
+    (pass.color_texture == texture && pass.color_subresource == subresource)
+        || pass
+            .extra_color
+            .iter()
+            .any(|a| a.texture == texture && a.subresource == subresource)
 }
 
 /// The texture a blit writes, if it writes one.

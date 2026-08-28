@@ -3357,6 +3357,45 @@ fn rule_e_merges_a_clear_only_pass_into_the_same_target_set() {
 }
 
 #[test]
+fn rule_e_refuses_a_pass_that_draws_into_the_target_as_an_extra() {
+    // Clear(rt), then an MRT pass that binds rt as render target 1 and
+    // draws into it, then a pass that rebinds rt as render target 0 with
+    // Load. The MRT pass carries a different attachment set, so it is no
+    // merge target, but it writes rt: the clear must stay ahead of it
+    // instead of folding into the third pass and wiping those writes.
+    let rt = tex(0x3000);
+    let other = tex(0x4000);
+    let mut s = fresh();
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.clear_color(1, 2, 3, 4);
+    s.set_color_render_target(
+        other,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_extra_color_render_target(1, Some(slot(rt, BB_SIZE)));
+    s.emit_command(dummy_draw());
+    s.set_extra_color_render_target(1, None);
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+    assert_eq!(s.passes()[1].extra_color()[0].texture(), rt);
+    assert_eq!(s.passes()[1].extra_color()[0].load(), ColorLoad::Load);
+    assert_eq!(s.passes()[2].color_texture(), rt);
+    assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+    s.coalesce_clear_only_passes();
+    assert_eq!(
+        s.passes().len(),
+        3,
+        "the clear stays ahead of the pass that draws into rt as an extra"
+    );
+    assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
+}
+
+#[test]
 fn rule_e_refuses_a_different_target_set() {
     // The clear-only pass carries {backbuffer, rt_a}; the next pass on
     // the backbuffer carries {backbuffer} alone, so the set does not
