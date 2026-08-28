@@ -7,13 +7,14 @@ use mtld3d_types::{
     D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
     D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
     D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
+    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
+    D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
@@ -135,6 +136,7 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_X8R8G8B8 => "X8R8G8B8",
         D3DFMT_R5G6B5 => "R5G6B5",
         D3DFMT_A1R5G5B5 => "A1R5G5B5",
+        D3DFMT_X1R5G5B5 => "X1R5G5B5",
         D3DFMT_A4R4G4B4 => "A4R4G4B4",
         D3DFMT_A8 => "A8",
         D3DFMT_A8L8 => "A8L8",
@@ -268,7 +270,7 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 ///
 /// On a device with native packed 16-bit support the answer is identical to
 /// `map_d3d_format`. Without it (Intel/AMD Mac2, or `debug.expandPacked16`),
-/// the three packed D3D formats are backed by `Bgra8Unorm` instead;
+/// the packed 16-bit D3D formats are backed by `Bgra8Unorm` instead;
 /// `bytes_per_pixel`/`block_bytes` stay 2 because they describe the SOURCE
 /// layout (Lock pitch, staging sizing — D3D9 Lock semantics are unchanged),
 /// and the upload widens texels to 32-bit in the GPU upload pass
@@ -279,13 +281,15 @@ pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<F
     if !native_packed16 {
         let expanded = match d3d_format {
             // The upload pass writes D3D channel order directly into BGRA8
-            // and forces alpha opaque for the alpha-less R5G6B5, so none of
-            // the three needs a sampler swizzle, in particular A4R4G4B4
-            // drops the native path's ABGR4 channel-order workaround. A
-            // swizzle would also be fatal here rather than cosmetic: Metal
-            // refuses `RenderTarget` usage on a swizzled texture view, and
-            // the expansion writes these textures through a render pass.
-            D3DFMT_R5G6B5 => Some(FormatMapping {
+            // and forces alpha opaque for the alpha-less R5G6B5 and
+            // X1R5G5B5, so none of the four needs a sampler swizzle, in
+            // particular A4R4G4B4 drops the native path's ABGR4
+            // channel-order workaround and X1R5G5B5 the native path's forced
+            // alpha. A swizzle would also be fatal here rather than
+            // cosmetic: Metal refuses `RenderTarget` usage on a swizzled
+            // texture view, and the expansion writes these textures through
+            // a render pass.
+            D3DFMT_R5G6B5 | D3DFMT_X1R5G5B5 => Some(FormatMapping {
                 metal_pixel_format: PixelFormat::Bgra8Unorm,
                 bytes_per_pixel: 2,
                 block_width: 1,
@@ -477,6 +481,20 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             block_bytes: 2,
             swizzle: None,
             has_alpha: true,
+        }),
+        D3DFMT_X1R5G5B5 => Some(FormatMapping {
+            // The A1R5G5B5 bit layout with the top bit "don't care": same
+            // Metal BGR5A1Unorm, with the alpha output forced to 1 the way
+            // X8R8G8B8 forces its X byte. The swizzle is sampling-only, so
+            // X1R5G5B5 is not a render-target format (see
+            // `is_render_target_format`).
+            metal_pixel_format: PixelFormat::Bgr5A1Unorm,
+            bytes_per_pixel: 2,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 2,
+            swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One]),
+            has_alpha: false,
         }),
         D3DFMT_A4R4G4B4 => Some(FormatMapping {
             // 16-bit packed 4/4/4/4. Metal has only ABGR4Unorm (A[0-3] B[4-7]

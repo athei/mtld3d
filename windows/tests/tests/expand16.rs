@@ -1,18 +1,20 @@
 //! The packed 16-bit expansion path, forced on via `debug.expandPacked16`.
 //!
 //! On devices without Metal's packed 16-bit pixel formats (Intel/AMD Mac2),
-//! A4R4G4B4 / R5G6B5 / A1R5G5B5 textures are backed by BGRA8 and widened by
+//! A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 textures are backed by BGRA8 and
+//! widened by
 //! the GPU upload pass, and the 16-bit render-target formats stop being
 //! advertised. These tests run that whole path on Apple Silicon by forcing
 //! the config key, so it cannot rot between rare Intel-hardware runs.
 
 use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5,
+    D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -142,9 +144,10 @@ fn expanded_color_formats_sample_red() {
     force_expand();
     let h = Harness::new();
     // 1×1 opaque-red texel encoded for each format (little-endian bytes).
-    let cases: [(u32, &[u8]); 3] = [
+    let cases: [(u32, &[u8]); 4] = [
         (D3DFMT_R5G6B5, &[0x00, 0xF8]),   // R=31
         (D3DFMT_A1R5G5B5, &[0x00, 0xFC]), // A=1 R=31
+        (D3DFMT_X1R5G5B5, &[0x00, 0x7C]), // X=0 R=31
         (D3DFMT_A4R4G4B4, &[0x00, 0xFF]), // A=F R=F
     ];
     for (format, bytes) in cases {
@@ -156,6 +159,47 @@ fn expanded_color_formats_sample_red() {
             "format {format:#x} red, got {px:?}"
         );
     }
+}
+
+/// The expansion forces `X1R5G5B5`'s alpha opaque in the widened texel.
+///
+/// Its BGRA8 backing carries no sampler swizzle (a swizzled view cannot be a
+/// render-pass attachment), so the opaque alpha has to come out of the upload
+/// pass itself. A texel with the padding bit clear must still blend as fully
+/// opaque.
+#[test]
+fn expanded_x1r5g5b5_blends_opaque_with_its_top_bit_clear() {
+    const BLUE_CLEAR: u32 = 0xFF00_00FF;
+    // X=0 R=31: red with the padding bit clear.
+    const RED555: u16 = 0x7C00;
+    force_expand();
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_X1R5G5B5, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write(&[RED555]);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    let quad = fullscreen_quad();
+    h.render_once(BLUE_CLEAR, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "blend draw"
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        px.r > 200 && px.b < 60,
+        "the widened texel blends over blue at alpha 1, got {px:?}"
+    );
 }
 
 #[test]
@@ -259,13 +303,31 @@ fn expanded_render_target_caps_are_denied() {
         assert_ne!(hr, D3D_OK, "CreateTexture(RT, {format:#x}) rejected");
     }
     // The sampled answers stay advertised: the expansion makes them true.
-    for format in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4] {
+    for format in [
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+    ] {
         assert_eq!(
             h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, format),
             D3D_OK,
             "sampled texture answer for {format:#x}"
         );
     }
+    // X1R5G5B5 is sampling-only on every device (its native mapping carries
+    // the alpha-forcing swizzle), so its render-target answer is denied here
+    // for the same reason it is denied natively.
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_SURFACE,
+            D3DFMT_X1R5G5B5
+        ),
+        D3DERR_NOTAVAILABLE,
+        "RT usage denied for X1R5G5B5"
+    );
     // Conversion SOURCE side and the backbuffer question are
     // device-independent: a 16-bit source is sampled (expansion covers it)
     // and a 16-bit backbuffer substitutes to BGRA8 at CreateDevice.

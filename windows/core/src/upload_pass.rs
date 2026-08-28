@@ -17,7 +17,9 @@
 //! at a texture that can be an attachment.
 
 use mtld3d_shared::mtl::PixelFormat;
-use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5};
+use mtld3d_types::{
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5,
+};
 
 /// Source layout the upload quad's fragment function decodes.
 ///
@@ -34,6 +36,8 @@ pub enum UploadDecode {
     A4R4G4B4 = 2,
     /// Verbatim copy of a 4-byte BGRA texel into the matching `Bgra8Unorm`.
     CopyBgra8 = 3,
+    /// 2 bpp `X1R5G5B5` widened to `Bgra8Unorm`, alpha forced opaque.
+    X1R5G5B5 = 4,
 }
 
 impl UploadDecode {
@@ -47,7 +51,7 @@ impl UploadDecode {
     #[must_use]
     pub const fn bytes_per_texel(self) -> u32 {
         match self {
-            Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 => 2,
+            Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 | Self::X1R5G5B5 => 2,
             Self::CopyBgra8 => 4,
         }
     }
@@ -55,8 +59,8 @@ impl UploadDecode {
 
 /// Decode for an upload of `src_d3d_format` into a `gpu_format` texture.
 ///
-/// `Some` for the three packed 16-bit formats a device without native
-/// support backs with `Bgra8Unorm`, and for the one uncompressed colour
+/// `Some` for the packed 16-bit formats a device without native support
+/// backs with `Bgra8Unorm`, and for the one uncompressed colour
 /// format whose Metal counterpart is renderable, carries no sampler swizzle,
 /// and stores its channels one unorm byte each. Everything else is `None`
 /// and keeps the blit upload (with its CPU repack when the pitch is under
@@ -71,6 +75,7 @@ pub const fn upload_decode(src_d3d_format: u32, gpu_format: PixelFormat) -> Opti
     match src_d3d_format {
         D3DFMT_R5G6B5 => Some(UploadDecode::R5G6B5),
         D3DFMT_A1R5G5B5 => Some(UploadDecode::A1R5G5B5),
+        D3DFMT_X1R5G5B5 => Some(UploadDecode::X1R5G5B5),
         D3DFMT_A4R4G4B4 => Some(UploadDecode::A4R4G4B4),
         D3DFMT_A8R8G8B8 => Some(UploadDecode::CopyBgra8),
         _ => None,
@@ -86,7 +91,10 @@ pub const fn upload_decode(src_d3d_format: u32, gpu_format: PixelFormat) -> Opti
 pub const fn is_expansion(decode: UploadDecode) -> bool {
     matches!(
         decode,
-        UploadDecode::R5G6B5 | UploadDecode::A1R5G5B5 | UploadDecode::A4R4G4B4
+        UploadDecode::R5G6B5
+            | UploadDecode::A1R5G5B5
+            | UploadDecode::A4R4G4B4
+            | UploadDecode::X1R5G5B5
     )
 }
 

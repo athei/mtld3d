@@ -6,14 +6,15 @@ use mtld3d_tests::{
     Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
-    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
+    D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
+    D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
     D3DUSAGE_RENDERTARGET,
 };
 
@@ -284,10 +285,11 @@ fn a_sysmem_texture_level_and_surface_share_one_pitch_at_an_odd_16_bit_width() {
 fn color_formats_sample_red() {
     let h = Harness::new();
     // 1×1 opaque-red texel encoded for each format (little-endian bytes).
-    let cases: [(u32, &[u8]); 4] = [
+    let cases: [(u32, &[u8]); 5] = [
         (D3DFMT_X8R8G8B8, &[0x00, 0x00, 0xFF, 0x00]), // BGRX
         (D3DFMT_R5G6B5, &[0x00, 0xF8]),               // R=31
         (D3DFMT_A1R5G5B5, &[0x00, 0xFC]),             // A=1 R=31
+        (D3DFMT_X1R5G5B5, &[0x00, 0x7C]),             // X=0 R=31
         (D3DFMT_A4R4G4B4, &[0x00, 0xFF]),             // A=F R=F
     ];
     for (format, bytes) in cases {
@@ -299,6 +301,105 @@ fn color_formats_sample_red() {
             "format {format:#x} red, got {px:?}"
         );
     }
+}
+
+/// `X1R5G5B5` samples alpha as 1.0 whatever its top bit holds.
+///
+/// The bit is padding in D3D9, so a texel that leaves it clear still blends
+/// as fully opaque. Reading it as an alpha channel, which is what the
+/// `A1R5G5B5` mapping would do, blends the draw away entirely.
+#[test]
+fn x1r5g5b5_blends_opaque_with_its_top_bit_clear() {
+    const BLUE: u32 = 0xFF00_00FF;
+    // X=0 R=31: red with the padding bit clear.
+    const RED555: u16 = 0x7C00;
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_X1R5G5B5, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write(&[RED555]);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    let quad = fullscreen_quad();
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "blend draw"
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        px.r > 200 && px.b < 60,
+        "the texel blends over blue at alpha 1, got {px:?}"
+    );
+}
+
+/// A `GetDC` on an `X1R5G5B5` level reads and writes it through the 5-5-5 DIB.
+///
+/// The DIB's `BI_BITFIELDS` masks cover the three colour channels only, so
+/// the padding bit is outside anything GDI reads or writes and the level's
+/// texels round-trip through it unchanged.
+#[test]
+fn get_dc_on_an_x1r5g5b5_level_round_trips_a_texel() {
+    const GREEN555: u16 = 0x03E0;
+    const RED555: u16 = 0x7C00;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_X1R5G5B5, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write(&[GREEN555; 16]);
+
+    let surface = tex.surface_level(0);
+    let dc = surface.dc();
+    assert_eq!(
+        dc.get_pixel(3, 3),
+        GREEN_COLORREF,
+        "the DC reads the texels the lock wrote"
+    );
+    assert_eq!(
+        dc.set_pixel(3, 3, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel stores full-scale channels exactly in a 5-5-5 DIB"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+
+    {
+        let locked = tex.lock_rect(0, D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() as usize / 2;
+        let texels = locked.as_u16(pitch_px * 4);
+        assert_eq!(
+            texels[pitch_px * 3 + 3] & 0x7FFF,
+            RED555,
+            "what GDI drew reached the level's staging"
+        );
+        assert_eq!(
+            texels[0] & 0x7FFF,
+            GREEN555,
+            "the texels GDI left alone kept the lock's own pixels"
+        );
+    }
+
+    // The quad spans the unit square over a 640x480 target, so texel (3, 3)
+    // covers x 480..640, y 360..480 and texel (0, 0) covers x 0..160,
+    // y 0..120.
+    let drawn = sample_at(&h, &tex, 560, 420);
+    assert!(
+        drawn.r > 200 && drawn.g < 60,
+        "a draw samples the texel GDI drew, got {drawn:?}"
+    );
+    let untouched = sample_at(&h, &tex, 80, 60);
+    assert!(
+        untouched.g > 200 && untouched.r < 60,
+        "the texels GDI left alone still sample as the lock wrote them, got {untouched:?}"
+    );
 }
 
 #[test]

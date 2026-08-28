@@ -132,6 +132,31 @@ fn the_wide_channel_family_maps_to_its_metal_counterpart() {
     assert!(!map_d3d_format(D3DFMT_G16R16).expect("mapped").has_alpha());
 }
 
+/// `X1R5G5B5` is `A1R5G5B5` with the top bit ignored.
+///
+/// Both take Metal's `Bgr5A1Unorm`; the X form forces the sampled alpha to 1
+/// through the swizzle, the way `X8R8G8B8` does against `A8R8G8B8`, and so
+/// reports no alpha channel to the blend translation.
+#[test]
+fn x1r5g5b5_is_a1r5g5b5_with_a_forced_alpha() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5};
+
+    let a1 = map_d3d_format(D3DFMT_A1R5G5B5).expect("mapped");
+    let x1 = map_d3d_format(D3DFMT_X1R5G5B5).expect("mapped");
+    assert_eq!(x1.metal_pixel_format(), a1.metal_pixel_format());
+    assert_eq!(x1.bytes_per_pixel(), 2);
+    assert_eq!(x1.block_bytes(), 2);
+    assert!(!x1.is_compressed());
+    assert_eq!(
+        x1.swizzle(),
+        Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One])
+    );
+    assert_eq!(a1.swizzle(), None);
+    assert!(!x1.has_alpha());
+    assert!(a1.has_alpha());
+    assert_eq!(format_name(D3DFMT_X1R5G5B5), "X1R5G5B5");
+}
+
 #[test]
 fn is_mapped_color_format_tracks_the_lookup() {
     // The `CheckDeviceFormat` texture answer is derived from this, so it
@@ -156,7 +181,7 @@ fn format_name_renders_mapped_names_and_a_fixed_unknown() {
 
 #[test]
 fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support() {
-    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5};
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5};
 
     use super::map_d3d_format_device;
 
@@ -164,6 +189,7 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     for fmt in [
         D3DFMT_R5G6B5,
         D3DFMT_A1R5G5B5,
+        D3DFMT_X1R5G5B5,
         D3DFMT_A4R4G4B4,
         D3DFMT_A8R8G8B8,
         D3DFMT_A16B16G16R16F,
@@ -199,6 +225,14 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     assert_eq!(a1r5g5b5.bytes_per_pixel(), 2);
     assert_eq!(a1r5g5b5.swizzle(), None);
     assert!(a1r5g5b5.has_alpha());
+
+    // The X form drops the native path's alpha-forcing swizzle too: the
+    // upload pass writes the opaque alpha into the BGRA8 texel itself.
+    let x1r5g5b5 = map_d3d_format_device(D3DFMT_X1R5G5B5, false).expect("mapped");
+    assert_eq!(x1r5g5b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(x1r5g5b5.bytes_per_pixel(), 2);
+    assert_eq!(x1r5g5b5.swizzle(), None);
+    assert!(!x1r5g5b5.has_alpha());
 
     let a4r4g4b4 = map_d3d_format_device(D3DFMT_A4R4G4B4, false).expect("mapped");
     assert_eq!(a4r4g4b4.metal_pixel_format(), PixelFormat::Bgra8Unorm);

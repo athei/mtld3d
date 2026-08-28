@@ -54,7 +54,7 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// read one at a time, which is what removes every alignment constraint on
 /// the pitch and on the base offset.
 ///
-/// `decode` selects the source layout. The three packed 16-bit layouts widen
+/// `decode` selects the source layout. The packed 16-bit layouts widen
 /// each channel by replicating its high bits into the low ones (so 0 stays 0
 /// and the maximum maps to 255 exactly) and divide by 255, which the
 /// destination's `Bgra8Unorm` round-to-nearest conversion inverts exactly;
@@ -80,7 +80,7 @@ fragment float4 mtld3d_upload_ps(
     uint decode = args.z;
     uint bpp = args.w;
     uint addr = args.x + texel.y * args.y + texel.x * bpp;
-    if (decode < 3u) {
+    if (decode != 3u) {
         uint bits = uint(src[addr]) | (uint(src[addr + 1u]) << 8);
         uint r;
         uint g;
@@ -95,15 +95,17 @@ fragment float4 mtld3d_upload_ps(
             g = (g6 << 2) | (g6 >> 4);
             b = (b5 << 3) | (b5 >> 2);
             a = 0xFFu;
-        } else if (decode == 1u) {
-            // A1R5G5B5: A[15] R[10-14] G[5-9] B[0-4].
+        } else if (decode == 1u || decode == 4u) {
+            // A1R5G5B5 (decode 1): A[15] R[10-14] G[5-9] B[0-4]. X1R5G5B5
+            // (decode 4) shares the layout, with bit 15 padding that D3D9
+            // samples as opaque.
             uint r5 = (bits >> 10) & 0x1Fu;
             uint g5 = (bits >> 5) & 0x1Fu;
             uint b5 = bits & 0x1Fu;
             r = (r5 << 3) | (r5 >> 2);
             g = (g5 << 3) | (g5 >> 2);
             b = (b5 << 3) | (b5 >> 2);
-            a = (bits & 0x8000u) == 0u ? 0x00u : 0xFFu;
+            a = (decode == 4u || (bits & 0x8000u) != 0u) ? 0xFFu : 0x00u;
         } else {
             // A4R4G4B4: A[12-15] R[8-11] G[4-7] B[0-3].
             r = ((bits >> 8) & 0xFu) * 17u;
