@@ -193,6 +193,73 @@ pub struct VariantKey {
     pub flags: VariantFlags,
 }
 
+/// Texture kind bound to each vertex-fetch sampler slot.
+///
+/// The four `D3DVERTEXTEXTURESAMPLER0..3` slots (API stages 257..260) bind
+/// whatever `SetTexture` last put there, which need not be the kind the
+/// `vs_3_0` declared with `dcl_2d` / `dcl_cube` / `dcl_volume`. The vertex
+/// emitter types the `[[texture(n)]]` argument and picks the sample coordinate
+/// swizzle from these masks instead of from the declaration, so the Metal
+/// binding always matches the texture the draw actually binds. A slot with
+/// neither bit set is 2D, which is also what an unbound slot gets: the black
+/// fallback the draw path binds there is 2D as well.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VsSamplerKinds {
+    /// Bit `i` set ⇒ vertex slot `i` binds a volume (3D) texture.
+    pub volume_mask: u8,
+    /// Bit `i` set ⇒ vertex slot `i` binds a cube texture.
+    pub cube_mask: u8,
+}
+
+impl VsSamplerKinds {
+    /// Number of vertex texture fetch slots D3D9 defines.
+    pub const SLOT_COUNT: u16 = 4;
+
+    /// The texture kind bound at vertex slot `idx`.
+    ///
+    /// Record the kind bound at slot `idx`.
+    ///
+    /// `volume` and `cube` come straight off the bound texture, so at most one
+    /// is true; both false is a 2D texture or an empty slot. Slots at or past
+    /// [`Self::SLOT_COUNT`] are ignored (D3D9 defines exactly four).
+    pub const fn set_slot(&mut self, idx: usize, volume: bool, cube: bool) {
+        if idx >= Self::SLOT_COUNT as usize {
+            return;
+        }
+        let bit = 1u8 << idx;
+        self.volume_mask = if volume {
+            self.volume_mask | bit
+        } else {
+            self.volume_mask & !bit
+        };
+        self.cube_mask = if cube {
+            self.cube_mask | bit
+        } else {
+            self.cube_mask & !bit
+        };
+    }
+
+    /// The texture kind bound at vertex slot `idx`.
+    ///
+    /// A texture is volume or cube or neither, so the two masks never share a
+    /// bit; the order below only settles a mask a caller built wrong. Slots at
+    /// or past [`Self::SLOT_COUNT`] read as 2D.
+    #[must_use]
+    pub const fn kind(self, idx: u16) -> TextureType {
+        if idx >= Self::SLOT_COUNT {
+            return TextureType::Texture2D;
+        }
+        let bit = 1u8 << idx;
+        if (self.volume_mask & bit) != 0 {
+            TextureType::Texture3D
+        } else if (self.cube_mask & bit) != 0 {
+            TextureType::TextureCube
+        } else {
+            TextureType::Texture2D
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum EmitError {
     WrongShaderType,
@@ -217,7 +284,7 @@ pub const DEFAULT_PS_ENTRY: &str = "mtld3d_ps";
 ///
 /// See [`emit_vs_programmable_named`].
 pub fn emit_vs_programmable(vs: &DxsoProgram) -> Result<String, EmitError> {
-    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX, 0)
+    emit_vs_programmable_named(vs, DEFAULT_VS_ENTRY, u16::MAX, 0, VsSamplerKinds::default())
 }
 
 /// Emit MSL for a pixel shader using the default `mtld3d_ps` entry name.
@@ -242,6 +309,7 @@ pub fn emit_vs_programmable_named(
     entry: &str,
     provided_mask: u16,
     clip_plane_count: u8,
+    sampler_kinds: VsSamplerKinds,
 ) -> Result<String, EmitError> {
     if vs.shader_type != ShaderType::Vertex {
         return Err(EmitError::WrongShaderType);
@@ -253,7 +321,16 @@ pub fn emit_vs_programmable_named(
     emit_varyings(&mut out, false, clip_plane_count);
     w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
-    emit_vs_function(&mut out, vs, entry, provided_mask, clip_plane_count)?;
+    emit_vs_function(
+        &mut out,
+        vs,
+        &VsFunctionKey {
+            entry,
+            provided_mask,
+            clip_plane_count,
+            sampler_kinds,
+        },
+    )?;
     Ok(out)
 }
 
@@ -446,13 +523,28 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
 
 // ── VS function ──
 
+/// Per-variant inputs to [`emit_vs_function`].
+///
+/// The vertex signature depends on more than the parsed program: the entry
+/// name, which vertex attributes the declaration provides, how many user clip
+/// planes the draw enables, and the texture kind bound at each vertex fetch
+/// slot. Bundled so the emitter takes one parameter instead of four positional
+/// integers of near-identical type.
+struct VsFunctionKey<'a> {
+    entry: &'a str,
+    provided_mask: u16,
+    clip_plane_count: u8,
+    sampler_kinds: VsSamplerKinds,
+}
+
 fn emit_vs_function(
     out: &mut String,
     vs: &DxsoProgram,
-    entry: &str,
-    provided_mask: u16,
-    clip_plane_count: u8,
+    key: &VsFunctionKey<'_>,
 ) -> Result<(), EmitError> {
+    let entry = key.entry;
+    let provided_mask = key.provided_mask;
+    let clip_plane_count = key.clip_plane_count;
     let _ = writeln!(out, "vertex Varyings {entry}(");
     w(out, "    VertexIn in [[stage_in]],\n");
     let _ = write!(
@@ -500,13 +592,11 @@ fn emit_vs_function(
     // shared sample-expression path serves both stages. The model only
     // allows `texldl` (explicit LOD), which is also the only sample form
     // MSL permits in a vertex function. Depth-format bindings are not
-    // routed to the vertex stage, so the type is always the declared one.
-    for (idx, ty) in declared_vs_samplers(vs) {
-        let tex_ty = match ty {
-            TextureType::TextureCube => "texturecube<float>",
-            TextureType::Texture3D => "texture3d<float>",
-            TextureType::Texture2D | TextureType::Unknown => "texture2d<float>",
-        };
+    // routed to the vertex stage, so the only per-slot override is the kind
+    // of texture the draw binds there.
+    let samplers = bound_vs_samplers(vs, key.sampler_kinds);
+    for (idx, ty) in &samplers {
+        let tex_ty = msl_texture_type(*ty);
         let _ = write!(
             out,
             ",\n    {tex_ty} s{idx} [[texture({idx})]],\n    sampler samp{idx} [[sampler({idx})]]"
@@ -591,6 +681,7 @@ fn emit_vs_function(
     let ctx = EmitContext::vs(&VsInit {
         major: vs.major,
         minor: vs.minor,
+        samplers: (!samplers.is_empty()).then_some(&samplers),
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
         def_bool_consts: &def_bool_consts,
@@ -767,6 +858,44 @@ pub fn declared_vs_samplers(vs: &DxsoProgram) -> BTreeMap<u16, TextureType> {
         }
     }
     samplers
+}
+
+/// The VS sampler slots the shader declares, typed by the bound texture.
+///
+/// The vertex twin of [`bound_ps_samplers`]: which slots exist comes from the
+/// `dcl_<dim>` set, each slot's type from [`VsSamplerKinds::kind`]. Drives the
+/// vertex function's `[[texture(n)]]` arguments and the coordinate swizzle at
+/// every `texldl` site.
+fn bound_vs_samplers(vs: &DxsoProgram, kinds: VsSamplerKinds) -> BTreeMap<u16, TextureType> {
+    let mut samplers = declared_vs_samplers(vs);
+    for (idx, ty) in &mut samplers {
+        let bound = kinds.kind(*idx);
+        if *ty == TextureType::Unknown {
+            mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
+                "dxso: vertex sampler s{idx} declares an unknown TextureType → binding {bound:?}"
+            );
+        } else if *ty != bound {
+            mtld3d_shared::log_once_info_by!(target: super::LOG_TARGET,
+                key: u64::from(*idx),
+                "dxso: vertex sampler s{idx} declares {ty:?} but is bound to {bound:?} → fetching \
+                 from the bound texture"
+            );
+        }
+        *ty = bound;
+    }
+    samplers
+}
+
+/// The MSL texture type an emitted vertex sampler argument carries.
+///
+/// A declaration the parser could not classify samples as 2D, which is what
+/// every `vs_3_0` vertex fetch a title issues uses.
+const fn msl_texture_type(ty: TextureType) -> &'static str {
+    match ty {
+        TextureType::TextureCube => "texturecube<float>",
+        TextureType::Texture3D => "texture3d<float>",
+        TextureType::Texture2D | TextureType::Unknown => "texture2d<float>",
+    }
 }
 
 /// Declared PS sampler slots and their texture dimensionality.
@@ -1368,11 +1497,14 @@ struct EmitContext<'a> {
     shader_major: u8,
     shader_minor: u8,
     ps_input_map: Option<&'a BTreeMap<u16, String>>,
-    /// PS only: per-sampler texture type of the texture bound to each declared slot.
+    /// Per-sampler texture type of the texture bound to each declared slot.
     ///
-    /// Picks the coord-swizzle for `texld` (`.xy` for 2D, `.xyz` for
-    /// cube and 3D). VS leaves this `None`.
-    ps_samplers: Option<&'a BTreeMap<u16, TextureType>>,
+    /// Picks the coord-swizzle for `texld` / `texldl` / `texldd` (`.xy` for
+    /// 2D, `.xyz` for cube and 3D), and is the same map the stage's argument
+    /// list is typed from, so the two cannot disagree. Both stages populate
+    /// it: the PS from the live stage bindings, the VS from the kind bound at
+    /// each vertex fetch slot.
+    samplers: Option<&'a BTreeMap<u16, TextureType>>,
     /// PS only: bit `i` set ⇒ sampler slot `i` is bound to a depth-format texture.
     ///
     /// So `s{i}.sample(...)` returns a scalar `float` (not `float4`) and the
@@ -1474,6 +1606,11 @@ struct PsInit<'a> {
 struct VsInit<'a> {
     major: u8,
     minor: u8,
+    /// Vertex fetch slots typed by the texture kind bound to each.
+    ///
+    /// `None` for a shader that declares no sampler, which is every VS below
+    /// `vs_3_0`. See [`bound_vs_samplers`].
+    samplers: Option<&'a BTreeMap<u16, TextureType>>,
     def_consts: &'a BTreeSet<u16>,
     def_int_consts: &'a BTreeSet<u16>,
     def_bool_consts: &'a BTreeSet<u16>,
@@ -1489,7 +1626,7 @@ impl<'a> EmitContext<'a> {
             shader_major: init.major,
             shader_minor: init.minor,
             ps_input_map: None,
-            ps_samplers: None,
+            samplers: init.samplers,
             ps_depth_sampler_mask: 0,
             ps_depth_fetch_mask: 0,
             ps_tt_projected_mask: 0,
@@ -1511,7 +1648,7 @@ impl<'a> EmitContext<'a> {
             shader_major: init.major,
             shader_minor: init.minor,
             ps_input_map: Some(init.map),
-            ps_samplers: Some(init.samplers),
+            samplers: Some(init.samplers),
             ps_depth_sampler_mask: init.depth_sampler_mask,
             ps_depth_fetch_mask: init.depth_fetch_mask,
             ps_tt_projected_mask: init.tt_projected_mask,
@@ -1586,7 +1723,7 @@ impl<'a> EmitContext<'a> {
         idx < 8
             && (self.ps_tt_projected_mask & (1u8 << idx)) != 0
             && !matches!(
-                self.ps_samplers.and_then(|m| m.get(&idx)),
+                self.samplers.and_then(|m| m.get(&idx)),
                 Some(TextureType::TextureCube)
             )
     }
@@ -1842,7 +1979,7 @@ fn translate_instruction(
             } else {
                 String::new()
             };
-            let gradient = match ctx.ps_samplers.and_then(|m| m.get(&sampler_idx)) {
+            let gradient = match ctx.samplers.and_then(|m| m.get(&sampler_idx)) {
                 Some(TextureType::TextureCube) => format!(
                     "gradientcube(({ddx}).xyz{scale}, ({ddy}).xyz{scale})",
                     ddx = srcs[2],
@@ -2772,7 +2909,7 @@ fn register_write_target(reg: Register, ctx: &EmitContext) -> String {
 /// `texldd` translations so future texture-dimensionality work has one site
 /// to update.
 fn sampler_coord_swizzle(ctx: &EmitContext, sampler_idx: u16) -> &'static str {
-    match ctx.ps_samplers.and_then(|m| m.get(&sampler_idx)) {
+    match ctx.samplers.and_then(|m| m.get(&sampler_idx)) {
         Some(TextureType::TextureCube | TextureType::Texture3D) => "xyz",
         _ => "xy",
     }

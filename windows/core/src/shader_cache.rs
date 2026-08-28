@@ -264,7 +264,12 @@ use crate::shader_compile_stats::CompileBucket;
 /// instead of from its `dcl_<dim>`, so the `[[texture(n)]]` argument type and
 /// the coordinate swizzle of any shader whose declaration disagrees with the
 /// binding change.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 66;
+///
+/// `67` does the same for the four vertex texture fetch slots: a `vs_3_0` slot
+/// bound to a volume or cube texture emits `texture3d<float>` /
+/// `texturecube<float>` and a `.xyz` coordinate whatever its `dcl_<dim>` said,
+/// which is new MSL and a new programmable-VS disk-key input.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 67;
 
 /// File magic.
 ///

@@ -15,7 +15,9 @@ use mtld3d_core::{
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
-    dxso::{FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, bound_sampler_type},
+    dxso::{
+        FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
+    },
     ids::{BufferId, ProgramId},
     passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
@@ -689,6 +691,8 @@ pub enum VsKey {
         provided_input_mask: u16,
         /// See `VsSource::Programmable::clip_plane_count`.
         clip_plane_count: u8,
+        /// See `VsSource::Programmable::sampler_kinds`.
+        sampler_kinds: VsSamplerKinds,
     },
     FixedFunction {
         ff: FfVsKey,
@@ -725,8 +729,14 @@ impl VsKey {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
+            } => vs_source_disk_key_programmable(
+                *vs_id,
+                *provided_input_mask,
+                *clip_plane_count,
+                *sampler_kinds,
+            ),
             Self::FixedFunction { ff, .. } => vs_source_disk_key_ff(ff),
         }
     }
@@ -764,21 +774,41 @@ impl PsKey {
     }
 }
 
+/// The black-fallback texture of the kind an emitted sampler argument carries.
+///
+/// Both stages type their `[[texture(n)]]` arguments from the texture bound to
+/// the slot, so a slot the draw cannot resolve to a real texture has to fall
+/// back to a black texture of that same kind or Metal rejects the binding.
+const fn null_texture_kind(ty: TextureType) -> NullTextureKind {
+    match ty {
+        TextureType::Texture3D => NullTextureKind::Texture3D,
+        TextureType::TextureCube => NullTextureKind::TextureCube,
+        TextureType::Texture2D | TextureType::Unknown => NullTextureKind::Texture2D,
+    }
+}
+
 /// Single source of truth for the VS programmable `disk_key`.
 ///
 /// The provided-input mask IS folded in: a shader reading an unprovided
 /// input emits different MSL (the input becomes `float4(0)` and `VertexIn`
 /// drops the attribute), so each `(vs_id, mask)` compiles a distinct
 /// `MTLLibrary`. So is the user clip plane count: it sizes the
-/// `[[clip_distance]]` output and the distances the epilogue computes.
-/// Variant bits still don't change VS MSL, so they are intentionally left
-/// out.
+/// `[[clip_distance]]` output and the distances the epilogue computes. So is
+/// the vertex-fetch sampler kind mask: it types the `[[texture(n)]]` arguments
+/// and picks the sample coordinate swizzle. Variant bits still don't change VS
+/// MSL, so they are intentionally left out.
 pub fn vs_source_disk_key_programmable(
     vs_id: ProgramId,
     provided_input_mask: u16,
     clip_plane_count: u8,
+    sampler_kinds: VsSamplerKinds,
 ) -> u64 {
-    shader_cache::ff_key_hash(&(vs_id.raw(), provided_input_mask, clip_plane_count))
+    shader_cache::ff_key_hash(&(
+        vs_id.raw(),
+        provided_input_mask,
+        clip_plane_count,
+        sampler_kinds,
+    ))
 }
 
 pub fn vs_source_disk_key_ff(ff: &FfVsKey) -> u64 {
@@ -855,6 +885,15 @@ pub enum VsSource {
         /// draw that never enables a plane, which keeps the common case at
         /// one variant.
         clip_plane_count: u8,
+        /// Texture kind bound at each of the four vertex texture fetch slots.
+        ///
+        /// Folds into the VS library + disk keys: the emitter types each
+        /// `[[texture(n)]]` argument and its sample coordinate swizzle from
+        /// the bound kind rather than from the shader's `dcl_*`, because
+        /// Metal type-checks the binding against the signature. Zero for
+        /// every shader without vertex texture fetch and for the ordinary
+        /// case of a 2D texture in every slot, which keeps one variant.
+        sampler_kinds: VsSamplerKinds,
     },
     FixedFunction {
         key: FfVsKey,
@@ -882,12 +921,14 @@ impl VsSource {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
             } => VsKey::Programmable {
                 vs_id: *vs_id,
                 variant,
                 provided_input_mask: *provided_input_mask,
                 clip_plane_count: *clip_plane_count,
+                sampler_kinds: *sampler_kinds,
             },
             Self::FixedFunction { key, .. } => VsKey::FixedFunction {
                 ff: key.clone(),
@@ -906,8 +947,14 @@ impl VsSource {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
-            } => vs_source_disk_key_programmable(*vs_id, *provided_input_mask, *clip_plane_count),
+            } => vs_source_disk_key_programmable(
+                *vs_id,
+                *provided_input_mask,
+                *clip_plane_count,
+                *sampler_kinds,
+            ),
             Self::FixedFunction { key, .. } => vs_source_disk_key_ff(key),
         }
     }
@@ -1939,11 +1986,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             // an unbound slot has no mask bit set and takes the 2D black
             // texture whatever the shader declared.
             let slot = u16::try_from(stage).expect("declared sampler slot is below STAGE_COUNT");
-            let kind = match bound_sampler_type(variant, slot) {
-                TextureType::Texture3D => NullTextureKind::Texture3D,
-                TextureType::TextureCube => NullTextureKind::TextureCube,
-                TextureType::Texture2D | TextureType::Unknown => NullTextureKind::Texture2D,
-            };
+            let kind = null_texture_kind(bound_sampler_type(variant, slot));
             let tex_sentinel = null_texture_tex_sentinel(kind as u64);
             if enc
                 .last_bound()
@@ -1962,7 +2005,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
     // encoder rather than the per-draw snapshot; a declared slot the game
     // never bound gets the shared black fallback, as on the fragment side.
-    if let VsSource::Programmable { vs_id, .. } = vs {
+    if let VsSource::Programmable {
+        vs_id,
+        sampler_kinds,
+        ..
+    } = vs
+    {
         let decls = enc.ps_declared_samplers(*vs_id);
         let mut mask = decls.unbound(0) & 0xF;
         while mask != 0 {
@@ -1977,7 +2025,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 }
             });
             if handle == 0 {
-                let kind = decls.kind(slot);
+                // The emitter types the argument from `sampler_kinds`, so the
+                // black fallback must carry the same kind: an unbound slot is
+                // 2D there, and a slot whose texture has no handle yet keeps
+                // the kind the key already compiled for.
+                let kind = null_texture_kind(
+                    sampler_kinds
+                        .kind(u16::try_from(slot).expect("vertex fetch slot is below four")),
+                );
                 let tex_sentinel = null_texture_tex_sentinel(kind as u64);
                 if enc.last_bound().vertex_texture_changed(slot, tex_sentinel) {
                     enc.emit_command(Command::set_vertex_null_texture(kind, slot));

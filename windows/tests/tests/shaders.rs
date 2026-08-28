@@ -731,6 +731,52 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
     assert_eq!(h.clear_texture(257), 0, "unbind slot");
 }
 
+#[test]
+fn vertex_texture_fetch_follows_the_bound_kind_not_the_declaration() {
+    // A vs_3_0 may declare one sampler kind and sample another: native
+    // drivers read the texture the game bound and ignore the dcl. Metal
+    // type-checks the `[[texture(n)]]` argument against the bound
+    // MTLTexture, so the emitted vertex function has to take its argument
+    // type and its coordinate width from the binding. Here the shader
+    // declares `dcl_volume s0` (sampler usage token 0xA0000000) and the game
+    // binds a plain 2D texture at D3DVERTEXTEXTURESAMPLER0. Typing from the
+    // declaration gives `texture3d<float>` sampled with a two-component
+    // coordinate, which is not valid MSL, so the whole vertex library fails
+    // to compile and the triangle never reaches the render target.
+    let h = Harness::new();
+    let tex = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[0xFF00_FF00; 4]); // all-green
+    }
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    vs_tokens[5] = 0xA000_0000; // dcl_volume s0 in place of dcl_2d s0
+    // `mov o1, r0` before the end token.
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the 2D texel fetched through a volume declaration colors the triangle"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
 /// `ps_2_0`: `def c0, 0, 0, 1, 1; mov oC0, c0;`, opaque blue with no buffer read.
 ///
 /// A `def`-declared row is translated into a shader-local literal, so this

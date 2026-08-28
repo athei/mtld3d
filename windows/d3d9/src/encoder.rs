@@ -18,7 +18,7 @@ use mtld3d_core::{
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
-        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, TextureType, VariantKey,
+        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
         declared_ps_samplers, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
         emit_vs_programmable_named,
     },
@@ -54,9 +54,8 @@ use mtld3d_shared::{
     CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
     CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, NullTextureKind, PassDescriptor,
-    SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams,
+    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
         PixelFormat, PrimitiveType, QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle,
@@ -718,25 +717,16 @@ bitflags::bitflags! {
     }
 }
 
-/// A programmable pixel shader's declared sampler slots and their types.
+/// The sampler slots a programmable shader declares.
 ///
-/// `mask` has a bit set for every stage the shader declares a sampler for;
-/// `kinds[stage]` is the matching texture dimensionality, valid only where the
-/// mask bit is set. The draw path binds an opaque-black texture of that kind to
-/// any declared slot the game did not bind a texture to.
-#[derive(Clone, Copy)]
+/// `mask` has a bit set for every stage the shader declares a sampler for. The
+/// declaration decides only which slots exist: both emitters type each one
+/// from the texture bound to it, so the draw path takes the kind of the
+/// opaque-black fallback it binds to an unbound slot from the same live
+/// bindings rather than from here.
+#[derive(Clone, Copy, Default)]
 pub struct PsSamplerDecls {
     mask: u16,
-    kinds: [NullTextureKind; crate::stage_bindings::STAGE_COUNT],
-}
-
-impl Default for PsSamplerDecls {
-    fn default() -> Self {
-        Self {
-            mask: 0,
-            kinds: [NullTextureKind::Texture2D; crate::stage_bindings::STAGE_COUNT],
-        }
-    }
 }
 
 /// One vertex-sampler slot's binding, mirrored from the device.
@@ -763,26 +753,19 @@ impl PsSamplerDecls {
     /// Stages at or past `STAGE_COUNT` are ignored (a D3D9 PS declares s0..s15).
     fn from_program(program: &DxsoProgram) -> Self {
         let mut decls = Self::default();
-        for (&slot, &texture_type) in &declared_ps_samplers(program) {
+        for &slot in declared_ps_samplers(program).keys() {
             let slot = slot as usize;
             if slot >= crate::stage_bindings::STAGE_COUNT {
                 continue;
             }
             decls.mask |= 1u16 << slot;
-            decls.kinds[slot] = match texture_type {
-                TextureType::TextureCube => NullTextureKind::TextureCube,
-                TextureType::Texture3D => NullTextureKind::Texture3D,
-                // A 2D declaration, or `Unknown`, which the emitter also treats
-                // as `texture2d<float>`.
-                TextureType::Texture2D | TextureType::Unknown => NullTextureKind::Texture2D,
-            };
         }
         decls
     }
 
     /// Slots this shader declares a sampler for but `bound_mask` leaves unbound.
     #[must_use]
-    pub const fn unbound(&self, bound_mask: u16) -> u16 {
+    pub const fn unbound(self, bound_mask: u16) -> u16 {
         self.mask & !bound_mask
     }
 
@@ -792,14 +775,8 @@ impl PsSamplerDecls {
     /// stage the game bound a texture to that the shader declares no sampler
     /// for is a binding no draw reads.
     #[must_use]
-    pub const fn mask(&self) -> u16 {
+    pub const fn mask(self) -> u16 {
         self.mask
-    }
-
-    /// The fallback texture kind for a declared slot.
-    #[must_use]
-    pub const fn kind(&self, stage: u32) -> NullTextureKind {
-        self.kinds[stage as usize]
     }
 }
 
@@ -1075,7 +1052,7 @@ pub struct FrameEncoder {
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
     /// (warm-load) and address the on-disk cache.
     ff_vs_libs: FxHashMap<FfVsKey, StageLibHandles>,
-    prog_vs_libs: FxHashMap<(ProgramId, u16, u8), StageLibHandles>,
+    prog_vs_libs: FxHashMap<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
     ff_ps_libs: FxHashMap<FfPsKey, FxHashMap<VariantKey, StageLibHandles>>,
     prog_ps_libs: FxHashMap<(ProgramId, VariantKey), StageLibHandles>,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
@@ -5158,12 +5135,15 @@ impl FrameEncoder {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
             } => {
-                if let Some(&handles) =
-                    self.prog_vs_libs
-                        .get(&(*vs_id, *provided_input_mask, *clip_plane_count))
-                {
+                if let Some(&handles) = self.prog_vs_libs.get(&(
+                    *vs_id,
+                    *provided_input_mask,
+                    *clip_plane_count,
+                    *sampler_kinds,
+                )) {
                     return Some(handles);
                 }
             }
@@ -5177,10 +5157,18 @@ impl FrameEncoder {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
             } => {
-                self.prog_vs_libs
-                    .insert((*vs_id, *provided_input_mask, *clip_plane_count), handles);
+                self.prog_vs_libs.insert(
+                    (
+                        *vs_id,
+                        *provided_input_mask,
+                        *clip_plane_count,
+                        *sampler_kinds,
+                    ),
+                    handles,
+                );
             }
         }
         Some(handles)
@@ -5212,6 +5200,7 @@ impl FrameEncoder {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
+                sampler_kinds,
                 ..
             } => {
                 let Some(program) = self.program_cache.get(vs_id) else {
@@ -5224,6 +5213,7 @@ impl FrameEncoder {
                     &entry_name,
                     *provided_input_mask,
                     *clip_plane_count,
+                    *sampler_kinds,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -9476,6 +9466,7 @@ fn shader_source_tag_vs(source: &VsSource) -> String {
             vs_id,
             provided_input_mask,
             clip_plane_count,
+            sampler_kinds,
             ..
         } => {
             format!(
@@ -9483,7 +9474,8 @@ fn shader_source_tag_vs(source: &VsSource) -> String {
                 draw::vs_source_disk_key_programmable(
                     *vs_id,
                     *provided_input_mask,
-                    *clip_plane_count
+                    *clip_plane_count,
+                    *sampler_kinds
                 )
             )
         }
