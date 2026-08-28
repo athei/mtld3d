@@ -241,6 +241,11 @@ pub struct BlitSide {
     pub dims: (u32, u32),
     /// Mip level of `handle` the blit reads or writes.
     pub mip: u32,
+    /// Array slice of `handle` the quad renders into.
+    ///
+    /// A cube face's `D3DCUBEMAP_FACES` index, zero for every other texture
+    /// kind. Read on the destination side only: the source is sampled whole.
+    pub slice: u32,
     /// Multisampled companion of `handle`, NULL when there is none.
     ///
     /// Read on the destination side only: the quad renders into the
@@ -2805,7 +2810,7 @@ impl FrameEncoder {
             depth: 1,
             bytes_per_image: 0,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         });
     }
 
@@ -2848,7 +2853,7 @@ impl FrameEncoder {
             depth: 1,
             bytes_per_image: 0,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         });
     }
 
@@ -2969,7 +2974,7 @@ impl FrameEncoder {
                 depth: 1,
                 bytes_per_image: 0,
                 dst_mip_level: 0,
-                pad0: 0,
+                dst_slice: 0,
             });
         }
         dst.raw()
@@ -4051,6 +4056,7 @@ impl FrameEncoder {
             rect: dst_rect,
             dims: dst_dims,
             mip: dst_mip,
+            slice: dst_slice,
             ..
         } = dst;
         if dst_handle == 0 || src_handle == 0 {
@@ -4135,7 +4141,7 @@ impl FrameEncoder {
             dst_dims.1,
             dst_format,
             RenderScale::IDENTITY,
-            (0, dst_mip),
+            (dst_slice, dst_mip),
         );
         // A multisampled destination is written through its companion and
         // resolved into `dst_tex` at pass end, which is what every later read
@@ -7222,6 +7228,7 @@ impl FrameEncoder {
             },
             dims: (src_w, src_h),
             mip: 0,
+            slice: 0,
             msaa: MetalHandle::NULL,
             msaa_srgb: MetalHandle::NULL,
             sample_count: 1,
@@ -7236,6 +7243,7 @@ impl FrameEncoder {
             },
             dims: (dst_w, dst_h),
             mip: 0,
+            slice: 0,
             msaa: target.msaa,
             msaa_srgb: target.msaa_srgb,
             sample_count: target.sample_count,

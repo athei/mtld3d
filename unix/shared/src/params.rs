@@ -1023,7 +1023,7 @@ impl Thunk for DestroyResourcesBulkParams {
 /// `PageBox`, passes its raw pointer as `dst_ptr` + `dst_len`. The unix side
 /// wraps that memory as an `MTLBuffer` via `newBufferWithBytesNoCopy:`,
 /// records a one-shot command buffer that blits `(origin_x, origin_y, width,
-/// height)` of the source texture at `mip_level` into the buffer at
+/// height)` of the source texture at `slice` / `mip_level` into the buffer at
 /// `bytes_per_row` stride, commits, and `waitUntilCompleted`. On return
 /// `dst_ptr` contains the readback pixels. The caller holds onto the backing
 /// until `UnlockRect`.
@@ -1036,13 +1036,15 @@ pub struct BlitTextureToBufferParams {
     pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
     pub device_handle: MetalHandle<MTLDeviceKind>,      // in (for newBufferWithBytesNoCopy)
     pub tex_handle: MetalHandle<MTLTextureKind>,        // in
-    pub dst_ptr: u64,       // in: page-aligned PE-addressable destination
-    pub dst_len: u64,       // in: page-multiple length of dst_ptr
-    pub mip_level: u32,     // in
-    pub origin_x: u32,      // in
-    pub origin_y: u32,      // in
-    pub width: u32,         // in
-    pub height: u32,        // in
+    pub dst_ptr: u64,   // in: page-aligned PE-addressable destination
+    pub dst_len: u64,   // in: page-multiple length of dst_ptr
+    pub mip_level: u32, // in
+    /// Source array slice: a cube face index, zero for every other texture.
+    pub slice: u32, // in
+    pub origin_x: u32,  // in
+    pub origin_y: u32,  // in
+    pub width: u32,     // in
+    pub height: u32,    // in
     pub bytes_per_row: u32, // in: destination row stride
     /// Full width of the image `origin_*` / `width` / `height` are measured in.
     ///
@@ -1057,6 +1059,8 @@ pub struct BlitTextureToBufferParams {
     ///
     /// See [`Self::source_width`].
     pub source_height: u32, // in
+    /// Explicit tail padding to the 8-byte stride.
+    pub pad0: u32,
 }
 
 impl Thunk for BlitTextureToBufferParams {

@@ -1687,7 +1687,8 @@ fn encode_leading_blits(
                 };
                 // Source origin lives in `origin_x`/`origin_y`;
                 // destination origin is packed into `dst_offset` as
-                // `(dst_y as u64) << 32 | dst_x as u64`. Full-mip
+                // `(dst_y as u64) << 32 | dst_x as u64`, and the
+                // destination cube face in `dst_slice`. Full-mip
                 // preserve sets all of these to 0, so existing callers
                 // are unaffected.
                 let dst_x = (cmd.dst_offset & 0xFFFF_FFFF) as usize;
@@ -1755,7 +1756,7 @@ fn encode_leading_blits(
                             depth: 1,
                         },
                         &dst,
-                        0,
+                        cmd.dst_slice as usize,
                         cmd.dst_mip_level as usize,
                         MTLOrigin { x: dst_x, y: dst_y, z: 0 },
                     );
@@ -2618,6 +2619,8 @@ pub struct BlitArgs {
     pub dst_ptr: u64,
     pub dst_len: u64,
     pub mip_level: u32,
+    /// Source array slice: a cube face index, zero for every other texture.
+    pub slice: u32,
     pub origin_x: u32,
     pub origin_y: u32,
     pub width: u32,
@@ -2732,6 +2735,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         dst_ptr,
         dst_len,
         mip_level,
+        slice,
         origin_x,
         origin_y,
         width,
@@ -2857,7 +2861,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
             texture,
-            0,
+            slice as usize,
             mip_level as usize,
             MTLOrigin {
                 x: origin_x as usize,
