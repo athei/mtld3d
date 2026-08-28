@@ -2063,6 +2063,31 @@ impl Harness {
         }
     }
 
+    /// `StretchRect` from one source rectangle onto the whole destination.
+    ///
+    /// The destination rectangle stays null, so the source rectangle alone
+    /// decides whether the copy scales.
+    pub fn stretch_rect_region_hr(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        filter: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live, `src_rect` is a live
+        // D3DRECT, null dst rect = whole destination surface.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                core::ptr::null(),
+                filter,
+            )
+        }
+    }
+
     /// `ColorFill` over the whole surface (null rect). Returns the hr.
     ///
     /// Only a `D3DPOOL_DEFAULT` render target or offscreen-plain surface is a
