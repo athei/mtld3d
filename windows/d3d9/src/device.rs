@@ -5531,7 +5531,7 @@ fn copy_systemmem_to_default(
     // SAFETY: `dst_parent` is a live texture pointer, distinct from `src_parent`.
     let dst_tex = unsafe { &mut *dst_parent };
     if src_tex.d3d_pool() != D3DPOOL_SYSTEMMEM || dst_tex.d3d_pool() != D3DPOOL_DEFAULT {
-        warn!(target: LOG_TARGET, "reject Update*: pool mismatch → INVALIDCALL");
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "reject Update*: pool mismatch → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     // D3D9 accepts a source and a destination of different formats and
@@ -7686,7 +7686,7 @@ extern "system" fn device_set_render_target(
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::RtDs);
     if index >= D3D_MAX_SIMULTANEOUS_RENDERTARGETS {
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject SetRenderTarget(index={index}) → INVALIDCALL (four simultaneous render targets)"
         );
@@ -7725,7 +7725,10 @@ extern "system" fn device_set_render_target(
     if surface.is_null() {
         if slot == 0 {
             // D3D9 spec: RT0 must remain non-null.
-            warn!(target: LOG_TARGET, "reject SetRenderTarget(index=0, null) → INVALIDCALL");
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "reject SetRenderTarget(index=0, null) → INVALIDCALL"
+            );
             return D3DERR_INVALIDCALL;
         }
         // Render targets 1..3 may be unbound; draws then leave the slot alone.
@@ -7744,7 +7747,10 @@ extern "system" fn device_set_render_target(
     // WoW uses a single device, so this never fires in-game.
     // SAFETY: `surf` is non-null (validated above) and points to a live surface.
     if unsafe { (*surf).device_inner() } != obj.inner_ptr() {
-        warn!(target: LOG_TARGET, "reject SetRenderTarget: surface owned by a different device → INVALIDCALL");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject SetRenderTarget: surface owned by a different device → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: `surf` is non-null (validated by `surface.is_null()` check
@@ -7765,7 +7771,7 @@ extern "system" fn device_set_render_target(
     // surface vtable with `surface` as `this` and `desc` as the writable
     // out-pointer.
     if unsafe { (vtbl.get_desc)(surface, &raw mut desc) } != 0 {
-        warn!(target: LOG_TARGET, "reject SetRenderTarget: GetDesc failed");
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "reject SetRenderTarget: GetDesc failed");
         return D3DERR_INVALIDCALL;
     }
     // The destination must be render-target-capable.
@@ -7774,7 +7780,7 @@ extern "system" fn device_set_render_target(
     // the implicit backbuffer / a CreateRenderTarget surface — so every
     // legitimate render-target bind passes.
     if desc.usage & D3DUSAGE_RENDERTARGET == 0 {
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject SetRenderTarget: surface is not a render target (usage={:#x}) → INVALIDCALL",
             desc.usage
@@ -7934,7 +7940,10 @@ extern "system" fn device_get_render_target(
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::RtDs);
     if surface.is_null() || index >= D3D_MAX_SIMULTANEOUS_RENDERTARGETS {
-        warn!(target: LOG_TARGET, "reject GetRenderTarget(index={index}) → INVALIDCALL");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetRenderTarget(index={index}) → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     let slot = usize::try_from(index).expect("index < 4 fits usize");
@@ -8033,7 +8042,7 @@ extern "system" fn device_set_depth_stencil_surface(
         if unsafe { (vtbl.get_desc)(surface, &raw mut desc) } != 0
             || desc.usage & D3DUSAGE_DEPTHSTENCIL == 0
         {
-            warn!(
+            mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "reject SetDepthStencilSurface: surface is not a depth-stencil (usage={:#x}) → INVALIDCALL",
                 desc.usage
@@ -9429,7 +9438,10 @@ extern "system" fn device_draw_primitive(
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
-        warn!(target: LOG_TARGET, "DrawPrimitive: no vertex buffer bound");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "DrawPrimitive: no vertex buffer bound"
+        );
         return D3DERR_INVALIDCALL;
     };
     emit_snapshot_deltas(&obj);
@@ -9493,7 +9505,10 @@ fn draw_bound_triangle_fan(
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(obj.inner()) else {
-        warn!(target: LOG_TARGET, "triangle fan: no vertex buffer bound");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "triangle fan: no vertex buffer bound"
+        );
         return no_vertex_buffer_hr;
     };
     emit_snapshot_deltas(obj);
@@ -9522,7 +9537,10 @@ fn bound_index_fan(
 ) -> Option<IndexSource> {
     let ptr = dev.bound_buffers().index_buffer();
     if ptr.is_null() {
-        warn!(target: LOG_TARGET, "DrawIndexedPrimitive: no index buffer bound");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "DrawIndexedPrimitive: no index buffer bound"
+        );
         return None;
     }
     // SAFETY: `ptr` is non-null (checked above) and points to a live
@@ -9532,8 +9550,9 @@ fn bound_index_fan(
         D3DFMT_INDEX16 => 2,
         D3DFMT_INDEX32 => 4,
         other => {
-            warn!(
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
+                key: u64::from(other),
                 "DrawIndexedPrimitive: unsupported index format {other}"
             );
             return None;
@@ -9542,7 +9561,7 @@ fn bound_index_fan(
     let first = u64::from(start_index) * index_size;
     let len = (u64::from(primitive_count) + 2) * index_size;
     if first + len > inner.current_backing_len() {
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "DrawIndexedPrimitive: triangle fan reads past the index buffer (start {start_index}, {primitive_count} primitives)"
         );
@@ -9619,7 +9638,10 @@ extern "system" fn device_draw_indexed_primitive(
     let Some(index_source) =
         snapshot_bound_index_source(dev, start_index, index_count, base_vertex_index)
     else {
-        warn!(target: LOG_TARGET, "DrawIndexedPrimitive: no index buffer bound");
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "DrawIndexedPrimitive: no index buffer bound"
+        );
         return D3DERR_INVALIDCALL;
     };
 
@@ -9741,8 +9763,9 @@ fn snapshot_bound_index_source(
         D3DFMT_INDEX16 => (mtld3d_shared::mtl::IndexType::UInt16, 2),
         D3DFMT_INDEX32 => (mtld3d_shared::mtl::IndexType::UInt32, 4),
         other => {
-            warn!(
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
+                key: u64::from(other),
                 "DrawIndexedPrimitive: unsupported index format {other}"
             );
             return None;
@@ -10807,8 +10830,9 @@ extern "system" fn device_draw_indexed_primitive_up(
         D3DFMT_INDEX16 => (mtld3d_shared::mtl::IndexType::UInt16, 2),
         D3DFMT_INDEX32 => (mtld3d_shared::mtl::IndexType::UInt32, 4),
         other => {
-            warn!(
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
+                key: u64::from(other),
                 "DrawIndexedPrimitiveUP: unsupported index format {other}"
             );
             return D3DERR_INVALIDCALL;
@@ -11734,7 +11758,7 @@ extern "system" fn device_set_stream_source(
 ) -> i32 {
     let _timer = bind_timer(this, BindSubCategory::Buffer);
     if stream >= mtld3d_types::MAX_STREAMS {
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject SetStreamSource(stream={stream}) → INVALIDCALL (exceeds max_streams)"
         );
@@ -11827,7 +11851,7 @@ extern "system" fn device_set_stream_source_freq(
     };
     if let Err(reason) = validate_stream_freq(stream, setting) {
         // A rejected call leaves the stored frequency untouched.
-        warn!(
+        mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject SetStreamSourceFreq(stream={stream}, setting={setting:#x}) → INVALIDCALL ({reason:?})"
         );
