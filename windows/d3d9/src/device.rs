@@ -4261,6 +4261,21 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     };
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
+    // The size the mip chain is charged at against the `GetAvailableTextureMem`
+    // budget, in the application's own currency: its D3D9 format, not the
+    // wider Metal one a 24-bit depth format is promoted to, and its requested
+    // dimensions, not a render-scaled attachment's. Every format with a Metal
+    // depth mapping has an entry, so the fallback is unreachable.
+    let bytes_per_pixel =
+        mtld3d_core::format::depth_format_bytes_per_pixel(format).unwrap_or_else(|| {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: u64::from(format),
+                "CreateTexture depth format={format} has a Metal mapping but no byte size; \
+                 its levels are charged 0 bytes of texture memory"
+            );
+            0
+        });
 
     trace!(
         target: LOG_TARGET,
@@ -4291,16 +4306,20 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         usage_flags,
         d3d_usage: usage,
         d3d_pool: pool,
-        bytes_per_pixel: 0,
+        bytes_per_pixel,
         block_w: 1,
         block_h: 1,
-        block_bytes: 0,
+        block_bytes: bytes_per_pixel,
         staging: Vec::new(),
-        // Per-level dimensions so `GetLevelDesc` reports each mip; no
-        // `bytes_per_row` since there's no CPU staging path.
+        // Per-level dimensions so `GetLevelDesc` reports each mip, and a
+        // per-level row pitch so `TextureInner::allocated_bytes` charges the
+        // chain like a colour texture's. There is no CPU staging behind a
+        // depth texture, so the pitch is a size and never a lock's stride.
         mip_widths: (0..actual_levels).map(|l| (width >> l).max(1)).collect(),
         mip_heights: (0..actual_levels).map(|l| (height >> l).max(1)).collect(),
-        mip_bytes_per_row: vec![0; actual_levels as usize],
+        mip_bytes_per_row: (0..actual_levels)
+            .map(|l| (width >> l).max(1).saturating_mul(bytes_per_pixel))
+            .collect(),
     });
 
     // Queue the eager `MTLTexture` create (sampleable shadow map path).
