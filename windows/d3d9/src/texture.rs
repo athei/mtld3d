@@ -76,14 +76,16 @@ static DIRECT3D_TEXTURE9_VTBL: IDirect3DTexture9Vtbl = IDirect3DTexture9Vtbl {
     add_dirty_rect: texture_add_dirty_rect,
 };
 
-/// A source image laid out like a mip level, for [`TextureInner::copy_bytes_to_staging_region`].
+/// A source image laid out like a mip level, for [`TextureInner::update_bytes_to_staging_region`].
 ///
-/// `bytes` at `pitch` bytes/row, `width` × `height` texels.
+/// `bytes` at `pitch` bytes/row, `width` × `height` texels in D3D format
+/// `format`.
 pub struct SourceImage<'a> {
     pub bytes: &'a [u8],
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
+    pub format: u32,
 }
 
 /// State used only by cube textures.
@@ -1449,6 +1451,7 @@ impl TextureInner {
             pitch: src_pitch,
             width: src_w,
             height: src_h,
+            format: _,
         } = src;
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, src_w, src_h),
@@ -1560,6 +1563,7 @@ impl TextureInner {
             pitch: src_pitch,
             width: src_w,
             height: src_h,
+            format: _,
         } = src;
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, src_w, src_h),
@@ -1609,6 +1613,154 @@ impl TextureInner {
             let src_ptr = unsafe { src_bytes.as_ptr().add(s_off) };
             // SAFETY: both ranges are in-bounds and cannot overlap.
             unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes) };
+        }
+        self.mark_cube_dirty(dst_face, dst_level);
+        true
+    }
+
+    /// Copy or convert standalone source bytes into `dst_level`, per the two formats.
+    ///
+    /// The [`Self::update_sub_region_from`] contract for a source that is not
+    /// texture-backed: an identical pair is a raw block copy, and a mismatched
+    /// pair the CPU codec covers is re-encoded.
+    pub fn update_bytes_to_staging_region(
+        &mut self,
+        dst_level: usize,
+        src: &SourceImage<'_>,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        if src.format == self.d3d_format {
+            self.copy_bytes_to_staging_region(dst_level, src, src_rect, dst_point)
+        } else {
+            self.convert_bytes_to_staging_region(dst_level, src, src_rect, dst_point)
+        }
+    }
+
+    /// One cube face's [`Self::update_bytes_to_staging_region`].
+    pub fn update_bytes_to_cube_staging_region(
+        &mut self,
+        dst_face: u32,
+        dst_level: usize,
+        src: &SourceImage<'_>,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        if src.format == self.d3d_format {
+            self.copy_bytes_to_cube_staging_region(dst_face, dst_level, src, src_rect, dst_point)
+        } else {
+            self.convert_bytes_to_cube_staging_region(dst_face, dst_level, src, src_rect, dst_point)
+        }
+    }
+
+    /// Re-encode a sub-rectangle of standalone source bytes into `dst_level`'s staging.
+    ///
+    /// The [`Self::convert_sub_region_from`] counterpart for a source that is
+    /// a standalone system-memory surface rather than a level of another
+    /// texture: one 2D image at its own pitch, so there is a single slice to
+    /// walk. Returns false for a pair the codec does not cover and for a
+    /// region no part of which lies in both images. Marks the written
+    /// rectangle dirty so a later `flush_dirty_mips` uploads the converted
+    /// texels.
+    pub fn convert_bytes_to_staging_region(
+        &mut self,
+        dst_level: usize,
+        src: &SourceImage<'_>,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        let dst_fmt = self.d3d_format;
+        if !pixel_convert::can_convert(src.format, dst_fmt) {
+            return false;
+        }
+        self.ensure_staging(dst_level);
+        let Some(dst_box) = self.staging.get(dst_level) else {
+            return false;
+        };
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
+        let Some((src_rect, dst_rect)) =
+            clip_texel_region(src_rect, dst_point, (src.width, src.height), (dw, dh))
+        else {
+            return false;
+        };
+        let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
+        let region = pixel_convert::ConvertRegion {
+            src_x: src_rect.x,
+            src_y: src_rect.y,
+            dst_x: dst_rect.x,
+            dst_y: dst_rect.y,
+            width: dst_rect.w,
+            height: dst_rect.h,
+            src_pitch: src.pitch,
+            dst_pitch,
+            src_slice_pitch: src.pitch * src.height as usize,
+            dst_slice_pitch: dst_pitch * dh as usize,
+            depth: 1,
+        };
+        // SAFETY: `dst_box` is this level's whole staging allocation, distinct
+        // from the caller-owned source bytes; D3D9 objects are single-threaded,
+        // so this call has exclusive access to it.
+        let dst_bytes = unsafe {
+            std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
+        };
+        if !pixel_convert::convert_region(dst_bytes, dst_fmt, src.bytes, src.format, &region) {
+            return false;
+        }
+        self.mark_written_region(dst_level, dst_rect);
+        true
+    }
+
+    /// One cube face's [`Self::convert_bytes_to_staging_region`].
+    pub fn convert_bytes_to_cube_staging_region(
+        &mut self,
+        dst_face: u32,
+        dst_level: usize,
+        src: &SourceImage<'_>,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        let dst_fmt = self.d3d_format;
+        if !pixel_convert::can_convert(src.format, dst_fmt) {
+            return false;
+        }
+        let Some(dst_index) = self.cube_subresource_index(dst_face, dst_level) else {
+            return false;
+        };
+        let Some(dst_box) = self
+            .cube
+            .as_deref()
+            .and_then(|cube| cube.staging.get(dst_index))
+        else {
+            return false;
+        };
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
+        let Some((src_rect, dst_rect)) =
+            clip_texel_region(src_rect, dst_point, (src.width, src.height), (dw, dh))
+        else {
+            return false;
+        };
+        let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
+        let region = pixel_convert::ConvertRegion {
+            src_x: src_rect.x,
+            src_y: src_rect.y,
+            dst_x: dst_rect.x,
+            dst_y: dst_rect.y,
+            width: dst_rect.w,
+            height: dst_rect.h,
+            src_pitch: src.pitch,
+            dst_pitch,
+            src_slice_pitch: src.pitch * src.height as usize,
+            dst_slice_pitch: dst_pitch * dh as usize,
+            depth: 1,
+        };
+        // SAFETY: `dst_box` is this face's whole staging allocation, distinct
+        // from the caller-owned source bytes; D3D9 objects are single-threaded,
+        // so this call has exclusive access to it.
+        let dst_bytes = unsafe {
+            std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
+        };
+        if !pixel_convert::convert_region(dst_bytes, dst_fmt, src.bytes, src.format, &region) {
+            return false;
         }
         self.mark_cube_dirty(dst_face, dst_level);
         true
@@ -4828,4 +4980,47 @@ extern "system" fn cube_add_dirty_rect(this: *mut c_void, face: u32, rect: *cons
     };
     ti.mark_cube_update_dirty(face, 0, dirty);
     D3D_OK
+}
+
+/// Clip a texel-addressed source rectangle and destination origin to the two levels.
+///
+/// The conversion paths address one texel per block, so this is the raw-copy
+/// clip with unit blocks: `None` for a rectangle that is empty, inverted, or
+/// lies outside both levels.
+fn clip_texel_region(
+    src_rect: Option<(i32, i32, i32, i32)>,
+    dst_point: (i32, i32),
+    (sw, sh): (u32, u32),
+    (dw, dh): (u32, u32),
+) -> Option<(DirtyRect, DirtyRect)> {
+    let (rx, ry, rw, rh) = match src_rect {
+        None => (0u32, 0u32, sw, sh),
+        Some((l, t, r, b)) => {
+            if l < 0 || t < 0 || r <= l || b <= t {
+                return None;
+            }
+            (
+                l.cast_unsigned(),
+                t.cast_unsigned(),
+                (r - l).cast_unsigned(),
+                (b - t).cast_unsigned(),
+            )
+        }
+    };
+    let (dx, dy) = (
+        dst_point.0.max(0).cast_unsigned(),
+        dst_point.1.max(0).cast_unsigned(),
+    );
+    clip_copy_region(
+        DirtyRect {
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+        },
+        (dx, dy),
+        (sw, sh),
+        (dw, dh),
+        (1, 1),
+    )
 }

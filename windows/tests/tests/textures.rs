@@ -1425,15 +1425,14 @@ fn update_surface_rejects_a_standalone_source_into_a_managed_destination() {
     assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "accepted fill");
 }
 
-/// `UpdateSurface` rejects a destination whose format differs from the source's.
+/// `UpdateSurface` rejects a standalone-source pair the CPU codec cannot convert.
 ///
-/// The standalone-source copy reinterprets the source bytes in the destination's
-/// mip layout rather than converting them, so an accepted `A1R5G5B5` into
-/// `R5G6B5` would land 1-5-5-5 bits the destination reads as 5-6-5. Both formats
-/// are 16 bits per pixel and the source is the destination's size, so nothing
-/// but the format check stands between the call and that copy.
+/// `A1R5G5B5` is outside the codec, so there is nothing to re-encode the source
+/// with. Both formats are 16 bits per pixel and the source is the destination's
+/// size, so without the check the call would land 1-5-5-5 bits the destination
+/// reads as 5-6-5.
 #[test]
-fn update_surface_rejects_a_standalone_source_of_another_format() {
+fn update_surface_rejects_a_standalone_source_the_codec_cannot_convert() {
     let h = Harness::new();
     let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_A1R5G5B5, D3DPOOL_SYSTEMMEM);
     src.lock_rect(0).write::<u16>(&[0x83E0; 16]);
@@ -2105,5 +2104,75 @@ fn update_texture_rejects_a_format_pair_with_no_converter() {
         h.update_texture_hr(&src, &dst),
         D3DERR_INVALIDCALL,
         "UpdateTexture from a compressed source"
+    );
+}
+
+/// `UpdateSurface` converts a mismatched pair from a standalone source too.
+///
+/// The source is a system-memory offscreen-plain surface, which is not
+/// texture-backed and so reaches the destination level's staging directly
+/// rather than through the texture-to-texture path. D3D9 converts a mismatched
+/// format pair on both. The source's undefined alpha byte reads as opaque, so
+/// what lands in the destination is the source colour.
+#[test]
+fn update_surface_converts_a_standalone_source_into_another_format() {
+    // X8R8G8B8 red, with the ignored byte left at zero.
+    const RED_X8: u32 = 0x00FF_0000;
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[RED_X8; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src, &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a standalone source across formats"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFFFF_0000,
+        "converted texel",
+    );
+}
+
+/// The converting standalone-source `UpdateSurface` reaches a cube face.
+///
+/// A cube destination takes its own staging path, keyed by face, so it needs
+/// the conversion as much as the 2D one. Only the addressed face is written.
+#[test]
+fn update_surface_converts_a_standalone_source_into_a_cube_face() {
+    // X8R8G8B8 green, with the ignored byte left at zero.
+    const GREEN_X8: u32 = 0x0000_FF00;
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[GREEN_X8; 16]);
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let negative_x = cube.surface(1, 0);
+    assert_eq!(
+        h.update_surface_hr(&src, &negative_x),
+        0,
+        "UpdateSurface from a standalone source into a cube face"
+    );
+    assert_pixel_eq(
+        sample_cube_x(&h, &cube, -1.0),
+        0xFF00_FF00,
+        "converted cube-face texel",
+    );
+}
+
+/// A standalone-source `UpdateSurface` into a compressed destination is rejected.
+///
+/// The codec encodes the simple uncompressed colour formats only, so a `DXT1`
+/// destination has no encoder here and the call answers `D3DERR_INVALIDCALL`
+/// rather than writing 32bpp rows over compressed blocks.
+#[test]
+fn update_surface_rejects_a_standalone_source_into_a_compressed_destination() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[0x00FF_0000; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_DXT1, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src, &dst.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface into a block-compressed destination"
     );
 }
