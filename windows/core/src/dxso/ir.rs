@@ -449,16 +449,22 @@ impl DxsoProgram {
     /// `defi` constants are baked into the MSL as locals, but a dynamic `iN`
     /// (typically a `loop aL, iN` / `rep iN` counter) needs the runtime
     /// integer-constant buffer uploaded and bound; draws that bind such a
-    /// shader gate that bind on this flag.
+    /// shader gate that bind on this flag, and the emitter gates the
+    /// declaration of the `vs_i` / `ps_i` argument on it. Subroutine bodies
+    /// count: a `call` inline-expands them into the entry point, so a `rep
+    /// iN` reached only through a `call` still reads the argument.
     #[must_use]
     pub fn uses_dynamic_int_constants(&self) -> bool {
         let defined: std::collections::BTreeSet<u16> =
             self.def_int_constants.iter().map(|d| d.reg.index).collect();
-        self.instructions.iter().any(|inst| {
-            inst.srcs
-                .iter()
-                .any(|s| s.reg.kind == RegKind::ConstInt && !defined.contains(&s.reg.index))
-        })
+        self.instructions
+            .iter()
+            .chain(self.subroutines.values().flatten())
+            .any(|inst| {
+                inst.srcs
+                    .iter()
+                    .any(|s| s.reg.kind == RegKind::ConstInt && !defined.contains(&s.reg.index))
+            })
     }
 
     /// Whether any instruction reads a boolean constant no `defb` defines.
