@@ -5264,6 +5264,19 @@ extern "system" fn device_update_surface(
         // SAFETY: `dst_parent` is a live `Direct3DTexture9` whose refcount keeps
         // it alive while the destination surface is alive.
         let tex = unsafe { &mut *dst_parent };
+        // An `UpdateSurface` destination is a `D3DPOOL_DEFAULT` surface of the
+        // source's format. The copy below reinterprets the source bytes in the
+        // destination's mip layout rather than converting them, so a format
+        // mismatch would land decoded-as-garbage pixels; a managed or
+        // system-memory destination has its own upload path and never takes
+        // this one.
+        if tex.d3d_pool() != D3DPOOL_DEFAULT || tex.d3d_format() != src_fmt {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: destination pool/format mismatch → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        }
         let image = SourceImage {
             bytes: src_bytes,
             pitch: src_pitch,
@@ -5271,9 +5284,6 @@ extern "system" fn device_update_surface(
             height: src_h,
         };
         let copied = if let Some(face) = dst_surf.cube_face() {
-            if tex.d3d_pool() != D3DPOOL_DEFAULT || tex.d3d_format() != src_fmt {
-                return D3DERR_INVALIDCALL;
-            }
             tex.inner_mut()
                 .copy_bytes_to_cube_staging_region(face, dst_level, &image, rect, point)
         } else {
