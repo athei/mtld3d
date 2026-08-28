@@ -8,6 +8,12 @@ pub const D3DSDK_VERSION: u32 = 32;
 /// `D3DCREATE_HARDWARE_VERTEXPROCESSING` — `CreateDevice` behaviour flag.
 pub const D3DCREATE_HARDWARE_VERTEXPROCESSING: u32 = 0x40;
 
+/// `CreateDevice` behaviour flag `D3DCREATE_NOWINDOWCHANGES`.
+///
+/// The app manages the device window itself, so the device leaves its style,
+/// rect and visibility alone.
+pub const D3DCREATE_NOWINDOWCHANGES: u32 = 0x800;
+
 /// `D3DSWAPEFFECT_DISCARD` — `D3DPRESENT_PARAMETERS::SwapEffect`.
 pub const D3DSWAPEFFECT_DISCARD: u32 = 1;
 

@@ -35,6 +35,13 @@
 //! `NtUserSetWindowPos` on another thread and both stall. See
 //! `apply_fullscreen_window`.
 //!
+//! A device created with `D3DCREATE_NOWINDOWCHANGES` opts out of all of it.
+//! The flag hands window management to the app, so the device leaves the
+//! window's style, rect and visibility exactly as it found them, in
+//! fullscreen as in windowed mode, and never re-covers the monitor behind
+//! the app's back. The back buffer still honours the requested mode, and the
+//! display-mode restore still runs: neither is a window change.
+//!
 //! Only the primary display is driven, so a device whose window lives on a
 //! secondary monitor is covered by the wrong rect. Matching the window's
 //! current monitor is a follow-up.
@@ -441,6 +448,8 @@ pub struct SavedWindow {
     rect: Rect,
     /// Ping-pong guard for [`reassert_cover`], one per fullscreen session.
     guard: mtld3d_core::fullscreen_resize::ExternalResizeGuard,
+    /// `false` under `D3DCREATE_NOWINDOWCHANGES`: the window is the app's.
+    manage_window: bool,
 }
 
 impl SavedWindow {
@@ -450,20 +459,44 @@ impl SavedWindow {
     }
 }
 
+/// `true` when the app asked the device to keep its hands off the window.
+///
+/// `D3DCREATE_NOWINDOWCHANGES` makes window management the app's job, so a
+/// fullscreen device neither styles, moves, shows nor hides the window it
+/// presents into, and never re-covers the monitor behind the app's back. The
+/// note is logged once because a fullscreen device whose window stays small
+/// and decorated looks like a defect from the outside.
+fn window_changes_suppressed(saved: &SavedWindow) -> bool {
+    if saved.manage_window {
+        return false;
+    }
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "D3DCREATE_NOWINDOWCHANGES: the device window keeps its style, rect and visibility",
+    );
+    true
+}
+
 /// Take `hwnd` fullscreen: no decoration, covering the monitor.
 ///
 /// The window's pre-fullscreen style and rect are captured first so [`leave`]
 /// can put it back. The display mode is deliberately untouched, and so is the
-/// z-order; see the module docs.
-pub fn enter(hwnd: *mut c_void) -> SavedWindow {
+/// z-order; see the module docs. With `manage_window` false
+/// (`D3DCREATE_NOWINDOWCHANGES`) nothing is applied at all: the state is
+/// captured, the window is left to the app, and every later transition is a
+/// no-op.
+pub fn enter(hwnd: *mut c_void, manage_window: bool) -> SavedWindow {
     let saved = SavedWindow {
         hwnd,
         style: window_long(hwnd, GWL_STYLE),
         exstyle: window_long(hwnd, GWL_EXSTYLE),
         rect: window_rect(hwnd).unwrap_or(Rect::EMPTY),
         guard: mtld3d_core::fullscreen_resize::ExternalResizeGuard::new(),
+        manage_window,
     };
-    apply_fullscreen_window(hwnd, &saved);
+    if !window_changes_suppressed(&saved) {
+        apply_fullscreen_window(hwnd, &saved);
+    }
     saved
 }
 
@@ -474,6 +507,9 @@ pub fn enter(hwnd: *mut c_void) -> SavedWindow {
 /// *pre-fullscreen* window when the device finally leaves. The re-assert
 /// guard refills: a game-driven Reset is a fresh session.
 pub fn update(saved: &mut SavedWindow) {
+    if window_changes_suppressed(saved) {
+        return;
+    }
     saved.guard.reset();
     apply_fullscreen_window(saved.hwnd, saved);
 }
@@ -490,6 +526,9 @@ pub fn update(saved: &mut SavedWindow) {
 pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
     use mtld3d_core::fullscreen_resize::ExternalResizeAction;
 
+    if window_changes_suppressed(saved) {
+        return;
+    }
     let Some(rect) = primary_monitor_rect() else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -576,6 +615,9 @@ pub fn leave(saved: &SavedWindow) {
     // registry display mode back first, matching native D3D9's order (mode
     // restore, then window restore). No-op when nothing changed the mode.
     restore_registry_mode();
+    if window_changes_suppressed(saved) {
+        return;
+    }
     let _driving = DrivingGuard::new();
     let hwnd = saved.hwnd;
     if !is_window(hwnd) {

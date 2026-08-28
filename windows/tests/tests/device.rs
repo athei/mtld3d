@@ -3,10 +3,13 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
-use mtld3d_tests::{Harness, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq};
+use mtld3d_tests::{
+    Harness, HarnessConfig, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq,
+};
 use mtld3d_types::{
-    D3D_OK, D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
-    D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
+    D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
+    D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
     D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F,
     D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
     D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
@@ -753,6 +756,68 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
         h.window_style() & !WS_VISIBLE,
         windowed_style & !WS_VISIBLE,
         "leaving fullscreen restores the window style",
+    );
+}
+
+/// `D3DCREATE_NOWINDOWCHANGES` hands window management to the app.
+///
+/// A fullscreen Reset must then leave the device window's style, rect and
+/// visibility exactly as the app left them, and the windowed Reset back must
+/// not show a window the app kept hidden.
+#[test]
+fn nowindowchanges_leaves_the_device_window_alone() {
+    let h = Harness::create(&HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES,
+        ..HarnessConfig::default()
+    });
+    let windowed_rect = h.window_rect();
+    let windowed_style = h.window_style();
+    let windowed_exstyle = h.window_exstyle();
+    assert_eq!(
+        windowed_style & WS_VISIBLE,
+        0,
+        "the harness window starts hidden, which is what this test turns on",
+    );
+
+    let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+
+    assert_eq!(
+        h.window_rect(),
+        windowed_rect,
+        "NOWINDOWCHANGES: a fullscreen Reset must not move the device window",
+    );
+    assert_eq!(
+        h.window_style(),
+        windowed_style,
+        "NOWINDOWCHANGES: a fullscreen Reset must not restyle or show the device window",
+    );
+    assert_eq!(
+        h.window_exstyle(),
+        windowed_exstyle,
+        "NOWINDOWCHANGES: a fullscreen Reset must not touch the extended style",
+    );
+
+    // The back buffer still follows the D3D9 contract: the window is the
+    // app's, the mode is ours.
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
+    assert_eq!(
+        (bb.width, bb.height),
+        (640, 480),
+        "back buffer keeps the requested mode even when the window is untouched",
+    );
+
+    assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+    assert_eq!(
+        h.window_style(),
+        windowed_style,
+        "NOWINDOWCHANGES: leaving fullscreen must not show a window the app kept hidden",
+    );
+    assert_eq!(
+        h.window_rect(),
+        windowed_rect,
+        "NOWINDOWCHANGES: leaving fullscreen must not move the device window",
     );
 }
 

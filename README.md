@@ -182,7 +182,12 @@ memory headroom and no tested game depends on them:
   their window and keep sizing their rendering and input from it.
 - **The fullscreen focus lifecycle**: no device loss on deactivation, no
   focus-window subclassing, no synthesized activation messages. Presentation is
-  a composited Metal layer, so a lost display is never a lost device.
+  a composited Metal layer and no exclusive mode is ever taken, so a lost
+  display is never a lost device: `TestCooperativeLevel` reports `D3D_OK`
+  across a focus change and only ever reports `D3DERR_DEVICENOTRESET`, which is
+  real, after a failed `Reset`. Reporting a loss that did not happen would make
+  every fullscreen game release and rebuild its whole `D3DPOOL_DEFAULT` working
+  set on each activation change, for a device that lost nothing.
 - **Software paths**: no reference or software rasterizer, no software vertex
   processing, no RegisterSoftwareDevice. HAL on the default Metal device is the
   only device type; multi-adapter setups are not enumerated. ProcessVertices

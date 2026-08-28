@@ -57,7 +57,6 @@
   device.c:4871 count=1
   device.c:5041 count=1
   device.c:5051 count=1
-  device.c:5215 count=1
   device.c:5220 count=1
   device.c:5509 count=1
   device.c:5533 count=1
@@ -179,7 +178,6 @@
   device.c:4778 count=1
   device.c:4785 count=1
   device.c:4871 count=1
-  device.c:5215 count=1
   device.c:5220 count=1
   device.c:5509 count=1
   device.c:5533 count=1

@@ -2134,8 +2134,18 @@ impl DeviceInner {
     /// No display mode is set and the z-order is left alone. The window
     /// covering the monitor is what makes the image fill the screen; the back
     /// buffer keeps the resolution the game asked for and present scales it.
+    /// A device created with `D3DCREATE_NOWINDOWCHANGES` leaves the window
+    /// untouched instead, which is what the flag asks for.
     pub fn enter_fullscreen(&mut self, hwnd: *mut c_void) {
-        self.fullscreen = Some(crate::fullscreen::enter(hwnd));
+        self.fullscreen = Some(crate::fullscreen::enter(hwnd, self.manages_window()));
+    }
+
+    /// `true` unless the app took window management over itself.
+    ///
+    /// `D3DCREATE_NOWINDOWCHANGES` is the app saying it owns the device
+    /// window's style, rect and visibility.
+    pub const fn manages_window(&self) -> bool {
+        self.creation_behavior_flags & mtld3d_types::D3DCREATE_NOWINDOWCHANGES == 0
     }
 
     /// Re-apply the window rect for a device that stays fullscreen across a `Reset`.
