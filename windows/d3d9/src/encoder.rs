@@ -7401,9 +7401,9 @@ impl FrameEncoder {
             // position reconstruction wants anyway. Comparison samplers stay
             // as configured: linear there is hardware PCF, which Apple GPUs
             // do support.
-            snapshot.min_filter = 1; // D3DTEXF_POINT
-            snapshot.mag_filter = 1;
-            snapshot.mip_filter = 0; // D3DTEXF_NONE
+            snapshot.min_filter = mtld3d_types::D3DTEXF_POINT;
+            snapshot.mag_filter = mtld3d_types::D3DTEXF_POINT;
+            snapshot.mip_filter = mtld3d_types::D3DTEXF_NONE;
             snapshot.max_anisotropy = 1;
         }
         let key = sampler_state::key_from_snapshot(&snapshot);

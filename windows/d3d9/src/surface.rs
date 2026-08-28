@@ -9,8 +9,8 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3DFMT_A1R5G5B5, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5,
     D3DFMT_X8R8G8B8, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DRECT, D3DSURFACE_DESC, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET, Guid, IDirect3DSurface9Vtbl,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DRECT, D3DRTYPE_SURFACE, D3DSURFACE_DESC,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET, Guid, IDirect3DSurface9Vtbl,
     IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IUNKNOWN,
 };
 
@@ -1981,7 +1981,7 @@ extern "system" fn surface_pre_load(this: *mut c_void) {
 extern "system" fn surface_get_type(this: *mut c_void) -> u32 {
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetType()");
-    1 // D3DRTYPE_SURFACE
+    D3DRTYPE_SURFACE
 }
 
 // ── IDirect3DSurface9 ──
@@ -2095,7 +2095,7 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
         // Implicit surfaces resolve format + dims live from the device (see
         // `ImplicitKind`); ordinary standalone surfaces read their snapshot.
         out.format = inner.live_format();
-        out.resource_type = 1; // D3DRTYPE_SURFACE
+        out.resource_type = D3DRTYPE_SURFACE;
         out.usage = inner.standalone_usage;
         // A standalone surface reports its creation pool: RT / depth-stencil /
         // backbuffer / lockable-RT are `D3DPOOL_DEFAULT`; a system-memory
@@ -2117,7 +2117,7 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
     let level = inner.mip_level as usize;
 
     out.format = tex.d3d_format();
-    out.resource_type = 1; // D3DRTYPE_SURFACE
+    out.resource_type = D3DRTYPE_SURFACE;
     // A texture-level surface reports its parent texture's usage and pool, not
     // 0/0 — SetRenderTarget / SetDepthStencilSurface gate on them.
     out.usage = tex.d3d_usage();
