@@ -33,7 +33,7 @@ pub fn create_backbuffer(
     queue_handle: MetalHandle<MTLCommandQueueKind>,
     width: u32,
     height: u32,
-) -> Option<MetalHandle<MTLTextureKind>> {
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
     // Metal raises an NSException (→ abort) for a zero or over-large texture
     // dimension. Reject such a request so a degenerate backbuffer size — e.g.
     // resolved from the off-screen monitor geometry the conformance suite
@@ -61,9 +61,67 @@ pub fn create_backbuffer(
     let label = objc2_foundation::NSString::from_str("mtld3d-backbuffer");
     texture.setLabel(Some(&label));
     clear_texture_black(queue_handle, &texture);
+    let srgb_handle = srgb_twin_view(
+        &texture,
+        PixelFormat::Bgra8Unorm,
+        1,
+        1,
+        IDENTITY_SWIZZLE,
+        "mtld3d-backbuffer",
+    );
     // SAFETY: `Retained::into_raw` transfers the retain into a raw
     // pointer; `MetalHandle::new` adopts it as the canonical retain.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        srgb_handle,
+    ))
+}
+
+/// The channel order a view leaves untouched.
+const IDENTITY_SWIZZLE: MTLTextureSwizzleChannels = MTLTextureSwizzleChannels {
+    red: objc2_metal::MTLTextureSwizzle::Red,
+    green: objc2_metal::MTLTextureSwizzle::Green,
+    blue: objc2_metal::MTLTextureSwizzle::Blue,
+    alpha: objc2_metal::MTLTextureSwizzle::Alpha,
+};
+
+/// The sRGB twin view of a colour texture, or 0 when the format has no twin.
+///
+/// Metal exempts a view that differs from its base only in transfer function
+/// from the `PixelFormatView` usage requirement, so the twin costs neither an
+/// extra usage flag nor the texture's lossless compression, and it inherits
+/// the base's usage, which keeps a render target's twin render-targetable.
+/// `swizzle` mirrors whichever channel order the base handle is handed out
+/// with, so the two views differ only in transfer function; a render target
+/// is always handed out unswizzled, since Metal forbids rendering through a
+/// channel swizzle.
+fn srgb_twin_view(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    levels: usize,
+    slices: usize,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> u64 {
+    let Some(srgb_format) = format.srgb_twin() else {
+        return 0;
+    };
+    // SAFETY: objc2 typed binding; `texture` is live and the ranges match
+    // the descriptor it was created with.
+    let view = unsafe {
+        texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+            mtl_pixel_format(srgb_format),
+            texture.textureType(),
+            objc2_foundation::NSRange::new(0, levels),
+            objc2_foundation::NSRange::new(0, slices),
+            swizzle,
+        )
+    };
+    view.map_or(0, |view| {
+        let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
+        view.setLabel(Some(&srgb_label));
+        Retained::into_raw(view) as u64
+    })
 }
 
 /// Clear a freshly created render target to opaque black.
@@ -163,16 +221,30 @@ pub fn create_color_target(
     width: u32,
     height: u32,
     pixel_format: PixelFormat,
-) -> Option<MetalHandle<MTLTextureKind>> {
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
     let device = device_handle.into_retained()?;
-    create_color_texture(
+    let texture = create_color_texture(
         &device,
         width,
         height,
         mtl_pixel_format(pixel_format),
         None,
         "mtld3d-color-target",
-    )
+    )?;
+    let srgb_handle = srgb_twin_view(
+        &texture,
+        pixel_format,
+        1,
+        1,
+        IDENTITY_SWIZZLE,
+        "mtld3d-color-target",
+    );
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        srgb_handle,
+    ))
 }
 
 /// Creates the `Private` colour texture a `MetalFX` upscale reads or writes.
@@ -193,20 +265,25 @@ pub fn create_upscale_target(
     height: u32,
     pixel_format: PixelFormat,
 ) -> Option<MetalHandle<MTLTextureKind>> {
-    create_color_texture(
+    let texture = create_color_texture(
         device,
         width,
         height,
         mtl_pixel_format(pixel_format),
         Some(MTLStorageMode::Private),
         "mtld3d-upscale-scratch",
-    )
+    )?;
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
 }
 
 /// Shared body of the colour-texture creators.
 ///
 /// `storage_mode` of `None` leaves the descriptor's default, which is what the
-/// D3D9-facing render targets have always used.
+/// D3D9-facing render targets have always used. Hands back the retained
+/// texture rather than a handle, so the caller can take an sRGB view of it
+/// before transferring the retain into the handle it returns.
 fn create_color_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
@@ -214,7 +291,7 @@ fn create_color_texture(
     mtl_format: objc2_metal::MTLPixelFormat,
     storage_mode: Option<MTLStorageMode>,
     label: &str,
-) -> Option<MetalHandle<MTLTextureKind>> {
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     // SAFETY: objc2 typed binding; class-method constructor on
     // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
     let desc = unsafe {
@@ -233,9 +310,7 @@ fn create_color_texture(
     let texture = device.newTextureWithDescriptor(&desc)?;
     let label = objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&label));
-    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
-    // adopts it as canonical.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
+    Some(texture)
 }
 
 /// Creates an `MTLDepthStencilState` object.
@@ -347,7 +422,9 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// the eagerly-created sRGB twin view when the format has one
 /// (`PixelFormat::srgb_twin`), else 0. The draw-time bind picks the twin
 /// when the stage's sampler has `D3DSAMP_SRGBTEXTURE=1`, giving the
-/// hardware sRGB→linear decode D3D9 promises for that state.
+/// hardware sRGB→linear decode D3D9 promises for that state, and the render
+/// pass attaches it in place of the base texture under
+/// `D3DRS_SRGBWRITEENABLE`, giving the post-blend encode.
 pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
@@ -442,14 +519,16 @@ pub fn create_texture(
     // neither an extra usage flag nor the texture's lossless compression.
     // The twin mirrors the base handle's swizzle (when the base is handed out
     // as a swizzle view below) so the two views only ever differ in transfer
-    // function; it is sampled only, never bound as an attachment, so the
-    // render-target swizzle restriction doesn't apply to it.
+    // function. A render target never takes the swizzle branch, so the twin
+    // of one carries the identity swizzle and stays legal as a colour
+    // attachment; a view inherits its base texture's usage, so the twin of a
+    // render target is render-targetable too.
     let srgb_handle = if is_depth {
         0
-    } else if let Some(srgb_format) = desc.pixel_format.srgb_twin() {
+    } else {
         let base_is_swizzle_view =
             !is_render_target && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
-        let swizzle_channels = if base_is_swizzle_view {
+        let swizzle = if base_is_swizzle_view {
             MTLTextureSwizzleChannels {
                 red: mtl_texture_swizzle(desc.swizzle_r),
                 green: mtl_texture_swizzle(desc.swizzle_g),
@@ -457,38 +536,20 @@ pub fn create_texture(
                 alpha: mtl_texture_swizzle(desc.swizzle_a),
             }
         } else {
-            MTLTextureSwizzleChannels {
-                red: objc2_metal::MTLTextureSwizzle::Red,
-                green: objc2_metal::MTLTextureSwizzle::Green,
-                blue: objc2_metal::MTLTextureSwizzle::Blue,
-                alpha: objc2_metal::MTLTextureSwizzle::Alpha,
-            }
+            IDENTITY_SWIZZLE
         };
-        // SAFETY: objc2 typed binding; `texture` is the freshly retained
-        // texture above; levels/slices ranges match its descriptor.
-        let view = unsafe {
-            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
-                mtl_pixel_format(srgb_format),
-                texture.textureType(),
-                objc2_foundation::NSRange::new(0, desc.levels as usize),
-                objc2_foundation::NSRange::new(
-                    0,
-                    if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
-                        6
-                    } else {
-                        1
-                    },
-                ),
-                swizzle_channels,
-            )
-        };
-        view.map_or(0, |view| {
-            let srgb_label = objc2_foundation::NSString::from_str(&format!("{label_str}-srgb"));
-            view.setLabel(Some(&srgb_label));
-            Retained::into_raw(view) as u64
-        })
-    } else {
-        0
+        srgb_twin_view(
+            &texture,
+            desc.pixel_format,
+            desc.levels as usize,
+            if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+                6
+            } else {
+                1
+            },
+            swizzle,
+            &label_str,
+        )
     };
 
     // Swizzle views don't apply to depth formats — depth shaders sample

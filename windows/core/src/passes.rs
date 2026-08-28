@@ -18,6 +18,12 @@ use crate::{
 /// What a clear-only pass carries, and the attachments it must land on.
 struct ClearMerge {
     color: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view the clear-only pass writes its colour through, or null.
+    ///
+    /// A merge target must write through the same view: the clear value is
+    /// stored raw through the linear view and sRGB-encoded through the twin,
+    /// so moving the load action across the two changes the stored colour.
+    color_srgb: MetalHandle<MTLTextureKind>,
     color_subresource: u32,
     /// Render targets 1..3 as `(texture, subresource)`; a null texture is an unbound slot.
     ///
@@ -335,6 +341,12 @@ impl ExtraColorSlot {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PassColorAttachment {
     texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `texture`, bound in its place under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Null when the pass writes linear. Only the render-pass descriptor
+    /// uses it: every identity question (seen sets, load/store rules) is
+    /// asked with `texture`, since the two views share one Metal texture.
+    srgb_texture: MetalHandle<MTLTextureKind>,
     subresource: u32,
     size: (u32, u32),
     format: PixelFormat,
@@ -346,6 +358,7 @@ impl PassColorAttachment {
     /// The unbound attachment.
     pub const NONE: Self = Self {
         texture: MetalHandle::NULL,
+        srgb_texture: MetalHandle::NULL,
         subresource: 0,
         size: (0, 0),
         format: PixelFormat::Bgra8Unorm,
@@ -360,6 +373,15 @@ impl PassColorAttachment {
     #[must_use]
     pub const fn texture(&self) -> MetalHandle<MTLTextureKind> {
         self.texture
+    }
+    /// The view the render pass binds: the sRGB twin, or the base texture.
+    #[must_use]
+    pub const fn attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.srgb_texture.is_null() {
+            self.texture
+        } else {
+            self.srgb_texture
+        }
     }
     #[must_use]
     pub const fn slice(&self) -> u32 {
@@ -485,6 +507,12 @@ impl SavedColorAttachments {
 /// mid-frame Clear, depth change) end the current pass and open a new one.
 pub struct Pass {
     color_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `color_texture`, bound in its place under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Null when the pass writes linear. See
+    /// [`PassColorAttachment::srgb_texture`] for why identity stays on the
+    /// base handle.
+    color_srgb_texture: MetalHandle<MTLTextureKind>,
     color_subresource: u32,
     color_size: (u32, u32),
     color_format: PixelFormat,
@@ -573,6 +601,17 @@ impl Pass {
     #[must_use]
     pub const fn color_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.color_texture
+    }
+    /// The view the render pass binds for colour attachment 0.
+    ///
+    /// The sRGB twin when the pass encodes on write, else the base texture.
+    #[must_use]
+    pub const fn color_attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.color_srgb_texture.is_null() {
+            self.color_texture
+        } else {
+            self.color_srgb_texture
+        }
     }
     /// Render targets 1..3 of this pass, unbound entries included.
     #[must_use]
@@ -825,6 +864,13 @@ bitflags::bitflags! {
 /// [`PassState::reset_frame`]).
 pub struct FrameReset {
     pub backbuffer: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer`, or null when there is none.
+    ///
+    /// Registered as the back buffer's twin every frame, so a
+    /// `D3DRS_SRGBWRITEENABLE` draw straight onto the swap chain attaches it
+    /// and Metal encodes after the blender. Re-supplied per frame because
+    /// `Reset` and an auto-resize replace the pair together.
+    pub backbuffer_srgb: MetalHandle<MTLTextureKind>,
     /// Logical back-buffer size, the resolution D3D9 reports.
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
@@ -1042,6 +1088,36 @@ pub struct PassState {
     /// map for its command scans. Maintained by the encoder's texture
     /// create / rename / destroy paths.
     srgb_twin_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    /// base texture → sRGB twin view, the inverse of `srgb_twin_to_base`.
+    ///
+    /// Read when a colour attachment is bound, to answer "does this render
+    /// target have an sRGB view the pass can attach in its place". Kept by
+    /// the same register / unregister pair.
+    srgb_base_to_twin: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    /// `D3DRS_SRGBWRITEENABLE` as the last draw or `Clear` saw it.
+    ///
+    /// The render state alone; whether it can be honoured by the attachment
+    /// is `pass_srgb_write`.
+    srgb_write_enabled: bool,
+    /// Whether the next pass binds sRGB twin views of its colour attachments.
+    ///
+    /// True when `srgb_write_enabled` is set and every colour target the
+    /// pass attaches has a twin. Metal then converts linear → sRGB *after*
+    /// the blender, which is the D3D9 order the
+    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises. False leaves the
+    /// encode to the pixel shader's OETF variant, which runs before the
+    /// blender and is exact only for opaque draws.
+    ///
+    /// A change ends the current pass: the view is an attachment property,
+    /// so draws on either side of the toggle cannot share one encoder.
+    pass_srgb_write: bool,
+    /// sRGB twin of the bound colour render target, null when it has none.
+    ///
+    /// Resolved through `srgb_base_to_twin` on every bind, so the per-draw
+    /// path reads a field instead of probing the map.
+    current_color_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twins of render targets 1..3, in slot order; null where absent.
+    current_extra_srgb: [MetalHandle<MTLTextureKind>; 3],
     /// Live texture handles that were bound as a sampleable depth attachment.
     ///
     /// The bind runs via `set_depth_stencil_attachment(_,
@@ -1158,6 +1234,11 @@ impl PassState {
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
             srgb_twin_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            srgb_base_to_twin: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            srgb_write_enabled: false,
+            pass_srgb_write: false,
+            current_color_srgb_texture: MetalHandle::NULL,
+            current_extra_srgb: [MetalHandle::NULL; 3],
             seen_sampleable_depth_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_caster_writes: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             frame_cascade_samples: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
@@ -1192,6 +1273,7 @@ impl PassState {
     pub fn reset_frame(&mut self, reset: &FrameReset) {
         let &FrameReset {
             backbuffer,
+            backbuffer_srgb,
             backbuffer_size,
             backbuffer_format,
             depth_texture,
@@ -1237,6 +1319,18 @@ impl PassState {
         self.current_extra_color = [ExtraColorSlot::NONE; 3];
         self.current_extra_present_mask = 0;
         self.current_extra_attachments = ExtraColorAttachments::NONE;
+        // Re-register the back buffer's sRGB twin every frame. `Reset` and an
+        // auto-resize replace the pair together and destroy the old view with
+        // the old texture, so a registration naming the retired one must not
+        // survive the swap.
+        if self.backbuffer_texture != backbuffer {
+            let stale = self.twin_of(self.backbuffer_texture);
+            self.drop_srgb_twin(stale);
+        }
+        self.store_srgb_twin(backbuffer_srgb, backbuffer);
+        // The frame's colour binding changed wholesale; re-resolve the sRGB
+        // views the fresh binding implies.
+        self.recompute_srgb_write();
         // The backbuffer is an alpha-bearing (`Bgra8Unorm` / A8R8G8B8) target,
         // so destination-alpha blend factors resolve unclamped — byte-identical
         // to the pre-`COLOR_HAS_ALPHA` behaviour. A sub-frame `SetRenderTarget`
@@ -1446,9 +1540,15 @@ impl PassState {
         self.seen_sampleable_depth_textures.remove(&texture);
     }
 
+    /// Metal pixel format the next pass binds for colour attachment 0.
+    ///
+    /// The sRGB twin of the render target's format while
+    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment view, so
+    /// the render pipeline the draw path builds declares the format the
+    /// pass actually attaches.
     #[must_use]
     pub const fn current_color_format(&self) -> PixelFormat {
-        self.current_color_format
+        self.color_attachment_format()
     }
 
     /// Set whether the currently bound colour RT's D3D format has a real alpha channel.
@@ -1630,6 +1730,9 @@ impl PassState {
             present_mask: mask,
             has_alpha_mask: has_alpha_mask & mask,
         };
+        // The extras decide whether the whole attachment set can carry the
+        // sRGB views, and the formats keyed above follow that choice.
+        self.recompute_srgb_write();
     }
 
     /// Record that a colour texture is read back this session.
@@ -1661,16 +1764,159 @@ impl PassState {
         twin: MetalHandle<MTLTextureKind>,
         base: MetalHandle<MTLTextureKind>,
     ) {
-        if !twin.is_null() && !base.is_null() {
-            self.srgb_twin_to_base.insert(twin, base);
+        if self.store_srgb_twin(twin, base) {
+            self.apply_srgb_write_change();
         }
     }
 
     /// Drop a twin registration when its texture is destroyed or renamed.
     pub fn unregister_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) {
-        if !twin.is_null() {
-            self.srgb_twin_to_base.remove(&twin);
+        if self.drop_srgb_twin(twin) {
+            self.apply_srgb_write_change();
         }
+    }
+
+    /// Record a base → twin pair in both directions; `true` when it landed.
+    ///
+    /// Split from [`Self::register_srgb_twin`] so `reset_frame`, which
+    /// re-registers the back buffer's pair every frame, can update the maps
+    /// without the pass-boundary check it is in the middle of redoing anyway.
+    fn store_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        if twin.is_null() || base.is_null() {
+            return false;
+        }
+        self.srgb_twin_to_base.insert(twin, base);
+        self.srgb_base_to_twin.insert(base, twin);
+        true
+    }
+
+    /// Forget a base → twin pair; `true` when one was registered.
+    fn drop_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) -> bool {
+        if twin.is_null() {
+            return false;
+        }
+        let Some(base) = self.srgb_twin_to_base.remove(&twin) else {
+            return false;
+        };
+        self.srgb_base_to_twin.remove(&base);
+        true
+    }
+
+    /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.
+    ///
+    /// Ends the current pass when the attachment view this implies changes,
+    /// materialising any pending `Clear` on the outgoing view first: the
+    /// twin is chosen when the pass opens and one encoder cannot carry both.
+    pub fn set_srgb_write_enabled(&mut self, enabled: bool) {
+        if self.srgb_write_enabled == enabled {
+            return;
+        }
+        self.srgb_write_enabled = enabled;
+        self.apply_srgb_write_change();
+    }
+
+    /// Re-resolve the sRGB views, ending the current pass if the choice changed.
+    ///
+    /// A pass freezes its attachment views at open, so a change has to close
+    /// it. The close happens BEFORE the new choice is stored: a pending
+    /// `Clear` has to materialise on the outgoing views, or its colour goes
+    /// through the wrong transfer function.
+    fn apply_srgb_write_change(&mut self) {
+        if self.pass_srgb_write != (self.srgb_write_enabled && self.srgb_write_is_attachable()) {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("srgb_write");
+        }
+        self.recompute_srgb_write();
+    }
+
+    /// Whether the next pass binds sRGB twin views of its colour attachments.
+    ///
+    /// Read per draw to decide between the hardware post-blend encode and
+    /// the pixel shader's OETF variant, and per `Clear` to decide whether
+    /// the clear colour is encoded on the way in.
+    #[must_use]
+    pub const fn pass_srgb_write(&self) -> bool {
+        self.pass_srgb_write
+    }
+
+    /// Re-resolve the colour attachments' twins and whether the pass uses them.
+    ///
+    /// Split from [`Self::apply_srgb_write_change`] so a caller that has
+    /// already ended the pass (every attachment rebind) pays no second
+    /// check.
+    fn recompute_srgb_write(&mut self) {
+        self.current_color_srgb_texture = self.twin_of(self.current_color_texture);
+        for i in 0..3 {
+            self.current_extra_srgb[i] = self.twin_of(self.current_extra_color[i].texture);
+        }
+        self.pass_srgb_write = self.srgb_write_enabled && self.srgb_write_is_attachable();
+        if self.srgb_write_enabled && !self.pass_srgb_write && !self.current_color_texture.is_null()
+        {
+            mtld3d_shared::log_once_info_by!(
+                target: crate::LOG_TARGET,
+                key: self.current_color_texture.raw(),
+                "colour target {:#x} has no sRGB Metal view: D3DRS_SRGBWRITEENABLE encodes in the pixel shader, before the blender",
+                self.current_color_texture,
+            );
+        }
+        // The extras' keyed formats follow the chosen views.
+        self.current_extra_attachments.formats =
+            core::array::from_fn(|i| self.extra_attachment_format(i));
+    }
+
+    /// The registered sRGB twin view of `base`, or null when it has none.
+    fn twin_of(&self, base: MetalHandle<MTLTextureKind>) -> MetalHandle<MTLTextureKind> {
+        self.srgb_base_to_twin
+            .get(&base)
+            .copied()
+            .unwrap_or(MetalHandle::NULL)
+    }
+
+    /// Whether every colour target the next pass attaches has an sRGB twin.
+    ///
+    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment only then:
+    /// one render pass has one set of views, so a target without a twin
+    /// would have to be written linear while its neighbours encode. The
+    /// all-or-nothing rule keeps a mixed set on the shader path.
+    fn srgb_write_is_attachable(&self) -> bool {
+        !self.current_color_texture.is_null()
+            && !self.twin_of(self.current_color_texture).is_null()
+            && (0..3).all(|i| {
+                self.current_extra_present_mask & (1 << i) == 0
+                    || !self.twin_of(self.current_extra_color[i].texture).is_null()
+            })
+    }
+
+    /// Metal pixel format of the view bound for colour attachment 0.
+    ///
+    /// The sRGB twin's format while the pass encodes on write. The render
+    /// pipeline and every clear-quad pipeline must declare exactly this, or
+    /// Metal rejects them against the pass.
+    const fn color_attachment_format(&self) -> PixelFormat {
+        if self.pass_srgb_write
+            && let Some(twin) = self.current_color_format.srgb_twin()
+        {
+            return twin;
+        }
+        self.current_color_format
+    }
+
+    /// [`Self::color_attachment_format`] for render target `index + 1`.
+    const fn extra_attachment_format(&self, index: usize) -> PixelFormat {
+        let format = self.current_extra_color[index].format;
+        if self.pass_srgb_write
+            && self.current_extra_present_mask & (1 << index) != 0
+            && let Some(twin) = format.srgb_twin()
+        {
+            return twin;
+        }
+        format
     }
 
     /// True when `handle` was bound as a fragment sampler input by an earlier draw this frame.
@@ -2045,9 +2291,14 @@ impl PassState {
             }
             PassColorAttachment {
                 texture: slot.texture,
+                srgb_texture: if self.pass_srgb_write {
+                    self.current_extra_srgb[i]
+                } else {
+                    MetalHandle::NULL
+                },
                 subresource: slot.subresource,
                 size: slot.size,
-                format: slot.format,
+                format: self.extra_attachment_format(i),
                 load: color_load_for(slot.texture, slot.subresource),
                 store: StoreAction::Store,
             }
@@ -2104,9 +2355,14 @@ impl PassState {
             .unwrap_or_else(|| Vec::with_capacity(64));
         let mut pass = Pass {
             color_texture: self.current_color_texture,
+            color_srgb_texture: if self.pass_srgb_write {
+                self.current_color_srgb_texture
+            } else {
+                MetalHandle::NULL
+            },
             color_subresource: self.current_color_subresource,
             color_size: self.current_color_size,
-            color_format: self.current_color_format,
+            color_format: self.color_attachment_format(),
             color_load,
             color_store: StoreAction::Store,
             depth_texture: self.current_depth_texture,
@@ -2150,10 +2406,11 @@ impl PassState {
             let idx = self.passes.len() - 1;
             trace!(
                 target: TRACE_TARGET,
-                "pass-open  idx={idx} color={:#x} depth={:#x} \
+                "pass-open  idx={idx} color={:#x} srgb={:#x} depth={:#x} \
                  size={}x{} color_load={:?} depth_load={:?} viewport={vpx},{vpy}+{vpw}x{vph} \
                  extra={:#x}",
                 self.current_color_texture,
+                self.passes[idx].color_srgb_texture,
                 self.current_depth_texture,
                 self.current_color_size.0,
                 self.current_color_size.1,
@@ -2306,6 +2563,8 @@ impl PassState {
             self.current_color_format = format;
             if self.has_extra_color_targets() {
                 self.recompute_extra_present_mask();
+            } else {
+                self.recompute_srgb_write();
             }
             return;
         }
@@ -2327,6 +2586,8 @@ impl PassState {
         self.current_color_format = format;
         if self.has_extra_color_targets() {
             self.recompute_extra_present_mask();
+        } else {
+            self.recompute_srgb_write();
         }
     }
 
@@ -2448,7 +2709,7 @@ impl PassState {
                 return ColorClearOutcome::EmitQuad {
                     rgba: (r, g, b, a),
                     viewport: vp,
-                    color_format: self.current_color_format,
+                    color_format: self.color_attachment_format(),
                 };
             }
         }
@@ -2490,7 +2751,7 @@ impl PassState {
             return ColorClearOutcome::EmitQuad {
                 rgba: (r, g, b, a),
                 viewport: vp,
-                color_format: self.current_color_format,
+                color_format: self.color_attachment_format(),
             };
         }
         if !self.current_pass_closed
@@ -2575,7 +2836,7 @@ impl PassState {
                 }
             }
         }
-        self.current_color_format
+        self.color_attachment_format()
     }
 
     /// Open (or reuse) the pass for a depth/stencil `Clear` with explicit `pRects` sub-regions.
@@ -2621,7 +2882,7 @@ impl PassState {
         }
         Some((
             !self.current_color_texture.is_null(),
-            self.current_color_format,
+            self.color_attachment_format(),
         ))
     }
 
@@ -2705,7 +2966,7 @@ impl PassState {
             value,
             viewport: vp,
             has_color: !self.current_color_texture.is_null(),
-            color_format: self.current_color_format,
+            color_format: self.color_attachment_format(),
         })
     }
 
@@ -2760,7 +3021,7 @@ impl PassState {
             value,
             viewport: vp,
             has_color: !self.current_color_texture.is_null(),
-            color_format: self.current_color_format,
+            color_format: self.color_attachment_format(),
         })
     }
 
@@ -2795,7 +3056,7 @@ impl PassState {
             value,
             viewport: vp,
             has_color: !self.current_color_texture.is_null(),
-            color_format: self.current_color_format,
+            color_format: self.color_attachment_format(),
         })
     }
 
@@ -2869,7 +3130,7 @@ impl PassState {
             value,
             viewport: vp,
             has_color: !self.current_color_texture.is_null(),
-            color_format: self.current_color_format,
+            color_format: self.color_attachment_format(),
         })
     }
 
@@ -3428,6 +3689,7 @@ impl PassState {
                 continue;
             }
             let target_color = p.color_texture;
+            let target_color_srgb = p.color_srgb_texture;
             let target_color_subresource = p.color_subresource;
             let target_extra: [(MetalHandle<MTLTextureKind>, u32); 3] =
                 core::array::from_fn(|k| (p.extra_color[k].texture, p.extra_color[k].subresource));
@@ -3445,6 +3707,7 @@ impl PassState {
                 i,
                 &ClearMerge {
                     color: target_color,
+                    color_srgb: target_color_srgb,
                     color_subresource: target_color_subresource,
                     extra: target_extra,
                     depth: target_depth,
@@ -3494,6 +3757,7 @@ impl PassState {
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
+            color_srgb: target_color_srgb,
             color_subresource: target_color_subresource,
             extra: target_extra,
             depth: target_depth,
@@ -3586,6 +3850,7 @@ impl PassState {
             let color_ok = !needs_color
                 || (same_set
                     && cand.color_texture == target_color
+                    && cand.color_srgb_texture == target_color_srgb
                     && cand.color_subresource == target_color_subresource
                     && matches!(cand.color_load, ColorLoad::Load));
             let depth_ok = !needs_depth

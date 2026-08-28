@@ -135,6 +135,7 @@ impl Direct3DSurface9 {
     pub fn new_color_target(
         device_inner: *mut DeviceInner,
         metal_color_handle: MetalHandle<MTLTextureKind>,
+        metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
         width: u32,
         height: u32,
         format: u32,
@@ -152,6 +153,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle,
+            metal_color_srgb_handle,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
@@ -202,6 +204,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
@@ -244,6 +247,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
@@ -285,6 +289,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::empty(),
@@ -326,6 +331,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
@@ -374,6 +380,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::CONTAINER_CACHED,
@@ -416,6 +423,7 @@ impl Direct3DSurface9 {
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: None,
             flags: SurfaceFlags::OWNS_PARENT_TEXTURE,
@@ -460,6 +468,7 @@ impl Direct3DSurface9 {
             standalone_pool: pool,
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
+            metal_color_srgb_handle: MetalHandle::NULL,
             readback: None,
             system_memory: Some(backing),
             flags: SurfaceFlags::empty(),
@@ -717,6 +726,20 @@ impl Direct3DSurface9 {
         self.inner().live_color_handle()
     }
 
+    /// sRGB twin view of [`Self::metal_color_handle`], or null.
+    ///
+    /// The implicit back buffer answers with the device's current twin, which
+    /// `Reset` and an auto-resize replace along with the texture itself.
+    pub fn metal_color_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
+        let inner = self.inner();
+        if inner.implicit_kind == ImplicitKind::Backbuffer && !inner.device_inner.is_null() {
+            // SAFETY: `device_inner` is the live owning device; it outlives
+            // its child surfaces per D3D9 lifetime rules.
+            return unsafe { (*inner.device_inner).backbuffer_srgb_handle() };
+        }
+        inner.metal_color_srgb_handle
+    }
+
     /// Raw `(ptr, len)` of a system-memory offscreen surface's backing buffer.
     ///
     /// For use as a `BlitTextureToBuffer` destination. `None` for GPU-backed
@@ -839,6 +862,12 @@ struct SurfaceInner {
     /// `DeviceInner::backbuffer_handle` carries). Enables synchronous
     /// `LockRect` readback via texture→buffer blit.
     metal_color_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `metal_color_handle`, or null.
+    ///
+    /// Created with the colour texture and retired with it. The render pass
+    /// attaches it in place of the base under `D3DRS_SRGBWRITEENABLE`, which
+    /// puts the encode after the blender.
+    metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
     /// Page-aligned PE-addressable readback buffer held between `LockRect` and `UnlockRect`.
     ///
     /// Allocated on the `LockRect` readback path (backbuffer), dropped on
@@ -1218,6 +1247,21 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         !inner.flags.contains(SurfaceFlags::CONTAINER_CACHED),
         "container-cached sub-resource surface finalized outside its container's teardown"
     );
+    // A standalone colour target owns its Metal colour texture and the sRGB
+    // twin view taken of it. Both go on the encoder's seq-gated retention
+    // queue so a blit or pass this frame still referencing them finishes
+    // first, and the twin's registration goes with them.
+    if inner.parent_texture.is_null()
+        && !inner.metal_color_handle.is_null()
+        && !inner.device_inner.is_null()
+    {
+        let base = inner.metal_color_handle;
+        let srgb = inner.metal_color_srgb_handle;
+        // SAFETY: a standalone surface forwards a device reference for its
+        // public lifetime, so the device outlives this finalize.
+        unsafe { &mut *inner.device_inner }
+            .push_op(Box::new(move |enc| enc.retire_color_target(base, srgb)));
+    }
     // A cube face has nothing of the cube to give back here. The reference
     // `GetCubeMapSurface` took on it is dropped by the container forwarding in
     // `surface_release`, and the face's DC lives on the shared cube state, torn

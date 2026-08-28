@@ -30,11 +30,16 @@ fn backbuffer() -> MetalHandle<MTLTextureKind> {
 fn depth() -> MetalHandle<MTLTextureKind> {
     tex(0x2000)
 }
+/// The back buffer's sRGB twin view, as the device supplies it every frame.
+fn backbuffer_srgb() -> MetalHandle<MTLTextureKind> {
+    tex(0x1001)
+}
 
 fn fresh() -> PassState {
     let mut s = PassState::new();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -51,6 +56,7 @@ fn fresh_scaled() -> PassState {
     let mut s = PassState::new();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -173,6 +179,7 @@ fn frame_sampled_textures_clears_on_reset_frame() {
     assert!(s.texture_sampled_this_frame(atlas));
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -503,6 +510,7 @@ fn reset_frame_drops_pending_clears() {
     assert!(s.pending_color_clear().is_some());
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1143,6 +1151,7 @@ fn rule_a_reset_frame_re_arms_dontcare() {
     // seen set was reset.
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1238,6 +1247,7 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
     assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3325,6 +3335,7 @@ fn blit_written_set_resets_with_the_frame() {
     s.take_pending_leading_blits();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3432,6 +3443,7 @@ fn continuation_loads_targets_drawn_before_the_flush() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3463,6 +3475,7 @@ fn a_real_present_still_dontcares_first_use() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3496,6 +3509,7 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3677,6 +3691,7 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
     // bind of the stale handle no longer implicates the base.
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3688,4 +3703,234 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
     s.unregister_srgb_twin(twin);
     s.emit_command(Command::set_fragment_texture(twin.raw(), 0));
     assert!(!s.texture_sampled_this_frame(base));
+}
+
+/// `D3DRS_SRGBWRITEENABLE` attaches the render target's sRGB twin view.
+///
+/// The pass must carry the base handle for identity (the load/store rules
+/// and the seen sets reason about it) and the twin only as the attachment,
+/// with the pipeline format keyed on the sRGB variant so the render
+/// pipeline the draw path builds declares what the pass binds.
+#[test]
+fn srgb_write_attaches_the_twin_view_and_keys_the_srgb_format() {
+    let mut s = fresh();
+    let base = tex(0x7F10);
+    let twin = tex(0x7F11);
+    s.register_srgb_twin(twin, base);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), PixelFormat::Bgra8UnormSrgb);
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), base, "identity stays on the base");
+    assert_eq!(pass.color_attachment_texture(), twin);
+    assert_eq!(pass.color_format(), PixelFormat::Bgra8UnormSrgb);
+}
+
+/// Turning the state off mid-frame ends the pass and returns to the base view.
+///
+/// One render encoder has one set of attachment views, so draws on either
+/// side of the toggle cannot share a pass.
+#[test]
+fn srgb_write_toggle_breaks_the_pass() {
+    let mut s = fresh();
+    let base = tex(0x7F20);
+    let twin = tex(0x7F21);
+    s.register_srgb_twin(twin, base);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_srgb_write_enabled(true);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    s.set_srgb_write_enabled(false);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[0].color_attachment_texture(), twin);
+    assert_eq!(s.passes()[1].color_attachment_texture(), base);
+    assert_eq!(s.passes()[1].color_format(), RT_FORMAT);
+}
+
+/// A colour target with no sRGB view keeps the linear attachment.
+///
+/// The encode then has to happen in the pixel shader, which is what the
+/// `VariantFlags::SRGB_WRITE` emitter path is for.
+#[test]
+fn srgb_write_without_a_twin_keeps_the_linear_attachment() {
+    let mut s = fresh();
+    let base = tex(0x7F30);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_srgb_write_enabled(true);
+    assert!(!s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), RT_FORMAT);
+    s.ensure_pass_open();
+    assert_eq!(s.passes()[0].color_attachment_texture(), base);
+}
+
+/// One extra target without a twin keeps the whole attachment set linear.
+///
+/// A render pass binds one set of views: a target that cannot encode would
+/// otherwise be written linear while its neighbours encode.
+#[test]
+fn an_extra_target_without_a_twin_keeps_the_whole_set_linear() {
+    let mut s = fresh();
+    let base = tex(0x7F40);
+    let twin = tex(0x7F41);
+    let extra = tex(0x7F42);
+    s.register_srgb_twin(twin, base);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(
+        1,
+        Some(ExtraColorSlot {
+            texture: extra,
+            subresource: 0,
+            size: (256, 256),
+            logical_size: (256, 256),
+            format: RT_FORMAT,
+            scale: RenderScale::IDENTITY,
+            has_alpha: true,
+        }),
+    );
+    s.set_srgb_write_enabled(true);
+    assert!(!s.pass_srgb_write());
+
+    // Give the extra a twin of its own and the whole set can encode.
+    let extra_twin = tex(0x7F43);
+    s.register_srgb_twin(extra_twin, extra);
+    assert!(s.pass_srgb_write());
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), twin);
+    assert_eq!(pass.extra_color()[0].attachment_texture(), extra_twin);
+    assert_eq!(pass.extra_color()[0].texture(), extra);
+    assert_eq!(
+        s.extra_color_attachments().formats[0],
+        PixelFormat::Bgra8UnormSrgb
+    );
+}
+
+/// Rule E never folds a linear clear into a pass that writes through the twin.
+///
+/// The clear value is stored raw through the linear view and sRGB-encoded
+/// through the twin, so moving the load action across the two would change
+/// the colour the target ends up holding.
+#[test]
+fn a_clear_only_pass_does_not_coalesce_across_an_srgb_view_change() {
+    let mut s = fresh();
+    let base = tex(0x7F50);
+    let twin = tex(0x7F51);
+    s.register_srgb_twin(twin, base);
+    s.set_color_render_target(base, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    // Clear with linear writes, then draw with sRGB writes: the clear-only
+    // pass and the draw pass carry the same texture but different views.
+    s.clear_color(1, 2, 3, 4);
+    s.set_srgb_write_enabled(true);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the clear must stay in its own pass");
+    assert!(matches!(
+        s.passes()[0].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+    assert!(s.passes()[0].color_srgb_texture.is_null());
+    assert_eq!(s.passes()[1].color_attachment_texture(), twin);
+}
+
+/// The back buffer's sRGB twin is registered from the frame reset.
+///
+/// A `D3DRS_SRGBWRITEENABLE` draw straight onto the swap chain therefore
+/// attaches the twin, exactly as one onto a render-target texture does. The
+/// pair is re-supplied every frame because `Reset` and an auto-resize
+/// replace both halves together.
+#[test]
+fn the_backbuffer_attaches_its_srgb_twin() {
+    let mut s = fresh();
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), PixelFormat::Bgra8UnormSrgb);
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), backbuffer());
+    assert_eq!(pass.color_attachment_texture(), backbuffer_srgb());
+}
+
+/// A replaced back buffer drops the retired twin's registration.
+///
+/// `Reset` destroys the old texture and its view together, so a later
+/// binding must not be able to resolve the dead one.
+#[test]
+fn replacing_the_backbuffer_forgets_the_retired_twin() {
+    let mut s = fresh();
+    let fresh_bb = tex(0x1100);
+    let fresh_twin = tex(0x1101);
+    s.reset_frame(&FrameReset {
+        backbuffer: fresh_bb,
+        backbuffer_srgb: fresh_twin,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s.set_srgb_write_enabled(true);
+    s.ensure_pass_open();
+    assert_eq!(s.passes()[0].color_attachment_texture(), fresh_twin);
+    // The retired pair is gone: rebinding the old texture finds no twin.
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    assert!(!s.pass_srgb_write());
+}
+
+/// A scoped internal pass attaches the base view even while the game's state is on.
+///
+/// `StretchRect` copies pixels verbatim, so no render state reaches it and
+/// its quad pipeline declares the destination's own format. If the scoped
+/// pass took the sRGB view from a leftover `D3DRS_SRGBWRITEENABLE`, the
+/// pipeline and the attachment would disagree, which Metal treats as
+/// undefined behaviour with the validation layer off.
+#[test]
+fn a_scoped_pass_with_srgb_write_off_attaches_the_base_view() {
+    let mut s = fresh();
+    let dst = tex(0x7F60);
+    let dst_twin = tex(0x7F61);
+    s.register_srgb_twin(dst_twin, dst);
+    // The game leaves sRGB writes on over its own target.
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+
+    // The scoped pass takes the device's binding, clears the state, and binds
+    // the copy destination.
+    let saved = s.take_color_attachments();
+    s.set_srgb_write_enabled(false);
+    s.set_color_render_target(dst, 128, 128, RT_FORMAT, RenderScale::IDENTITY);
+    s.ensure_pass_open();
+    assert!(!s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), RT_FORMAT);
+    let pass = s.passes().last().expect("scoped pass");
+    assert_eq!(pass.color_attachment_texture(), dst);
+    assert_eq!(pass.color_format(), RT_FORMAT);
+
+    // Putting the device's binding back leaves the next draw free to re-apply
+    // the game's state.
+    s.end_current_pass("test");
+    s.restore_color_attachments(saved);
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.ensure_pass_open();
+    assert_eq!(
+        s.passes()
+            .last()
+            .expect("device pass")
+            .color_attachment_texture(),
+        backbuffer_srgb()
+    );
 }

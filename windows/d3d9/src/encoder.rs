@@ -2083,6 +2083,7 @@ impl FrameEncoder {
         self.pass_state
             .reset_frame(&mtld3d_core::passes::FrameReset {
                 backbuffer: frame.backbuffer_handle,
+                backbuffer_srgb: frame.backbuffer_srgb_handle,
                 backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
                 backbuffer_format: frame.backbuffer_format,
                 depth_texture: frame.depth_texture,
@@ -2895,6 +2896,59 @@ impl FrameEncoder {
         self.pass_state.current_color_format()
     }
 
+    /// Register a live sRGB twin view so a colour target bound later can attach it.
+    pub fn register_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        self.pass_state.register_srgb_twin(twin, base);
+    }
+
+    /// Park a standalone colour target's textures on the retention queue.
+    ///
+    /// Called when the surface that owns them finalizes. The sRGB twin goes
+    /// first (it holds a retain on the base) and its registration is dropped
+    /// with it, so no later binding can resolve a view whose storage is gone.
+    /// Both destroys are gated on the current submit seq, since a pass or
+    /// blit already encoded this frame may still name either handle.
+    pub fn retire_color_target(
+        &mut self,
+        base: MetalHandle<MTLTextureKind>,
+        srgb: MetalHandle<MTLTextureKind>,
+    ) {
+        self.pass_state.unregister_srgb_twin(srgb);
+        let seq = self.current_submit_seq;
+        for handle in [srgb, base] {
+            if handle.is_null() {
+                continue;
+            }
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: handle.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq,
+                    from_texture: true,
+                });
+        }
+    }
+
+    /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.
+    pub fn set_srgb_write_enabled(&mut self, enabled: bool) {
+        self.pass_state.set_srgb_write_enabled(enabled);
+    }
+
+    /// Whether the pass binds sRGB views, so the hardware encodes post-blend.
+    ///
+    /// Read at draw time: when it is set the pixel shader must NOT also
+    /// apply the OETF, or the colour is encoded twice.
+    #[must_use]
+    pub const fn color_attachment_is_srgb(&self) -> bool {
+        self.pass_state.pass_srgb_write()
+    }
+
     /// Whether the currently bound color RT's D3D format has a real alpha channel.
     ///
     /// Read at draw time into the pipeline snapshot's `COLOR_HAS_ALPHA`
@@ -3021,7 +3075,15 @@ impl FrameEncoder {
         );
     }
 
-    pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) {
+    /// Apply a whole-target colour `Clear`.
+    ///
+    /// `srgb_write` is `D3DRS_SRGBWRITEENABLE` at the `Clear` call. It is
+    /// resolved into the value here rather than on the API thread because
+    /// only the pass state knows whether the attachment about to be bound
+    /// is an sRGB view that converts the clear value itself.
+    pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
+        self.pass_state.set_srgb_write_enabled(srgb_write);
+        let (r, g, b, a) = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_color(r, g, b, a) {
             ColorClearOutcome::Folded => {}
@@ -3037,8 +3099,39 @@ impl FrameEncoder {
         // A target bound outside the pass (sized unlike target 0) is owed the
         // clear too; neither the fold nor the quad above reached it.
         if self.pass_state.has_extra_color_targets_outside_pass() {
-            self.clear_targets_outside_pass(|enc| enc.clear_color(r, g, b, a));
+            self.clear_targets_outside_pass(|enc| enc.clear_color(r, g, b, a, srgb_write));
         }
+    }
+
+    /// The clear colour as the bound attachment needs it stored.
+    ///
+    /// A pass that binds sRGB views takes the linear value and lets Metal
+    /// encode it, exactly as it encodes a draw's blended output. A target
+    /// with no sRGB view is written raw, so the curve is applied here: the
+    /// same encode the pixel-shader OETF variant performs for a draw.
+    fn resolved_clear_rgba(
+        &self,
+        r: u32,
+        g: u32,
+        b: u32,
+        a: u32,
+        srgb_write: bool,
+    ) -> (u32, u32, u32, u32) {
+        if !srgb_write || self.pass_state.pass_srgb_write() {
+            return (r, g, b, a);
+        }
+        let encoded = mtld3d_core::convert::linear_to_srgb_rgba([
+            f32::from_bits(r),
+            f32::from_bits(g),
+            f32::from_bits(b),
+            f32::from_bits(a),
+        ]);
+        (
+            encoded[0].to_bits(),
+            encoded[1].to_bits(),
+            encoded[2].to_bits(),
+            encoded[3].to_bits(),
+        )
     }
 
     /// `Clear(pRects = NULL)` for colour: D3D9 bounds it to the current viewport ∩ RT.
@@ -3052,9 +3145,16 @@ impl FrameEncoder {
     /// stencil plane or not. The bound is per plane and per attachment;
     /// [`Self::clear_depth_stencil_bounded_to_viewport`] answers the same
     /// question for the depth-stencil side.
-    pub fn clear_color_bounded_to_viewport(&mut self, r: u32, g: u32, b: u32, a: u32) {
+    pub fn clear_color_bounded_to_viewport(
+        &mut self,
+        r: u32,
+        g: u32,
+        b: u32,
+        a: u32,
+        srgb_write: bool,
+    ) {
         if self.pass_state.viewport_covers_color_attachment() {
-            self.clear_color(r, g, b, a);
+            self.clear_color(r, g, b, a, srgb_write);
         } else {
             let (vpx, vpy, vpw, vph) = self.pass_state.effective_viewport();
             let rect = (
@@ -3066,11 +3166,11 @@ impl FrameEncoder {
             // Derived from `effective_viewport`, so already in the bound
             // texture's space — goes to the resolved entry point, not the
             // converting one.
-            self.clear_color_rects_resolved(r, g, b, a, &[rect]);
+            self.clear_color_rects_resolved(r, g, b, a, srgb_write, &[rect]);
             // A target outside the pass bounds the clear to its own extent.
             if self.pass_state.has_extra_color_targets_outside_pass() {
                 self.clear_targets_outside_pass(|enc| {
-                    enc.clear_color_bounded_to_viewport(r, g, b, a);
+                    enc.clear_color_bounded_to_viewport(r, g, b, a, srgb_write);
                 });
             }
         }
@@ -3090,6 +3190,7 @@ impl FrameEncoder {
         g: u32,
         b: u32,
         a: u32,
+        srgb_write: bool,
         rects: &[(i32, i32, i32, i32)],
     ) {
         // `rects` are the game's own; the viewport they clip against is already
@@ -3097,16 +3198,18 @@ impl FrameEncoder {
         // the intersection is taken between two different spaces.
         let scale = self.pass_state.target_scale();
         if scale.is_identity() {
-            self.clear_color_rects_resolved(r, g, b, a, rects);
+            self.clear_color_rects_resolved(r, g, b, a, srgb_write, rects);
         } else {
             let scaled: Vec<(i32, i32, i32, i32)> =
                 rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
-            self.clear_color_rects_resolved(r, g, b, a, &scaled);
+            self.clear_color_rects_resolved(r, g, b, a, srgb_write, &scaled);
         }
         // A target outside the pass clips the rects against its own viewport
         // and converts them at its own scale.
         if self.pass_state.has_extra_color_targets_outside_pass() {
-            self.clear_targets_outside_pass(|enc| enc.clear_color_rects(r, g, b, a, rects));
+            self.clear_targets_outside_pass(|enc| {
+                enc.clear_color_rects(r, g, b, a, srgb_write, rects);
+            });
         }
     }
 
@@ -3120,8 +3223,11 @@ impl FrameEncoder {
         g: u32,
         b: u32,
         a: u32,
+        srgb_write: bool,
         rects: &[(i32, i32, i32, i32)],
     ) {
+        self.pass_state.set_srgb_write_enabled(srgb_write);
+        let (r, g, b, a) = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
             .iter()
@@ -3613,6 +3719,15 @@ impl FrameEncoder {
         // the caller (`get_or_create_texture` / a standalone colour handle),
         // non-zero per the guard above.
         let dst_tex = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
+        // `StretchRect` copies pixels verbatim, so no render state reaches it
+        // and `D3DRS_SRGBWRITEENABLE` must not pick sRGB views for the
+        // destination pass: encoding the copy would change the pixels it is
+        // supposed to reproduce. One decision therefore drives both halves:
+        // the pass attaches the destination's own format and the quad's
+        // pipeline declares that same format. It is applied before the
+        // destination is bound, so `ensure_pass_open` freezes the same
+        // choice, and the next draw or `Clear` re-applies the game's state.
+        self.pass_state.set_srgb_write_enabled(false);
         let pipeline = self.get_or_create_blit_pipeline(dst_format);
         if pipeline == 0 {
             return;
@@ -3684,6 +3799,14 @@ impl FrameEncoder {
             .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state
             .set_viewport(dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h, 0.0, 1.0);
+        // A pipeline whose colour format differs from the bound attachment's
+        // is undefined behaviour with the validation layer off, so pin the
+        // two together where the binding is finished.
+        debug_assert_eq!(
+            self.pass_state.current_color_format(),
+            dst_format,
+            "blit-quad pipeline format must equal the pass's attachment format"
+        );
         self.pass_state.ensure_pass_open();
         // The destination's content survives the readback that drives the
         // conformance check (and any real `GetRenderTargetData`).
@@ -7123,6 +7246,8 @@ pub struct FrameData {
     device_handle: MetalHandle<MTLDeviceKind>,
     queue_handle: MetalHandle<MTLCommandQueueKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the back buffer; see `FrameInit`.
+    backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
@@ -7251,6 +7376,8 @@ pub struct FrameInit {
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub queue_handle: MetalHandle<MTLCommandQueueKind>,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the back buffer, attached under `D3DRS_SRGBWRITEENABLE`.
+    pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     pub view_handle: MetalHandle<NSViewKind>,
     /// The frame's **logical** back-buffer width, the one D3D9 reports.
@@ -7289,6 +7416,7 @@ impl FrameData {
             device_handle: init.device_handle,
             queue_handle: init.queue_handle,
             backbuffer_handle: init.backbuffer_handle,
+            backbuffer_srgb_handle: init.backbuffer_srgb_handle,
             layer_handle: init.layer_handle,
             view_handle: init.view_handle,
             backbuffer_width: init.backbuffer_width,
@@ -8268,7 +8396,10 @@ fn pass_to_descriptor(
             MetalHandle::NULL
         };
     PassDescriptor {
-        color_texture: p.color_texture(),
+        // The attachment is the sRGB twin view whenever the pass encodes on
+        // write; every load/store rule above still reasons about the base
+        // handle, which is the same Metal texture.
+        color_texture: p.color_attachment_texture(),
         depth_texture: p.depth_texture(),
         commands_ptr: p.commands().as_ptr() as u64,
         visibility_result_buffer,
@@ -8308,7 +8439,7 @@ fn pass_to_descriptor(
                 return ExtraColorDesc::NONE;
             }
             ExtraColorDesc {
-                texture: a.texture(),
+                texture: a.attachment_texture(),
                 subresource: a.slice() | (a.level() << 8),
                 load_action: match a.load() {
                     ColorLoad::Load => LoadAction::Load,
