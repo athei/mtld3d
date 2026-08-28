@@ -11,8 +11,8 @@
 //! asserting on the render space by accident.
 //!
 //! Exact-colour comparisons survive resampling because every region asserted on
-//! is a flat block several pixels from any colour boundary, where an edge-aware
-//! upscale reproduces the source colour exactly. Sampling *on* a boundary would
+//! is a flat block several pixels from any colour boundary, where a filtered
+//! resample reproduces the source colour exactly. Sampling *on* a boundary would
 //! be scale-dependent by construction, so the probes stay away from them.
 //!
 //! One test sets `render.scale` itself instead of inheriting the run's, because
@@ -35,6 +35,8 @@ const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
 const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
+/// A colour whose alpha is neither zero nor opaque, so either mistake shows.
+const TRANSLUCENT: u32 = 0x4000_FF00;
 
 /// The sub-rect every viewport-bound test narrows to, in reported coordinates.
 ///
@@ -421,6 +423,27 @@ fn rebinding_the_backbuffer_keeps_its_coordinate_space() {
 
     assert_pixel_eq(h.read_pixel(320, 240), GREEN, "scissor still converts");
     assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside the scissor");
+}
+
+#[test]
+fn a_readback_keeps_the_alpha_the_frame_carries() {
+    // Under a reduced scale the back buffer is rasterized smaller than the size
+    // D3D9 reports, so `GetRenderTargetData` has to resample it up on the way
+    // to the caller. That resample owes the game all four channels: a title
+    // reading the back buffer back gets the alpha it wrote, not an opaque one.
+    let h = Harness::new();
+    h.render_once(TRANSLUCENT, |_| {});
+
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        TRANSLUCENT,
+        "the readback carries the alpha the frame was cleared to",
+    );
+    assert_pixel_eq(
+        h.read_pixel(40, 40),
+        TRANSLUCENT,
+        "including at the edge of the frame",
+    );
 }
 
 #[test]
