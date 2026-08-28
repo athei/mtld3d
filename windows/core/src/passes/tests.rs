@@ -2907,6 +2907,7 @@ fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
     }
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
