@@ -3919,8 +3919,13 @@ impl FrameEncoder {
             .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state.set_viewport(rx, ry, rw, rh, 0.0, 1.0);
         self.pass_state.note_color_read_back(fill.texture);
+        // `ColorFill` writes the colour bytes verbatim, so the fill pass
+        // attaches the base view and applies no encode whatever
+        // `D3DRS_SRGBWRITEENABLE` the game left set. The next draw or `Clear`
+        // re-applies the game's state to the pass it opens.
+        self.pass_state.set_srgb_write_enabled(false);
         let (r, g, b, a) = fill.rgba;
-        self.clear_color_bounded_to_viewport(r, g, b, a);
+        self.clear_color_bounded_to_viewport(r, g, b, a, false);
         // A folded fill is still only a pending clear; materialise it here so
         // it lands on this destination rather than on the restored one.
         self.pass_state.ensure_pass_open();
