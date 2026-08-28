@@ -609,15 +609,58 @@ pub fn compute_mip_count(width: u32, height: u32) -> u32 {
     32 - max_dim.leading_zeros()
 }
 
+/// Which allocation shape a standalone surface's VRAM charge covers.
+///
+/// The two standalone-surface entry points spend memory differently once
+/// their surface is multisampled, so the charge has to know which one it is
+/// sizing.
+#[derive(Clone, Copy)]
+pub enum StandaloneSurfaceKind {
+    /// `CreateRenderTarget`: a single-sample texture, plus a companion above one sample.
+    ColorTarget,
+    /// `CreateDepthStencilSurface`: the attachment texture alone, multisampled in place.
+    DepthStencil,
+}
+
+/// Bytes a standalone surface occupies, every texture the create allocated.
+///
+/// `sample_count` is the surface's Metal sample count, 1 for a single-sampled
+/// surface. A multisampled colour target is two allocations, the single-sample
+/// texture an application resolves into plus a companion `sample_count` times
+/// its size, so it is charged `1 + sample_count` times the single-sample
+/// figure. A multisampled depth-stencil surface is one allocation, the
+/// multisampled attachment itself (D3D9 offers no way to read one back, so
+/// there is nothing to resolve into), so it is charged `sample_count` times.
+/// The sRGB twin of either is a view of a texture already charged and costs
+/// no memory of its own.
+#[must_use]
+pub fn standalone_surface_bytes(
+    width: u32,
+    height: u32,
+    d3d_format: u32,
+    sample_count: u32,
+    kind: StandaloneSurfaceKind,
+) -> u64 {
+    let copies = match kind {
+        StandaloneSurfaceKind::ColorTarget if sample_count > 1 => {
+            u64::from(sample_count).saturating_add(1)
+        }
+        StandaloneSurfaceKind::ColorTarget => 1,
+        StandaloneSurfaceKind::DepthStencil => u64::from(sample_count.max(1)),
+    };
+    surface_bytes(width, height, d3d_format).saturating_mul(copies)
+}
+
 /// Bytes one single-level `width` x `height` surface of `d3d_format` occupies.
 ///
 /// The single size formula behind the `GetAvailableTextureMem` accounting for
 /// the two standalone-surface entry points, `CreateRenderTarget` and
 /// `CreateDepthStencilSurface`, so a surface is charged and refunded from
-/// identical inputs. The figure is in the application's own currency: the
-/// dimensions it asked for, and its own D3D9 format rather than the Metal
-/// format the surface is really backed by. Both substitutions underneath (a
-/// render-scaled attachment, a 24-bit depth format promoted to
+/// identical inputs. Multisampling multiplies it in
+/// [`standalone_surface_bytes`]. The figure is in the application's own
+/// currency: the dimensions it asked for, and its own D3D9 format rather than
+/// the Metal format the surface is really backed by. Both substitutions
+/// underneath (a render-scaled attachment, a 24-bit depth format promoted to
 /// `Depth32Float`) are ours, and an application sizing its resource budget
 /// from this call reasons in the units it passed in. Returns 0 for a format
 /// with neither a colour nor a depth mapping.

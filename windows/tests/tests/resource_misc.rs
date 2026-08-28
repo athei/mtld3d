@@ -9,10 +9,10 @@ use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
     D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
-    D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9,
-    IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DFMT_INDEX16, D3DFVF_XYZ, D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
+    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -549,6 +549,69 @@ fn available_texture_mem_tracks_standalone_surfaces() {
         h.available_texture_mem(),
         base,
         "releasing the render target gives its bytes back"
+    );
+}
+
+/// A multisampled standalone surface is charged for every texture it owns.
+///
+/// `CreateRenderTarget` above one sample allocates the single-sample texture
+/// an application resolves out of plus a multisampled companion
+/// `sample_count` times its size, so the reported figure drops by
+/// `1 + sample_count` times the single-sample bytes. `CreateDepthStencilSurface`
+/// has no resolve target, so its one attachment is charged `sample_count`
+/// times. Both are 512x512 at four bytes per pixel, so the single-sample
+/// figure is exactly 1 MiB.
+#[test]
+fn available_texture_mem_charges_multisampled_surfaces() {
+    const SIZE: u32 = 512;
+    const SURFACE_BYTES: u32 = SIZE * SIZE * 4;
+
+    let h = Harness::new();
+    // Metal serves a sample count of 4 on every GPU family mtld3d runs on, so
+    // this is the device answering rather than a capability the test probes.
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_A8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES)
+            .0,
+        D3D_OK,
+        "4x colour multisampling"
+    );
+    let base = h.available_texture_mem();
+    assert!(
+        base > 16 * SURFACE_BYTES,
+        "budget {base} leaves room for the multisampled surfaces"
+    );
+    {
+        let _rt =
+            h.create_render_target_ms((SIZE, SIZE), D3DFMT_A8R8G8B8, (D3DMULTISAMPLE_4_SAMPLES, 0));
+        assert_eq!(
+            h.available_texture_mem(),
+            base - 5 * SURFACE_BYTES,
+            "a 4x render target costs its resolve target plus its companion"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the multisampled render target gives both back"
+    );
+    {
+        let (hr, ds) = h.create_depth_stencil_surface_ms_hr(
+            (SIZE, SIZE),
+            D3DFMT_D24S8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        );
+        assert_eq!(hr, D3D_OK, "CreateDepthStencilSurface(4x)");
+        let _ds = ds.expect("multisampled depth surface");
+        assert_eq!(
+            h.available_texture_mem(),
+            base - 4 * SURFACE_BYTES,
+            "a 4x depth surface costs its one multisampled attachment"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the multisampled depth surface gives its bytes back"
     );
 }
 

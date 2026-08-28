@@ -14,8 +14,9 @@ use super::{
     D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
     D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16,
     D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_X8R8G8B8, PixelFormat, Swizzle, depth_format_bytes_per_pixel, is_depth_format,
-    is_mapped_color_format, linear_row_pitch, map_d3d_depth_format, map_d3d_format, surface_bytes,
+    D3DFMT_X8R8G8B8, PixelFormat, StandaloneSurfaceKind, Swizzle, depth_format_bytes_per_pixel,
+    is_depth_format, is_mapped_color_format, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, standalone_surface_bytes, surface_bytes,
 };
 
 #[test]
@@ -309,6 +310,87 @@ fn surface_bytes_charges_colour_and_depth_surfaces() {
     assert_eq!(surface_bytes(64, 64, D3DFMT_DXT1), 64 * 64 / 2);
     // A format with neither mapping is charged nothing rather than panicking.
     assert_eq!(surface_bytes(64, 64, 0), 0);
+}
+
+/// A multisampled surface is charged for every texture its create allocated.
+///
+/// The colour path allocates the single-sample texture an application
+/// resolves into plus a companion `sample_count` times its size; the
+/// depth-stencil path allocates only the multisampled attachment.
+#[test]
+fn standalone_surface_bytes_charges_the_multisampled_companion() {
+    const BASE: u64 = 2048 * 2048 * 4;
+
+    // One sample is the single-sample figure on both paths.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget
+        ),
+        BASE
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            1,
+            StandaloneSurfaceKind::DepthStencil
+        ),
+        BASE
+    );
+    // A colour target pays for the resolve target and the companion.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            4,
+            StandaloneSurfaceKind::ColorTarget
+        ),
+        5 * BASE
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            2,
+            StandaloneSurfaceKind::ColorTarget
+        ),
+        3 * BASE
+    );
+    // A depth-stencil surface has no resolve target, so it pays for the
+    // multisampled attachment alone.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            4,
+            StandaloneSurfaceKind::DepthStencil
+        ),
+        4 * BASE
+    );
+    // A zero sample count is read as single-sampled rather than free.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            0,
+            StandaloneSurfaceKind::DepthStencil
+        ),
+        BASE
+    );
+    // A format with no mapping stays at zero however many samples it claims.
+    assert_eq!(
+        standalone_surface_bytes(64, 64, 0, 4, StandaloneSurfaceKind::ColorTarget),
+        0
+    );
 }
 
 #[test]
