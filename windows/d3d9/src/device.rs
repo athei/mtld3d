@@ -9821,6 +9821,17 @@ extern "system" fn device_process_vertices(
     // SAFETY: `src_vb` is a live bound `Direct3DVertexBuffer9` (non-null
     // checked); the bound-slot reference keeps it alive for this call.
     let src_inner = unsafe { (*src_vb).inner() };
+    if src_inner.backing_is_released() {
+        // A default-pool D3DUSAGE_WRITEONLY buffer keeps its bytes on the GPU
+        // alone. D3DUSAGE_SOFTWAREPROCESSING is the usage a title declares for
+        // a buffer it feeds to ProcessVertices, and that declaration keeps the
+        // CPU copy, so a source without it has nothing left to read.
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "ProcessVertices from a D3DUSAGE_WRITEONLY source without D3DUSAGE_SOFTWAREPROCESSING: no CPU copy to read → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
     let src_bytes = src_inner.backing();
     let first = (src_stream_offset + src_start.saturating_mul(src_stride)) as usize;
     if first > src_bytes.len() {

@@ -8,6 +8,10 @@
 //! and logs one line per threshold crossed on the way down, with the sizes
 //! of the pools mtld3d itself holds, so the log says how close the process
 //! was and who owned the space.
+//!
+//! Both the texture staging and the vertex/index backing are reported split by
+//! the class that decides whether the copy can be released at all, so the line
+//! names which class holds the space rather than leaving it to a guess.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
@@ -96,12 +100,15 @@ impl DeviceInner {
             && log::log_enabled!(target: LOG_TARGET, log::Level::Debug)
         {
             let fp = self.live_texture_footprint();
+            let vbib = mtld3d_core::buffer_backing::live_backing_bytes();
             let largest = largest_free_region_mib();
             debug!(
                 target: LOG_TARGET,
                 "address space: {avail} MiB free, largest free block {largest} MiB; mtld3d holds \
                  {} textures with {} MiB of mip data, staging resident {} MiB \
-                 (default static {} / default dynamic {} / other {}), page boxes {} MiB, \
+                 (default static {} / default dynamic {} / other {}), \
+                 vertex/index backing {} MiB \
+                 (writeonly static {} / dynamic {} / other {}), page boxes {} MiB, \
                  retained vertex/index buffers {} MiB, locks on static default textures {}",
                 fp.count,
                 fp.mip_bytes >> 20,
@@ -109,6 +116,10 @@ impl DeviceInner {
                 fp.resident_default_static >> 20,
                 fp.resident_default_dynamic >> 20,
                 fp.resident_other >> 20,
+                vbib.total() >> 20,
+                vbib.write_only_static >> 20,
+                vbib.dynamic >> 20,
+                vbib.other >> 20,
                 mtld3d_core::page_box::live_bytes() >> 20,
                 self.vbib_retained_bytes.load(Ordering::Relaxed) >> 20,
                 crate::texture::default_static_lock_count()
@@ -124,12 +135,15 @@ impl DeviceInner {
             next += 1;
             NEXT_THRESHOLD.store(next, Ordering::Relaxed);
             let fp = self.live_texture_footprint();
+            let vbib = mtld3d_core::buffer_backing::live_backing_bytes();
             warn!(
                 target: LOG_TARGET,
                 "address space: {avail} MiB free (below {threshold} MiB); mtld3d holds \
-                 {} textures with {} MiB of mip data, page boxes {} MiB",
+                 {} textures with {} MiB of mip data, {} MiB of vertex/index backing, \
+                 page boxes {} MiB",
                 fp.count,
                 fp.mip_bytes >> 20,
+                vbib.total() >> 20,
                 mtld3d_core::page_box::live_bytes() >> 20
             );
         }

@@ -12,6 +12,7 @@
 const LOG_TARGET: &str = "mtld3d::d3d9";
 
 pub mod app_profile;
+pub mod buffer_backing;
 pub mod buffer_rename;
 pub mod caps;
 pub mod config;

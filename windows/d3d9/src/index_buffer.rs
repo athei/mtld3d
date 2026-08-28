@@ -9,6 +9,7 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
+    buffer_backing::{BufferBacking, classify_backing},
     buffer_rename::{
         BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
         records_dirty_range,
@@ -74,7 +75,12 @@ pub struct IndexBufferInner {
     map_mode: BufferMapMode,
     /// `Staged` only: byte range dirtied since the last upload.
     dirty: DirtyRange,
-    current_box: PageBox,
+    /// Canonical CPU backing.
+    ///
+    /// Never released the way a vertex buffer's is: the triangle-fan
+    /// rewrite reads an index buffer's bytes back on the API thread
+    /// whatever its usage promised, so the copy has to stay.
+    backing: BufferBacking,
     last_submit_seq: u64,
     locked: bool,
 }
@@ -97,16 +103,19 @@ impl IndexBufferInner {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
+        let Some(src) = self.backing.read_ptr_at(min as usize) else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "flush_staged_if_mapped: no CPU backing behind a mapped dirty range");
+            return;
+        };
         let size = (max - min) as usize;
         let mut transient = dev.alloc_pagebox_capped(size);
-        // SAFETY: `min <= length` and `current_box` is allocated for `length`
-        // bytes, so the offset stays in-bounds.
-        let src = unsafe { self.current_box.as_ptr().add(min as usize) };
-        // SAFETY: `src` spans `[min, max)` of `current_box`; `transient` is a
+        // SAFETY: `src` spans `[min, max)` of the backing; `transient` is a
         // fresh `PageBox` of ≥ `size` bytes; the two allocations are disjoint.
         unsafe {
             core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
         }
+        self.backing.note_upload(min, max);
         dev.push_stage_upload(self.buffer_id, transient, min, max - min);
     }
 
@@ -119,11 +128,11 @@ impl IndexBufferInner {
     }
 
     pub fn current_backing_ptr(&self) -> u64 {
-        self.current_box.as_ptr() as u64
+        self.backing.ptr()
     }
 
     pub const fn current_backing_len(&self) -> u64 {
-        self.current_box.len() as u64
+        self.backing.padded_len()
     }
 
     pub const fn stamp_submit_seq(&mut self, seq: u64) {
@@ -149,7 +158,11 @@ impl Direct3DIndexBuffer9 {
         // opening upload is unconditional because the device buffer starts
         // undefined, no blit command can fill it, and a fill made only
         // through locks `records_dirty_range` rejects announces nothing.
-        let current_box = PageBox::new_zeroed(info.length as usize);
+        let backing = BufferBacking::new(
+            PageBox::new_zeroed(info.length as usize),
+            info.length,
+            classify_backing(info.usage, info.pool),
+        );
         let map_mode = classify_map_mode(info.usage, info.pool);
         let dirty = if matches!(map_mode, BufferMapMode::Staged) {
             DirtyRange::full(info.length)
@@ -166,7 +179,7 @@ impl Direct3DIndexBuffer9 {
             private_data: PrivateDataStore::default(),
             map_mode,
             dirty,
-            current_box,
+            backing,
             last_submit_seq: 0,
             locked: false,
         }));
@@ -266,15 +279,17 @@ unsafe fn finalize_index_buffer(this: *mut Direct3DIndexBuffer9) {
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(IndexBufferInner)` from `Self::new` and no
     // other reference can survive.
-    let inner_box = unsafe { Box::from_raw(inner_ptr) };
+    let mut inner_box = unsafe { Box::from_raw(inner_ptr) };
+    let current_box = inner_box.backing.release();
     let IndexBufferInner {
         device_inner,
         buffer_id,
-        current_box,
         last_submit_seq,
         ..
     } = *inner_box;
-    if !device_inner.is_null() {
+    if !device_inner.is_null()
+        && let Some(current_box) = current_box
+    {
         // SAFETY: `device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
@@ -524,7 +539,13 @@ extern "system" fn ib_lock(
                 let old_seq = inner.last_submit_seq;
                 let logical_len = inner.length as usize;
                 let fresh = dev.alloc_pagebox_capped(logical_len);
-                let old_box = core::mem::replace(&mut inner.current_box, fresh);
+                // An index buffer never releases its backing, so the swap
+                // always hands the old one back.
+                let Some(old_box) = inner.backing.replace(fresh) else {
+                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                        "ib_lock: rename found no backing to retain");
+                    return D3DERR_INVALIDCALL;
+                };
                 match preserve {
                     PreserveKind::None => {
                         // Rename without preserve. Either explicit DISCARD
@@ -537,21 +558,22 @@ extern "system" fn ib_lock(
                         // pointer, so carry the old bytes across
                         // synchronously.
                         dev.perf_mut().bump_vbib_preserve_cpu();
-                        // SAFETY: both `old_box` and `inner.current_box` are
-                        // freshly allocated `PageBox`es of `logical_len`
-                        // bytes; the two allocations don't alias.
+                        let dst = inner
+                            .backing
+                            .write_ptr_at(0)
+                            .expect("the fresh rename backing was just installed");
+                        // SAFETY: both `old_box` and the fresh backing are
+                        // `PageBox`es of `logical_len` bytes; the two
+                        // allocations don't alias.
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                old_box.as_ptr(),
-                                inner.current_box.as_mut_ptr(),
-                                logical_len,
-                            );
+                            core::ptr::copy_nonoverlapping(old_box.as_ptr(), dst, logical_len);
                         }
                     }
                 }
                 dev.perf_mut().bump_ib_rename();
-                dev.perf_mut()
-                    .bump_vbib_rename_bytes(inner.current_box.len());
+                let renamed_bytes = usize::try_from(inner.backing.padded_len())
+                    .expect("a PageBox length fits the host address space");
+                dev.perf_mut().bump_vbib_rename_bytes(renamed_bytes);
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
             }
@@ -578,10 +600,15 @@ extern "system" fn ib_lock(
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "ib_lock: unrecognised D3DLOCK bits {unknown:#x} ignored");
     }
-    // SAFETY: `offset_to_lock <= inner.length` (checked above) and
-    // `inner.current_box` is allocated for `inner.length` bytes, so the
-    // pointer arithmetic stays within the allocation.
-    let ptr = unsafe { inner.current_box.as_mut_ptr().add(offset_to_lock as usize) };
+    // `offset_to_lock <= inner.length` is checked above and the backing is
+    // allocated for `inner.length` bytes, so the offset lands inside it.
+    let Some(ptr) = inner.backing.write_ptr_at(offset_to_lock as usize) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "ib_lock: no backing to map");
+        // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
+        // ABI points to a writable `*mut c_void` slot owned by the caller.
+        unsafe { *pp_data = core::ptr::null_mut() };
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
     // ABI points to a writable `*mut c_void` slot owned by the caller.
     unsafe { *pp_data = ptr.cast::<c_void>() };
@@ -606,19 +633,23 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from
         // a live `DeviceInner` that outlives its children.
         let dev = unsafe { &mut *inner.device_inner };
+        let Some(src) = inner.backing.read_ptr_at(min as usize) else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "ib_unlock: dirty range with no CPU backing behind it, dropping the upload");
+            inner.dirty.clear();
+            return D3D_OK;
+        };
         let size = (max - min) as usize;
         let mut transient = dev.alloc_pagebox_capped(size);
-        // SAFETY: `min <= length` and `current_box` is allocated for
-        // `length` bytes, so the offset stays in-bounds.
-        let src = unsafe { inner.current_box.as_ptr().add(min as usize) };
-        // SAFETY: `src` spans `[min, max)` of `current_box`;
-        // `transient` is a fresh `PageBox` of ≥ `size` bytes; the two
-        // allocations are disjoint.
+        // SAFETY: `src` spans `[min, max)` of the backing; `transient` is
+        // a fresh `PageBox` of ≥ `size` bytes; the two allocations are
+        // disjoint.
         unsafe {
             core::ptr::copy_nonoverlapping(src, transient.as_mut_ptr(), size);
         }
         // Push the upload as an inline op so the encoder sees it in
         // draw order (for rename-at-overlap). No Metal thunk here.
+        inner.backing.note_upload(min, max);
         dev.push_stage_upload(inner.buffer_id, transient, min, max - min);
         // Only once the upload is actually queued: the range is the
         // only record that these bytes still owe a copy to the device

@@ -141,6 +141,20 @@ memory headroom and no tested game depends on them:
   test suite probes this and reports it in some runs, so the rationale is
   written up in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) like every
   other kept divergence.
+- **A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` static vertex buffer keeps no CPU
+  copy of its contents** once an upload has carried every byte to the GPU. D3D9
+  preserves a buffer's contents across a plain `Lock` whatever its usage said,
+  so a title that locks such a buffer and reads back through the pointer sees
+  zeros rather than what it wrote, and one that writes past the window it
+  announced loses the bytes outside it; the log carries a warning the first time
+  a backing is released and again the first time a lock lands on a re-created
+  one. What it buys is the reason the divergence is here: inside a
+  large-address-aware i386 title those copies have been measured near a gigabyte
+  of the same 4 GiB the title needs for its own data, and running out of it
+  crashes the process. `buffer.ignoreLockBounds` keeps the copy for a title that
+  provably writes outside its announced windows. Index buffers keep theirs
+  unconditionally, because the triangle-fan rewrite reads their bytes back on
+  the CPU.
 
 ### Deliberately not implemented
 
