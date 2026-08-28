@@ -4089,6 +4089,14 @@ extern "system" fn device_present(
     let dev = obj.inner();
 
     mtld3d_shared::crumb!("d3d9:present");
+    // The unix side republishes the backing scale whenever the window's
+    // display changes it, so the cursor upscale follows the window between
+    // displays. One relaxed load and a compare on an unchanged value, which
+    // is every frame that stays put.
+    if let Some(backing_scale) = crate::direct3d9::display_backing_scale() {
+        let (scale, _origin) = crate::direct3d9::resolve_cursor_scale(backing_scale);
+        dev.cursor_mut().follow_scale(scale);
+    }
     dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);

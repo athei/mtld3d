@@ -17,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use log::{Level, debug, error, log_enabled, trace, warn};
+use log::{Level, debug, error, info, log_enabled, trace, warn};
 use mtld3d_core::perf::DeviceSubCategory;
 use mtld3d_shared::InPtr;
 use mtld3d_types::{
@@ -319,11 +319,31 @@ pub struct CursorState {
     probe: HitchProbe,
     /// Nearest-neighbor upscale factor applied to the cursor bitmap.
     ///
-    /// Sourced from the display's `backingScaleFactor` at `CreateDevice` so
-    /// a retina Mac gets a proportionally-sized Win32 cursor (Wine's
-    /// HCURSOR path does not participate in the OS's retina upscale).
-    /// `1` is the identity fast path.
+    /// Sourced from the display's `backingScaleFactor` at `CreateDevice`, and
+    /// re-sourced whenever the window lands on a display of another one, so a
+    /// retina Mac gets a proportionally-sized Win32 cursor (Wine's HCURSOR
+    /// path does not participate in the OS's retina upscale). `1` is the
+    /// identity fast path.
     scale: u32,
+    /// The bitmap the game last handed `SetCursorProperties`.
+    ///
+    /// Kept so a backing-scale change can rebuild the pointer the game is
+    /// already showing. Without it the new factor would only reach the
+    /// display on the game's next cursor change, which for a title that sets
+    /// its pointer once is never. `None` until the first accepted call.
+    source: Option<CursorSource>,
+}
+
+/// A cursor bitmap in the shape `build_hcursor` consumes.
+///
+/// `pixels` is a tight BGRA copy of the locked surface, so the row pitch is
+/// `width * 4` and the buffer outlives the lock it came from.
+struct CursorSource {
+    width: u32,
+    height: u32,
+    x_hotspot: u32,
+    y_hotspot: u32,
+    pixels: Vec<u8>,
 }
 
 impl CursorState {
@@ -339,6 +359,81 @@ impl CursorState {
             cache: FxHashMap::default(),
             probe: HitchProbe::new(),
             scale: scale.clamp(1, 8),
+            source: None,
+        }
+    }
+
+    /// Re-scale the pointer after the window moved to a display of another backing scale.
+    ///
+    /// A no-op while the factor is unchanged, which is every frame of a
+    /// session that stays on one display. On a real change the bitmap the
+    /// game is currently showing is rebuilt at the new factor and re-realised
+    /// straight away, so the pointer resizes with the window rather than at
+    /// the game's next `SetCursorProperties`.
+    pub fn follow_scale(&mut self, scale: u32) {
+        let scale = scale.clamp(1, 8);
+        let previous = self.scale;
+        if scale == previous {
+            return;
+        }
+        self.scale = scale;
+        info!(
+            target: LOG_TARGET,
+            "hardware cursor scale: {previous}x -> {scale}x (display backing scale changed)",
+        );
+        self.rebuild_current();
+    }
+
+    /// Rebuild and re-realise the current pointer at the current scale.
+    ///
+    /// Keyed through the same cache as `SetCursorProperties`, whose key folds
+    /// the scale in, so moving back to the first display reuses the bitmap
+    /// built for it instead of building a third.
+    fn rebuild_current(&mut self) {
+        let Some(source) = self.source.take() else {
+            return;
+        };
+        let pitch = source.width as usize * 4;
+        let hash = hash_cursor(
+            source.x_hotspot,
+            source.y_hotspot,
+            source.width,
+            source.height,
+            source.pixels.as_ptr(),
+            pitch,
+            self.scale,
+        );
+        let handle = if let Some(&h) = self.cache.get(&hash) {
+            Some(h)
+        } else {
+            let built = build_hcursor(
+                source.width,
+                source.height,
+                pitch,
+                source.pixels.as_ptr(),
+                source.x_hotspot,
+                source.y_hotspot,
+                self.scale,
+            );
+            if let Some(h) = built {
+                self.cache.insert(hash, h);
+            }
+            built
+        };
+        self.source = Some(source);
+        let Some(handle) = handle else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "cursor: build_hcursor failed while following a backing-scale change; \
+                 the pointer stays at its previous size",
+            );
+            return;
+        };
+        self.hash = hash;
+        self.handle = handle;
+        if self.effective_visible() {
+            let us = timed_set_cursor(handle);
+            self.charge_call_us(us);
         }
     }
 
@@ -602,9 +697,8 @@ pub extern "system" fn device_set_cursor_properties(
 
     let pitch = usize::try_from(locked.pitch).expect("D3D9 LOCKED_RECT.pitch is non-negative");
     let src = locked.bits as *const u8;
-    let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch);
-
     let cur = dev.cursor_mut();
+    let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch, cur.scale);
     let prev_hash = cur.hash;
     let (handle, outcome) = if hash == prev_hash {
         (cur.handle, "unchanged")
@@ -626,6 +720,21 @@ pub extern "system" fn device_set_cursor_properties(
         cur.cache.insert(hash, h);
         (h, "built-fresh")
     };
+
+    // Keep the pixels: the backing scale can change under a running session
+    // when the window moves to another display, and rebuilding the pointer at
+    // the new factor needs the bitmap the unlock below hands back to the
+    // guest. Only on a new bitmap, so a game re-setting the same cursor every
+    // frame pays nothing.
+    if hash != prev_hash {
+        cur.source = Some(CursorSource {
+            width,
+            height,
+            x_hotspot,
+            y_hotspot,
+            pixels: tight_copy(width, height, pitch, src),
+        });
+    }
 
     // SAFETY: calling the just-loaded `unlock_rect` thunk through
     // `surf_vtbl`; paired with the `lock_rect` call above.
@@ -941,6 +1050,10 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
 /// content hash for byte buffers throughout the tree (see `ProgramId`); the
 /// value is the whole identity of the cursor, so it needs real avalanche, not
 /// a map hasher.
+///
+/// The upscale factor is part of that identity: the same bitmap on displays
+/// of different backing scale produces different HCURSORs, and one key for
+/// both would serve the wrong-sized one out of the cache.
 fn hash_cursor(
     x_hotspot: u32,
     y_hotspot: u32,
@@ -948,12 +1061,14 @@ fn hash_cursor(
     height: u32,
     src: *const u8,
     pitch: usize,
+    scale: u32,
 ) -> u64 {
     let mut h = Xxh3::new();
     h.write_u32(x_hotspot);
     h.write_u32(y_hotspot);
     h.write_u32(width);
     h.write_u32(height);
+    h.write_u32(scale);
     let row_bytes = (width as usize) * 4;
     for y in 0..height as usize {
         // SAFETY: caller-validated `src + y*pitch` stays within the bitmap.
@@ -963,6 +1078,24 @@ fn hash_cursor(
         h.write(row);
     }
     h.finish()
+}
+
+/// Copy a locked BGRA cursor surface into a tight `width * 4`-pitch buffer.
+///
+/// The caller validates that `src` covers `height` rows of at least
+/// `width * 4` readable bytes, `pitch` apart, which is what
+/// `D3DLOCKED_RECT` describes for the locked region.
+fn tight_copy(width: u32, height: u32, pitch: usize, src: *const u8) -> Vec<u8> {
+    let row_bytes = width as usize * 4;
+    let mut out = vec![0u8; row_bytes * height as usize];
+    for y in 0..height as usize {
+        // SAFETY: caller-validated `src + y*pitch` stays within the bitmap.
+        let row_ptr = unsafe { src.add(y * pitch) };
+        // SAFETY: `row_ptr..row_ptr + row_bytes` lies in the same allocation.
+        let row = unsafe { core::slice::from_raw_parts(row_ptr, row_bytes) };
+        out[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(row);
+    }
+    out
 }
 
 /// Build a Win32 HCURSOR from a BGRA bitmap.

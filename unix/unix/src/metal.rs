@@ -22,7 +22,8 @@ pub use clear_quad::ensure_clear_quad_pipeline;
 pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_retire};
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
 pub use macdrv::{
-    PresentPacing, attach_metal_layer, declare_latency_critical_activity, set_display_sync_enabled,
+    LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
+    set_display_sync_enabled,
 };
 pub use mtld3d_shared::perf::init_tracking_enabled;
 pub use pipeline::{create_render_pipeline, destroy_render_pipeline};

@@ -44,7 +44,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 64);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 72);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
@@ -175,6 +175,17 @@ pub struct AttachMetalLayerParams {
     /// the layer instead — the pre-`MetalFX` behaviour, and the only correct
     /// fallback since nothing else on the unix side can resize a frame.
     pub metalfx_available: u32, // out
+    /// Address of a PE-side `AtomicU32` that receives a changed `backing_scale`.
+    ///
+    /// `backing_scale` above answers for the display the window is on at
+    /// attach; the window can move to one with another scale afterwards. The
+    /// unix side stores the new value here whenever its display-follow
+    /// reconciliation derives one, so the PE-side cursor upscale picks it up
+    /// without a second thunk. Backed by a static in the PE image rather than
+    /// a device-owned allocation: the reconciliation runs on the `AppKit`
+    /// main thread, outside any thunk, so it cannot be ordered against a
+    /// device teardown. `0` disables the republish.
+    pub backing_scale_ptr: u64, // in: *const AtomicU32 (PE static, process lifetime)
 }
 
 impl Thunk for AttachMetalLayerParams {

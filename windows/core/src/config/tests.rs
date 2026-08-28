@@ -214,6 +214,28 @@ fn cursor_scale_garbage_keeps_default() {
 }
 
 #[test]
+fn cursor_scale_auto_follows_the_display() {
+    // Resolved again on every display move, so both readings of the same
+    // policy have to answer for the display they were handed.
+    assert_eq!(CursorScale::Auto.resolve(1), 1);
+    assert_eq!(CursorScale::Auto.resolve(2), 2);
+}
+
+#[test]
+fn cursor_scale_override_ignores_the_display() {
+    assert_eq!(CursorScale::Fixed(3).resolve(1), 3);
+    assert_eq!(CursorScale::Fixed(3).resolve(2), 3);
+}
+
+#[test]
+fn cursor_scale_resolves_into_the_hcursor_range() {
+    assert_eq!(CursorScale::Auto.resolve(0), 1);
+    assert_eq!(CursorScale::Auto.resolve(99), 8);
+    assert_eq!(CursorScale::Fixed(0).resolve(2), 1);
+    assert_eq!(CursorScale::Fixed(99).resolve(2), 8);
+}
+
+#[test]
 fn color_space_accepts_both_policies_case_insensitive() {
     let cfg = parse(None, "color.space = accurate\n", None);
     assert_eq!(cfg.color_space, ColorSpacePolicy::Accurate);
