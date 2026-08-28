@@ -401,6 +401,21 @@ pub struct UploadPassTarget {
     pub rect: (u32, u32, u32, u32),
 }
 
+/// The two ends of a depth resolve and how it reduces the samples.
+///
+/// `size` is the source level's extent, which the destination shares: a
+/// resolve neither scales nor sub-rects. `source_is_sampleable` marks a source
+/// something also reads as a texture, which keeps its store action alive under
+/// Rule B.
+pub struct DepthResolve {
+    pub source: MetalHandle<MTLTextureKind>,
+    pub level: u32,
+    pub size: (u32, u32),
+    pub destination: MetalHandle<MTLTextureKind>,
+    pub filter: DepthResolveFilter,
+    pub source_is_sampleable: bool,
+}
+
 impl PassColorAttachment {
     /// The unbound attachment.
     pub const NONE: Self = Self {
@@ -4279,9 +4294,9 @@ impl PassState {
     /// Rule E's Clear into it. Bail on any intervening pass that reads
     /// the target as a fragment sampler input, as a blit source, or
     /// attaches it with `Clear` itself (that pass already overwrites
-    /// whatever we'd move), and on any intervening leading blit that
-    /// writes the target: the copy landed after the clear, so a clear moved
-    /// past it would wipe it.
+    /// whatever we'd move), and on any intervening leading blit or depth
+    /// resolve that writes the target: the copy landed after the clear, so a
+    /// clear moved past it would wipe it.
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
@@ -4318,6 +4333,11 @@ impl PassState {
             }
             if (needs_depth || needs_stencil) && blit_list_writes(&cand.leading_blits, target_depth)
             {
+                return None;
+            }
+            // A depth resolve into the target writes it the same way a blit
+            // does, and is ordered after our clear for the same reason.
+            if (needs_depth || needs_stencil) && cand.depth_resolve_texture == target_depth {
                 return None;
             }
             // Render targets 1..3 travel as a set: only a candidate with
@@ -4667,24 +4687,52 @@ impl PassState {
 
     /// Resolve the bound multisampled depth attachment into `destination`.
     ///
-    /// Metal has no depth resolve on the blit encoder, so the resolve is a
-    /// render pass of its own: the multisampled depth attachment loaded, no
-    /// draws, and a store action that also writes the single-sample
-    /// destination. Colour is left unattached, so the pass touches nothing
-    /// else. The caller ends the pass that produced the depth first, which
-    /// puts the resolve in the command stream where D3D9 asked for it.
-    ///
-    /// `destination` joins the blit-written set, so a later pass that binds it
-    /// loads the resolved content instead of discarding it under Rule A, and
-    /// the pass stays out of the dead-pass rules through
-    /// `depth_resolve_texture`. Returns `false` with nothing recorded when no
-    /// depth attachment is bound.
+    /// The RESZ shape of [`Self::resolve_depth_texture`]: the source is
+    /// whatever `SetDepthStencilSurface` last bound, at its own level and
+    /// extent. Returns `false` with nothing recorded when no depth attachment
+    /// is bound.
     pub fn resolve_depth_attachment(
         &mut self,
         destination: MetalHandle<MTLTextureKind>,
         filter: DepthResolveFilter,
     ) -> bool {
-        if self.current_depth_texture.is_null() || destination.is_null() {
+        let sampleable = self
+            .current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE);
+        self.resolve_depth_texture(&DepthResolve {
+            source: self.current_depth_texture,
+            level: self.current_depth_level,
+            size: self.current_depth_size,
+            destination,
+            filter,
+            source_is_sampleable: sampleable,
+        })
+    }
+
+    /// Resolve one multisampled depth texture into a single-sample one.
+    ///
+    /// Metal has no depth resolve on the blit encoder, so the resolve is a
+    /// render pass of its own: the multisampled depth texture loaded, no
+    /// draws, and a store action that also writes the single-sample
+    /// destination. Colour is left unattached, so the pass touches nothing
+    /// else. It goes in after the passes recorded so far, which is where D3D9
+    /// asked for it, and the pass open at the time ends first.
+    ///
+    /// The destination joins the blit-written set, so a later pass that binds
+    /// it loads the resolved content instead of discarding it under Rule A,
+    /// and the pass stays out of the dead-pass rules through
+    /// `depth_resolve_texture`. Returns `false` with nothing recorded when
+    /// either end is null.
+    pub fn resolve_depth_texture(&mut self, resolve: &DepthResolve) -> bool {
+        let &DepthResolve {
+            source,
+            level,
+            size: (width, height),
+            destination,
+            filter,
+            source_is_sampleable,
+        } = resolve;
+        if source.is_null() || destination.is_null() {
             return false;
         }
         self.end_current_pass("depth-resolve");
@@ -4692,7 +4740,6 @@ impl PassState {
             .command_vec_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(64));
-        let (width, height) = self.current_depth_size;
         self.passes.push(Pass {
             color_texture: MetalHandle::NULL,
             color_srgb_texture: MetalHandle::NULL,
@@ -4704,8 +4751,8 @@ impl PassState {
             color_format: self.current_color_format,
             color_load: ColorLoad::DontCare,
             color_store: StoreAction::DontCare,
-            depth_texture: self.current_depth_texture,
-            depth_level: self.current_depth_level,
+            depth_texture: source,
+            depth_level: level,
             depth_load: DepthLoad::Load,
             stencil_load: StencilLoad::Load,
             depth_store: StoreAction::Store,
@@ -4717,17 +4764,14 @@ impl PassState {
             // before the resolve still runs before it.
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
-            depth_is_sampleable: self
-                .current_attachments
-                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            depth_is_sampleable: source_is_sampleable,
             color_writes_observed: false,
             color_clear_quad_ranges: Vec::new(),
             extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
         });
         self.current_pass_closed = true;
-        self.seen_depth_rts.insert(self.current_depth_texture);
-        self.seen_depth_rts_segment
-            .insert(self.current_depth_texture);
+        self.seen_depth_rts.insert(source);
+        self.seen_depth_rts_segment.insert(source);
         self.blit_written_rts.insert(destination);
         true
     }

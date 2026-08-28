@@ -27,9 +27,9 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::PageBox,
     passes::{
-        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, ExtraColorSlot, LastBoundCache,
-        Pass, PassState, StencilClearOutcome, StencilLoad, StoreAction as PassStoreAction,
-        UploadPassTarget,
+        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
+        LastBoundCache, Pass, PassState, StencilClearOutcome, StencilLoad,
+        StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -2837,6 +2837,47 @@ impl FrameEncoder {
             dst_slice: 0,
             src_slice: 0,
         });
+    }
+
+    /// Resolve one multisampled depth surface into a single-sampled one.
+    ///
+    /// The multisample arm of the depth-to-depth `StretchRect`: D3D9 resolves
+    /// the samples on a copy that leaves a multisampled surface, and Metal
+    /// takes a depth resolve on a render pass rather than on the blit encoder,
+    /// which refuses a sample-count change outright. Both handles address the
+    /// whole surface at the same extent and depth format, which the caller has
+    /// established. Sample zero is the reduction: D3D9 defines no filter for
+    /// this and it is what the hardware the copy was written for delivers.
+    pub fn resolve_depth_surface(
+        &mut self,
+        src: MetalHandle<MTLTextureKind>,
+        dst: MetalHandle<MTLTextureKind>,
+        width: u32,
+        height: u32,
+    ) {
+        let resolved = self.pass_state.resolve_depth_texture(&DepthResolve {
+            source: src,
+            level: 0,
+            size: (width, height),
+            destination: dst,
+            filter: DepthResolveFilter::Sample0,
+            source_is_sampleable: false,
+        });
+        if resolved {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "StretchRect: resolving a multisampled {width}x{height} depth surface \
+                 into a single-sampled one"
+            );
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "StretchRect: depth resolve skipped, source or destination texture unresolved \
+                 (src={:#x}, dst={:#x})",
+                src.raw(),
+                dst.raw()
+            );
+        }
     }
 
     /// Copy one depth texture's contents into another (`depth.aliasSameSize`).

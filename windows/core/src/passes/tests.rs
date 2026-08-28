@@ -4546,3 +4546,84 @@ fn a_resz_resolve_without_a_bound_depth_attachment_records_nothing() {
     assert!(!s.resolve_depth_attachment(tex(0x4003), DepthResolveFilter::Sample0));
     assert_eq!(s.passes().len(), passes_before, "no pass is synthesised");
 }
+
+#[test]
+fn a_depth_resolve_takes_a_source_that_is_not_the_bound_attachment() {
+    // The depth-to-depth `StretchRect` names both of its surfaces, and neither
+    // has to be the one `SetDepthStencilSurface` last bound.
+    let source = tex(0x4004);
+    let destination = tex(0x4005);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    assert!(s.resolve_depth_texture(&DepthResolve {
+        source,
+        level: 0,
+        size: BB_SIZE,
+        destination,
+        filter: DepthResolveFilter::Sample0,
+        source_is_sampleable: false,
+    }));
+
+    let resolve = s.passes().last().expect("the resolve pass");
+    assert_eq!(
+        resolve.depth_texture(),
+        source,
+        "the pass reads the surface the copy named"
+    );
+    assert_ne!(
+        resolve.depth_texture(),
+        depth(),
+        "and not the bound attachment"
+    );
+    assert_eq!(resolve.depth_resolve_texture(), destination);
+}
+
+#[test]
+fn a_clear_only_pass_does_not_fold_past_a_depth_resolve_into_its_target() {
+    // Clear(ds) → resolve into ds → depth-test against ds. Rule E may not move
+    // the clear into the last pass's load action: the resolve lands between
+    // them, and a clear moved past it would wipe what it wrote.
+    let other_rt = tex(0x3000);
+    let source = tex(0x4006);
+    let resolved = tex(0x4007);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(resolved, BB_SIZE, false, false);
+    s.clear_depth(f32::to_bits(1.0));
+    // Switching the target materialises the clear as a pass of its own.
+    s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    assert!(s.resolve_depth_texture(&DepthResolve {
+        source,
+        level: 0,
+        size: BB_SIZE,
+        destination: resolved,
+        filter: DepthResolveFilter::Sample0,
+        source_is_sampleable: false,
+    }));
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(resolved, BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    assert_eq!(
+        s.passes().len(),
+        4,
+        "the clear-only pass stays where it was"
+    );
+    assert!(
+        matches!(s.passes()[0].depth_load(), DepthLoad::Clear { .. }),
+        "the clear lands before the resolve"
+    );
+    assert!(
+        matches!(s.passes()[3].depth_load(), DepthLoad::Load),
+        "the draw after the resolve loads what it wrote"
+    );
+}

@@ -109,7 +109,6 @@
   visual.c:15824 count=8
   visual.c:15829 count=12
   visual.c:16433 count=2
-  visual.c:17476 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
   visual.c:19232 count=1
@@ -232,7 +231,6 @@
   visual.c:15824 count=8
   visual.c:15829 count=12
   visual.c:16433 count=2
-  visual.c:17476 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
   visual.c:19232 count=1
