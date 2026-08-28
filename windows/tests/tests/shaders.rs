@@ -120,7 +120,7 @@ fn user_shader_constant_drives_color() {
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
 }
 
-/// `vs_2_0`: `dcl_position v0; add oPos, v0, c0;` — translate by VS constant c0.
+/// `vs_2_0`: `dcl_position v0; add oPos, v0, c0;`, translate by VS constant c0.
 const VS_TRANSLATE: [u32; 9] = [
     0xFFFE_0200,
     (31) | (2 << 24),
@@ -652,7 +652,7 @@ fn depth_writing_ps_draws_without_a_depth_buffer() {
 ///
 /// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
 /// def c4, 0.5, 0.5, 0, 0; mov o0, v0; texldl r0, c4, s0; mov o1, r0;`
-/// The fetch coordinate is `c4` — center of the texture, LOD 0 from `.w`.
+/// The fetch coordinate is `c4`, the center of the texture, LOD 0 from `.w`.
 #[rustfmt::skip]
 const VS_FETCH: [u32; 27] = [
     0xFFFE_0300,                                        // vs_3_0
@@ -667,7 +667,7 @@ const VS_FETCH: [u32; 27] = [
     0x0000_FFFF,                                        // end (o1 write below)
 ];
 
-/// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }` — pass the VS color through.
+/// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }`, pass the VS color through.
 #[rustfmt::skip]
 const PS_COLOR_PASSTHROUGH: [u32; 8] = [
     0xFFFF_0300,                                        // ps_3_0
