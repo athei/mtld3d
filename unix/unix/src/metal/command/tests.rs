@@ -1,12 +1,21 @@
-//! Unit tests for present routing and the geometry settle filter.
+//! Unit tests for present routing, the geometry settle filter and the blit copy guard.
 //!
 //! `present_route` is checked across the geometries a present can produce: equal extents
 //! copy, an enlargement in both axes reaches `MetalFX` only if it exists, and anything
 //! else falls to the stretch shader. The settle tests pin the other half of the decision,
 //! that a scaler is spent on a geometry that held still rather than on a ratio, which is
 //! what keeps a window drag from building one scaler per frame.
+//!
+//! `copy_texture_reject` is checked against each condition Metal validates on
+//! `copyFromTexture:`, plus the pairs it accepts: an identical pair, a sub-rect inside a
+//! mip level, and a linear format against its sRGB twin.
 
-use super::{PresentGeometry, PresentRoute, SETTLED_PRESENTS, geometry_settled, present_route};
+use objc2_metal::MTLPixelFormat;
+
+use super::{
+    CopyEndpoint, CopyRejectReason, PresentGeometry, PresentRoute, SETTLED_PRESENTS,
+    copy_texture_reject, geometry_settled, present_route,
+};
 
 /// Matching extents take the blit whether or not `MetalFX` exists.
 #[test]
@@ -168,4 +177,146 @@ fn a_changed_geometry_restarts_the_count() {
         SETTLED_PRESENTS <= 2,
         "returning to a geometry starts its count over, it does not resume"
     );
+}
+
+/// A square `BGRA8` texture with one mip level, copied from its origin.
+fn endpoint(size: usize) -> CopyEndpoint {
+    CopyEndpoint {
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        sample_count: 1,
+        width: size,
+        height: size,
+        level: 0,
+        levels: 1,
+        origin_x: 0,
+        origin_y: 0,
+    }
+}
+
+/// A pair that agrees on everything copies.
+#[test]
+fn a_matching_pair_is_accepted() {
+    assert_eq!(
+        copy_texture_reject(&endpoint(256), &endpoint(256), 256, 256),
+        None
+    );
+}
+
+/// Differing sample counts are the case the RESZ resolve exists for.
+#[test]
+fn a_sample_count_change_is_rejected() {
+    let mut src = endpoint(256);
+    src.sample_count = 4;
+    assert_eq!(
+        copy_texture_reject(&src, &endpoint(256), 256, 256),
+        Some(CopyRejectReason::SampleCountMismatch)
+    );
+}
+
+/// Two unrelated formats of the same size are still a reject.
+#[test]
+fn a_format_change_is_rejected() {
+    let mut dst = endpoint(256);
+    dst.pixel_format = MTLPixelFormat::RGBA8Unorm;
+    assert_eq!(
+        copy_texture_reject(&endpoint(256), &dst, 256, 256),
+        Some(CopyRejectReason::FormatMismatch)
+    );
+}
+
+/// A linear format and its sRGB twin are two views of one base format.
+#[test]
+fn an_srgb_twin_is_accepted_in_either_direction() {
+    let mut srgb = endpoint(256);
+    srgb.pixel_format = MTLPixelFormat::BGRA8Unorm_sRGB;
+    assert_eq!(copy_texture_reject(&endpoint(256), &srgb, 256, 256), None);
+    assert_eq!(copy_texture_reject(&srgb, &endpoint(256), 256, 256), None);
+}
+
+/// The format check runs before the sample-count check, so it reports first.
+#[test]
+fn a_pair_that_differs_in_both_reports_the_format() {
+    let mut src = endpoint(256);
+    src.pixel_format = MTLPixelFormat::RGBA8Unorm;
+    src.sample_count = 4;
+    assert_eq!(
+        copy_texture_reject(&src, &endpoint(256), 256, 256),
+        Some(CopyRejectReason::FormatMismatch)
+    );
+}
+
+/// The region is bounds-checked against the source as well as the destination.
+#[test]
+fn a_region_leaving_either_end_is_rejected() {
+    assert_eq!(
+        copy_texture_reject(&endpoint(128), &endpoint(256), 256, 256),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+    assert_eq!(
+        copy_texture_reject(&endpoint(256), &endpoint(128), 256, 256),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+}
+
+/// The origin counts towards the bound, so a sub-rect can still overrun.
+#[test]
+fn an_offset_sub_rect_is_bounded_by_the_origin() {
+    let mut src = endpoint(256);
+    src.origin_x = 128;
+    src.origin_y = 128;
+    assert_eq!(copy_texture_reject(&src, &endpoint(256), 128, 128), None);
+    assert_eq!(
+        copy_texture_reject(&src, &endpoint(256), 129, 128),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+}
+
+/// Bounds are the addressed mip level's extent, not the base level's.
+#[test]
+fn the_bound_is_the_addressed_mip_level() {
+    let mut src = endpoint(256);
+    src.levels = 9;
+    src.level = 2;
+    let mut dst = endpoint(64);
+    dst.levels = 7;
+    assert_eq!(copy_texture_reject(&src, &dst, 64, 64), None);
+    assert_eq!(
+        copy_texture_reject(&src, &dst, 65, 64),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+}
+
+/// A level past the end of either chain has no extent to copy through.
+#[test]
+fn a_missing_mip_level_is_rejected() {
+    let mut src = endpoint(256);
+    src.level = 1;
+    assert_eq!(
+        copy_texture_reject(&src, &endpoint(256), 1, 1),
+        Some(CopyRejectReason::SourceLevelMissing)
+    );
+    let mut dst = endpoint(256);
+    dst.level = 1;
+    assert_eq!(
+        copy_texture_reject(&endpoint(256), &dst, 1, 1),
+        Some(CopyRejectReason::DestinationLevelMissing)
+    );
+}
+
+/// Each reason keys its own one-shot warn.
+#[test]
+fn every_reject_reason_has_a_distinct_key() {
+    let reasons = [
+        CopyRejectReason::FormatMismatch,
+        CopyRejectReason::SampleCountMismatch,
+        CopyRejectReason::SourceLevelMissing,
+        CopyRejectReason::DestinationLevelMissing,
+        CopyRejectReason::SourceRegionOutOfBounds,
+        CopyRejectReason::DestinationRegionOutOfBounds,
+    ];
+    let mut keys: Vec<u64> = reasons.iter().map(|r| r.key()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), reasons.len());
+    assert!(reasons.iter().all(|r| !r.as_str().is_empty()));
 }

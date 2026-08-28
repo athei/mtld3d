@@ -43,6 +43,7 @@ unix/shared/src/params.rs StencilFaceParams Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy
 unix/unix/src/metal/clear_quad.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 unix/unix/src/metal/command.rs BlitSite Clone,Copy
+unix/unix/src/metal/command.rs CopyRejectReason Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/command.rs PresentGeometry Clone,Copy,PartialEq,Eq
 unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq

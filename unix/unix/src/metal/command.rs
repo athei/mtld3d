@@ -36,7 +36,7 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
     LOG_TARGET,
-    metal::{handle::IntoRetained, null_texture},
+    metal::{handle::IntoRetained, null_texture, texture::mtl_pixel_format},
 };
 
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
@@ -1159,6 +1159,163 @@ const fn pixel_format_supports_mipgen(fmt: MTLPixelFormat) -> bool {
     )
 }
 
+/// Why Metal would refuse a texture-to-texture blit.
+///
+/// `copyFromTexture:` validates every one of these itself: under
+/// `MTL_DEBUG_LAYER` a violation aborts the process, and without the layer
+/// the copy is undefined. The blit encoder tests them first and skips the
+/// copy, so a caller that sends a mismatched pair loses one copy rather than
+/// the process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyRejectReason {
+    /// The pixel formats are neither equal nor a linear/sRGB twin pair.
+    FormatMismatch,
+    /// The sample counts differ, which a blit copy cannot resolve.
+    SampleCountMismatch,
+    /// The source texture has no such mip level.
+    SourceLevelMissing,
+    /// The destination texture has no such mip level.
+    DestinationLevelMissing,
+    /// The region leaves the addressed source mip level.
+    SourceRegionOutOfBounds,
+    /// The region leaves the addressed destination mip level.
+    DestinationRegionOutOfBounds,
+}
+
+impl CopyRejectReason {
+    /// Stable `u64` key so `log_once_warn_by!` fires once per reason.
+    ///
+    /// Keying on the discriminant keeps the reasons distinct instead of
+    /// collapsing every later rejection into the first one seen.
+    const fn key(self) -> u64 {
+        self as u64
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FormatMismatch => "source and destination pixel formats are incompatible",
+            Self::SampleCountMismatch => "source and destination sample counts differ",
+            Self::SourceLevelMissing => "the source has no such mip level",
+            Self::DestinationLevelMissing => "the destination has no such mip level",
+            Self::SourceRegionOutOfBounds => "the region leaves the source mip level",
+            Self::DestinationRegionOutOfBounds => "the region leaves the destination mip level",
+        }
+    }
+}
+
+/// One end of a texture-to-texture blit, as the live `MTLTexture` describes it.
+///
+/// `width` and `height` are the base level's, `level` the mip level the copy
+/// addresses and `levels` the texture's level count, so the addressed extent
+/// is derived here rather than passed in alongside them.
+struct CopyEndpoint {
+    pixel_format: MTLPixelFormat,
+    sample_count: usize,
+    width: usize,
+    height: usize,
+    level: usize,
+    levels: usize,
+    origin_x: usize,
+    origin_y: usize,
+}
+
+impl CopyEndpoint {
+    /// Extent of the addressed mip level, or `None` when it does not exist.
+    const fn level_extent(&self) -> Option<(usize, usize)> {
+        if self.level >= self.levels {
+            return None;
+        }
+        let w = self.width >> self.level;
+        let h = self.height >> self.level;
+        Some((if w == 0 { 1 } else { w }, if h == 0 { 1 } else { h }))
+    }
+}
+
+impl core::fmt::Display for CopyEndpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{:?} samples={} level={}/{} origin={},{} size={}x{}",
+            self.pixel_format,
+            self.sample_count,
+            self.level,
+            self.levels,
+            self.origin_x,
+            self.origin_y,
+            self.width,
+            self.height
+        )
+    }
+}
+
+/// The sRGB-encoded twin of a pixel format the wire enum covers.
+fn srgb_twin_of(format: MTLPixelFormat) -> Option<MTLPixelFormat> {
+    let raw = u32::try_from(format.0).ok()?;
+    Some(mtl_pixel_format(PixelFormat::from_repr(raw)?.srgb_twin()?))
+}
+
+/// Whether `copyFromTexture:` accepts a copy between these two pixel formats.
+///
+/// Equal formats always. A linear format and its sRGB twin are the one
+/// unequal pair Metal accepts, being two encodings of one base format, and
+/// mtld3d creates an sRGB view next to every colour texture that has one.
+fn pixel_formats_copy_compatible(src: MTLPixelFormat, dst: MTLPixelFormat) -> bool {
+    if src == dst {
+        return true;
+    }
+    if srgb_twin_of(src) == Some(dst) {
+        return true;
+    }
+    srgb_twin_of(dst) == Some(src)
+}
+
+/// Whether a region placed at `origin` stays inside `extent`.
+const fn region_fits(
+    origin: (usize, usize),
+    region: (usize, usize),
+    extent: (usize, usize),
+) -> bool {
+    match (
+        origin.0.checked_add(region.0),
+        origin.1.checked_add(region.1),
+    ) {
+        (Some(right), Some(bottom)) => right <= extent.0 && bottom <= extent.1,
+        _ => false,
+    }
+}
+
+/// Reject a texture-to-texture copy `copyFromTexture:` would not accept.
+///
+/// `None` means the pair is copyable. One region serves both ends because a
+/// blit copy cannot resize, so it is bounds-checked against each of them.
+fn copy_texture_reject(
+    src: &CopyEndpoint,
+    dst: &CopyEndpoint,
+    region_w: usize,
+    region_h: usize,
+) -> Option<CopyRejectReason> {
+    if !pixel_formats_copy_compatible(src.pixel_format, dst.pixel_format) {
+        return Some(CopyRejectReason::FormatMismatch);
+    }
+    if src.sample_count != dst.sample_count {
+        return Some(CopyRejectReason::SampleCountMismatch);
+    }
+    let Some(src_extent) = src.level_extent() else {
+        return Some(CopyRejectReason::SourceLevelMissing);
+    };
+    let Some(dst_extent) = dst.level_extent() else {
+        return Some(CopyRejectReason::DestinationLevelMissing);
+    };
+    let region = (region_w, region_h);
+    if !region_fits((src.origin_x, src.origin_y), region, src_extent) {
+        return Some(CopyRejectReason::SourceRegionOutOfBounds);
+    }
+    if !region_fits((dst.origin_x, dst.origin_y), region, dst_extent) {
+        return Some(CopyRejectReason::DestinationRegionOutOfBounds);
+    }
+    None
+}
+
 /// Replay the frame's leading blit commands inside a single `MTLBlitCommandEncoder`.
 ///
 /// Runs before any render pass. Preserves ordering between
@@ -1308,6 +1465,47 @@ fn encode_leading_blits(
                 // are unaffected.
                 let dst_x = (cmd.dst_offset & 0xFFFF_FFFF) as usize;
                 let dst_y = ((cmd.dst_offset >> 32) & 0xFFFF_FFFF) as usize;
+                let src_endpoint = CopyEndpoint {
+                    pixel_format: src.pixelFormat(),
+                    sample_count: src.sampleCount(),
+                    width: src.width(),
+                    height: src.height(),
+                    level: cmd.mip_level as usize,
+                    levels: src.mipmapLevelCount(),
+                    origin_x: cmd.origin_x as usize,
+                    origin_y: cmd.origin_y as usize,
+                };
+                let dst_endpoint = CopyEndpoint {
+                    pixel_format: dst.pixelFormat(),
+                    sample_count: dst.sampleCount(),
+                    width: dst.width(),
+                    height: dst.height(),
+                    level: cmd.dst_mip_level as usize,
+                    levels: dst.mipmapLevelCount(),
+                    origin_x: dst_x,
+                    origin_y: dst_y,
+                };
+                let region_w = cmd.region_w;
+                let region_h = cmd.region_h;
+                if let Some(reason) = copy_texture_reject(
+                    &src_endpoint,
+                    &dst_endpoint,
+                    region_w as usize,
+                    region_h as usize,
+                ) {
+                    let reason_text = reason.as_str();
+                    let src_handle = cmd.src_handle;
+                    let dst_handle = cmd.dst_handle;
+                    mtld3d_shared::log_once_warn_by!(
+                        target: crate::LOG_TARGET,
+                        key: reason.key(),
+                        "encode_leading_blits: {reason_text}, copy skipped. \
+                         src handle={src_handle:#x} {src_endpoint}, \
+                         dst handle={dst_handle:#x} {dst_endpoint}, \
+                         region {region_w}x{region_h}"
+                    );
+                    continue;
+                }
                 mtld3d_shared::crumb!("blit:tex2tex", cmd.src_handle, cmd.dst_handle);
                 // SAFETY: objc2 typed binding; `src`/`dst` are retained Metal
                 // textures live for the call; geometry comes from a packed
