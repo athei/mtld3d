@@ -7,10 +7,49 @@ use mtld3d_types::{
     D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
     D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
     D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DUSAGE_QUERY_FILTER,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
+
+// Usage bits `usage_allowed_for_rtype` weighs. The named D3D9 usage flags
+// outside this set are the ones the runtime strips before it validates:
+// `D3DUSAGE_WRITEONLY` is a lock hint rather than a capability question, and
+// `D3DUSAGE_NONSECURE` belongs to the protected-content path.
+const VALIDATED_USAGE: u32 = D3DUSAGE_RENDERTARGET
+    | D3DUSAGE_DEPTHSTENCIL
+    | D3DUSAGE_SOFTWAREPROCESSING
+    | D3DUSAGE_DONOTCLIP
+    | D3DUSAGE_POINTS
+    | D3DUSAGE_RTPATCHES
+    | D3DUSAGE_NPATCHES
+    | D3DUSAGE_DYNAMIC
+    | D3DUSAGE_AUTOGENMIPMAP
+    | D3DUSAGE_DMAP
+    | D3DUSAGE_QUERY_LEGACYBUMPMAP
+    | D3DUSAGE_QUERY_SRGBREAD
+    | D3DUSAGE_QUERY_FILTER
+    | D3DUSAGE_QUERY_SRGBWRITE
+    | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
+    | D3DUSAGE_QUERY_VERTEXTEXTURE
+    | D3DUSAGE_QUERY_WRAPANDMIP;
+
+// The usage a resource type expresses only while it can be bound as a shader
+// resource: every sampling question, plus the two create hints that only a
+// texture pool honours.
+const SAMPLED_USAGE: u32 = D3DUSAGE_DYNAMIC
+    | D3DUSAGE_SOFTWAREPROCESSING
+    | D3DUSAGE_QUERY_FILTER
+    | D3DUSAGE_QUERY_SRGBREAD
+    | D3DUSAGE_QUERY_SRGBWRITE
+    | D3DUSAGE_QUERY_VERTEXTEXTURE
+    | D3DUSAGE_QUERY_WRAPANDMIP;
 
 pub struct FormatMapping {
     metal_pixel_format: PixelFormat,
@@ -296,6 +335,65 @@ pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering
             d3d_format,
             D3DFMT_R32F | D3DFMT_G32R32F | D3DFMT_A32B32G32R32F
         )
+}
+
+/// Whether a `CheckDeviceFormat` query on `rtype` may carry `usage`.
+///
+/// D3D9 weighs the usage bits against the resource type before it looks at the
+/// format at all: a type expresses only the bits its resources can be created
+/// or bound with, and a query carrying any other bit answers
+/// `D3DERR_NOTAVAILABLE` whatever the format is. The group that separates the
+/// types is the sampling one (`QUERY_FILTER`, `QUERY_SRGBREAD`,
+/// `QUERY_VERTEXTEXTURE`, `QUERY_WRAPANDMIP`, plus the `DYNAMIC` and
+/// `SOFTWAREPROCESSING` create hints): it presumes a shader-resource binding,
+/// so a plain `D3DRTYPE_SURFACE` cannot answer yes to any of it. A surface
+/// keeps `RENDERTARGET`, `DEPTHSTENCIL` and `QUERY_POSTPIXELSHADER_BLENDING`,
+/// and gains `QUERY_SRGBWRITE` only next to `RENDERTARGET`, the encode being a
+/// property of the render pass rather than of the surface.
+///
+/// Bits outside `VALIDATED_USAGE` ride through a query without affecting the
+/// answer, and an unrecognised `rtype` allows nothing.
+#[must_use]
+pub const fn usage_allowed_for_rtype(usage: u32, rtype: u32) -> bool {
+    let allowed = match rtype {
+        D3DRTYPE_SURFACE => {
+            let base = D3DUSAGE_RENDERTARGET
+                | D3DUSAGE_DEPTHSTENCIL
+                | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING;
+            if usage & D3DUSAGE_RENDERTARGET == 0 {
+                base
+            } else {
+                base | D3DUSAGE_QUERY_SRGBWRITE
+            }
+        }
+        D3DRTYPE_TEXTURE => {
+            D3DUSAGE_RENDERTARGET
+                | D3DUSAGE_DEPTHSTENCIL
+                | D3DUSAGE_AUTOGENMIPMAP
+                | D3DUSAGE_QUERY_LEGACYBUMPMAP
+                | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
+                | SAMPLED_USAGE
+        }
+        // A cube map has no depth-stencil binding, and the legacy bump-map
+        // question is asked of 2D textures only.
+        D3DRTYPE_CUBETEXTURE => {
+            D3DUSAGE_RENDERTARGET
+                | D3DUSAGE_AUTOGENMIPMAP
+                | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
+                | SAMPLED_USAGE
+        }
+        // A volume is sampled only: no render-target or depth binding, and no
+        // mip generation.
+        D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE => {
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING | SAMPLED_USAGE
+        }
+        // A buffer expresses one capability bit; the vertex-processing hints
+        // it also accepts at creation (POINTS, NPATCHES, DONOTCLIP) are not
+        // questions about the format.
+        D3DRTYPE_VERTEXBUFFER | D3DRTYPE_INDEXBUFFER => D3DUSAGE_DYNAMIC,
+        _ => 0,
+    };
+    (usage & VALIDATED_USAGE & !allowed) == 0
 }
 
 #[must_use]

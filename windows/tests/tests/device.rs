@@ -15,8 +15,9 @@ use mtld3d_types::{
     D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
@@ -166,6 +167,64 @@ fn check_device_format_accept_and_reject() {
         ),
         D3D_OK,
         "cube render-target autogen query agrees with creation",
+    );
+}
+
+#[test]
+fn surface_queries_reject_the_sampling_only_usage_bits() {
+    // A query may only carry the usage its resource type expresses. A plain
+    // D3DRTYPE_SURFACE is never bound as a shader resource, so every
+    // sampling-only bit answers NOTAVAILABLE on one whatever the format,
+    // while the same probe on a D3DRTYPE_TEXTURE answers on the format.
+    let h = Harness::factory_only();
+    for (usage, name) in [
+        (D3DUSAGE_QUERY_FILTER, "QUERY_FILTER"),
+        (D3DUSAGE_QUERY_SRGBREAD, "QUERY_SRGBREAD"),
+        (D3DUSAGE_QUERY_VERTEXTEXTURE, "QUERY_VERTEXTEXTURE"),
+        (D3DUSAGE_QUERY_WRAPANDMIP, "QUERY_WRAPANDMIP"),
+        (D3DUSAGE_DYNAMIC, "DYNAMIC"),
+    ] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, usage, D3DRTYPE_SURFACE, D3DFMT_A8R8G8B8),
+            D3DERR_NOTAVAILABLE,
+            "{name} is not a question a plain surface can answer",
+        );
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, usage, D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8),
+            D3D_OK,
+            "{name} on a sampled texture answers on the format",
+        );
+    }
+    // The bits a surface does express keep their answers: the two bindings,
+    // the blend question, and the sRGB encode beside a render target.
+    for (usage, name) in [
+        (D3DUSAGE_RENDERTARGET, "RENDERTARGET"),
+        (
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            "QUERY_POSTPIXELSHADER_BLENDING",
+        ),
+        (
+            D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+            "RENDERTARGET | QUERY_SRGBWRITE",
+        ),
+    ] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, usage, D3DRTYPE_SURFACE, D3DFMT_A8R8G8B8),
+            D3D_OK,
+            "{name} stays advertised for a surface",
+        );
+    }
+    // SRGBWRITE describes the render pass, so on its own it is not a
+    // surface question.
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DRTYPE_SURFACE,
+            D3DFMT_A8R8G8B8
+        ),
+        D3DERR_NOTAVAILABLE,
+        "SRGBWRITE without RENDERTARGET is not a surface question",
     );
 }
 
