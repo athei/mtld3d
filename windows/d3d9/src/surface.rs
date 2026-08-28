@@ -2618,9 +2618,9 @@ const fn dc_format_info(d3d_format: u32) -> Option<(u16, Option<[u32; 3]>)> {
 /// Pixel store + geometry a `GetDC` reads/writes.
 ///
 /// The surface's CPU pixels, its row pitch, and its dimensions. Resolved from
-/// the system-memory backing (offscreen-plain + cube-face shells) or the parent
-/// texture's level-0 staging (a `D3DPOOL_MANAGED` texture's `GetSurfaceLevel`
-/// surface).
+/// the system-memory backing (offscreen-plain + cube-face shells) or from a
+/// parent texture's per-level staging, whether the surface reaches that texture
+/// through `GetSurfaceLevel` or owns it (a `D3DPOOL_DEFAULT` offscreen plain).
 struct SurfacePixels {
     bits: *mut u8,
     width: u32,
@@ -2791,12 +2791,15 @@ impl SurfaceInner {
                 d3d_format: format,
             });
         }
-        if self.parent_texture.is_null() || self.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE) {
+        if self.parent_texture.is_null() {
             return None;
         }
-        // A texture sub-surface (`GetSurfaceLevel`): the pixels live in the
-        // parent texture's per-level CPU staging. `D3DPOOL_MANAGED` textures
-        // keep a permanent staging copy, which is what `GetDC` exposes.
+        // A texture-backed surface: the pixels live in the parent texture's
+        // per-level CPU staging. That covers a sub-surface from
+        // `GetSurfaceLevel` (a `D3DPOOL_MANAGED` texture keeps a permanent
+        // staging copy, which is what `GetDC` exposes) and a `D3DPOOL_DEFAULT`
+        // offscreen plain, whose single-level texture the surface owns and
+        // whose staging is likewise never released.
         // SAFETY: `parent_texture` is non-null (checked above) and points to a
         // live `Direct3DTexture9` whose refcount keeps it alive for as long as
         // this surface is live.
@@ -2833,14 +2836,13 @@ impl SurfaceInner {
 /// staging, or the staging went once its upload retired and its slot now points
 /// at the page every released level shares. A DC reads the level and keeps what
 /// GDI draws into it, so it takes the same GPU reads a `LockRect` of the level
-/// takes. A cube face is never released (a cube keeps its staging for the
-/// texture's life), and a surface that owns its parent texture has no pixels of
-/// its own to expose.
+/// takes. An offscreen plain reaches its level through the texture it owns and
+/// takes them the same way: a `StretchRect` or a `ColorFill` claims it exactly
+/// as it claims any other texture level. A cube face is skipped, never being
+/// released (a cube keeps its staging for the texture's life) and never being
+/// claimed.
 fn refill_dc_texture_level(inner: &SurfaceInner) {
-    if inner.parent_texture.is_null()
-        || inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
-        || inner.cube_face != u32::MAX
-    {
+    if inner.parent_texture.is_null() || inner.cube_face != u32::MAX {
         return;
     }
     // SAFETY: `parent_texture` is non-null (checked above) and points to a live
