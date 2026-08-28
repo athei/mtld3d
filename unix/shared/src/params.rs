@@ -2,9 +2,9 @@ use super::{
     Thunk, Thunks,
     mtl::{
         AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
-        ColorSpacePolicy, ColorWriteMask, CompareFunc, DestroyKind, DeviceCapsFlags, LoadAction,
-        MinMagFilter, MipFilter, PixelFormat, StageTag, StencilOp, StorageMode, StoreAction,
-        Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
+        ColorSpacePolicy, ColorWriteMask, CompareFunc, DepthResolveFilter, DestroyKind,
+        DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat, StageTag, StencilOp,
+        StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -48,7 +48,7 @@ const _: () = {
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
-    assert!(core::mem::size_of::<PassDescriptor>() == 200);
+    assert!(core::mem::size_of::<PassDescriptor>() == 216);
 };
 
 /// One-shot "register `env_logger` on the unix side" thunk.
@@ -572,8 +572,9 @@ impl Thunk for CompileShaderLibraryParams {
 /// `command_count == 0` is a "blit-only" trailing pass synthesised when
 /// `StretchRect` lands after the last draw of the frame.
 ///
-/// Fields are ordered u64s-first then u32s so the natural struct layout
-/// is padding-free on both 32- and 64-bit PE.
+/// Fields are ordered u64s-first then u32s, and the one odd u32 is followed by
+/// an explicit pad, so the layout carries no implicit padding on either PE
+/// architecture.
 #[repr(C, align(8))]
 pub struct PassDescriptor {
     pub color_texture: MetalHandle<MTLTextureKind>, // in
@@ -584,6 +585,13 @@ pub struct PassDescriptor {
     /// is the same D3D9 surface seen without multisampling.
     pub color_resolve_texture: MetalHandle<MTLTextureKind>, // in (NULL = no resolve)
     pub depth_texture: MetalHandle<MTLTextureKind>, // in (NULL = none)
+    /// Single-sample depth texture `depth_texture` resolves into, NULL for no resolve.
+    ///
+    /// Non-NULL only alongside a `depth_store_action` that carries a resolve.
+    /// It takes the depth attachment's own mip level, and only the depth plane
+    /// is resolved: the stencil half of a combined format keeps the plain
+    /// store action.
+    pub depth_resolve_texture: MetalHandle<MTLTextureKind>, // in (NULL = no resolve)
     pub commands_ptr: u64,                          // in: *const Command
     pub visibility_result_buffer: MetalHandle<MTLBufferKind>, // in (NULL = no visibility tracking)
     pub leading_blits_ptr: u64,                     // in: *const BlitCommand (0 = none)
@@ -618,6 +626,10 @@ pub struct PassDescriptor {
     /// Ordinary 2D level-zero passes therefore retain their previous 0/1
     /// value and the descriptor keeps its size.
     pub pass_flags: u32, // in
+    /// How the depth resolve reduces the samples; ignored without `depth_resolve_texture`.
+    pub depth_resolve_filter: DepthResolveFilter, // in
+    /// Keeps the struct free of implicit padding after the odd `u32`.
+    pub pad0: u32,
     /// Render targets 1..3 (`colorAttachments[1..=3]`); `texture` null = unbound.
     ///
     /// They share `clear_r..clear_a` with attachment 0 (a D3D9 `Clear` has

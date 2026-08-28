@@ -13,8 +13,8 @@ use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
     NullTextureKind, PassDescriptor, SubmitFrameParams,
     mtl::{
-        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
-        VisibilityResultMode,
+        BlockLayout, CullMode, DepthResolveFilter, IndexType, LoadAction, PixelFormat,
+        PrimitiveType, StoreAction, VisibilityResultMode,
     },
     mtl_handle::{
         MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
@@ -27,9 +27,9 @@ use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLDrawable, MTLIndexType,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize,
-    MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
+    MTLLoadAction, MTLMultisampleDepthResolveFilter, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResource, MTLResourceOptions,
+    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -1879,7 +1879,7 @@ fn encode_pass(
     // Blit-only trailing pass: synthesised by the PE side when a
     // StretchRect lands after the last draw of the frame. The leading
     // blits have already run above; there's nothing else to do.
-    if pass.color_texture.is_null() && pass.command_count == 0 {
+    if pass.color_texture.is_null() && pass.depth_texture.is_null() && pass.command_count == 0 {
         mtld3d_shared::crumb!("pass:blitonly", pass_idx as u64);
         return true;
     }
@@ -2026,6 +2026,21 @@ fn encode_pass(
             depth_attach.setTexture(Some(&depth_tex));
             depth_attach.setLevel(level as usize);
             depth_attach.setStoreAction(map_store_action(pass.depth_store_action));
+            if !pass.depth_resolve_texture.is_null() {
+                mtld3d_shared::crumb!("pass:depthres", pass.depth_resolve_texture.raw());
+                let Some(resolve) = pass.depth_resolve_texture.into_retained() else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_pass: depth resolve texture retain failed (handle={:#x})",
+                        pass.depth_resolve_texture,
+                    );
+                    return false;
+                };
+                depth_attach.setResolveTexture(Some(&resolve));
+                depth_attach.setResolveLevel(level as usize);
+                depth_attach
+                    .setDepthResolveFilter(map_depth_resolve_filter(pass.depth_resolve_filter));
+            }
             match pass.depth_load_action {
                 LoadAction::Clear => {
                     depth_attach.setLoadAction(MTLLoadAction::Clear);
@@ -2041,10 +2056,14 @@ fn encode_pass(
                 stencil_attach.setTexture(Some(&depth_tex));
                 stencil_attach.setLevel(level as usize);
                 // Stencil shares the depth attachment's storage on
-                // `Depth32Float_Stencil8`, so the store action mirrors
-                // depth — flipping one without the other would either
-                // be a Metal validation error or a redundant store.
-                stencil_attach.setStoreAction(map_store_action(pass.depth_store_action));
+                // `Depth32Float_Stencil8`, so the keep-or-drop half of the
+                // store action mirrors depth: flipping one without the other
+                // would either be a Metal validation error or a redundant
+                // store. The resolve half does not carry over, since it names
+                // a depth resolve texture and filter with no stencil
+                // counterpart.
+                stencil_attach
+                    .setStoreAction(map_store_action(pass.depth_store_action.without_resolve()));
                 match pass.stencil_load_action {
                     LoadAction::Clear => {
                         stencil_attach.setLoadAction(MTLLoadAction::Clear);
@@ -2577,6 +2596,15 @@ fn encode_pass(
     mtld3d_shared::crumb!("pass:endenc", pass_idx as u64);
     encoder.endEncoding();
     true
+}
+
+/// Translate a wire `DepthResolveFilter` to the corresponding Metal filter.
+const fn map_depth_resolve_filter(f: DepthResolveFilter) -> MTLMultisampleDepthResolveFilter {
+    match f {
+        DepthResolveFilter::Sample0 => MTLMultisampleDepthResolveFilter::Sample0,
+        DepthResolveFilter::Min => MTLMultisampleDepthResolveFilter::Min,
+        DepthResolveFilter::Max => MTLMultisampleDepthResolveFilter::Max,
+    }
 }
 
 /// Translate a wire `StoreAction` to the corresponding `MTLStoreAction`.

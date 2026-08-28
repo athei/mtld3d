@@ -6,7 +6,7 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{CullMode, PixelFormat, VERTEX_STREAM_SLOTS, VisibilityResultMode},
+    mtl::{CullMode, DepthResolveFilter, PixelFormat, VERTEX_STREAM_SLOTS, VisibilityResultMode},
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -640,6 +640,16 @@ pub struct Pass {
     /// back to device memory is wasted. The unix side mirrors this to the
     /// stencil attachment when the texture is `Depth32Float_Stencil8`.
     depth_store: StoreAction,
+    /// Single-sample depth texture this pass resolves `depth_texture` into.
+    ///
+    /// NULL on every ordinary pass. Set by
+    /// [`PassState::resolve_depth_attachment`] on the pass it synthesises for
+    /// the RESZ hack, the one place D3D9 asks for a depth surface's samples to
+    /// be resolved. `depth_store` still decides whether the multisample
+    /// content survives the pass; the resolve rides alongside it.
+    depth_resolve_texture: MetalHandle<MTLTextureKind>,
+    /// How the resolve reduces the samples; meaningless without `depth_resolve_texture`.
+    depth_resolve_filter: DepthResolveFilter,
     viewport: (u32, u32, u32, u32),
     commands: Vec<Command>,
     /// Blits replayed inside an `MTLBlitCommandEncoder` *before* this pass's render encoder begins.
@@ -845,6 +855,16 @@ impl Pass {
     #[must_use]
     pub const fn depth_store(&self) -> StoreAction {
         self.depth_store
+    }
+    /// Single-sample depth texture this pass resolves into, NULL for none.
+    #[must_use]
+    pub const fn depth_resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.depth_resolve_texture
+    }
+    /// How the depth resolve reduces the samples; meaningless without a resolve texture.
+    #[must_use]
+    pub const fn depth_resolve_filter(&self) -> DepthResolveFilter {
+        self.depth_resolve_filter
     }
     /// `(origin_x, origin_y, width, height)` in pixels.
     ///
@@ -2706,6 +2726,8 @@ impl PassState {
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
+            depth_resolve_texture: MetalHandle::NULL,
+            depth_resolve_filter: DepthResolveFilter::Sample0,
             viewport: (vpx, vpy, vpw, vph),
             commands,
             leading_blits,
@@ -2814,6 +2836,8 @@ impl PassState {
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
             depth_store: StoreAction::DontCare,
+            depth_resolve_texture: MetalHandle::NULL,
+            depth_resolve_filter: DepthResolveFilter::Sample0,
             viewport: (x, y, w, h),
             commands: cmds,
             leading_blits: Vec::new(),
@@ -4113,8 +4137,9 @@ impl PassState {
                 || p.bound_color_attachments()
                     .iter()
                     .any(|a| matches!(a.store, StoreAction::Store));
-            let depth_writes =
-                !p.depth_texture.is_null() && matches!(p.depth_store, StoreAction::Store);
+            let depth_writes = !p.depth_texture.is_null()
+                && (matches!(p.depth_store, StoreAction::Store)
+                    || !p.depth_resolve_texture.is_null());
             color_writes || depth_writes
         });
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
@@ -4620,6 +4645,73 @@ impl PassState {
                 }
             }
         }
+    }
+
+    /// Resolve the bound multisampled depth attachment into `destination`.
+    ///
+    /// Metal has no depth resolve on the blit encoder, so the resolve is a
+    /// render pass of its own: the multisampled depth attachment loaded, no
+    /// draws, and a store action that also writes the single-sample
+    /// destination. Colour is left unattached, so the pass touches nothing
+    /// else. The caller ends the pass that produced the depth first, which
+    /// puts the resolve in the command stream where D3D9 asked for it.
+    ///
+    /// `destination` joins the blit-written set, so a later pass that binds it
+    /// loads the resolved content instead of discarding it under Rule A, and
+    /// the pass stays out of the dead-pass rules through
+    /// `depth_resolve_texture`. Returns `false` with nothing recorded when no
+    /// depth attachment is bound.
+    pub fn resolve_depth_attachment(
+        &mut self,
+        destination: MetalHandle<MTLTextureKind>,
+        filter: DepthResolveFilter,
+    ) -> bool {
+        if self.current_depth_texture.is_null() || destination.is_null() {
+            return false;
+        }
+        self.end_current_pass("depth-resolve");
+        let commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        let (width, height) = self.current_depth_size;
+        self.passes.push(Pass {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (width, height),
+            color_format: self.current_color_format,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture: self.current_depth_texture,
+            depth_level: self.current_depth_level,
+            depth_load: DepthLoad::Load,
+            stencil_load: StencilLoad::Load,
+            depth_store: StoreAction::Store,
+            depth_resolve_texture: destination,
+            depth_resolve_filter: filter,
+            viewport: (0, 0, width, height),
+            commands,
+            // Drained here rather than left for the next pass so a blit queued
+            // before the resolve still runs before it.
+            leading_blits: core::mem::take(&mut self.pending_leading_blits),
+            has_counting_visibility: false,
+            depth_is_sampleable: self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            color_writes_observed: false,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
+        });
+        self.current_pass_closed = true;
+        self.seen_depth_rts.insert(self.current_depth_texture);
+        self.seen_depth_rts_segment
+            .insert(self.current_depth_texture);
+        self.blit_written_rts.insert(destination);
+        true
     }
 
     /// Resolve `texture` now, because something is about to read it mid-submission.

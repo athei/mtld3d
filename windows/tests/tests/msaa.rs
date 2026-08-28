@@ -7,13 +7,18 @@
 //! along one scanline, so nothing depends on where exactly the rasterizer puts
 //! the edge or on the device's sample positions.
 
-use mtld3d_tests::{Harness, HarnessConfig, Rgba8, RhwVertex, Surface, assert_pixel_eq};
+use mtld3d_tests::{
+    Harness, HarnessConfig, Rgba8, RhwVertex, Surface, Texture, TexturedVertex, assert_pixel_eq,
+};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
-    D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DMULTISAMPLE_2_SAMPLES,
-    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK, D3DRS_ZENABLE, D3DTEXF_NONE,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DERR_INVALIDCALL,
+    D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
+    D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
+    D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK, D3DRS_POINTSIZE, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
 };
 
 /// Edge of the standalone render targets, small enough to keep the readback cheap.
@@ -608,4 +613,208 @@ fn multisample_mask_selects_the_samples_a_draw_writes() {
         WHITE,
         "the default mask writes every sample",
     );
+}
+
+// ── RESZ from a multisampled depth surface ──
+
+/// The depth the RESZ scene writes, and the grey it samples back as.
+const RESZ_DEPTH: f32 = 0.25;
+
+/// One screen-space triangle covering the whole `RT_SIZE` target at depth `z`.
+///
+/// Twice the target's edge in both directions, so every sample of every pixel
+/// is inside it and the depth written is `z` at each of them.
+const fn covering_triangle(z: f32) -> [RhwVertex; 3] {
+    [
+        RhwVertex {
+            x: 0.0,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+        RhwVertex {
+            x: RT_SIZE_F * 2.0,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+        RhwVertex {
+            x: 0.0,
+            y: RT_SIZE_F * 2.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+    ]
+}
+
+/// A clip-space quad over the whole target with the texture mapped onto it.
+const fn textured_quad() -> [TexturedVertex; 6] {
+    const fn v(x: f32, y: f32, u: f32, tv: f32) -> TexturedVertex {
+        TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: tv,
+        }
+    }
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+/// Fill `intz` with depth 1.0, so a resolve that never runs is visible.
+fn prime_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) {
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&intz.surface_level(0)),
+        0,
+        "bind the INTZ level as depth"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the INTZ to the far plane"
+    );
+}
+
+/// Render depth `RESZ_DEPTH` into `ds` beside `rt`, then RESZ it into `intz`.
+fn resz_into(h: &Harness, rt: &Surface<'_>, ds: &Surface<'_>, intz: &Texture<'_>) {
+    arm(h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(h.set_depth_stencil_surface(ds), 0, "SetDepthStencilSurface");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(h.set_texture(0, intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+}
+
+/// Sample `intz` over the whole of `rt` and read the middle pixel back.
+///
+/// An INTZ texture answers a fixed-function fetch with the raw stored depth
+/// broadcast to every channel, so the quad reads back as the depth value.
+fn sample_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) -> u32 {
+    h.select_texture_stage(0);
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(sample)");
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth so the INTZ is a sampler, not an attachment"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0, "depth test off");
+    assert_eq!(h.set_texture(0, intz), 0, "bind the INTZ as a sampler");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler state");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the sample target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_quad()),
+        0,
+        "sample the resolved depth",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    surface_row(h, rt, (RT_SIZE, RT_SIZE))[(RT_SIZE / 2) as usize]
+}
+
+#[test]
+fn resz_resolves_a_multisampled_depth_surface() {
+    // The RESZ hack hands the bound depth-stencil to a single-sampled INTZ
+    // texture. From a multisampled surface that is a resolve, not a copy:
+    // Metal's blit encoder refuses the sample-count change, so the pass
+    // machinery has to take the resolve instead. The scene writes one constant
+    // depth, so the multisampled answer and the single-sampled one are the
+    // same value and can be compared directly.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
+
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("4x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ss_ds = h.create_depth_stencil_surface(RT_SIZE, RT_SIZE, D3DFMT_D24S8);
+    let resolved_depth = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let copied_depth = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+
+    // Both destinations start at the far plane, so a resolve that never
+    // happens reads back white instead of the scene's depth.
+    prime_intz(&h, &ss_rt, &resolved_depth);
+    prime_intz(&h, &ss_rt, &copied_depth);
+
+    resz_into(&h, &ms_rt, &ms_ds, &resolved_depth);
+    let from_multisampled = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &resolved_depth));
+
+    resz_into(&h, &ss_rt, &ss_ds, &copied_depth);
+    let from_single_sampled = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &copied_depth));
+
+    assert!(
+        from_multisampled.r < 200,
+        "the multisampled resolve ran at all, got {from_multisampled:?}"
+    );
+    assert!(
+        from_multisampled.r.abs_diff(from_single_sampled.r) <= 2,
+        "the resolved depth matches the single-sampled RESZ: \
+         multisampled {from_multisampled:?} vs single-sampled {from_single_sampled:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
 }
