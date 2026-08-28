@@ -318,7 +318,7 @@ fn install_occlusion_tracking(view: *mut c_void) {
         install_occlusion_observer_once();
         // SAFETY: inside the main-thread dispatch above.
         let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
-        install_screen_params_filter_once(mtm);
+        install_screen_params_filter(mtm);
     });
 }
 
@@ -327,7 +327,7 @@ static SCREEN_PARAM_CHANGES: AtomicU64 = AtomicU64::new(0);
 
 /// Wine's `NSApplication` delegate, retained for the process lifetime.
 ///
-/// Set once by [`install_screen_params_filter_once`]; zero until then. Held
+/// Set once by [`install_screen_params_filter`]; zero until then. Held
 /// as an address because the observer block that reads it must not capture
 /// a `!Send` `Retained`, and the delegate is only ever touched on the main
 /// thread, where the notification is posted.
@@ -392,6 +392,41 @@ fn current_screen_configuration(mtm: objc2::MainThreadMarker) -> ScreenConfigura
 /// Last configuration forwarded to Wine. **Main thread only.**
 static LAST_SCREEN_CONFIGURATION: Mutex<Option<ScreenConfiguration>> = Mutex::new(None);
 
+/// Whether the screen-parameter filter is in place. **Main thread only.**
+///
+/// Set by the attempt that took the notification over, and only by that one.
+/// An attempt that runs before `NSApp` has a delegate installs nothing, so it
+/// leaves this clear and the next attach or headroom refresh tries again.
+/// Read and written on the main thread alone, which is what `Relaxed` rests on.
+static SCREEN_PARAMS_FILTER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// What an attempt to install the screen-parameter filter does.
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenParamsFilterStep {
+    /// The notification is already ours, so the attempt is a no-op.
+    AlreadyOurs,
+    /// `NSApp` has no delegate to take the notification over from yet.
+    AwaitDelegate,
+    /// Unregister Wine's delegate for the name and observe it ourselves.
+    TakeOver,
+}
+
+/// Decide what an install attempt does from the state it found.
+///
+/// Only a take-over marks the filter installed. Wine installs its application
+/// delegate while it brings the application up, which can land after the first
+/// `CreateDevice`, so an attempt that finds none has to leave the decision
+/// open: marking it done there would spend the process's one attempt on a
+/// delegate that does not exist yet and leave the storm unfiltered for the
+/// rest of the run.
+const fn screen_params_filter_step(installed: bool, has_delegate: bool) -> ScreenParamsFilterStep {
+    match (installed, has_delegate) {
+        (true, _) => ScreenParamsFilterStep::AlreadyOurs,
+        (false, false) => ScreenParamsFilterStep::AwaitDelegate,
+        (false, true) => ScreenParamsFilterStep::TakeOver,
+    }
+}
+
 /// Take over `NSApplicationDidChangeScreenParametersNotification` from Wine. **Main thread only.**
 ///
 /// macOS posts this notification not only for display topology or mode
@@ -412,15 +447,18 @@ static LAST_SCREEN_CONFIGURATION: Mutex<Option<ScreenConfiguration>> = Mutex::ne
 /// Wine does in its handler still happens on real changes, and nothing at
 /// all happens on a headroom step. The desktop process never loads mtld3d,
 /// so its own copy of the storm is out of reach here; that half is a Wine
-/// patch. Installed once; the observer token is leaked for the process
-/// lifetime like the occlusion observer, and it has to outlive any one
+/// patch. Attempted from every attach and every headroom refresh until one
+/// lands, because `NSApp` gains its delegate when Wine finishes bringing the
+/// application up and that can be after the first `CreateDevice`; an attempt
+/// with no delegate to take the notification over from installs nothing and
+/// leaves the next one to try again. The observer token is leaked for the
+/// process lifetime like the occlusion observer, and it has to outlive any one
 /// device: taking the notification over unregisters Wine's delegate for this
 /// name, so removing our observer at teardown would leave nobody forwarding
 /// it at all. What teardown clears instead is [`BOUND_DISPLAY`], which is
 /// what the handler walks.
-fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
+fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     use core::ptr::NonNull;
-    use std::sync::Once;
 
     use block2::RcBlock;
     use objc2::{MainThreadMarker, runtime::ProtocolObject};
@@ -430,88 +468,100 @@ fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter};
 
-    static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| {
-        let Some(delegate) = NSApplication::sharedApplication(mtm).delegate() else {
+    let installed = SCREEN_PARAMS_FILTER_INSTALLED.load(Ordering::Relaxed);
+    // The delegate lookup is skipped once the filter is in place, so every
+    // attach and every headroom refresh after that costs one relaxed load.
+    let delegate = if installed {
+        None
+    } else {
+        NSApplication::sharedApplication(mtm).delegate()
+    };
+    match screen_params_filter_step(installed, delegate.is_some()) {
+        ScreenParamsFilterStep::AlreadyOurs => return,
+        ScreenParamsFilterStep::AwaitDelegate => {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "present: NSApp has no delegate; screen-parameter notifications are not \
-                 filtered, every EDR headroom step will cost a Wine display re-enumeration",
+                "present: NSApp has no delegate yet; screen-parameter notifications are not \
+                 filtered and every EDR headroom step costs a Wine display re-enumeration \
+                 until an attach or a headroom refresh finds one",
             );
             return;
-        };
-        let center = NSNotificationCenter::defaultCenter();
-        // SAFETY: AppKit-exported notification-name constant, valid for the
-        // process lifetime.
-        let name = unsafe { NSApplicationDidChangeScreenParametersNotification };
-        // SAFETY: `ProtocolObject` is a transparent wrapper over `AnyObject`,
-        // so the pointer reinterprets losslessly for the call below.
-        let observer = unsafe { &*Retained::as_ptr(&delegate).cast::<objc2::runtime::AnyObject>() };
-        // SAFETY: objc2 typed binding; the delegate is a live observer of the
-        // center (AppKit registered it), and removing a registration that
-        // does not exist is a documented no-op.
-        unsafe { center.removeObserver_name_object(observer, Some(name), None) };
-        WINE_APP_DELEGATE_PTR.store(Retained::as_ptr(&delegate) as usize, Ordering::Release);
-        // Leaked on purpose: the delegate is Wine's application controller
-        // and lives as long as the process.
-        core::mem::forget(delegate);
+        }
+        ScreenParamsFilterStep::TakeOver => {}
+    }
+    let delegate = delegate.expect("TakeOver is reached only when the delegate is present");
+    let center = NSNotificationCenter::defaultCenter();
+    // SAFETY: AppKit-exported notification-name constant, valid for the
+    // process lifetime.
+    let name = unsafe { NSApplicationDidChangeScreenParametersNotification };
+    // SAFETY: `ProtocolObject` is a transparent wrapper over `AnyObject`,
+    // so the pointer reinterprets losslessly for the call below.
+    let observer = unsafe { &*Retained::as_ptr(&delegate).cast::<objc2::runtime::AnyObject>() };
+    // SAFETY: objc2 typed binding; the delegate is a live observer of the
+    // center (AppKit registered it), and removing a registration that
+    // does not exist is a documented no-op.
+    unsafe { center.removeObserver_name_object(observer, Some(name), None) };
+    WINE_APP_DELEGATE_PTR.store(Retained::as_ptr(&delegate) as usize, Ordering::Release);
+    // Leaked on purpose: the delegate is Wine's application controller
+    // and lives as long as the process.
+    core::mem::forget(delegate);
 
-        let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
-            let count = SCREEN_PARAM_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
-            // SAFETY: AppKit posts this notification on the main thread.
-            let mtm = unsafe { MainThreadMarker::new_unchecked() };
-            let config = current_screen_configuration(mtm);
-            let changed = {
-                let mut last = LAST_SCREEN_CONFIGURATION
-                    .lock()
-                    .expect("screen-configuration mutex poisoned");
-                let changed = last.as_ref() != Some(&config);
-                if changed {
-                    *last = Some(config);
-                }
-                changed
-            };
-            if log_enabled!(target: LOG_TARGET, log::Level::Debug) {
-                let headroom = NSScreen::mainScreen(mtm)
-                    .map_or(0.0, |s| s.maximumExtendedDynamicRangeColorComponentValue());
-                debug!(
-                    target: LOG_TARGET,
-                    "screen params changed #{count}: headroom={headroom:.3} {}",
-                    if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
-                );
+    let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
+        let count = SCREEN_PARAM_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+        // SAFETY: AppKit posts this notification on the main thread.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let config = current_screen_configuration(mtm);
+        let changed = {
+            let mut last = LAST_SCREEN_CONFIGURATION
+                .lock()
+                .expect("screen-configuration mutex poisoned");
+            let changed = last.as_ref() != Some(&config);
+            if changed {
+                *last = Some(config);
             }
-            if !changed {
-                return;
-            }
-            // A real topology or mode change is the moment a display was
-            // attached, removed or reconfigured, so reconcile the layer now
-            // rather than waiting out the present-counted poll interval.
-            refresh_headroom_on_main();
-            let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
-            if delegate_ptr == 0 {
-                return;
-            }
-            // SAFETY: the pointer was taken from a `Retained` that is leaked
-            // above, so the delegate outlives this block, and the call is on
-            // the main thread, which is the delegate's thread.
-            let delegate =
-                unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
-            // SAFETY: the notification pointer is valid for the handler's
-            // duration; Wine implements this optional delegate method.
-            unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
-        });
-        // SAFETY: objc2 typed binding; the center copies the block, and the
-        // token is leaked below so the observer is never removed.
-        let token = unsafe {
-            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+            changed
         };
-        core::mem::forget(token);
-        info!(
-            target: LOG_TARGET,
-            "present: filtering NSApplicationDidChangeScreenParametersNotification for Wine \
-             (forwarded only when screen geometry, scale or the main display mode changed)",
-        );
+        if log_enabled!(target: LOG_TARGET, log::Level::Debug) {
+            let headroom = NSScreen::mainScreen(mtm)
+                .map_or(0.0, |s| s.maximumExtendedDynamicRangeColorComponentValue());
+            debug!(
+                target: LOG_TARGET,
+                "screen params changed #{count}: headroom={headroom:.3} {}",
+                if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
+            );
+        }
+        if !changed {
+            return;
+        }
+        // A real topology or mode change is the moment a display was
+        // attached, removed or reconfigured, so reconcile the layer now
+        // rather than waiting out the present-counted poll interval.
+        refresh_headroom_on_main();
+        let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
+        if delegate_ptr == 0 {
+            return;
+        }
+        // SAFETY: the pointer was taken from a `Retained` that is leaked
+        // above, so the delegate outlives this block, and the call is on
+        // the main thread, which is the delegate's thread.
+        let delegate =
+            unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
+        // SAFETY: the notification pointer is valid for the handler's
+        // duration; Wine implements this optional delegate method.
+        unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
     });
+    // SAFETY: objc2 typed binding; the center copies the block, and the
+    // token is leaked below so the observer is never removed.
+    let token = unsafe {
+        center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+    };
+    core::mem::forget(token);
+    SCREEN_PARAMS_FILTER_INSTALLED.store(true, Ordering::Relaxed);
+    info!(
+        target: LOG_TARGET,
+        "present: filtering NSApplicationDidChangeScreenParametersNotification for Wine \
+         (forwarded only when screen geometry, scale or the main display mode changed)",
+    );
 }
 
 /// Install the `NSWindowDidChangeOcclusionState` observer exactly once.
@@ -1564,6 +1614,11 @@ fn refresh_headroom_on_main() {
     // SAFETY: we are on the main thread (dispatched to the main queue), where
     // NSScreen's main-thread-only class annotation is satisfied for real.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    // The attach that bound this view may have run before Wine had an
+    // application delegate, which leaves the notification unfiltered. This is
+    // the recurring main-thread pass, so it is where the install is retried;
+    // once it has landed the retry is one relaxed load.
+    install_screen_params_filter(mtm);
     let screen = view_obj
         .window()
         .and_then(|w| w.screen())

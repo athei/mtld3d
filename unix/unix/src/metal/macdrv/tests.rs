@@ -15,6 +15,13 @@
 //! display change, the user's off switch, the degenerate ceilings, and the
 //! case that must *not* reconfigure.
 //!
+//! `screen_params_filter_step` decides what one attempt to take
+//! `NSApplicationDidChangeScreenParametersNotification` over from Wine does.
+//! The tests pin all three outcomes, and in particular that an attempt made
+//! before `NSApp` has a delegate resolves to a retry rather than to a filter
+//! marked installed, which is what keeps a process whose first `CreateDevice`
+//! beats Wine's application delegate from running unfiltered for its lifetime.
+//!
 //! `detach_metal_layer` is the other half of that path: the reconciliation
 //! runs from process-lifetime observers, so what stops it walking a released
 //! view, or re-deriving against a display nothing is bound to, is that
@@ -27,10 +34,11 @@ use mtld3d_shared::{MetalHandle, mtl_handle::NSViewKind};
 
 use super::{
     BACKING_SCALE_SINK_PTR, CURRENT_BACKING_SCALE, CURRENT_HEADROOM_BITS, HDR_ACTIVE,
-    LAST_LOGGED_HEADROOM_BITS, LayerMode, PRESENT_PACING_BITS, PresentPacing, WINDOW_OCCLUDED,
-    backing_scale_change, backing_scale_from, detach_metal_layer, display_state_is_latched,
-    is_bound_window, layer_mode_change, layer_mode_for, min_present_duration,
-    min_present_duration_change, pack_pacing, unpack_pacing, with_bound_display,
+    LAST_LOGGED_HEADROOM_BITS, LayerMode, PRESENT_PACING_BITS, PresentPacing,
+    ScreenParamsFilterStep, WINDOW_OCCLUDED, backing_scale_change, backing_scale_from,
+    detach_metal_layer, display_state_is_latched, is_bound_window, layer_mode_change,
+    layer_mode_for, min_present_duration, min_present_duration_change, pack_pacing,
+    screen_params_filter_step, unpack_pacing, with_bound_display,
 };
 
 #[test]
@@ -355,4 +363,34 @@ fn staying_on_one_display_never_republishes_the_scale() {
 fn moving_between_displays_of_different_scale_republishes() {
     assert_eq!(backing_scale_change(2, 1.0), Some(1));
     assert_eq!(backing_scale_change(1, 2.0), Some(2));
+}
+
+#[test]
+fn an_attempt_without_a_delegate_installs_nothing_and_retries() {
+    assert_eq!(
+        screen_params_filter_step(false, false),
+        ScreenParamsFilterStep::AwaitDelegate
+    );
+}
+
+#[test]
+fn the_first_attempt_that_finds_a_delegate_takes_the_notification_over() {
+    assert_eq!(
+        screen_params_filter_step(false, true),
+        ScreenParamsFilterStep::TakeOver
+    );
+}
+
+#[test]
+fn an_installed_filter_is_never_installed_twice() {
+    assert_eq!(
+        screen_params_filter_step(true, true),
+        ScreenParamsFilterStep::AlreadyOurs
+    );
+    // A delegate that went away after the take-over does not reopen the
+    // decision: the observer is registered with the center, not with it.
+    assert_eq!(
+        screen_params_filter_step(true, false),
+        ScreenParamsFilterStep::AlreadyOurs
+    );
 }
