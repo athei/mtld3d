@@ -34,6 +34,7 @@ pub mod page_box_pool;
 pub mod passes;
 pub mod perf;
 pub mod pipeline_state;
+pub mod pixel_convert;
 pub mod pool;
 pub mod present;
 pub mod process_vertices;

@@ -6,6 +6,7 @@ use mtld3d_core::{
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::PageBox,
+    pixel_convert,
     render_scale::RenderScale,
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
@@ -19,12 +20,11 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use mtld3d_types::{
-    D3DBOX, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DLOCKED_BOX,
-    D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC,
-    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid,
-    IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl,
+    D3DBOX, D3DFMT_UYVY, D3DFMT_YUY2, D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE,
+    D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_DYNAMIC,
+    D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl,
     IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9,
     IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
     IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
@@ -1160,25 +1160,76 @@ impl TextureInner {
         true
     }
 
+    /// Copy or convert `src`'s `src_level` into `dst_level`, per the two formats.
+    ///
+    /// `UpdateSurface` and `UpdateTexture` accept a source and a destination of
+    /// different formats and convert; an identical pair is a raw block copy.
+    pub fn update_sub_region_from(
+        &mut self,
+        dst_level: usize,
+        src: &Self,
+        src_level: usize,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        if src.d3d_format == self.d3d_format {
+            self.copy_sub_region_from(dst_level, src, src_level, src_rect, dst_point)
+        } else {
+            self.convert_sub_region_from(dst_level, src, src_level, src_rect, dst_point)
+        }
+    }
+
+    /// One cube face's [`Self::update_sub_region_from`].
+    pub fn update_cube_sub_region_from(
+        &mut self,
+        dst_subresource: (u32, usize),
+        src: &Self,
+        src_face: u32,
+        src_level: usize,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        if src.d3d_format == self.d3d_format {
+            self.copy_cube_sub_region_from(
+                dst_subresource,
+                src,
+                src_face,
+                src_level,
+                src_rect,
+                dst_point,
+            )
+        } else {
+            self.convert_cube_sub_region_from(
+                dst_subresource,
+                src,
+                src_face,
+                src_level,
+                src_rect,
+                dst_point,
+            )
+        }
+    }
+
     /// Convert a sub-rectangle of `src`'s `src_level` staging into `dst_level`'s staging.
     ///
-    /// Lands at `dst_point`, re-encoding each pixel from `src`'s D3D format to
-    /// this texture's D3D format. This is the cross-format `StretchRect` path
-    /// into an offscreen-plain destination: neither GPU path serves it — the
-    /// 1:1 blit can't convert and the render-quad conversion needs a
-    /// render-target destination — so the conversion runs on the CPU. Sources
-    /// are the simple uncompressed RGB formats R5G6B5 / X8R8G8B8 / A8R8G8B8
-    /// plus the packed YUV formats YUY2 / UYVY (decoded per macropixel, the
-    /// CPU twin of the render quad's decode); destinations are the RGB three.
-    /// Returns false for any other pair (caller falls back to a
-    /// best-effort no-op) or a region no part of which lies in both levels.
-    /// Same-size only (`src_rect` extent equals the destination extent), the
-    /// caller rejects scaling upstream. The region is clipped to the source and
-    /// the destination level, so a caller that paired a source with a smaller
-    /// destination converts only what the two share instead of running the row
-    /// loop off the destination staging. Marks the written rectangle of
-    /// `dst_level` dirty on success so a later `flush_dirty_mips` uploads the
-    /// converted pixels.
+    /// Lands at `dst_point`, re-encoding each texel from `src`'s D3D format
+    /// into this texture's (`mtld3d_core::pixel_convert`). Two paths need it.
+    /// The cross-format `StretchRect` into an offscreen-plain destination:
+    /// neither GPU path serves that one, the 1:1 blit cannot convert and the
+    /// render-quad conversion needs a render-target destination. And an
+    /// `UpdateSurface` / `UpdateTexture` whose endpoints differ in format,
+    /// which D3D9 accepts and converts. Returns false for a pair the codec
+    /// does not cover (the `StretchRect` caller falls back to a best-effort
+    /// no-op, the `Update*` callers reject the pair up front) and for a region
+    /// no part of which lies in both levels. Same-size only (`src_rect` extent
+    /// equals the destination extent), the caller rejects scaling upstream. The
+    /// region is clipped to the source and the destination level, so a caller
+    /// that paired a source with a smaller destination converts only what the
+    /// two share instead of running the row loop off the destination staging.
+    /// Every depth slice the two levels share converts, so a volume level
+    /// carries its whole depth. Marks the written rectangle of `dst_level`
+    /// dirty on success so a later `flush_dirty_mips` uploads the converted
+    /// texels.
     pub fn convert_sub_region_from(
         &mut self,
         dst_level: usize,
@@ -1188,8 +1239,7 @@ impl TextureInner {
         dst_point: (i32, i32),
     ) -> bool {
         let (src_fmt, dst_fmt) = (src.d3d_format, self.d3d_format);
-        let yuv_src = mtld3d_core::stretch_rect::is_packed_yuv(src_fmt);
-        if !(is_convertible_rgb(src_fmt) || yuv_src) || !is_convertible_rgb(dst_fmt) {
+        if !pixel_convert::can_convert(src_fmt, dst_fmt) {
             return false;
         }
         let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
@@ -1217,7 +1267,7 @@ impl TextureInner {
         // conversion reaches past its own level: a row running off the
         // destination's right edge would wrap into the next one, and the dirty
         // rectangle recorded below has to describe a real part of the level.
-        // Every format this path accepts is one pixel per block, so the clip
+        // Every format this path accepts is one texel per block, so the clip
         // reduces to trimming both rectangles to the extent the levels share.
         let Some((src_rect, dst_rect)) = clip_copy_region(
             DirtyRect {
@@ -1233,19 +1283,9 @@ impl TextureInner {
         ) else {
             return false;
         };
-        let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
-        let (dx, dy) = (dst_rect.x, dst_rect.y);
         // The conversion is what defines the destination level from here on, so
         // the level moves off the GPU before a byte of it is written.
-        let whole = self.write_covers_level(
-            dst_level,
-            DirtyRect {
-                x: dx,
-                y: dy,
-                w: rw,
-                h: rh,
-            },
-        );
+        let whole = self.write_covers_level(dst_level, dst_rect);
         self.move_level_to_staging(dst_level, whole);
         self.ensure_staging(dst_level);
         let (Some(dst_box), Some(src_box)) =
@@ -1255,69 +1295,136 @@ impl TextureInner {
         };
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        let (src_bpp, dst_bpp) = (rgb_bpp(src_fmt), rgb_bpp(dst_fmt));
-        let (src_len, dst_len) = (src_box.logical_len(), dst_box.logical_len());
-        let src_base = src_box.as_ptr();
-        let dst_base = dst_box.as_ptr().cast_mut();
-        for row in 0..rh {
-            let s_row = (ry + row) as usize * src_pitch;
-            let d_row = (dy + row) as usize * dst_pitch;
-            for col in 0..rw {
-                let sx = (rx + col) as usize;
-                let d_off = d_row + (dx + col) as usize * dst_bpp;
-                if d_off + dst_bpp > dst_len {
+        let region = pixel_convert::ConvertRegion {
+            src_x: src_rect.x,
+            src_y: src_rect.y,
+            dst_x: dst_rect.x,
+            dst_y: dst_rect.y,
+            width: dst_rect.w,
+            height: dst_rect.h,
+            src_pitch,
+            dst_pitch,
+            // A volume level is `depth` slices of `pitch * height` bytes laid
+            // out back to back; a 2D level is the single-slice case.
+            src_slice_pitch: src_pitch * sh as usize,
+            dst_slice_pitch: dst_pitch * dh as usize,
+            depth: (src.depth >> src_level)
+                .max(1)
+                .min((self.depth >> dst_level).max(1)) as usize,
+        };
+        // SAFETY: `src_box` is the source level's whole staging allocation, and
+        // `src` is a different texture from `self`, so the two allocations are
+        // disjoint and the slice cannot alias the destination's.
+        let src_bytes =
+            unsafe { std::slice::from_raw_parts(src_box.as_ptr(), src_box.logical_len()) };
+        // SAFETY: `dst_box` is this level's whole staging allocation, disjoint
+        // from the source's as above; D3D9 objects are single-threaded, so this
+        // call has exclusive access to it.
+        let dst_bytes = unsafe {
+            std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
+        };
+        if !pixel_convert::convert_region(dst_bytes, dst_fmt, src_bytes, src_fmt, &region) {
+            return false;
+        }
+        self.mark_written_region(dst_level, dst_rect);
+        true
+    }
+
+    /// Convert one cube face sub-rectangle between cube staging allocations.
+    ///
+    /// The cube counterpart of [`Self::convert_sub_region_from`], down to the
+    /// clip against both levels; a face is a single depth slice.
+    pub fn convert_cube_sub_region_from(
+        &mut self,
+        dst_subresource: (u32, usize),
+        src: &Self,
+        src_face: u32,
+        src_level: usize,
+        src_rect: Option<(i32, i32, i32, i32)>,
+        dst_point: (i32, i32),
+    ) -> bool {
+        let (src_fmt, dst_fmt) = (src.d3d_format, self.d3d_format);
+        if !pixel_convert::can_convert(src_fmt, dst_fmt) {
+            return false;
+        }
+        let (dst_face, dst_level) = dst_subresource;
+        let (Some(dst_index), Some(src_index)) = (
+            self.cube_subresource_index(dst_face, dst_level),
+            src.cube_subresource_index(src_face, src_level),
+        ) else {
+            return false;
+        };
+        let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
+            return false;
+        };
+        let (dst_box, src_box) = (&dst_cube.staging[dst_index], &src_cube.staging[src_index]);
+        let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
+        let (rx, ry, rw, rh) = match src_rect {
+            None => (0u32, 0u32, sw, sh),
+            Some((l, t, r, b)) => {
+                if l < 0 || t < 0 || r <= l || b <= t {
                     return false;
                 }
-                let rgba = if yuv_src {
-                    // Packed 4:2:2: the pixel's macropixel is the 4 bytes at
-                    // the even column; its parity picks the luma sample.
-                    let s_off = s_row + (sx & !1) * 2;
-                    if s_off + 4 > src_len {
-                        return false;
-                    }
-                    // SAFETY: `s_off + 4 <= src_len` (checked), so this stays
-                    // in-bounds of the source PageBox allocation.
-                    let src_ptr = unsafe { src_base.add(s_off) };
-                    // SAFETY: 4 bytes from `src_ptr`; `src`/`self` are distinct
-                    // textures with disjoint PageBox allocations.
-                    let mp = unsafe { std::slice::from_raw_parts(src_ptr, 4) };
-                    let Some((r, g, b)) = mtld3d_core::stretch_rect::decode_packed_yuv(
-                        src_fmt,
-                        [mp[0], mp[1], mp[2], mp[3]],
-                        sx & 1 == 1,
-                    ) else {
-                        return false;
-                    };
-                    (r, g, b, 0xff)
-                } else {
-                    let s_off = s_row + sx * src_bpp;
-                    if s_off + src_bpp > src_len {
-                        return false;
-                    }
-                    // SAFETY: `s_off + src_bpp <= src_len` (checked), so this stays
-                    // in-bounds of the source PageBox allocation.
-                    let src_ptr = unsafe { src_base.add(s_off) };
-                    // SAFETY: `src_bpp` bytes from `src_ptr`; `src`/`self` are distinct
-                    // textures with disjoint PageBox allocations.
-                    let px = unsafe { std::slice::from_raw_parts(src_ptr, src_bpp) };
-                    decode_rgb_pixel(src_fmt, px)
-                };
-                // SAFETY: `d_off + dst_bpp <= dst_len` (checked); in-bounds of dst.
-                let dst_ptr = unsafe { dst_base.add(d_off) };
-                // SAFETY: `dst_bpp` bytes from `dst_ptr`; disjoint from `src` as above.
-                let out = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_bpp) };
-                encode_rgb_pixel(dst_fmt, rgba, out);
+                (
+                    l.cast_unsigned(),
+                    t.cast_unsigned(),
+                    (r - l).cast_unsigned(),
+                    (b - t).cast_unsigned(),
+                )
             }
-        }
-        self.mark_written_region(
-            dst_level,
+        };
+        let (dx, dy) = (
+            dst_point.0.max(0).cast_unsigned(),
+            dst_point.1.max(0).cast_unsigned(),
+        );
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
+        let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
+        // Same clip as the 2D conversion, so neither half reaches past its own
+        // face allocation.
+        let Some((src_rect, dst_rect)) = clip_copy_region(
             DirtyRect {
-                x: dx,
-                y: dy,
+                x: rx,
+                y: ry,
                 w: rw,
                 h: rh,
             },
-        );
+            (dx, dy),
+            (sw, sh),
+            (dw, dh),
+            (bw, bh),
+        ) else {
+            return false;
+        };
+        let src_pitch = src.mip_bytes_per_row(src_level) as usize;
+        let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
+        let region = pixel_convert::ConvertRegion {
+            src_x: src_rect.x,
+            src_y: src_rect.y,
+            dst_x: dst_rect.x,
+            dst_y: dst_rect.y,
+            width: dst_rect.w,
+            height: dst_rect.h,
+            src_pitch,
+            dst_pitch,
+            src_slice_pitch: src_pitch * sh as usize,
+            dst_slice_pitch: dst_pitch * dh as usize,
+            depth: 1,
+        };
+        // SAFETY: `src_box` is the source face's whole staging allocation, and
+        // `src` is a different texture from `self`, so the two allocations are
+        // disjoint and the slice cannot alias the destination's.
+        let src_bytes =
+            unsafe { std::slice::from_raw_parts(src_box.as_ptr(), src_box.logical_len()) };
+        // SAFETY: `dst_box` is this face's whole staging allocation, disjoint
+        // from the source's as above; D3D9 objects are single-threaded, so this
+        // call has exclusive access to it.
+        let dst_bytes = unsafe {
+            std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
+        };
+        if !pixel_convert::convert_region(dst_bytes, dst_fmt, src_bytes, src_fmt, &region) {
+            return false;
+        }
+        self.mark_cube_dirty(dst_face, dst_level);
         true
     }
 
@@ -2280,78 +2387,6 @@ impl TextureInner {
     /// The app-set `SetLOD` value (the most-detailed mip the runtime may use).
     pub const fn lod(&self) -> u32 {
         self.lod
-    }
-}
-
-/// The simple uncompressed RGB formats the cross-format `StretchRect` converter handles.
-///
-/// The converter is the offscreen-plain destination path
-/// ([`TextureInner::convert_sub_region_from`]). Any other pair takes the
-/// best-effort no-op path (the HR still succeeds).
-const fn is_convertible_rgb(d3d_format: u32) -> bool {
-    matches!(
-        d3d_format,
-        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_R5G6B5
-    )
-}
-
-/// Bytes per pixel of an `is_convertible_rgb` format.
-const fn rgb_bpp(d3d_format: u32) -> usize {
-    match d3d_format {
-        D3DFMT_R5G6B5 => 2,
-        _ => 4, // A8R8G8B8 / X8R8G8B8
-    }
-}
-
-/// Decode one `is_convertible_rgb` pixel from its little-endian bytes into `(r, g, b, a)`.
-///
-/// The 32bpp formats store `[B, G, R, A/X]`; R5G6B5 packs `RRRRR GGGGGG BBBBB`
-/// into a little-endian `u16` (channels bit-replicated up to 8 bits). X8's
-/// alpha reads as opaque. `px` is at least `rgb_bpp` long.
-fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
-    match d3d_format {
-        D3DFMT_R5G6B5 => {
-            let v = u16::from_le_bytes([px[0], px[1]]);
-            let r5 = ((v >> 11) & 0x1f) as u8;
-            let g6 = ((v >> 5) & 0x3f) as u8;
-            let b5 = (v & 0x1f) as u8;
-            (
-                (r5 << 3) | (r5 >> 2),
-                (g6 << 2) | (g6 >> 4),
-                (b5 << 3) | (b5 >> 2),
-                0xff,
-            )
-        }
-        // X8R8G8B8: alpha byte is undefined; report opaque.
-        D3DFMT_X8R8G8B8 => (px[2], px[1], px[0], 0xff),
-        // A8R8G8B8 (only remaining is_convertible_rgb case).
-        _ => (px[2], px[1], px[0], px[3]),
-    }
-}
-
-/// Encode `(r, g, b, a)` into one `is_convertible_rgb` pixel's little-endian bytes.
-///
-/// Inverse of `decode_rgb_pixel`. X8's byte is written opaque. `out` is at
-/// least `rgb_bpp` long.
-fn encode_rgb_pixel(d3d_format: u32, (r, g, b, a): (u8, u8, u8, u8), out: &mut [u8]) {
-    match d3d_format {
-        D3DFMT_R5G6B5 => {
-            let packed = (u16::from(r >> 3) << 11) | (u16::from(g >> 2) << 5) | u16::from(b >> 3);
-            out[..2].copy_from_slice(&packed.to_le_bytes());
-        }
-        D3DFMT_X8R8G8B8 => {
-            out[0] = b;
-            out[1] = g;
-            out[2] = r;
-            out[3] = 0xff;
-        }
-        // A8R8G8B8 (only remaining is_convertible_rgb case).
-        _ => {
-            out[0] = b;
-            out[1] = g;
-            out[2] = r;
-            out[3] = a;
-        }
     }
 }
 

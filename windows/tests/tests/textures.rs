@@ -1983,3 +1983,90 @@ fn single_slice_default_volume_takes_a_second_update_after_its_upload() {
     );
     assert_pixel_eq(sample_volume_depth(&h, 0.5), GREEN, "second fill");
 }
+
+/// `UpdateSurface` converts a mismatched format pair instead of rejecting it.
+///
+/// D3D9 accepts a source and a destination whose formats differ and converts
+/// the texels; only a pair no codec covers fails. The source's undefined alpha
+/// byte reads as opaque, so what lands in the destination is the source colour.
+#[test]
+fn update_surface_converts_x8r8g8b8_into_a8r8g8b8() {
+    const RED: u32 = 0x00FF_0000;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u32>(&[RED; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface across formats"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFFFF_0000,
+        "converted texel",
+    );
+}
+
+/// `UpdateSurface` re-encodes a 16-bit source into a 32-bit destination.
+///
+/// The two formats disagree on bytes per texel, so a raw copy of the source
+/// rows would land two texels of source in one texel of destination and read
+/// half the level. Each channel widens by bit replication, so a saturated
+/// source channel arrives at 255.
+#[test]
+fn update_surface_converts_r5g6b5_into_x8r8g8b8() {
+    // R=0, G=63, B=0.
+    const GREEN_565: u16 = 0x07E0;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u16>(&[GREEN_565; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface across formats"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFF00_FF00,
+        "converted texel",
+    );
+}
+
+/// `UpdateTexture` converts a mismatched format pair over the whole mip.
+///
+/// The destination is half the bytes per texel of the source, so the copy has
+/// to re-encode rather than move rows: a saturated 8-bit channel packs into
+/// the 5- and 6-bit lanes and widens back to 255 when it is sampled.
+#[test]
+fn update_texture_converts_a8r8g8b8_into_r5g6b5() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u32>(&[GREEN; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        0,
+        "UpdateTexture across formats"
+    );
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "converted texel");
+}
+
+/// `UpdateTexture` still rejects a format pair the CPU codec cannot convert.
+///
+/// The codec covers the simple uncompressed colour formats. A
+/// block-compressed source has no decoder here, so rather than writing
+/// reinterpreted bytes the call answers `D3DERR_INVALIDCALL`.
+#[test]
+fn update_texture_rejects_a_format_pair_with_no_converter() {
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_DXT1, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        D3DERR_INVALIDCALL,
+        "UpdateTexture from a compressed source"
+    );
+}
