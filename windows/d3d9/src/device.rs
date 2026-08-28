@@ -18,8 +18,8 @@ use mtld3d_core::{
     dxso::operand_token_count,
     ff_state::{FfState, FfVsDirty},
     format::{
-        FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, linear_row_pitch,
-        map_d3d_format,
+        FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, linear_mip_size,
+        linear_row_pitch, map_d3d_format,
     },
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
@@ -4595,6 +4595,21 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         "CreateTexture depth {width}x{height} levels={actual_levels} format={format} → sampleable shadow map"
     );
 
+    // Per-level dimensions so `GetLevelDesc` reports each mip, and a per-level
+    // row pitch so `TextureInner::allocated_bytes` charges the chain on the
+    // formula a colour chain is charged on: the host-visible stride of the
+    // level's width, not a tight one. There is no CPU staging behind a depth
+    // texture, so the pitch is a size and never a lock's stride.
+    let mut mip_widths = Vec::with_capacity(actual_levels as usize);
+    let mut mip_heights = Vec::with_capacity(actual_levels as usize);
+    let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
+    for level in 0..actual_levels {
+        let (mw, mh, _, bpr) = linear_mip_size(width, height, level, bytes_per_pixel);
+        mip_widths.push(mw);
+        mip_heights.push(mh);
+        mip_bytes_per_row.push(bpr);
+    }
+
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -4624,15 +4639,9 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         block_h: 1,
         block_bytes: bytes_per_pixel,
         staging: Vec::new(),
-        // Per-level dimensions so `GetLevelDesc` reports each mip, and a
-        // per-level row pitch so `TextureInner::allocated_bytes` charges the
-        // chain like a colour texture's. There is no CPU staging behind a
-        // depth texture, so the pitch is a size and never a lock's stride.
-        mip_widths: (0..actual_levels).map(|l| (width >> l).max(1)).collect(),
-        mip_heights: (0..actual_levels).map(|l| (height >> l).max(1)).collect(),
-        mip_bytes_per_row: (0..actual_levels)
-            .map(|l| (width >> l).max(1).saturating_mul(bytes_per_pixel))
-            .collect(),
+        mip_widths,
+        mip_heights,
+        mip_bytes_per_row,
     });
 
     // Queue the eager `MTLTexture` create (sampleable shadow map path).

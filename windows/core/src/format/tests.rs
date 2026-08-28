@@ -25,8 +25,9 @@ use super::{
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
     StandaloneSurfaceKind, Swizzle, compute_mip_size, depth_format_bytes_per_pixel, format_name,
-    is_depth_format, is_mapped_color_format, linear_row_pitch, map_d3d_depth_format,
-    map_d3d_format, standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
+    is_depth_format, is_mapped_color_format, linear_mip_size, linear_row_pitch,
+    map_d3d_depth_format, map_d3d_format, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
 };
 
 #[test]
@@ -552,6 +553,30 @@ fn a_mip_level_is_sized_and_strided_at_the_host_visible_pitch() {
     assert_eq!((w, h), (16, 2));
     assert_eq!(pitch, 32);
     assert_eq!(size, 64);
+}
+
+/// A depth level is measured on the formula its colour twin is measured on.
+///
+/// A depth format reaches the sizing as a bare bytes-per-pixel, with no
+/// `FormatMapping` of its own, so the two entry points have to agree level for
+/// level or a `D3DFMT_D16` chain and an `R5G6B5` chain of the same shape are
+/// charged different bytes against the texture-memory budget.
+#[test]
+fn a_depth_level_matches_the_colour_level_of_its_pixel_size() {
+    let r5g6b5 = map_d3d_format(D3DFMT_R5G6B5).expect("mapped");
+    let bpp = depth_format_bytes_per_pixel(D3DFMT_D16).expect("depth size");
+    for level in 0..6 {
+        assert_eq!(
+            linear_mip_size(33, 33, level, bpp),
+            compute_mip_size(33, 33, level, &r5g6b5),
+            "level {level}"
+        );
+    }
+
+    // The odd top level strides at the dword-rounded pitch, not the tight one.
+    assert_eq!(linear_mip_size(33, 33, 0, 2), (33, 33, 68 * 33, 68));
+    // A 4-byte format is already dword-aligned at every width.
+    assert_eq!(linear_mip_size(33, 33, 0, 4), (33, 33, 33 * 4 * 33, 33 * 4));
 }
 
 #[test]

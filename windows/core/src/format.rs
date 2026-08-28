@@ -701,10 +701,29 @@ pub fn compute_mip_size(
         let byte_size = bytes_per_row * blocks_y;
         (w, h, byte_size, bytes_per_row)
     } else {
-        let bytes_per_row = linear_row_pitch(w, fmt.bytes_per_pixel);
-        let byte_size = bytes_per_row * h;
-        (w, h, byte_size, bytes_per_row)
+        linear_mip_size(base_width, base_height, level, fmt.bytes_per_pixel)
     }
+}
+
+/// Mip dimensions, byte size and row stride for one level of a linear format.
+///
+/// The uncompressed half of [`compute_mip_size`], for a format carried as a
+/// bare pixel size rather than a [`FormatMapping`]: a depth format has no
+/// colour mapping to hand over, and its chain is measured on the same formula
+/// a colour chain is so that the two are charged alike against the
+/// `GetAvailableTextureMem` budget. The level strides by [`linear_row_pitch`]
+/// and occupies that stride times its texel row count.
+#[must_use]
+pub fn linear_mip_size(
+    base_width: u32,
+    base_height: u32,
+    level: u32,
+    bytes_per_pixel: u32,
+) -> (u32, u32, u32, u32) {
+    let w = (base_width >> level).max(1);
+    let h = (base_height >> level).max(1);
+    let bytes_per_row = linear_row_pitch(w, bytes_per_pixel);
+    (w, h, bytes_per_row.saturating_mul(h), bytes_per_row)
 }
 
 /// Compute the number of mip levels for a texture.

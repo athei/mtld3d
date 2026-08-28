@@ -8,11 +8,11 @@ use core::ffi::c_void;
 use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
-    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
-    D3DFMT_INDEX16, D3DFVF_XYZ, D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
-    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D16,
+    D3DFMT_D24S8, D3DFMT_INDEX16, D3DFMT_R5G6B5, D3DFVF_XYZ, D3DMULTISAMPLE_4_SAMPLES,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY,
+    D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -654,6 +654,55 @@ fn available_texture_mem_tracks_depth_textures() {
         h.available_texture_mem(),
         base,
         "releasing the depth-stencil texture gives its bytes back"
+    );
+}
+
+/// A depth chain is charged on the formula a colour chain is charged on.
+///
+/// `GetAvailableTextureMem` sums a texture's per-level row pitches, and a
+/// level's pitch is the host-visible (dword-rounded) stride of its own width.
+/// At an odd width a two-byte format rounds up, so the six-level `D3DFMT_D16`
+/// chain here has to cost exactly what the `D3DFMT_R5G6B5` chain of the same
+/// shape costs rather than the tight `width * 2` a depth level once measured.
+#[test]
+fn available_texture_mem_charges_a_depth_chain_like_a_colour_chain() {
+    // 33 wide: a 16-bit row is 66 bytes tight and 68 host-visible. The six
+    // levels stride 68, 32, 16, 8, 4, 4 over heights 33, 16, 8, 4, 2, 1.
+    const WIDTH: u32 = 33;
+    const CHAIN_BYTES: u32 = 68 * 33 + 32 * 16 + 16 * 8 + 8 * 4 + 4 * 2 + 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(base > 2 * CHAIN_BYTES, "budget {base} leaves room for both");
+
+    let colour_cost = {
+        let _tex = h.create_texture(WIDTH, WIDTH, 0, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        colour_cost, CHAIN_BYTES,
+        "a colour chain costs its host-visible row pitches"
+    );
+
+    let depth_cost = {
+        let _tex = h.create_texture(
+            WIDTH,
+            WIDTH,
+            0,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D16,
+            D3DPOOL_DEFAULT,
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        depth_cost, colour_cost,
+        "a depth chain costs what the colour chain of the same shape costs"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing both chains gives their bytes back"
     );
 }
 
