@@ -757,6 +757,32 @@ pub fn compute_mip_count(width: u32, height: u32) -> u32 {
     32 - max_dim.leading_zeros()
 }
 
+/// Number of mip levels for a volume texture.
+///
+/// The 3D form of [`compute_mip_count`]: a volume level halves depth along
+/// with width and height and every extent floors at one texel, so the chain
+/// ends at 1x1x1 and its length is measured on the largest of the three.
+#[must_use]
+pub fn compute_volume_mip_count(width: u32, height: u32, depth: u32) -> u32 {
+    compute_mip_count(width.max(height), depth)
+}
+
+/// The level count a create resolves its `Levels` argument to.
+///
+/// `0` asks for the whole chain. Any other value is the count the caller
+/// wants, capped at `natural`, the chain [`compute_mip_count`] (or
+/// [`compute_volume_mip_count`]) measures for the dimensions: past that every
+/// further level would repeat the last one, and Metal refuses a
+/// `mipmapLevelCount` above it outright rather than allocating the repeats.
+#[must_use]
+pub fn resolve_mip_levels(requested: u32, natural: u32) -> u32 {
+    if requested == 0 {
+        natural
+    } else {
+        requested.min(natural)
+    }
+}
+
 /// Which allocation shape a standalone surface's VRAM charge covers.
 ///
 /// The two standalone-surface entry points spend memory differently once

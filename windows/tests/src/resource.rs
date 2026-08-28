@@ -96,6 +96,13 @@ impl VolumeTexture<'_> {
         self.ptr
     }
 
+    /// Mip-chain length.
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_level_count)(self.ptr) }
+    }
+
     /// Describe mip `level`. Returns `(hr, desc)`.
     #[must_use]
     pub fn level_desc(&self, level: u32) -> (i32, D3DVOLUME_DESC) {

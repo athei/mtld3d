@@ -18,8 +18,8 @@ use mtld3d_core::{
     dxso::{VsSamplerKinds, operand_token_count},
     ff_state::{FfState, FfVsDirty},
     format::{
-        FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, linear_mip_size,
-        linear_row_pitch, map_d3d_format,
+        FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
+        is_dxt_format, linear_mip_size, linear_row_pitch, map_d3d_format, resolve_mip_levels,
     },
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
@@ -4219,6 +4219,30 @@ struct TextureCreateArgs {
     offscreen_plain: bool,
 }
 
+/// Resolve a create's `Levels` argument against the chain its extent allows.
+///
+/// Shared by the colour, depth, cube and volume create paths, which all take
+/// `0` as a request for the full chain and any other value as the level count.
+/// A count above the natural chain is capped at it rather than refused: the
+/// levels past the chain would each repeat the last one, and D3D9 hands the
+/// caller the chain its dimensions do have. Passing such a count through is
+/// not an option either, because Metal's descriptor validation refuses a
+/// `mipmapLevelCount` above `floor(log2(max_dim)) + 1` with an abort rather
+/// than a returned error. The clamp is warned once per distinct
+/// `(requested, natural)` pair, naming the entry point the first request came
+/// through.
+fn resolve_create_levels(entry_point: &str, requested: u32, natural: u32) -> u32 {
+    if requested > natural {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: (u64::from(requested) << 32) | u64::from(natural),
+            "{entry_point} levels={requested} is past the {natural}-level chain the extent allows; \
+             clamped to {natural}"
+        );
+    }
+    resolve_mip_levels(requested, natural)
+}
+
 /// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
 ///
 /// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
@@ -4380,10 +4404,11 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // to downsample.
     let autogen_mipmap = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
     let autogen_full_chain = autogen_mipmap && !fmt.is_compressed();
-    let actual_levels = if autogen_full_chain || levels == 0 {
-        compute_mip_count(width, height)
+    let natural_levels = compute_mip_count(width, height);
+    let actual_levels = if autogen_full_chain {
+        natural_levels
     } else {
-        levels
+        resolve_create_levels("CreateTexture", levels, natural_levels)
     };
 
     // Trace probe: one line per distinct (format, dims, levels, usage, pool)
@@ -4549,12 +4574,12 @@ struct DepthTextureCreateInfo {
 ///   refuses depth formats.
 /// - A format with no `map_d3d_depth_format` entry.
 ///
-/// `levels` follows the colour path's rule: 0 requests the full chain down to
-/// one texel (`compute_mip_count`), and any other value is the level count,
-/// taken as given. A mip chain on a depth texture is an engine's depth
-/// pyramid, every level rendered into through `GetSurfaceLevel(n)` bound as
-/// the depth attachment, because with `generateMipmaps` unavailable nothing
-/// else can fill one.
+/// `levels` follows the colour path's rule, through the shared
+/// [`resolve_create_levels`]: 0 requests the full chain down to one texel, and
+/// any other value is the level count, capped at that chain. A mip chain on a
+/// depth texture is an engine's depth pyramid, every level rendered into
+/// through `GetSurfaceLevel(n)` bound as the depth attachment, because with
+/// `generateMipmaps` unavailable nothing else can fill one.
 ///
 /// The created texture has no PE-side staging buffer, so its per-level
 /// tracking arrays are sized from the level count rather than from the
@@ -4614,11 +4639,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     // A mip chain on a depth texture is an engine's depth pyramid: each level
     // is rendered into through `GetSurfaceLevel(n)` bound as the depth
     // attachment and sampled back at a coarser resolution.
-    let actual_levels = if levels == 0 {
-        compute_mip_count(width, height)
-    } else {
-        levels
-    };
+    let actual_levels = resolve_create_levels(
+        "CreateTexture depth",
+        levels,
+        compute_mip_count(width, height),
+    );
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
     // The per-pixel size the mip chain is charged at against the
@@ -4811,19 +4836,11 @@ extern "system" fn device_create_volume_texture(
     // resolve a real box instead of returning NULL (a NULL box would fault a
     // LockBox on a mip sub-level).
     let bpp = fmt.bytes_per_pixel().max(1);
-    let actual_levels = if levels == 0 {
-        let mut n = 1u32;
-        let (mut w, mut h, mut d) = (width, height, depth);
-        while w > 1 || h > 1 || d > 1 {
-            w = (w >> 1).max(1);
-            h = (h >> 1).max(1);
-            d = (d >> 1).max(1);
-            n += 1;
-        }
-        n
-    } else {
-        levels
-    };
+    let actual_levels = resolve_create_levels(
+        "CreateVolumeTexture",
+        levels,
+        compute_volume_mip_count(width, height, depth),
+    );
     let mut staging: Vec<PageBox> = Vec::with_capacity(actual_levels as usize);
     let mut mip_widths = Vec::with_capacity(actual_levels as usize);
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
@@ -4972,10 +4989,11 @@ extern "system" fn device_create_cube_texture(
     // sidecar can address `face * levels + level` without another allocation.
     let autogen_mipmap = usage & D3DUSAGE_AUTOGENMIPMAP != 0;
     let autogen_full_chain = autogen_mipmap && !fmt.is_compressed();
-    let actual_levels = if autogen_full_chain || levels == 0 {
-        compute_mip_count(edge_length, edge_length)
+    let natural_levels = compute_mip_count(edge_length, edge_length);
+    let actual_levels = if autogen_full_chain {
+        natural_levels
     } else {
-        levels
+        resolve_create_levels("CreateCubeTexture", levels, natural_levels)
     };
     let mut staging: Vec<PageBox> =
         Vec::with_capacity(actual_levels as usize * CUBE_FACE_COUNT as usize);

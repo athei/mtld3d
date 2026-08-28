@@ -24,10 +24,11 @@ use super::{
     D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
     D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_size,
-    depth_format_bytes_per_pixel, format_name, is_depth_format, is_mapped_color_format,
-    linear_mip_size, linear_row_pitch, map_d3d_depth_format, map_d3d_format,
-    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
+    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count, compute_mip_size,
+    compute_volume_mip_count, depth_format_bytes_per_pixel, format_name, is_depth_format,
+    is_mapped_color_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
 };
 
 #[test]
@@ -684,4 +685,36 @@ fn unvalidated_bits_and_unknown_resource_types() {
     // still has to reach the per-format arms that reject it.
     assert!(usage_allowed_for_rtype(0, 0));
     assert!(!usage_allowed_for_rtype(D3DUSAGE_RENDERTARGET, 0));
+}
+
+#[test]
+fn a_volume_chain_is_measured_on_its_largest_extent() {
+    // Depth counts alongside width and height: a 2x4x8 volume runs down to
+    // 1x1x1 in four levels, one more than its 4-texel height alone allows.
+    assert_eq!(compute_volume_mip_count(2, 4, 8), 4);
+    assert_eq!(compute_volume_mip_count(8, 4, 2), 4);
+    assert_eq!(compute_volume_mip_count(1, 1, 1), 1);
+    assert_eq!(compute_volume_mip_count(64, 64, 64), 7);
+    // A single-slice volume is the 2D chain of its face.
+    assert_eq!(
+        compute_volume_mip_count(64, 16, 1),
+        compute_mip_count(64, 16)
+    );
+}
+
+#[test]
+fn a_requested_level_count_is_capped_at_the_natural_chain() {
+    let natural = compute_mip_count(64, 64);
+    assert_eq!(natural, 7);
+    // 0 asks for the whole chain.
+    assert_eq!(resolve_mip_levels(0, natural), natural);
+    // A count inside the chain is taken as given.
+    assert_eq!(resolve_mip_levels(1, natural), 1);
+    assert_eq!(resolve_mip_levels(natural, natural), natural);
+    // A count past it resolves to the chain rather than to repeated 1x1
+    // levels Metal would refuse to allocate.
+    assert_eq!(resolve_mip_levels(natural + 1, natural), natural);
+    assert_eq!(resolve_mip_levels(20, natural), natural);
+    // A 1x1 texture has exactly one level, whatever is asked for.
+    assert_eq!(resolve_mip_levels(4, compute_mip_count(1, 1)), 1);
 }
