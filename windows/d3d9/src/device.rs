@@ -7859,7 +7859,13 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
             // is rebound or released, both on this thread.
             let tex = unsafe { &*tex };
             let inner = tex.inner();
-            let (id, w, h) = (tex.texture_id(), inner.mip_width(0), inner.mip_height(0));
+            // The resolve is a texture-to-texture copy, so the destination is
+            // measured where its Metal texture lives: a depth texture created
+            // at the reported back-buffer size is rasterized at
+            // `render.scale` of it, exactly like the depth attachment the
+            // resolve compares it against.
+            let (w, h) = inner.render_extent();
+            let id = tex.texture_id();
             if dev.frame_dump.active {
                 dev.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
             }

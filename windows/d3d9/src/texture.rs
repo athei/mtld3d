@@ -563,6 +563,20 @@ impl TextureInner {
         self.mip_heights[level]
     }
 
+    /// Base-level extent of the backing Metal texture.
+    ///
+    /// `mip_width`/`mip_height` report the logical size D3D9 answers with. A
+    /// render-target or depth-stencil texture created at the reported
+    /// back-buffer size is rasterized at `render.scale` of that, so a command
+    /// that addresses the Metal texture directly (a full-surface blit, an
+    /// attachment extent) has to be measured here instead.
+    pub fn render_extent(&self) -> (u32, u32) {
+        (
+            self.render_scale.dimension(self.width),
+            self.render_scale.dimension(self.height),
+        )
+    }
+
     pub fn mip_bytes_per_row(&self, level: usize) -> u32 {
         self.mip_bytes_per_row[level]
     }
