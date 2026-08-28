@@ -10,8 +10,8 @@ use mtld3d_types::{
     D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_NO_DIRTY_UPDATE,
     D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
@@ -105,6 +105,34 @@ fn sample_center(h: &Harness, tex: &Texture<'_>) -> Rgba8 {
         );
     });
     Rgba8::from_pixel(h.read_pixel(320, 240))
+}
+
+/// Bind `tex`, sample it across the backbuffer, return the pixels at `points`.
+///
+/// One draw feeds every point, so the caller reads several texels of the same
+/// sampled image.
+fn sample_points<const N: usize>(
+    h: &Harness,
+    tex: &Texture<'_>,
+    points: [(u32, u32); N],
+) -> [u32; N] {
+    assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample draw"
+        );
+    });
+    points.map(|(x, y)| h.read_pixel(x, y))
 }
 
 #[test]
@@ -877,6 +905,59 @@ fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
     for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
         assert_pixel_eq(repainted[i], color, name);
     }
+}
+
+/// A sub-rectangle `UpdateSurface` leaves the rest of the destination level alone.
+///
+/// The destination is a default-pool texture whose staging is released once
+/// its first whole-level upload has been submitted, so the partial update
+/// re-creates a staging buffer holding only the copied rectangle. Uploading
+/// the whole mip from it would push uninitialised pages over the GPU content
+/// the copy never touched.
+#[test]
+fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let level = dst.surface_level(0);
+
+    let whole = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    whole.lock_rect(0).write_u32(&[GREEN; 16]);
+    assert_eq!(
+        h.update_surface_hr(&whole, &level),
+        0,
+        "whole-level UpdateSurface"
+    );
+    // The sampling draw submits the whole-level upload, which releases the
+    // destination's staging.
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        GREEN,
+        "whole-level fill",
+    );
+
+    let patch = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    patch.lock_rect(0).write_u32(&[RED; 16]);
+    let rect = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 2,
+        y2: 2,
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&patch, &rect, &level, (0, 0)),
+        0,
+        "sub-rect UpdateSurface"
+    );
+
+    // The 4x4 level spans the 640x480 backbuffer, so each of these reads one
+    // texel: (0,0) inside the copied rectangle, (3,0) and (0,3) outside it.
+    let [inside, right_of_rect, below_rect] =
+        sample_points(&h, &dst, [(80, 60), (560, 60), (80, 420)]);
+    assert_pixel_eq(inside, RED, "texel inside the updated rectangle");
+    assert_pixel_eq(right_of_rect, GREEN, "texel right of the updated rectangle");
+    assert_pixel_eq(below_rect, GREEN, "texel below the updated rectangle");
 }
 
 #[test]

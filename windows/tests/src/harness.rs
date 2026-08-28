@@ -1900,6 +1900,28 @@ impl Harness {
         }
     }
 
+    /// `UpdateSurface` for one source rectangle landing at a destination point.
+    pub fn update_surface_region_hr(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        dst_point: (i32, i32),
+    ) -> i32 {
+        let point = [dst_point.0, dst_point.1];
+        // SAFETY: vtable thunk; both surfaces are live, `src_rect` is a live
+        // D3DRECT and `point` a live POINT (two i32).
+        unsafe {
+            (self.dev_vtbl().update_surface)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                point.as_ptr().cast(),
+            )
+        }
+    }
+
     /// `UpdateTexture` between two 2D textures.
     pub fn update_texture_hr(&self, src: &Texture<'_>, dst: &Texture<'_>) -> i32 {
         // SAFETY: vtable thunk; both textures are live base textures.
