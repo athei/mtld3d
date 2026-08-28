@@ -232,6 +232,67 @@ fn color_fill_r5g6b5_packs_top_bits() {
 }
 
 #[test]
+fn color_fill_packed_5551_takes_the_top_bits() {
+    // 0xdeadbeef into A1R5G5B5: A=0xde>>7=1, R=0xad>>3, G=0xbe>>3, B=0xef>>3
+    // pack to 0xd6fd. X1R5G5B5 shares the layout, so it shares the encoding.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xd6fd);
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_X1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xd6fd);
+    // An alpha below half clears the top bit rather than rounding it up.
+    let bytes = d3dcolor_fill_pixel_bytes(0x7fad_beef, D3DFMT_A1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0x56fd);
+}
+
+#[test]
+fn color_fill_packed_4444_takes_the_top_nibbles() {
+    // 0xdeadbeef into A4R4G4B4 keeps the high nibble of each channel in
+    // A, R, G, B order: 0xdabe.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A4R4G4B4).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xdabe);
+    // Every channel saturated packs to every bit set.
+    let bytes = d3dcolor_fill_pixel_bytes(0xffff_ffff, D3DFMT_A4R4G4B4).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xffff);
+}
+
+#[test]
+fn color_fill_l8_is_the_rec709_luminance() {
+    // 0.2125*0xad + 0.7154*0xbe + 0.0721*0xef = 190.42 -> 0xbe.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_L8).unwrap(),
+        vec![0xbe]
+    );
+    // The luminance ignores alpha, and the weights sum to one, so white
+    // stays white and black stays black.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x00ff_ffff, D3DFMT_L8).unwrap(),
+        vec![0xff]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xff00_0000, D3DFMT_L8).unwrap(),
+        vec![0x00]
+    );
+    // A pure-green colour keeps the green weight alone: 0.7154*0xff = 182.4.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x0000_ff00, D3DFMT_L8).unwrap(),
+        vec![182]
+    );
+}
+
+#[test]
+fn color_fill_a8_is_the_alpha_byte() {
+    // An alpha-only destination takes the D3DCOLOR's alpha and nothing else.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A8).unwrap(),
+        vec![0xde]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x00ff_ffff, D3DFMT_A8).unwrap(),
+        vec![0x00]
+    );
+}
+
+#[test]
 fn color_fill_unsupported_format_is_none() {
     // Block-compressed / unmapped formats aren't encoded yet. (The packed
     // 16-bit formats ARE encoded — on a device that expands them to BGRA8
