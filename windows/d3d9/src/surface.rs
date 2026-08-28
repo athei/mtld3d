@@ -2337,6 +2337,19 @@ fn lockable_rt_lock_rect(
     D3D_OK
 }
 
+/// Bring a lockable render target's CPU staging up to date with its colour texture.
+///
+/// The entry point for a caller that has no byte size of its own to pass:
+/// resolves the format's bytes per pixel and defers to
+/// [`lockable_rt_readback_fill`], which leaves the staging alone for a format
+/// with no CPU byte size (unreachable, the surface's creation validated an
+/// uncompressed colour format).
+fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) {
+    let bpp = mtld3d_core::format::map_d3d_format(inner.standalone_format)
+        .map_or(0, |f| f.bytes_per_pixel());
+    lockable_rt_readback_fill(inner, bpp);
+}
+
 /// Read the lockable render target's colour `MTLTexture` back into its CPU staging buffer.
 ///
 /// The read-half of a non-discard `LockRect`. Flushes the in-progress frame so
@@ -2565,6 +2578,20 @@ impl SurfaceInner {
                 != 0
     }
 
+    /// True for a lockable standalone render target.
+    ///
+    /// `CreateRenderTarget` with `Lockable == TRUE`: a standalone colour
+    /// surface that also carries CPU staging, so its pixels live in two
+    /// places. Every CPU read of it has to refresh the staging from the
+    /// colour texture first and every CPU write has to be pushed back.
+    /// Mirrors the dispatch in [`surface_lock_rect`]: the implicit backbuffer
+    /// keeps no staging, so it never lands here.
+    fn is_lockable_render_target(&self) -> bool {
+        self.parent_texture.is_null()
+            && self.system_memory.is_some()
+            && !self.live_color_handle().is_null()
+    }
+
     /// Resolve the CPU pixel store this surface exposes through `GetDC`.
     ///
     /// `None` for a surface kind with no host-readable pixels (a GPU-only
@@ -2682,6 +2709,15 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     if inner.is_lockable_backbuffer() && readback_full_backbuffer(inner).is_none() {
         return D3DERR_INVALIDCALL;
     }
+    // A lockable standalone render target keeps its pixels in the colour
+    // texture the GPU writes and hands the DC a DIB over its CPU staging, so
+    // the staging has to be refreshed from the texture first. Otherwise a
+    // `ColorFill`, a draw or a `StretchRect` into the surface is invisible to
+    // the DC, exactly as it would be to a `LockRect` that skipped the same
+    // read-back.
+    if inner.is_lockable_render_target() {
+        refresh_lockable_rt_staging(inner);
+    }
     let Some(px) = inner.dc_pixels() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "IDirect3DSurface9::GetDC on a surface with no host pixel store → INVALIDCALL");
@@ -2795,6 +2831,13 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
         }
     }
     teardown_gdi_dc(held);
+    // The DC's DIB aliased a lockable render target's CPU staging, so whatever
+    // GDI drew is in the staging alone: push it to the colour texture the way
+    // `UnlockRect` does, or the next read-back overwrites it with the pixels
+    // the GPU still holds.
+    if inner.is_lockable_render_target() {
+        lockable_rt_upload(inner);
+    }
     // A backbuffer GetDC stashed a full read-back snapshot in `readback`; drop it
     // now the DC is gone (the LockRect path reuses the same slot). No-op for
     // every other surface kind (their `readback` is already None here).

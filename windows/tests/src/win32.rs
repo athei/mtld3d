@@ -60,6 +60,12 @@ unsafe extern "system" {
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
 }
 
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn GetPixel(hdc: usize, x: i32, y: i32) -> u32;
+    fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) -> u32;
+}
+
 static FAILURE_EXIT_HOOK: Once = Once::new();
 
 /// Exit code a test process ends with once an assertion has failed.
@@ -319,6 +325,27 @@ pub fn set_window_pos(hwnd: usize, x: i32, y: i32, width: i32, height: i32) {
     // geometry is plain scalars.
     let ok = unsafe { SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) };
     assert!(ok != 0, "SetWindowPos failed");
+}
+
+/// Read one pixel of a device context as a `COLORREF` (`0x00BBGGRR`).
+///
+/// For an `IDirect3DSurface9::GetDC` memory DC, this is how a test observes
+/// the pixels GDI sees through the DIB the DC wraps.
+#[must_use]
+pub fn dc_get_pixel(hdc: usize, x: i32, y: i32) -> u32 {
+    // SAFETY: GDI thunk; `hdc` is a live device context and the coordinates
+    // are plain scalars (an out-of-range one returns CLR_INVALID).
+    unsafe { GetPixel(hdc, x, y) }
+}
+
+/// Paint one pixel of a device context, `color` a `COLORREF` (`0x00BBGGRR`).
+///
+/// Returns the colour GDI actually stored, which for a DIB of a
+/// lower-precision format is the nearest representable one.
+pub fn dc_set_pixel(hdc: usize, x: i32, y: i32, color: u32) -> u32 {
+    // SAFETY: GDI thunk; `hdc` is a live device context and the coordinates
+    // and colour are plain scalars.
+    unsafe { SetPixel(hdc, x, y, color) }
 }
 
 /// Destroy a window created by [`create_window`].

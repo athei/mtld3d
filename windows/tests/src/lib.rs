@@ -19,7 +19,7 @@ pub use harness::{DrawIndexedUpParams, Harness, HarnessConfig, render_scale_is_i
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
 pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
-    Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
+    SurfaceDc, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
 };
 pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,

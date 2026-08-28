@@ -1721,6 +1721,41 @@ impl Harness {
         Surface::from_raw(out)
     }
 
+    /// `CreateRenderTarget` with `Lockable == TRUE`, asserting success.
+    ///
+    /// The surface is a `D3DPOOL_DEFAULT` render target like
+    /// [`Self::create_render_target`] and additionally serves `LockRect` /
+    /// `UnlockRect` out of a CPU staging buffer.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_lockable_render_target(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                width,
+                height,
+                format,
+                0,
+                0,
+                1,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "lockable CreateRenderTarget failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "lockable CreateRenderTarget returned null");
+        Surface::from_raw(out)
+    }
+
     /// `CreateDepthStencilSurface`, asserting success.
     ///
     /// # Panics
