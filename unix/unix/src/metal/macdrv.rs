@@ -32,14 +32,6 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// `NSView*` from `AttachMetalLayer`; sending it is independent of HDR).
 static HDR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Raw `CAMetalLayer*` (as `usize`) bound at the most recent attach. `0` = none.
-///
-/// The display-follow path reconfigures this layer from the main thread, the
-/// same posture as [`BOUND_VIEW_PTR`]: re-attach re-points it, and the
-/// presenting thread never hands a Core Animation pointer across a thread
-/// boundary.
-static BOUND_LAYER_PTR: AtomicUsize = AtomicUsize::new(0);
-
 /// The `color.hdr.enable` setting the most recent attach carried.
 ///
 /// Deciding the layer configuration for a screen first seen mid-session needs
@@ -62,15 +54,6 @@ static COLOR_SPACE_POLICY: AtomicU32 = AtomicU32::new(ColorSpacePolicy::Passthro
 /// Relaxed is enough — a one-frame lag at the transition is harmless and
 /// bounded by the retained `allowsNextDrawableTimeout` safety valve.
 static WINDOW_OCCLUDED: AtomicBool = AtomicBool::new(false);
-
-/// Raw `NSWindow*` (as `usize`) of the window bound at the most recent attach.
-///
-/// The occlusion observer compares each notification's window against this to
-/// ignore other windows' occlusion changes, and only ever dereferences the
-/// *live* notification object after a match. `0` = none bound yet. Re-attach
-/// (device/window churn) simply re-points this, so a single leaked observer
-/// stays correct.
-static BOUND_WINDOW_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Last per-frame headroom we emitted an `info!` for, encoded as `f32::to_bits`.
 ///
@@ -95,12 +78,125 @@ static LAST_LOGGED_HEADROOM_BITS: AtomicU32 = AtomicU32::new(0);
 /// presents before the first refresh lands are correct rather than merely safe.
 static CURRENT_HEADROOM_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
 
-/// Raw `NSView*` (as `usize`) the headroom refresh walks. `0` = none bound yet.
+/// Raw addresses of the `AppKit` objects the most recent attach latched.
 ///
-/// Seeded at attach so the main thread never has to be handed a view pointer by
-/// the presenting thread. Re-attach re-points it, the same posture as
-/// [`BOUND_WINDOW_PTR`].
-static BOUND_VIEW_PTR: AtomicUsize = AtomicUsize::new(0);
+/// `0` in a field means nothing of that kind is bound. All three belong to the
+/// metal view the attaching device owns, so they are valid only while that
+/// device holds it alive.
+struct BoundDisplay {
+    /// Raw `NSView*` the headroom refresh walks.
+    ///
+    /// Latched at attach so the main thread never has to be handed a view
+    /// pointer by the presenting thread.
+    view: usize,
+    /// Raw `CAMetalLayer*` the display-follow path reconfigures.
+    ///
+    /// Reconfigured from the main thread for the same reason: the presenting
+    /// thread never hands a Core Animation pointer across a thread boundary.
+    layer: usize,
+    /// Raw `NSWindow*` the occlusion observer filters notifications by.
+    ///
+    /// Compared against the notification's own live object, never
+    /// dereferenced.
+    window: usize,
+}
+
+impl BoundDisplay {
+    /// The record of a session with no metal view attached.
+    const UNBOUND: Self = Self {
+        view: 0,
+        layer: 0,
+        window: 0,
+    };
+}
+
+/// The `AppKit` objects a display reconciliation may resurrect, guarded as one.
+///
+/// [`detach_metal_layer`] clears the record under this lock before the
+/// teardown path releases the metal view, and every resurrection retains its
+/// object while holding the lock, so a reconciliation either owns a retain of
+/// a live object or finds nothing bound. Re-attach re-points the record, which
+/// is what keeps the process-lifetime observers correct across device and
+/// window churn.
+static BOUND_DISPLAY: Mutex<BoundDisplay> = Mutex::new(BoundDisplay::UNBOUND);
+
+/// Run `f` against the bound-display record.
+fn with_bound_display<R>(f: impl FnOnce(&mut BoundDisplay) -> R) -> R {
+    let mut bound = BOUND_DISPLAY.lock().expect("bound-display mutex poisoned");
+    f(&mut bound)
+}
+
+/// Retain the bound `NSView`, or `None` while no metal view is attached.
+///
+/// **Main thread only**, because the caller goes on to walk the view.
+fn retain_bound_view() -> Option<Retained<objc2_app_kit::NSView>> {
+    with_bound_display(|bound| {
+        if bound.view == 0 {
+            return None;
+        }
+        // SAFETY: teardown clears this field under the same lock before it
+        // releases the metal view, so a non-zero address names a live `NSView`
+        // here, and the retain this takes keeps it alive for the walk.
+        unsafe { Retained::retain(bound.view as *mut objc2_app_kit::NSView) }
+    })
+}
+
+/// Retain the bound `CAMetalLayer`, or `None` while no metal view is attached.
+///
+/// **Main thread only**, for the same reason [`retain_bound_view`] is.
+fn retain_bound_layer() -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
+    with_bound_display(|bound| {
+        if bound.layer == 0 {
+            return None;
+        }
+        // SAFETY: wine retains the layer for the metal view's lifetime, and
+        // teardown clears this field under the same lock before releasing that
+        // view, so the address names a live layer here.
+        unsafe { Retained::retain(bound.layer as *mut objc2_quartz_core::CAMetalLayer) }
+    })
+}
+
+/// Whether `window` is the `NSWindow` the most recent attach bound.
+///
+/// `0` and any other window answer `false`, so the occlusion observer ignores
+/// notifications for windows that are not ours and every notification once the
+/// device is gone.
+fn is_bound_window(window: usize) -> bool {
+    window != 0 && with_bound_display(|bound| bound.window == window)
+}
+
+/// Release the latches `view_handle` left behind. **Device teardown only.**
+///
+/// The teardown path releases that metal view, so the view, its layer and its
+/// window stop being valid the moment it runs. Clearing the record before the
+/// release is what keeps the process-lifetime screen-parameter and occlusion
+/// observers from walking a freed view: they take the same lock, so each one
+/// either retained its object before the clear or finds nothing bound. The
+/// derived state then goes back to what a session with no layer reports: no
+/// HDR configuration applied, the identity headroom the present pass treats
+/// as a no-op, and a window that never suppresses a present.
+///
+/// Only the bound view's own teardown clears, so a device that never attached
+/// and one whose view a later attach has already replaced leave the record
+/// naming the view that is still live.
+pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
+    let view_addr =
+        usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
+    let detached = with_bound_display(|bound| {
+        let bound_view = view_addr != 0 && bound.view == view_addr;
+        if bound_view {
+            *bound = BoundDisplay::UNBOUND;
+        }
+        bound_view
+    });
+    if !detached {
+        return;
+    }
+    HDR_ACTIVE.store(false, Ordering::Relaxed);
+    CURRENT_HEADROOM_BITS.store(1.0_f32.to_bits(), Ordering::Relaxed);
+    LAST_LOGGED_HEADROOM_BITS.store(0, Ordering::Relaxed);
+    WINDOW_OCCLUDED.store(false, Ordering::Relaxed);
+}
 
 /// Whether a headroom refresh is already queued on the main thread.
 ///
@@ -190,7 +286,7 @@ fn install_occlusion_tracking(view: *mut c_void) {
     // The headroom refresh walks this same view, and stores it here rather
     // than taking it per present so the presenting thread never hands an
     // AppKit pointer across a thread boundary. Re-attach re-points it.
-    BOUND_VIEW_PTR.store(view_addr, Ordering::Relaxed);
+    with_bound_display(|bound| bound.view = view_addr);
     run_on_main_thread_sync(move || {
         // SAFETY: `view_addr` is the metal `NSView*` macdrv just created and
         // returned to attach; we are on the main thread (dispatch to the main
@@ -200,11 +296,12 @@ fn install_occlusion_tracking(view: *mut c_void) {
         let Some(window) = view.window() else {
             // No host window yet — assume visible so we never wrongly suppress
             // presents; the observer corrects it on the first state change.
-            BOUND_WINDOW_PTR.store(0, Ordering::Relaxed);
+            with_bound_display(|bound| bound.window = 0);
             WINDOW_OCCLUDED.store(false, Ordering::Relaxed);
             return;
         };
-        BOUND_WINDOW_PTR.store(Retained::as_ptr(&window) as usize, Ordering::Relaxed);
+        let window_addr = Retained::as_ptr(&window) as usize;
+        with_bound_display(|bound| bound.window = window_addr);
         let occluded = !window
             .occlusionState()
             .contains(NSWindowOcclusionState::Visible);
@@ -307,7 +404,11 @@ static LAST_SCREEN_CONFIGURATION: Mutex<Option<ScreenConfiguration>> = Mutex::ne
 /// all happens on a headroom step. The desktop process never loads mtld3d,
 /// so its own copy of the storm is out of reach here; that half is a Wine
 /// patch. Installed once; the observer token is leaked for the process
-/// lifetime like the occlusion observer.
+/// lifetime like the occlusion observer, and it has to outlive any one
+/// device: taking the notification over unregisters Wine's delegate for this
+/// name, so removing our observer at teardown would leave nobody forwarding
+/// it at all. What teardown clears instead is [`BOUND_DISPLAY`], which is
+/// what the handler walks.
 fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
     use core::ptr::NonNull;
     use std::sync::Once;
@@ -407,8 +508,8 @@ fn install_screen_params_filter_once(mtm: objc2::MainThreadMarker) {
 /// Install the `NSWindowDidChangeOcclusionState` observer exactly once.
 ///
 /// Scoped to all windows (`object: None`) and filtered in the block by
-/// [`BOUND_WINDOW_PTR`], so a single leaked observer survives device/window
-/// churn — a re-attach just re-points `BOUND_WINDOW_PTR`. The token is
+/// [`is_bound_window`], so a single leaked observer survives device/window
+/// churn — a re-attach just re-points [`BOUND_DISPLAY`]. The token is
 /// intentionally leaked for the process lifetime, the same posture as the
 /// `NSProcessInfo` activity in [`declare_latency_critical_activity`].
 fn install_occlusion_observer_once() {
@@ -434,7 +535,7 @@ fn install_occlusion_observer_once() {
                 return;
             };
             let object_ptr = Retained::as_ptr(&object) as usize;
-            if object_ptr == 0 || object_ptr != BOUND_WINDOW_PTR.load(Ordering::Relaxed) {
+            if !is_bound_window(object_ptr) {
                 return;
             }
             // SAFETY: `object` is the live window that posted the notification;
@@ -451,7 +552,7 @@ fn install_occlusion_observer_once() {
         // SAFETY: AppKit-exported notification-name constant.
         let name = unsafe { NSWindowDidChangeOcclusionStateNotification };
         // SAFETY: `name` is a valid notification name; `object: None` observes
-        // all windows (filtered by `BOUND_WINDOW_PTR` in the block); `queue:
+        // all windows (filtered by the bound-window check in the block); `queue:
         // None` delivers synchronously on the posting (main) thread; the block
         // captures no non-`Send` state. The returned token is leaked below.
         let token = unsafe {
@@ -776,7 +877,7 @@ pub fn attach_metal_layer(
             // path needs: it reconfigures this layer for a screen that was
             // not attached yet, and has to apply the same gate and the same
             // colorspace policy attach would have applied.
-            BOUND_LAYER_PTR.store(layer as usize, Ordering::Relaxed);
+            with_bound_display(|bound| bound.layer = layer as usize);
             HDR_ENABLE_REQUESTED.store(hdr_enable, Ordering::Relaxed);
             COLOR_SPACE_POLICY.store(color_space as u32, Ordering::Relaxed);
             // Decide HDR vs SDR layer configuration from the panel's
@@ -1299,23 +1400,19 @@ fn queue_headroom_refresh() {
 /// where the layer's own configuration is reconciled against that screen; see
 /// [`follow_screen_layer_mode`].
 fn refresh_headroom_on_main() {
-    use objc2::{MainThreadMarker, rc::Retained};
-    use objc2_app_kit::{NSScreen, NSView};
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
 
     HEADROOM_REFRESH_PENDING.store(false, Ordering::Release);
-    let view_addr = BOUND_VIEW_PTR.load(Ordering::Relaxed);
-    if view_addr == 0 {
+    // Nothing bound: either no device has attached a layer yet, or the one
+    // that had is gone and its view with it. Either way there is no window to
+    // walk, and the notification that got us here still reaches Wine.
+    let Some(view_obj) = retain_bound_view() else {
         return;
-    }
+    };
     // SAFETY: we are on the main thread (dispatched to the main queue), where
     // NSScreen's main-thread-only class annotation is satisfied for real.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    // SAFETY: `view_addr` is the metal `NSView*` macdrv created and attach
-    // stored; wine's macdrv retains it for the layer's lifetime, and
-    // `Retained::retain` bumps the count for the duration of the walk.
-    let Some(view_obj) = (unsafe { Retained::retain(view_addr as *mut NSView) }) else {
-        return;
-    };
     let screen = view_obj
         .window()
         .and_then(|w| w.screen())
@@ -1339,7 +1436,7 @@ fn refresh_headroom_on_main() {
     if let Some(screen) = screen.as_deref() {
         follow_screen_layer_mode(screen);
     }
-    log_headroom_change_if_any(headroom, view_addr as *mut c_void);
+    log_headroom_change_if_any(headroom, &view_obj);
 }
 
 /// Emit one `info!` line when the live headroom drifts more than 5% from the last logged value.
@@ -1354,7 +1451,7 @@ fn refresh_headroom_on_main() {
 /// without flooding the console during sub-percent oscillation. Names the
 /// screen the view is currently bound to so a stuck-at-1.0 run tells us
 /// *which* display is reporting no headroom.
-fn log_headroom_change_if_any(current_headroom: f32, view: *mut c_void) {
+fn log_headroom_change_if_any(current_headroom: f32, view: &objc2_app_kit::NSView) {
     let last_bits = LAST_LOGGED_HEADROOM_BITS.load(Ordering::Relaxed);
     let last = f32::from_bits(last_bits);
     let should_log = last_bits == 0 || ((current_headroom - last).abs() / last) > 0.05;
@@ -1376,21 +1473,15 @@ fn log_headroom_change_if_any(current_headroom: f32, view: *mut c_void) {
 /// logged screen identity matches the screen whose headroom we just read.
 /// **Main thread only**, for the same reason that one is. Returns `None`
 /// if the view has no window or no screen association yet.
-fn view_screen_name(view: *mut c_void) -> Option<String> {
-    use objc2::{MainThreadMarker, rc::Retained};
-    use objc2_app_kit::{NSScreen, NSView};
+fn view_screen_name(view: &objc2_app_kit::NSView) -> Option<String> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
 
-    if view.is_null() {
-        return None;
-    }
     // SAFETY: the sole caller is `log_headroom_change_if_any`, itself reached
     // only from the main-queue refresh, so NSScreen's main-thread-only class
     // annotation is satisfied for real rather than asserted.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    // SAFETY: `view` is a non-null `*mut NSView` from wine macdrv; `Retained::
-    // retain` bumps the refcount via standard Cocoa retain semantics.
-    let view_obj = unsafe { Retained::retain(view.cast::<NSView>()) }?;
-    let screen = view_obj
+    let screen = view
         .window()
         .and_then(|w| w.screen())
         .or_else(|| NSScreen::mainScreen(mtm))?;
@@ -1738,13 +1829,6 @@ fn screen_color_profile(
 /// for a value the present shader already tracks per frame. Reconfiguring is
 /// therefore rare, and each one gets a log line.
 fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
-    use objc2_quartz_core::CAMetalLayer;
-
-    let layer_addr = BOUND_LAYER_PTR.load(Ordering::Relaxed);
-    // No layer attached yet: attach itself configures the first one.
-    if layer_addr == 0 {
-        return;
-    }
     let applied = if HDR_ACTIVE.load(Ordering::Relaxed) {
         LayerMode::Hdr
     } else {
@@ -1757,10 +1841,9 @@ fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
     let Some(mode) = layer_mode_change(applied, potential, hdr_enable) else {
         return;
     };
-    // SAFETY: `layer_addr` is the `CAMetalLayer*` wine macdrv handed attach;
-    // wine retains it for the metal view's lifetime, and `Retained::retain`
-    // bumps the count for the duration of the reconfiguration.
-    let Some(layer) = (unsafe { Retained::retain(layer_addr as *mut CAMetalLayer) }) else {
+    // No layer bound: attach configures the first one itself, and a torn-down
+    // device leaves none to reconcile.
+    let Some(layer) = retain_bound_layer() else {
         return;
     };
     let raw_policy = COLOR_SPACE_POLICY.load(Ordering::Relaxed);

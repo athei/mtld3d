@@ -13,7 +13,7 @@ use objc2_metal::{
 
 use super::{
     handle::{IntoRetained, ReleaseRetain},
-    macdrv::release_metal_view,
+    macdrv::{detach_metal_layer, release_metal_view},
 };
 
 // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked.
@@ -141,6 +141,11 @@ pub fn destroy_command_queue(
     pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>,
     depth_texture_handle: MetalHandle<MTLTextureKind>,
 ) {
+    // Drop the latched view, layer and window first: the main thread
+    // reconciles them against the display it is told about, and this call is
+    // about to release the view all three belong to.
+    detach_metal_layer(view_handle);
+
     // Force-drain any in-flight or recently-completed command buffers
     // before we drop the queue + device. The PE-side encoder already
     // waited for `coherent_seq` to catch up before destroying its
