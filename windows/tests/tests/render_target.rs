@@ -9,12 +9,12 @@ use mtld3d_types::{
     D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ,
     D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
     D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_DIFFUSE,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
-    D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -2621,6 +2621,138 @@ fn get_render_target_data_reads_backbuffer() {
     assert!(
         c.r > 200 && c.g > 100 && c.g < 160 && c.b < 40,
         "read-back decodes to orange, got {c:?}",
+    );
+}
+
+#[test]
+fn get_render_target_data_fills_a_system_memory_texture_level() {
+    // D3D9 takes any system-memory surface as the destination, and a title
+    // that screenshots or feeds a reflection reads the back buffer into a
+    // level of a D3DPOOL_SYSTEMMEM texture rather than into an offscreen
+    // plain surface. Both CPU-only pools qualify.
+    const TEAL: u32 = 0xFF00_8080;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(TEAL), 0, "clear backbuffer teal");
+    assert_eq!(h.present(), 0, "present");
+
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+
+    for (pool, name) in [
+        (D3DPOOL_SYSTEMMEM, "D3DPOOL_SYSTEMMEM"),
+        (D3DPOOL_SCRATCH, "D3DPOOL_SCRATCH"),
+    ] {
+        let texture = h.create_texture(desc.width, desc.height, 1, 0, D3DFMT_A8R8G8B8, pool);
+        let level = texture.surface_level(0);
+        assert_eq!(
+            h.get_render_target_data_hr(&bb, &level),
+            0,
+            "GetRenderTargetData backbuffer → {name} texture level",
+        );
+        let pixel = {
+            let locked = level.lock_rect(D3DLOCK_READONLY);
+            let pitch_px = locked.pitch().cast_unsigned() / 4;
+            let idx = (240 * pitch_px + 320) as usize;
+            locked.as_u32(idx + 1)[idx]
+        };
+        // The locked pixel decodes to the cleared teal (R=0, G=B≈128).
+        let c = Rgba8::from_pixel(pixel);
+        assert!(
+            c.r < 40 && c.g > 100 && c.g < 160 && c.b > 100 && c.b < 160,
+            "{name} level decodes to teal, got {c:?}",
+        );
+    }
+}
+
+#[test]
+fn get_front_buffer_data_fills_a_system_memory_texture_level() {
+    // Same destination rule on the front-buffer read; the source is the
+    // presented image rather than a caller-named render target.
+    const PURPLE: u32 = 0xFF80_0080;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(PURPLE), 0, "clear backbuffer purple");
+    assert_eq!(h.present(), 0, "present");
+
+    let (hr, desc) = h.render_target(0).desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let texture = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.get_front_buffer_data_hr(&level),
+        0,
+        "GetFrontBufferData → SYSTEMMEM texture level",
+    );
+    let pixel = {
+        let locked = level.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (240 * pitch_px + 320) as usize;
+        locked.as_u32(idx + 1)[idx]
+    };
+    // The locked pixel decodes to the cleared purple (R=B≈128, G=0).
+    let c = Rgba8::from_pixel(pixel);
+    assert!(
+        c.r > 100 && c.r < 160 && c.g < 40 && c.b > 100 && c.b < 160,
+        "front-buffer level decodes to purple, got {c:?}",
+    );
+}
+
+#[test]
+fn readback_rejects_a_destination_that_is_not_the_source_in_system_memory() {
+    // The destination rules are D3D9's: a system-memory surface with the
+    // source's extent and format. A level of a GPU-resident texture, and a
+    // system-memory destination of another size, are both INVALIDCALL rather
+    // than a copy of whatever fits.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+
+    let managed = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &managed.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a D3DPOOL_MANAGED level is not a system-memory destination",
+    );
+
+    let small = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &small.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a smaller destination is rejected, not filled with a scaled copy",
+    );
+    assert_eq!(
+        h.get_front_buffer_data_hr(&small.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "GetFrontBufferData applies the same extent rule",
+    );
+
+    let wrong_format = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_R5G6B5,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &wrong_format.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a destination with another byte layout is rejected, not converted",
     );
 }
 

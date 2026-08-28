@@ -610,18 +610,6 @@ GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
 result matching no vendor's encoding. Matching a specific vendor is neither
 feasible nor desirable. No capability involved (old `caps` tag incoherent).
 
-### visual.c/test_multisample_get_front_buffer_data
-Sites: 17179=real 17181=real
-
-`GetFrontBufferData` into a `D3DPOOL_SYSTEMMEM` *texture level* returns
-INVALIDCALL, so the pixel read after it sees nothing. The same call into an
-offscreen-plain system-memory surface, a few lines earlier in the same test,
-passes. Nothing about it is multisample-specific: the readback path takes the
-destination's own backing store, which only an offscreen-plain surface has,
-while a texture level's pixels live in the parent texture's per-mip staging.
-The test reaches it only on a multisample-capable device, which is why the
-site is new.
-
 ### visual.c/multisampled_depth_buffer_test
 Sites: 17476=expected
 

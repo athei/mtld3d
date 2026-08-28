@@ -28,6 +28,7 @@ use mtld3d_core::{
         ApiPerfState, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer, DeviceSubCategory,
         KeysGate,
     },
+    readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
 };
 use mtld3d_shared::{
@@ -94,7 +95,7 @@ use super::{
     shader_bindings::{CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT, ShaderBindings},
     stage_bindings::{STAGE_COUNT, StageBindings, TextureSwapDelta},
     state_block::{RecordingStateBlock, StateOp},
-    surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample},
+    surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample, SystemMemoryDst},
     texture::{
         CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureFlags,
         TextureInner, new_uninit_page_box,
@@ -5898,6 +5899,40 @@ extern "system" fn device_update_texture(
     hr
 }
 
+/// Reject a read-back whose destination cannot take the source; `None` accepts it.
+///
+/// One warn per distinct reason, naming the entry point that reached it first,
+/// since an application that reads back every frame retries a rejected call
+/// every frame.
+fn reject_readback(
+    entry_point: &str,
+    src: &ReadbackSource,
+    dst: &SystemMemoryDst,
+) -> Option<ReadbackReject> {
+    let reason = mtld3d_core::readback::reject_readback_dst(
+        src,
+        &ReadbackDestination {
+            width: dst.width,
+            height: dst.height,
+            format: dst.format,
+            bytes_per_row: dst.bytes_per_row,
+            len: dst.len,
+        },
+    )?;
+    warn_readback_rejected(entry_point, reason);
+    Some(reason)
+}
+
+/// One `log_once_warn_by!` line per (entry point, reason) pair.
+fn warn_readback_rejected(entry_point: &str, reason: ReadbackReject) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: reason.key(),
+        "reject {entry_point}: {} → INVALIDCALL",
+        reason.as_str()
+    );
+}
+
 extern "system" fn device_get_render_target_data(
     this: *mut c_void,
     rt: *mut c_void,
@@ -5931,95 +5966,117 @@ extern "system" fn device_get_render_target_data(
             "GetRenderTargetData: source is multisampled → INVALIDCALL (StretchRect it into a single-sampled surface first)");
         return D3DERR_INVALIDCALL;
     }
-    let Some((dst_ptr, dst_len)) = dst_surf.system_memory_blit_dst() else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "GetRenderTargetData: dst is not a D3DPOOL_SYSTEMMEM offscreen surface → INVALIDCALL");
+    let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
+        warn_readback_rejected("GetRenderTargetData", ReadbackReject::NotSystemMemory);
         return D3DERR_INVALIDCALL;
     };
-    // Source must expose a persistent Metal color texture (the backbuffer or a
-    // standalone color RT). Texture-backed RTs hold their handle on the encoder
-    // thread keyed by texture id.
+    // A source with no persistent colour handle is either a render-target
+    // texture level, whose handle lives encoder-side, or not a render target
+    // at all.
     let src_handle = src.metal_color_handle();
-    if src_handle.is_null() {
-        // A render-target *texture* surface (GetSurfaceLevel on a
-        // D3DUSAGE_RENDERTARGET texture) is a valid GetRenderTargetData source —
-        // D3D9 returns S_OK and blits its content to the system-memory dst. Its
-        // Metal handle lives encoder-side keyed by texture
-        // id, so resolve it AND note it read-back inside one op (before the flush
-        // finalizes the frame, so the store optimiser keeps the rendered
-        // content), pass the handle back through an atomic slot, then blit it. A
-        // non-render-target texture source stays INVALIDCALL.
-        let parent = src.parent_texture();
-        if !parent.is_null() {
-            // SAFETY: `parent` is a live `Direct3DTexture9` (its refcount keeps it
-            // alive while the surface is alive).
-            let tex = unsafe { &*parent };
-            if tex.d3d_usage() & D3DUSAGE_RENDERTARGET != 0 && tex.d3d_pool() == D3DPOOL_DEFAULT {
-                let texture_id = tex.inner().texture_info().texture_id;
-                let Some(bpp) =
-                    map_d3d_format(dst_surf.standalone_format()).map(|m| m.bytes_per_pixel())
-                else {
-                    return D3DERR_INVALIDCALL;
-                };
-                let width = dst_surf.standalone_width();
-                let height = dst_surf.standalone_height();
-                let bytes_per_row = width.saturating_mul(bpp);
-                let needed = u64::from(bytes_per_row).saturating_mul(u64::from(height));
-                if width == 0 || height == 0 || bpp == 0 || needed == 0 || dst_len < needed {
-                    return D3DERR_INVALIDCALL;
-                }
-                let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let slot_op = std::sync::Arc::clone(&slot);
-                obj.inner().push_op(Box::new(move |enc| {
-                    let h = enc.get_texture_handle_by_id(texture_id);
-                    if h != 0 {
-                        // SAFETY: `h` is a live retained MTLTexture handle from the
-                        // encoder texture cache.
-                        enc.note_color_read_back(unsafe { MetalHandle::new(h) });
-                    }
-                    slot_op.store(h, std::sync::atomic::Ordering::Release);
-                }));
-                obj.inner().flush_current_frame_blocking();
-                let h = slot.load(std::sync::atomic::Ordering::Acquire);
-                if h == 0 {
-                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                        "GetRenderTargetData: texture-RT handle unresolved → INVALIDCALL");
-                    return D3DERR_INVALIDCALL;
-                }
-                return blit_handle_to_systemmem(
-                    obj.inner(),
-                    &SystemMemReadback {
-                        // SAFETY: `h` is non-zero (checked above) and a live
-                        // retained MTLTexture handle from the encoder's RT slot.
-                        tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-                        dst_ptr,
-                        dst_len,
-                        level: 0,
-                        width,
-                        height,
-                        bytes_per_row,
-                        full_width: width,
-                        full_height: height,
-                    },
-                );
-            }
+    let hr = if src_handle.is_null() {
+        readback_from_texture_rt(&obj, &src, &dst_desc)
+    } else {
+        let Some(fmt) = map_d3d_format(src.standalone_format()) else {
+            warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
+            return D3DERR_INVALIDCALL;
+        };
+        let source = ReadbackSource {
+            width: src.standalone_width(),
+            height: src.standalone_height(),
+            format: fmt.metal_pixel_format(),
+        };
+        if reject_readback("GetRenderTargetData", &source, &dst_desc).is_some() {
+            return D3DERR_INVALIDCALL;
         }
+        blit_texture_to_systemmem(
+            obj.inner(),
+            &SystemMemReadback::for_readback(
+                src_handle,
+                0,
+                (source.width, source.height),
+                &dst_desc,
+            ),
+        )
+    };
+    if hr == D3D_OK {
+        dst_surf.note_system_memory_written();
+    }
+    hr
+}
+
+/// `GetRenderTargetData` from a level of a `D3DUSAGE_RENDERTARGET` texture.
+///
+/// D3D9 accepts one and returns its content; a non-render-target texture
+/// source stays `INVALIDCALL`. Its Metal handle lives on the encoder thread
+/// keyed by texture id, so one op resolves it *and* notes it read-back before
+/// the flush finalizes the frame (the store optimiser would otherwise discard
+/// a colour store nothing sampled in-frame), then hands it back through an
+/// atomic slot.
+fn readback_from_texture_rt(
+    dev: &Direct3DDevice9,
+    src: &Direct3DSurface9,
+    dst: &SystemMemoryDst,
+) -> i32 {
+    let parent = src.parent_texture();
+    if parent.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "GetRenderTargetData: source is not a render target → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
-    let Some(bpp) = map_d3d_format(dst_surf.standalone_format()).map(|m| m.bytes_per_pixel())
-    else {
+    // SAFETY: `parent` is a live `Direct3DTexture9` (its refcount keeps it
+    // alive while the surface is alive).
+    let tex = unsafe { &*parent };
+    if tex.d3d_usage() & D3DUSAGE_RENDERTARGET == 0 || tex.d3d_pool() != D3DPOOL_DEFAULT {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "GetRenderTargetData: source is not a render target → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    let Some(fmt) = map_d3d_format(tex.d3d_format()) else {
+        warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
         return D3DERR_INVALIDCALL;
     };
-    blit_texture_to_systemmem(
-        obj.inner(),
-        src_handle,
-        dst_ptr,
-        dst_len,
-        dst_surf.standalone_width(),
-        dst_surf.standalone_height(),
-        bpp,
+    let level = src.mip_level();
+    let ti = tex.inner();
+    let source = ReadbackSource {
+        width: ti.mip_width(level as usize),
+        height: ti.mip_height(level as usize),
+        format: fmt.metal_pixel_format(),
+    };
+    if reject_readback("GetRenderTargetData", &source, dst).is_some() {
+        return D3DERR_INVALIDCALL;
+    }
+    let texture_id = ti.texture_info().texture_id;
+    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let slot_op = std::sync::Arc::clone(&slot);
+    dev.inner().push_op(Box::new(move |enc| {
+        let h = enc.get_texture_handle_by_id(texture_id);
+        if h != 0 {
+            // SAFETY: `h` is a live retained MTLTexture handle from the
+            // encoder texture cache.
+            enc.note_color_read_back(unsafe { MetalHandle::new(h) });
+        }
+        slot_op.store(h, std::sync::atomic::Ordering::Release);
+    }));
+    dev.inner().flush_current_frame_blocking();
+    let h = slot.load(std::sync::atomic::Ordering::Acquire);
+    if h == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "GetRenderTargetData: texture-RT handle unresolved → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    blit_handle_to_systemmem(
+        dev.inner(),
+        &SystemMemReadback::for_readback(
+            // SAFETY: `h` is non-zero (checked above) and a live retained
+            // MTLTexture handle from the encoder texture cache.
+            unsafe { MetalHandle::<MTLTextureKind>::new(h) },
+            level,
+            // The texture's own logical extent, which the mip extent above is
+            // measured against.
+            (ti.mip_width(0), ti.mip_height(0)),
+            dst,
+        ),
     )
 }
 
@@ -6037,63 +6094,50 @@ extern "system" fn device_get_front_buffer_data(
     let Some(dst_surf) = (unsafe { InPtr::<Direct3DSurface9>::opt(dst_surface) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let Some((dst_ptr, dst_len)) = dst_surf.system_memory_blit_dst() else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "GetFrontBufferData: dst is not a D3DPOOL_SYSTEMMEM offscreen surface → INVALIDCALL");
+    let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
+        warn_readback_rejected("GetFrontBufferData", ReadbackReject::NotSystemMemory);
         return D3DERR_INVALIDCALL;
     };
     let device_inner = obj.inner();
-    let src_handle = device_inner.backbuffer_handle;
-    let width = device_inner.backbuffer_width;
-    let height = device_inner.backbuffer_height;
-    // Front-buffer reads are approximated by the persistent backbuffer texture,
-    // which is pinned to BGRA8 (D3DFMT_A8R8G8B8 byte layout → 4 bytes/pixel).
-    blit_texture_to_systemmem(device_inner, src_handle, dst_ptr, dst_len, width, height, 4)
+    // Front-buffer reads are approximated by the persistent back-buffer
+    // texture, whose extent and layout the destination is measured against.
+    let source = ReadbackSource {
+        width: device_inner.backbuffer_width,
+        height: device_inner.backbuffer_height,
+        format: device_inner.current_frame.backbuffer_format(),
+    };
+    if reject_readback("GetFrontBufferData", &source, &dst_desc).is_some() {
+        return D3DERR_INVALIDCALL;
+    }
+    let hr = blit_texture_to_systemmem(
+        device_inner,
+        &SystemMemReadback::for_readback(
+            device_inner.backbuffer_handle,
+            0,
+            (source.width, source.height),
+            &dst_desc,
+        ),
+    );
+    if hr == D3D_OK {
+        dst_surf.note_system_memory_written();
+    }
+    hr
 }
 
 /// Flush pending GPU work, then blit a Metal color texture into system memory.
 ///
-/// The destination is a PE-addressable system-memory buffer (a
-/// `D3DPOOL_SYSTEMMEM` surface's backing). Shared by `GetRenderTargetData` /
-/// `GetFrontBufferData`; mirrors the per-`LockRect` backbuffer readback in
-/// `surface.rs`.
-fn blit_texture_to_systemmem(
-    device_inner: &mut DeviceInner,
-    src: MetalHandle<MTLTextureKind>,
-    dst_ptr: u64,
-    dst_len: u64,
-    width: u32,
-    height: u32,
-    bytes_per_pixel: u32,
-) -> i32 {
-    if width == 0 || height == 0 || bytes_per_pixel == 0 {
-        return D3DERR_INVALIDCALL;
-    }
-    let bytes_per_row = width.saturating_mul(bytes_per_pixel);
-    let needed = u64::from(bytes_per_row).saturating_mul(u64::from(height));
-    if needed == 0 || dst_len < needed {
-        return D3DERR_INVALIDCALL;
-    }
+/// Shared by `GetRenderTargetData` / `GetFrontBufferData`; mirrors the
+/// per-`LockRect` backbuffer readback in `surface.rs`. The destination has
+/// already been checked against the source by `reject_readback`.
+fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemReadback) -> i32 {
+    let src = read.tex_handle;
     // The store-action optimiser runs at flush time and would discard an
     // offscreen RT's colour store when nothing samples it in-frame (Rule D) —
     // but this blit reads it right after. Mark it read-back BEFORE the flush
     // so finalize_store_actions keeps the rendered content.
     device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(src)));
     device_inner.flush_current_frame_blocking();
-    blit_handle_to_systemmem(
-        device_inner,
-        &SystemMemReadback {
-            tex_handle: src,
-            dst_ptr,
-            dst_len,
-            level: 0,
-            width,
-            height,
-            bytes_per_row,
-            full_width: width,
-            full_height: height,
-        },
-    )
+    blit_handle_to_systemmem(device_inner, read)
 }
 
 /// Parameters for one synchronous read of a Metal texture into system memory.
@@ -6122,6 +6166,34 @@ pub struct SystemMemReadback {
     ///
     /// See [`Self::full_width`].
     pub full_height: u32,
+}
+
+impl SystemMemReadback {
+    /// The read a `GetRenderTargetData` / `GetFrontBufferData` performs.
+    ///
+    /// Call it only on a source and destination `reject_readback` accepted:
+    /// their extents agree there, so the whole image is one region and the
+    /// destination's own row stride carries it. `full_width` / `full_height`
+    /// are the source texture's logical extent, which `level` is measured
+    /// against.
+    const fn for_readback(
+        tex_handle: MetalHandle<MTLTextureKind>,
+        level: u32,
+        (full_width, full_height): (u32, u32),
+        dst: &SystemMemoryDst,
+    ) -> Self {
+        Self {
+            tex_handle,
+            dst_ptr: dst.ptr,
+            dst_len: dst.len,
+            level,
+            width: dst.width,
+            height: dst.height,
+            bytes_per_row: dst.bytes_per_row,
+            full_width,
+            full_height,
+        }
+    }
 }
 
 /// Synchronous `MTLTexture`→system-memory blit.
