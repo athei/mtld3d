@@ -11,10 +11,11 @@ use mtld3d_types::{
     D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
     D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -2192,6 +2193,134 @@ fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
         read_surface_pixel(&h, &rt, w - 1, height - 1),
         BLUE,
         "the upload reaches the last pixel of the colour texture"
+    );
+}
+
+fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
+    // The runtime owns a D3DUSAGE_AUTOGENMIPMAP texture's mip chain, so a
+    // ColorFill into level 0 regenerates it. Seed the chain red through a
+    // render into the texture, fill level 0 green, then sample a level the
+    // fill never touched: it reads green once the fill regenerates, red while
+    // the chain is stale.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // Seed: render red into the texture. Unbinding it regenerates the chain,
+    // so every level holds red before the fill.
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(
+        h.color_fill_hr(&rt_surface, GREEN),
+        D3D_OK,
+        "ColorFill green"
+    );
+
+    // Sample level 4 (4x4) of the 64x64 chain. MAXMIPLEVEL is the most
+    // detailed level the sampler may use, so the draw cannot read the filled
+    // level 0 instead.
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the filled texture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAXMIPLEVEL, 4),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = [
+        TexturedVertex {
+            x: -0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the regenerated mip"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries the fill colour, got {center:?}"
     );
 }
 
