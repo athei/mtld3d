@@ -1,4 +1,7 @@
-use core::ffi::c_void;
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use std::sync::LazyLock;
 
 use log::{error, info, trace, warn};
@@ -41,6 +44,18 @@ use super::{
 // so the list shapes the game's UI dropdown, not actual rendering behaviour.
 // The first entry doubles as the current adapter display mode.
 static ADAPTER_MODES: LazyLock<Vec<D3DDISPLAYMODE>> = LazyLock::new(build_adapter_modes);
+
+/// Backing scale of the display the Metal layer's window is on.
+///
+/// `AttachMetalLayer` hands the unix side this address and it publishes the
+/// scale here, at attach and again whenever its display-follow reconciliation
+/// derives a different one, so a window dragged between a retina panel and a
+/// 1x one moves every consumer with it. A static rather than device-owned
+/// state because the writer is `AppKit`'s main thread running outside any
+/// thunk, which cannot be ordered against a device teardown; one bound layer
+/// exists per process, so one slot answers for it. `0` until the first
+/// attach publishes.
+static DISPLAY_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
 
 // Common gaming resolutions filtered down to those <= host display. Host
 // native is prepended separately so GetAdapterDisplayMode returns it.
@@ -1354,7 +1369,7 @@ extern "system" fn d3d9_create_device(
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
-    let (cursor_scale, scale_origin) = resolve_initial_cursor_scale(layer_params.backing_scale);
+    let (cursor_scale, scale_origin) = resolve_cursor_scale(layer_params.backing_scale);
     info!(
         target: LOG_TARGET,
         "hardware cursor scale: {cursor_scale}x ({scale_origin})"
@@ -1569,6 +1584,7 @@ fn attach_metal_layer(
         color_space: crate::config::CONFIG.color_space,
         max_fps: crate::config::CONFIG.present_max_fps,
         metalfx_available: 0,
+        backing_scale_ptr: (&raw const DISPLAY_BACKING_SCALE) as u64,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);
@@ -1651,21 +1667,32 @@ fn warn_unsupported_backbuffer_format(format: u32) {
     }
 }
 
+/// The backing scale of the display the layer is on, or `None` before attach.
+///
+/// See [`DISPLAY_BACKING_SCALE`]. `Present` reads it once per frame so a
+/// display move reaches the cursor upscale without a thunk of its own.
+pub fn display_backing_scale() -> Option<u32> {
+    match DISPLAY_BACKING_SCALE.load(Ordering::Relaxed) {
+        0 => None,
+        scale => Some(scale),
+    }
+}
+
 /// Match the hardware cursor bitmap to the display's retina factor by default.
 ///
 /// Wine's HCURSOR path then produces a proportionally-sized pointer on a
 /// retina Mac. `cursor.scale` in `mtld3d.conf` overrides: `auto` (the default)
 /// follows `backingScaleFactor`; a positive integer forces a fixed multiplier.
 /// Both paths clamp to `[1, 8]` — the downstream HCURSOR builder asserts that
-/// range.
-fn resolve_initial_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
-    match crate::config::CONFIG.cursor_scale {
-        mtld3d_core::config::CursorScale::Auto => (
-            backing_scale.clamp(1, 8),
-            "auto from display backingScaleFactor",
-        ),
-        mtld3d_core::config::CursorScale::Fixed(n) => (n.clamp(1, 8), "cursor.scale override"),
-    }
+/// range. Resolved again on every display move, so the override keeps
+/// overriding on the display the window arrived at.
+pub fn resolve_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
+    let scale = crate::config::CONFIG.cursor_scale.resolve(backing_scale);
+    let origin = match crate::config::CONFIG.cursor_scale {
+        mtld3d_core::config::CursorScale::Auto => "auto from display backingScaleFactor",
+        mtld3d_core::config::CursorScale::Fixed(_) => "cursor.scale override",
+    };
+    (scale, origin)
 }
 
 /// Resolve `render.scale` against what the GPU can actually do.

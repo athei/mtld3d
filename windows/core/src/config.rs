@@ -235,6 +235,30 @@ pub enum CursorScale {
     Fixed(u32),
 }
 
+impl CursorScale {
+    /// Resolve the HCURSOR upscale factor for a display's backing scale.
+    ///
+    /// Called again whenever the window lands on a display of another
+    /// backing scale, so `Fixed` has to keep answering with the user's
+    /// number: a setting that pins the cursor size means pinned, on every
+    /// display. The clamp is the range the HCURSOR builder accepts.
+    #[must_use]
+    pub const fn resolve(self, backing_scale: u32) -> u32 {
+        let requested = match self {
+            Self::Auto => backing_scale,
+            Self::Fixed(n) => n,
+        };
+        // `u32::clamp` is not const.
+        if requested < 1 {
+            1
+        } else if requested > 8 {
+            8
+        } else {
+            requested
+        }
+    }
+}
+
 impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {

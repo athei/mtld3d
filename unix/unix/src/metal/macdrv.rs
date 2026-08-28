@@ -176,6 +176,12 @@ fn is_bound_window(window: usize) -> bool {
 /// HDR configuration applied, the identity headroom the present pass treats
 /// as a no-op, and a window that never suppresses a present.
 ///
+/// What attach latched *about* the display goes with it. A reconciliation
+/// that survived the clear must not re-derive a present throttle from the
+/// pacing of a guest that is gone, and must not publish a backing scale into
+/// a `d3d9.dll` static the guest may since have unloaded. This is the only
+/// entry point that drops any of it; the next attach latches its own.
+///
 /// Only the bound view's own teardown clears, so a device that never attached
 /// and one whose view a later attach has already replaced leave the record
 /// naming the view that is still live.
@@ -196,6 +202,9 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
     CURRENT_HEADROOM_BITS.store(1.0_f32.to_bits(), Ordering::Relaxed);
     LAST_LOGGED_HEADROOM_BITS.store(0, Ordering::Relaxed);
     WINDOW_OCCLUDED.store(false, Ordering::Relaxed);
+    PRESENT_PACING_BITS.store(0, Ordering::Relaxed);
+    CURRENT_BACKING_SCALE.store(0, Ordering::Relaxed);
+    BACKING_SCALE_SINK_PTR.store(0, Ordering::Relaxed);
 }
 
 /// Whether a headroom refresh is already queued on the main thread.
@@ -578,6 +587,35 @@ fn install_occlusion_observer_once() {
 /// (`set_display_sync_enabled`) re-queries the panel and overwrites.
 static MIN_PRESENT_DURATION_BITS: AtomicU64 = AtomicU64::new(0);
 
+/// Present pacing latched from the PE side, encoded by [`pack_pacing`].
+///
+/// Attach and the D3D9 Reset path both write it, and the display-follow
+/// reconciliation reads it back so a re-derivation on another panel still
+/// honours the guest's vsync request and the user's `present.maxFps`
+/// ceiling. One packed word rather than two atomics, so a Reset landing
+/// between two reads cannot hand the reconciliation half of each.
+static PRESENT_PACING_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Backing scale of the display the bound layer is on.
+///
+/// Seeded at attach from the same reading [`DisplayCaps`] carries to the PE
+/// side, and re-derived by the display-follow reconciliation. Compared
+/// against before publishing, so the PE side only hears about real changes.
+/// `0` before the first attach and again once [`detach_metal_layer`] runs,
+/// which is what [`display_state_is_latched`] reads.
+static CURRENT_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
+
+/// Address of the PE-side `AtomicU32` a changed backing scale is published into.
+///
+/// Latched at attach from `AttachMetalLayerParams::backing_scale_ptr`. The
+/// PE side backs it with a static in its own image rather than a
+/// device-owned allocation, because the reconciliation runs on the main
+/// thread outside any thunk and so cannot be ordered against a device
+/// teardown. [`detach_metal_layer`] clears it all the same, because a
+/// `d3d9.dll` the guest unloads takes the static with it. `0` before the
+/// first attach.
+static BACKING_SCALE_SINK_PTR: AtomicUsize = AtomicUsize::new(0);
+
 /// Present-throttle request resolved PE-side.
 ///
 /// The guest's vsync ask (`D3DPRESENT_PARAMETERS::PresentationInterval`
@@ -634,6 +672,110 @@ fn min_present_duration(panel_max_hz: f64, pacing: &PresentPacing) -> f64 {
 fn store_min_present_duration(panel_max_hz: f64, pacing: &PresentPacing) {
     let seconds = min_present_duration(panel_max_hz, pacing);
     MIN_PRESENT_DURATION_BITS.store(seconds.to_bits(), Ordering::Relaxed);
+}
+
+/// Fold a [`PresentPacing`] into the one word [`PRESENT_PACING_BITS`] holds.
+///
+/// The vsync request is the low bit and the frame cap rides above it, so the
+/// pair is written and read as a unit.
+fn pack_pacing(pacing: &PresentPacing) -> u64 {
+    (u64::from(pacing.max_fps) << 1) | u64::from(pacing.vsync_requested)
+}
+
+/// Read back what [`pack_pacing`] wrote.
+fn unpack_pacing(bits: u64) -> PresentPacing {
+    let max_fps = u32::try_from((bits >> 1) & u64::from(u32::MAX))
+        .expect("masked to u32::MAX on the line above");
+    PresentPacing {
+        vsync_requested: bits & 1 != 0,
+        max_fps,
+    }
+}
+
+/// The present-throttle duration to apply when the panel under the window changed.
+///
+/// `Some(seconds)` when what [`min_present_duration`] derives differs from
+/// the duration the present site is using, `None` while the two agree, which
+/// is every poll of a session that stays on one display. The comparison is
+/// bit-exact because both sides come out of the same derivation, so equal
+/// inputs give an identical pattern and only a real change moves it.
+fn min_present_duration_change(
+    applied_seconds: f64,
+    panel_max_hz: f64,
+    pacing: &PresentPacing,
+) -> Option<f64> {
+    let target = min_present_duration(panel_max_hz, pacing);
+    (target.to_bits() != applied_seconds.to_bits()).then_some(target)
+}
+
+/// Round and clamp an `NSScreen.backingScaleFactor` into the range the PE side takes.
+///
+/// macOS reports the factor as an integer already; the clamp bounds the
+/// HCURSOR upscaler downstream, which asserts `[1, 8]`.
+fn backing_scale_from(screen_scale: f64) -> u32 {
+    bounded_cast::f64_to_u32_saturating(screen_scale.round()).clamp(1, 8)
+}
+
+/// The backing scale to publish when the window's display no longer matches it.
+///
+/// `Some(scale)` when the screen asks for a different factor than the one
+/// last published, `None` while they agree.
+fn backing_scale_change(applied: u32, screen_scale: f64) -> Option<u32> {
+    let target = backing_scale_from(screen_scale);
+    (target != applied).then_some(target)
+}
+
+/// A screen's refresh ceiling in Hz, from `NSScreen.maximumFramesPerSecond`.
+///
+/// 60 on most external displays, 120 on a `ProMotion` panel. `0.0` when the
+/// screen reports nothing usable (older macOS, a virtualised display), which
+/// [`min_present_duration`] reads as "no vsync throttle".
+fn screen_max_hz(screen: &objc2_app_kit::NSScreen) -> f64 {
+    let clamped = screen.maximumFramesPerSecond().clamp(0, 1000);
+    let as_u32 = u32::try_from(clamped).expect("clamped above to [0, 1000]");
+    f64::from(as_u32)
+}
+
+/// Publish a backing scale into the PE-side sink, when one has been handed over.
+///
+/// The store is `Relaxed`: the value stands alone, the PE side reads it once
+/// per present, and there is nothing for it to order against.
+fn publish_backing_scale(scale: u32) {
+    let sink = BACKING_SCALE_SINK_PTR.load(Ordering::Relaxed);
+    if sink == 0 {
+        return;
+    }
+    // SAFETY: the PE side backs this address with a static `AtomicU32` in its
+    // own image, so it stays readable for every write from here, including
+    // ones landing after the device it was attached for is gone. `AtomicU32`
+    // has the same size and alignment in both images.
+    let sink = unsafe { &*(sink as *const AtomicU32) };
+    sink.store(scale, Ordering::Relaxed);
+}
+
+/// Everything the PE side's `AttachMetalLayer` request carries in.
+///
+/// Bundled so the entry point stays inside clippy's `too_many_arguments`
+/// threshold, the same reason [`PresentPacing`] exists.
+pub struct LayerAttachRequest {
+    /// The guest window the layer is attached to.
+    pub hwnd: u64,
+    /// Back-buffer width, for the geometry log line.
+    pub width: u32,
+    /// Back-buffer height, for the geometry log line.
+    pub height: u32,
+    /// The guest's vsync ask plus the user's frame-rate ceiling.
+    pub pacing: PresentPacing,
+    /// `color.hdr.enable` from `mtld3d.conf`.
+    pub hdr_enable: bool,
+    /// `color.space` from `mtld3d.conf`.
+    pub color_space: ColorSpacePolicy,
+    /// Address of the PE-side `AtomicU32` that receives a changed backing scale.
+    ///
+    /// See [`BACKING_SCALE_SINK_PTR`]. `0` leaves the display-follow path
+    /// with nothing to publish into, which is what a headless smoke test
+    /// that never built one looks like.
+    pub backing_scale_sink_ptr: u64,
 }
 
 /// Resolved `CAMetalLayer`-relevant capabilities of the `NSScreen` the bound view lives on.
@@ -822,22 +964,27 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
 ///
 /// Side effect: latches the unix-side `HDR_ACTIVE` global to `true`
 /// when the display has EDR potential and `hdr_enable` is set (resolved
-/// PE-side from `color.hdr.enable` in `mtld3d.conf`), and records the layer
-/// plus both user settings so the per-present poll can follow the window
-/// onto a display of the other class.
+/// PE-side from `color.hdr.enable` in `mtld3d.conf`), and records the layer,
+/// the pacing, the backing scale and both user settings so the per-present
+/// poll can follow the window onto another display and re-derive everything
+/// that display decides.
 pub fn attach_metal_layer(
     device_handle: MetalHandle<MTLDeviceKind>,
-    hwnd: u64,
-    width: u32,
-    height: u32,
-    pacing: PresentPacing,
-    hdr_enable: bool,
-    color_space: mtld3d_shared::mtl::ColorSpacePolicy,
+    request: LayerAttachRequest,
 ) -> Option<(
     MetalHandle<NSViewKind>,
     MetalHandle<CAMetalLayerKind>,
     DisplayCaps,
 )> {
+    let LayerAttachRequest {
+        hwnd,
+        width,
+        height,
+        pacing,
+        hdr_enable,
+        color_space,
+        backing_scale_sink_ptr,
+    } = request;
     if hwnd == 0 || device_handle.is_null() {
         return None;
     }
@@ -880,6 +1027,18 @@ pub fn attach_metal_layer(
             with_bound_display(|bound| bound.layer = layer as usize);
             HDR_ENABLE_REQUESTED.store(hdr_enable, Ordering::Relaxed);
             COLOR_SPACE_POLICY.store(color_space as u32, Ordering::Relaxed);
+            // Same for the pacing and the backing scale: the display-follow
+            // path re-derives the present throttle and the scale for a screen
+            // that was not attached yet, and needs the guest's vsync ask, the
+            // user's frame cap and the value the PE side is already using.
+            PRESENT_PACING_BITS.store(pack_pacing(&pacing), Ordering::Relaxed);
+            CURRENT_BACKING_SCALE.store(hint.caps.backing_scale, Ordering::Relaxed);
+            BACKING_SCALE_SINK_PTR.store(
+                usize::try_from(backing_scale_sink_ptr)
+                    .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+                Ordering::Relaxed,
+            );
+            publish_backing_scale(hint.caps.backing_scale);
             // Decide HDR vs SDR layer configuration from the panel's
             // static potential + the user's `color.hdr.enable` setting. Latch
             // the result as the configuration the layer now carries — the
@@ -938,9 +1097,12 @@ pub fn attach_metal_layer(
 /// recomputed from `NSScreen.mainScreen` here (the PE side re-sends the
 /// `present.maxFps` cap so it survives Resets). `layer_handle` is unused
 /// (kept for wire-format stability). The mainScreen lookup may pick the
-/// wrong panel in multi-monitor setups — accepted simplification, the Reset
-/// path is rare; the right fix (traverse `layer → delegate → window →
-/// screen`) is more code than the multi-monitor edge case warrants today.
+/// wrong panel in a multi-monitor setup; the display-follow reconciliation
+/// walks to the window's own screen and corrects it within one poll
+/// interval, which is why this path stays a one-line read.
+///
+/// The new pacing is latched for that reconciliation too, so a throttle it
+/// re-derives on another panel keeps the interval the guest just asked for.
 pub fn set_display_sync_enabled(
     _layer_handle: MetalHandle<CAMetalLayerKind>,
     pacing: &PresentPacing,
@@ -954,11 +1116,8 @@ pub fn set_display_sync_enabled(
     // can be retrieved from any thread"). This is the canonical statement
     // of that posture; the other NSScreen readers in this file cite it.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    let panel_max_hz = NSScreen::mainScreen(mtm).map_or(0.0_f64, |s| {
-        let clamped = s.maximumFramesPerSecond().clamp(0, 1000);
-        let as_u32 = u32::try_from(clamped).expect("clamped above to [0, 1000]");
-        f64::from(as_u32)
-    });
+    PRESENT_PACING_BITS.store(pack_pacing(pacing), Ordering::Relaxed);
+    let panel_max_hz = NSScreen::mainScreen(mtm).map_or(0.0_f64, |s| screen_max_hz(&s));
     store_min_present_duration(panel_max_hz, pacing);
 }
 
@@ -1238,20 +1397,10 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
             )
         });
 
-    // f64 → u32 via the saturating helper, then clamped to a reasonable
-    // backing-scale range (1×–8× — clippy can't see the prior clamp).
-    let backing_scale = bounded_cast::f64_to_u32_saturating(screen_scale.round()).clamp(1, 8);
-    // `maximumFramesPerSecond` is the panel ceiling (e.g. 60 on most
-    // external displays, 120 on `ProMotion`). Drives the present-throttle
-    // cap computed at attach. Returns `NSInteger`; clamp + widening cast
-    // mirrors `set_display_sync_enabled`'s posture. Sub-zero / huge
-    // pathological values fall through to `0.0`, which
-    // `compute_min_present_duration` then treats as "no throttle".
-    let panel_max_hz = screen.as_deref().map_or(0.0_f64, |s| {
-        let clamped = s.maximumFramesPerSecond().clamp(0, 1000);
-        let as_u32 = u32::try_from(clamped).expect("clamped above to [0, 1000]");
-        f64::from(as_u32)
-    });
+    let backing_scale = backing_scale_from(screen_scale);
+    // The panel ceiling drives the present-throttle duration computed at
+    // attach; a display move re-derives it from the same helper.
+    let panel_max_hz = screen.as_deref().map_or(0.0_f64, screen_max_hz);
     let mut colorspace_flags = ColorspaceFlags::empty();
     colorspace_flags.set(ColorspaceFlags::IS_HDR, colorspace_is_hdr);
     colorspace_flags.set(ColorspaceFlags::IS_WIDE_GAMUT, colorspace_is_wide_gamut);
@@ -1397,8 +1546,10 @@ fn queue_headroom_refresh() {
 /// reason, since naming the screen means walking to it again.
 ///
 /// The walk ends on whichever screen the window is on *now*, so it is also
-/// where the layer's own configuration is reconciled against that screen; see
-/// [`follow_screen_layer_mode`].
+/// where everything the display decides is reconciled against that screen:
+/// the layer's own configuration ([`follow_screen_layer_mode`]), the present
+/// throttle ([`follow_screen_present_throttle`]) and the backing scale the PE
+/// side consumes ([`follow_screen_backing_scale`]).
 fn refresh_headroom_on_main() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
@@ -1435,6 +1586,8 @@ fn refresh_headroom_on_main() {
     // than reconfigured twice against a screen the window is leaving.
     if let Some(screen) = screen.as_deref() {
         follow_screen_layer_mode(screen);
+        follow_screen_present_throttle(screen);
+        follow_screen_backing_scale(screen);
     }
     log_headroom_change_if_any(headroom, &view_obj);
 }
@@ -1874,6 +2027,77 @@ fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
         target: LOG_TARGET,
         "hdr: window moved onto '{screen_name}' (potential={potential:.2}×), layer reconfigured: \
          pixelFormat={pf:?} wantsEDR={wants} colorspace={cs_label}",
+    );
+}
+
+/// Whether a bound display's own state is latched for the follow path to use.
+///
+/// Attach seeds [`CURRENT_BACKING_SCALE`] with a factor of at least 1 and
+/// [`detach_metal_layer`] clears it back to `0`, so it doubles as the flag
+/// for "there is a display whose state these two can re-derive". The retained
+/// view the reconciliation walks answers whether an `AppKit` object is safe
+/// to touch; this answers whether the values to compare against are still
+/// this session's, which a teardown landing between the two would otherwise
+/// leave stale.
+fn display_state_is_latched() -> bool {
+    CURRENT_BACKING_SCALE.load(Ordering::Relaxed) != 0
+}
+
+/// Re-derive the present throttle for the screen the window is on. **Main thread only.**
+///
+/// The throttle is a function of the panel's refresh ceiling, so a window
+/// dragged from a 120 Hz panel onto a 60 Hz one keeps presenting at an 8.3 ms
+/// floor until this runs, and the reverse leaves a 16.6 ms floor on a panel
+/// that could show twice as many frames. The guest's vsync request and the
+/// user's frame cap are not what moved, so they come from the pacing latched
+/// at attach and at every Reset.
+///
+/// A session that stays on one display derives the duration it already has,
+/// and nothing is stored or logged.
+fn follow_screen_present_throttle(screen: &objc2_app_kit::NSScreen) {
+    if !display_state_is_latched() {
+        return;
+    }
+    let pacing = unpack_pacing(PRESENT_PACING_BITS.load(Ordering::Relaxed));
+    let panel_max_hz = screen_max_hz(screen);
+    let applied = min_present_duration_sec();
+    let Some(seconds) = min_present_duration_change(applied, panel_max_hz, &pacing) else {
+        return;
+    };
+    MIN_PRESENT_DURATION_BITS.store(seconds.to_bits(), Ordering::Relaxed);
+    info!(
+        target: LOG_TARGET,
+        "present: '{}' tops out at {panel_max_hz:.0} Hz, minimum present duration \
+         {applied:.5}s -> {seconds:.5}s (vsync={} maxFps={})",
+        screen.localizedName(),
+        pacing.vsync_requested,
+        pacing.max_fps,
+    );
+}
+
+/// Re-derive the backing scale for the screen the window is on. **Main thread only.**
+///
+/// The PE side takes the scale as a property of the display and drives the
+/// hardware-cursor upscale from it, so a move between a retina panel and a
+/// 1x one leaves the pointer at twice or half the size the display asks for
+/// until the new value is published.
+///
+/// A session that stays on one display reads back the scale it already
+/// published, and nothing is stored or logged.
+fn follow_screen_backing_scale(screen: &objc2_app_kit::NSScreen) {
+    if !display_state_is_latched() {
+        return;
+    }
+    let applied = CURRENT_BACKING_SCALE.load(Ordering::Relaxed);
+    let Some(scale) = backing_scale_change(applied, screen.backingScaleFactor()) else {
+        return;
+    };
+    CURRENT_BACKING_SCALE.store(scale, Ordering::Relaxed);
+    publish_backing_scale(scale);
+    info!(
+        target: LOG_TARGET,
+        "present: '{}' has a {scale}x backing scale (was {applied}x), republished to the guest",
+        screen.localizedName(),
     );
 }
 

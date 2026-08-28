@@ -9,23 +9,28 @@
 //!
 //! `layer_mode_for` and `layer_mode_change` decide which `CAMetalLayer`
 //! configuration a screen asks for and whether the applied one has to be
-//! replaced. They are the whole of the display-follow decision, so the tests
-//! below pin both directions of a display change, the user's off switch, the
-//! degenerate ceilings, and the case that must *not* reconfigure.
+//! replaced. `min_present_duration_change` and `backing_scale_change` are
+//! their two neighbours in the same reconciliation. All four are the whole of
+//! the display-follow decision, so the tests below pin both directions of a
+//! display change, the user's off switch, the degenerate ceilings, and the
+//! case that must *not* reconfigure.
 //!
 //! `detach_metal_layer` is the other half of that path: the reconciliation
 //! runs from process-lifetime observers, so what stops it walking a released
-//! view is that teardown leaves nothing bound. One test covers it, because the
-//! record and the derived state it clears are process-wide.
+//! view, or re-deriving against a display nothing is bound to, is that
+//! teardown leaves nothing bound. One test covers it, because the record and
+//! the derived state it clears are process-wide.
 
 use core::sync::atomic::Ordering;
 
 use mtld3d_shared::{MetalHandle, mtl_handle::NSViewKind};
 
 use super::{
-    CURRENT_HEADROOM_BITS, HDR_ACTIVE, LAST_LOGGED_HEADROOM_BITS, LayerMode, PresentPacing,
-    WINDOW_OCCLUDED, detach_metal_layer, is_bound_window, layer_mode_change, layer_mode_for,
-    min_present_duration, with_bound_display,
+    BACKING_SCALE_SINK_PTR, CURRENT_BACKING_SCALE, CURRENT_HEADROOM_BITS, HDR_ACTIVE,
+    LAST_LOGGED_HEADROOM_BITS, LayerMode, PRESENT_PACING_BITS, PresentPacing, WINDOW_OCCLUDED,
+    backing_scale_change, backing_scale_from, detach_metal_layer, display_state_is_latched,
+    is_bound_window, layer_mode_change, layer_mode_for, min_present_duration,
+    min_present_duration_change, pack_pacing, unpack_pacing, with_bound_display,
 };
 
 #[test]
@@ -158,6 +163,19 @@ fn teardown_unbinds_the_display_and_resets_what_it_derived() {
     CURRENT_HEADROOM_BITS.store(4.0_f32.to_bits(), Ordering::Relaxed);
     LAST_LOGGED_HEADROOM_BITS.store(4.0_f32.to_bits(), Ordering::Relaxed);
     WINDOW_OCCLUDED.store(true, Ordering::Relaxed);
+    PRESENT_PACING_BITS.store(
+        pack_pacing(&PresentPacing {
+            vsync_requested: true,
+            max_fps: 60,
+        }),
+        Ordering::Relaxed,
+    );
+    CURRENT_BACKING_SCALE.store(2, Ordering::Relaxed);
+    BACKING_SCALE_SINK_PTR.store(0x4000, Ordering::Relaxed);
+    assert!(
+        display_state_is_latched(),
+        "the reconciliation has a display to re-derive against"
+    );
     assert!(
         is_bound_window(WINDOW),
         "the bound window matches while attached"
@@ -213,4 +231,128 @@ fn teardown_unbinds_the_display_and_resets_what_it_derived() {
         !WINDOW_OCCLUDED.load(Ordering::Relaxed),
         "no window suppresses a present"
     );
+    assert_eq!(
+        PRESENT_PACING_BITS.load(Ordering::Relaxed),
+        0,
+        "the next attach latches the pacing its own guest asked for",
+    );
+    assert_eq!(
+        CURRENT_BACKING_SCALE.load(Ordering::Relaxed),
+        0,
+        "no display's backing scale is published",
+    );
+    assert_eq!(
+        BACKING_SCALE_SINK_PTR.load(Ordering::Relaxed),
+        0,
+        "nothing is written into a guest that may have unloaded d3d9.dll",
+    );
+    assert!(
+        !display_state_is_latched(),
+        "the reconciliation has nothing to re-derive against"
+    );
+}
+
+#[test]
+fn pacing_survives_the_round_trip_through_one_word() {
+    for (vsync_requested, max_fps) in [(true, 0), (false, 0), (true, 60), (false, 240)] {
+        let packed = pack_pacing(&PresentPacing {
+            vsync_requested,
+            max_fps,
+        });
+        let back = unpack_pacing(packed);
+        assert_eq!(back.vsync_requested, vsync_requested);
+        assert_eq!(back.max_fps, max_fps);
+    }
+}
+
+#[test]
+fn the_widest_cap_survives_the_round_trip() {
+    let packed = pack_pacing(&PresentPacing {
+        vsync_requested: true,
+        max_fps: u32::MAX,
+    });
+    let back = unpack_pacing(packed);
+    assert!(back.vsync_requested);
+    assert_eq!(back.max_fps, u32::MAX);
+}
+
+#[test]
+fn staying_on_one_panel_never_rederives_the_throttle() {
+    let pacing = PresentPacing {
+        vsync_requested: true,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(120.0, &pacing);
+    assert_eq!(min_present_duration_change(applied, 120.0, &pacing), None);
+}
+
+#[test]
+fn moving_onto_a_slower_panel_lengthens_the_throttle() {
+    let pacing = PresentPacing {
+        vsync_requested: true,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(120.0, &pacing);
+    let changed = min_present_duration_change(applied, 60.0, &pacing).expect("panel rate moved");
+    assert_eq!(changed.to_bits(), (1.0_f64 / 60.0).to_bits());
+}
+
+#[test]
+fn moving_onto_a_faster_panel_shortens_the_throttle() {
+    let pacing = PresentPacing {
+        vsync_requested: true,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(60.0, &pacing);
+    let changed = min_present_duration_change(applied, 120.0, &pacing).expect("panel rate moved");
+    assert_eq!(changed.to_bits(), (1.0_f64 / 120.0).to_bits());
+}
+
+#[test]
+fn a_user_cap_below_both_panels_holds_the_throttle_still() {
+    // The cap is the lower rate on either display, so the duration the
+    // present site uses does not move and nothing is rewritten or logged.
+    let pacing = PresentPacing {
+        vsync_requested: true,
+        max_fps: 30,
+    };
+    let applied = min_present_duration(120.0, &pacing);
+    assert_eq!(min_present_duration_change(applied, 60.0, &pacing), None);
+}
+
+#[test]
+fn a_free_running_session_stays_unthrottled_on_any_panel() {
+    let pacing = PresentPacing {
+        vsync_requested: false,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(120.0, &pacing);
+    assert_eq!(applied.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(min_present_duration_change(applied, 60.0, &pacing), None);
+}
+
+#[test]
+fn backing_scale_rounds_and_clamps_into_the_hcursor_range() {
+    assert_eq!(backing_scale_from(1.0), 1);
+    assert_eq!(backing_scale_from(2.0), 2);
+    assert_eq!(backing_scale_from(1.4), 1);
+    assert_eq!(backing_scale_from(1.5), 2);
+    // No screen at all, and a pathological reading, both land on identity
+    // rather than a factor the HCURSOR builder would reject.
+    assert_eq!(backing_scale_from(0.0), 1);
+    assert_eq!(backing_scale_from(-4.0), 1);
+    assert_eq!(backing_scale_from(f64::NAN), 1);
+    assert_eq!(backing_scale_from(99.0), 8);
+}
+
+#[test]
+fn staying_on_one_display_never_republishes_the_scale() {
+    assert_eq!(backing_scale_change(2, 2.0), None);
+    assert_eq!(backing_scale_change(1, 1.0), None);
+}
+
+#[test]
+fn moving_between_displays_of_different_scale_republishes() {
+    assert_eq!(backing_scale_change(2, 1.0), Some(1));
+    assert_eq!(backing_scale_change(1, 2.0), Some(2));
 }

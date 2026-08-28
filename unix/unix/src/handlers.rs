@@ -150,20 +150,19 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         return -1;
     };
 
-    let pacing = metal::PresentPacing {
-        vsync_requested: params.display_sync_enabled != 0,
-        max_fps: params.max_fps,
+    let request = metal::LayerAttachRequest {
+        hwnd: params.hwnd,
+        width: params.width,
+        height: params.height,
+        pacing: metal::PresentPacing {
+            vsync_requested: params.display_sync_enabled != 0,
+            max_fps: params.max_fps,
+        },
+        hdr_enable: params.hdr_enable != 0,
+        color_space: params.color_space,
+        backing_scale_sink_ptr: params.backing_scale_ptr,
     };
-    let hdr_enable = params.hdr_enable != 0;
-    if let Some((view, layer, caps)) = metal::attach_metal_layer(
-        params.device_handle,
-        params.hwnd,
-        params.width,
-        params.height,
-        pacing,
-        hdr_enable,
-        params.color_space,
-    ) {
+    if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
         params.view_handle = view;
         params.layer_handle = layer;
         params.backing_scale = caps.backing_scale;
