@@ -3995,3 +3995,50 @@ fn a_scoped_pass_with_srgb_write_off_attaches_the_base_view() {
         backbuffer_srgb()
     );
 }
+
+/// Retiring the bound depth texture unbinds it and forgets every set naming it.
+///
+/// The standalone surface that owns the texture finalizes while the device
+/// still has it bound, and the Metal texture is destroyed once the submit
+/// seq gating it retires. A handle left in the session-wide sampled or
+/// sampleable-depth sets would then answer for whatever Metal hands back at
+/// the same address next.
+#[test]
+fn retiring_the_bound_depth_texture_unbinds_and_forgets_it() {
+    let mut s = fresh();
+    let shadow = tex(0x9100);
+    s.set_depth_stencil_attachment(shadow, (256, 256), true, true);
+    s.emit_command(Command::set_fragment_texture(shadow.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.current_depth_texture(), shadow);
+    assert!(s.is_depth_handle_sampleable(shadow));
+    assert!(s.texture_sampled_this_frame(shadow));
+
+    s.retire_depth_texture(shadow);
+
+    assert!(s.current_depth_texture().is_null(), "attachment unbound");
+    assert_eq!(s.current_depth_size(), (0, 0));
+    assert!(!s.current_depth_has_stencil());
+    assert!(!s.current_depth_is_sampleable());
+    assert!(!s.is_depth_handle_sampleable(shadow));
+    assert!(!s.texture_sampled_this_frame(shadow));
+}
+
+/// Retiring a texture that is not the bound one leaves the attachment alone.
+///
+/// A surface released while a different depth target is bound is the common
+/// case, and the retire must not break the pass the game is building.
+#[test]
+fn retiring_an_unbound_depth_texture_keeps_the_binding() {
+    let mut s = fresh();
+    let other = tex(0x9200);
+    s.emit_command(dummy_draw());
+    let passes_before = s.passes().len();
+
+    s.retire_depth_texture(other);
+
+    assert_eq!(s.current_depth_texture(), depth());
+    assert_eq!(s.passes().len(), passes_before);
+    assert!(!s.current_pass_closed(), "the open pass survives");
+}
