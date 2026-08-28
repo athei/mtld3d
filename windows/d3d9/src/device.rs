@@ -5500,10 +5500,18 @@ extern "system" fn device_update_surface(
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     // SAFETY: vtable args; live `Direct3DSurface9` pointers per the ABI.
     let Some(src_surf) = (unsafe { InPtr::<crate::surface::Direct3DSurface9>::opt(src) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateSurface: null source surface → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: as above.
     let Some(dst_surf) = (unsafe { InPtr::<crate::surface::Direct3DSurface9>::opt(dst) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateSurface: null destination surface → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -5550,6 +5558,11 @@ extern "system" fn device_update_surface(
         }
         let dst_level = dst_surf.mip_level() as usize;
         let Some(bpp) = map_d3d_format(src_fmt).map(|m| m.bytes_per_pixel()) else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: unmapped source format {} (0x{src_fmt:x}) → INVALIDCALL",
+                mtld3d_core::format::format_name(src_fmt)
+            );
             return D3DERR_INVALIDCALL;
         };
         let src_pitch = linear_row_pitch(src_w, bpp) as usize;
@@ -5592,12 +5605,20 @@ extern "system" fn device_update_surface(
                 .copy_bytes_to_staging_region(dst_level, &image, rect, point)
         };
         if !copied {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: source region outside the destination mip → INVALIDCALL"
+            );
             return D3DERR_INVALIDCALL;
         }
         schedule_staging_upload_at_next_bind(tex);
         return D3D_OK;
     }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateSurface: endpoints are not two distinct textures → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     let src_level = src_surf.mip_level() as usize;
@@ -5610,6 +5631,10 @@ extern "system" fn device_update_surface(
         (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
     copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
         if !dst.update_region_valid(dst_level, src, src_level, rect, point) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: source rect/destination point out of bounds → INVALIDCALL"
+            );
             return D3DERR_INVALIDCALL;
         }
         match (dst_surf.cube_face(), src_surf.cube_face()) {
@@ -5626,7 +5651,13 @@ extern "system" fn device_update_surface(
             (None, None) => {
                 let _ = dst.copy_sub_region_from(dst_level, src, src_level, rect, point);
             }
-            _ => return D3DERR_INVALIDCALL,
+            _ => {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "reject UpdateSurface: cube face mixed with a plain surface → INVALIDCALL"
+                );
+                return D3DERR_INVALIDCALL;
+            }
         }
         D3D_OK
     })
@@ -5639,6 +5670,10 @@ extern "system" fn device_update_texture(
 ) -> i32 {
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     if src.is_null() || dst.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateTexture: null source or destination texture → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     // All texture interfaces share this wrapper layout. The type flag below
@@ -5647,6 +5682,10 @@ extern "system" fn device_update_texture(
     let src_parent = src.cast::<crate::texture::Direct3DTexture9>();
     let dst_parent = dst.cast::<crate::texture::Direct3DTexture9>();
     if std::ptr::eq(src_parent.cast_const(), dst_parent.cast_const()) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateTexture: source and destination are one texture → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
@@ -5666,6 +5705,10 @@ extern "system" fn device_update_texture(
     // SAFETY: same invariant as the source pointer above.
     let dst_is_cube = unsafe { (*dst_parent).is_cube() };
     if src_is_cube != dst_is_cube {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "reject UpdateTexture: cube and non-cube endpoints mixed → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     if src_is_cube {
