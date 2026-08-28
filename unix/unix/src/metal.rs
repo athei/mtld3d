@@ -12,6 +12,7 @@ mod present;
 mod sampler;
 mod shader;
 mod texture;
+mod upload_quad;
 mod upscale;
 
 pub use blit::ensure_blit_pipeline;
@@ -31,4 +32,5 @@ pub use texture::{
     create_backbuffer, create_color_target, create_depth_stencil_state, create_depth_texture,
     create_texture, destroy_depth_stencil_state, destroy_texture,
 };
+pub use upload_quad::ensure_upload_pipeline;
 pub use upscale::is_supported as upscale_is_supported;

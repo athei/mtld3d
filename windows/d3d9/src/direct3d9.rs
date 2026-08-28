@@ -622,7 +622,7 @@ pub fn sampler_border_supported() -> bool {
 ///
 /// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
 /// formats A4R4G4B4 / R5G6B5 / A1R5G5B5 are backed by `Bgra8Unorm` instead
-/// and expanded on the CPU at upload time. `debug.expandPacked16` forces the
+/// and widened by the GPU upload pass. `debug.expandPacked16` forces the
 /// expansion path on any device so it can be exercised on Apple Silicon; it
 /// folds in here so every consumer (format mapping, `CheckDeviceFormat`,
 /// create gates) flips together.
@@ -635,7 +635,7 @@ pub fn native_packed16_supported() -> bool {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "packed 16-bit formats unavailable natively (forced={}): A4R4G4B4/R5G6B5/A1R5G5B5 \
-             expand to BGRA8 at upload, 16-bit render targets are not advertised",
+             widen to BGRA8 in the GPU upload pass, 16-bit render targets are not advertised",
             crate::config::CONFIG.expand_packed16
         );
     }

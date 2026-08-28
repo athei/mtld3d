@@ -417,11 +417,6 @@ impl TextureInner {
         self.d3d_pool
     }
 
-    /// D3DFMT_* the texture was created with.
-    pub const fn d3d_format(&self) -> u32 {
-        self.d3d_format
-    }
-
     /// D3DUSAGE_* the texture was created with.
     pub const fn d3d_usage(&self) -> u32 {
         self.d3d_usage
@@ -1423,10 +1418,40 @@ impl TextureInner {
         }
     }
 
+    /// Which GPU retirement counter this mip's staging must be measured against.
+    ///
+    /// A blit upload reads the staging from the frame-leading blit command
+    /// buffer, which is committed before the draw command buffer and retires
+    /// ~a frame earlier, so `upload_coherent_seq` frees the staging sooner. A
+    /// mip the encoder writes with the GPU upload pass instead is read by a
+    /// render pass on the draw command buffer, so it must wait for
+    /// `coherent_seq`. The predicate mirrors the encoder's own upload-path
+    /// choice, off the same format pair, mip pitch and device alignment.
+    fn staging_coherent_seq(&self, level: usize) -> u64 {
+        if self.device_inner == 0 {
+            return 0;
+        }
+        let device = DeviceInner::from_ptr(self.device_inner);
+        let takes_upload_pass =
+            mtld3d_core::upload_pass::upload_decode(self.d3d_format, self.metal_pixel_format)
+                .is_some_and(|decode| {
+                    mtld3d_core::upload_pass::is_expansion(decode)
+                        || self.mip_bytes_per_row[level]
+                            < device.gpu_caps().min_linear_texture_align
+                });
+        let seq = if takes_upload_pass {
+            device.coherent_seq_arc()
+        } else {
+            device.upload_coherent_seq_arc()
+        };
+        seq.load(Ordering::Acquire)
+    }
+
     /// Build a `TextureInfo` snapshot for upload closures and draw-time stage binding capture.
     pub fn texture_info(&self) -> TextureInfo {
         TextureInfo {
             texture_id: self.texture_id,
+            d3d_format: self.d3d_format,
             // Render space: this snapshot is what creates and addresses the
             // Metal texture. `self.width`/`self.height` stay logical for
             // `GetLevelDesc` and for every rect the game supplies.
@@ -1559,13 +1584,7 @@ impl TextureInner {
             return Some((unsafe { base.add(offset) }, pitch));
         }
 
-        let coherent_seq = if self.device_inner == 0 {
-            0
-        } else {
-            DeviceInner::from_ptr(self.device_inner)
-                .upload_coherent_seq_arc()
-                .load(Ordering::Acquire)
-        };
+        let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
         let action = decide_lock_action(
             coherent_seq,
@@ -1761,18 +1780,10 @@ impl TextureInner {
         // activity": next bind on a new device will rehydrate and
         // re-upload, so an in-place write here is sound.
         //
-        // The staging Box is read only by the texture-upload blit, not by
-        // draws. That blit lives in its own command buffer (committed
-        // before the draw CB) which retires ~a frame before full-frame
-        // completion, so compare against `upload_coherent_seq` — the
-        // staging is free as soon as the upload retires.
-        let coherent_seq = if self.device_inner == 0 {
-            0
-        } else {
-            DeviceInner::from_ptr(self.device_inner)
-                .upload_coherent_seq_arc()
-                .load(Ordering::Acquire)
-        };
+        // The staging Box is read by the upload, not by draws; which
+        // command buffer that upload rides decides which retirement counter
+        // frees it. See `staging_coherent_seq`.
+        let coherent_seq = self.staging_coherent_seq(level);
         let action = decide_lock_action(
             coherent_seq,
             self.last_submit_seq[level],

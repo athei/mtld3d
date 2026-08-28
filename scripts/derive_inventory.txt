@@ -28,6 +28,7 @@ unix/shared/src/mtl.rs MinMagFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MipFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StageTag Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StencilOp Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StorageMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -102,7 +103,6 @@ windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs ProgramId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs TextureId Clone,Copy,PartialEq,Eq,Hash,Debug
-windows/core/src/packed16.rs Packed16Kind Clone,Copy
 windows/core/src/passes.rs ColorClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs CurrentAttachmentFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
@@ -146,6 +146,7 @@ windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/upload_pass.rs UploadDecode Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/upload_recovery.rs UploadFate Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/visibility.rs QueryStatus Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/cursor.rs CursorFlags Clone,Copy,Debug,Default,PartialEq,Eq

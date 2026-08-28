@@ -1292,6 +1292,11 @@ impl DeviceInner {
     ///
     /// Read on texture `LockRect` (instead of `coherent_seq`) to decide
     /// staging contention. See [`Self::upload_coherent_seq`].
+    /// Device capabilities, as the encoder sees them.
+    pub const fn gpu_caps(&self) -> mtld3d_core::gpu_caps::GpuCaps {
+        self.encoder.gpu_caps()
+    }
+
     pub const fn upload_coherent_seq_arc(&self) -> &Arc<AtomicU64> {
         &self.upload_coherent_seq
     }
@@ -4161,15 +4166,8 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
     let info = inner.texture_info();
     let texture_id = info.texture_id;
     let usage_flags = info.usage_flags;
-    let pixel_format = info.pixel_format;
     dev.push_texture_warmup(info);
     if usage_flags.contains(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET) {
-        return;
-    }
-    // Expansion-path textures never wrap their 16-bit staging in a cached
-    // MTLBuffer — every upload repacks into a fresh padded PageBox — so a
-    // staging warmup would create wrappers nothing ever uses.
-    if mtld3d_core::packed16::expansion_kind(inner.d3d_format(), pixel_format).is_some() {
         return;
     }
     for level in 0..inner.staging_warmup_levels() {
@@ -4861,7 +4859,7 @@ fn create_color_target_surface(
     // lockable-RT upload/readback blits, so reject the create outright.
     // `CheckDeviceFormat(RENDERTARGET)` already answers NOTAVAILABLE for
     // them on such a device. On a native device the lenient accept stands.
-    if mtld3d_core::packed16::expansion_kind(format, mapping.metal_pixel_format()).is_some() {
+    if mtld3d_core::upload_pass::is_expanded_upload(format, mapping.metal_pixel_format()) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateRenderTarget(format={format}) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
         return None;

@@ -607,5 +607,19 @@ bitflags! {
     }
 }
 
+/// Which render-quad pipeline `EnsureBlitPipeline` resolves.
+///
+/// Both kinds draw a single fullscreen triangle into a colour attachment and
+/// are cached per destination pixel format, so they share one thunk and
+/// differ only in their fragment function.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum QuadPipelineKind {
+    /// Scaling `StretchRect`: samples a source texture across the destination rect.
+    StretchBlit = 0,
+    /// Texture upload: decodes packed staging bytes read out of an `MTLBuffer`.
+    TextureUpload = 1,
+}
+
 #[cfg(test)]
 mod tests;

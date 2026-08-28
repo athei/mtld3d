@@ -230,28 +230,29 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 /// the three packed D3D formats are backed by `Bgra8Unorm` instead;
 /// `bytes_per_pixel`/`block_bytes` stay 2 because they describe the SOURCE
 /// layout (Lock pitch, staging sizing — D3D9 Lock semantics are unchanged),
-/// and the upload path expands texels to 32-bit on the CPU
-/// (`packed16::expand_rows`). Create paths that freeze a Metal format into a
-/// texture must use this form; layout-only callers may keep `map_d3d_format`.
+/// and the upload widens texels to 32-bit in the GPU upload pass
+/// (`upload_pass`). Create paths that freeze a Metal format into a texture
+/// must use this form; layout-only callers may keep `map_d3d_format`.
 #[must_use]
 pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<FormatMapping> {
     if !native_packed16 {
         let expanded = match d3d_format {
+            // The upload pass writes D3D channel order directly into BGRA8
+            // and forces alpha opaque for the alpha-less R5G6B5, so none of
+            // the three needs a sampler swizzle, in particular A4R4G4B4
+            // drops the native path's ABGR4 channel-order workaround. A
+            // swizzle would also be fatal here rather than cosmetic: Metal
+            // refuses `RenderTarget` usage on a swizzled texture view, and
+            // the expansion writes these textures through a render pass.
             D3DFMT_R5G6B5 => Some(FormatMapping {
-                // Expanded: the repack writes B/G/R and alpha 0xFF, but a
-                // never-uploaded region must still sample alpha = 1.0 (the
-                // X8R8G8B8 rule), so force it via the swizzle.
                 metal_pixel_format: PixelFormat::Bgra8Unorm,
                 bytes_per_pixel: 2,
                 block_width: 1,
                 block_height: 1,
                 block_bytes: 2,
-                swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One]),
+                swizzle: None,
                 has_alpha: false,
             }),
-            // The repack writes D3D channel order directly into BGRA8, so no
-            // sampler swizzle — in particular A4R4G4B4 drops the native
-            // path's ABGR4 channel-order workaround.
             D3DFMT_A1R5G5B5 | D3DFMT_A4R4G4B4 => Some(FormatMapping {
                 metal_pixel_format: PixelFormat::Bgra8Unorm,
                 bytes_per_pixel: 2,

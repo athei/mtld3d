@@ -102,6 +102,14 @@ pub enum CommandType {
     /// Same contract as [`CommandType::SetFragmentNullTexture`], on the
     /// vertex stage: `param_a` is the slot, `param_b` a [`NullTextureKind`].
     SetVertexNullTexture = 23,
+    /// `encoder.setFragmentBuffer(buffer, offset, index)`
+    ///
+    /// Binds a whole `MTLBuffer` (not inline bytes) to a fragment buffer
+    /// slot. The texture-upload quad reads its packed staging source through
+    /// this: the staging slab is far past the inline-bytes limit, and reading
+    /// it as a shader argument is what lets the upload ignore the linear
+    /// texture row alignment a blit copy would have to satisfy.
+    SetFragmentBuffer = 24,
 }
 
 /// Dimensionality of the opaque-black texture a null-texture bind selects.
@@ -342,6 +350,18 @@ impl Command {
     pub const fn set_vertex_buffer(buffer_handle: u64, offset: u32, buffer_index: u32) -> Self {
         Self {
             cmd: CommandType::SetVertexBuffer as u32,
+            param_a: buffer_index,
+            param_b: buffer_handle,
+            param_c: offset as u64,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.setFragmentBuffer(buffer_handle, offset, buffer_index)`
+    #[must_use]
+    pub const fn set_fragment_buffer(buffer_handle: u64, offset: u32, buffer_index: u32) -> Self {
+        Self {
+            cmd: CommandType::SetFragmentBuffer as u32,
             param_a: buffer_index,
             param_b: buffer_handle,
             param_c: offset as u64,
