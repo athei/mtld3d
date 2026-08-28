@@ -1077,10 +1077,12 @@ impl DeviceInner {
             None
         } else {
             // SAFETY: non-null per the branch; live per D3D9 lifetime rules.
-            let ti = unsafe { (*tex).inner_mut() };
-            crate::texture::flush_dirty_mips(ti, self);
-            // SAFETY: as above.
-            Some(unsafe { (*tex).texture_id() })
+            let bound = unsafe { &mut *tex };
+            // Vertex texture fetch samples like a stage bind, so it ends a
+            // system-memory texture's CPU-only phase the same way.
+            promote_cpu_only_texture(self, bound);
+            crate::texture::flush_dirty_mips(bound.inner_mut(), self);
+            Some(bound.texture_id())
         };
         self.push_op(Box::new(move |enc| {
             enc.set_vertex_texture_binding(slot, id);
@@ -4025,7 +4027,7 @@ extern "system" fn device_create_texture(
         mip_bytes_per_row,
     });
 
-    push_texture_warmups(obj.inner(), tex.inner(), actual_levels);
+    push_texture_warmups(obj.inner(), tex.inner());
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
     unsafe { crate::com_ref::com_register_child(tex_ptr) };
@@ -4048,10 +4050,16 @@ extern "system" fn device_create_texture(
 
 /// Queue the eager `MTLTexture` create and per-mip staging-buffer wraps.
 ///
-/// Runs for a freshly constructed texture. Staging warmup is skipped
-/// for RT (no upload staging path). The staging Arcs stay stable until a
+/// Runs for a freshly constructed texture, and again when a system-memory one
+/// is promoted at its first sampling bind. Staging warmup is skipped for RT
+/// (no upload staging path). The staging Arcs stay stable until a
 /// Lock(DISCARD) rename swaps them.
-fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureInner, levels: u32) {
+fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureInner) {
+    // A system-memory texture owns no Metal texture, so there is nothing to
+    // create and nothing for a staging wrapper to feed.
+    if inner.is_cpu_only() {
+        return;
+    }
     let info = inner.texture_info();
     let texture_id = info.texture_id;
     let usage_flags = info.usage_flags;
@@ -4066,7 +4074,7 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
     if mtld3d_core::packed16::expansion_kind(inner.d3d_format(), pixel_format).is_some() {
         return;
     }
-    for level in 0..levels {
+    for level in 0..inner.staging_warmup_levels() {
         if inner.staging_is_dropped(level as usize) {
             continue;
         }
@@ -4395,8 +4403,11 @@ extern "system" fn device_create_volume_texture(
     });
     // Warm up the `MTLTextureType3D` texture (depth > 1 → 3D on the unix side)
     // so binds resolve. No staging warmup / upload yet — the box contents stay
-    // CPU-side and the volume samples as cleared until upload lands.
-    obj.inner().push_texture_warmup(tex.inner().texture_info());
+    // CPU-side and the volume samples as cleared until upload lands. A
+    // system-memory volume gets no Metal texture at all.
+    if !mtld3d_core::pool::is_cpu_only(pool) {
+        obj.inner().push_texture_warmup(tex.inner().texture_info());
+    }
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live volume texture at refcount 1;
     // it shares `Direct3DTexture9`'s layout and refcount engine.
@@ -4547,7 +4558,7 @@ extern "system" fn device_create_cube_texture(
         mip_heights,
         mip_bytes_per_row,
     });
-    if matches!(pool, D3DPOOL_DEFAULT | D3DPOOL_MANAGED) {
+    if !mtld3d_core::pool::is_cpu_only(pool) {
         obj.inner().push_texture_warmup(tex.inner().texture_info());
     }
     let tex_ptr = Box::into_raw(Box::new(tex));
@@ -9585,6 +9596,33 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     drop(bumps_timer);
 }
 
+/// Give a system-memory texture the Metal texture its pool withheld.
+///
+/// A `D3DPOOL_SYSTEMMEM` or `D3DPOOL_SCRATCH` texture is created with staging
+/// and nothing else, so one an application only locks, copies from, or reads
+/// back into never reaches the GPU. D3D9 samples such a texture when it is
+/// bound at a texture stage, so that bind is where the allocation has to
+/// happen; the levels already written are marked dirty, and the flush that
+/// follows the bind uploads them. A no-op for every texture that already has
+/// a Metal texture, which is every texture in a GPU-resident pool.
+fn promote_cpu_only_texture(dev: &mut DeviceInner, tex: &mut crate::texture::Direct3DTexture9) {
+    if !crate::texture::promote_to_gpu(tex.inner_mut()) {
+        return;
+    }
+    let id = tex.texture_id();
+    // Not a gap: this is what D3D9 does. The line is a residency probe, so a
+    // title that pays video memory for a pool meant to avoid it is visible.
+    mtld3d_shared::log_once_info_by!(
+        target: LOG_TARGET,
+        key: id.raw(),
+        "texture {:#x} (D3DPOOL={}) sampled from a texture stage: allocating the Metal texture \
+         its system-memory pool had withheld",
+        id.raw(),
+        tex.inner().d3d_pool()
+    );
+    push_texture_warmups(dev, tex.inner());
+}
+
 /// Capture bound textures as a packed [`StageBinding`] prefix plus the bound-stage masks.
 ///
 /// Walks only the set bits of `StageBindings::bound_mask` and writes the
@@ -9622,6 +9660,17 @@ fn snapshot_stage_bindings(
             packed_mask &= !(1u16 << stage);
             continue;
         }
+        // The `&mut Direct3DTexture9` here doesn't alias `dev: &mut
+        // DeviceInner` because the texture is a separate Box:
+        // `dev.stage_bindings.textures[stage]` is a raw `*mut`, not a tracked
+        // reference.
+        // SAFETY: `tex_ptr` is the bound-texture pointer from
+        // `stage_bindings` (checked non-null above); the texture is held
+        // alive by the stage-bindings refcount until rebound.
+        let tex = unsafe { &mut *tex_ptr };
+        // A system-memory texture bound for sampling stops being CPU-only
+        // here, before the flush below can find a level to upload.
+        promote_cpu_only_texture(dev, tex);
         // FF combiner only consumes stages 0–7 (MaxTextureBlendStages = 8);
         // stages 8–15 are programmable-PS-only and would shift past the
         // u8 mask width.
@@ -9632,15 +9681,7 @@ fn snapshot_stage_bindings(
         // Lazy texture upload: flush any per-mip `dirty` flags before
         // capturing TextureInfo. Closures pushed by `schedule_upload`
         // precede the Draw closure on the encoder thread, so the
-        // upload runs before the bind reads. The `&mut
-        // Direct3DTexture9` here doesn't alias `dev: &mut DeviceInner`
-        // because the Texture is a separate Box —
-        // `dev.stage_bindings.textures[stage]` is a raw `*mut`, not a
-        // tracked reference.
-        // SAFETY: `tex_ptr` is the bound-texture pointer from
-        // `stage_bindings` (caller checks non-null above); the texture
-        // is held alive by stage-bindings refcount until rebound.
-        let tex = unsafe { &mut *tex_ptr };
+        // upload runs before the bind reads.
         // Cross-device migration handler — must run before flush_dirty_mips
         // so the re-marked dirty bits drive an upload against the new
         // device's encoder + handles.
@@ -11447,25 +11488,22 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
         );
     }
 
-    // Pool: we treat everything as GPU-resident. DEFAULT = 0.
+    // Pool. DEFAULT = 0.
     // D3DPOOL_MANAGED: behaviourally equivalent to DEFAULT in our
     // implementation. Metal's StorageModeShared/Managed textures are already
     // CPU+GPU accessible with OS-level paging, so "driver-managed residency"
     // is a non-concept. We also don't implement device loss (see
     // device_reset), so MANAGED's "survives reset" promise is vacuously true
     // for DEFAULT too. Accept and move on.
+    // D3DPOOL_SYSTEMMEM / D3DPOOL_SCRATCH on a texture: a system-memory
+    // resource, created with staging and no Metal texture
+    // (`TextureFlags::CPU_ONLY`).
+    // D3DPOOL_SYSTEMMEM on a vertex / index buffer: D3D9 draws from one
+    // directly, so the buffer keeps its `MTLBuffer` and behaves like a
+    // default-pool buffer. D3DPOOL_SCRATCH never reaches here for a buffer;
+    // both Create* entry points reject it first.
     match pool {
-        0 | D3DPOOL_MANAGED => {}
-        D3DPOOL_SYSTEMMEM => {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "Create{kind}: D3DPOOL_SYSTEMMEM set but system-memory backing not implemented"
-            );
-        }
-        D3DPOOL_SCRATCH => {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "Create{kind}: D3DPOOL_SCRATCH set but scratch pool not implemented"
-            );
-        }
+        0 | D3DPOOL_MANAGED | D3DPOOL_SYSTEMMEM | D3DPOOL_SCRATCH => {}
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "Create{kind}: unknown D3DPOOL={other} — update warn_unused_usage_and_pool_once"

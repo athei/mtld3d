@@ -112,6 +112,15 @@ bitflags::bitflags! {
         /// to be freed as the kind they hold, so the container records which one
         /// that is.
         const VOLUME_TEXTURE = 1 << 5;
+        /// System-memory resource: no Metal texture exists for it yet.
+        ///
+        /// Set at creation for the two CPU-only pools (`D3DPOOL_SYSTEMMEM` and
+        /// `D3DPOOL_SCRATCH`). Nothing warms up an `MTLTexture` and nothing
+        /// uploads a mip while it is set, so a texture the application only
+        /// locks, copies from, or reads back into costs system memory alone.
+        /// Binding one for sampling clears it ([`promote_to_gpu`]), because
+        /// D3D9 does sample a bound system-memory texture.
+        const CPU_ONLY = 1 << 6;
     }
 }
 
@@ -552,6 +561,30 @@ impl TextureInner {
     /// GPU-resident; counted against the `GetAvailableTextureMem` budget.
     pub const fn is_default_pool(&self) -> bool {
         self.d3d_pool == D3DPOOL_DEFAULT
+    }
+
+    /// True while this texture is system memory with no `MTLTexture`.
+    ///
+    /// See [`TextureFlags::CPU_ONLY`]. Every site that would hand the texture
+    /// to the encoder checks it first: the create-time warmup, the upload
+    /// flush, and the cross-device rehydrate.
+    pub const fn is_cpu_only(&self) -> bool {
+        self.flags.contains(TextureFlags::CPU_ONLY)
+    }
+
+    /// How many per-mip staging buffers to wrap in an `MTLBuffer` eagerly.
+    ///
+    /// Zero for a cube map, whose staging is face-major in the cube sidecar,
+    /// and for a volume texture, whose box upload carries its own `Arc`;
+    /// neither has a per-level wrapper for the encoder to reuse.
+    pub fn staging_warmup_levels(&self) -> u32 {
+        if self
+            .flags
+            .intersects(TextureFlags::CUBE.union(TextureFlags::VOLUME_TEXTURE))
+        {
+            return 0;
+        }
+        u32::try_from(self.staging.len()).expect("mip count fits u32")
     }
 
     /// Volume (`LockBox`) lock: a writable pointer into the level's single staging buffer.
@@ -2039,6 +2072,13 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         info.staging.len()
     };
     let dev_ptr = info.device_inner;
+    // The two system-memory pools get no Metal texture, so the residency bit
+    // is derived from the pool here rather than restated at each Create*.
+    let mut flags = info.flags;
+    flags.set(
+        TextureFlags::CPU_ONLY,
+        mtld3d_core::pool::is_cpu_only(info.d3d_pool),
+    );
     // A freshly created texture is fully dirty as an UpdateTexture source until
     // its first copy (per the D3D9 spec, a managed texture starts full-dirty).
     let update_dirty: Vec<Option<DirtyRect>> = (0..mip_count)
@@ -2076,7 +2116,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         levels: info.levels,
         d3d_format: info.d3d_format,
         metal_pixel_format: info.metal_pixel_format,
-        flags: info.flags,
+        flags,
         swizzle: info.swizzle,
         usage_flags: info.usage_flags,
         d3d_usage: info.d3d_usage,
@@ -3274,12 +3314,30 @@ fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_p
     // `texture_id`) resolves to a real Metal handle without needing
     // TextureInfo on the per-draw bump. The warmup is drained at
     // `run_frame` before any op processes — including the bind that
-    // triggered this rehydrate call.
-    dev.push_texture_warmup(ti.texture_info());
+    // triggered this rehydrate call. A system-memory texture has no Metal
+    // texture on any device, so it seeds nothing.
+    if !ti.is_cpu_only() {
+        dev.push_texture_warmup(ti.texture_info());
+    }
     log::info!(
         target: TEX_TRACE_TARGET,
         "tex {texture_id:#x} rehydrated for new device (re-marked {levels_remarked} mips dirty)"
     );
+}
+
+/// End a system-memory texture's CPU-only phase; report whether it was in one.
+///
+/// D3D9 samples a `D3DPOOL_SYSTEMMEM` texture bound at a texture stage, so a
+/// sampling bind is where the pool stops meaning "no GPU allocation". Clearing
+/// the flag is all this does: the caller queues the `MTLTexture` create, and
+/// every level the application has written is already marked dirty, so the
+/// flush that follows the bind uploads them.
+pub fn promote_to_gpu(ti: &mut TextureInner) -> bool {
+    if !ti.is_cpu_only() {
+        return false;
+    }
+    ti.flags.remove(TextureFlags::CPU_ONLY);
+    true
 }
 
 /// Walk a texture's `dirty_mask` and dispatch a full-mip upload for every dirty level.
@@ -3306,6 +3364,12 @@ pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
 #[cold]
 #[inline(never)]
 fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
+    if ti.is_cpu_only() {
+        // No `MTLTexture` to upload into yet. The bits stay set, so the
+        // promotion a sampling bind performs uploads every level the
+        // application has written by then.
+        return;
+    }
     if ti.flags.contains(TextureFlags::CUBE) {
         let mut dirty_count = 0u32;
         let mut regenerate_mipmaps = false;
