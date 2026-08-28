@@ -1,4 +1,4 @@
-//! Decision helper for per-mip texture-staging Lock handling.
+//! Decision helpers for per-mip texture staging: the Lock action and the release class.
 //!
 //! Mirrors `crate::buffer_rename::plan_lock`'s structure for textures.
 //! Same well-behaved-game no-overlap contract VB/IB now relies on —
@@ -44,10 +44,17 @@
 //! Side effects (allocate `PageBox`, sync memcpy preserve, queue
 //! retention, bump perf counters) stay in `d3d9::texture`; this
 //! module just returns a verdict.
+//!
+//! [`staging_droppable_class`] answers the other staging question, the
+//! one asked after an upload rather than before a write: whether a
+//! texture is of a class whose levels may release their staging at all.
 
-use mtld3d_types::{D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DUSAGE_DYNAMIC};
+use mtld3d_types::{
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+};
 
-use crate::dirty_rect::DirtyRect;
+use crate::{dirty_rect::DirtyRect, texture_flags::TextureFlags};
 
 /// What the caller should do with the old backing's contents on a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +215,40 @@ pub const fn decide_lock_action(
 #[must_use]
 pub const fn released_level_lock_needs_readback(flags: u32) -> bool {
     flags & D3DLOCK_DISCARD == 0
+}
+
+/// Whether a texture's class ever lets a level release its staging after an upload.
+///
+/// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked in D3D9,
+/// and the runtime keeps no system-memory copy of it: once the GPU holds every
+/// byte, ours is redundant, and keeping it doubles the footprint of every
+/// streamed texture inside a 32-bit game.
+///
+/// Every other class keeps its staging, each for a reason of its own. The
+/// lockable pools, `D3DUSAGE_DYNAMIC` and an offscreen-plain surface all hand
+/// the game a pointer back into it. Render targets and depth textures are
+/// written by the GPU, so no upload of ours ever makes the staging redundant.
+/// Cubes and volumes are written and uploaded a whole level at a time by paths
+/// that expect the level to be there, and a re-created level is sized as a
+/// single 2D slice, which is short of a volume's box. `depth` does not identify
+/// a volume on its own: a single-slice `CreateVolumeTexture` is 2D on both
+/// sides, so the flag is what excludes it.
+#[must_use]
+pub const fn staging_droppable_class(
+    pool: u32,
+    usage: u32,
+    flags: TextureFlags,
+    depth: u32,
+) -> bool {
+    pool == D3DPOOL_DEFAULT
+        && usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) == 0
+        && !flags.intersects(
+            TextureFlags::CUBE
+                .union(TextureFlags::OFFSCREEN_PLAIN)
+                .union(TextureFlags::DEPTH_FORMAT)
+                .union(TextureFlags::VOLUME_TEXTURE),
+        )
+        && depth <= 1
 }
 
 /// Byte offset into a mip's staging Box for the start of the locked rect.

@@ -8,7 +8,10 @@ use mtld3d_core::{
     page_box::PageBox,
     render_scale::RenderScale,
     staging_coverage::StagingCoverage,
-    texture_staging::{LockAction, MipShape, PreserveKind, decide_lock_action},
+    texture_flags::TextureFlags,
+    texture_staging::{
+        LockAction, MipShape, PreserveKind, decide_lock_action, staging_droppable_class,
+    },
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn,
@@ -72,62 +75,6 @@ static DIRECT3D_TEXTURE9_VTBL: IDirect3DTexture9Vtbl = IDirect3DTexture9Vtbl {
     unlock_rect: texture_unlock_rect,
     add_dirty_rect: texture_add_dirty_rect,
 };
-
-bitflags::bitflags! {
-    /// Boolean attributes of a texture, packed into one field.
-    ///
-    /// The packing keeps `TextureInner`/`TextureCreateInfo` under the bool-bag
-    /// lint and tightens the surrounding structs' tail padding.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct TextureFlags: u8 {
-        /// `D3DUSAGE_AUTOGENMIPMAP` requested AND the format supports it.
-        ///
-        /// Metal can't auto-generate compressed BC/DXT, so the flag is dropped
-        /// in `device_create_texture` for those. When set, mip-0 uploads append
-        /// a `BlitCommand::generate_mipmaps` to the frame's leading-blit list
-        /// right after the mip-0 `CopyBufferToTexture`, and the COM
-        /// `IDirect3DBaseTexture9::GenerateMipSubLevels` call pushes the same op
-        /// explicitly. Also collapses the app-visible level count to 1.
-        const AUTOGEN_MIPMAP = 1 << 1;
-        /// Sampleable shadow-map texture.
-        ///
-        /// Created via
-        /// `CreateTexture(format=D24X8, usage=D3DUSAGE_DEPTHSTENCIL)`.
-        /// `LockRect` bails with INVALIDCALL, no staging is wired up, and
-        /// `SetDepthStencilSurface` resolves through to this texture's Metal
-        /// handle when one of its mip surfaces is bound.
-        const DEPTH_FORMAT = 1 << 2;
-        /// Cube-map texture.
-        ///
-        /// Backed by six Metal array slices when the pool is GPU-visible.
-        const CUBE = 1 << 3;
-        /// The texture behind a `CreateOffscreenPlainSurface` surface.
-        ///
-        /// D3D9 lets a game lock such a surface even in the default pool, so
-        /// its staging is never released: not after an upload, and not by the
-        /// create-time drop loop, which is why the flag is part of the create
-        /// info rather than set on the finished texture.
-        const OFFSCREEN_PLAIN = 1 << 4;
-        /// Created through `CreateVolumeTexture`, whatever its depth.
-        ///
-        /// Distinct from `Direct3DTexture9::is_volume` (`depth > 1`), which asks
-        /// whether the *Metal* texture is 3D: a single-slice volume texture is
-        /// created 2D on both sides yet still hands out `IDirect3DVolume9`
-        /// sub-resources rather than surfaces. The cached sub-resource slots have
-        /// to be freed as the kind they hold, so the container records which one
-        /// that is.
-        const VOLUME_TEXTURE = 1 << 5;
-        /// System-memory resource: no Metal texture exists for it yet.
-        ///
-        /// Set at creation for the two CPU-only pools (`D3DPOOL_SYSTEMMEM` and
-        /// `D3DPOOL_SCRATCH`). Nothing warms up an `MTLTexture` and nothing
-        /// uploads a mip while it is set, so a texture the application only
-        /// locks, copies from, or reads back into costs system memory alone.
-        /// Binding one for sampling clears it ([`promote_to_gpu`]), because
-        /// D3D9 does sample a bound system-memory texture.
-        const CPU_ONLY = 1 << 6;
-    }
-}
 
 /// A source image laid out like a mip level, for [`TextureInner::copy_bytes_to_staging_region`].
 ///
@@ -563,16 +510,7 @@ impl TextureInner {
     /// only ever narrows the class, so a texture outside it at creation stays
     /// outside it and needs no coverage tracking at all.
     const fn staging_droppable_class(&self) -> bool {
-        self.d3d_pool == D3DPOOL_DEFAULT
-            && self.d3d_usage
-                & (D3DUSAGE_DYNAMIC
-                    | mtld3d_types::D3DUSAGE_RENDERTARGET
-                    | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
-                == 0
-            && !self.flags.contains(TextureFlags::CUBE)
-            && !self.flags.contains(TextureFlags::OFFSCREEN_PLAIN)
-            && !self.flags.contains(TextureFlags::DEPTH_FORMAT)
-            && self.depth <= 1
+        staging_droppable_class(self.d3d_pool, self.d3d_usage, self.flags, self.depth)
     }
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.

@@ -147,8 +147,15 @@ windows/core/src/shader_compile_stats.rs Snapshot Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/staging_coverage.rs CoverageState Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/stretch_rect.rs RejectReason Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/texture_flags.rs TextureFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/upload_pass.rs UploadDecode Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/upload_recovery.rs UploadFate Clone,Copy,Debug,PartialEq,Eq
@@ -187,7 +194,6 @@ windows/d3d9/src/surface.rs GdiDc Clone,Copy
 windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceMultiSample Clone,Copy,PartialEq,Eq
-windows/d3d9/src/texture.rs TextureFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/vertex_shader.rs VsConstUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/tests/src/pixel.rs Rgba8 Clone,Copy,PartialEq,Eq,Debug
 windows/tests/src/vertex.rs LitVertex Clone,Copy
