@@ -1188,3 +1188,94 @@ fn intra_frame_relock_keeps_per_draw_content() {
         "right half must sample the post-relock blue, got {r:?}"
     );
 }
+
+/// Bind `tex` and read back the single texel at `(u, v)`.
+///
+/// Every vertex of the quad carries the same texture coordinate, so with point
+/// filtering the whole backbuffer is that one texel and the centre pixel reads
+/// it. Lets a test address one texel of a texture whose two dimensions differ.
+fn sample_texel(h: &Harness, tex: &Texture<'_>, u: f32, v: f32) -> u32 {
+    assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let vertex = |x: f32, y: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u,
+        v,
+    };
+    let quad = [
+        vertex(-1.0, 1.0),
+        vertex(1.0, 1.0),
+        vertex(-1.0, -1.0),
+        vertex(1.0, 1.0),
+        vertex(1.0, -1.0),
+        vertex(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "texel sample draw"
+        );
+    });
+    h.read_pixel(320, 240)
+}
+
+/// `UpdateTexture` from a transposed source copies the region both levels share.
+///
+/// D3D9 pairs source and destination mips on the larger of width and height, so
+/// a 2x4 source pairs with a 4x2 destination and the call succeeds. Only the 2x2
+/// overlap is defined. A copy driven by the source extent alone runs four rows
+/// into a two-row destination, walks off the end of its staging part-way
+/// through, and abandons the whole update, leaving the destination untouched.
+#[test]
+fn update_texture_from_a_transposed_source_copies_the_shared_region() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::new();
+    let dst = h.create_texture(4, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let primer = h.create_texture(4, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    primer.lock_rect(0, 0).write::<u32>(&[GREEN; 8]);
+    assert_eq!(
+        h.update_texture_hr(&primer, &dst),
+        0,
+        "priming UpdateTexture"
+    );
+    assert_pixel_eq(sample_texel(&h, &dst, 0.125, 0.25), GREEN, "primed texel");
+
+    let transposed = h.create_texture(2, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    transposed.lock_rect(0, 0).write::<u32>(&[RED; 8]);
+    assert_eq!(
+        h.update_texture_hr(&transposed, &dst),
+        0,
+        "transposed UpdateTexture"
+    );
+    assert_pixel_eq(
+        sample_texel(&h, &dst, 0.125, 0.25),
+        RED,
+        "shared texel (0,0)",
+    );
+    assert_pixel_eq(
+        sample_texel(&h, &dst, 0.375, 0.75),
+        RED,
+        "shared texel (1,1)",
+    );
+    assert_pixel_eq(
+        sample_texel(&h, &dst, 0.625, 0.25),
+        GREEN,
+        "texel (2,0) kept",
+    );
+    assert_pixel_eq(
+        sample_texel(&h, &dst, 0.875, 0.75),
+        GREEN,
+        "texel (3,1) kept",
+    );
+}
