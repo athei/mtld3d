@@ -208,6 +208,77 @@ fn sysmem_lock_rect_pitch_is_dword_aligned() {
     );
 }
 
+/// A system-memory texture level and an offscreen surface answer one pitch.
+///
+/// D3D9 leaves the row pitch to the driver, but an application that reads it
+/// from one system-memory store and steps another by it needs the two to
+/// agree, and a 16-bit format at an odd width is where a tight stride and a
+/// dword-rounded one part company. The rows written at the reported stride
+/// then have to survive `UpdateTexture` and sampling: a level whose upload
+/// steps by a different stride shears the image.
+#[test]
+fn a_sysmem_texture_level_and_surface_share_one_pitch_at_an_odd_16_bit_width() {
+    const WIDTH: u32 = 33;
+    const HEIGHT: u32 = 4;
+    // R5G6B5 opaque red and blue.
+    const RED: u16 = 0xF800;
+    const BLUE: u16 = 0x001F;
+    let h = Harness::new();
+    let surf = h.create_offscreen_plain_surface(WIDTH, HEIGHT, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    let surface_pitch = surf.lock_rect(0).pitch();
+    let src = h.create_texture(WIDTH, HEIGHT, 1, 0, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    let level_pitch = src.lock_rect(0, D3DLOCK_READONLY).pitch();
+    assert_eq!(
+        surface_pitch, 68,
+        "{WIDTH} texels of two bytes is 66, reported as 68"
+    );
+    assert_eq!(
+        level_pitch, surface_pitch,
+        "a {WIDTH}x{HEIGHT} R5G6B5 level and surface report one pitch"
+    );
+
+    // Fill the level row by row at the pitch it reports, the last texel of
+    // the last row red and every other one blue. A level whose upload steps
+    // by another stride puts that texel somewhere else.
+    {
+        let locked = src.lock_rect(0, 0);
+        let pitch = usize::try_from(locked.pitch()).expect("a positive row pitch");
+        let base = locked.bits_ptr();
+        for row in 0..HEIGHT as usize {
+            for col in 0..WIDTH as usize {
+                let texel = if row == HEIGHT as usize - 1 && col == WIDTH as usize - 1 {
+                    RED
+                } else {
+                    BLUE
+                };
+                let bytes = texel.to_le_bytes();
+                // SAFETY: the lock maps `HEIGHT` rows of `pitch` bytes and a
+                // row holds `WIDTH` two-byte texels, so `row * pitch + col * 2`
+                // is inside the mapped level.
+                let texel_ptr = unsafe { base.add(row * pitch + col * 2) };
+                // SAFETY: `texel_ptr` addresses two writable bytes of the
+                // level (above), disjoint from the stack-local `bytes`.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), texel_ptr, bytes.len()) };
+            }
+        }
+    }
+    let dst = h.create_texture(WIDTH, HEIGHT, 1, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "UpdateTexture");
+    // The last texel of the last row covers the back buffer's bottom-right
+    // corner under the unit-square quad; the centre is one of the blue ones.
+    let [corner, centre] = sample_points(&h, &dst, [(630, 470), (320, 240)]);
+    let corner = Rgba8::from_pixel(corner);
+    assert!(
+        corner.r > 200 && corner.b < 60,
+        "the last texel of the last row is red, got {corner:?}"
+    );
+    let centre = Rgba8::from_pixel(centre);
+    assert!(
+        centre.b > 200 && centre.r < 60,
+        "the level's other texels are blue, got {centre:?}"
+    );
+}
+
 #[test]
 fn color_formats_sample_red() {
     let h = Harness::new();
@@ -1910,10 +1981,9 @@ fn update_texture_from_a_transposed_source_copies_the_shared_region() {
 fn get_dc_on_an_odd_width_16_bit_texture_level_round_trips_a_texel() {
     // A row of an odd number of 2-byte texels is not a whole number of dwords,
     // and GDI steps a DIB by the row length rounded up to four bytes, rejecting
-    // any pitch below that. A texture level's staging is allocated at the tight
-    // `width * bpp` stride its GPU upload steps by, which for this level is two
-    // bytes short, so `GetDC` has to hand GDI a DIB of its own at the rounded
-    // stride and copy back what GDI drew.
+    // any pitch below that. A texture level's staging carries that same stride,
+    // so the DIB aliases it directly; a level two bytes short of it would start
+    // every row late and run the last one off the end of the allocation.
     const W: u32 = 33;
     const H: u32 = 4;
     const GREEN_565: u16 = 0x07E0;
@@ -1924,12 +1994,15 @@ fn get_dc_on_an_odd_width_16_bit_texture_level_round_trips_a_texel() {
     let tex = h.create_texture(W, H, 1, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
     {
         let mut locked = tex.lock_rect(0, 0);
+        let pitch = locked.pitch();
         assert_eq!(
-            locked.pitch(),
-            (W * 2).cast_signed(),
-            "the level locks at its own tight row stride"
+            pitch,
+            (W * 2).next_multiple_of(4).cast_signed(),
+            "the level locks at the dword-rounded stride GDI derives for its DIB"
         );
-        locked.write(&[GREEN_565; (W * H) as usize]);
+        let pitch_px = pitch.cast_unsigned() / 2;
+        let seed = vec![GREEN_565; (pitch_px * H) as usize];
+        locked.write(&seed);
     }
 
     // The last texel of the last row is the one a DIB over the tighter staging

@@ -1037,12 +1037,11 @@ impl TextureInner {
         };
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        // Bytes per block-column = row pitch / blocks per row.
-        let src_blocks_per_row = sw.div_ceil(bw) as usize;
-        if src_blocks_per_row == 0 {
-            return false;
-        }
-        let block_bytes = src_pitch / src_blocks_per_row;
+        // Both sides carry the same format, which the raw-copy path is only
+        // entered for, so one block is the same size on each. The row pitch
+        // cannot stand in for it: a padded row carries bytes past its last
+        // block.
+        let block_bytes = self.block_bytes.max(1) as usize;
         let rblock_cols = rw.div_ceil(bw) as usize;
         let rblock_rows = rh.div_ceil(bh) as usize;
         let (src_col0, src_row0) = ((rx / bw) as usize, (ry / bh) as usize);
@@ -1159,11 +1158,9 @@ impl TextureInner {
         let (dx, dy) = (dst_rect.x, dst_rect.y);
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        let src_blocks_per_row = sw.div_ceil(bw) as usize;
-        if src_blocks_per_row == 0 {
-            return false;
-        }
-        let block_bytes = src_pitch / src_blocks_per_row;
+        // A padded row carries bytes past its last block, so the block size
+        // comes from the format rather than from the pitch.
+        let block_bytes = self.block_bytes.max(1) as usize;
         let rblock_cols = rw.div_ceil(bw) as usize;
         let rblock_rows = rh.div_ceil(bh) as usize;
         let (src_col0, src_row0) = ((rx / bw) as usize, (ry / bh) as usize);
@@ -1524,11 +1521,12 @@ impl TextureInner {
         };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        let src_blocks_per_row = src_w.div_ceil(bw) as usize;
-        if src_blocks_per_row == 0 || src_pitch == 0 {
+        if src_pitch == 0 {
             return false;
         }
-        let block_bytes = src_pitch / src_blocks_per_row;
+        // A padded row carries bytes past its last block, so the block size
+        // comes from the format rather than from the pitch.
+        let block_bytes = self.block_bytes.max(1) as usize;
         let rblock_cols = rw.div_ceil(bw) as usize;
         let rblock_rows = rh.div_ceil(bh) as usize;
         let (src_col0, src_row0) = ((rx / bw) as usize, (ry / bh) as usize);
@@ -1617,11 +1615,12 @@ impl TextureInner {
         }
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        let src_blocks_per_row = src_w.div_ceil(bw) as usize;
-        if src_blocks_per_row == 0 || src_pitch == 0 {
+        if src_pitch == 0 {
             return false;
         }
-        let block_bytes = src_pitch / src_blocks_per_row;
+        // A padded row carries bytes past its last block, so the block size
+        // comes from the format rather than from the pitch.
+        let block_bytes = self.block_bytes.max(1) as usize;
         let rblock_cols = rw.div_ceil(bw) as usize;
         let rblock_rows = rh.div_ceil(bh) as usize;
         let (src_col0, src_row0) = ((rx / bw) as usize, (ry / bh) as usize);

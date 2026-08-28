@@ -663,7 +663,7 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
 /// Row pitch of a CPU-visible linear surface, in bytes.
 ///
 /// `width * bytes_per_pixel` rounded up to a 4-byte boundary. D3D9 leaves the
-/// row pitch to the driver, so a host-visible surface store picks one and
+/// row pitch to the driver, so a host-visible pixel store picks one and
 /// keeps it everywhere: the size the backing buffer is allocated at, the pitch
 /// `LockRect` reports, the `bytes_per_row` its GPU read-back and upload run
 /// at, and the pitch of the DIB a `GetDC` wraps around it. This rounding is
@@ -675,7 +675,15 @@ pub const fn linear_row_pitch(width: u32, bytes_per_pixel: u32) -> u32 {
     width.saturating_mul(bytes_per_pixel).next_multiple_of(4)
 }
 
-/// Compute mip dimensions and byte size for a given mip level.
+/// Mip dimensions, staging byte size and row stride for one mip level.
+///
+/// An uncompressed level strides by [`linear_row_pitch`], the one row pitch
+/// every host-visible store of the format uses, so a texture level and an
+/// offscreen surface of the same format and width report the same pitch from
+/// `LockRect` and step their rows the same way. A compressed level strides by
+/// whole block rows, which is a multiple of four bytes at every width already.
+/// The byte size is that stride times the level's row count: block rows for a
+/// compressed format, texel rows for a linear one.
 #[must_use]
 pub fn compute_mip_size(
     base_width: u32,
@@ -693,7 +701,7 @@ pub fn compute_mip_size(
         let byte_size = bytes_per_row * blocks_y;
         (w, h, byte_size, bytes_per_row)
     } else {
-        let bytes_per_row = w * fmt.bytes_per_pixel;
+        let bytes_per_row = linear_row_pitch(w, fmt.bytes_per_pixel);
         let byte_size = bytes_per_row * h;
         (w, h, byte_size, bytes_per_row)
     }
