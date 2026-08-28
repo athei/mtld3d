@@ -1702,6 +1702,72 @@ fn get_dc_on_a_lockable_render_target_round_trips_through_the_gpu() {
 }
 
 #[test]
+fn get_dc_on_an_odd_width_16_bit_lockable_render_target_reaches_the_last_row() {
+    // A row of an odd number of 2-byte pixels is not a whole number of
+    // dwords, and GDI steps a DIB by the row length rounded up to four bytes.
+    // The staging the DC wraps has to carry that same stride, or every row the
+    // DC reads starts two bytes late and the last one falls out of the buffer
+    // entirely: its pixels read as black and GDI's own drawing into it never
+    // reaches the colour texture.
+    const W: u32 = 33;
+    const H: u32 = 4;
+    const GREEN_565: u16 = 0x07E0;
+    const RED_565: u16 = 0xF800;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    // A device without Metal's packed 16-bit pixel formats does not advertise
+    // them as render targets and rejects the create to match, which leaves
+    // nothing to hold a DC over. That contract is pinned in `expand16`.
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        mtld3d_types::D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) != D3D_OK
+    {
+        assert_ne!(
+            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
+            D3D_OK,
+            "a 16-bit render target is rejected where the caps deny it"
+        );
+        return;
+    }
+    let rt = h.create_lockable_render_target(W, H, D3DFMT_R5G6B5);
+    assert_eq!(h.color_fill_hr(&rt, GREEN), D3D_OK, "ColorFill green");
+
+    let last_x = (W - 1).cast_signed();
+    let last_y = (H - 1).cast_signed();
+    let dc = rt.dc();
+    assert_eq!(
+        dc.get_pixel(last_x, last_y),
+        GREEN_COLORREF,
+        "the last pixel of the last row is inside the DIB the DC wraps",
+    );
+    assert_eq!(
+        dc.set_pixel(last_x, last_y, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel stores full-scale channels exactly in a 5-6-5 DIB",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    let locked = rt.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() as usize / 2;
+    let px = locked.as_u16(pitch_px * H as usize);
+    let last_row = pitch_px * (H as usize - 1);
+    assert_eq!(
+        px[last_row + W as usize - 1],
+        RED_565,
+        "what GDI drew into the last pixel reached the colour texture",
+    );
+    assert_eq!(
+        px[last_row], GREEN_565,
+        "the rest of the last row still holds the fill",
+    );
+    assert_eq!(px[0], GREEN_565, "so does the first row");
+}
+
+#[test]
 fn surface_ops_contracts() {
     let h = Harness::new();
     let bb = h.back_buffer(0);

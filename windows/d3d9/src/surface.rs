@@ -505,7 +505,8 @@ impl Direct3DSurface9 {
     /// false — so `GetContainer`/`GetDesc`/`StretchRect` behave exactly as for
     /// a non-lockable RT. Only `LockRect`/`UnlockRect` change: they now read /
     /// write `backing` and upload it to `metal_color_handle` on unlock. The
-    /// `backing` must be sized `width * height * bpp` (tight pitch).
+    /// `backing` must be sized `linear_row_pitch(width, bpp) * height`, the
+    /// same layout every other host-visible surface store carries.
     pub fn set_lockable_staging(&mut self, backing: PageBox) {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper,
         // freshly created by `new_color_target` (refcount 1, single-threaded).
@@ -2242,7 +2243,7 @@ fn systemmem_lock_rect(
         let offset = top.div_euclid(to_i(bh)) * to_i(pitch) + left.div_euclid(to_i(bw)) * to_i(bb);
         (pitch, offset)
     } else {
-        let pitch = full_w.saturating_mul(bpp).next_multiple_of(4);
+        let pitch = mtld3d_core::format::linear_row_pitch(full_w, bpp);
         let offset = top * to_i(pitch) + left * to_i(bpp);
         (pitch, offset)
     };
@@ -2263,13 +2264,14 @@ fn systemmem_lock_rect(
 /// `LockRect` for a lockable standalone render target.
 ///
 /// `CreateRenderTarget` with `Lockable == TRUE`: hand back a pointer into the
-/// CPU staging buffer at the requested sub-rect, with a tight `width * bpp`
-/// pitch. The staging was sized `width * height * bpp` at creation.
-/// `UnlockRect` later uploads it to the renderable colour texture
+/// CPU staging buffer at the requested sub-rect, at the
+/// [`mtld3d_core::format::linear_row_pitch`] stride the staging was allocated
+/// at. `UnlockRect` later uploads it to the renderable colour texture
 /// (`lockable_rt_upload`). A `NULL` rect locks the whole surface (origin 0,0).
-/// Mirrors the systemmem accept-any-rect contract, but the pitch is tight (no
-/// 4-byte rounding) so the staging size and the GPU upload region agree
-/// exactly.
+/// Mirrors the systemmem accept-any-rect contract, pitch included: D3D9 leaves
+/// the pitch to the driver, and one stride for every host-visible surface store
+/// is what keeps the staging, the read-back, the upload and a `GetDC` DIB in
+/// agreement.
 ///
 /// Unless the lock is `D3DLOCK_DISCARD` (the app will overwrite every pixel),
 /// the GPU colour texture is first read back into the staging so a read lock
@@ -2306,16 +2308,13 @@ fn lockable_rt_lock_rect(
         // never reaches here (CreateRenderTarget rejects it).
         return D3DERR_INVALIDCALL;
     }
-    // Tight pitch (no 4-byte rounding): the staging is `width * bpp` per row, so
-    // a full-surface fill writes exactly `width * height * bpp` bytes — the
-    // region the unlock upload then copies. A sub-rect origin steps in whole
-    // pixels: `top * pitch + left * bpp`.
-    let pitch = inner.standalone_width.saturating_mul(bpp);
+    // A sub-rect origin steps in whole pixels: `top * pitch + left * bpp`.
+    let pitch = mtld3d_core::format::linear_row_pitch(inner.standalone_width, bpp);
     // A read (or read/modify) lock sees the current GPU content: sync the colour
     // texture into the staging before handing back the pointer. `D3DLOCK_DISCARD`
     // skips it — the app will overwrite the whole surface. The read-back fills
-    // the full surface (origin 0,0, tight pitch) so any sub-rect pointer derived
-    // below indexes valid bytes.
+    // the full surface (origin 0,0) so any sub-rect pointer derived below
+    // indexes valid bytes.
     if flags & D3DLOCK_DISCARD == 0 {
         lockable_rt_readback_fill(inner, bpp);
     }
@@ -2354,8 +2353,9 @@ fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) {
 ///
 /// The read-half of a non-discard `LockRect`. Flushes the in-progress frame so
 /// the latest draws / `StretchRect` land in the texture, then blits the full
-/// surface into the tight-pitch staging via the same `BlitTextureToBuffer` core
-/// the backbuffer / `GetRenderTargetData` path uses. Marks the texture
+/// surface into the staging at its own row pitch, via the same
+/// `BlitTextureToBuffer` core the backbuffer / `GetRenderTargetData` path
+/// uses. Marks the texture
 /// read-back BEFORE the flush so the store-action optimiser (Rule D) keeps the
 /// rendered content. A blit failure leaves the staging as-is (the zero-init /
 /// prior content) — the lock still succeeds.
@@ -2365,7 +2365,7 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
     if bpp == 0 || width == 0 || height == 0 || tex_handle.is_null() {
         return;
     }
-    let bytes_per_row = width.saturating_mul(bpp);
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(width, bpp);
     let needed = (bytes_per_row as usize).saturating_mul(height as usize);
     if needed == 0 {
         return;
@@ -2425,9 +2425,9 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
 ///
 /// Push the CPU staging buffer up to the renderable colour `MTLTexture` so a
 /// subsequent `StretchRect` / sample observes the just-written pixels. The
-/// staging bytes are *copied* into the pushed encoder op (a `Vec<u8>` the
-/// closure owns) so the surface's `PageBox` is never aliased across the
-/// API/encoder boundary.
+/// staging rows are *copied* into the pushed encoder op (a `Vec<u8>` the
+/// closure owns, at the staging's own row pitch) so the surface's `PageBox` is
+/// never aliased across the API/encoder boundary.
 fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         return;
@@ -2441,15 +2441,14 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(page) = inner.system_memory.as_ref() else {
         return;
     };
-    let needed = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(bpp as usize);
+    let pitch = mtld3d_core::format::linear_row_pitch(width, bpp);
+    let needed = (pitch as usize).saturating_mul(height as usize);
     if page.len() < needed {
         return;
     }
-    // Copy the tight `width*height*bpp` bytes the lock just received into a
-    // heap buffer the op owns — the encoder thread reads it long after this
-    // returns, so it must not borrow the surface's staging (no-thunk rule).
+    // Copy the `pitch * height` bytes the lock just received into a heap buffer
+    // the op owns: the encoder thread reads it long after this returns, so it
+    // must not borrow the surface's staging (no-thunk rule).
     let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
     if inner.device_inner.is_null() {
         return;
@@ -2459,7 +2458,7 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     // resources per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
     device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, bpp);
+        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, pitch);
     }));
 }
 
@@ -2606,9 +2605,9 @@ impl SurfaceInner {
             }
             let width = self.standalone_width;
             let height = self.standalone_height;
-            // The backing buffer pitch matches the DIB's `bmWidthBytes`:
-            // `width * bpp` rounded up to a 4-byte boundary.
-            let src_pitch = (width.saturating_mul(bpp).next_multiple_of(4)) as usize;
+            // The backing buffer pitch matches the DIB's `bmWidthBytes`, which
+            // GDI derives from the same rounding.
+            let src_pitch = mtld3d_core::format::linear_row_pitch(width, bpp) as usize;
             // SAFETY: `system_memory` is `Some` (checked above); the `PageBox`
             // pointer stays valid for the surface's lifetime and is only read
             // through this borrow on the single-threaded API thread.
