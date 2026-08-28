@@ -12,9 +12,10 @@
 use super::{
     D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D15S1,
     D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
-    D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R16F, D3DFMT_R32F, PixelFormat, Swizzle, is_depth_format,
-    is_mapped_color_format, map_d3d_depth_format, map_d3d_format,
+    D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16,
+    D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_X8R8G8B8, PixelFormat, Swizzle, depth_format_bytes_per_pixel, is_depth_format,
+    is_mapped_color_format, map_d3d_depth_format, map_d3d_format, surface_bytes,
 };
 
 #[test]
@@ -254,4 +255,55 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
             float32_filtering
         ));
     }
+}
+
+/// Every depth format `map_d3d_depth_format` maps has a byte size here.
+///
+/// The two tables are consulted in sequence by `surface_bytes`, so a depth
+/// format present in one and missing from the other is charged zero bytes
+/// against the `GetAvailableTextureMem` budget.
+#[test]
+fn depth_size_table_covers_the_depth_mapping() {
+    for fmt in [
+        D3DFMT_D16,
+        D3DFMT_D16_LOCKABLE,
+        D3DFMT_D15S1,
+        D3DFMT_D24X8,
+        D3DFMT_D24S8,
+        D3DFMT_D24X4S4,
+        D3DFMT_D24FS8,
+        D3DFMT_D32,
+        D3DFMT_D32F_LOCKABLE,
+        D3DFMT_DF16,
+        D3DFMT_DF24,
+        D3DFMT_INTZ,
+    ] {
+        assert!(
+            map_d3d_depth_format(fmt).is_some(),
+            "{fmt:#x} is a depth format"
+        );
+        assert!(
+            depth_format_bytes_per_pixel(fmt).is_some(),
+            "{fmt:#x} has no depth byte size"
+        );
+    }
+    assert_eq!(depth_format_bytes_per_pixel(D3DFMT_A8R8G8B8), None);
+}
+
+#[test]
+fn surface_bytes_charges_colour_and_depth_surfaces() {
+    // A standalone 2048x2048 A8R8G8B8 render target is 16 MiB.
+    assert_eq!(surface_bytes(2048, 2048, D3DFMT_A8R8G8B8), 16 * 1024 * 1024);
+    assert_eq!(surface_bytes(2048, 2048, D3DFMT_X8R8G8B8), 16 * 1024 * 1024);
+    // Source bytes per pixel, not the Metal backing: R5G6B5 is 2 bytes even
+    // where it is expanded to BGRA8, and D24S8 is 4 even though the Metal
+    // texture behind it is `Depth32Float_Stencil8`.
+    assert_eq!(surface_bytes(256, 128, D3DFMT_R5G6B5), 256 * 128 * 2);
+    assert_eq!(surface_bytes(1024, 1024, D3DFMT_D24S8), 4 * 1024 * 1024);
+    assert_eq!(surface_bytes(1024, 1024, D3DFMT_D16), 2 * 1024 * 1024);
+    // Block-compressed formats are charged by block: DXT1 is 8 bytes per
+    // 4x4 block, so half a byte per texel.
+    assert_eq!(surface_bytes(64, 64, D3DFMT_DXT1), 64 * 64 / 2);
+    // A format with neither mapping is charged nothing rather than panicking.
+    assert_eq!(surface_bytes(64, 64, 0), 0);
 }

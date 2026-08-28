@@ -593,5 +593,51 @@ pub fn compute_mip_count(width: u32, height: u32) -> u32 {
     32 - max_dim.leading_zeros()
 }
 
+/// Bytes one single-level `width` x `height` surface of `d3d_format` occupies.
+///
+/// The single size formula behind the `GetAvailableTextureMem` accounting for
+/// the two standalone-surface entry points, `CreateRenderTarget` and
+/// `CreateDepthStencilSurface`, so a surface is charged and refunded from
+/// identical inputs. The figure is in the application's own currency: the
+/// dimensions it asked for, and its own D3D9 format rather than the Metal
+/// format the surface is really backed by. Both substitutions underneath (a
+/// render-scaled attachment, a 24-bit depth format promoted to
+/// `Depth32Float`) are ours, and an application sizing its resource budget
+/// from this call reasons in the units it passed in. Returns 0 for a format
+/// with neither a colour nor a depth mapping.
+#[must_use]
+pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
+    if let Some(fmt) = lookup_d3d_format(d3d_format) {
+        let (_, _, byte_size, _) = compute_mip_size(width, height, 0, &fmt);
+        return u64::from(byte_size);
+    }
+    if let Some(bpp) = depth_format_bytes_per_pixel(d3d_format) {
+        return u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(u64::from(bpp));
+    }
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "surface_bytes({d3d_format:#x}): no colour or depth mapping → 0 bytes charged"
+    );
+    0
+}
+
+/// Bytes per pixel a D3D9 depth/stencil format occupies on the wire.
+///
+/// The D3D9 figure, kept in step with `map_d3d_depth_format`: every format
+/// that has a Metal depth mapping has a size here, so a depth surface is
+/// never charged zero bytes. The Metal texture behind it is wider for the
+/// 24-bit family, which is a substitution of ours and not part of the budget
+/// an application sizes from.
+const fn depth_format_bytes_per_pixel(d3d_format: u32) -> Option<u32> {
+    match d3d_format {
+        D3DFMT_D16 | D3DFMT_D16_LOCKABLE | D3DFMT_D15S1 | D3DFMT_DF16 => Some(2),
+        D3DFMT_D32 | D3DFMT_D32F_LOCKABLE | D3DFMT_D24X8 | D3DFMT_D24S8 | D3DFMT_D24X4S4
+        | D3DFMT_D24FS8 | D3DFMT_DF24 | D3DFMT_INTZ => Some(4),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -8,10 +8,10 @@ use core::ffi::c_void;
 use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
-    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_INDEX16,
-    D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DQUERYTYPE_EVENT,
-    D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
-    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
+    D3DFMT_INDEX16, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DQUERYTYPE_EVENT, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -413,6 +413,51 @@ fn available_texture_mem_is_nonzero() {
     assert!(
         h.available_texture_mem() > 0,
         "GetAvailableTextureMem reports memory"
+    );
+}
+
+/// The two standalone-surface entry points move the reported figure.
+///
+/// A `CreateRenderTarget` / `CreateDepthStencilSurface` surface owns a real
+/// `D3DPOOL_DEFAULT` Metal texture without going through the texture path, so
+/// each has to be charged at creation and refunded at release. Both are
+/// 2048x2048 at four bytes per pixel, so each is exactly 16 MiB, and the
+/// reported figure is in bytes (no rounding to whole MiB).
+#[test]
+fn available_texture_mem_tracks_standalone_surfaces() {
+    const SURFACE_BYTES: u32 = 2048 * 2048 * 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(
+        base > 2 * SURFACE_BYTES,
+        "budget {base} leaves room for both surfaces"
+    );
+    {
+        let _rt = h.create_render_target(2048, 2048, D3DFMT_A8R8G8B8);
+        assert_eq!(
+            h.available_texture_mem(),
+            base - SURFACE_BYTES,
+            "a standalone render target costs its own bytes"
+        );
+        {
+            let _ds = h.create_depth_stencil_surface(2048, 2048, D3DFMT_D24S8);
+            assert_eq!(
+                h.available_texture_mem(),
+                base - 2 * SURFACE_BYTES,
+                "a standalone depth-stencil surface costs its own bytes"
+            );
+        }
+        assert_eq!(
+            h.available_texture_mem(),
+            base - SURFACE_BYTES,
+            "releasing the depth-stencil surface gives its bytes back"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the render target gives its bytes back"
     );
 }
 

@@ -443,12 +443,15 @@ pub struct DeviceInner {
     /// `alloc_pagebox_capped` to cap retention before a rename burst
     /// balloons PE-heap usage into 32-bit OOM territory.
     vbib_retained_bytes: Arc<AtomicU64>,
-    /// Running total of bytes occupied by live `D3DPOOL_DEFAULT` textures.
+    /// Running total of bytes occupied by live `D3DPOOL_DEFAULT` resources.
     ///
     /// Counts RTs + DEFAULT textures, maintained at `register_texture` /
-    /// `deregister_texture`. `GetAvailableTextureMem` reports
-    /// `VRAM_BUDGET - this`, so the value visibly decreases as the app
-    /// allocates GPU resources.
+    /// `deregister_texture`, plus the standalone `CreateRenderTarget` and
+    /// `CreateDepthStencilSurface` surfaces, maintained at
+    /// `register_standalone_surface` / `deregister_standalone_surface` (they
+    /// own a Metal texture with no `TextureInner` behind it).
+    /// `GetAvailableTextureMem` reports `VRAM_BUDGET - this`, so the value
+    /// visibly decreases as the app allocates GPU resources.
     vram_bytes_used: Arc<AtomicU64>,
     /// Number of `D3DPOOL_DEFAULT` resources and implicit surfaces the app holds a reference to.
     ///
@@ -1747,6 +1750,33 @@ impl DeviceInner {
             .lock()
             .expect("live_textures mutex poisoned")
             .push(ti);
+    }
+
+    /// Charge a standalone `D3DPOOL_DEFAULT` surface against the VRAM total.
+    ///
+    /// The surfaces `CreateRenderTarget` and `CreateDepthStencilSurface` hand
+    /// out own a real Metal texture without a `TextureInner`, so the texture
+    /// registry never sees them; without this they would cost nothing in the
+    /// figure `GetAvailableTextureMem` reports. `surface_bytes` is the same
+    /// formula [`Self::deregister_standalone_surface`] refunds with, fed the
+    /// dimensions and format the surface reports through `GetDesc`.
+    pub fn register_standalone_surface(&self, width: u32, height: u32, d3d_format: u32) {
+        self.vram_bytes_used.fetch_add(
+            mtld3d_core::format::surface_bytes(width, height, d3d_format),
+            Ordering::AcqRel,
+        );
+    }
+
+    /// Refund a standalone surface's bytes as it retires its Metal texture.
+    ///
+    /// Called from the colour and depth retire arms of `finalize_surface`,
+    /// which are gated exactly as the two creation sites that charged the
+    /// surface, so the total returns to where it started.
+    pub fn deregister_standalone_surface(&self, width: u32, height: u32, d3d_format: u32) {
+        self.vram_bytes_used.fetch_sub(
+            mtld3d_core::format::surface_bytes(width, height, d3d_format),
+            Ordering::AcqRel,
+        );
     }
 
     /// Drop a `TextureInner` from the live-texture registry.
@@ -4831,6 +4861,11 @@ fn create_color_target_surface(
         format,
         usage,
     );
+    // The surface owns a DEFAULT-pool Metal texture no `TextureInner` covers,
+    // so charge it here; `finalize_surface`'s colour retire arm refunds it.
+    // SAFETY: `device_inner` is the live owning device, non-null for every
+    // caller of this fn.
+    unsafe { &*device_inner }.register_standalone_surface(width, height, format);
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
     // surface at refcount 1.
@@ -4999,6 +5034,11 @@ extern "system" fn device_create_depth_stencil_surface(
         height,
         format,
     );
+    // Same accounting as a standalone colour target: a real Metal depth
+    // texture with no `TextureInner` behind it, refunded by
+    // `finalize_surface`'s depth retire arm.
+    obj.inner()
+        .register_standalone_surface(width, height, format);
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone depth-stencil
     // surface at refcount 1.
