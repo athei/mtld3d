@@ -35,11 +35,14 @@ pub struct Mtld3dConfig {
     /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
     ///
     /// Treats the device as lacking the native packed 16-bit pixel
-    /// formats: A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 textures are backed
-    /// by BGRA8 and expanded on the CPU at upload, and the 16-bit render
-    /// target formats stop being advertised. Exists so the Intel/AMD
-    /// path can be exercised on Apple Silicon. Default: `false`. File
-    /// key: `debug.expandPacked16`.
+    /// formats: A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 textures are
+    /// backed by BGRA8, every upload into one is widened from its 2 bpp staging
+    /// by the GPU upload pass (a render pass whose fragment function
+    /// reads the staging slab as a buffer argument) instead of a blit
+    /// copy, and the 16-bit render target formats stop being
+    /// advertised. Exists so the Intel/AMD path can be exercised on
+    /// Apple Silicon. Default: `false`. File key:
+    /// `debug.expandPacked16`.
     pub expand_packed16: bool,
     /// Whether single-precision float textures may be advertised as filterable.
     ///
