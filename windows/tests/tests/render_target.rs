@@ -2360,7 +2360,7 @@ fn surface_ops_contracts() {
         "CreateOffscreenPlainSurface(D3DPOOL_DEFAULT) succeeds",
     );
     assert_eq!(
-        h.create_offscreen_plain_surface_hr(64, 64, D3DFMT_A8R8G8B8, 1 /* D3DPOOL_MANAGED */),
+        h.create_offscreen_plain_surface_hr(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED),
         D3DERR_INVALIDCALL,
         "CreateOffscreenPlainSurface(D3DPOOL_MANAGED) is rejected",
     );
