@@ -2983,6 +2983,74 @@ fn get_render_target_data_reads_backbuffer() {
 }
 
 #[test]
+fn get_render_target_data_writes_rows_at_the_reported_pitch() {
+    // An odd width in a 16-bit format is where the tight row stride and the
+    // one `LockRect` reports part company: 33 R5G6B5 texels are 66 bytes, and
+    // a linear system-memory surface reports 68, the next four-byte boundary.
+    // The read-back writes its rows at the reported stride, so row n starts
+    // where the lock reads it and the last row's tail is written too. At the
+    // tight stride row n would land 2n bytes early (row 1 ending in row 2's
+    // first texel) and the last row's last texels would keep whatever the
+    // backing already held.
+    const W: u32 = 33;
+    const H: u32 = 4;
+    // `W * 2` rounded up to the next four-byte boundary, in bytes and in lanes.
+    const PITCH: usize = 68;
+    const LANES: usize = PITCH / 2 * H as usize;
+    // BLUE and GREEN in B5G6R5 (`B[0..5] G[5..11] R[11..16]`).
+    const BLUE_565: u16 = 0x001F;
+    const GREEN_565: u16 = 0x07E0;
+    const SENTINEL: u16 = 0xAAAA;
+
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(W, H, D3DFMT_R5G6B5);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the R5G6B5 target");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the R5G6B5 target blue");
+    let stripe = D3DRECT {
+        x1: 0,
+        y1: 1,
+        x2: 33,
+        y2: 2,
+    };
+    assert_eq!(h.clear_target_rects(GREEN, &[stripe]), 0, "row 1 green");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let sysmem = h.create_offscreen_plain_surface(W, H, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    // Seed the backing so a byte the read-back never writes reads back as
+    // something no clear colour produces; the create leaves it uninitialised.
+    {
+        let mut seed = sysmem.lock_rect(0);
+        assert_eq!(
+            usize::try_from(seed.pitch()).expect("non-negative pitch"),
+            PITCH,
+            "LockRect reports the four-byte-rounded pitch"
+        );
+        seed.write(&[SENTINEL; LANES]);
+    }
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData R5G6B5 RT → SYSTEMMEM",
+    );
+
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let lanes = locked.as_u16(LANES);
+    let texel = |x: usize, y: usize| lanes[y * (PITCH / 2) + x];
+    assert_eq!(texel(0, 1), GREEN_565, "row 1 starts green");
+    assert_eq!(
+        texel(32, 1),
+        GREEN_565,
+        "row 1 ends green, not row 2's blue"
+    );
+    assert_eq!(
+        texel(32, 3),
+        BLUE_565,
+        "the last row's last texel is written"
+    );
+}
+
+#[test]
 fn get_render_target_data_fills_a_system_memory_texture_level() {
     // D3D9 takes any system-memory surface as the destination, and a title
     // that screenshots or feeds a reflection reads the back buffer into a
