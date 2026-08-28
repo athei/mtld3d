@@ -2188,6 +2188,56 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
     Some((w, h, bytes_per_row))
 }
 
+/// Push the back buffer's `GetDC` snapshot page back into its colour texture.
+///
+/// The write half of [`readback_full_backbuffer`]. The DIB `GetDC` handed out
+/// wraps that page, not the back buffer itself, so GDI's drawing lives only
+/// there until it is copied back. The copy takes the route a lockable render
+/// target's `UnlockRect` upload takes, the frame's leading blit pass, so it
+/// lands before the next draw (`GetDC` flushed everything before it).
+///
+/// A `render.scale` below 100% rasterizes the back buffer into a texture
+/// smaller than the logical size the DIB was handed out at, and this path
+/// carries no downscale, so it declines the upload and says so once.
+fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
+    let (width, height) = (inner.live_width(), inner.live_height());
+    let color_handle = inner.live_color_handle().raw();
+    let bpp =
+        mtld3d_core::format::map_d3d_format(inner.live_format()).map_or(0, |f| f.bytes_per_pixel());
+    if bpp == 0 || width == 0 || height == 0 || color_handle == 0 || inner.device_inner.is_null() {
+        return;
+    }
+    // SAFETY: `device_inner` is non-null (checked above) and points to the live
+    // owning device, which outlives its child surfaces.
+    let scale = unsafe { (*inner.device_inner).scale_for_created_target(width, height, true) };
+    if !scale.is_identity() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::ReleaseDC on the back buffer: no downscale for render.scale={percent}%, GDI's drawing is dropped",
+            percent = scale.percent(),
+        );
+        return;
+    }
+    let needed = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(bpp as usize);
+    let Some(page) = inner.readback.as_ref() else {
+        return;
+    };
+    if page.len() < needed {
+        return;
+    }
+    // Copy the snapshot into a buffer the pushed op owns: the encoder thread
+    // reads it long after this returns, so it must not borrow the page (which
+    // the caller drops as soon as the DC is gone).
+    let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
+    // SAFETY: `inner.device_inner` is non-null (checked above) and points to
+    // the live owning device, a different allocation from the page above.
+    let device_inner = unsafe { &mut *inner.device_inner };
+    device_inner.push_op(Box::new(move |enc| {
+        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, bpp);
+    }));
+}
+
 /// `LockRect` for a system-memory offscreen surface.
 ///
 /// Hand back a pointer into the persistent backing buffer (no GPU work). A
@@ -2836,6 +2886,12 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     // the GPU still holds.
     if inner.is_lockable_render_target() {
         lockable_rt_upload(inner);
+    }
+    // The back buffer's DC wraps the read-back snapshot page rather than any
+    // persistent store, so GDI's drawing exists only there: push it back into
+    // the back buffer before the page is dropped just below.
+    if inner.is_lockable_backbuffer() {
+        backbuffer_dc_upload(inner);
     }
     // A backbuffer GetDC stashed a full read-back snapshot in `readback`; drop it
     // now the DC is gone (the LockRect path reuses the same slot). No-op for
