@@ -13,22 +13,23 @@
 use mtld3d_types::{D3DUSAGE_NONSECURE, D3DUSAGE_WRITEONLY};
 
 use super::{
-    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D15S1,
-    D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
-    D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16,
-    D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_X8R8G8B8, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
-    RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
-    compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
-    is_depth_format, is_mapped_color_format, linear_mip_size, linear_row_pitch,
-    map_d3d_depth_format, map_d3d_format, resolve_mip_levels, standalone_surface_bytes,
-    surface_bytes, usage_allowed_for_rtype,
+    D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8,
+    D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16,
+    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
+    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat, RenderScale,
+    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count, compute_mip_size,
+    compute_volume_mip_count, depth_format_bytes_per_pixel, format_name, is_depth_format,
+    is_mapped_color_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
 };
 
 #[test]
@@ -155,6 +156,73 @@ fn x1r5g5b5_is_a1r5g5b5_with_a_forced_alpha() {
     assert!(!x1.has_alpha());
     assert!(a1.has_alpha());
     assert_eq!(format_name(D3DFMT_X1R5G5B5), "X1R5G5B5");
+}
+
+/// The reversed-channel 32-bit pair and the 24-bit format the GPU widens.
+///
+/// `A8B8G8R8` / `X8B8G8R8` store R, G, B, A in ascending addresses, which is
+/// Metal's `RGBA8Unorm` byte for byte, and the X member forces alpha to 1 the
+/// way `X8R8G8B8` does. `R8G8B8` has no Metal counterpart at all, so it keeps
+/// its 3-byte source layout for Lock and staging while its texels are widened
+/// into a `Bgra8Unorm` backing by the upload pass.
+#[test]
+fn the_reversed_channel_and_24_bit_formats_map() {
+    let a8b8g8r8 = map_d3d_format(D3DFMT_A8B8G8R8).expect("mapped");
+    assert_eq!(a8b8g8r8.metal_pixel_format(), PixelFormat::Rgba8Unorm);
+    assert_eq!(a8b8g8r8.bytes_per_pixel(), 4);
+    assert_eq!(a8b8g8r8.swizzle(), None);
+    assert!(a8b8g8r8.has_alpha());
+
+    let x8b8g8r8 = map_d3d_format(D3DFMT_X8B8G8R8).expect("mapped");
+    assert_eq!(x8b8g8r8.metal_pixel_format(), PixelFormat::Rgba8Unorm);
+    assert_eq!(x8b8g8r8.bytes_per_pixel(), 4);
+    assert_eq!(
+        x8b8g8r8.swizzle(),
+        map_d3d_format(D3DFMT_X8R8G8B8).expect("mapped").swizzle(),
+        "the X member forces alpha to 1 like its BGRA twin"
+    );
+    assert!(!x8b8g8r8.has_alpha());
+
+    let r8g8b8 = map_d3d_format(D3DFMT_R8G8B8).expect("mapped");
+    assert_eq!(r8g8b8.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(
+        r8g8b8.bytes_per_pixel(),
+        3,
+        "source layout, not the backing"
+    );
+    assert_eq!(r8g8b8.block_bytes(), 3);
+    assert_eq!(
+        r8g8b8.swizzle(),
+        None,
+        "the upload pass writes D3D channel order into the backing"
+    );
+    assert!(!r8g8b8.has_alpha());
+    assert!(!r8g8b8.is_compressed());
+
+    // The 3-byte pitch is the one GDI computes for a 24-bit DIB of the same
+    // width, which is what a `GetDC` over the surface steps its rows by.
+    assert_eq!(linear_row_pitch(5, 3), 16);
+    assert_eq!(linear_row_pitch(4, 3), 12);
+    assert_eq!(
+        compute_mip_size(5, 2, 0, &r8g8b8),
+        (5, 2, 32, 16),
+        "a 24-bit level strides at the dword-rounded pitch"
+    );
+
+    // All three are unconditional: no device backs them differently.
+    for fmt in [D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8, D3DFMT_R8G8B8] {
+        assert!(is_mapped_color_format(fmt), "format {fmt}");
+        assert_eq!(
+            super::map_d3d_format_device(fmt, false)
+                .expect("mapped")
+                .metal_pixel_format(),
+            map_d3d_format(fmt).expect("mapped").metal_pixel_format(),
+            "format {fmt} is not device-dependent"
+        );
+    }
+    assert_eq!(format_name(D3DFMT_A8B8G8R8), "A8B8G8R8");
+    assert_eq!(format_name(D3DFMT_X8B8G8R8), "X8B8G8R8");
+    assert_eq!(format_name(D3DFMT_R8G8B8), "R8G8B8");
 }
 
 #[test]

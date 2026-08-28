@@ -55,6 +55,10 @@ fn srgb_twin_table() {
         Some(PixelFormat::Bgra8UnormSrgb)
     );
     assert_eq!(
+        PixelFormat::Rgba8Unorm.srgb_twin(),
+        Some(PixelFormat::Rgba8UnormSrgb)
+    );
+    assert_eq!(
         PixelFormat::Bc1Rgba.srgb_twin(),
         Some(PixelFormat::Bc1RgbaSrgb)
     );
@@ -70,6 +74,7 @@ fn srgb_twin_table() {
     // Already-sRGB formats are their own input, not their own twin —
     // callers should never request the twin of an sRGB format.
     assert_eq!(PixelFormat::Bgra8UnormSrgb.srgb_twin(), None);
+    assert_eq!(PixelFormat::Rgba8UnormSrgb.srgb_twin(), None);
     assert_eq!(PixelFormat::Bc1RgbaSrgb.srgb_twin(), None);
 
     // No sRGB encoding for single-channel, float, or depth formats.
@@ -142,6 +147,8 @@ fn block_layout_table() {
         (PixelFormat::B5G6R5Unorm, 2),
         (PixelFormat::Bgra8Unorm, 4),
         (PixelFormat::Bgra8UnormSrgb, 4),
+        (PixelFormat::Rgba8Unorm, 4),
+        (PixelFormat::Rgba8UnormSrgb, 4),
         (PixelFormat::Depth32Float, 4),
         (PixelFormat::Rgba16Float, 8),
         (PixelFormat::Rgba32Float, 16),

@@ -1,20 +1,20 @@
 use log::warn;
 use mtld3d_shared::mtl::{PixelFormat, Swizzle};
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16,
-    D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32,
-    D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
-    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
-    D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
-    D3DUSAGE_SOFTWAREPROCESSING,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1,
+    D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
+    D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
+    D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F,
+    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
+    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
@@ -135,6 +135,9 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
     match d3d_format {
         D3DFMT_A8R8G8B8 => "A8R8G8B8",
         D3DFMT_X8R8G8B8 => "X8R8G8B8",
+        D3DFMT_A8B8G8R8 => "A8B8G8R8",
+        D3DFMT_X8B8G8R8 => "X8B8G8R8",
+        D3DFMT_R8G8B8 => "R8G8B8",
         D3DFMT_R5G6B5 => "R5G6B5",
         D3DFMT_A1R5G5B5 => "A1R5G5B5",
         D3DFMT_X1R5G5B5 => "X1R5G5B5",
@@ -431,6 +434,51 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             // The X byte is "don't care"; D3D9 samples alpha as 1.0 and, as a
             // render target, destination alpha is the constant 1.0 (no alpha
             // channel to blend against).
+            has_alpha: false,
+        }),
+        D3DFMT_A8B8G8R8 => Some(FormatMapping {
+            // The reversed-channel twin of A8R8G8B8: stored R, G, B, A in
+            // ascending addresses, which is Metal's RGBA8Unorm byte for byte.
+            metal_pixel_format: PixelFormat::Rgba8Unorm,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            swizzle: None,
+            has_alpha: true,
+        }),
+        D3DFMT_X8B8G8R8 => Some(FormatMapping {
+            // X8B8G8R8 is to A8B8G8R8 what X8R8G8B8 is to A8R8G8B8: the same
+            // memory layout with a "don't care" fourth byte that D3D9 samples
+            // as alpha = 1. Force it with the texture swizzle for the same
+            // reason, or every SRC_ALPHA-blended draw reads the stored byte.
+            metal_pixel_format: PixelFormat::Rgba8Unorm,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One]),
+            has_alpha: false,
+        }),
+        D3DFMT_R8G8B8 => Some(FormatMapping {
+            // 24-bit B, G, R in ascending addresses, with no Metal
+            // counterpart at all: no GPU family has a three-byte colour
+            // format. The texels are widened to BGRA8 by the GPU upload pass
+            // (`upload_pass`), which also forces alpha opaque, the way the
+            // packed 16-bit formats are widened on a device without them.
+            // `bytes_per_pixel` stays 3 because it describes the SOURCE
+            // layout that D3D9 Lock semantics expose. Unconditional, unlike
+            // the packed 16-bit expansion: there is no device where a native
+            // format could serve this one.
+            metal_pixel_format: PixelFormat::Bgra8Unorm,
+            bytes_per_pixel: 3,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 3,
+            // No sampler swizzle: the upload pass writes D3D channel order
+            // into the BGRA8 backing directly, and a swizzled view cannot
+            // carry the `RenderTarget` usage that pass writes through.
+            swizzle: None,
             has_alpha: false,
         }),
         D3DFMT_A8 => Some(FormatMapping {

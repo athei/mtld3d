@@ -7,8 +7,8 @@
 
 use mtld3d_shared::mtl::PixelFormat;
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5,
-    D3DFMT_X8R8G8B8,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_R5G6B5,
+    D3DFMT_R8G8B8, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8,
 };
 
 use super::{UploadDecode, is_expanded_upload, is_expansion, needs_render_target, upload_decode};
@@ -39,6 +39,40 @@ fn packed16_formats_decode_only_against_a_bgra8_texture() {
             "{format:#x} on a native packed texture stays a blit"
         );
     }
+}
+
+/// 24-bit `R8G8B8` expands on every device, and only against a BGRA8 texture.
+///
+/// Unlike the packed 16-bit family, no device has a Metal counterpart for a
+/// three-byte colour format, so the decode is not conditional on anything.
+/// `A8B8G8R8` shares the byte count but has its own native Metal format, so
+/// it keeps the blit.
+#[test]
+fn the_24_bit_format_always_expands() {
+    assert_eq!(
+        upload_decode(D3DFMT_R8G8B8, PixelFormat::Bgra8Unorm),
+        Some(UploadDecode::R8G8B8)
+    );
+    assert!(is_expansion(UploadDecode::R8G8B8));
+    assert!(is_expanded_upload(D3DFMT_R8G8B8, PixelFormat::Bgra8Unorm));
+    // The expansion has no blit form, so the attachment is needed whatever
+    // the mip pitch is.
+    assert!(needs_render_target(
+        D3DFMT_R8G8B8,
+        PixelFormat::Bgra8Unorm,
+        1024,
+        1,
+        16
+    ));
+    assert_eq!(
+        upload_decode(D3DFMT_A8B8G8R8, PixelFormat::Rgba8Unorm),
+        None,
+        "the reversed-channel 32-bit format has a native Metal counterpart"
+    );
+    assert!(!is_expanded_upload(
+        D3DFMT_A8B8G8R8,
+        PixelFormat::Rgba8Unorm
+    ));
 }
 
 #[test]
@@ -125,7 +159,9 @@ fn wire_values_match_the_shader_cases() {
     assert_eq!(UploadDecode::A4R4G4B4.wire(), 2);
     assert_eq!(UploadDecode::CopyBgra8.wire(), 3);
     assert_eq!(UploadDecode::X1R5G5B5.wire(), 4);
+    assert_eq!(UploadDecode::R8G8B8.wire(), 5);
     assert_eq!(UploadDecode::R5G6B5.bytes_per_texel(), 2);
     assert_eq!(UploadDecode::X1R5G5B5.bytes_per_texel(), 2);
     assert_eq!(UploadDecode::CopyBgra8.bytes_per_texel(), 4);
+    assert_eq!(UploadDecode::R8G8B8.bytes_per_texel(), 3);
 }

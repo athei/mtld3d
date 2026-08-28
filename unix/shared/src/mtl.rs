@@ -68,6 +68,13 @@ pub enum PixelFormat {
     R32Float = 55,
     /// 16-bit two-channel float. D3D9 `D3DFMT_G16R16F`.
     Rg16Float = 65,
+    /// 32-bit four-channel unorm in R, G, B, A memory order.
+    ///
+    /// D3D9 `D3DFMT_A8B8G8R8` and `D3DFMT_X8B8G8R8`, whose channels sit in
+    /// the reverse order of the `A8R8G8B8` family that backs `Bgra8Unorm`.
+    Rgba8Unorm = 70,
+    /// sRGB-encoded twin of `Rgba8Unorm`.
+    Rgba8UnormSrgb = 71,
     Bgra8Unorm = 80,
     /// sRGB-encoded twin of `Bgra8Unorm`.
     ///
@@ -110,9 +117,10 @@ pub enum PixelFormat {
 impl PixelFormat {
     /// The sRGB-encoded twin of a linear color format, if one exists.
     ///
-    /// Only `Bgra8Unorm` and the BC1/2/3 compressed colour families have
-    /// sRGB pairs in mtld3d's wire today. Depth formats, single-channel
-    /// formats (A8/R8) and float formats have no sRGB encoding.
+    /// Only the two 8-bit four-channel unorms and the BC1/2/3 compressed
+    /// colour families have sRGB pairs in mtld3d's wire today. Depth
+    /// formats, single-channel formats (A8/R8) and float formats have no
+    /// sRGB encoding.
     ///
     /// Drives both sRGB render states. `create_texture` eagerly creates a
     /// view of the sRGB twin next to every colour texture whose format has
@@ -128,6 +136,7 @@ impl PixelFormat {
     #[must_use]
     pub const fn srgb_twin(self) -> Option<Self> {
         match self {
+            Self::Rgba8Unorm => Some(Self::Rgba8UnormSrgb),
             Self::Bgra8Unorm => Some(Self::Bgra8UnormSrgb),
             Self::Bc1Rgba => Some(Self::Bc1RgbaSrgb),
             Self::Bc2Rgba => Some(Self::Bc2RgbaSrgb),
@@ -161,6 +170,8 @@ impl PixelFormat {
             Self::R32Float
             | Self::Rg16Unorm
             | Self::Rg16Float
+            | Self::Rgba8Unorm
+            | Self::Rgba8UnormSrgb
             | Self::Bgra8Unorm
             | Self::Bgra8UnormSrgb
             | Self::Depth32Float => BlockLayout::pixel(4),

@@ -7002,7 +7002,7 @@ impl FrameEncoder {
         if mtld3d_core::upload_pass::is_expansion(decode) {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "run_texture_upload: the upload pass declined a packed 16-bit expansion; no \
+                "run_texture_upload: the upload pass declined a texel-widening expansion; no \
                  blit can widen those texels, so the mip keeps its previous contents",
             );
             return Some(false);
@@ -7013,11 +7013,11 @@ impl FrameEncoder {
     /// GPU upload pass: write one dirty region into the texture with a render quad.
     ///
     /// Serves the two upload shapes `copyFromBuffer:toTexture:` cannot take.
-    /// A packed 16-bit source (A4R4G4B4 / R5G6B5 / A1R5G5B5) feeding the
-    /// `Bgra8Unorm` texture `map_d3d_format_device` gave it on a device
-    /// without the native formats has no verbatim copy at all: the widening
-    /// happens in the fragment function, which writes D3D channel order and
-    /// forces alpha opaque for the alpha-less R5G6B5. A mip whose row pitch
+    /// A source narrower than the `Bgra8Unorm` texture behind it has no
+    /// verbatim copy at all: a packed 16-bit format on a device without the
+    /// native formats, or 24-bit R8G8B8 anywhere. The widening happens in the
+    /// fragment function, which writes D3D channel order and forces alpha
+    /// opaque for the formats that store none. A mip whose row pitch
     /// is below `min_linear_texture_align` has no legal blit source pitch:
     /// the fragment function addresses the staging by texel, so the pitch is
     /// just a multiplier.
@@ -7091,7 +7091,7 @@ impl FrameEncoder {
 
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "texture upload pass in use: uploads a blit cannot express (packed 16-bit widening, \
+            "texture upload pass in use: uploads a blit cannot express (texel widening, \
              row pitch under the {}-byte linear texture alignment) render into the destination",
             self.gpu_caps.min_linear_texture_align,
         );
