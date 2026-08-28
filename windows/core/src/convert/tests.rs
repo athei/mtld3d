@@ -9,22 +9,6 @@
 use super::*;
 use crate::dxso::DeclUsage;
 
-#[test]
-fn triangle_fan_expands_to_list() {
-    // 5 fan vertices (1 byte each) → 3 triangles: (0,1,2),(0,2,3),(0,3,4).
-    let src = [10u8, 11, 12, 13, 14];
-    let out = expand_triangle_fan(&src, 1, 3);
-    assert_eq!(out, vec![10, 11, 12, 10, 12, 13, 10, 13, 14]);
-}
-
-#[test]
-fn triangle_fan_respects_stride() {
-    // 4 vertices of 2 bytes → 2 triangles: (0,1,2),(0,2,3).
-    let src = [0u8, 0, 1, 1, 2, 2, 3, 3];
-    let out = expand_triangle_fan(&src, 2, 2);
-    assert_eq!(out, vec![0, 0, 1, 1, 2, 2, 0, 0, 2, 2, 3, 3]);
-}
-
 fn u16_indices(bytes: &[u8]) -> Vec<u16> {
     bytes
         .chunks_exact(2)
@@ -39,16 +23,43 @@ fn u32_indices(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// The whole index list a rewrite produces, into a buffer of its own size.
+fn rewritten(fan: &FanRewrite) -> Vec<u8> {
+    let mut out = vec![0xAAu8; fan.byte_len()];
+    fan.write(&mut out);
+    out
+}
+
+/// `count` little-endian indices of `size` bytes each.
+fn index_stream(indices: &[u32], size: usize) -> Vec<u8> {
+    indices
+        .iter()
+        .flat_map(|i| i.to_le_bytes().into_iter().take(size))
+        .collect()
+}
+
 #[test]
 fn nonindexed_fan_becomes_absolute_u16_triangles() {
     // DrawPrimitive(FAN, start 10, 3 prims): fan vertices 10..=14.
-    let fan = triangle_fan_indices(10, 3).expect("fits");
-    assert_eq!(fan.index_type, IndexType::UInt16);
+    let fan = FanRewrite::sequential(10, 3).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(fan.index_count(), 9);
+    assert_eq!(fan.byte_len(), 18);
     assert_eq!(
-        u16_indices(&fan.bytes),
+        u16_indices(&rewritten(&fan)),
         vec![10, 11, 12, 10, 12, 13, 10, 13, 14]
     );
-    assert_eq!((fan.min_vertex, fan.max_vertex), (10, 14));
+    assert_eq!((fan.min_vertex(), fan.max_vertex()), (10, 14));
+}
+
+#[test]
+fn fan_rewrite_writes_only_the_triangles_that_fit() {
+    // The draw path sizes the arena block with `byte_len`; a shorter buffer
+    // is filled with whole triangles and the rest left alone.
+    let fan = FanRewrite::sequential(0, 3).expect("fits");
+    let mut short = vec![0xAAu8; 6];
+    fan.write(&mut short);
+    assert_eq!(u16_indices(&short), vec![0, 1, 2]);
 }
 
 #[test]
@@ -71,41 +82,49 @@ fn fan_pattern_is_the_relative_fan_and_clips_to_the_buffer() {
 
 #[test]
 fn fan_widens_to_u32_past_u16_range() {
-    let fan = triangle_fan_indices(0xFFFE, 1).expect("fits");
-    assert_eq!(fan.index_type, IndexType::UInt32);
-    assert_eq!(u32_indices(&fan.bytes), vec![0xFFFE, 0xFFFF, 0x1_0000]);
-    assert!(triangle_fan_indices(u32::MAX - 1, 1).is_none());
+    let fan = FanRewrite::sequential(0xFFFE, 1).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt32);
+    assert_eq!(fan.byte_len(), 12);
+    assert_eq!(
+        u32_indices(&rewritten(&fan)),
+        vec![0xFFFE, 0xFFFF, 0x1_0000]
+    );
+    assert!(FanRewrite::sequential(u32::MAX - 1, 1).is_none());
 }
 
 #[test]
 fn indexed_fan_folds_the_base_vertex_in() {
     // 16-bit app indices 5,6,7,8 with base vertex 100: triangles over
     // 105..=108.
-    let src: Vec<u8> = [5u16, 6, 7, 8]
-        .iter()
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
-    let fan = triangle_fan_indices_from(&src, 2, 100, 2).expect("fits");
-    assert_eq!(fan.index_type, IndexType::UInt16);
-    assert_eq!(u16_indices(&fan.bytes), vec![105, 106, 107, 105, 107, 108]);
-    assert_eq!((fan.min_vertex, fan.max_vertex), (105, 108));
+    let src = index_stream(&[5, 6, 7, 8], 2);
+    let fan = FanRewrite::indexed(&src, 2, 100, 2).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(
+        u16_indices(&rewritten(&fan)),
+        vec![105, 106, 107, 105, 107, 108]
+    );
+    assert_eq!((fan.min_vertex(), fan.max_vertex()), (105, 108));
     // A negative base is legal as long as no index goes below zero.
-    let fan = triangle_fan_indices_from(&src, 2, -5, 2).expect("fits");
-    assert_eq!(u16_indices(&fan.bytes), vec![0, 1, 2, 0, 2, 3]);
-    assert!(triangle_fan_indices_from(&src, 2, -6, 2).is_none());
+    let fan = FanRewrite::indexed(&src, 2, -5, 2).expect("fits");
+    assert_eq!(u16_indices(&rewritten(&fan)), vec![0, 1, 2, 0, 2, 3]);
+    assert!(FanRewrite::indexed(&src, 2, -6, 2).is_none());
 }
 
 #[test]
 fn indexed_fan_reads_32_bit_indices_and_rejects_short_streams() {
-    let src: Vec<u8> = [1u32, 2, 0x2_0000]
-        .iter()
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
-    let fan = triangle_fan_indices_from(&src, 4, 0, 1).expect("fits");
-    assert_eq!(fan.index_type, IndexType::UInt32);
-    assert_eq!(u32_indices(&fan.bytes), vec![1, 2, 0x2_0000]);
-    assert!(triangle_fan_indices_from(&src, 4, 0, 2).is_none());
-    assert!(triangle_fan_indices_from(&src, 3, 0, 1).is_none());
+    let src = index_stream(&[1, 2, 0x2_0000], 4);
+    let fan = FanRewrite::indexed(&src, 4, 0, 1).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt32);
+    assert_eq!(u32_indices(&rewritten(&fan)), vec![1, 2, 0x2_0000]);
+    assert!(FanRewrite::indexed(&src, 4, 0, 2).is_none());
+    assert!(FanRewrite::indexed(&src, 3, 0, 1).is_none());
+    // A 32-bit stream every index of which fits 16 bits narrows, halving
+    // the bytes the draw stages.
+    let narrow = index_stream(&[1, 2, 3, 4], 4);
+    let fan = FanRewrite::indexed(&narrow, 4, 0, 2).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(fan.byte_len(), 12);
+    assert_eq!(u16_indices(&rewritten(&fan)), vec![1, 2, 3, 1, 3, 4]);
 }
 
 fn pos3() -> D3DVERTEXELEMENT9 {

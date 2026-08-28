@@ -8335,10 +8335,10 @@ extern "system" fn device_draw_primitive(
                 primitive_count,
             }
         } else {
-            let Some(fan) = convert::triangle_fan_indices(start_vertex, primitive_count) else {
+            let Some(fan) = convert::FanRewrite::sequential(start_vertex, primitive_count) else {
                 return D3DERR_INVALIDCALL;
             };
-            generated_fan_source(fan, primitive_count)
+            generated_fan_source(dev, &fan)
         };
         return draw_bound_triangle_fan(&obj, index_source, D3DERR_INVALIDCALL);
     }
@@ -8373,13 +8373,30 @@ extern "system" fn device_draw_primitive(
 }
 
 /// The `IndexSource` for a fan rewritten into an explicit index list.
-fn generated_fan_source(fan: convert::FanIndices, primitive_count: u32) -> IndexSource {
+///
+/// The list is written straight into the frame's scratch arena, which is
+/// what the unix side reads at replay time, so a fan that cannot ride the
+/// encoder's shared pattern still allocates nothing and is copied once.
+fn generated_fan_source(dev: &mut DeviceInner, fan: &convert::FanRewrite) -> IndexSource {
+    let byte_len = fan.byte_len();
+    let ptr = dev
+        .current_frame
+        .scratch_mut()
+        .alloc_uninit_slice::<u8>(byte_len);
+    // SAFETY: `alloc_uninit_slice` returned `byte_len` writable bytes in the
+    // frame arena, and nothing else holds a reference to that block yet.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr, byte_len) };
+    fan.write(out);
+    let data = ScratchSlice::from_raw_parts(
+        NonNull::new(ptr).expect("ScratchArena alloc returned non-null"),
+        u32::try_from(byte_len).expect("fan index list fits u32"),
+    );
     IndexSource::Generated {
-        bytes: fan.bytes,
-        index_count: primitive_count * 3,
-        index_type: fan.index_type,
-        min_vertex: fan.min_vertex,
-        max_vertex: fan.max_vertex,
+        data,
+        index_count: fan.index_count(),
+        index_type: fan.index_type(),
+        min_vertex: fan.min_vertex(),
+        max_vertex: fan.max_vertex(),
     }
 }
 
@@ -8424,11 +8441,11 @@ fn draw_bound_triangle_fan(
 /// trip is needed. `None`, with a warn, when nothing is bound, the format is
 /// unknown, or the draw reads past the buffer.
 fn bound_index_fan(
-    dev: &DeviceInner,
+    dev: &mut DeviceInner,
     start_index: u32,
     base_vertex: i32,
     primitive_count: u32,
-) -> Option<convert::FanIndices> {
+) -> Option<IndexSource> {
     let ptr = dev.bound_buffers().index_buffer();
     if ptr.is_null() {
         warn!(target: LOG_TARGET, "DrawIndexedPrimitive: no index buffer bound");
@@ -8462,12 +8479,13 @@ fn bound_index_fan(
     // SAFETY: `[first, first + len)` lies inside the live backing box (checked
     // above); the API thread owns CPU access to it while the buffer is bound.
     let src = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-    convert::triangle_fan_indices_from(
+    let fan = convert::FanRewrite::indexed(
         src,
         usize::try_from(index_size).ok()?,
         base_vertex,
         primitive_count,
-    )
+    )?;
+    Some(generated_fan_source(dev, &fan))
 }
 
 extern "system" fn device_draw_indexed_primitive(
@@ -8494,13 +8512,14 @@ extern "system" fn device_draw_indexed_primitive(
         if primitive_count == 0 {
             return D3DERR_INVALIDCALL;
         }
-        let Some(fan) = bound_index_fan(dev, start_index, base_vertex_index, primitive_count)
+        let Some(index_source) =
+            bound_index_fan(dev, start_index, base_vertex_index, primitive_count)
         else {
             return D3DERR_INVALIDCALL;
         };
         // A valid declaration with no stream bound is S_OK for indexed draws,
         // same as the non-fan path below.
-        return draw_bound_triangle_fan(&obj, generated_fan_source(fan, primitive_count), D3D_OK);
+        return draw_bound_triangle_fan(&obj, index_source, D3D_OK);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
         return D3DERR_INVALIDCALL;
@@ -8667,6 +8686,28 @@ fn snapshot_bound_index_source(
     })
 }
 
+/// Copy `len` bytes of a `Draw*PrimitiveUP` vertex stream out of the user pointer.
+///
+/// The bytes travel to the encoder inside the draw op, so they are copied
+/// once here rather than read from the application's memory later.
+///
+/// # Safety
+///
+/// `vertex_data` must be readable for `len` bytes for the duration of the
+/// call, which the D3D9 ABI makes the caller's contract.
+unsafe fn copy_up_vertices(vertex_data: *const c_void, len: usize) -> Vec<u8> {
+    let mut copy = Vec::<u8>::with_capacity(len);
+    // SAFETY: the caller guarantees `len` readable bytes at `vertex_data`;
+    // `copy` was just allocated with matching capacity.
+    unsafe {
+        core::ptr::copy_nonoverlapping(vertex_data.cast::<u8>(), copy.as_mut_ptr(), len);
+    }
+    // SAFETY: `len <= copy.capacity()` and bytes `0..len` were just
+    // initialised by the copy above.
+    unsafe { copy.set_len(len) };
+    copy
+}
+
 extern "system" fn device_draw_primitive_up(
     this: *mut c_void,
     primitive_type: u32,
@@ -8684,37 +8725,46 @@ extern "system" fn device_draw_primitive_up(
         return D3DERR_INVALIDCALL;
     }
 
-    // Triangle fan has no Metal primitive: expand the inline fan vertices into a
-    // triangle list and emit that. Kept off the (non-fan) hot path below.
+    // Triangle fan has no Metal primitive: the fan's vertices go up as they
+    // are and an index list makes the triangles. Kept off the (non-fan) hot
+    // path below.
     if primitive_type == D3DPT_TRIANGLEFAN {
         if vertex_data.is_null() || primitive_count == 0 {
             return D3DERR_INVALIDCALL;
         }
-        let stride = vertex_stride as usize;
-        let src_size = (primitive_count as usize + 2) * stride;
+        let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
         // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
         // vertices of `vertex_stride` bytes are readable from `vertex_data`.
-        let src = unsafe { core::slice::from_raw_parts(vertex_data.cast::<u8>(), src_size) };
-        let expanded = convert::expand_triangle_fan(src, stride, primitive_count);
+        let vertex_copy = unsafe { copy_up_vertices(vertex_data, fan_bytes) };
+        // The encoder's shared 16-bit pattern is relative to the fan's first
+        // vertex, which the inline stream starts at, so it covers every fan a
+        // 16-bit index can address; anything longer gets a generated list.
+        let index_source = if primitive_count <= convert::FAN_PATTERN_MAX_TRIANGLES {
+            IndexSource::Fan {
+                start_vertex: 0,
+                primitive_count,
+            }
+        } else {
+            let Some(fan) = convert::FanRewrite::sequential(0, primitive_count) else {
+                return D3DERR_INVALIDCALL;
+            };
+            generated_fan_source(dev, &fan)
+        };
         let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
         let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
         emit_snapshot_deltas(&obj);
         drop(snap);
         let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-        let size = u32::try_from(expanded.len()).expect("triangle-fan UP size fits u32");
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
         dev.push_op_inline(Op::Draw(DrawOp {
             metal_prim,
             vertex_source: VertexSource::Up {
-                bytes: expanded,
-                size,
+                bytes: vertex_copy,
+                size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
                 stride: vertex_stride,
             },
-            index_source: IndexSource::None {
-                start_vertex: 0,
-                vertex_count: primitive_count * 3,
-            },
+            index_source,
         }));
         // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
         dev.bound_buffers_mut().reset_stream0();
@@ -8733,19 +8783,9 @@ extern "system" fn device_draw_primitive_up(
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
 
     let data_size = (vtx_count * vertex_stride) as usize;
-    let mut vertex_copy = Vec::with_capacity(data_size);
     // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
-    // contract; `vertex_copy` was just allocated with matching capacity.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            vertex_data.cast::<u8>(),
-            vertex_copy.as_mut_ptr(),
-            data_size,
-        );
-    }
-    // SAFETY: `data_size <= vertex_copy.capacity()` and the bytes 0..data_size
-    // were just initialised by the copy above.
-    unsafe { vertex_copy.set_len(data_size) };
+    // contract.
+    let vertex_copy = unsafe { copy_up_vertices(vertex_data, data_size) };
 
     emit_snapshot_deltas(&obj);
     drop(snap);
@@ -9660,33 +9700,25 @@ extern "system" fn device_draw_indexed_primitive_up(
     // uploaded but unreferenced.
     let vtx_upload = min_vertex_index as usize + num_vertices as usize;
     let vtx_bytes = vtx_upload * vertex_stride as usize;
-    let mut vertex_copy = Vec::<u8>::with_capacity(vtx_bytes);
     // SAFETY: per the D3D9 ABI `vertex_data` covers at least
-    // `(min_vertex_index + num_vertices) * vertex_stride` bytes; `vertex_copy`
-    // was just allocated with matching capacity.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            vertex_data.cast::<u8>(),
-            vertex_copy.as_mut_ptr(),
-            vtx_bytes,
-        );
-    }
-    // SAFETY: the leading `vtx_bytes` were just initialised by the copy above.
-    unsafe { vertex_copy.set_len(vtx_bytes) };
+    // `(min_vertex_index + num_vertices) * vertex_stride` bytes.
+    let vertex_copy = unsafe { copy_up_vertices(vertex_data, vtx_bytes) };
 
-    // Build the index stream. Triangle fan has no Metal primitive, so expand the
-    // inline index list into a triangle list (indices 0, i+1, i+2) — the same
-    // fan expansion the vertex path uses, applied here over the index stride.
-    let (metal_prim, index_bytes, index_count) = if primitive_type == D3DPT_TRIANGLEFAN {
+    // Build the index stream. Triangle fan has no Metal primitive, so the
+    // inline indices are gathered into a triangle list (fan vertices
+    // 0, i+1, i+2) written straight into the frame arena.
+    let (metal_prim, index_source) = if primitive_type == D3DPT_TRIANGLEFAN {
         let src_bytes = (primitive_count as usize + 2) * index_size;
         // SAFETY: per the D3D9 ABI `index_data` covers at least
         // `(primitive_count + 2)` indices of `index_size` bytes.
         let src = unsafe { core::slice::from_raw_parts(index_data.cast::<u8>(), src_bytes) };
-        let expanded = convert::expand_triangle_fan(src, index_size, primitive_count);
+        // Inline indices are absolute, so no base vertex folds in.
+        let Some(fan) = convert::FanRewrite::indexed(src, index_size, 0, primitive_count) else {
+            return D3DERR_INVALIDCALL;
+        };
         (
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported"),
-            expanded,
-            primitive_count * 3,
+            generated_fan_source(dev, &fan),
         )
     } else {
         let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
@@ -9709,7 +9741,14 @@ extern "system" fn device_draw_indexed_primitive_up(
         }
         // SAFETY: the leading `idx_bytes` were just initialised by the copy above.
         unsafe { index_copy.set_len(idx_bytes) };
-        (metal_prim, index_copy, index_count)
+        (
+            metal_prim,
+            IndexSource::Up {
+                bytes: index_copy,
+                index_count,
+                index_type,
+            },
+        )
     };
 
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
@@ -9724,11 +9763,7 @@ extern "system" fn device_draw_indexed_primitive_up(
             size: u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
             stride: vertex_stride,
         },
-        index_source: IndexSource::Up {
-            bytes: index_bytes,
-            index_count,
-            index_type,
-        },
+        index_source,
     }));
     // D3D9 resets stream source 0 to (NULL, 0, 0) AND the index buffer to NULL
     // after a successful DrawIndexedPrimitiveUP.

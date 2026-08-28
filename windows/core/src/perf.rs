@@ -949,9 +949,10 @@ struct EncoderFrameCounters {
     /// Triangle-fan draws that took the generated-index slow path.
     ///
     /// Indexed fans and fans past the 16-bit pattern's reach: the API
-    /// thread rewrote the index list per draw and the unix side wrapped
-    /// it in a transient `MTLBuffer`. Non-indexed fans ride the shared
-    /// pattern buffer and are not counted. A tripwire: 0 is the goal.
+    /// thread rewrote the index list into the frame arena per draw and the
+    /// unix side wrapped it in a transient `MTLBuffer`. Non-indexed fans
+    /// ride the shared pattern buffer and are not counted. A tripwire: 0
+    /// is the goal.
     fan_generated: u32,
     /// Encoder-thread submit cost.
     ///
@@ -4383,6 +4384,8 @@ impl<'a> Summary<'a> {
         );
         // Fan draws off the shared pattern buffer: each one rewrote its
         // index list on the API thread and cost a transient MTLBuffer.
+        // Every indexed fan is one, since the pattern only serves fans
+        // whose vertices are consecutive.
         let _ = writeln!(
             out,
             "  fan generated  {fans:<9} indexed / oversized fans rewritten per draw (slow path; 0 is the goal)",

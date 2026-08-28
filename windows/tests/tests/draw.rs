@@ -245,6 +245,31 @@ fn bound_triangle_fan_draws_from_a_vertex_buffer() {
     );
 }
 
+/// The `rim + 2` vertices of a disc fan of radius 0.8.
+///
+/// The centre, then the rim clockwise on screen (decreasing angle) so the
+/// default cull keeps every triangle, closed by repeating the first rim
+/// vertex.
+fn fan_disc(rim: u16) -> Vec<PosColorVertex> {
+    let mut verts = vec![PosColorVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.5,
+        color: GREEN,
+    }];
+    for k in 0..=rim {
+        let angle = core::f32::consts::FRAC_PI_2
+            - f32::from(k % rim) * core::f32::consts::TAU / f32::from(rim);
+        verts.push(PosColorVertex {
+            x: 0.8 * angle.cos(),
+            y: 0.8 * angle.sin(),
+            z: 0.5,
+            color: GREEN,
+        });
+    }
+    verts
+}
+
 #[test]
 fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
     // Bound `DrawPrimitive` fans share one index pattern buffer that starts
@@ -256,25 +281,7 @@ fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
     arm_diffuse(&h);
     let mut verts = fan_diamond().to_vec();
     let diamond_len = u32::try_from(verts.len()).expect("count fits u32");
-    // A disc of radius 0.8: the centre, then the rim clockwise on screen
-    // (decreasing angle) so the default cull keeps every triangle, closed by
-    // repeating the first rim vertex.
-    verts.push(PosColorVertex {
-        x: 0.0,
-        y: 0.0,
-        z: 0.5,
-        color: GREEN,
-    });
-    for k in 0..=RIM {
-        let angle = core::f32::consts::FRAC_PI_2
-            - f32::from(k % RIM) * core::f32::consts::TAU / f32::from(RIM);
-        verts.push(PosColorVertex {
-            x: 0.8 * angle.cos(),
-            y: 0.8 * angle.sin(),
-            z: 0.5,
-            color: GREEN,
-        });
-    }
+    verts.extend_from_slice(&fan_disc(RIM));
     let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
     let count = u32::try_from(verts.len()).expect("count fits u32");
     let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
@@ -285,6 +292,35 @@ fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
         assert_eq!(d.draw_primitive(D3DPT_TRIANGLEFAN, 0, 2), 0, "short fan");
         assert_eq!(
             d.draw_primitive(D3DPT_TRIANGLEFAN, diamond_len, rim),
+            0,
+            "300 triangle fan",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside both fans");
+    // (0.5, 0.5) in clip space: outside the diamond, inside the disc.
+    assert_eq!(h.read_pixel(480, 120), GREEN, "the long fan's rim renders");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the disc");
+}
+
+#[test]
+fn long_triangle_fan_up_outgrows_the_shared_index_pattern() {
+    // `DrawPrimitiveUP` fans ride the same shared index pattern as bound
+    // fans, over the caller's vertices exactly as they arrive. A short fan
+    // and then a 300 triangle fan in the same frame make the pattern grow
+    // while the short fan's draw still references the first buffer; both
+    // must render.
+    const RIM: u16 = 300;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let disc = fan_disc(RIM);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLEFAN, 2, &fan_diamond()),
+            0,
+            "short fan",
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLEFAN, u32::from(RIM), &disc),
             0,
             "300 triangle fan",
         );

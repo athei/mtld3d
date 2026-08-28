@@ -551,74 +551,206 @@ pub fn d3d_to_metal_primitive(d3d_type: u32) -> Option<PrimitiveType> {
     }
 }
 
-/// Expand a triangle-**fan** vertex stream into a triangle **list**.
-///
-/// Metal has no triangle-fan primitive. A fan of `primitive_count + 2`
-/// vertices makes `primitive_count` triangles, where triangle `i` is fan
-/// vertices `0, i+1, i+2`. `src` holds the fan vertices back-to-back at
-/// `stride` bytes each (at least `(primitive_count + 2) * stride` bytes);
-/// the returned buffer holds `primitive_count * 3` vertices ready for a
-/// `PrimitiveType::Triangle` draw.
-#[must_use]
-pub fn expand_triangle_fan(src: &[u8], stride: usize, primitive_count: u32) -> Vec<u8> {
-    let pc = primitive_count as usize;
-    let mut out = Vec::with_capacity(pc.saturating_mul(3).saturating_mul(stride));
-    let vertex = |i: usize| &src[i * stride..(i + 1) * stride];
-    for i in 0..pc {
-        out.extend_from_slice(vertex(0));
-        out.extend_from_slice(vertex(i + 1));
-        out.extend_from_slice(vertex(i + 2));
+/// Where a triangle fan's vertex indices come from.
+enum FanSource<'a> {
+    /// `DrawPrimitive` / `DrawPrimitiveUP`: vertices back-to-back from `start_vertex`.
+    Sequential { start_vertex: u32 },
+    /// `DrawIndexedPrimitive` / `DrawIndexedPrimitiveUP`: application indices.
+    ///
+    /// `src` holds the fan's indices at `index_size` (2 or 4) bytes each
+    /// starting at the draw's first index, and `base_vertex` is folded into
+    /// every one so the rewritten list is absolute.
+    Indexed {
+        src: &'a [u8],
+        index_size: usize,
+        base_vertex: i32,
+    },
+}
+
+impl FanSource<'_> {
+    /// Absolute vertex index of fan vertex `k`.
+    ///
+    /// `None` when `k` reads past the source stream, the index size is
+    /// neither 2 nor 4 bytes, or the index leaves `u32` once the base vertex
+    /// is folded in.
+    fn vertex(&self, k: usize) -> Option<u32> {
+        match *self {
+            Self::Sequential { start_vertex } => start_vertex.checked_add(u32::try_from(k).ok()?),
+            Self::Indexed {
+                src,
+                index_size,
+                base_vertex,
+            } => {
+                let first = k.checked_mul(index_size)?;
+                let raw = src.get(first..first.checked_add(index_size)?)?;
+                let index = match index_size {
+                    2 => u32::from(u16::from_le_bytes([raw[0], raw[1]])),
+                    4 => u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                    other => {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "triangle fan: {other}-byte indices unhandled → draw dropped");
+                        return None;
+                    }
+                };
+                u32::try_from(i64::from(index) + i64::from(base_vertex)).ok()
+            }
+        }
     }
-    out
 }
 
 /// A triangle fan rewritten as a triangle-list index stream.
 ///
-/// Built by [`triangle_fan_indices`] / [`triangle_fan_indices_from`] for the
-/// bound-buffer draw paths: the vertices stay in the application's vertex
-/// buffers and only this generated index list is staged per draw.
-pub struct FanIndices {
-    /// `primitive_count * 3` little-endian indices, each `index_type` wide.
-    pub bytes: Vec<u8>,
-    /// `UInt16` when every index fits, `UInt32` otherwise.
-    pub index_type: IndexType,
-    /// Lowest vertex-buffer index the list references.
-    pub min_vertex: u32,
-    /// Highest vertex-buffer index the list references.
-    pub max_vertex: u32,
+/// Metal has no triangle-fan primitive, and triangle `i` of a fan is fan
+/// vertices `0, i + 1, i + 2`, so a fan draws as an indexed triangle list
+/// over the caller's untouched vertices. Construction resolves the vertex
+/// span and the index width the list needs; [`FanRewrite::write`] then fills
+/// a caller-owned buffer of [`FanRewrite::byte_len`] bytes, so the draw path
+/// writes the list straight into the frame's scratch arena instead of
+/// allocating a stream per call.
+pub struct FanRewrite<'a> {
+    source: FanSource<'a>,
+    primitive_count: u32,
+    index_count: u32,
+    index_type: IndexType,
+    min_vertex: u32,
+    max_vertex: u32,
 }
 
-/// Pack `fan` (the fan's vertices, in order) into triangles `0, i+1, i+2`.
-fn build_fan_indices(fan: &[u32], primitive_count: u32) -> FanIndices {
-    let (min_vertex, max_vertex) = fan
-        .iter()
-        .fold((u32::MAX, 0), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-    let wide = max_vertex > u32::from(u16::MAX);
-    let index_type = if wide {
-        IndexType::UInt32
-    } else {
-        IndexType::UInt16
-    };
-    let pc = primitive_count as usize;
-    let mut bytes = Vec::with_capacity(pc * 3 * if wide { 4 } else { 2 });
-    let mut push = |v: u32| {
-        if wide {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        } else {
-            let narrow = u16::try_from(v).expect("narrow index stream only when every index fits");
-            bytes.extend_from_slice(&narrow.to_le_bytes());
-        }
-    };
-    for i in 0..pc {
-        push(fan[0]);
-        push(fan[i + 1]);
-        push(fan[i + 2]);
+impl<'a> FanRewrite<'a> {
+    /// Rewrite a non-indexed fan whose vertices run from `start_vertex`.
+    ///
+    /// `None` when the fan's last vertex leaves `u32`.
+    #[must_use]
+    pub fn sequential(start_vertex: u32, primitive_count: u32) -> Option<Self> {
+        Self::new(FanSource::Sequential { start_vertex }, primitive_count)
     }
-    FanIndices {
-        bytes,
-        index_type,
-        min_vertex,
-        max_vertex,
+
+    /// Rewrite an indexed fan over `primitive_count + 2` application indices.
+    ///
+    /// `src` holds them at `index_size` (2 or 4) bytes each from the draw's
+    /// first index; `base_vertex` is folded into every one. `None` when
+    /// `src` is short, the index size is unknown, or an index leaves `u32`
+    /// after the base offset.
+    #[must_use]
+    pub fn indexed(
+        src: &'a [u8],
+        index_size: usize,
+        base_vertex: i32,
+        primitive_count: u32,
+    ) -> Option<Self> {
+        Self::new(
+            FanSource::Indexed {
+                src,
+                index_size,
+                base_vertex,
+            },
+            primitive_count,
+        )
+    }
+
+    fn new(source: FanSource<'a>, primitive_count: u32) -> Option<Self> {
+        let count = usize::try_from(primitive_count.checked_add(2)?).ok()?;
+        let index_count = primitive_count.checked_mul(3)?;
+        let mut min_vertex = u32::MAX;
+        let mut max_vertex = 0;
+        for k in 0..count {
+            let vertex = source.vertex(k)?;
+            min_vertex = min_vertex.min(vertex);
+            max_vertex = max_vertex.max(vertex);
+        }
+        let index_type = if max_vertex > u32::from(u16::MAX) {
+            IndexType::UInt32
+        } else {
+            IndexType::UInt16
+        };
+        Some(Self {
+            source,
+            primitive_count,
+            index_count,
+            index_type,
+            min_vertex,
+            max_vertex,
+        })
+    }
+
+    /// Indices the rewritten triangle list holds.
+    #[must_use]
+    pub const fn index_count(&self) -> u32 {
+        self.index_count
+    }
+
+    /// `UInt16` when every index fits, `UInt32` otherwise.
+    #[must_use]
+    pub const fn index_type(&self) -> IndexType {
+        self.index_type
+    }
+
+    /// Lowest vertex-buffer index the list references.
+    #[must_use]
+    pub const fn min_vertex(&self) -> u32 {
+        self.min_vertex
+    }
+
+    /// Highest vertex-buffer index the list references.
+    #[must_use]
+    pub const fn max_vertex(&self) -> u32 {
+        self.max_vertex
+    }
+
+    /// Bytes [`FanRewrite::write`] needs for the whole list.
+    #[must_use]
+    pub const fn byte_len(&self) -> usize {
+        self.index_count as usize * self.index_stride()
+    }
+
+    /// Bytes one index of the rewritten list occupies.
+    const fn index_stride(&self) -> usize {
+        match self.index_type {
+            IndexType::UInt16 => 2,
+            IndexType::UInt32 => 4,
+        }
+    }
+
+    /// Write the triangle-list indices into `out`, little-endian.
+    ///
+    /// Writes the triangles that fit; the caller sizes `out` with
+    /// [`FanRewrite::byte_len`]. Fan vertex `i + 2` of one triangle is fan
+    /// vertex `i + 1` of the next, so the source is read once per fan vertex
+    /// rather than once per index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a fan vertex stops resolving, or stops fitting the index
+    /// width, between construction and this call. Both are settled by
+    /// construction over the same immutable source.
+    pub fn write(&self, out: &mut [u8]) {
+        const RESOLVED: &str = "every fan vertex resolved at construction";
+        let stride = self.index_stride();
+        let first = self.source.vertex(0).expect(RESOLVED);
+        let mut prev = self.source.vertex(1).expect(RESOLVED);
+        let triangles = self.primitive_count as usize;
+        for (i, triangle) in out.chunks_exact_mut(stride * 3).take(triangles).enumerate() {
+            let next = self.source.vertex(i + 2).expect(RESOLVED);
+            for (slot, vertex) in [first, prev, next].into_iter().enumerate() {
+                put_fan_index(
+                    &mut triangle[slot * stride..(slot + 1) * stride],
+                    vertex,
+                    self.index_type,
+                );
+            }
+            prev = next;
+        }
+    }
+}
+
+/// Write one triangle-list index into `dst` at the list's width.
+fn put_fan_index(dst: &mut [u8], vertex: u32, index_type: IndexType) {
+    match index_type {
+        IndexType::UInt16 => {
+            let narrow =
+                u16::try_from(vertex).expect("narrow index stream only when every index fits");
+            dst.copy_from_slice(&narrow.to_le_bytes());
+        }
+        IndexType::UInt32 => dst.copy_from_slice(&vertex.to_le_bytes()),
     }
 }
 
@@ -653,53 +785,6 @@ pub fn fill_fan_pattern_u16(out: &mut [u8], primitive_count: u32) {
         tri[2..4].copy_from_slice(&second.to_le_bytes());
         tri[4..6].copy_from_slice(&third.to_le_bytes());
     }
-}
-
-/// Index stream for a non-indexed triangle fan (`DrawPrimitive`).
-///
-/// Metal has no triangle-fan primitive. The fan's `primitive_count + 2`
-/// vertices sit back-to-back from `start_vertex`, and triangle `i` is fan
-/// vertices `0, i+1, i+2`; the result references them by absolute index.
-/// `None` when the vertex range overflows `u32`. The draw path only comes
-/// here for fans the shared pattern ([`fill_fan_pattern_u16`]) cannot
-/// address.
-#[must_use]
-pub fn triangle_fan_indices(start_vertex: u32, primitive_count: u32) -> Option<FanIndices> {
-    let count = primitive_count.checked_add(2)?;
-    start_vertex.checked_add(count - 1)?;
-    let fan: Vec<u32> = (0..count).map(|k| start_vertex + k).collect();
-    Some(build_fan_indices(&fan, primitive_count))
-}
-
-/// Index stream for an indexed triangle fan (`DrawIndexedPrimitive`).
-///
-/// `src` holds the fan's `primitive_count + 2` application indices, each
-/// `index_size` (2 or 4) bytes, starting at the draw's `StartIndex`.
-/// `base_vertex` is folded into every index so the result is absolute, which
-/// is what the inline-index draw form takes. `None` when `src` is short, the
-/// index size is unknown, or an index leaves `u32` after the base offset.
-#[must_use]
-pub fn triangle_fan_indices_from(
-    src: &[u8],
-    index_size: usize,
-    base_vertex: i32,
-    primitive_count: u32,
-) -> Option<FanIndices> {
-    let count = usize::try_from(primitive_count.checked_add(2)?).ok()?;
-    if src.len() < count.checked_mul(index_size)? {
-        return None;
-    }
-    let mut fan = Vec::with_capacity(count);
-    for k in 0..count {
-        let raw = &src[k * index_size..(k + 1) * index_size];
-        let index = match index_size {
-            2 => u32::from(u16::from_le_bytes([raw[0], raw[1]])),
-            4 => u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-            _ => return None,
-        };
-        fan.push(u32::try_from(i64::from(index) + i64::from(base_vertex)).ok()?);
-    }
-    Some(build_fan_indices(&fan, primitive_count))
 }
 
 /// Compute vertex count from D3D9 primitive type and primitive count.
