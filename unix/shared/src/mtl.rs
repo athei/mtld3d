@@ -280,6 +280,34 @@ impl StoreAction {
             Self::Store | Self::StoreAndMultisampleResolve => Self::StoreAndMultisampleResolve,
         }
     }
+
+    /// The same keep-or-drop decision with the resolve half removed.
+    ///
+    /// The stencil plane of a combined depth/stencil attachment shares the
+    /// depth store action but never the depth resolve, which names a depth
+    /// resolve texture and a depth resolve filter the stencil half has no
+    /// counterpart for.
+    #[must_use]
+    pub const fn without_resolve(self) -> Self {
+        match self {
+            Self::DontCare | Self::MultisampleResolve => Self::DontCare,
+            Self::Store | Self::StoreAndMultisampleResolve => Self::Store,
+        }
+    }
+}
+
+/// `MTLMultisampleDepthResolveFilter` wire encoding.
+///
+/// Discriminants match the native enum. `Sample0` is what the D3D9 RESZ hack
+/// delivers on the hardware it was defined for: the resolved texture carries
+/// one sample's depth rather than a blend of the samples, which is the only
+/// answer a depth value can carry and still mean a position.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum DepthResolveFilter {
+    Sample0 = 0,
+    Min = 1,
+    Max = 2,
 }
 
 /// `MTLVisibilityResultMode` wire encoding.

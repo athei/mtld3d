@@ -4428,3 +4428,82 @@ fn a_multisampled_target_without_a_companion_twin_keeps_the_linear_attachment() 
     assert_eq!(pass.color_attachment_texture(), msaa_backbuffer());
     assert_eq!(pass.color_resolve_texture(), backbuffer());
 }
+
+// ── RESZ depth resolve ──
+
+#[test]
+fn the_resz_resolve_from_a_multisampled_depth_surface_gets_its_own_pass() {
+    // Metal has no depth resolve on the blit encoder, so the RESZ hack turns
+    // into a render pass that loads the multisampled depth, draws nothing and
+    // resolves into the single-sample destination.
+    let destination = tex(0x4000);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+
+    assert_eq!(s.passes().len(), 2, "the resolve is a pass of its own");
+    let resolve = &s.passes()[1];
+    assert_eq!(
+        resolve.depth_texture(),
+        depth(),
+        "the source is the samples"
+    );
+    assert_eq!(resolve.depth_resolve_texture(), destination);
+    assert_eq!(resolve.depth_resolve_filter(), DepthResolveFilter::Sample0);
+    assert_eq!(
+        resolve.depth_load(),
+        DepthLoad::Load,
+        "the pass has to read what the draws left"
+    );
+    assert!(
+        resolve.color_texture().is_null(),
+        "nothing but the depth plane is touched"
+    );
+    assert!(resolve.commands().is_empty(), "and no draw is emitted");
+}
+
+#[test]
+fn the_depth_resolve_pass_survives_the_dead_pass_cull() {
+    // It has no draw, and Rule B drops the multisample content as the last
+    // use of that depth surface. The resolve is still the whole point of it.
+    let destination = tex(0x4001);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 2, "the resolve pass is not dead work");
+    assert_eq!(s.passes()[1].depth_resolve_texture(), destination);
+}
+
+#[test]
+fn the_depth_resolve_destination_opens_a_later_pass_on_its_contents() {
+    // Rule A would discard the destination's first use this frame; the
+    // resolve wrote it, so the bind that follows has to load.
+    let destination = tex(0x4002);
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+    s.set_depth_stencil_attachment(destination, BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+
+    assert_eq!(
+        s.passes()[2].depth_load(),
+        DepthLoad::Load,
+        "the resolved contents are loaded, not discarded"
+    );
+}
+
+#[test]
+fn a_resz_resolve_without_a_bound_depth_attachment_records_nothing() {
+    let mut s = fresh_multisampled();
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.emit_command(dummy_draw());
+    let passes_before = s.passes().len();
+    assert!(!s.resolve_depth_attachment(tex(0x4003), DepthResolveFilter::Sample0));
+    assert_eq!(s.passes().len(), passes_before, "no pass is synthesised");
+}

@@ -622,17 +622,6 @@ it accepts one result from AMD and a different one from Nvidia, and does not
 require depth testing to work at all. The matched half of the test (a 2x
 depth surface beside a 2x render target) passes.
 
-### visual.c/resz_test
-Sites: 17724=real 17862=real
-
-The RESZ hack (`SetRenderState(D3DRS_POINTSIZE, 0x7fa05000)`) resolves the
-bound depth buffer into an INTZ texture, and mtld3d implements it as a
-depth-to-depth copy. From a *multisampled* depth surface that copy is not
-what RESZ means: the samples have to be resolved, which on Metal is a render
-pass with a depth resolve attachment rather than a blit. The colours the
-test reads back are close to the expected gradient but wrong per pixel. The
-single-sampled RESZ path is unaffected and covered by the end-to-end suite.
-
 ### visual.c/add_dirty_rect_test
 Sites: 19210=expected 19217=expected 19232=expected
 

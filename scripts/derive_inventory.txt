@@ -21,6 +21,7 @@ unix/shared/src/mtl.rs ColorSpacePolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromR
 unix/shared/src/mtl.rs ColorWriteMask Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs CompareFunc Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs CullMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs DepthResolveFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs DestroyKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs DeviceCapsFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/shared/src/mtl.rs IndexType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr

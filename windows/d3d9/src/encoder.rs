@@ -58,9 +58,9 @@ use mtld3d_shared::{
     SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
     WaitForGpuRetireParams,
     mtl::{
-        BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PixelFormat, PrimitiveType,
-        QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
-        TextureUsage, VisibilityResultMode,
+        BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
+        PixelFormat, PrimitiveType, QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle,
+        TextureCreateFlags, TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -2774,10 +2774,12 @@ impl FrameEncoder {
     ///
     /// The magic `SetRenderState(POINTSIZE, 0x7fa05000)` asks for the
     /// current depth-stencil contents in the texture bound at stage 0.
-    /// Mechanically identical to the snapshot copy: close the pass, queue
-    /// a full-surface depth blit ahead of the next one. The destination
-    /// keeps its own contents when no depth attachment is bound (the
-    /// resolve is then a no-op, as on hardware).
+    /// From a single-sampled depth surface that is a full-surface depth
+    /// blit queued ahead of the next pass; from a multisampled one the
+    /// samples have to be resolved, which Metal offers on a render pass
+    /// rather than on the blit encoder. The destination keeps its own
+    /// contents when no depth attachment is bound (the resolve is then a
+    /// no-op, as on hardware).
     pub fn resolve_depth_to_texture(&mut self, dst: u64, dst_w: u32, dst_h: u32) {
         let src = self.pass_state.current_depth_texture();
         if src.is_null() || dst == 0 {
@@ -2794,6 +2796,20 @@ impl FrameEncoder {
                 "RESZ resolve size mismatch: depth {width}x{height} vs destination \
                  {dst_w}x{dst_h} — skipped"
             );
+            return;
+        }
+        if self.pass_state.current_depth_sample_count() > 1 {
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "RESZ resolve: resolving the bound {}x multisampled depth attachment \
+                 ({width}x{height}) into the stage-0 texture",
+                self.pass_state.current_depth_sample_count()
+            );
+            // SAFETY: `dst` is a Metal texture handle the encoder's typed
+            // cache produced through `.raw()` and checked non-zero above.
+            let destination = unsafe { MetalHandle::<MTLTextureKind>::new(dst) };
+            self.pass_state
+                .resolve_depth_attachment(destination, DepthResolveFilter::Sample0);
             return;
         }
         mtld3d_shared::log_once_info!(
@@ -9124,10 +9140,13 @@ fn pass_to_descriptor(
     if !p.color_resolve_texture().is_null() {
         color_store_action = color_store_action.with_resolve();
     }
-    let depth_store_action = match p.depth_store() {
+    let mut depth_store_action = match p.depth_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
     };
+    if !p.depth_resolve_texture().is_null() {
+        depth_store_action = depth_store_action.with_resolve();
+    }
     log_pass_depth_attach(p);
     let leading = p.leading_blits();
     let visibility_result_buffer =
@@ -9144,6 +9163,7 @@ fn pass_to_descriptor(
         color_texture: p.color_attachment_texture(),
         color_resolve_texture: p.color_resolve_texture(),
         depth_texture: p.depth_texture(),
+        depth_resolve_texture: p.depth_resolve_texture(),
         commands_ptr: p.commands().as_ptr() as u64,
         visibility_result_buffer,
         leading_blits_ptr: if leading.is_empty() {
@@ -9176,6 +9196,8 @@ fn pass_to_descriptor(
             p.color_level(),
             p.depth_level(),
         ),
+        depth_resolve_filter: p.depth_resolve_filter(),
+        pad0: 0,
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
             if !a.is_bound() {
@@ -9242,6 +9264,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         color_texture: MetalHandle::NULL,
         color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
+        depth_resolve_texture: MetalHandle::NULL,
         commands_ptr: 0,
         visibility_result_buffer: MetalHandle::NULL,
         leading_blits_ptr: trailing_blits.as_ptr() as u64,
@@ -9260,6 +9283,8 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
         pass_flags: PassDescriptor::pack_flags(true, 0, 0, 0),
+        depth_resolve_filter: DepthResolveFilter::Sample0,
+        pad0: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }
