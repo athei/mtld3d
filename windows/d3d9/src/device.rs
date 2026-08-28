@@ -5515,9 +5515,10 @@ fn schedule_staging_upload_at_next_bind(tex: &crate::texture::Direct3DTexture9) 
 ///
 /// `src_parent` and
 /// `dst_parent` are distinct, live `Direct3DTexture9` pointers; `copy` runs the
-/// per-mip staging memcpy(s) once pool/format are validated. Validates source
-/// `D3DPOOL_SYSTEMMEM`, destination `D3DPOOL_DEFAULT`, matching formats, then
-/// schedules the upload at the next bind.
+/// per-mip staging copies once pool and format are validated. Validates source
+/// `D3DPOOL_SYSTEMMEM`, destination `D3DPOOL_DEFAULT`, and a format pair that is
+/// either identical or one the CPU converter covers, then schedules the upload
+/// at the next bind.
 fn copy_systemmem_to_default(
     dst_parent: *mut crate::texture::Direct3DTexture9,
     src_parent: *mut crate::texture::Direct3DTexture9,
@@ -5529,11 +5530,20 @@ fn copy_systemmem_to_default(
     let src_tex = unsafe { &*src_parent };
     // SAFETY: `dst_parent` is a live texture pointer, distinct from `src_parent`.
     let dst_tex = unsafe { &mut *dst_parent };
-    if src_tex.d3d_pool() != D3DPOOL_SYSTEMMEM
-        || dst_tex.d3d_pool() != D3DPOOL_DEFAULT
-        || src_tex.d3d_format() != dst_tex.d3d_format()
-    {
-        warn!(target: LOG_TARGET, "reject Update*: pool/format mismatch → INVALIDCALL");
+    if src_tex.d3d_pool() != D3DPOOL_SYSTEMMEM || dst_tex.d3d_pool() != D3DPOOL_DEFAULT {
+        warn!(target: LOG_TARGET, "reject Update*: pool mismatch → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    // D3D9 accepts a source and a destination of different formats and
+    // converts. The CPU codec covers the simple uncompressed colour formats;
+    // a pair outside it (block-compressed, depth, YUV destinations) has no
+    // conversion to run, so it is the one mismatch still rejected.
+    let (src_fmt, dst_fmt) = (src_tex.d3d_format(), dst_tex.d3d_format());
+    if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert(src_fmt, dst_fmt) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject Update*: no conversion for src=0x{src_fmt:x} into dst=0x{dst_fmt:x} → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: re-borrow of the immutable src inner via a raw pointer; the
@@ -5696,7 +5706,7 @@ extern "system" fn device_update_surface(
         }
         match (dst_surf.cube_face(), src_surf.cube_face()) {
             (Some(dst_face), Some(src_face)) => {
-                let _ = dst.copy_cube_sub_region_from(
+                let _ = dst.update_cube_sub_region_from(
                     (dst_face, dst_level),
                     src,
                     src_face,
@@ -5706,7 +5716,7 @@ extern "system" fn device_update_surface(
                 );
             }
             (None, None) => {
-                let _ = dst.copy_sub_region_from(dst_level, src, src_level, rect, point);
+                let _ = dst.update_sub_region_from(dst_level, src, src_level, rect, point);
             }
             _ => {
                 mtld3d_shared::log_once_warn!(
@@ -5796,7 +5806,7 @@ extern "system" fn device_update_texture(
                     let sh = src.mip_height(src_level);
                     let Some(c) = dr.clamp(sw, sh) else { continue };
                     if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
-                        let _ = dst.copy_cube_sub_region_from(
+                        let _ = dst.update_cube_sub_region_from(
                             (face, level),
                             src,
                             face,
@@ -5811,7 +5821,7 @@ extern "system" fn device_update_texture(
                             (c.x + c.w).cast_signed(),
                             (c.y + c.h).cast_signed(),
                         );
-                        let _ = dst.copy_cube_sub_region_from(
+                        let _ = dst.update_cube_sub_region_from(
                             (face, level),
                             src,
                             face,
@@ -5861,7 +5871,7 @@ extern "system" fn device_update_texture(
             let Some(c) = dr.clamp(sw, sh) else { continue };
             if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                 // Whole mip.
-                let _ = dst.copy_sub_region_from(level, src, src_level, None, (0, 0));
+                let _ = dst.update_sub_region_from(level, src, src_level, None, (0, 0));
             } else {
                 let rect = (
                     c.x.cast_signed(),
@@ -5869,7 +5879,7 @@ extern "system" fn device_update_texture(
                     (c.x + c.w).cast_signed(),
                     (c.y + c.h).cast_signed(),
                 );
-                let _ = dst.copy_sub_region_from(
+                let _ = dst.update_sub_region_from(
                     level,
                     src,
                     src_level,
