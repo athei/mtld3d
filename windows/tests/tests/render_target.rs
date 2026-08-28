@@ -3398,7 +3398,7 @@ fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
             D3DFMT_X8R8G8B8,
             mtld3d_types::D3DUSAGE_RENDERTARGET,
             mtld3d_types::D3DRTYPE_SURFACE,
-            0x5A53_4552,
+            mtld3d_types::D3DFMT_RESZ,
         ),
         0,
         "RESZ pseudo-format probe answers available"
