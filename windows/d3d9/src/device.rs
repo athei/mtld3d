@@ -5531,14 +5531,23 @@ extern "system" fn device_update_surface(
     }
     let src_parent = src_surf.parent_texture();
     let dst_parent = dst_surf.parent_texture();
-    // A standalone D3DPOOL_SYSTEMMEM / SCRATCH offscreen *source* surface (not
-    // texture-backed) updating a texture destination: copy its CPU backing into
-    // the dst texture's mip staging and mark it dirty so a subsequent bind /
-    // StretchRect uploads it.
+    // A standalone offscreen *source* surface (not texture-backed) updating a
+    // texture destination: copy its CPU backing into the dst texture's mip
+    // staging and mark it dirty so a subsequent bind / StretchRect uploads it.
     if src_parent.is_null()
         && !dst_parent.is_null()
         && let Some((src_ptr, src_len, src_w, src_h, src_fmt)) = src_surf.system_memory_source()
     {
+        // An `UpdateSurface` source is a `D3DPOOL_SYSTEMMEM` surface. A
+        // `D3DPOOL_SCRATCH` one carries the same CPU backing but is not a
+        // device resource, so it is never a valid endpoint of a device copy.
+        if src_surf.standalone_pool() != D3DPOOL_SYSTEMMEM {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: standalone source outside D3DPOOL_SYSTEMMEM → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        }
         let dst_level = dst_surf.mip_level() as usize;
         let Some(bpp) = map_d3d_format(src_fmt).map(|m| m.bytes_per_pixel()) else {
             return D3DERR_INVALIDCALL;

@@ -787,6 +787,16 @@ impl Direct3DSurface9 {
         self.inner().live_format()
     }
 
+    /// `D3DPOOL_*` the standalone surface was created with.
+    ///
+    /// Only meaningful when `parent_texture()` is null; texture-backed surfaces
+    /// report their parent texture's pool instead. `D3DPOOL_DEFAULT` for a
+    /// render target, depth-stencil or backbuffer surface, and the creation
+    /// pool for an offscreen-plain one.
+    pub fn standalone_pool(&self) -> u32 {
+        self.inner().standalone_pool
+    }
+
     /// D3D9 format of this surface when bound as a depth attachment (D3DFMT_*).
     ///
     /// Texture-backed depth surfaces report the parent texture's format;
@@ -909,13 +919,16 @@ impl Direct3DSurface9 {
             .map(|p| (p.as_mut_ptr() as u64, p.len() as u64))
     }
 
-    /// Standalone `D3DPOOL_SYSTEMMEM`/`SCRATCH` offscreen surface as an `UpdateSurface` *source*.
+    /// CPU backing of a standalone offscreen surface.
     ///
-    /// Yields `(ptr, len, width, height, format)` of its CPU backing. `None`
-    /// for any GPU-backed or texture-backed surface. The row pitch is
-    /// `width * bpp` rounded up to 4 (the layout `CreateOffscreenPlainSurface`
-    /// allocated and `systemmem_lock_rect` reports), so the caller recomputes
-    /// it from `format`.
+    /// Yields `(ptr, len, width, height, format)`. `None` for any GPU-backed or
+    /// texture-backed surface. The pool is not filtered, so a
+    /// `D3DPOOL_SCRATCH` surface answers as well as a `D3DPOOL_SYSTEMMEM` one;
+    /// a caller that needs a valid `UpdateSurface` source checks
+    /// [`Self::standalone_pool`] too. The row pitch is `width * bpp` rounded up
+    /// to 4 (the layout `CreateOffscreenPlainSurface` allocated and
+    /// `systemmem_lock_rect` reports), so the caller recomputes it from
+    /// `format`.
     pub fn system_memory_source(&self) -> Option<(*const u8, usize, u32, u32, u32)> {
         if !self.inner().parent_texture.is_null() {
             return None;

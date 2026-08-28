@@ -1408,6 +1408,39 @@ fn update_surface_rejects_a_standalone_source_of_another_format() {
     );
 }
 
+/// `UpdateSurface` rejects a standalone source outside `D3DPOOL_SYSTEMMEM`.
+///
+/// A `D3DPOOL_SCRATCH` offscreen-plain surface carries the same CPU backing as
+/// a system-memory one, so the source pool is the only thing separating the
+/// two on the standalone-source path. Scratch is a CPU-only staging pool rather
+/// than a device resource, and D3D9 answers `D3DERR_INVALIDCALL` for it. The
+/// system-memory source accepted into the same destination keeps the check
+/// narrow.
+#[test]
+fn update_surface_rejects_a_scratch_standalone_source() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+
+    let scratch = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    scratch.lock_rect(0).write_u32(&[RED; 16]);
+    assert_eq!(
+        h.update_surface_hr(&scratch, &dst.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface from a scratch source"
+    );
+
+    let sysmem = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    sysmem.lock_rect(0).write_u32(&[GREEN; 16]);
+    assert_eq!(
+        h.update_surface_hr(&sysmem, &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a system-memory source"
+    );
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "accepted fill");
+}
+
 #[test]
 fn update_texture_keeps_cube_faces_independent() {
     let h = Harness::new();
