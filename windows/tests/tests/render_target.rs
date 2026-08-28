@@ -1532,6 +1532,51 @@ fn stretch_rect_rejects_a_render_target_into_an_offscreen_plain() {
 }
 
 #[test]
+fn stretch_rect_into_a_texture_level_is_visible_to_get_dc() {
+    // A StretchRect into a render-target texture's level writes that level's
+    // Metal texture alone, while a GetDC on the level's surface builds its DIB
+    // over the texture's CPU staging, so the DC has to take the read back the
+    // claim on the level makes a LockRect take. The lock seeds the staging with
+    // a colour the blit never writes, so a DC that skips the read back reads
+    // green where the blit left red.
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let src = h.create_render_target(SIZE, SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, RED), D3D_OK, "fill the source red");
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        locked.write_u32(&[GREEN; TEXELS]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from a render target into a texture level",
+    );
+
+    let dc = level.dc();
+    let last = (SIZE - 1).cast_signed();
+    for (x, y, name) in [(0, 0, "first texel"), (last, last, "last texel")] {
+        assert_eq!(
+            dc.get_pixel(x, y),
+            RED_COLORREF,
+            "the DC reads the blit's {name}"
+        );
+    }
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+}
+
+#[test]
 fn color_fill_render_target_overwrites_earlier_draws() {
     // ColorFill on a render target is ordered against the draws around it: it
     // wipes what the frame already drew, and the draw after it blends against

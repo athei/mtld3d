@@ -645,14 +645,19 @@ impl TextureInner {
         );
     }
 
-    /// Re-materialise `level`'s released staging for a `GetDC`.
+    /// Re-materialise `level`'s pixels for a `GetDC`.
     ///
     /// A device context is a read-write mapping of the level: GDI reads the
     /// pixels through it and `ReleaseDC` keeps whatever GDI drew, which is what
-    /// a `LockRect` without `D3DLOCK_DISCARD` asks for, so it takes the same
-    /// GPU read back. The level is `level` of this texture, the one its
-    /// surface was handed out for.
-    pub fn ensure_staging_for_dc(&mut self, level: usize) {
+    /// a `LockRect` without `D3DLOCK_DISCARD` asks for, so it takes both of the
+    /// GPU reads that lock takes. A level claimed for the GPU holds pixels its
+    /// staging does not; a level whose staging was released after its upload
+    /// holds them nowhere else at all. The level is `level` of this texture,
+    /// the one its surface was handed out for.
+    pub fn materialize_level_for_dc(&mut self, level: usize) {
+        if self.level_gpu_authoritative(level) {
+            materialize_level_from_gpu(self, level);
+        }
         self.ensure_staging_for_lock(level, 0);
     }
 
@@ -3091,13 +3096,13 @@ unsafe fn hand_back_cached_surface(cached: u64, out: *mut *mut c_void) {
 
 /// Read a GPU-authoritative level back into its CPU staging.
 ///
-/// The read half of a `LockRect` on a level the GPU wrote with no CPU mirror
-/// (a `StretchRect` blit into a `D3DPOOL_DEFAULT` offscreen plain). Flush the
-/// frame so the write has landed, then blit the level into its staging through
-/// the same `BlitTextureToBuffer` core `GetRenderTargetData` uses; a D3D9 Lock
-/// of a GPU-written surface stalls on a real driver too. The claim is released
-/// up front, so a level whose Metal handle or staging cannot serve the read
-/// costs one warning rather than one per Lock, and keeps the bytes it has.
+/// The read half of a `LockRect` or a `GetDC` on a level the GPU wrote with no
+/// CPU mirror (a `StretchRect` blit into a `D3DPOOL_DEFAULT` texture). Flush
+/// the frame so the write has landed, then blit the level into its staging
+/// through the same `BlitTextureToBuffer` core `GetRenderTargetData` uses; a
+/// D3D9 Lock of a GPU-written surface stalls on a real driver too. The claim is
+/// released up front, so a level whose Metal handle or staging cannot serve the
+/// read costs one warning rather than one per map, and keeps the bytes it has.
 fn materialize_level_from_gpu(ti: &mut TextureInner, level: usize) {
     ti.clear_level_gpu_authoritative(level);
     let (width, height) = (ti.mip_width(level), ti.mip_height(level));
@@ -3155,9 +3160,10 @@ fn materialize_level_from_gpu(ti: &mut TextureInner, level: usize) {
         width,
         height,
         bytes_per_row,
-        // The texture's own extent, so the read-back resolve is a no-op: a
-        // surface claimed this way is an offscreen plain, which never inherits
-        // the back buffer's `render.scale`.
+        // The texture's own logical extent, which the read is measured
+        // against: a render-target texture rasterized at `render.scale` is
+        // resolved up to it first, and an offscreen plain, which never inherits
+        // that scale, already matches it.
         source_width: ti.mip_width(0),
         source_height: ti.mip_height(0),
     };

@@ -5961,15 +5961,12 @@ extern "system" fn device_stretch_rect(
     }
     let render_quad = scaling || cross_format;
 
-    // The blit below writes only the destination's Metal texture, and an
-    // offscreen-plain destination reads its pixels back through `LockRect`,
-    // which serves CPU staging. Claim the level for the GPU so the next Lock
-    // reads the blit rather than the staging it left behind.
-    if !render_quad
-        && dst_info
-            .flags
-            .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
-    {
+    // The blit below writes only the destination's Metal texture, and a
+    // texture-backed destination (an offscreen plain or a render-target texture
+    // level) reads its pixels back through the CPU staging a `LockRect` or a
+    // `GetDC` maps. Claim the level for the GPU so the next map reads the blit
+    // rather than the staging it left behind.
+    if !render_quad && matches!(dst_info.kind, StretchKind::Texture(_)) {
         claim_stretch_dst_for_gpu(dst_surf, &dst_info);
     }
 
@@ -6003,11 +6000,11 @@ extern "system" fn device_stretch_rect(
 
 /// Claim a `StretchRect` destination level for the GPU.
 ///
-/// An offscreen-plain destination is texture-backed and lockable, and the blit
-/// writes only its Metal texture, so its `LockRect` has to read the level back
-/// instead of the staging the blit never touched. Every source kind lands here,
-/// including one with no CPU staging of its own to copy from. Marking is all
-/// this does; the read happens at the next Lock.
+/// A texture-backed destination carries CPU staging, and the blit writes only
+/// its Metal texture, so a `LockRect` or a `GetDC` of the level has to read it
+/// back instead of serving the staging the blit never touched. Every source
+/// kind lands here, including one with no CPU staging of its own to copy from.
+/// Marking is all this does; the read happens at the next map.
 fn claim_stretch_dst_for_gpu(
     dst_surf: *mut crate::surface::Direct3DSurface9,
     dst_info: &StretchSurfaceInfo,
@@ -6021,7 +6018,7 @@ fn claim_stretch_dst_for_gpu(
     if dst_parent.is_null() {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "StretchRect: offscreen-plain destination has no texture backing → \
+            "StretchRect: texture-backed destination has no parent texture → \
              its staging keeps what it held"
         );
         return;
