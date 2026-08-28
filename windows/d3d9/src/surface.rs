@@ -2849,6 +2849,28 @@ fn refill_dc_texture_level(inner: &SurfaceInner) {
     texture.ensure_staging_for_dc(inner.mip_level as usize);
 }
 
+/// Hold a texture level's staging for as long as a device context maps it.
+///
+/// The DIB aliases the level's staging pages directly and `ReleaseDC` keeps
+/// what GDI drew in them, so an upload that retires while the DC is open must
+/// not release the level: the DIB would alias a page nothing owns and the
+/// drawing would reach the GPU nowhere. Guarded like
+/// [`refill_dc_texture_level`], whose call it pairs with: the level classes it
+/// skips never release their staging in the first place.
+fn pin_dc_texture_level(inner: &SurfaceInner, open: bool) {
+    if inner.parent_texture.is_null()
+        || inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
+        || inner.cube_face != u32::MAX
+    {
+        return;
+    }
+    // SAFETY: `parent_texture` is non-null (checked above) and points to a live
+    // `Direct3DTexture9` whose refcount keeps it alive for as long as this
+    // surface is live; it is a distinct allocation from the surface inner.
+    let texture = unsafe { (*inner.parent_texture).inner_mut() };
+    texture.set_level_dc_open(inner.mip_level as usize, open);
+}
+
 extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i32 {
     let _timer = surf_timer(this, SurfaceSubCategory::GetDc);
     if hdc.is_null() {
@@ -2973,6 +2995,9 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // park it on the surface, where `ReleaseDC` finds it. A rejected call above
     // dropped it on the way out, leaving the surface's slot empty.
     inner.dc_shim = shim;
+    // The DC now maps the level, so nothing may release the staging under it
+    // until `ReleaseDC` drops the pin.
+    pin_dc_texture_level(inner, true);
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state; the prior
     // immutable borrow above ended, so this exclusive deref does not alias it.
     let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
@@ -3065,6 +3090,9 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
     // now the DC is gone (the LockRect path reuses the same slot). No-op for
     // every other surface kind (their `readback` is already None here).
     inner.readback = None;
+    // Nothing maps the level any more, so the upload the dirty mark above
+    // schedules may release its staging again once it has carried GDI's rows.
+    pin_dc_texture_level(inner, false);
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state; the prior
     // borrows ended, so this exclusive deref does not alias them.
     let dc_lock = unsafe { &mut *inner.dc_lock_ptr() };
