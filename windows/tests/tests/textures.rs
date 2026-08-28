@@ -1674,12 +1674,6 @@ fn update_texture_accepts_a_single_slice_volume_pair() {
     assert_eq!(h.update_volume_texture_hr(&src, &dst), 0, "UpdateTexture");
 }
 
-/// `D3DFMT_V8U8` must sample its content, not black.
-///
-/// Signed two-channel, → `Rg8Snorm` with {R,G,1,1} swizzle. A 1x1 texel of
-/// signed (+1,+1) reads as (1,1,1,1) → white. Confirms `V8U8`
-/// create/upload/sample works in isolation (a full FF-alpha +
-/// per-texel-bias `V8U8` setup is not covered here).
 /// A level from `GetVolumeLevel` locked and written reaches the texture.
 ///
 /// The level shell forwards to the parent's per-level lock, so the write
@@ -1721,6 +1715,12 @@ fn volume_level_lock_box_writes_reach_the_texture() {
     }
 }
 
+/// `D3DFMT_V8U8` must sample its content, not black.
+///
+/// Signed two-channel, → `Rg8Snorm` with {R,G,1,1} swizzle. A 1x1 texel of
+/// signed (+1,+1) reads as (1,1,1,1) → white. Confirms `V8U8`
+/// create/upload/sample works in isolation (a full FF-alpha +
+/// per-texel-bias `V8U8` setup is not covered here).
 #[test]
 fn v8u8_signed_texture_samples_nonzero() {
     let h = Harness::new();
