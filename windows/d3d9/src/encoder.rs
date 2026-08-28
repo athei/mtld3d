@@ -2835,6 +2835,7 @@ impl FrameEncoder {
             bytes_per_image: 0,
             dst_mip_level: 0,
             dst_slice: 0,
+            src_slice: 0,
         });
     }
 
@@ -2878,6 +2879,7 @@ impl FrameEncoder {
             bytes_per_image: 0,
             dst_mip_level: 0,
             dst_slice: 0,
+            src_slice: 0,
         });
     }
 
@@ -2999,6 +3001,7 @@ impl FrameEncoder {
                 bytes_per_image: 0,
                 dst_mip_level: 0,
                 dst_slice: 0,
+                src_slice: 0,
             });
         }
         dst.raw()

@@ -1865,6 +1865,45 @@ fn stretch_rect_into_a_cube_face_is_visible_to_that_face_get_dc() {
     assert_eq!(dc.release(), 0, "ReleaseDC on face 0");
 }
 
+#[test]
+fn stretch_rect_out_of_a_cube_face_reads_that_face() {
+    // A 1:1 same-format StretchRect replays as a blit copy, which names a
+    // source slice as well as a destination one, so a cube source has to read
+    // the face the call named. Faces 0 and 3 carry different colours and the
+    // destination is a plain 2D render target, so a copy pinned to slice 0
+    // answers with face 0's fill instead of face 3's.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face3, GREEN), D3D_OK, "fill face 3 green");
+
+    let dst = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&dst, BLUE),
+        D3D_OK,
+        "fill the destination blue"
+    );
+    assert_eq!(
+        h.stretch_rect(&face3, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect out of a cube face",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &dst, 1, 1),
+        GREEN,
+        "the copy read face 3 rather than face 0",
+    );
+}
+
 /// Bind `cube`, sample it across the back buffer along `direction`, return the centre pixel.
 ///
 /// The direction is constant across the quad, so every pixel reads the one cube
