@@ -651,6 +651,140 @@ fn uses_relative_const_addressing_is_false_for_static_reads() {
 }
 
 #[test]
+fn relative_addressed_const_read_inside_a_call_is_detected() {
+    // vs_3_0 {
+    //   dcl_position v0;
+    //   dcl_position oT0;
+    //   mova a0, v0;
+    //   call l0;
+    //   ret;
+    //   label l0;
+    //     mov r0, c[a0.x + 5];
+    //     mov oT0, r0;
+    //   ret;
+    // }
+    // The only relative read sits in the subroutine, which `call` inline-expands
+    // into the emitted function, so the flag the draw path gates the
+    // full-constant-buffer upload on has to see it.
+    let mut bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        opcode_token(OP_MOVA, 2),
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_CALL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        opcode_token(OP_LABEL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 3),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+    ];
+    bc.extend_from_slice(&src_token_rel(
+        TYPE_CONST,
+        5,
+        SWIZ_IDENTITY,
+        0,
+        TYPE_ADDR,
+        0,
+        SWIZ_XXXX,
+    ));
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ]);
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(
+        vs.uses_relative_const_addressing(),
+        "a rel-addr const read reached only through `call` must set the flag"
+    );
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("r[0] = vs_c[a.x + 5];"),
+        "the inlined subroutine body must carry the relative read:\n{vs_msl}"
+    );
+}
+
+#[test]
+fn call_only_relative_read_emits_the_def_overlay_helper() {
+    // vs_3_0 {
+    //   def c2, 0.25, 0.5, 0.75, 1.0;
+    //   dcl_position v0;
+    //   dcl_position oT0;
+    //   mova a0, v0;
+    //   call l0;
+    //   ret;
+    //   label l0;
+    //     mov r0, c[a0.x + 0];
+    //     mov oT0, r0;
+    //   ret;
+    // }
+    // `load_src` routes every rel-addr read through `mtld3d_const_rel` as soon as
+    // the shader declares any `def` constant, so the helper's own emission gate
+    // must walk the same instructions or the MSL calls a function it never
+    // defines.
+    let mut bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 2, 0xF, false),
+        f32::to_bits(0.25),
+        f32::to_bits(0.5),
+        f32::to_bits(0.75),
+        f32::to_bits(1.0),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        opcode_token(OP_MOVA, 2),
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_CALL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        opcode_token(OP_LABEL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 3),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+    ];
+    bc.extend_from_slice(&src_token_rel(
+        TYPE_CONST,
+        0,
+        SWIZ_IDENTITY,
+        0,
+        TYPE_ADDR,
+        0,
+        SWIZ_XXXX,
+    ));
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ]);
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("mtld3d_const_rel(a.x + 0, vs_c)"),
+        "the inlined rel-addr read must route through the overlay:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("inline float4 mtld3d_const_rel(int idx, constant float4 *cb)"),
+        "the overlay helper the inlined body calls must be defined:\n{vs_msl}"
+    );
+}
+
+#[test]
 fn cmp_emits_select_on_ge_zero() {
     // vs_2_0 { dcl_position v0; cmp r0, v0, c0, c1; mov oPos, v0; }
     let bc = vec![

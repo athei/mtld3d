@@ -773,6 +773,70 @@ fn triangle_at(cx: f32) -> [PosVertex; 3] {
     ]
 }
 
+/// `vs_3_0` reading `c[a0.x + 0]` from a subroutine reached through `call`.
+///
+/// `dcl_position v0; dcl_position o0; dcl_color0 o1; mov o0, v0; mova a0, c0;
+/// call l0; ret; label l0; mov o1, c[a0.x + 0]; ret;`
+/// `c0.x` carries the row index, so the row the colour comes from is known
+/// only at draw time and the whole uploaded prefix has to be bound.
+#[rustfmt::skip]
+const VS_CALL_REL_CONST: [u32; 27] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_002E, 0xB00F_0000, 0xA0E4_0000,              // mova a0, c0
+    0x0100_0019, 0xA0E4_1000,                           // call l0
+    0x0000_001C,                                        // ret
+    0x0100_001E, 0xA0E4_1000,                           // label l0
+    0x0300_0001, 0xE00F_0001, 0xA0E4_2000, 0xB000_0000, // mov o1, c[a0.x + 0]
+    0x0000_001C,                                        // ret
+    0x0000_FFFF,                                        // end
+];
+
+/// The constant prefix a draw binds covers a relative read inside a subroutine.
+///
+/// The only statically named float rows are `c0` (the index) and the rel-addr
+/// base `c0`, so a prefix sized from what the instruction stream names ends one
+/// row long. The colour lives in `c20`, reachable only because the shader
+/// reports relative addressing and the draw binds every populated row.
+#[test]
+fn relative_constant_read_inside_a_call_sees_the_uploaded_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_CALL_REL_CONST);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    // Rows 0..=20: row 0 is the index, rows 1..=19 are red so a read that lands
+    // short of the target row is a visibly different colour, row 20 is green.
+    let mut constants = [0.0f32; 21 * 4];
+    constants[0] = 20.0;
+    for row in 1..20 {
+        constants[row * 4] = 1.0;
+        constants[row * 4 + 3] = 1.0;
+    }
+    constants[20 * 4 + 1] = 1.0;
+    constants[20 * 4 + 3] = 1.0;
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &constants),
+        0,
+        "SetVertexShaderConstantF"
+    );
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the row c[a0.x + 0] names must be inside the bound constant prefix"
+    );
+}
+
 #[test]
 fn defined_pixel_constant_ignores_the_constant_buffer() {
     let h = Harness::new();
