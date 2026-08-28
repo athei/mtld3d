@@ -10,19 +10,19 @@ use mtld3d_core::{
     texture_staging::{LockAction, MipShape, PreserveKind, decide_lock_action},
 };
 use mtld3d_shared::{
-    InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn,
+    BlitTextureToBufferParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn,
     mtl::{PixelFormat, Swizzle, TextureUsage},
-    mtl_handle::MTLDeviceKind,
+    mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use mtld3d_types::{
     D3DBOX, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl,
-    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9,
-    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
-    IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
+    D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DLOCKED_BOX,
+    D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE,
+    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
+    IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9,
+    IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9, IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
@@ -33,6 +33,7 @@ use super::{
     null_out,
     private_data::PrivateDataStore,
     surface::{DcLockState, Direct3DSurface9},
+    unix_call::unix_call,
 };
 
 /// Sub-target for texture-lifecycle probes.
@@ -294,6 +295,13 @@ pub struct TextureInner {
     /// staging ([`TextureInner::staging_droppable_class`]), which pays neither
     /// the memory nor the bookkeeping.
     staging_coverage: Vec<StagingCoverage>,
+    /// Levels whose Metal texture holds pixels the CPU staging does not (bit N = level N).
+    ///
+    /// Set when the GPU writes a lockable level with no CPU mirror: a
+    /// `StretchRect` blit into a `D3DPOOL_DEFAULT` offscreen-plain surface. The
+    /// next `LockRect` reads the level back into staging and clears the bit, so
+    /// the two agree again.
+    gpu_authoritative: u32,
     /// `LockRect(D3DLOCK_READONLY)` stash per mip.
     ///
     /// Suppresses the upload at `UnlockRect` so a game's read-only inspection
@@ -435,6 +443,30 @@ impl TextureInner {
     /// wrapping, and every dropped level of every texture shares one page.
     pub const fn staging_is_dropped(&self, level: usize) -> bool {
         self.dropped_staging & (1u32 << level) != 0
+    }
+
+    /// Claim `level` for the GPU: its Metal texture holds pixels staging does not.
+    ///
+    /// The next `LockRect` on the level reads it back before handing out a
+    /// staging pointer. A D3D9 mip chain tops out at 15 levels, so the mask
+    /// covers every level a texture can carry; the bound is a guard, not a
+    /// limit anything reaches.
+    pub const fn mark_level_gpu_authoritative(&mut self, level: usize) {
+        if level < u32::BITS as usize {
+            self.gpu_authoritative |= 1u32 << level;
+        }
+    }
+
+    /// Whether `level`'s Metal texture holds pixels its staging does not.
+    pub const fn level_gpu_authoritative(&self, level: usize) -> bool {
+        level < u32::BITS as usize && self.gpu_authoritative & (1u32 << level) != 0
+    }
+
+    /// Release the claim once staging matches the texture again.
+    const fn clear_level_gpu_authoritative(&mut self, level: usize) {
+        if level < u32::BITS as usize {
+            self.gpu_authoritative &= !(1u32 << level);
+        }
     }
 
     /// Whether `level`'s staging can go once its upload has retired.
@@ -2212,6 +2244,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         staging,
         dropped_staging: 0,
         staging_coverage: Vec::new(),
+        gpu_authoritative: 0,
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
         mip_bytes_per_row: info.mip_bytes_per_row,
@@ -2866,6 +2899,86 @@ unsafe fn hand_back_cached_surface(cached: u64, out: *mut *mut c_void) {
     unsafe { OutPtr::write_opt(out, surf.cast::<c_void>()) };
 }
 
+/// Read a GPU-authoritative level back into its CPU staging.
+///
+/// The read half of a `LockRect` on a level the GPU wrote with no CPU mirror
+/// (a `StretchRect` blit into a `D3DPOOL_DEFAULT` offscreen plain). Flush the
+/// frame so the write has landed, then blit the level into its staging through
+/// the same `BlitTextureToBuffer` core `GetRenderTargetData` uses; a D3D9 Lock
+/// of a GPU-written surface stalls on a real driver too. The claim is released
+/// up front, so a level whose Metal handle or staging cannot serve the read
+/// costs one warning rather than one per Lock, and keeps the bytes it has.
+fn materialize_level_from_gpu(ti: &mut TextureInner, level: usize) {
+    ti.clear_level_gpu_authoritative(level);
+    let (width, height) = (ti.mip_width(level), ti.mip_height(level));
+    let bytes_per_row = ti.mip_bytes_per_row(level);
+    let block_rows = height.div_ceil(ti.block_h.max(1));
+    let needed = (bytes_per_row as usize).saturating_mul(block_rows as usize);
+    let device_inner_ptr = ti.device_inner;
+    let texture_id = ti.texture_id;
+    if device_inner_ptr == 0 || width == 0 || height == 0 || needed == 0 {
+        return;
+    }
+    ti.ensure_staging(level);
+    let (dst_ptr, dst_len) = {
+        let page = &ti.staging[level];
+        (page.as_ptr() as u64, page.len())
+    };
+    if dst_len < needed {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "texture {texture_id:#x}: level {level} staging is too small for a read-back \
+             ({dst_len} < {needed}) → staging left as-is");
+        return;
+    }
+    // The staging `PageBox` and the `DeviceInner` are distinct allocations, so
+    // the raw-pointer borrow below never overlaps the slice read above.
+    // SAFETY: `device_inner` is the `DeviceInner*` recorded at texture
+    // creation (non-zero, checked); the device outlives every texture it owns.
+    let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
+    // The Metal texture lives encoder-side keyed by texture id, so resolve the
+    // handle inside an op and read it back through an atomic slot once the
+    // flush has drained the queue.
+    let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
+    let slot_op = Arc::clone(&slot);
+    dev.push_op(Box::new(move |enc| {
+        slot_op.store(enc.get_texture_handle_by_id(texture_id), Ordering::Release);
+    }));
+    dev.flush_current_frame_blocking();
+    let handle = slot.load(Ordering::Acquire);
+    if handle == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "texture {texture_id:#x}: no Metal handle for a level {level} read-back → \
+             staging left as-is");
+        return;
+    }
+    let mut params = BlitTextureToBufferParams {
+        queue_handle: dev.queue_handle(),
+        device_handle: dev.device_handle(),
+        // SAFETY: `handle` is non-zero (checked above) and a live retained
+        // `MTLTexture` handle from the encoder texture cache.
+        tex_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
+        dst_ptr,
+        dst_len: dst_len as u64,
+        mip_level: u32::try_from(level).unwrap_or(0),
+        origin_x: 0,
+        origin_y: 0,
+        width,
+        height,
+        bytes_per_row,
+        // The texture's own extent, so the read-back resolve is a no-op: a
+        // surface claimed this way is an offscreen plain, which never inherits
+        // the back buffer's `render.scale`.
+        source_width: ti.mip_width(0),
+        source_height: ti.mip_height(0),
+    };
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "texture {texture_id:#x}: level {level} read-back BlitTextureToBuffer failed \
+             status={status:#x} → staging left as-is");
+    }
+}
+
 extern "system" fn texture_lock_rect(
     this: *mut c_void,
     level: u32,
@@ -2927,6 +3040,13 @@ extern "system" fn texture_lock_rect(
         if provided.is_some_and(|r| !default_lock_rect_valid(&r, mip_w, mip_h, vbw, vbh)) {
             return D3DERR_INVALIDCALL;
         }
+    }
+    // A level the GPU wrote with no CPU mirror has to be read back before the
+    // Lock hands out a pointer into staging, and before `lock_region_ptr` may
+    // rename the box (a preserve then copies the fresh bytes). `D3DLOCK_DISCARD`
+    // promises a whole-level overwrite, so it skips the stall.
+    if flags & D3DLOCK_DISCARD == 0 && ti.level_gpu_authoritative(level_u) {
+        materialize_level_from_gpu(ti, level_u);
     }
     let dirty_rect = parse_rect(rect, mip_w, mip_h);
     let read_only = flags & D3DLOCK_READONLY != 0;

@@ -2,7 +2,7 @@
 //!
 //! The round-trip renders to a texture, then samples it.
 
-use mtld3d_tests::{Harness, PosColorVertex, Rgba8, TexturedVertex, Vertex};
+use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex};
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
@@ -1377,6 +1377,93 @@ fn color_fill_sub_rect_of_offscreen_plain_reads_back() {
     );
     assert_eq!(at(60, 60), RED, "inside the clipped overhanging rect");
     assert_eq!(at(55, 55), GREEN, "outside the clipped overhanging rect");
+}
+
+#[test]
+fn stretch_rect_into_offscreen_plain_is_visible_to_lock_rect() {
+    // A StretchRect into a lockable DEFAULT offscreen plain writes the plain's
+    // Metal texture; its LockRect reads CPU staging, so the lock has to
+    // materialise the level from the texture. Whole-surface first, then a
+    // sub-rect, which must land in the destination without disturbing the
+    // pixels the copy did not cover.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let fill = |surface: &Surface<'_>, color: u32| {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![color; (pitch_px * 64) as usize]);
+    };
+    let read = |surface: &Surface<'_>, x: u32, y: u32| {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    fill(&src, RED);
+    fill(&dst, GREEN);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect between two DEFAULT offscreen plains",
+    );
+    assert_eq!(
+        read(&dst, 32, 32),
+        RED,
+        "LockRect reads the copied pixels, not the seed the destination held",
+    );
+
+    fill(&src, BLUE);
+    fill(&dst, GREEN);
+    assert_eq!(
+        h.stretch_rect_rects(&src, (0, 0, 32, 32), &dst, (32, 32, 64, 64), D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect of a sub-rect between two offscreen plains",
+    );
+    assert_eq!(read(&dst, 48, 48), BLUE, "inside the copied sub-rect");
+    assert_eq!(read(&dst, 32, 32), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(
+        read(&dst, 63, 63),
+        BLUE,
+        "the sub-rect's bottom-right corner"
+    );
+    assert_eq!(read(&dst, 16, 48), GREEN, "outside the copied sub-rect");
+    assert_eq!(read(&dst, 31, 31), GREEN, "one pixel before the sub-rect");
+}
+
+#[test]
+fn stretch_rect_rejects_a_render_target_into_an_offscreen_plain() {
+    // D3D9 allows an offscreen-plain destination only from an offscreen-plain
+    // source: a render-target source, standalone or texture-backed, and the back
+    // buffer are all INVALIDCALL. The reverse direction is allowed.
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let standalone = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+
+    for (source, what) in [
+        (&standalone, "a standalone CreateRenderTarget surface"),
+        (&rt_surface, "a render-target texture surface"),
+    ] {
+        assert_eq!(
+            h.stretch_rect(source, &plain, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "StretchRect from {what} into an offscreen plain",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect(&plain, &standalone, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect from an offscreen plain into a render target",
+    );
 }
 
 #[test]

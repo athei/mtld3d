@@ -5749,18 +5749,16 @@ extern "system" fn device_stretch_rect(
     }
     let render_quad = scaling || cross_format;
 
-    // Refresh an offscreen-plain destination's CPU staging from a texture-backed
-    // source on a same-format 1:1 copy, so a later LockRect reads the new pixels
-    // rather than the stale staging mirror. The GPU blit
-    // below keeps the dst texture correct for sampling.
+    // The blit below writes only the destination's Metal texture, and an
+    // offscreen-plain destination reads its pixels back through `LockRect`,
+    // which serves CPU staging. Claim the level for the GPU so the next Lock
+    // reads the blit rather than the staging it left behind.
     if !render_quad
         && dst_info
             .flags
             .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
     {
-        refresh_stretch_dst_staging(
-            src_surf, dst_surf, &src_info, &dst_info, src_region, dst_region,
-        );
+        claim_stretch_dst_for_gpu(dst_surf, &dst_info);
     }
 
     let mip_level = src_info.mip_level;
@@ -5791,50 +5789,36 @@ extern "system" fn device_stretch_rect(
     D3D_OK
 }
 
-/// CPU-side refresh of an offscreen-plain `StretchRect` destination's staging.
+/// Claim a `StretchRect` destination level for the GPU.
 ///
-/// Fed from a texture-backed source (same format, 1:1). Without it, a `StretchRect`
-/// updates only the destination's GPU texture and a later `LockRect` reads the
-/// stale CPU mirror. A no-op when the source isn't
-/// texture-backed (e.g. the backbuffer) — then only the GPU copy applies.
-fn refresh_stretch_dst_staging(
-    src_surf: *mut crate::surface::Direct3DSurface9,
+/// An offscreen-plain destination is texture-backed and lockable, and the blit
+/// writes only its Metal texture, so its `LockRect` has to read the level back
+/// instead of the staging the blit never touched. Every source kind lands here,
+/// including one with no CPU staging of its own to copy from. Marking is all
+/// this does; the read happens at the next Lock.
+fn claim_stretch_dst_for_gpu(
     dst_surf: *mut crate::surface::Direct3DSurface9,
-    src_info: &StretchSurfaceInfo,
     dst_info: &StretchSurfaceInfo,
-    src_region: mtld3d_core::stretch_rect::StretchRegion,
-    dst_region: mtld3d_core::stretch_rect::StretchRegion,
 ) {
-    if src_surf.is_null() || dst_surf.is_null() {
+    if dst_surf.is_null() {
         return;
     }
     // SAFETY: caller-supplied live `Direct3DSurface9*` from the StretchRect
     // thunk (non-null checked above).
-    let src_parent = unsafe { (*src_surf).parent_texture() };
-    // SAFETY: as above.
     let dst_parent = unsafe { (*dst_surf).parent_texture() };
-    if src_parent.is_null() || dst_parent.is_null() || src_parent == dst_parent {
+    if dst_parent.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "StretchRect: offscreen-plain destination has no texture backing → \
+             its staging keeps what it held"
+        );
         return;
     }
-    // SAFETY: non-null (checked) and a live `Direct3DTexture9` whose refcount
-    // keeps it alive while the source surface is.
-    let src_tex = unsafe { &*src_parent };
-    // SAFETY: non-null (checked), distinct from `src_parent`, and a live
-    // `Direct3DTexture9` kept alive by the destination surface's reference.
-    let dst_tex = unsafe { &mut *dst_parent };
-    let src_rect = (
-        src_region.x.cast_signed(),
-        src_region.y.cast_signed(),
-        (src_region.x + src_region.w).cast_signed(),
-        (src_region.y + src_region.h).cast_signed(),
-    );
-    dst_tex.inner_mut().copy_sub_region_from(
-        dst_info.mip_level as usize,
-        src_tex.inner(),
-        src_info.mip_level as usize,
-        Some(src_rect),
-        (dst_region.x.cast_signed(), dst_region.y.cast_signed()),
-    );
+    // SAFETY: `dst_parent` is non-null (checked) and a live `Direct3DTexture9`
+    // kept alive by the destination surface's reference.
+    unsafe { &mut *dst_parent }
+        .inner_mut()
+        .mark_level_gpu_authoritative(dst_info.mip_level as usize);
 }
 
 /// CPU-side cross-format `StretchRect` into an offscreen-plain destination.
