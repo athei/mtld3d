@@ -1594,6 +1594,16 @@ impl LockedRect<'_> {
         unsafe { core::slice::from_raw_parts(self.bits.cast::<u32>(), count) }
     }
 
+    /// View the first `count` bytes of the mapped span.
+    ///
+    /// For the single-byte formats (`L8`, `A8`), where one texel is one byte.
+    #[must_use]
+    pub const fn as_u8(&self, count: usize) -> &[u8] {
+        // SAFETY: `bits` is valid for `count` bytes within the locked region
+        // (caller's contract) and lives until this guard drops.
+        unsafe { core::slice::from_raw_parts(self.bits.cast::<u8>(), count) }
+    }
+
     /// View the first `count` `u16` lanes of the mapped span.
     ///
     /// For the 16-bit-per-channel formats, where one texel spans several

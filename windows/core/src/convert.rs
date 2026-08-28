@@ -20,9 +20,10 @@ use mtld3d_types::{
     D3DDECLTYPE_SHORT4, D3DDECLTYPE_SHORT4N, D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N,
     D3DDECLTYPE_UDEC3, D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
-    D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFMT_A8R8G8B8,
-    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFMT_A1R5G5B5,
+    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5,
+    D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK,
     D3DFVF_PSIZE, D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT,
     D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1,
@@ -134,6 +135,30 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
                 ((u16::from(r) >> 3) << 11) | ((u16::from(g) >> 2) << 5) | (u16::from(b) >> 3);
             Some(packed.to_le_bytes().to_vec())
         }
+        // 16-bit packed 5/5/5/1 and its X twin: the top 5 bits of each colour
+        // channel and the top bit of alpha. X1R5G5B5 stores that alpha bit
+        // the way X8R8G8B8 stores its alpha byte, and reads force it to 1
+        // either way (e.g. 0xdeadbeef -> 0xd6fd).
+        D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 => {
+            let packed = ((u16::from(a) >> 7) << 15)
+                | ((u16::from(r) >> 3) << 10)
+                | ((u16::from(g) >> 3) << 5)
+                | (u16::from(b) >> 3);
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // 16-bit packed 4/4/4/4: the top nibble of every channel, alpha in
+        // the high nibble (e.g. 0xdeadbeef -> 0xdabe).
+        D3DFMT_A4R4G4B4 => {
+            let packed = ((u16::from(a) >> 4) << 12)
+                | ((u16::from(r) >> 4) << 8)
+                | ((u16::from(g) >> 4) << 4)
+                | (u16::from(b) >> 4);
+            Some(packed.to_le_bytes().to_vec())
+        }
+        // The single-channel 8-bit pair: a luminance destination takes the
+        // colour's luminance, an alpha destination its alpha byte.
+        D3DFMT_L8 => Some(vec![d3dcolor_luminance(r, g, b)]),
+        D3DFMT_A8 => Some(vec![a]),
         // Float formats carry the D3DCOLOR channels normalised to [0, 1], in
         // channel order R, G, B, A — the D3D9 names list them most-significant
         // first, so the stored order is the reverse of the name.
@@ -180,6 +205,18 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
         }
         _ => None,
     }
+}
+
+/// The luminance of a D3DCOLOR's colour channels, as an 8-bit unorm.
+///
+/// D3D9's rule for writing a colour into a luminance destination weights the
+/// channels by Rec. 709 (0.2125 R, 0.7154 G, 0.0721 B), the same weights D3DX
+/// applies when it converts an RGB surface into an L8 or L16 one. The
+/// arithmetic runs in ten-thousandths so it stays integral, and the weights
+/// sum to one, so an all-0xff colour lands exactly on 0xff.
+fn d3dcolor_luminance(r: u8, g: u8, b: u8) -> u8 {
+    let weighted = 2125 * u32::from(r) + 7154 * u32::from(g) + 721 * u32::from(b);
+    u8::try_from((weighted + 5_000) / 10_000).expect("Rec. 709 weights sum to one")
 }
 
 /// Widen an 8-bit unorm channel to 16 bits by replication.
