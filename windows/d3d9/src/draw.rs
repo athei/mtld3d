@@ -33,7 +33,9 @@ use mtld3d_shared::{
         VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
-use mtld3d_types::{D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults};
+use mtld3d_types::{
+    D3DCMP_ALWAYS, D3DCMP_NEVER, D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults,
+};
 
 /// `VsDraw` bytes for the default render states.
 ///
@@ -942,6 +944,19 @@ pub enum PsSource {
     },
     FixedFunction {
         key: FfPsKey,
+        /// Stages the emitted shader declares a texture and sampler for.
+        ///
+        /// `FfPsKey::sampled_stage_mask`, resolved on the API thread so
+        /// `emit_draw` never re-walks the stage array. The draw binds a
+        /// texture only inside the mask; a stage outside it is one the
+        /// combiner cascade never samples.
+        sampled_stage_mask: u16,
+        /// Whether the shader reads the fixed-function pixel constant buffer.
+        ///
+        /// `FfPsKey::reads_texture_factor`. Its one row is
+        /// `D3DRS_TEXTUREFACTOR`, so a key that references neither
+        /// `D3DTA_TFACTOR` nor `D3DTOP_BLENDFACTORALPHA` binds no constants.
+        reads_texture_factor: bool,
     },
 }
 
@@ -952,7 +967,7 @@ impl PsSource {
                 ps_id: *ps_id,
                 variant,
             },
-            Self::FixedFunction { key } => PsKey::FixedFunction {
+            Self::FixedFunction { key, .. } => PsKey::FixedFunction {
                 ff: key.clone(),
                 variant,
             },
@@ -966,7 +981,7 @@ impl PsSource {
     pub fn disk_key(&self, variant: VariantKey) -> u64 {
         match self {
             Self::Programmable { ps_id, .. } => ps_source_disk_key_programmable(*ps_id, variant),
-            Self::FixedFunction { key } => ps_source_disk_key_ff(key, variant),
+            Self::FixedFunction { key, .. } => ps_source_disk_key_ff(key, variant),
         }
     }
 }
@@ -1245,13 +1260,28 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         .expect("emit_draw: ps not populated")
         .as_ref();
     let variant = snap.variant.expect("emit_draw: variant not populated");
+    // Stages the bound pixel shader declares a sampler for. Every texture,
+    // sampler and per-slot bias bind below is confined to this mask: a stage
+    // the game bound a texture to that the shader never samples has no
+    // argument in the emitted function, so binding it only adds encoder work.
+    let ps_sampled_mask = match ps {
+        PsSource::Programmable { ps_id, .. } => enc.ps_declared_samplers(*ps_id).mask(),
+        PsSource::FixedFunction {
+            sampled_stage_mask, ..
+        } => *sampled_stage_mask,
+    };
     // `D3DSAMP_MIPMAPLODBIAS` has no Metal sampler equivalent, so the bias
     // reaches the GPU as a fragment uniform the sample sites read. Resolving
     // it here keeps every draw that leaves the state at its zero default on
-    // the unbiased shader with nothing extra bound.
+    // the unbiased shader with nothing extra bound. A bias on a stage this
+    // shader does not sample reaches no sample site, so it neither mints the
+    // biased variant nor binds the table.
     let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
     let mut any_lod_bias = false;
     for (stage_u32, b) in stage_bindings.iter() {
+        if ps_sampled_mask & (1u16 << stage_u32) == 0 {
+            continue;
+        }
         let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state);
         if mtld3d_core::sampler_state::lod_bias_active(bias) {
             lod_bias[stage_u32 as usize] = bias;
@@ -1337,7 +1367,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     };
     let ps_constants = match ps {
         PsSource::Programmable { max_const_used, .. } => enc.ps_const_scratch(*max_const_used),
-        PsSource::FixedFunction { .. } => snap.ps_constants.unwrap_or(ScratchSlice::EMPTY),
+        PsSource::FixedFunction {
+            reads_texture_factor: true,
+            ..
+        } => snap.ps_constants.unwrap_or(ScratchSlice::EMPTY),
+        PsSource::FixedFunction { .. } => ScratchSlice::EMPTY,
     };
     let alpha_ref_slice = snap.alpha_ref_bytes.unwrap_or(ScratchSlice::EMPTY);
     let fog_color_slice = snap.fog_color_bytes.unwrap_or(ScratchSlice::EMPTY);
@@ -1426,6 +1460,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
     let mut stage_texture_handles: [u64; STAGE_COUNT] = [0; STAGE_COUNT];
     for (stage, b) in stage_bindings.iter() {
+        if ps_sampled_mask & (1u16 << stage) == 0 {
+            // No sampler argument at this slot. Resolving the handle anyway
+            // would put a texture no draw reads into the alias check below,
+            // where a stage that happens to hold the pass's depth attachment
+            // costs a depth copy.
+            continue;
+        }
         // D3DSAMP_SRGBTEXTURE binds the texture's eager sRGB twin view so
         // the hardware decodes sRGB→linear at sample time. The handle value
         // itself carries the choice, so the `last_bound` dedup below re-emits
@@ -1852,6 +1893,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let fetch_mask = variant.depth_fetch_mask;
     let mut bound_mask: u16 = 0;
     for (stage_u32, b) in stage_bindings.iter() {
+        if ps_sampled_mask & (1u16 << stage_u32) == 0 {
+            continue;
+        }
         let handle = stage_texture_handles[stage_u32 as usize];
         if handle == 0 {
             mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
@@ -2016,7 +2060,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let (p, n) = ps_constants.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 15));
     }
-    if !alpha_ref_bytes.is_empty() && enc.last_bound().ps_alpha_ref_changed(alpha_ref_bytes) {
+    // The alpha-reference scalar (slot 14) is read only by a comparison that
+    // has a reference to compare against: the two constant results compile to
+    // `true` / `false` and leave the argument untouched, and a disabled test
+    // emits none. Asking the shader rather than trusting the byte buffer to be
+    // empty keeps the bind in step with what the emitter produced.
+    let alpha_func = u32::from(ps_variant.alpha_func);
+    let alpha_ref_read =
+        alpha_func != 0 && alpha_func != D3DCMP_ALWAYS && alpha_func != D3DCMP_NEVER;
+    if alpha_ref_read
+        && !alpha_ref_bytes.is_empty()
+        && enc.last_bound().ps_alpha_ref_changed(alpha_ref_bytes)
+    {
         let (p, n) = alpha_ref_slice.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 14));
     }

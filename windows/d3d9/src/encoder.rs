@@ -786,6 +786,16 @@ impl PsSamplerDecls {
         self.mask & !bound_mask
     }
 
+    /// Every slot this shader declares a sampler for.
+    ///
+    /// The draw path binds a texture and a sampler only inside this mask: a
+    /// stage the game bound a texture to that the shader declares no sampler
+    /// for is a binding no draw reads.
+    #[must_use]
+    pub const fn mask(&self) -> u16 {
+        self.mask
+    }
+
     /// The fallback texture kind for a declared slot.
     #[must_use]
     pub const fn kind(&self, stage: u32) -> NullTextureKind {
@@ -5261,7 +5271,7 @@ impl FrameEncoder {
         variant: VariantKey,
     ) -> Option<StageLibHandles> {
         match source {
-            PsSource::FixedFunction { key } => {
+            PsSource::FixedFunction { key, .. } => {
                 if let Some(&handles) = self.ff_ps_libs.get(key).and_then(|m| m.get(&variant)) {
                     return Some(handles);
                 }
@@ -5274,7 +5284,7 @@ impl FrameEncoder {
         }
         let handles = self.resolve_ps_library_cold(source, variant)?;
         match source {
-            PsSource::FixedFunction { key } => {
+            PsSource::FixedFunction { key, .. } => {
                 self.ff_ps_libs
                     .entry(key.clone())
                     .or_default()
@@ -5325,7 +5335,7 @@ impl FrameEncoder {
                 };
                 (msl, bucket)
             }
-            PsSource::FixedFunction { key } => (
+            PsSource::FixedFunction { key, .. } => (
                 emit_ps_ff_named(key, variant, &entry_name),
                 Some(CompileBucket::Ff),
             ),
@@ -9489,7 +9499,7 @@ fn shader_source_tag_ps(source: &PsSource, variant: VariantKey) -> String {
             "prog {:#x}",
             draw::ps_source_disk_key_programmable(*ps_id, variant)
         ),
-        PsSource::FixedFunction { key } => {
+        PsSource::FixedFunction { key, .. } => {
             format!("ff {:#x}", draw::ps_source_disk_key_ff(key, variant))
         }
     }

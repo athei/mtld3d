@@ -10439,7 +10439,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let ps_value = if dirty.contains(SnapshotDirty::PS_SOURCE) {
         if bound_pixel_shader.is_null() {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
-            Some(PsSource::FixedFunction { key })
+            let sampled_stage_mask = key.sampled_stage_mask();
+            let reads_texture_factor = key.reads_texture_factor();
+            Some(PsSource::FixedFunction {
+                key,
+                sampled_stage_mask,
+                reads_texture_factor,
+            })
         } else {
             // SAFETY: non-null check; refcount holds it live.
             let ps_obj = unsafe { &*bound_pixel_shader };

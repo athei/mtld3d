@@ -321,18 +321,29 @@ impl DxsoProgram {
         })
     }
 
-    /// Highest float constant register `cN` read by an instruction in the main body.
+    /// Highest float constant register `cN` the shader reads out of the uniform buffer.
     ///
     /// Matrix instructions span multiple consecutive rows starting from their
     /// second source, so their range is expanded to cover the whole matrix.
-    /// Only `instructions` is walked: a constant read solely from a subroutine
-    /// body in `subroutines` is not counted, unlike [`Self::max_const_index`],
-    /// which covers both. Returns `None` if the main body reads no constants
-    /// from the buffer.
+    /// Subroutine bodies count: a `call` is inline-expanded at emit time, so a
+    /// constant read there lands in the emitted function like any other.
+    ///
+    /// A row a `def c` declaration supplies is emitted as an MSL local and
+    /// never reaches the buffer, so a plain read of one does not count. A
+    /// matrix source and a relative-addressed read both span rows the
+    /// declaration cannot cover, so those count whatever the base index is.
+    /// `None` therefore means the shader binds no float constants at all, not
+    /// merely that it reads none from row 0.
     #[must_use]
     pub fn max_const_reg(&self) -> Option<u16> {
+        let defined: std::collections::BTreeSet<u16> =
+            self.def_constants.iter().map(|d| d.reg.index).collect();
         let mut max: Option<u16> = None;
-        for inst in &self.instructions {
+        for inst in self
+            .instructions
+            .iter()
+            .chain(self.subroutines.values().flatten())
+        {
             let (mat_src_idx, mat_rows) = match inst.opcode {
                 Opcode::M4x4 | Opcode::M3x4 => (Some(1usize), 4u16),
                 Opcode::M4x3 | Opcode::M3x3 => (Some(1usize), 3u16),
@@ -344,6 +355,9 @@ impl DxsoProgram {
                     continue;
                 }
                 let span = if mat_src_idx == Some(i) { mat_rows } else { 1 };
+                if span == 1 && src.rel_addr.is_none() && defined.contains(&src.reg.index) {
+                    continue;
+                }
                 let top = src.reg.index + span - 1;
                 max = Some(max.map_or(top, |m| m.max(top)));
             }
