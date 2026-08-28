@@ -3,7 +3,8 @@
 //! Plus cube and volume texture contracts.
 
 use mtld3d_tests::{
-    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_eq,
+    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_approx,
+    assert_pixel_eq,
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5,
@@ -1607,14 +1608,14 @@ fn update_surface_rejects_a_standalone_source_into_a_managed_destination() {
 
 /// `UpdateSurface` rejects a standalone-source pair the CPU codec cannot convert.
 ///
-/// `A1R5G5B5` is outside the codec, so there is nothing to re-encode the source
-/// with. Both formats are 16 bits per pixel and the source is the destination's
-/// size, so without the check the call would land 1-5-5-5 bits the destination
-/// reads as 5-6-5.
+/// `V8U8` is signed, so it is outside the codec's unsigned normalised set and
+/// there is nothing to re-encode the source with. Both formats are 16 bits per
+/// pixel and the source is the destination's size, so without the check the
+/// call would land signed two-channel bits the destination reads as 5-6-5.
 #[test]
 fn update_surface_rejects_a_standalone_source_the_codec_cannot_convert() {
     let h = Harness::new();
-    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_A1R5G5B5, D3DPOOL_SYSTEMMEM);
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_V8U8, D3DPOOL_SYSTEMMEM);
     src.lock_rect(0).write::<u16>(&[0x83E0; 16]);
     let dst = h.create_texture(4, 4, 1, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
     assert_eq!(
@@ -2270,6 +2271,131 @@ fn update_texture_converts_a8r8g8b8_into_r5g6b5() {
         "UpdateTexture across formats"
     );
     assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "converted texel");
+}
+
+/// `UpdateSurface` re-encodes a packed 16-bit source with an alpha bit.
+///
+/// `A1R5G5B5` splits its 16 bits differently from the `R5G6B5` the codec
+/// already carried: five bits of green instead of six, and the top bit an
+/// alpha channel rather than part of red. A source texel that is opaque green
+/// arrives as opaque green rather than as the colour a 5-6-5 reader would see.
+#[test]
+fn update_surface_converts_a1r5g5b5_into_a8r8g8b8() {
+    // A=1, R=0, G=31, B=0.
+    const GREEN_1555: u16 = 0x83E0;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_A1R5G5B5, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u16>(&[GREEN_1555; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a 1-5-5-5 source"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFF00_FF00,
+        "converted texel",
+    );
+}
+
+/// `UpdateTexture` encodes into a packed 16-bit destination.
+///
+/// The destination is half the bytes per texel of the source and packs its
+/// channels four bits each, so the copy has to re-encode. A saturated 8-bit
+/// channel packs into a saturated nibble and widens back to 255 when it is
+/// sampled.
+#[test]
+fn update_texture_converts_a8r8g8b8_into_a4r4g4b4() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u32>(&[GREEN; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        0,
+        "UpdateTexture into a 4-4-4-4 destination"
+    );
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "converted texel");
+}
+
+/// `UpdateSurface` re-encodes a single-channel luminance source.
+///
+/// `L8` is one byte per texel against the destination's four, and its one
+/// channel stands for all three colour channels. The destination texel is the
+/// grey the source luminance names, with alpha opaque.
+#[test]
+fn update_surface_converts_l8_into_a8r8g8b8() {
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_L8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u8>(&[0x80; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a luminance source"
+    );
+    assert_pixel_approx(
+        sample_center(&h, &dst).to_pixel(),
+        0xFF80_8080,
+        2,
+        "converted texel",
+    );
+}
+
+/// `UpdateSurface` re-encodes a 24-bit source into a 32-bit destination.
+///
+/// `R8G8B8` is three bytes a texel against the destination's four, so the row
+/// the source hands over is neither the destination's length nor a whole
+/// number of destination texels. Each texel gains the opaque alpha the source
+/// has no channel for.
+#[test]
+fn update_surface_converts_r8g8b8_into_a8r8g8b8() {
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_R8G8B8, D3DPOOL_SYSTEMMEM);
+    {
+        let mut locked = src.lock_rect(0, 0);
+        assert_eq!(locked.pitch(), 12, "4 texels of three bytes, dword aligned");
+        // B, G, R per texel: opaque red.
+        locked.write::<u8>(&[0x00, 0x00, 0xFF].repeat(16));
+    }
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a 24-bit source"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFFFF_0000,
+        "converted texel",
+    );
+}
+
+/// `UpdateSurface` re-encodes a reversed-channel source.
+///
+/// `A8B8G8R8` and `A8R8G8B8` are the same four bytes a texel with red and blue
+/// exchanged, so a raw copy would land the source colour with those two
+/// channels swapped. The conversion keeps the colour.
+#[test]
+fn update_surface_converts_a8b8g8r8_into_a8r8g8b8() {
+    // R=255, G=0, B=0, A=255 in ascending addresses.
+    const RED_ABGR: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_A8B8G8R8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u32>(&[RED_ABGR; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(0), &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a reversed-channel source"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFFFF_0000,
+        "converted texel",
+    );
 }
 
 /// `UpdateTexture` still rejects a format pair the CPU codec cannot convert.

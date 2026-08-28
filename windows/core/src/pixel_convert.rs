@@ -6,12 +6,17 @@
 //! `UpdateTexture`, which accept a mismatched pair. Both run here, on the CPU
 //! staging that backs the destination level.
 //!
-//! The codec covers the simple RGB formats in both directions plus the packed
-//! 4:2:2 YUV formats as a source. [`can_convert`] answers for a pair up front,
-//! so a caller can reject the pairs no codec covers instead of writing
+//! The codec covers every uncompressed colour format whose channels are
+//! unsigned normalised and at most 8 bits wide, in both directions, plus the
+//! packed 4:2:2 YUV formats as a source. RGBA8 is the intermediate, so it
+//! carries those formats without loss. [`can_convert`] answers for a pair up
+//! front, so a caller can reject the pairs no codec covers instead of writing
 //! reinterpreted bytes.
 
-use mtld3d_types::{D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8};
+use mtld3d_types::{
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
+    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+};
 
 use crate::stretch_rect::{decode_packed_yuv, is_packed_yuv};
 
@@ -36,9 +41,10 @@ pub struct ConvertRegion {
 
 /// Whether [`convert_region`] re-encodes this source format into this destination format.
 ///
-/// Destinations are the three simple RGB formats; sources are those plus the
-/// packed 4:2:2 YUV pair. Anything else (block-compressed, depth, the
-/// floating-point and packed-16 colour formats) has no codec here.
+/// Destinations are the uncompressed 8-bit-or-narrower unsigned normalised
+/// colour formats; sources are those plus the packed 4:2:2 YUV pair. Anything
+/// else (block-compressed, depth, palettised, signed, and the 16-bit-per-
+/// channel and floating-point colour formats) has no codec here.
 #[must_use]
 pub const fn can_convert(src_format: u32, dst_format: u32) -> bool {
     (is_convertible_rgb(src_format) || is_packed_yuv(src_format)) && is_convertible_rgb(dst_format)
@@ -103,27 +109,78 @@ pub fn convert_region(
     true
 }
 
-/// The simple uncompressed RGB formats the converter decodes and encodes.
+/// The uncompressed colour formats the converter decodes and encodes.
+///
+/// Every member's channels are unsigned normalised and at most 8 bits wide, so
+/// the RGBA8 intermediate holds a decoded texel exactly.
 const fn is_convertible_rgb(d3d_format: u32) -> bool {
     matches!(
         d3d_format,
-        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_R5G6B5
+        D3DFMT_A8R8G8B8
+            | D3DFMT_X8R8G8B8
+            | D3DFMT_A8B8G8R8
+            | D3DFMT_X8B8G8R8
+            | D3DFMT_R8G8B8
+            | D3DFMT_R5G6B5
+            | D3DFMT_A1R5G5B5
+            | D3DFMT_X1R5G5B5
+            | D3DFMT_A4R4G4B4
+            | D3DFMT_L8
+            | D3DFMT_A8
+            | D3DFMT_A8L8
     )
 }
 
 /// Bytes per texel of an `is_convertible_rgb` format.
 const fn rgb_bpp(d3d_format: u32) -> usize {
     match d3d_format {
-        D3DFMT_R5G6B5 => 2,
-        _ => 4, // A8R8G8B8 / X8R8G8B8
+        D3DFMT_L8 | D3DFMT_A8 => 1,
+        D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 | D3DFMT_A4R4G4B4 | D3DFMT_A8L8 => 2,
+        D3DFMT_R8G8B8 => 3,
+        _ => 4, // A8R8G8B8 / X8R8G8B8 / A8B8G8R8 / X8B8G8R8
     }
 }
 
+/// Widen a 5-bit channel to 8 bits, replicating its top bits into the low ones.
+const fn expand5(v: u8) -> u8 {
+    (v << 3) | (v >> 2)
+}
+
+/// Widen a 6-bit channel to 8 bits, replicating its top bits into the low ones.
+const fn expand6(v: u8) -> u8 {
+    (v << 2) | (v >> 4)
+}
+
+/// Widen a 4-bit channel to 8 bits, replicating it into the low nibble.
+const fn expand4(v: u8) -> u8 {
+    (v << 4) | v
+}
+
+/// The luminance an RGB triple carries, as D3D's colour-space conversions weight it.
+///
+/// Rec. 709 luma: the weights sum to 1, so a 0..=255 input gives a 0..=255
+/// result, and the added half is the round-to-nearest the fixed-point form
+/// needs.
+fn luminance(r: u8, g: u8, b: u8) -> u8 {
+    let weighted =
+        2125 * u32::from(r) + 7154 * u32::from(g) + 721 * u32::from(b) + LUMA_ROUNDING_HALF;
+    ((weighted / LUMA_WEIGHT_TOTAL) & 0xff) as u8
+}
+
+/// The denominator the fixed-point [`luminance`] weights share.
+const LUMA_WEIGHT_TOTAL: u32 = 10000;
+
+/// Half of [`LUMA_WEIGHT_TOTAL`], added before the divide to round to nearest.
+const LUMA_ROUNDING_HALF: u32 = LUMA_WEIGHT_TOTAL / 2;
+
 /// Decode one `is_convertible_rgb` texel from its little-endian bytes into `(r, g, b, a)`.
 ///
-/// The 32bpp formats store `[B, G, R, A/X]`; R5G6B5 packs `RRRRR GGGGGG BBBBB`
-/// into a little-endian `u16` (channels bit-replicated up to 8 bits). X8's
-/// alpha reads as opaque. `px` is at least `rgb_bpp` long.
+/// The `*R8G8B8` formats store `[B, G, R]` and then the alpha or padding byte
+/// the 32bpp ones carry; the `*B8G8R8` pair reverses that to `[R, G, B]`. The
+/// packed 16-bit formats hold their channels in one little-endian `u16`,
+/// widened to 8 bits by bit replication. An X format's alpha reads as opaque,
+/// `L8` replicates its luminance across RGB, and `A8` carries no colour, so
+/// its RGB reads as black. `px` is at least `rgb_bpp` long.
 fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
     match d3d_format {
         D3DFMT_R5G6B5 => {
@@ -131,15 +188,41 @@ fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
             let r5 = ((v >> 11) & 0x1f) as u8;
             let g6 = ((v >> 5) & 0x3f) as u8;
             let b5 = (v & 0x1f) as u8;
-            (
-                (r5 << 3) | (r5 >> 2),
-                (g6 << 2) | (g6 >> 4),
-                (b5 << 3) | (b5 >> 2),
-                0xff,
-            )
+            (expand5(r5), expand6(g6), expand5(b5), 0xff)
         }
-        // X8R8G8B8: alpha byte is undefined; report opaque.
-        D3DFMT_X8R8G8B8 => (px[2], px[1], px[0], 0xff),
+        // A1R5G5B5 / X1R5G5B5: A[15] R[14:10] G[9:5] B[4:0]. X1's top bit is
+        // undefined; report opaque.
+        D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 => {
+            let v = u16::from_le_bytes([px[0], px[1]]);
+            let r5 = ((v >> 10) & 0x1f) as u8;
+            let g5 = ((v >> 5) & 0x1f) as u8;
+            let b5 = (v & 0x1f) as u8;
+            let a = if d3d_format == D3DFMT_X1R5G5B5 || v & 0x8000 != 0 {
+                0xff
+            } else {
+                0x00
+            };
+            (expand5(r5), expand5(g5), expand5(b5), a)
+        }
+        // A4R4G4B4: A[15:12] R[11:8] G[7:4] B[3:0].
+        D3DFMT_A4R4G4B4 => {
+            let v = u16::from_le_bytes([px[0], px[1]]);
+            let a4 = ((v >> 12) & 0xf) as u8;
+            let r4 = ((v >> 8) & 0xf) as u8;
+            let g4 = ((v >> 4) & 0xf) as u8;
+            let b4 = (v & 0xf) as u8;
+            (expand4(r4), expand4(g4), expand4(b4), expand4(a4))
+        }
+        // A8L8: luminance in the low byte, alpha in the high one.
+        D3DFMT_A8L8 => (px[0], px[0], px[0], px[1]),
+        D3DFMT_L8 => (px[0], px[0], px[0], 0xff),
+        D3DFMT_A8 => (0, 0, 0, px[0]),
+        // The reversed-channel twins store [R, G, B, A/X].
+        D3DFMT_A8B8G8R8 => (px[0], px[1], px[2], px[3]),
+        D3DFMT_X8B8G8R8 => (px[0], px[1], px[2], 0xff),
+        // R8G8B8 is 24-bit [B, G, R], with no channel left to carry alpha;
+        // X8R8G8B8 adds a fourth byte that is undefined. Both report opaque.
+        D3DFMT_R8G8B8 | D3DFMT_X8R8G8B8 => (px[2], px[1], px[0], 0xff),
         // A8R8G8B8 (only remaining is_convertible_rgb case).
         _ => (px[2], px[1], px[0], px[3]),
     }
@@ -147,13 +230,52 @@ fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
 
 /// Encode `(r, g, b, a)` into one `is_convertible_rgb` texel's little-endian bytes.
 ///
-/// Inverse of `decode_rgb_pixel`. X8's byte is written opaque. `out` is at
-/// least `rgb_bpp` long.
+/// Inverse of `decode_rgb_pixel`. A channel narrower than 8 bits takes the top
+/// bits of its input, which is what the widening decode reverses; a 1-bit
+/// alpha rounds instead, so a half-opaque source lands opaque. An X format's
+/// bits are written opaque, and a luminance destination takes the Rec. 709
+/// luma of the colour. `out` is at least `rgb_bpp` long.
 fn encode_rgb_pixel(d3d_format: u32, (r, g, b, a): (u8, u8, u8, u8), out: &mut [u8]) {
     match d3d_format {
         D3DFMT_R5G6B5 => {
             let packed = (u16::from(r >> 3) << 11) | (u16::from(g >> 2) << 5) | u16::from(b >> 3);
             out[..2].copy_from_slice(&packed.to_le_bytes());
+        }
+        D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 => {
+            let opaque = d3d_format == D3DFMT_X1R5G5B5 || a >= 0x80;
+            let packed = (u16::from(opaque) << 15)
+                | (u16::from(r >> 3) << 10)
+                | (u16::from(g >> 3) << 5)
+                | u16::from(b >> 3);
+            out[..2].copy_from_slice(&packed.to_le_bytes());
+        }
+        D3DFMT_A4R4G4B4 => {
+            let packed = (u16::from(a >> 4) << 12)
+                | (u16::from(r >> 4) << 8)
+                | (u16::from(g >> 4) << 4)
+                | u16::from(b >> 4);
+            out[..2].copy_from_slice(&packed.to_le_bytes());
+        }
+        D3DFMT_A8L8 => {
+            out[0] = luminance(r, g, b);
+            out[1] = a;
+        }
+        D3DFMT_L8 => out[0] = luminance(r, g, b),
+        D3DFMT_A8 => out[0] = a,
+        D3DFMT_A8B8G8R8 | D3DFMT_X8B8G8R8 => {
+            out[0] = r;
+            out[1] = g;
+            out[2] = b;
+            out[3] = if d3d_format == D3DFMT_X8B8G8R8 {
+                0xff
+            } else {
+                a
+            };
+        }
+        D3DFMT_R8G8B8 => {
+            out[0] = b;
+            out[1] = g;
+            out[2] = r;
         }
         D3DFMT_X8R8G8B8 => {
             out[0] = b;
