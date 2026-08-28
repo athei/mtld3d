@@ -4347,3 +4347,47 @@ fn depth_stencil_surfaces_released_across_frames_stay_sound() {
         "the device renders after every depth surface has retired"
     );
 }
+
+#[test]
+fn get_render_target_data_from_a_cube_face_reads_that_face() {
+    // The source surface names one subresource of the cube's Metal texture, so
+    // the read-back has to blit that face and that mip rather than the
+    // texture's first slice. Faces 0 and 3 carry different colours and the mip
+    // chain puts a third on face 3's level 1, so a read pinned to slice 0
+    // answers the face-3 reads with face 0's content.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    let face3_mip1 = cube.surface(3, 1);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face3, GREEN), D3D_OK, "fill face 3 green");
+    assert_eq!(
+        h.color_fill_hr(&face3_mip1, BLUE),
+        D3D_OK,
+        "fill face 3 level 1 blue"
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "GetRenderTargetData reads face 3 rather than face 0"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face3_mip1, 1, 1),
+        BLUE,
+        "GetRenderTargetData reads face 3's level 1 rather than face 0's"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face0, 1, 1),
+        RED,
+        "face 0 still reads its own fill"
+    );
+}

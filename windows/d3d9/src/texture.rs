@@ -692,6 +692,9 @@ impl TextureInner {
                 dst_ptr: self.staging[level].as_ptr() as u64,
                 dst_len,
                 level: u32::try_from(level).expect("D3D9 mip level fits u32"),
+                // Only a class that can release its staging reaches here, and a
+                // cube never does, so the read is always slice zero.
+                slice: 0,
                 width: self.mip_widths[level],
                 height: self.mip_heights[level],
                 bytes_per_row,
