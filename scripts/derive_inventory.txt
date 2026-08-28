@@ -149,13 +149,7 @@ windows/core/src/stretch_rect.rs RejectReason Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/texture_flags.rs TextureFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs LockAction Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs MipShape Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/texture_staging.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/upload_pass.rs UploadDecode Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/upload_recovery.rs UploadFate Clone,Copy,Debug,PartialEq,Eq
