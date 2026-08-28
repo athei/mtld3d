@@ -96,9 +96,11 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   reaching every bound target.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
   enumeration, hardware color cursors, and MetalFX upscaling on the way to the
-  screen with `render.scale` choosing the render resolution. Fullscreen never
-  changes the display mode; what it does instead is under
-  [Display-mode switching](#deliberately-not-implemented).
+  screen with `render.scale` choosing the render resolution. A render target or
+  depth-stencil the game creates at the reported back-buffer size rasterizes at
+  that same scale, so a depth resolve into an INTZ texture stays a same-size
+  copy. Fullscreen never changes the display mode; what it does instead is
+  under [Display-mode switching](#deliberately-not-implemented).
 - **HDR**: on an EDR-capable display the layer is upgraded to
   `extendedDynamicRange` and present routes through a BT.2446-A
   inverse-tone-mapping pass in ICtCp, its peak following the display's live

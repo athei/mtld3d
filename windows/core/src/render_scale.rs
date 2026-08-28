@@ -11,6 +11,16 @@
 //! can read back must stay logical, or D3D9's coordinate space stops agreeing
 //! with `GetClientRect` and mouse input.
 //!
+//! The back buffer is not the only surface that shrinks. A render target or
+//! depth-stencil the game creates at the reported back-buffer size is part of
+//! the same image and is rasterized at the same scale, the auto depth-stencil
+//! and a `D3DUSAGE_DEPTHSTENCIL` texture (INTZ, DF24, DF16, a plain depth
+//! format) alike, so a colour/depth pair stays the same size and a depth
+//! resolve from the attachment into such a texture stays a same-size copy.
+//! Descriptors keep reporting the logical size; whatever addresses the Metal
+//! texture itself, an attachment extent or a full-surface blit, measures it in
+//! render space.
+//!
 //! A scale of 100% is an exact identity on every conversion here, so the
 //! default configuration cannot perturb a single pixel.
 
