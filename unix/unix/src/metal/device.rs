@@ -38,6 +38,18 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
         DeviceCapsFlags::FLOAT32_FILTERING,
         supports_float32_filtering(&device),
     );
+    caps.set(
+        DeviceCapsFlags::SAMPLE_COUNT_2,
+        device.supportsTextureSampleCount(2),
+    );
+    caps.set(
+        DeviceCapsFlags::SAMPLE_COUNT_4,
+        device.supportsTextureSampleCount(4),
+    );
+    caps.set(
+        DeviceCapsFlags::SAMPLE_COUNT_8,
+        device.supportsTextureSampleCount(8),
+    );
     Some((name, registry_id, caps))
 }
 

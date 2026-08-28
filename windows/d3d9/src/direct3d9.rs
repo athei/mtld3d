@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::sync::LazyLock;
 
 use log::{error, info, trace, warn};
-use mtld3d_core::{caps, format_probe::FormatProbeKey};
+use mtld3d_core::{caps, format_probe::FormatProbeKey, multisample};
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
@@ -16,10 +16,11 @@ use mtld3d_types::{
     D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1,
     D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
     D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DMULTISAMPLE_NONE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS,
+    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
+    IDirect3D9Vtbl,
 };
 
 use super::{
@@ -618,6 +619,15 @@ pub fn sampler_border_supported() -> bool {
     device_info().caps.contains(DeviceCapsFlags::SAMPLER_BORDER)
 }
 
+/// The Metal device's boolean capability bits.
+///
+/// The multisample paths resolve a `(type, quality)` request against these
+/// through `mtld3d_core::multisample`, so `CheckDeviceMultiSampleType` and
+/// every create path answer from the same cached `GetDeviceInfo` reply.
+pub fn device_caps_flags() -> DeviceCapsFlags {
+    device_info().caps
+}
+
 /// Whether the packed 16-bit Metal formats exist natively on this device.
 ///
 /// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
@@ -962,7 +972,7 @@ extern "system" fn d3d9_check_device_multi_sample_type(
     _this: *mut c_void,
     adapter: u32,
     _dev_type: u32,
-    _surface_format: u32,
+    surface_format: u32,
     _windowed: i32,
     multi_sample_type: u32,
     quality_levels: *mut u32,
@@ -976,13 +986,28 @@ extern "system" fn d3d9_check_device_multi_sample_type(
         );
         return D3DERR_INVALIDCALL;
     }
-    // D3D9 advertises "no MSAA" by returning NOTAVAILABLE for every non-NONE
-    // sample type. Games poll all 16 levels at init, so logging the expected
-    // "no" would spam WARN — this is the spec contract, not a fallback.
-    if multi_sample_type != D3DMULTISAMPLE_NONE {
-        return D3DERR_NOTAVAILABLE;
+    let caps = device_caps_flags();
+    // A format the device cannot render into at all cannot be multisampled
+    // either, whatever count is asked for.
+    let renderable = is_render_target_format_on_device(surface_format)
+        || is_depth_stencil_format(surface_format);
+    // `D3DMULTISAMPLE_NONMASKABLE` reports how many rungs its quality ladder
+    // has; every maskable level has exactly one quality level. Games poll the
+    // whole enum at start-up, so neither the yes nor the no is logged.
+    match multisample::resolve_sample_count(multi_sample_type, 0, surface_format, caps) {
+        Err(multisample::MultiSampleReject::Invalid) => D3DERR_INVALIDCALL,
+        Err(multisample::MultiSampleReject::Unavailable) => D3DERR_NOTAVAILABLE,
+        Ok(_) if !renderable && multi_sample_type != D3DMULTISAMPLE_NONE => D3DERR_NOTAVAILABLE,
+        Ok(_) => {
+            if multi_sample_type == D3DMULTISAMPLE_NONMASKABLE {
+                let levels = multisample::nonmaskable_quality_levels(caps);
+                // SAFETY: vtable out-param; `quality_levels` is *mut u32 per
+                // IDirect3D9 ABI.
+                unsafe { OutPtr::write_opt(quality_levels, levels) };
+            }
+            D3D_OK
+        }
     }
-    D3D_OK
 }
 
 extern "system" fn d3d9_check_depth_stencil_match(
@@ -1250,7 +1275,12 @@ extern "system" fn d3d9_create_device(
             "reject CreateDevice({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
-        destroy_partial_device(&cq_params, MetalHandle::NULL, MetalHandle::NULL);
+        destroy_partial_device(
+            &cq_params,
+            MetalHandle::NULL,
+            MetalHandle::NULL,
+            MetalHandle::NULL,
+        );
         return D3DERR_INVALIDCALL;
     }
 
@@ -1288,7 +1318,12 @@ extern "system" fn d3d9_create_device(
             "reject CreateDevice — zero backbuffer dims (windowed={}, hwnd=0x{hwnd:x})",
             pp.windowed,
         );
-        destroy_partial_device(&cq_params, layer_params.view_handle, MetalHandle::NULL);
+        destroy_partial_device(
+            &cq_params,
+            layer_params.view_handle,
+            MetalHandle::NULL,
+            MetalHandle::NULL,
+        );
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
@@ -1307,19 +1342,62 @@ extern "system" fn d3d9_create_device(
     let render_width = render_scale.dimension(pp.back_buffer_width);
     let render_height = render_scale.dimension(pp.back_buffer_height);
 
+    // The swap chain's multisample type applies to the back buffer and to the
+    // auto depth-stencil surface alike; the two attachments have to agree for
+    // Metal to accept the pass at all.
+    let sample_count = match multisample::resolve_sample_count(
+        pp.multi_sample_type,
+        pp.multi_sample_quality,
+        pp.back_buffer_format,
+        device_caps_flags(),
+    ) {
+        Ok(count) => u8::try_from(count).expect("sample count ≤ 16 fits u8"),
+        Err(reject) => {
+            warn!(
+                target: LOG_TARGET,
+                "reject CreateDevice: MultiSampleType={} Quality={} on back-buffer format {} is {}",
+                pp.multi_sample_type,
+                pp.multi_sample_quality,
+                pp.back_buffer_format,
+                if matches!(reject, multisample::MultiSampleReject::Invalid) {
+                    "not a valid sample count"
+                } else {
+                    "not available on this device"
+                },
+            );
+            destroy_partial_device(
+                &cq_params,
+                layer_params.view_handle,
+                MetalHandle::NULL,
+                MetalHandle::NULL,
+            );
+            restore_from_fullscreen(fullscreen.as_ref());
+            return D3DERR_INVALIDCALL;
+        }
+    };
+
     // Create backbuffer texture
     let mut bb_params = CreateBackbufferParams {
         device_handle: cq_params.device_handle,
         queue_handle: cq_params.queue_handle,
         width: render_width,
         height: render_height,
+        sample_count: u32::from(sample_count),
+        pad0: 0,
         texture_handle: MetalHandle::NULL,
         srgb_texture_handle: MetalHandle::NULL,
+        msaa_texture_handle: MetalHandle::NULL,
+        msaa_srgb_texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
     if status != 0 {
         error!(target: LOG_TARGET, "CreateBackbuffer failed (0x{status:08X})");
-        destroy_partial_device(&cq_params, layer_params.view_handle, MetalHandle::NULL);
+        destroy_partial_device(
+            &cq_params,
+            layer_params.view_handle,
+            MetalHandle::NULL,
+            MetalHandle::NULL,
+        );
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
@@ -1349,6 +1427,9 @@ extern "system" fn d3d9_create_device(
         layer_handle: layer_params.layer_handle,
         backbuffer_handle: bb_params.texture_handle,
         backbuffer_srgb_handle: bb_params.srgb_texture_handle,
+        backbuffer_msaa_handle: bb_params.msaa_texture_handle,
+        backbuffer_msaa_srgb_handle: bb_params.msaa_srgb_texture_handle,
+        backbuffer_sample_count: sample_count,
         depth_stencil_handle: depth_handle,
         depth_stencil_format: if depth_handle.is_null() {
             0
@@ -1365,6 +1446,9 @@ extern "system" fn d3d9_create_device(
             queue_handle: cq_params.queue_handle,
             backbuffer_handle: bb_params.texture_handle,
             backbuffer_srgb_handle: bb_params.srgb_texture_handle,
+            backbuffer_msaa_handle: bb_params.msaa_texture_handle,
+            backbuffer_msaa_srgb_handle: bb_params.msaa_srgb_texture_handle,
+            backbuffer_sample_count: sample_count,
             layer_handle: layer_params.layer_handle,
             view_handle: layer_params.view_handle,
             // Logical, paired with the scale below: `PassState::reset_frame`
@@ -1602,13 +1686,26 @@ fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
 /// Tear down the partial device handles assembled so far.
 ///
 /// Called on any failure between `CreateCommandQueue` and the final
-/// `Box::into_raw`. `view_handle` / `backbuffer_handle` are `MetalHandle::NULL`
-/// when the failure happens before that object was created.
+/// `Box::into_raw`. `view_handle` / `backbuffer_handle` /
+/// `backbuffer_msaa_handle` are `MetalHandle::NULL` when the failure happens
+/// before that object was created.
 fn destroy_partial_device(
     cq: &CreateCommandQueueParams,
     view_handle: MetalHandle<NSViewKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
+    backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
 ) {
+    if !backbuffer_msaa_handle.is_null() {
+        let handles = [backbuffer_msaa_handle.raw()];
+        let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+            kind: mtld3d_shared::mtl::DestroyKind::Texture,
+            pad0: 0,
+            handles_ptr: handles.as_ptr() as u64,
+            count: 1,
+            pad1: 0,
+        };
+        unix_call(&mut destroy);
+    }
     let mut destroy = DestroyCommandQueueParams {
         device_handle: cq.device_handle,
         queue_handle: cq.queue_handle,
@@ -1645,6 +1742,7 @@ fn create_auto_depth_stencil(
             cq_params,
             layer_params.view_handle,
             bb_params.texture_handle,
+            bb_params.msaa_texture_handle,
         );
         return Err(D3DERR_INVALIDCALL);
     };
@@ -1656,7 +1754,9 @@ fn create_auto_depth_stencil(
         width: bb_params.width,
         height: bb_params.height,
         pixel_format: ds_pixel_format,
-        pad0: 0,
+        // Matches the back buffer: Metal takes a pass's sample count from its
+        // attachments and rejects one where they disagree.
+        sample_count: bb_params.sample_count,
         texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut ds_params);
@@ -1666,6 +1766,7 @@ fn create_auto_depth_stencil(
             cq_params,
             layer_params.view_handle,
             bb_params.texture_handle,
+            bb_params.msaa_texture_handle,
         );
         return Err(D3DERR_INVALIDCALL);
     }

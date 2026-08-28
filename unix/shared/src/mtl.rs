@@ -151,15 +151,32 @@ pub enum LoadAction {
 
 /// `MTLStoreAction` wire encoding for render-pass color/depth/stencil attachments.
 ///
-/// Only the two values mtld3d currently emits are present — MSAA resolve
-/// variants land here when we wire MSAA.
-///
-/// Discriminants match the native `MTLStoreAction` enum.
+/// Discriminants match the native `MTLStoreAction` enum. The two resolve
+/// variants are only legal on an attachment whose texture is multisampled and
+/// whose descriptor names a single-sample resolve texture; `MultisampleResolve`
+/// additionally discards the multisample content, so it is emitted only where
+/// the load/store rules already decided the attachment itself is dead.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
 pub enum StoreAction {
     DontCare = 0,
     Store = 1,
+    MultisampleResolve = 2,
+    StoreAndMultisampleResolve = 3,
+}
+
+impl StoreAction {
+    /// The variant that also resolves into the attachment's resolve texture.
+    ///
+    /// `Store` keeps the multisample content for a later pass in the same
+    /// submission; `DontCare` drops it once the resolve has been taken.
+    #[must_use]
+    pub const fn with_resolve(self) -> Self {
+        match self {
+            Self::DontCare | Self::MultisampleResolve => Self::MultisampleResolve,
+            Self::Store | Self::StoreAndMultisampleResolve => Self::StoreAndMultisampleResolve,
+        }
+    }
 }
 
 /// `MTLVisibilityResultMode` wire encoding.
@@ -526,6 +543,31 @@ bitflags! {
         /// Intel/AMD Bronze driver typically says no. The half-float
         /// formats filter on every family and are not covered by this bit.
         const FLOAT32_FILTERING = 1 << 2;
+        /// `supportsTextureSampleCount:2` answered yes.
+        const SAMPLE_COUNT_2 = 1 << 3;
+        /// `supportsTextureSampleCount:4` answered yes.
+        const SAMPLE_COUNT_4 = 1 << 4;
+        /// `supportsTextureSampleCount:8` answered yes.
+        const SAMPLE_COUNT_8 = 1 << 5;
+    }
+}
+
+impl DeviceCapsFlags {
+    /// Whether `sample_count` is a creatable multisample texture count here.
+    ///
+    /// `1` (no multisampling) is always creatable. Every other count needs the
+    /// matching bit the `GetDeviceInfo` thunk filled in from
+    /// `supportsTextureSampleCount:`; counts mtld3d does not plumb answer
+    /// `false` even when Metal would accept them.
+    #[must_use]
+    pub const fn supports_sample_count(self, sample_count: u32) -> bool {
+        match sample_count {
+            1 => true,
+            2 => self.contains(Self::SAMPLE_COUNT_2),
+            4 => self.contains(Self::SAMPLE_COUNT_4),
+            8 => self.contains(Self::SAMPLE_COUNT_8),
+            _ => false,
+        }
     }
 }
 

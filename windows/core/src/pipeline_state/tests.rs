@@ -53,6 +53,7 @@ fn base() -> PipelineSnapshot {
         },
         extra: ExtraColorAttachments::NONE,
         ps_color_out_mask: 0b1,
+        sample_count: 1,
     }
 }
 
@@ -241,6 +242,7 @@ fn key_changes_on_every_field() {
         mutate(|s| s.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT)),
         "has_color_output"
     );
+    assert_ne!(k0, mutate(|s| s.sample_count = 4), "sample_count");
 
     // Separate-alpha path: enabling it changes the effective alpha
     // factors even though the per-alpha fields were already set.

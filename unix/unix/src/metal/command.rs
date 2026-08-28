@@ -1496,6 +1496,18 @@ fn encode_pass(
         color0.setLevel(pass.color_level() as usize);
         rt_width = rt_width.min((texture.width() >> pass.color_level()).max(1));
         rt_height = rt_height.min((texture.height() >> pass.color_level()).max(1));
+        if !pass.color_resolve_texture.is_null() {
+            mtld3d_shared::crumb!("pass:colorres", pass.color_resolve_texture.raw());
+            let Some(resolve) = pass.color_resolve_texture.into_retained() else {
+                error!(target: LOG_TARGET, "encode_pass: colour resolve texture retain failed (handle={:#x})", pass.color_resolve_texture);
+                return false;
+            };
+            color0.setResolveTexture(Some(&resolve));
+            // The resolve target is the same D3D9 surface without
+            // multisampling, so it takes the attachment's own subresource.
+            color0.setResolveSlice(pass.color_slice() as usize);
+            color0.setResolveLevel(pass.color_level() as usize);
+        }
         color0.setStoreAction(map_store_action(pass.color_store_action));
         match pass.color_load_action {
             LoadAction::Clear => {
@@ -1543,6 +1555,15 @@ fn encode_pass(
         color.setLevel(extra.level() as usize);
         rt_width = rt_width.min((texture.width() >> extra.level()).max(1));
         rt_height = rt_height.min((texture.height() >> extra.level()).max(1));
+        if !extra.resolve_texture.is_null() {
+            let Some(resolve) = extra.resolve_texture.into_retained() else {
+                error!(target: LOG_TARGET, "encode_pass: colour {} resolve texture retain failed (handle={:#x})", i + 1, extra.resolve_texture);
+                return false;
+            };
+            color.setResolveTexture(Some(&resolve));
+            color.setResolveSlice(extra.slice() as usize);
+            color.setResolveLevel(extra.level() as usize);
+        }
         color.setStoreAction(map_store_action(extra.store_action));
         match extra.load_action {
             LoadAction::Clear => {
@@ -2131,13 +2152,12 @@ fn encode_pass(
 }
 
 /// Translate a wire `StoreAction` to the corresponding `MTLStoreAction`.
-///
-/// Trivial today (two variants); centralised so MSAA-resolve variants
-/// land in one place when we wire MSAA.
 const fn map_store_action(s: StoreAction) -> MTLStoreAction {
     match s {
         StoreAction::Store => MTLStoreAction::Store,
         StoreAction::DontCare => MTLStoreAction::DontCare,
+        StoreAction::MultisampleResolve => MTLStoreAction::MultisampleResolve,
+        StoreAction::StoreAndMultisampleResolve => MTLStoreAction::StoreAndMultisampleResolve,
     }
 }
 

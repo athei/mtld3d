@@ -213,6 +213,26 @@ pub enum Op {
     },
 }
 
+/// Render target 0 as the encoder binds it.
+///
+/// A parameter bag rather than eight positional arguments. `logical_size` is
+/// the extent D3D9 reports and `scale` what it is rasterized at; `msaa_texture`
+/// is the multisampled companion the pass attaches, NULL for a single-sampled
+/// target, and `sample_count` its count.
+pub struct ColorRtBinding {
+    pub texture: MetalHandle<MTLTextureKind>,
+    pub msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa_texture`, NULL whenever that is.
+    pub msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    pub sample_count: u8,
+    pub logical_size: (u32, u32),
+    pub format: PixelFormat,
+    pub has_alpha: bool,
+    pub scale: RenderScale,
+    /// `(slice, level)` of the attachment.
+    pub subresource: (u32, u32),
+}
+
 /// One side (source or destination) of a scaled blit, for [`FrameEncoder::stretch_blit_scaled`].
 pub struct BlitSide {
     pub handle: u64,
@@ -220,6 +240,17 @@ pub struct BlitSide {
     pub dims: (u32, u32),
     /// Mip level of `handle` the blit reads or writes.
     pub mip: u32,
+    /// Multisampled companion of `handle`, NULL when there is none.
+    ///
+    /// Read on the destination side only: the quad renders into the
+    /// multisampled attachment and the pass resolves into `handle`. A
+    /// multisampled *source* is read through `handle`, which the resolve has
+    /// already filled.
+    pub msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of that companion, NULL whenever the companion is.
+    pub msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the destination, 1 when it is single-sampled.
+    pub sample_count: u8,
 }
 
 /// One `ColorFill` against a render-target texture, resolved on the API thread.
@@ -905,12 +936,12 @@ pub struct FrameEncoder {
     clear_quad_pipeline_cache: FxHashMap<ClearQuadKey, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-destination-format "blit-quad" pipeline handles.
     ///
-    /// One entry per destination colour `PixelFormat`. Used by the scaling
+    /// One entry per `(destination colour format, pass sample count)`. Used by the scaling
     /// `StretchRect` path (`stretch_blit_scaled`) to render the source
     /// texture onto a quad covering the destination rect — Metal's blit
     /// encoder can't scale. Process-lifetime, same posture as
     /// `clear_quad_pipeline_cache`.
-    blit_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
+    blit_pipeline_cache: FxHashMap<(PixelFormat, u8), MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-destination-format "upload-quad" pipeline handles.
     ///
     /// One entry per destination colour `PixelFormat`. Used by the GPU
@@ -1150,6 +1181,8 @@ struct ClearQuadKey {
     flags: ClearQuadFlags,
     /// Render targets 1..3 of the pass, alpha bits cleared (the quad blends nothing).
     extra: mtld3d_core::pipeline_state::ExtraColorAttachments,
+    /// Sample count of the pass the quad draws into; Metal requires the match.
+    sample_count: u8,
 }
 
 /// Where a mid-pass clear quad lands, as the depth and stencil clear chains report it.
@@ -1333,6 +1366,20 @@ fn clip_rect_to_viewport(
         return None;
     }
     Some((x1, y1, x2 - x1, y2 - y1))
+}
+
+/// The Metal textures a standalone colour surface owns, for retirement.
+///
+/// A surface can carry up to four: the single-sample texture the D3D9
+/// surface's identity is, its sRGB twin view, the multisampled companion the
+/// passes attach, and that companion's own twin. Grouped so
+/// [`FrameEncoder::retire_color_target`] takes one argument per surface
+/// rather than one per view.
+pub struct RetiredColorTarget {
+    pub base: MetalHandle<MTLTextureKind>,
+    pub srgb: MetalHandle<MTLTextureKind>,
+    pub msaa: MetalHandle<MTLTextureKind>,
+    pub msaa_srgb: MetalHandle<MTLTextureKind>,
 }
 
 impl FrameEncoder {
@@ -2167,6 +2214,9 @@ impl FrameEncoder {
             .reset_frame(&mtld3d_core::passes::FrameReset {
                 backbuffer: frame.backbuffer_handle,
                 backbuffer_srgb: frame.backbuffer_srgb_handle,
+                backbuffer_msaa: frame.backbuffer_msaa_handle,
+                backbuffer_msaa_srgb: frame.backbuffer_msaa_srgb_handle,
+                backbuffer_sample_count: frame.backbuffer_sample_count,
                 backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
                 backbuffer_format: frame.backbuffer_format,
                 depth_texture: frame.depth_texture,
@@ -3023,47 +3073,27 @@ impl FrameEncoder {
         self.pass_state.flush_pending_clears();
     }
 
-    pub fn set_color_render_target(
-        &mut self,
-        texture: MetalHandle<MTLTextureKind>,
-        width: u32,
-        height: u32,
-        format: PixelFormat,
-        has_alpha: bool,
-        scale: RenderScale,
-    ) {
-        self.set_color_render_target_subresource(
-            texture,
-            (width, height),
-            format,
-            has_alpha,
-            scale,
-            (0, 0),
-        );
-    }
-
-    /// Bind a color render-target slice and mip level.
-    pub fn set_color_render_target_subresource(
-        &mut self,
-        texture: MetalHandle<MTLTextureKind>,
-        size: (u32, u32),
-        format: PixelFormat,
-        has_alpha: bool,
-        scale: RenderScale,
-        subresource: (u32, u32),
-    ) {
-        let (width, height) = size;
+    /// Bind render target 0, with its subresource, alpha bit and multisample companion.
+    pub fn set_color_render_target(&mut self, binding: &ColorRtBinding) {
+        let (width, height) = binding.logical_size;
         self.pass_state.set_color_render_target_subresource(
-            texture,
+            binding.texture,
             width,
             height,
-            format,
-            scale,
-            subresource,
+            binding.format,
+            binding.scale,
+            binding.subresource,
         );
         // Kept in lockstep with the format: the Metal pixel format alone can't
         // distinguish X8R8G8B8 (no alpha) from A8R8G8B8 (both `Bgra8Unorm`).
-        self.pass_state.set_color_rt_has_alpha(has_alpha);
+        self.pass_state.set_color_rt_has_alpha(binding.has_alpha);
+        // Likewise in lockstep: the setter above clears the companion, so a
+        // single-sampled target can never inherit the previous one's.
+        self.pass_state.set_color_msaa(
+            binding.msaa_texture,
+            binding.msaa_srgb_texture,
+            binding.sample_count,
+        );
     }
 
     /// Metal pixel format of the currently bound color RT.
@@ -3085,19 +3115,16 @@ impl FrameEncoder {
 
     /// Park a standalone colour target's textures on the retention queue.
     ///
-    /// Called when the surface that owns them finalizes. The sRGB twin goes
-    /// first (it holds a retain on the base) and its registration is dropped
-    /// with it, so no later binding can resolve a view whose storage is gone.
-    /// Both destroys are gated on the current submit seq, since a pass or
-    /// blit already encoded this frame may still name either handle.
-    pub fn retire_color_target(
-        &mut self,
-        base: MetalHandle<MTLTextureKind>,
-        srgb: MetalHandle<MTLTextureKind>,
-    ) {
-        self.pass_state.unregister_srgb_twin(srgb);
+    /// Called when the surface that owns them finalizes. Each view goes ahead
+    /// of the texture it was made from, since it holds a retain on it, and
+    /// the sRGB twin's registration is dropped with it so no later binding
+    /// can resolve a view whose storage is gone. Every destroy is gated on
+    /// the current submit seq, since a pass or blit already encoded this
+    /// frame may still name any of the handles.
+    pub fn retire_color_target(&mut self, target: &RetiredColorTarget) {
+        self.pass_state.unregister_srgb_twin(target.srgb);
         let seq = self.current_submit_seq;
-        for handle in [srgb, base] {
+        for handle in [target.srgb, target.base, target.msaa_srgb, target.msaa] {
             if handle.is_null() {
                 continue;
             }
@@ -3147,6 +3174,14 @@ impl FrameEncoder {
     #[must_use]
     pub const fn color_attachment_is_srgb(&self) -> bool {
         self.pass_state.pass_srgb_write()
+    }
+
+    /// Sample count of the currently bound color RT, 1 when single-sampled.
+    ///
+    /// Read at draw time into the pipeline key: Metal requires a pipeline's
+    /// `rasterSampleCount` to match the pass's attachments.
+    pub const fn current_color_sample_count(&self) -> u8 {
+        self.pass_state.current_color_sample_count()
     }
 
     /// Whether the currently bound color RT's D3D format has a real alpha channel.
@@ -3199,6 +3234,7 @@ impl FrameEncoder {
         let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
+        let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
         for slot in 1..4usize {
             if saved.extra_matches_rt0(slot) {
                 continue;
@@ -3215,6 +3251,11 @@ impl FrameEncoder {
                 (target.subresource & 0xff, target.subresource >> 8),
             );
             self.pass_state.set_color_rt_has_alpha(target.has_alpha);
+            self.pass_state.set_color_msaa(
+                target.msaa_texture,
+                target.msaa_srgb_texture,
+                target.sample_count,
+            );
             self.pass_state
                 .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
             f(self);
@@ -3226,6 +3267,11 @@ impl FrameEncoder {
             prev_depth_sampleable,
             prev_depth_has_stencil,
         );
+        // The setter above reset the count, so it travels back with the
+        // handle; without it a multisampled depth attachment would come back
+        // declared single-sampled and be dropped at the next pass open.
+        self.pass_state
+            .set_depth_sample_count(prev_depth_sample_count);
         self.pass_state.restore_color_attachments(saved);
     }
 
@@ -3257,6 +3303,13 @@ impl FrameEncoder {
         self.pass_state.note_color_read_back(handle);
     }
 
+    /// Resolve `handle` now, because a blit is about to read it.
+    ///
+    /// See `PassState::note_msaa_read`. A no-op for a single-sampled target.
+    pub fn note_msaa_read(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        self.pass_state.note_msaa_read(handle);
+    }
+
     /// Bind mip `level` of `texture`, extent `size`, as the depth/stencil attachment.
     pub fn set_depth_stencil_attachment_level(
         &mut self,
@@ -3273,6 +3326,14 @@ impl FrameEncoder {
             is_sampleable,
             has_stencil,
         );
+    }
+
+    /// Declare the bound depth attachment's sample count.
+    ///
+    /// Called in lockstep with `set_depth_stencil_attachment_level`, which
+    /// resets it to 1.
+    pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
+        self.pass_state.set_depth_sample_count(sample_count);
     }
 
     /// Apply a whole-target colour `Clear`.
@@ -3761,6 +3822,7 @@ impl FrameEncoder {
             flags: key.flags,
             extra_present_mask: u32::from(key.extra.present_mask),
             extra_formats: key.extra.formats,
+            sample_count: u32::from(key.sample_count),
             pipeline_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut params);
@@ -3816,14 +3878,16 @@ impl FrameEncoder {
     /// Used by the scaling `StretchRect` path. Returns 0 on a unix-side
     /// compile / pipeline-create failure; `stretch_blit_scaled` guards
     /// on `!= 0` and aborts the scale (the 1:1 path is unaffected).
-    fn get_or_create_blit_pipeline(&mut self, color_format: PixelFormat) -> u64 {
-        if let Some(&handle) = self.blit_pipeline_cache.get(&color_format) {
+    fn get_or_create_blit_pipeline(&mut self, color_format: PixelFormat, sample_count: u8) -> u64 {
+        let key = (color_format, sample_count);
+        if let Some(&handle) = self.blit_pipeline_cache.get(&key) {
             return handle.raw();
         }
         let mut params = EnsureBlitPipelineParams {
             device_handle: self.device_handle,
             color_format,
             quad_kind: QuadPipelineKind::StretchBlit,
+            sample_count: u32::from(sample_count),
             pipeline_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut params);
@@ -3833,11 +3897,10 @@ impl FrameEncoder {
                 target: LOG_TARGET,
                 "blit-quad: EnsureBlitPipeline failed status={status:#x} → scaling StretchRect dropped"
             );
-            self.blit_pipeline_cache
-                .insert(color_format, MetalHandle::NULL);
+            self.blit_pipeline_cache.insert(key, MetalHandle::NULL);
             return 0;
         }
-        self.blit_pipeline_cache.insert(color_format, pipeline);
+        self.blit_pipeline_cache.insert(key, pipeline);
         pipeline.raw()
     }
 
@@ -3854,6 +3917,9 @@ impl FrameEncoder {
             device_handle: self.device_handle,
             color_format,
             quad_kind: QuadPipelineKind::TextureUpload,
+            // A D3D9 texture cannot be multisampled, so the upload pass is
+            // always single-sampled.
+            sample_count: 1,
             pipeline_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut params);
@@ -3935,12 +4001,14 @@ impl FrameEncoder {
             rect: src_rect,
             dims: src_dims,
             mip: src_mip,
+            ..
         } = src;
         let &BlitSide {
             handle: dst_handle,
             rect: dst_rect,
             dims: dst_dims,
             mip: dst_mip,
+            ..
         } = dst;
         if dst_handle == 0 || src_handle == 0 {
             return;
@@ -3958,7 +4026,7 @@ impl FrameEncoder {
         // destination is bound, so `ensure_pass_open` freezes the same
         // choice, and the next draw or `Clear` re-applies the game's state.
         self.pass_state.set_srgb_write_enabled(false);
-        let pipeline = self.get_or_create_blit_pipeline(dst_format);
+        let pipeline = self.get_or_create_blit_pipeline(dst_format, dst.sample_count.max(1));
         if pipeline == 0 {
             return;
         }
@@ -4007,6 +4075,7 @@ impl FrameEncoder {
         let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
+        let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
 
@@ -4025,6 +4094,11 @@ impl FrameEncoder {
             RenderScale::IDENTITY,
             (0, dst_mip),
         );
+        // A multisampled destination is written through its companion and
+        // resolved into `dst_tex` at pass end, which is what every later read
+        // of the surface looks at.
+        self.pass_state
+            .set_color_msaa(dst.msaa, dst.msaa_srgb, dst.sample_count);
         self.pass_state
             .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state
@@ -4088,6 +4162,11 @@ impl FrameEncoder {
             prev_depth_sampleable,
             prev_depth_has_stencil,
         );
+        // The setter above reset the count, so it travels back with the
+        // handle; without it a multisampled depth attachment would come back
+        // declared single-sampled and be dropped at the next pass open.
+        self.pass_state
+            .set_depth_sample_count(prev_depth_sample_count);
         let (pvx, pvy, pvw, pvh) = prev_viewport;
         self.pass_state
             .set_viewport(pvx, pvy, pvw, pvh, prev_min_z, prev_max_z);
@@ -4260,6 +4339,7 @@ impl FrameEncoder {
                 PixelFormat::Bgra8Unorm
             },
             flags,
+            sample_count: self.pass_state.current_color_sample_count(),
             extra: if has_color {
                 self.clear_quad_extra_targets()
             } else {
@@ -4382,6 +4462,7 @@ impl FrameEncoder {
             color_format,
             flags,
             extra: self.clear_quad_extra_targets(),
+            sample_count: self.pass_state.current_color_sample_count(),
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
@@ -7520,6 +7601,12 @@ pub struct FrameData {
     backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of the back buffer; see `FrameInit`.
     backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `backbuffer_handle`, NULL when there is none.
+    backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_msaa_handle`; see `FrameInit`.
+    backbuffer_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Sample count the frame's back buffer and default depth surface carry.
+    backbuffer_sample_count: u8,
     layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
@@ -7650,6 +7737,12 @@ pub struct FrameInit {
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of the back buffer, attached under `D3DRS_SRGBWRITEENABLE`.
     pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the back buffer, NULL when it is single-sampled.
+    pub backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of that companion, attached under `D3DRS_SRGBWRITEENABLE`.
+    pub backbuffer_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Sample count of the back buffer and the frame's default depth surface.
+    pub backbuffer_sample_count: u8,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     pub view_handle: MetalHandle<NSViewKind>,
     /// The frame's **logical** back-buffer width, the one D3D9 reports.
@@ -7689,6 +7782,9 @@ impl FrameData {
             queue_handle: init.queue_handle,
             backbuffer_handle: init.backbuffer_handle,
             backbuffer_srgb_handle: init.backbuffer_srgb_handle,
+            backbuffer_msaa_handle: init.backbuffer_msaa_handle,
+            backbuffer_msaa_srgb_handle: init.backbuffer_msaa_srgb_handle,
+            backbuffer_sample_count: init.backbuffer_sample_count,
             layer_handle: init.layer_handle,
             view_handle: init.view_handle,
             backbuffer_width: init.backbuffer_width,
@@ -8664,10 +8760,13 @@ fn pass_to_descriptor(
         StencilLoad::Clear { value } => (LoadAction::Clear, value),
         StencilLoad::DontCare => (LoadAction::DontCare, 0),
     };
-    let color_store_action = match p.color_store() {
+    let mut color_store_action = match p.color_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
     };
+    if !p.color_resolve_texture().is_null() {
+        color_store_action = color_store_action.with_resolve();
+    }
     let depth_store_action = match p.depth_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
@@ -8681,10 +8780,12 @@ fn pass_to_descriptor(
             MetalHandle::NULL
         };
     PassDescriptor {
-        // The attachment is the sRGB twin view whenever the pass encodes on
-        // write; every load/store rule above still reasons about the base
-        // handle, which is the same Metal texture.
+        // The attachment is the multisampled companion where the target has
+        // one, and the sRGB twin view of whichever texture that is whenever
+        // the pass encodes on write; every load/store rule above still
+        // reasons about the base handle, which is the same Metal texture.
         color_texture: p.color_attachment_texture(),
+        color_resolve_texture: p.color_resolve_texture(),
         depth_texture: p.depth_texture(),
         commands_ptr: p.commands().as_ptr() as u64,
         visibility_result_buffer,
@@ -8723,17 +8824,23 @@ fn pass_to_descriptor(
             if !a.is_bound() {
                 return ExtraColorDesc::NONE;
             }
+            let store = match a.store() {
+                PassStoreAction::Store => StoreAction::Store,
+                PassStoreAction::DontCare => StoreAction::DontCare,
+            };
             ExtraColorDesc {
                 texture: a.attachment_texture(),
+                resolve_texture: a.resolve_texture(),
                 subresource: a.slice() | (a.level() << 8),
                 load_action: match a.load() {
                     ColorLoad::Load => LoadAction::Load,
                     ColorLoad::Clear { .. } => LoadAction::Clear,
                     ColorLoad::DontCare => LoadAction::DontCare,
                 },
-                store_action: match a.store() {
-                    PassStoreAction::Store => StoreAction::Store,
-                    PassStoreAction::DontCare => StoreAction::DontCare,
+                store_action: if a.resolve_texture().is_null() {
+                    store
+                } else {
+                    store.with_resolve()
                 },
                 reserved: 0,
             }
@@ -8776,6 +8883,7 @@ fn log_pass_depth_attach(p: &Pass) {
 fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
     PassDescriptor {
         color_texture: MetalHandle::NULL,
+        color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
         commands_ptr: 0,
         visibility_result_buffer: MetalHandle::NULL,

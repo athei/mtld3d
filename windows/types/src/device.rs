@@ -231,8 +231,18 @@ pub const D3DRTYPE_VERTEXBUFFER: u32 = 6;
 pub const D3DRTYPE_INDEXBUFFER: u32 = 7;
 
 // ── D3D9 multisample types (`D3DMULTISAMPLE_TYPE`) ──
+//
+// The enum is the sample count for every maskable level, so
+// `D3DMULTISAMPLE_4_SAMPLES` is literally 4. `NONMASKABLE` is the exception:
+// it names a driver-chosen quality ladder whose rung is the separate
+// `MultiSampleQuality` argument.
 
 pub const D3DMULTISAMPLE_NONE: u32 = 0;
+pub const D3DMULTISAMPLE_NONMASKABLE: u32 = 1;
+pub const D3DMULTISAMPLE_2_SAMPLES: u32 = 2;
+pub const D3DMULTISAMPLE_4_SAMPLES: u32 = 4;
+pub const D3DMULTISAMPLE_8_SAMPLES: u32 = 8;
+pub const D3DMULTISAMPLE_16_SAMPLES: u32 = 16;
 
 // ── D3D9 state-block types (`D3DSTATEBLOCKTYPE`) ──
 

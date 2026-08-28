@@ -166,18 +166,25 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **0 `real` · 92 `expected` ·
-2 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
+re-checked before retagging. Headline: **4 `real` · 93 `expected` ·
+3 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
 subtest-arches `crash=0`. (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
 newly-running `srgbtexture_test` passes. 2026-08-28: honouring
 `D3DCREATE_NOWINDOWCHANGES` dropped test_window_style 5215, and test_wndproc
 4551 was re-derived from the raw capture and corrected from `real` to
-`expected`, which empties the `real` backlog.) Only two tags change what the
-gate tolerates: `flaky` (count changes in either direction) and `ceiling`
-(reads below the pin). Every other tag is documentation, so a correction between `real`,
-`expected` and `caps` is never a gate change.
+`expected`. Multisampling then moved the counts in both directions. Four
+`device.c/test_reset` sites now pass, because a fullscreen `Reset` with a
+zeroed `D3DPRESENT_PARAMETERS` is rejected for its `D3DFMT_UNKNOWN`
+back-buffer format. Seven `visual.c` tests stopped skipping (every one of
+them gates on `CheckDeviceMultiSampleType`) and five of the seven pass
+outright; the clusters below cover what the other two and the tests they
+unblocked leave failing, including the four `real` sites they add.) Only two
+tags change what the gate tolerates: `flaky` (count changes in either
+direction) and `ceiling` (reads below the pin). Every other tag is
+documentation, so a correction between `real`, `expected` and `caps` is never
+a gate change.
 
 #### Desktop mode switching, and how fullscreen honors the requested size
 
@@ -311,8 +318,7 @@ mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths.
 ### device.c/test_reset
 Sites: 2126=expected 2127=expected 2179=expected 2180=expected
 Sites: 2234=ceiling 2237=ceiling 2238=ceiling 2250=ceiling
-Sites: 2251=ceiling 2519=expected 2521=expected 2529=expected
-Sites: 2531=expected
+Sites: 2251=ceiling
 
 Everything fullscreen in this cluster follows from one decision: we never
 change the desktop mode. The back buffer honors the resolution it was asked
@@ -326,13 +332,12 @@ request at 2133/2134 and 2172/2173, `GetPresentParameters` reporting it at
   before any D3D9 object is involved. Not ours to implement. These and
   2250/2251 are `ceiling`: a CI runner's display accepts the CDS and they
   read zero there.
-- 2519/2521, 2529/2531 expect a fullscreen Reset to a non-enumerable mode
-  (32x32, 801x600) to return INVALIDCALL. We do not validate the requested
-  resolution against a mode list: no mode is set, the only list worth
-  validating against is Wine's own (what the mode-set used to consult), and
-  rejecting against our narrower synthetic `ADAPTER_MODES` table would fail
-  resolutions Wine really does enumerate. Zero dimensions are still rejected,
-  since the D3D9 "zero means the client area" rule is windowed-only.
+
+The fullscreen Resets to a non-enumerable mode (32x32, 801x600) now return
+INVALIDCALL, for a reason that has nothing to do with the resolution: each
+zeroes its whole `D3DPRESENT_PARAMETERS`, so `BackBufferFormat` is
+`D3DFMT_UNKNOWN`, which a fullscreen Reset has to reject. The resolution
+itself is still not validated against a mode list, since no mode is set.
 
 The windowed API contract in this test passes: Reset rejects an outstanding
 app reference to a DEFAULT-pool resource or an implicit surface, and a
@@ -605,6 +610,41 @@ GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
 result matching no vendor's encoding. Matching a specific vendor is neither
 feasible nor desirable. No capability involved (old `caps` tag incoherent).
 
+### visual.c/test_multisample_get_front_buffer_data
+Sites: 17179=real 17181=real
+
+`GetFrontBufferData` into a `D3DPOOL_SYSTEMMEM` *texture level* returns
+INVALIDCALL, so the pixel read after it sees nothing. The same call into an
+offscreen-plain system-memory surface, a few lines earlier in the same test,
+passes. Nothing about it is multisample-specific: the readback path takes the
+destination's own backing store, which only an offscreen-plain surface has,
+while a texture level's pixels live in the parent texture's per-mip staging.
+The test reaches it only on a multisample-capable device, which is why the
+site is new.
+
+### visual.c/multisampled_depth_buffer_test
+Sites: 17476=expected
+
+The second half of the test binds a 2x multisampled depth surface while
+render target 0 is the single-sampled back buffer. Metal takes a render
+pass's sample count from its attachments and rejects a pass where they
+disagree, so mtld3d drops the mismatched depth attachment and the draw runs
+untested. D3D9 leaves this case to the driver, and the test says so itself:
+it accepts one result from AMD and a different one from Nvidia, and does not
+require depth testing to work at all. The matched half of the test (a 2x
+depth surface beside a 2x render target) passes.
+
+### visual.c/resz_test
+Sites: 17724=real 17862=real
+
+The RESZ hack (`SetRenderState(D3DRS_POINTSIZE, 0x7fa05000)`) resolves the
+bound depth buffer into an INTZ texture, and mtld3d implements it as a
+depth-to-depth copy. From a *multisampled* depth surface that copy is not
+what RESZ means: the samples have to be resolved, which on Metal is a render
+pass with a depth resolve attachment rather than a blit. The colours the
+test reads back are close to the expected gradient but wrong per pixel. The
+single-sampled RESZ path is unaffected and covered by the end-to-end suite.
+
 ### visual.c/add_dirty_rect_test
 Sites: 19210=expected 19217=expected 19232=expected
 
@@ -614,6 +654,18 @@ sub-rect may refresh (19232). Our design uploads whole mips eagerly with
 self-tracked dirtiness and treats AddDirtyRect as a no-op — we show fresher
 data than required. Deliberate; the READONLY-first-lock upload defect that
 used to live here (19156/19163) is fixed.
+
+### visual.c/test_multisample_mismatch
+Sites: 20880=expected 20883=expected 20959=expected 20962=expected
+
+The whole test draws with a multisampled render target beside a
+single-sampled depth buffer and the other way round. Metal rejects a render
+pass whose attachments disagree on sample count, so mtld3d drops the
+mismatched depth attachment; the draws land but the depth test does not
+gate them. Same rationale as multisampled_depth_buffer_test 17476, and the
+same evidence that D3D9 never defined the case: every assertion here carries
+a second accepted colour under `broken()`, and the comments in the test
+record that AMD and Nvidia disagree about whether the draw happens at all.
 
 ### visual.c/test_flip
 Sites: 22053=expected 22055=expected 22064=expected 22066=expected
@@ -653,6 +705,17 @@ with Acquire before calling, and only the unix side raises that counter
 (`fetch_max`, on GPU retirement), so a stale read can turn a legal
 in-place write into a needless rename but never the reverse. The kept
 divergence itself is unchanged.
+
+### visual.c/test_alpha_to_coverage
+Sites: 26538=caps
+
+`win_skip("Alpha to coverage is not supported.")`, which counts as a failure
+under Wine. Alpha to coverage is reached through a vendor pseudo-format
+(NVIDIA's `ATOC` through `D3DRS_ADAPTIVETESS_Y`, AMD's `A2M1` through
+`D3DRS_POINTSIZE`); mtld3d advertises neither, and answering NOTAVAILABLE for
+the probe is the conformant response for a device without the extension. The
+test only reaches the probe on a multisample-capable device, which is why the
+site is new.
 
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected

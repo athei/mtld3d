@@ -253,7 +253,12 @@ use crate::shader_compile_stats::CompileBucket;
 /// `64` sampler LOD bias: `VariantFlags::LOD_BIAS` gives a pixel shader a
 /// per-slot bias uniform and puts `bias(...)` on every implicit-LOD sample,
 /// changing the MSL of both pixel-shader emitters and the PS key hash shape.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 64;
+///
+/// `65` `D3DRS_MULTISAMPLEMASK`: a pixel shader drawing into a maskable
+/// multisampled render target under a narrowed mask returns a struct with a
+/// `[[sample_mask]]` member, which is a new PS variant bit and new MSL for
+/// both the fixed-function and the programmable emitter.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 65;
 
 /// File magic.
 ///

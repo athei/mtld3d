@@ -103,6 +103,7 @@ windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs ProgramId Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/ids.rs TextureId Clone,Copy,PartialEq,Eq,Hash,Debug
+windows/core/src/multisample.rs MultiSampleReject Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorClearOutcome Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs ColorLoad Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/passes.rs CurrentAttachmentFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
@@ -182,6 +183,7 @@ windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,Par
 windows/d3d9/src/surface.rs GdiDc Clone,Copy
 windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/d3d9/src/surface.rs SurfaceMultiSample Clone,Copy,PartialEq,Eq
 windows/d3d9/src/texture.rs TextureFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/vertex_shader.rs VsConstUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/tests/src/pixel.rs Rgba8 Clone,Copy,PartialEq,Eq,Debug

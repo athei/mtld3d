@@ -1267,6 +1267,11 @@ impl FfState {
             cube_sampler_mask: 0,
             tt_projected_mask: 0,
             color_out_mask: 0,
+            // A render-pass property: only a maskable multisampled target
+            // gives `D3DRS_MULTISAMPLEMASK` a meaning, and which target a draw
+            // lands on is known on the encoder thread, so `emit_draw` folds it
+            // in there.
+            sample_mask: 0,
             flags,
         }
     }

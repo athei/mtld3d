@@ -39,6 +39,10 @@ pub struct HarnessConfig {
     pub behavior_flags: u32,
     /// `D3DPRESENT_PARAMETERS.Flags`, e.g. `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`.
     pub present_flags: u32,
+    /// `D3DPRESENT_PARAMETERS.MultiSampleType` (`D3DMULTISAMPLE_*`).
+    pub multi_sample_type: u32,
+    /// `D3DPRESENT_PARAMETERS.MultiSampleQuality`.
+    pub multi_sample_quality: u32,
 }
 
 impl Default for HarnessConfig {
@@ -52,6 +56,8 @@ impl Default for HarnessConfig {
             windowed: 1,
             behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
             present_flags: 0,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
         }
     }
 }
@@ -112,6 +118,8 @@ pub struct Harness {
     back_buffer_format: u32,
     depth_format: Option<u32>,
     present_flags: u32,
+    /// `D3DMULTISAMPLE_TYPE` the swap chain was created with, carried into `reset`.
+    multi_sample_type: u32,
 }
 
 impl Harness {
@@ -181,6 +189,7 @@ impl Harness {
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
             present_flags: 0,
+            multi_sample_type: 0,
         }
     }
 
@@ -229,6 +238,7 @@ impl Harness {
             back_buffer_format: cfg.back_buffer_format,
             depth_format: cfg.depth_format,
             present_flags: cfg.present_flags,
+            multi_sample_type: cfg.multi_sample_type,
         }
     }
 
@@ -1798,6 +1808,84 @@ impl Harness {
         Surface::from_raw(out)
     }
 
+    /// `CreateRenderTarget` with a multisample type, returning the raw hr.
+    ///
+    /// `lockable` is passed through so the rejection of a lockable
+    /// multisampled target can be pinned.
+    pub fn create_render_target_ms_hr(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+        lockable: i32,
+    ) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                size.0,
+                size.1,
+                format,
+                multi_sample.0,
+                multi_sample.1,
+                lockable,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() {
+            (hr, Some(Surface::from_raw(out)))
+        } else {
+            (hr, None)
+        }
+    }
+
+    /// `CreateRenderTarget` with a multisample type, asserting success.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_render_target_ms(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+    ) -> Surface<'_> {
+        let (hr, surf) = self.create_render_target_ms_hr(size, format, multi_sample, 0);
+        assert_eq!(hr, 0, "CreateRenderTarget(multisampled) failed: 0x{hr:08X}");
+        surf.expect("CreateRenderTarget(multisampled) returned null")
+    }
+
+    /// `CreateDepthStencilSurface` with a multisample type, returning the raw hr.
+    pub fn create_depth_stencil_surface_ms_hr(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+    ) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_depth_stencil_surface)(
+                self.device,
+                size.0,
+                size.1,
+                format,
+                multi_sample.0,
+                multi_sample.1,
+                0,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() {
+            (hr, Some(Surface::from_raw(out)))
+        } else {
+            (hr, None)
+        }
+    }
+
     /// `CreateDepthStencilSurface`, asserting success.
     ///
     /// # Panics
@@ -2260,6 +2348,7 @@ impl Harness {
             visible: false,
             windowed: 1,
             present_flags: self.present_flags,
+            multi_sample_type: self.multi_sample_type,
             ..HarnessConfig::default()
         };
         let mut pp = present_params(&cfg, self.hwnd);
@@ -2395,6 +2484,29 @@ impl Harness {
         }
     }
 
+    /// `CheckDeviceMultiSampleType`, returning `(hr, quality_levels)`.
+    pub fn check_device_multi_sample_type(
+        &self,
+        surface_format: u32,
+        windowed: i32,
+        multi_sample_type: u32,
+    ) -> (i32, u32) {
+        let mut levels = 0u32;
+        // SAFETY: vtable thunk; `self.d3d9` is live and `&mut levels` writable.
+        let hr = unsafe {
+            (self.factory_vtbl().check_device_multi_sample_type)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                surface_format,
+                windowed,
+                multi_sample_type,
+                &raw mut levels,
+            )
+        };
+        (hr, levels)
+    }
+
     /// `IDirect3D9::GetDeviceCaps`, asserting success.
     #[must_use]
     pub fn device_caps(&self) -> D3DCAPS9 {
@@ -2435,8 +2547,8 @@ fn present_params(cfg: &HarnessConfig, hwnd: usize) -> D3DPRESENT_PARAMETERS {
         back_buffer_height: cfg.height,
         back_buffer_format: cfg.back_buffer_format,
         back_buffer_count: 1,
-        multi_sample_type: 0,
-        multi_sample_quality: 0,
+        multi_sample_type: cfg.multi_sample_type,
+        multi_sample_quality: cfg.multi_sample_quality,
         swap_effect: D3DSWAPEFFECT_DISCARD,
         device_window: hwnd,
         windowed: cfg.windowed,

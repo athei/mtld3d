@@ -116,6 +116,51 @@ impl DcLockState {
     }
 }
 
+/// A surface's multisample configuration as D3D9 states it and Metal needs it.
+///
+/// `multi_sample_type` / `multi_sample_quality` are the values `GetDesc`
+/// reports back, and `sample_count` is what they resolve to for Metal. Kept
+/// together because the three are always set and read as one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceMultiSample {
+    pub multi_sample_type: u32,
+    pub multi_sample_quality: u32,
+    /// Sample count the two fields resolve to; 1 for a single-sampled surface.
+    pub sample_count: u8,
+}
+
+impl SurfaceMultiSample {
+    /// A surface with no multisampling.
+    pub const NONE: Self = Self {
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        sample_count: 1,
+    };
+}
+
+/// Everything [`Direct3DSurface9::new_color_target`] needs to build the surface.
+///
+/// `width` and `height` are the logical extent `GetDesc` reports;
+/// `render_scale` is the factor the Metal texture was allocated at. `usage` is
+/// `D3DUSAGE_RENDERTARGET` for a render target and `0` for an offscreen-plain
+/// `D3DPOOL_DEFAULT` surface. The multisample trio travels as one value.
+pub struct ColorTargetCreateInfo {
+    pub device_inner: *mut DeviceInner,
+    pub metal_color_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the colour texture, NULL when the format has none.
+    pub metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion, NULL when the surface is single-sampled.
+    pub metal_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of that companion, NULL whenever the companion is.
+    pub metal_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub usage: u32,
+    pub render_scale: RenderScale,
+    pub multi_sample: SurfaceMultiSample,
+}
+
 #[repr(C)]
 pub struct Direct3DSurface9 {
     vtbl: *const IDirect3DSurface9Vtbl,
@@ -128,25 +173,6 @@ pub struct Direct3DSurface9 {
     inner: *mut SurfaceInner,
 }
 
-/// Everything `Direct3DSurface9::new_color_target` needs to build the surface.
-///
-/// `metal_color_srgb_handle` is the eager sRGB twin view of
-/// `metal_color_handle` and is null when the format has no sRGB counterpart.
-/// `width` and `height` are the logical extent `GetDesc` reports;
-/// `render_scale` is the factor the Metal texture was allocated at. `usage` is
-/// `D3DUSAGE_RENDERTARGET` for a render target and `0` for an offscreen-plain
-/// `D3DPOOL_DEFAULT` surface.
-pub struct ColorTargetCreateInfo {
-    pub device_inner: *mut DeviceInner,
-    pub metal_color_handle: MetalHandle<MTLTextureKind>,
-    pub metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
-    pub width: u32,
-    pub height: u32,
-    pub format: u32,
-    pub usage: u32,
-    pub render_scale: RenderScale,
-}
-
 impl Direct3DSurface9 {
     /// Standalone color render-target surface.
     ///
@@ -154,21 +180,39 @@ impl Direct3DSurface9 {
     /// with `D3DPOOL_DEFAULT`. Wraps a persistent render-target-capable
     /// `MTLTexture` via `metal_color_handle`, identical to the backbuffer
     /// surface, so `StretchRect` and `GetRenderTargetData` resolve it for free.
-    pub fn new_color_target(info: &ColorTargetCreateInfo) -> Self {
+    /// `usage` is `D3DUSAGE_RENDERTARGET` for a render target, `0` for an
+    /// offscreen-plain `D3DPOOL_DEFAULT` surface.
+    pub fn new_color_target(init: &ColorTargetCreateInfo) -> Self {
+        let &ColorTargetCreateInfo {
+            device_inner,
+            metal_color_handle,
+            metal_color_srgb_handle,
+            metal_msaa_handle,
+            metal_msaa_srgb_handle,
+            width,
+            height,
+            format,
+            usage,
+            render_scale,
+            multi_sample,
+        } = init;
         let inner = Box::into_raw(Box::new(SurfaceInner {
-            device_inner: info.device_inner,
+            device_inner,
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
             cube_face: u32::MAX,
-            standalone_width: info.width,
-            standalone_height: info.height,
-            standalone_render_scale: info.render_scale,
-            standalone_format: info.format,
-            standalone_usage: info.usage,
+            standalone_width: width,
+            standalone_height: height,
+            standalone_render_scale: render_scale,
+            standalone_format: format,
+            standalone_usage: usage,
             standalone_pool: D3DPOOL_DEFAULT,
             metal_depth_handle: MetalHandle::NULL,
-            metal_color_handle: info.metal_color_handle,
-            metal_color_srgb_handle: info.metal_color_srgb_handle,
+            metal_color_handle,
+            metal_color_srgb_handle,
+            metal_msaa_handle,
+            metal_msaa_srgb_handle,
+            multi_sample,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -207,6 +251,7 @@ impl Direct3DSurface9 {
         height: u32,
         format: u32,
         render_scale: RenderScale,
+        multi_sample: SurfaceMultiSample,
     ) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
@@ -223,6 +268,9 @@ impl Direct3DSurface9 {
             metal_depth_handle,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -268,6 +316,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -312,6 +363,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -359,6 +413,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -410,6 +467,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -455,6 +515,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: None,
@@ -502,6 +565,9 @@ impl Direct3DSurface9 {
             metal_depth_handle: MetalHandle::NULL,
             metal_color_handle: MetalHandle::NULL,
             metal_color_srgb_handle: MetalHandle::NULL,
+            metal_msaa_handle: MetalHandle::NULL,
+            metal_msaa_srgb_handle: MetalHandle::NULL,
+            multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             dc_shim: None,
             system_memory: Some(backing),
@@ -801,6 +867,24 @@ impl Direct3DSurface9 {
         inner.metal_color_srgb_handle
     }
 
+    /// Multisampled companion of the colour texture, null when there is none.
+    ///
+    /// The implicit back buffer resolves the device's current companion live,
+    /// exactly as it does its colour handle.
+    pub fn metal_msaa_handle(&self) -> MetalHandle<MTLTextureKind> {
+        self.inner().live_msaa_handle()
+    }
+
+    /// sRGB twin view of that companion, null whenever the companion is.
+    pub fn metal_msaa_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
+        self.inner().live_msaa_srgb_handle()
+    }
+
+    /// Multisample type, quality and sample count this surface carries.
+    pub fn multi_sample(&self) -> SurfaceMultiSample {
+        self.inner().live_multi_sample()
+    }
+
     /// Raw `(ptr, len)` of a system-memory offscreen surface's backing buffer.
     ///
     /// For use as a `BlitTextureToBuffer` destination. `None` for GPU-backed
@@ -942,6 +1026,25 @@ struct SurfaceInner {
     /// attaches it in place of the base under `D3DRS_SRGBWRITEENABLE`, which
     /// puts the encode after the blender.
     metal_color_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `metal_color_handle`, or null.
+    ///
+    /// Non-null only for a `CreateRenderTarget` surface asked for a
+    /// multisample type. It is what a render pass attaches; every other
+    /// consumer (sampling, `StretchRect`, `LockRect`, `GetRenderTargetData`,
+    /// Present) keeps reading `metal_color_handle`, which the pass resolves
+    /// into.
+    metal_msaa_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `metal_msaa_handle`, or null.
+    ///
+    /// Created and retired with the companion. A multisampled pass encoding
+    /// on write attaches it and resolves into `metal_color_srgb_handle`,
+    /// which Metal requires to carry the same pixel format.
+    metal_msaa_srgb_handle: MetalHandle<MTLTextureKind>,
+    /// Multisample type, quality and resolved sample count of a standalone surface.
+    ///
+    /// [`SurfaceMultiSample::NONE`] for every texture-backed or system-memory
+    /// surface; an implicit surface resolves its own live from the device.
+    multi_sample: SurfaceMultiSample,
     /// Page-aligned PE-addressable readback buffer held between `LockRect` and `UnlockRect`.
     ///
     /// Allocated on the `LockRect` readback path (backbuffer), dropped on
@@ -1122,6 +1225,50 @@ impl SurfaceInner {
         } else {
             self.metal_color_handle
         }
+    }
+
+    /// Live multisampled colour companion.
+    ///
+    /// The device's current one for the implicit back buffer, else the stored
+    /// snapshot. Null for every surface that is not multisampled.
+    fn live_msaa_handle(&self) -> MetalHandle<MTLTextureKind> {
+        if self.implicit_kind == ImplicitKind::Backbuffer && !self.device_inner.is_null() {
+            // SAFETY: `device_inner` is the live owning device; it outlives its
+            // child surfaces per D3D9 lifetime rules.
+            unsafe { (*self.device_inner).backbuffer_msaa_handle() }
+        } else {
+            self.metal_msaa_handle
+        }
+    }
+
+    /// Live sRGB twin view of the multisampled colour companion.
+    ///
+    /// Resolved the same way `live_msaa_handle` is, and null wherever that is.
+    fn live_msaa_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
+        if self.implicit_kind == ImplicitKind::Backbuffer && !self.device_inner.is_null() {
+            // SAFETY: `device_inner` is the live owning device; it outlives its
+            // child surfaces per D3D9 lifetime rules.
+            unsafe { (*self.device_inner).backbuffer_msaa_srgb_handle() }
+        } else {
+            self.metal_msaa_srgb_handle
+        }
+    }
+
+    /// Live multisample configuration.
+    ///
+    /// Both implicit surfaces take the swap chain's, which is the only
+    /// configuration `CreateDevice` and `Reset` ever give them.
+    fn live_multi_sample(&self) -> SurfaceMultiSample {
+        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
+            // SAFETY: `device_inner` is the live owning device (see above).
+            let dev = unsafe { &*self.device_inner };
+            return SurfaceMultiSample {
+                multi_sample_type: dev.backbuffer_multi_sample_type(),
+                multi_sample_quality: dev.backbuffer_multi_sample_quality(),
+                sample_count: dev.backbuffer_sample_count(),
+            };
+        }
+        self.multi_sample
     }
 
     /// Live Metal depth handle.
@@ -1349,16 +1496,21 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         !inner.flags.contains(SurfaceFlags::CONTAINER_CACHED),
         "container-cached sub-resource surface finalized outside its container's teardown"
     );
-    // A standalone colour target owns its Metal colour texture and the sRGB
-    // twin view taken of it. Both go on the encoder's seq-gated retention
-    // queue so a blit or pass this frame still referencing them finishes
-    // first, and the twin's registration goes with them.
+    // A standalone colour target owns its Metal colour texture, the
+    // multisampled companion it resolves from, and the sRGB twin view taken
+    // of each. All of them go on the encoder's seq-gated retention queue so a
+    // blit or pass this frame still referencing them finishes first, and the
+    // twin's registration goes with them.
     if inner.parent_texture.is_null()
         && !inner.metal_color_handle.is_null()
         && !inner.device_inner.is_null()
     {
-        let base = inner.metal_color_handle;
-        let srgb = inner.metal_color_srgb_handle;
+        let retired = crate::encoder::RetiredColorTarget {
+            base: inner.metal_color_handle,
+            srgb: inner.metal_color_srgb_handle,
+            msaa: inner.metal_msaa_handle,
+            msaa_srgb: inner.metal_msaa_srgb_handle,
+        };
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
         unsafe { &*inner.device_inner }.deregister_standalone_surface(
@@ -1369,7 +1521,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
         unsafe { &mut *inner.device_inner }
-            .push_op(Box::new(move |enc| enc.retire_color_target(base, srgb)));
+            .push_op(Box::new(move |enc| enc.retire_color_target(&retired)));
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1854,8 +2006,9 @@ extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DES
         // offscreen-plain surface reports the pool it was created with
         // (`D3DPOOL_SYSTEMMEM` or `D3DPOOL_SCRATCH`).
         out.pool = inner.standalone_pool;
-        out.multi_sample_type = 0;
-        out.multi_sample_quality = 0;
+        let ms = inner.live_multi_sample();
+        out.multi_sample_type = ms.multi_sample_type;
+        out.multi_sample_quality = ms.multi_sample_quality;
         out.width = inner.live_width();
         out.height = inner.live_height();
         return 0; // S_OK

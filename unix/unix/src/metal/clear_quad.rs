@@ -112,6 +112,8 @@ struct ClearQuadKey {
     /// Bit `i` = render target `i + 1` declared; its format in `extra_formats[i]`.
     extra_present_mask: u8,
     extra_formats: [PixelFormat; 3],
+    /// `rasterSampleCount` of the pass the quad is drawn in.
+    sample_count: u32,
 }
 
 struct ClearQuadCache {
@@ -156,6 +158,7 @@ pub fn ensure_clear_quad_pipeline(
                 PixelFormat::Bgra8Unorm
             }
         }),
+        sample_count: params.sample_count.max(1),
     };
 
     {
@@ -323,6 +326,7 @@ fn build_pipeline(
 
     let desc = MTLRenderPipelineDescriptor::new();
     desc.setVertexFunction(Some(&vs));
+    desc.setRasterSampleCount(key.sample_count as usize);
 
     if has_color {
         let ps_color = color_ps_function(device, cache, key.extra_present_mask)?;

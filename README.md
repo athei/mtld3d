@@ -94,6 +94,14 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **Multiple render targets**: four simultaneous targets with independent
   formats and write masks, post-pixel-shader blending on each, and Clear
   reaching every bound target.
+- **Multisampling**: `CheckDeviceMultiSampleType` reports the sample counts the
+  Metal device accepts (2x and 4x everywhere, 8x where the device offers it),
+  with `D3DMULTISAMPLE_NONMASKABLE` mapped onto the same ladder. A multisampled
+  swap chain, `CreateRenderTarget` or `CreateDepthStencilSurface` renders into a
+  multisampled attachment and resolves into the single-sample surface every
+  other operation reads, so Present, `StretchRect`, `GetRenderTargetData` and
+  sampling all see the resolved image. `D3DRS_MULTISAMPLEMASK` narrows the
+  samples a draw writes.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
   enumeration, hardware color cursors, and MetalFX upscaling on the way to the
   screen with `render.scale` choosing the render resolution. A render target or
@@ -112,8 +120,6 @@ Missing features a D3D9 application can reasonably want. Each fails cleanly,
 with an absent cap bit or a documented error return, so applications take their
 own fallback paths instead of breaking:
 
-- **MSAA**: multisampled creates are rejected; CheckDeviceMultiSampleType only
-  accepts D3DMULTISAMPLE_NONE.
 - **Non-solid fill modes** (Metal has no native wireframe).
 - **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
   as the spec allows.
@@ -166,6 +172,15 @@ memory headroom and no tested game depends on them:
   provably writes outside its announced windows. Index buffers keep theirs
   unconditionally, because the triangle-fan rewrite reads their bytes back on
   the CPU.
+
+- **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** The state asks the
+  rasterizer to drop to a single sample for one draw on a multisampled target.
+  Metal ties a pipeline's `rasterSampleCount` to the sample count of the pass's
+  attachments and offers no per-draw override, so honouring it would mean
+  rendering the draw into a separate single-sampled target and compositing it
+  back. `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how
+  D3D9 tells an application the toggle is unavailable, and the first write is
+  logged.
 
 ### Deliberately not implemented
 
