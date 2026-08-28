@@ -1084,8 +1084,13 @@ pub struct BlitTextureToBufferParams {
     ///
     /// See [`Self::source_width`].
     pub source_height: u32, // in
-    /// Explicit tail padding to the 8-byte stride.
-    pub pad0: u32,
+    /// Block height of the source format: 1 uncompressed, 4 for the BC family.
+    ///
+    /// `bytes_per_row` is the stride of one *block* row, so a slice is
+    /// `ceil(height / block_height)` rows rather than `height`. The unix side
+    /// has no format table and derives the blit's `bytesPerImage` from this
+    /// through [`crate::blit_geometry::bytes_per_image`].
+    pub block_height: u32, // in
 }
 
 impl Thunk for BlitTextureToBufferParams {

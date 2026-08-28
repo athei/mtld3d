@@ -2633,6 +2633,11 @@ pub struct BlitArgs {
     pub source_width: u32,
     /// Full logical height the sub-rect coordinates are measured in.
     pub source_height: u32,
+    /// Block height of the source format.
+    ///
+    /// See `BlitTextureToBufferParams::block_height`. `bytes_per_row` is the
+    /// stride of one block row, so the slice size counts block rows.
+    pub block_height: u32,
 }
 
 /// Resolve a render-resolution source up to the size the caller's coordinates assume.
@@ -2743,6 +2748,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         bytes_per_row,
         source_width,
         source_height,
+        block_height,
     } = *args;
 
     if dst_ptr == 0 || dst_len == 0 || width == 0 || height == 0 {
@@ -2855,6 +2861,11 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         blit.setLabel(Some(&label));
     }
 
+    // `height` is in pixels but `bytes_per_row` strides one block row, so the
+    // slice size counts block rows. The two agree only for an uncompressed
+    // format, where the block height is 1.
+    let bytes_per_image =
+        mtld3d_shared::blit_geometry::bytes_per_image(bytes_per_row, height, block_height) as usize;
     // SAFETY: objc2 typed binding; `texture`/`dst_buffer` are retained Metal
     // objects live for the call; the geometry cleared
     // `copy_texture_to_buffer_reject` above.

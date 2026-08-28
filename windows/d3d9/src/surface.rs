@@ -2420,7 +2420,8 @@ fn backbuffer_lock_readback(
         // the game expects and `bytes_per_row` above stays logical.
         source_width: full_w,
         source_height: full_h,
-        pad0: 0,
+        // BGRA8 back buffer: a block row is a pixel row.
+        block_height: 1,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -2486,7 +2487,8 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
         // this seeds is the size `GetDC` promised.
         source_width: w,
         source_height: h,
-        pad0: 0,
+        // BGRA8 back buffer: a block row is a pixel row.
+        block_height: 1,
     };
     if unix_call(&mut params) != 0 {
         return None;
@@ -2787,7 +2789,9 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         // texture and the unix side skips the resolve.
         source_width: width,
         source_height: height,
-        pad0: 0,
+        // A lockable render target has a non-zero `bpp`, so its format is
+        // uncompressed and a block row is a pixel row.
+        block_height: 1,
     };
     let status = unix_call(&mut params);
     if status != 0 {

@@ -578,8 +578,8 @@ pub enum BlitCommandType {
 ///   `bytes_per_row` / `src_offset` describe the copy. `depth` is the
 ///   slice count (1 for a 2D texture, >1 for a volume/3D texture) and
 ///   `bytes_per_image` is the byte stride between slices (for a 2D copy
-///   it equals `bytes_per_row * region_h`, matching the implicit
-///   single-slice size). `dst_offset` / `byte_size` unused.
+///   it is the single slice's own size). `dst_offset` / `byte_size`
+///   unused.
 /// - `CopyTextureToTexture`: `src_handle` / `dst_handle` = textures,
 ///   `mip_level` selects the mip. `origin_x` / `origin_y` are the
 ///   *source* origin; `region_w` / `region_h` are the region size; the
@@ -657,9 +657,10 @@ pub struct CopyBufferToTextureInfo {
     pub depth: u32,
     /// Byte stride between slices.
     ///
-    /// For a 2D copy (`depth == 1`) callers pass `bytes_per_row * region_h` —
-    /// the implicit single-slice size. For a volume it is the box's slice
-    /// pitch.
+    /// For a 2D copy (`depth == 1`) callers pass the single slice's own size:
+    /// `bytes_per_row` times the region's *block*-row count, which is its pixel
+    /// height only for an uncompressed format. For a volume it is the box's
+    /// slice pitch.
     pub bytes_per_image: u32,
 }
 

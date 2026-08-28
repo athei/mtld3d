@@ -6257,7 +6257,9 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         bytes_per_row: read.bytes_per_row,
         source_width: read.full_width,
         source_height: read.full_height,
-        pad0: 0,
+        // Render-target colour formats are all uncompressed, so a block row is
+        // a pixel row.
+        block_height: 1,
     };
     let status = unix_call(&mut params);
     if status != 0 {
