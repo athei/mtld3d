@@ -1359,6 +1359,55 @@ fn update_surface_from_system_memory_reaches_the_next_draw() {
     );
 }
 
+/// `UpdateSurface` rejects a destination outside `D3DPOOL_DEFAULT`.
+///
+/// The source is a standalone system-memory offscreen surface, which reaches
+/// the destination level's staging directly instead of going through a source
+/// texture, so the destination pool contract has to hold on that path too. The
+/// matching default-pool destination in the same test keeps the check narrow.
+#[test]
+fn update_surface_rejects_a_standalone_source_into_a_managed_destination() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[GREEN; 16]);
+
+    let managed = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.update_surface_hr(&src, &managed.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface into a managed destination"
+    );
+
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src, &dst.surface_level(0)),
+        0,
+        "UpdateSurface into a matching default-pool destination"
+    );
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "accepted fill");
+}
+
+/// `UpdateSurface` rejects a destination whose format differs from the source's.
+///
+/// The standalone-source copy reinterprets the source bytes in the destination's
+/// mip layout rather than converting them, so an accepted `A1R5G5B5` into
+/// `R5G6B5` would land 1-5-5-5 bits the destination reads as 5-6-5. Both formats
+/// are 16 bits per pixel and the source is the destination's size, so nothing
+/// but the format check stands between the call and that copy.
+#[test]
+fn update_surface_rejects_a_standalone_source_of_another_format() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_A1R5G5B5, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write::<u16>(&[0x83E0; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src, &dst.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "UpdateSurface into a destination of another format"
+    );
+}
+
 #[test]
 fn update_texture_keeps_cube_faces_independent() {
     let h = Harness::new();
