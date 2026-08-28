@@ -2034,6 +2034,91 @@ fn scaling_stretch_rect_out_of_a_cube_face_reads_that_face() {
 }
 
 #[test]
+fn stretch_rect_between_two_cube_faces_copies_face_to_face() {
+    // Both surfaces of a copy inside one cube map resolve to the same Metal
+    // texture, so the route is picked inside that texture: two faces are two
+    // slices and the same rect on each names different texels, which is a real
+    // copy the blit encoder runs in place. A route blind to the faces reads the
+    // pair as one rect copied onto itself and skips the call, and a copy pinned
+    // to slice 0 lands on face 0. Face 1 is green, face 3 is red, and the full
+    // face is copied 1 to 1.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face1 = cube.surface(1, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face1, GREEN), D3D_OK, "fill face 1 green");
+    assert_eq!(h.color_fill_hr(&face3, RED), D3D_OK, "fill face 3 red");
+    assert_eq!(
+        h.stretch_rect(&face1, &face3, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from one cube face onto another",
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "face 3 carries face 1's colour",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face1, 1, 1),
+        GREEN,
+        "the source face is left as it was",
+    );
+}
+
+#[test]
+fn scaling_stretch_rect_between_two_cube_faces_copies_face_to_face() {
+    // The scaling form of the same pair stages through a scratch texture, since
+    // the render quad cannot sample the texture it draws into. Both halves of
+    // that detour carry a face: the copy out reads the source face and the quad
+    // attaches the destination face. Face 1 is green and face 3 is red, and the
+    // whole of face 1 lands in face 3's top-left quarter.
+    const EDGE: u32 = 64;
+    const HALF: i32 = (EDGE / 2).cast_signed();
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face1 = cube.surface(1, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face1, GREEN), D3D_OK, "fill face 1 green");
+    assert_eq!(h.color_fill_hr(&face3, RED), D3D_OK, "fill face 3 red");
+    assert_eq!(
+        h.stretch_rect_rects(
+            &face1,
+            (0, 0, EDGE.cast_signed(), EDGE.cast_signed()),
+            &face3,
+            (0, 0, HALF, HALF),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "scaling StretchRect from one cube face onto another",
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "the scaled copy landed in face 3, carrying face 1's colour",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face3, EDGE - 2, EDGE - 2),
+        RED,
+        "and left the rest of face 3 alone",
+    );
+}
+
+#[test]
 fn color_fill_of_a_cube_face_reaches_that_face_alone() {
     // ColorFill on a cube face's surface runs a render pass over that face's
     // slice and leaves the face's CPU staging untouched, so the GetDC that reads

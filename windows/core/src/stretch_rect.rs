@@ -118,20 +118,23 @@ pub enum SameSurfaceRoute {
 
 /// Route a `StretchRect` whose source and destination resolve to one texture.
 ///
-/// Regions are in the texture's own coordinates and carry the mip level each
-/// addresses; two different levels are different texels, so they never
-/// overlap.
+/// Regions are in the texture's own coordinates and carry the mip level and the
+/// array slice each addresses. Two different levels, and two different slices,
+/// are different texels, so neither pair can overlap. A slice is a cube map's
+/// `D3DCUBEMAP_FACES` index, and 0 for every texture that holds a single one.
 #[must_use]
 pub const fn same_surface_route(
     src_region: StretchRegion,
     dst_region: StretchRegion,
     src_mip: u32,
     dst_mip: u32,
+    src_slice: u32,
+    dst_slice: u32,
 ) -> SameSurfaceRoute {
     if src_region.w != dst_region.w || src_region.h != dst_region.h {
         return SameSurfaceRoute::Scratch;
     }
-    if src_mip != dst_mip {
+    if src_mip != dst_mip || src_slice != dst_slice {
         return SameSurfaceRoute::Direct;
     }
     if src_region.x == dst_region.x && src_region.y == dst_region.y {
