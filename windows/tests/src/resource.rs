@@ -494,6 +494,13 @@ impl<'h> Texture<'h> {
         unsafe { (self.vtbl().get_auto_gen_filter_type)(self.ptr) }
     }
 
+    /// `UnlockRect` for mip `level`. Returns the hr.
+    #[must_use]
+    pub fn unlock_rect(&self, level: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, level) }
+    }
+
     /// `AddDirtyRect(null)` — flag the whole texture dirty. Returns the hr.
     #[must_use]
     pub fn add_dirty_rect(&self) -> i32 {
@@ -667,6 +674,20 @@ impl CubeTexture<'_> {
             unsafe { (self.vtbl().get_cube_map_surface)(self.ptr, face, level, &raw mut surface) };
         expect_created(hr, surface, "GetCubeMapSurface");
         Surface::from_raw(surface)
+    }
+
+    /// `GetCubeMapSurface` returning `(hr, this)` for error-path tests.
+    ///
+    /// The unchecked form of [`Self::surface`]: a caller that expects a
+    /// rejection reads both the hr and the untouched out-param, and a caller
+    /// that gets a surface owns the reference it was handed.
+    #[must_use]
+    pub fn try_surface(&self, face: u32, level: u32) -> (i32, *mut c_void) {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live cube texture and writable surface out-param.
+        let hr =
+            unsafe { (self.vtbl().get_cube_map_surface)(self.ptr, face, level, &raw mut surface) };
+        (hr, surface)
     }
 
     /// Mip-chain length.

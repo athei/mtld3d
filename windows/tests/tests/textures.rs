@@ -295,6 +295,31 @@ fn autogen_mipmap_texture_creates() {
 }
 
 #[test]
+fn autogen_mipmap_texture_rejects_sub_level_unlock() {
+    let h = Harness::new();
+    let tex = h.create_texture(
+        64,
+        64,
+        0,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(tex.level_count(), 1, "autogen texture exposes 1 level");
+    // The sub-levels belong to the runtime, so every per-level entry point
+    // rejects them, `UnlockRect` included: it must answer the same
+    // INVALIDCALL `LockRect` does rather than treat the level as unlocked.
+    assert_eq!(
+        tex.unlock_rect(1),
+        D3DERR_INVALIDCALL,
+        "UnlockRect past the app-visible chain"
+    );
+    // Level zero stays reachable, where an Unlock without a matching Lock is
+    // the S_OK case for a texture level.
+    assert_eq!(tex.unlock_rect(0), 0, "UnlockRect on the exposed level");
+}
+
+#[test]
 fn cube_textures_create_in_all_pools() {
     let h = Harness::new();
     for (pool, name) in [
@@ -398,6 +423,33 @@ fn managed_cube_autogen_creates() {
         D3DPOOL_MANAGED,
     );
     assert_eq!(cube.level_count(), 1, "autogen exposes only level zero");
+}
+
+#[test]
+fn autogen_mipmap_cube_rejects_sub_level_surface() {
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        64,
+        0,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(cube.level_count(), 1, "autogen exposes only level zero");
+    // Level zero is the one face surface an application can hold; `surface`
+    // fails the test if the call it wraps is rejected.
+    let level_zero = cube.surface(0, 0);
+    let (hr, _) = level_zero.desc();
+    assert_eq!(hr, 0, "the exposed face surface describes");
+    // A sub-level face is driver-owned: handing one out would let an
+    // application bind a level `GetLevelCount` says is not there as a render
+    // target, under the generated chain AUTOGENMIPMAP owns.
+    let (hr, surface) = cube.try_surface(0, 1);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "GetCubeMapSurface past the app-visible chain"
+    );
+    assert!(surface.is_null(), "a rejected call leaves the slot null");
 }
 
 #[test]
