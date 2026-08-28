@@ -1996,7 +1996,12 @@ impl PassState {
         // survive) need `Load` so prior content carries forward — real
         // D3D9 drivers preserve depth content across frames; MTLD3D
         // must match.
-        let viewport_covers_attachment = vpx == 0
+        //
+        // Each plane is judged against its own attachment's extent. D3D9 only
+        // requires the depth-stencil surface to be at least as large as the
+        // render target, so a viewport that covers render target 0 exactly can
+        // still leave a larger depth surface partly un-rendered.
+        let viewport_covers_color_extent = vpx == 0
             && vpy == 0
             && vpw == self.current_color_size.0
             && vph == self.current_color_size.1;
@@ -2008,7 +2013,7 @@ impl PassState {
             |texture: MetalHandle<MTLTextureKind>, subresource: u32| match pending_color_clear {
                 Some((r, g, b, a)) => ColorLoad::Clear { r, g, b, a },
                 None if ENABLE_FIRST_USE_DONTCARE
-                    && viewport_covers_attachment
+                    && viewport_covers_color_extent
                     && !texture.is_null()
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
@@ -2035,8 +2040,11 @@ impl PassState {
         });
         // The depth texture's first use this frame under a viewport that
         // covers it: the Rule A predicate, shared by the depth plane and the
-        // stencil plane because both live in that one texture.
-        let depth_first_use = viewport_covers_attachment
+        // stencil plane because both live in that one texture. Coverage is
+        // measured against the depth attachment's own extent, greater-or-equal
+        // because D3D9 clips the viewport to the render target, so an oversized
+        // viewport still covers everything the pass can write.
+        let depth_first_use = self.viewport_covers_depth_attachment()
             && !self.current_depth_texture.is_null()
             && !self
                 .current_attachments
