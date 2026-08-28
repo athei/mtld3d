@@ -7144,30 +7144,38 @@ extern "system" fn device_get_depth_stencil_surface(
         return D3DERR_INVALIDCALL;
     };
     // `GetDepthStencilSurface` reflects the currently *bound* depth-stencil, not
-    // merely the device's auto depth-stencil: an explicit `SetDepthStencilSurface
-    // (NULL)` unbinds it, so report "none bound" (NOTFOUND) even though the auto
-    // depth texture still exists.
+    // merely the device's auto depth-stencil. Three shapes, in order:
+    // - a surface bound by `SetDepthStencilSurface` is handed back as itself, so
+    //   an application comparing the pointer against its own surface matches and
+    //   a `saved = Get; Set(other); ...; Set(saved)` sequence rebinds what was
+    //   actually bound rather than the auto depth;
+    // - an explicit `SetDepthStencilSurface(NULL)` unbinds depth, so report
+    //   "none bound" (NOTFOUND) even though the auto depth texture still exists;
+    // - otherwise the auto depth-stencil is in effect, and stands for the
+    //   device-owned implicit depth-stencil surface (cached, refcount-0,
+    //   container = the device). A single object across calls, depth-backed so
+    //   the save/restore above restores the real Metal depth handle (resolved
+    //   live). Null when the device has no auto depth-stencil.
     let dev = obj.inner();
-    if dev.flags.contains(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND) {
-        // SAFETY: `surface` is non-null (checked above) and per the D3D9 ABI
-        // points to a writable `*mut c_void` slot owned by the caller.
-        unsafe { *surface = core::ptr::null_mut() };
-        return crate::D3DERR_NOTFOUND;
-    }
-    // The device-owned implicit depth-stencil surface (cached, refcount-0,
-    // container = the device). A single object across calls, depth-backed so the
-    // common `GetDepthStencilSurface → … → SetDepthStencilSurface(saved)`
-    // save/restore restores the real Metal depth handle (resolved live). Null
-    // when the device has no auto depth-stencil.
-    let surf = dev.get_or_create_implicit_depth_stencil();
+    let bound = dev.bound_rt().depth_stencil();
+    let surf = if bound.is_null() {
+        if dev.flags.contains(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND) {
+            core::ptr::null_mut()
+        } else {
+            dev.get_or_create_implicit_depth_stencil()
+        }
+    } else {
+        bound
+    };
     if surf.is_null() {
         // SAFETY: `surface` is non-null (checked above) and per the D3D9 ABI
         // points to a writable `*mut c_void` slot owned by the caller.
         unsafe { *surface = core::ptr::null_mut() };
         return crate::D3DERR_NOTFOUND;
     }
-    // SAFETY: `surf` is the live cached implicit DS surface; its AddRef thunk
-    // forwards to the device on the 0→1 transition.
+    // SAFETY: `surf` is non-null: either the live bound depth-stencil (the
+    // bind refcount keeps it alive) or the live cached implicit DS surface,
+    // whose AddRef thunk forwards to the device on the 0→1 transition.
     let add_ref = unsafe { (*surf).vtbl().add_ref };
     // SAFETY: calling the surface's AddRef thunk; D3D9 mandates AddRef on return.
     unsafe { add_ref(surf.cast::<c_void>()) };
