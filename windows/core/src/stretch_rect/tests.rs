@@ -9,7 +9,8 @@
 //! `same_surface_route` is pinned against the four shapes a within-one-surface copy
 //! takes: disjoint rects that the blit encoder can copy in place, overlapping rects and
 //! scaled rects that have to stage through a scratch texture, and an identical pair that
-//! writes each texel its own value.
+//! writes each texel its own value. Two cube faces of one texture are disjoint whatever
+//! their rects say, so the face pair is pinned alongside the mip pair.
 //!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
@@ -93,15 +94,44 @@ fn disjoint_same_surface_rects_copy_in_place() {
         (region(32, 32, 8, 8), region(24, 24, 8, 8)),
     ] {
         assert_eq!(
-            same_surface_route(src, dst, 0, 0),
+            same_surface_route(src, dst, 0, 0, 0, 0),
             SameSurfaceRoute::Direct,
             "{src:?} -> {dst:?}"
         );
     }
     // Two mip levels are different texels whatever the rects say.
     assert_eq!(
-        same_surface_route(region(0, 0, 16, 16), region(0, 0, 16, 16), 0, 1),
+        same_surface_route(region(0, 0, 16, 16), region(0, 0, 16, 16), 0, 1, 0, 0),
         SameSurfaceRoute::Direct
+    );
+}
+
+#[test]
+fn same_surface_rects_on_two_cube_faces_copy_in_place() {
+    // Two faces are two slices of one texture, so the same rect on each names
+    // different texels: the copy is real and the blit encoder can do it in
+    // place, whether or not the rects would have overlapped on one face.
+    for (src, dst) in [
+        (region(0, 0, 16, 16), region(0, 0, 16, 16)),
+        (region(0, 0, 16, 16), region(8, 8, 16, 16)),
+        (region(0, 0, 16, 16), region(64, 64, 16, 16)),
+    ] {
+        assert_eq!(
+            same_surface_route(src, dst, 0, 0, 1, 3),
+            SameSurfaceRoute::Direct,
+            "{src:?} -> {dst:?}"
+        );
+    }
+    // A size change still stages through the scratch: the render quad cannot
+    // sample the texture it draws into, faces or no faces.
+    assert_eq!(
+        same_surface_route(region(0, 0, 32, 32), region(0, 0, 16, 16), 0, 1, 1, 3),
+        SameSurfaceRoute::Scratch
+    );
+    // One face copied onto itself is still the no-op.
+    assert_eq!(
+        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 0, 0, 3, 3),
+        SameSurfaceRoute::Skip
     );
 }
 
@@ -114,7 +144,7 @@ fn overlapping_same_surface_rects_need_a_scratch() {
         (region(0, 0, 32, 32), region(8, 8, 32, 32)),
     ] {
         assert_eq!(
-            same_surface_route(src, dst, 0, 0),
+            same_surface_route(src, dst, 0, 0, 0, 0),
             SameSurfaceRoute::Scratch,
             "{src:?} -> {dst:?}"
         );
@@ -127,11 +157,11 @@ fn scaled_same_surface_rects_need_a_scratch() {
     // change stages through a scratch even when the rects are disjoint and
     // even across mip levels.
     assert_eq!(
-        same_surface_route(region(0, 0, 32, 32), region(64, 64, 16, 16), 0, 0),
+        same_surface_route(region(0, 0, 32, 32), region(64, 64, 16, 16), 0, 0, 0, 0),
         SameSurfaceRoute::Scratch
     );
     assert_eq!(
-        same_surface_route(region(0, 0, 16, 16), region(0, 0, 32, 16), 0, 1),
+        same_surface_route(region(0, 0, 16, 16), region(0, 0, 32, 16), 0, 1, 0, 0),
         SameSurfaceRoute::Scratch
     );
 }
@@ -139,12 +169,12 @@ fn scaled_same_surface_rects_need_a_scratch() {
 #[test]
 fn identical_same_surface_rects_are_a_no_op() {
     assert_eq!(
-        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 2, 2),
+        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 2, 2, 0, 0),
         SameSurfaceRoute::Skip
     );
     // The same rect at two levels is a real copy, not the no-op.
     assert_eq!(
-        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 0, 2),
+        same_surface_route(region(4, 8, 16, 16), region(4, 8, 16, 16), 0, 2, 0, 0),
         SameSurfaceRoute::Direct
     );
 }

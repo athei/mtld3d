@@ -6810,14 +6810,17 @@ struct StretchBlitParams {
 
 /// Geometry for a `StretchRect` whose source and destination are one texture.
 ///
-/// Regions and dimensions are already in the texture's own space; `src_mip`
-/// addresses the source level, while the destination level, format and
-/// surface class come from the accompanying [`StretchSurfaceInfo`].
+/// Regions and dimensions are already in the texture's own space; `src_mip` and
+/// `src_slice` address the source subresource, while the destination level,
+/// slice, format and surface class come from the accompanying
+/// [`StretchSurfaceInfo`].
 struct SameTextureBlitParams {
     handle: u64,
     src_region: mtld3d_core::stretch_rect::StretchRegion,
     dst_region: mtld3d_core::stretch_rect::StretchRegion,
     src_mip: u32,
+    /// Array slice the source surface addresses, `None` for a single-slice texture.
+    src_slice: Option<u32>,
     dst_dims: (u32, u32),
     render_quad: bool,
     filter: u32,
@@ -6904,6 +6907,7 @@ fn emit_stretch_rect_blit(
                 src_region,
                 dst_region,
                 src_mip: mip_level,
+                src_slice: src_info.slice,
                 dst_dims,
                 render_quad,
                 filter,
@@ -7052,13 +7056,13 @@ fn flush_clears_before_stretch(enc: &mut FrameEncoder) {
     enc.end_current_pass("stretch_rect");
 }
 
-/// Encoder-thread body of a `StretchRect` between two rects of one surface.
+/// Encoder-thread body of a `StretchRect` between two rects of one texture.
 ///
 /// D3D9 performs the copy and reads the whole source region before writing any
 /// of the destination, so an overlapping or scaled pair stages through a
-/// scratch texture. Disjoint 1:1 rects, two mip levels included, go straight
-/// through the blit encoder: Metal allows a copy inside a single texture as
-/// long as the two regions do not overlap.
+/// scratch texture. Disjoint 1:1 rects, two mip levels and two cube faces
+/// included, go straight through the blit encoder: Metal allows a copy inside a
+/// single texture as long as the two subresource regions do not overlap.
 fn emit_same_texture_stretch(
     enc: &mut FrameEncoder,
     dst_info: &StretchSurfaceInfo,
@@ -7072,23 +7076,18 @@ fn emit_same_texture_stretch(
         src_region,
         dst_region,
         src_mip,
+        src_slice,
         dst_dims,
         render_quad,
         filter,
     } = params;
     let dst_mip = dst_info.mip_level;
-    // Both endpoints are one texture and this path pins both slices to 0: the
-    // route below is picked from the two rects and the two mip levels alone,
-    // so a cube whose two surfaces name different faces has no face to route
-    // on.
-    if dst_info.slice.is_some_and(|face| face != 0) {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "StretchRect: a copy inside one cube texture reads and writes face 0, \
-             whatever faces its two surfaces name"
-        );
-    }
-    let route = same_surface_route(src_region, dst_region, src_mip, dst_mip);
+    // A cube's faces are slices of the one texture, so the two endpoints can
+    // name different faces of it; every other texture kind holds a single
+    // slice and both sides read 0.
+    let src_face = src_slice.unwrap_or(0);
+    let dst_face = dst_info.slice.unwrap_or(0);
+    let route = same_surface_route(src_region, dst_region, src_mip, dst_mip, src_face, dst_face);
     if route == SameSurfaceRoute::Skip {
         mtld3d_shared::log_once_info!(
             target: crate::LOG_TARGET,
@@ -7109,8 +7108,8 @@ fn emit_same_texture_stretch(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
-                src_slice: 0,
-                dst_slice: 0,
+                src_slice: src_face,
+                dst_slice: dst_face,
                 region_w: src_region.w,
                 region_h: src_region.h,
             },
@@ -7164,7 +7163,7 @@ fn emit_same_texture_stretch(
             src_origin_y: src_region.y,
             dst_origin_x: 0,
             dst_origin_y: 0,
-            src_slice: 0,
+            src_slice: src_face,
             dst_slice: 0,
             region_w: src_region.w,
             region_h: src_region.h,
@@ -7192,7 +7191,7 @@ fn emit_same_texture_stretch(
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_mip,
-                slice: None,
+                slice: dst_info.slice,
                 msaa: dst_info.msaa,
                 msaa_srgb: dst_info.msaa_srgb,
                 sample_count: dst_info.sample_count,
@@ -7213,7 +7212,7 @@ fn emit_same_texture_stretch(
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
                 src_slice: 0,
-                dst_slice: 0,
+                dst_slice: dst_face,
                 region_w: dst_region.w,
                 region_h: dst_region.h,
             },
