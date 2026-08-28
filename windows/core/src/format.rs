@@ -560,6 +560,21 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
     }
 }
 
+/// Row pitch of a CPU-visible linear surface, in bytes.
+///
+/// `width * bytes_per_pixel` rounded up to a 4-byte boundary. D3D9 leaves the
+/// row pitch to the driver, so a host-visible surface store picks one and
+/// keeps it everywhere: the size the backing buffer is allocated at, the pitch
+/// `LockRect` reports, the `bytes_per_row` its GPU read-back and upload run
+/// at, and the pitch of the DIB a `GetDC` wraps around it. This rounding is
+/// the one GDI computes for a DIB of the same width and bit count, and it
+/// rejects anything narrower, so a store on a tighter stride cannot be handed
+/// to GDI without the DIB reading past the end of every row.
+#[must_use]
+pub const fn linear_row_pitch(width: u32, bytes_per_pixel: u32) -> u32 {
+    width.saturating_mul(bytes_per_pixel).next_multiple_of(4)
+}
+
 /// Compute mip dimensions and byte size for a given mip level.
 #[must_use]
 pub fn compute_mip_size(

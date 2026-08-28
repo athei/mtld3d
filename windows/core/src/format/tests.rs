@@ -15,7 +15,7 @@ use super::{
     D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16,
     D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
     D3DFMT_X8R8G8B8, PixelFormat, Swizzle, depth_format_bytes_per_pixel, is_depth_format,
-    is_mapped_color_format, map_d3d_depth_format, map_d3d_format, surface_bytes,
+    is_mapped_color_format, linear_row_pitch, map_d3d_depth_format, map_d3d_format, surface_bytes,
 };
 
 #[test]
@@ -309,4 +309,20 @@ fn surface_bytes_charges_colour_and_depth_surfaces() {
     assert_eq!(surface_bytes(64, 64, D3DFMT_DXT1), 64 * 64 / 2);
     // A format with neither mapping is charged nothing rather than panicking.
     assert_eq!(surface_bytes(64, 64, 0), 0);
+}
+
+#[test]
+fn linear_row_pitch_rounds_up_to_a_dword() {
+    // 32-bit rows are already a multiple of 4 at every width.
+    assert_eq!(linear_row_pitch(64, 4), 256);
+    assert_eq!(linear_row_pitch(33, 4), 132);
+    // 16-bit rows round up at odd widths, which is where a tight stride and
+    // the stride GDI computes for the same surface part company.
+    assert_eq!(linear_row_pitch(32, 2), 64);
+    assert_eq!(linear_row_pitch(33, 2), 68);
+    assert_eq!(linear_row_pitch(1, 2), 4);
+    // 8-bit rows round up to the next dword at every width but a multiple of 4.
+    assert_eq!(linear_row_pitch(5, 1), 8);
+    assert_eq!(linear_row_pitch(8, 1), 8);
+    assert_eq!(linear_row_pitch(0, 2), 0);
 }

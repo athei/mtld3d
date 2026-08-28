@@ -6817,59 +6817,61 @@ impl FrameEncoder {
         })
     }
 
-    /// Upload `tight` into the standalone colour `MTLTexture` `color_handle`.
+    /// Upload `rows` into the standalone colour `MTLTexture` `color_handle`.
     ///
-    /// `tight` is `width * height * bpp` bytes of tight-packed rows; this is
+    /// `rows` is `src_stride * height` bytes of the source's own rows; this is
     /// the `UnlockRect` half of a lockable render target (`CreateRenderTarget`
-    /// with `Lockable == TRUE`). Copies the rows into a fresh page-aligned
-    /// `PageBox` (padding each row up to `min_linear_texture_align` if the
-    /// tight stride is below it), wrap that in a transient `MTLBuffer`, append
-    /// a `CopyBufferToTexture` to the frame's leading blit pass, and retire
-    /// both after the GPU retires this frame. The bytes are *copied* here (the
-    /// caller's staging is not aliased across the API/encoder boundary).
+    /// with `Lockable == TRUE`), whose staging carries the row pitch every
+    /// host-visible surface store uses. Copies the rows into a fresh
+    /// page-aligned `PageBox` (padding each row up to
+    /// `min_linear_texture_align` if the source stride is below it), wraps
+    /// that in a transient `MTLBuffer`, appends a `CopyBufferToTexture` to the
+    /// frame's leading blit pass, and retires both after the GPU retires this
+    /// frame. The bytes are *copied* here (the caller's staging is not aliased
+    /// across the API/encoder boundary).
     pub fn upload_bytes_to_color_handle(
         &mut self,
         color_handle: u64,
-        tight: &[u8],
+        rows: &[u8],
         width: u32,
         height: u32,
-        bytes_per_pixel: u32,
+        src_stride: u32,
     ) {
-        if color_handle == 0 || width == 0 || height == 0 || bytes_per_pixel == 0 {
+        if color_handle == 0 || width == 0 || height == 0 || src_stride == 0 {
             return;
         }
-        let tight_stride = (width as usize) * (bytes_per_pixel as usize);
+        let src_stride = src_stride as usize;
         // `copyFromBuffer:toTexture:` requires `sourceBytesPerRow` ≥
         // `minimumLinearTextureAlignmentForPixelFormat:`; pad narrow rows up.
-        let padded_stride = tight_stride.max(self.gpu_caps.min_linear_texture_align as usize);
+        let padded_stride = src_stride.max(self.gpu_caps.min_linear_texture_align as usize);
         let Some(padded_size) = padded_stride.checked_mul(height as usize) else {
             error!(target: LOG_TARGET, "upload_bytes_to_color_handle: staging size overflow");
             return;
         };
-        if tight.len() < tight_stride.saturating_mul(height as usize) {
+        if rows.len() < src_stride.saturating_mul(height as usize) {
             error!(
                 target: LOG_TARGET,
-                "upload_bytes_to_color_handle: source slice {} shorter than {tight_stride}*{height}",
-                tight.len(),
+                "upload_bytes_to_color_handle: source slice {} shorter than {src_stride}*{height}",
+                rows.len(),
             );
             return;
         }
         // `bytesNoCopy` needs page-aligned backing, so the rows must land in a
-        // `PageBox` (re-packing the tight source into the padded stride).
+        // `PageBox` (re-packing the source rows into the padded stride).
         let mut staging = PageBox::new_uninit(padded_size);
         let dst_base = staging.as_mut_ptr();
-        let src_base = tight.as_ptr();
+        let src_base = rows.as_ptr();
         for row in 0..height as usize {
-            // SAFETY: the source row `[row*tight_stride, +tight_stride)` is in
-            // bounds (`tight.len() >= tight_stride * height`, checked above).
-            let src_row = unsafe { src_base.add(row * tight_stride) };
-            // SAFETY: the dest row `[row*padded_stride, +tight_stride)` is
-            // within `staging` (`padded_stride >= tight_stride`, alloc has
+            // SAFETY: the source row `[row*src_stride, +src_stride)` is in
+            // bounds (`rows.len() >= src_stride * height`, checked above).
+            let src_row = unsafe { src_base.add(row * src_stride) };
+            // SAFETY: the dest row `[row*padded_stride, +src_stride)` is
+            // within `staging` (`padded_stride >= src_stride`, alloc has
             // `padded_size = padded_stride * height` bytes).
             let dst_row = unsafe { dst_base.add(row * padded_stride) };
             // SAFETY: both pointers and the byte count are valid per above, and
-            // `tight` / `staging` are distinct allocations (disjoint copy).
-            unsafe { core::ptr::copy_nonoverlapping(src_row, dst_row, tight_stride) };
+            // `rows` / `staging` are distinct allocations (disjoint copy).
+            unsafe { core::ptr::copy_nonoverlapping(src_row, dst_row, src_stride) };
         }
 
         let staging_len = staging.len() as u64;

@@ -17,7 +17,10 @@ use mtld3d_core::{
     dirty_rect::DirtyRect,
     dxso::operand_token_count,
     ff_state::{FfState, FfVsDirty},
-    format::{FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, map_d3d_format},
+    format::{
+        FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, linear_row_pitch,
+        map_d3d_format,
+    },
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
     passes::ExtraColorSlot,
@@ -5015,14 +5018,15 @@ extern "system" fn device_create_render_target(
     };
     // A `Lockable == TRUE` render target keeps its standalone renderable colour
     // texture (so `GetContainer`/`GetDesc`/`StretchRect` are unchanged) but also
-    // gets a tight `width*height*bpp` CPU staging buffer: `LockRect` maps it,
-    // `UnlockRect` uploads it to the colour texture. The format mapping was
-    // already validated by `create_color_target_surface` (uncompressed colour).
+    // gets a CPU staging buffer: `LockRect` maps it, `UnlockRect` uploads it to
+    // the colour texture. It is sized at the same row pitch every host-visible
+    // surface store uses, so `LockRect`, the GPU read-back and the DIB a
+    // `GetDC` wraps around it all step by the same stride. The format mapping
+    // was already validated by `create_color_target_surface` (uncompressed
+    // colour).
     if lockable != 0 {
-        let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel()) as usize;
-        let bytes = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(bpp);
+        let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
+        let bytes = (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize);
         if bpp != 0 && bytes != 0 {
             // Zero-initialise the staging (defence-in-depth): a `LockRect`
             // before any render — or any path that skips the read-back fill —
@@ -5228,7 +5232,7 @@ extern "system" fn device_update_surface(
         let Some(bpp) = map_d3d_format(src_fmt).map(|m| m.bytes_per_pixel()) else {
             return D3DERR_INVALIDCALL;
         };
-        let src_pitch = src_w.saturating_mul(bpp).next_multiple_of(4) as usize;
+        let src_pitch = linear_row_pitch(src_w, bpp) as usize;
         // SAFETY: optional *const RECT / *const POINT per the ABI; null → None.
         let rect = (unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(src_rect) })
             .map(|r| (r.x1, r.y1, r.x2, r.y2));
@@ -6845,8 +6849,7 @@ extern "system" fn device_create_offscreen_plain_surface(
             .saturating_mul(blocks_h)
             .saturating_mul(fmt.block_bytes() as usize)
     } else {
-        let pitch = width.saturating_mul(bpp).next_multiple_of(4);
-        (pitch as usize).saturating_mul(height as usize)
+        (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
     let surf = Direct3DSurface9::new_system_memory(
         obj.inner_ptr(),
