@@ -973,3 +973,92 @@ fn stretch_rect_resolves_a_multisampled_depth_surface() {
         "the resolved depth rejects the draw behind it",
     );
 }
+
+// ── A clear ordered before a StretchRect resolve ──
+
+/// A triangle over the left quarter of the target, in `color`.
+///
+/// At the middle scanline it reaches a quarter of the way across, so one probe
+/// lands inside it and one well clear of it.
+const fn corner_triangle(color: u32) -> [RhwVertex; 3] {
+    [
+        RhwVertex {
+            x: 0.0,
+            y: 0.0,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: RT_SIZE_F / 4.0,
+            y: 0.0,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: 0.0,
+            y: RT_SIZE_F,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+    ]
+}
+
+#[test]
+fn a_clear_before_a_stretch_rect_resolve_does_not_wipe_it() {
+    // Clear(target), render into a multisampled surface, StretchRect it into
+    // the target, then draw over a corner of the target. The clear is ordered
+    // first, so the copy has to survive it: what the last draw does not cover
+    // reads back as the resolved image.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let ms = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let target = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    arm(&h);
+    h.select_diffuse_stage(0);
+
+    assert_eq!(
+        h.set_render_target(0, &target),
+        0,
+        "SetRenderTarget(target)"
+    );
+    assert_eq!(h.clear_target(BLUE), 0, "clear the target");
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(scene)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(scene)");
+    assert_eq!(h.clear_target(BLACK), 0, "clear the multisampled surface");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(0.5)),
+        0,
+        "covering draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(scene)");
+
+    assert_eq!(
+        h.stretch_rect(&ms, &target, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the multisampled surface into the target"
+    );
+
+    assert_eq!(h.set_render_target(0, &target), 0, "SetRenderTarget(over)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(over)");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner_triangle(BLACK)),
+        0,
+        "corner draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(over)");
+
+    let row = surface_row(&h, &target, (RT_SIZE, RT_SIZE));
+    assert_pixel_eq(row[INSIDE_X as usize], BLACK, "the corner draw landed");
+    assert_pixel_eq(
+        row[(RT_SIZE - 4) as usize],
+        WHITE,
+        "the resolved image survives the clear that was ordered before it",
+    );
+}

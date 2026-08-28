@@ -4294,9 +4294,9 @@ impl PassState {
     /// Rule E's Clear into it. Bail on any intervening pass that reads
     /// the target as a fragment sampler input, as a blit source, or
     /// attaches it with `Clear` itself (that pass already overwrites
-    /// whatever we'd move), and on any intervening leading blit or depth
-    /// resolve that writes the target: the copy landed after the clear, so a
-    /// clear moved past it would wipe it.
+    /// whatever we'd move), and on any intervening leading blit or
+    /// multisample resolve that writes the target: the copy landed after the
+    /// clear, so a clear moved past it would wipe it.
     fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
         let ClearMerge {
             color: target_color,
@@ -4338,6 +4338,17 @@ impl PassState {
             // A depth resolve into the target writes it the same way a blit
             // does, and is ordered after our clear for the same reason.
             if (needs_depth || needs_stencil) && cand.depth_resolve_texture == target_depth {
+                return None;
+            }
+            // So does a colour resolve, on any of the pass's attachments: the
+            // multisampled companion it reduces holds content the clear would
+            // otherwise land on top of.
+            if needs_color
+                && (pass_resolves_into(cand, target_color, &self.srgb_twin_to_base)
+                    || target_extra
+                        .iter()
+                        .any(|&(tex, _)| pass_resolves_into(cand, tex, &self.srgb_twin_to_base)))
+            {
                 return None;
             }
             // Render targets 1..3 travel as a set: only a candidate with
@@ -4851,6 +4862,30 @@ fn pass_reads_texture(
             Some(BlitCommandType::CopyTextureToTexture) => b.src_handle == target_raw,
             Some(BlitCommandType::GenerateMipmaps) => b.dst_handle == target_raw,
             _ => false,
+        })
+}
+
+/// True if `pass` resolves one of its colour attachments into `target_handle`.
+///
+/// A resolve carries the view it writes rather than the target's identity,
+/// which is the sRGB twin on a pass that encodes on write, so each candidate
+/// is mapped back to the base handle every rule keys on.
+///
+/// `target_handle == 0` is treated as "no resolve" since 0 is the unset
+/// sentinel for texture handles.
+fn pass_resolves_into(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    srgb_twin_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    core::iter::once(pass.color_resolve_texture)
+        .chain(pass.extra_color.iter().map(|a| a.resolve_texture))
+        .any(|view| {
+            !view.is_null()
+                && (view == target_handle || srgb_twin_to_base.get(&view) == Some(&target_handle))
         })
 }
 
