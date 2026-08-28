@@ -3477,7 +3477,9 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         // that scale, already matches it.
         source_width: ti.mip_width(0),
         source_height: ti.mip_height(0),
-        pad0: 0,
+        // A block-compressed level strides by block rows, so the slice size
+        // counts them the same way `needed` above does.
+        block_height: ti.block_h.max(1),
     };
     let status = unix_call(&mut params);
     if status != 0 {

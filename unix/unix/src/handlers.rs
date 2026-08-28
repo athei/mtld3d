@@ -496,6 +496,7 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
         bytes_per_row: params.bytes_per_row,
         source_width: params.source_width,
         source_height: params.source_height,
+        block_height: params.block_height,
     };
     if metal::blit_texture_to_buffer(&blit_args) {
         STATUS_SUCCESS

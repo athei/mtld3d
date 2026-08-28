@@ -347,7 +347,8 @@ pub struct TextureUploadJob {
     /// Byte stride between slices (the box slice pitch).
     ///
     /// Only read by the volume blit path; the 2D path derives its
-    /// single-slice `bytes_per_image` from `src_pitch * region_h` instead.
+    /// single-slice `bytes_per_image` from the region's block-row count
+    /// instead.
     pub slice_pitch: u32,
 }
 
@@ -6585,18 +6586,18 @@ impl FrameEncoder {
         }
 
         // Compute the blit descriptor against the staging buffer's
-        // src_pitch stride. `num_blit_rows` is the row count the GPU
-        // will actually read — pixel rows for uncompressed, block rows
-        // (rounded up) for compressed. Carried through alongside `info`
-        // so the alignment-pad branch below knows how many source rows
-        // to repack.
+        // src_pitch stride. The format's block height is carried through
+        // alongside `info` because a Metal blit is measured in block rows,
+        // not pixel rows: it turns `region_h` into the row count the GPU
+        // actually reads, both for the alignment-pad repack below and for
+        // the slice size the copy is given.
         let staging_buffer_handle =
             self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
         if staging_buffer_handle == 0 {
             return false;
         }
 
-        let (info, num_blit_rows) = if job.bytes_per_pixel == 0 {
+        let (info, block_height) = if job.bytes_per_pixel == 0 {
             // Compressed (BC1/2/3). Sub-rect must land on the block
             // grid; otherwise fall back to a full-mip blit from the
             // start of the staging buffer. Both variants are correct
@@ -6631,7 +6632,7 @@ impl FrameEncoder {
                     depth: 1,
                     bytes_per_image: 0,
                 };
-                (info, job.region_h.div_ceil(bh))
+                (info, bh)
             } else {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "run_texture_upload_blit: compressed sub-rect ({}+{},{}+{}) unaligned to {}×{} block grid → full-mip fallback",
@@ -6656,7 +6657,7 @@ impl FrameEncoder {
                     depth: 1,
                     bytes_per_image: 0,
                 };
-                (info, mip_h.div_ceil(bh))
+                (info, bh)
             }
         } else {
             // Uncompressed path. Sub-rect offset is
@@ -6677,8 +6678,9 @@ impl FrameEncoder {
                 depth: 1,
                 bytes_per_image: 0,
             };
-            (info, job.region_h)
+            (info, 1)
         };
+        let num_blit_rows = mtld3d_shared::blit_geometry::block_rows(info.region_h, block_height);
 
         // `copyFromBuffer:toTexture:` requires `sourceBytesPerRow` to
         // be ≥ `device.minimumLinearTextureAlignmentForPixelFormat`
@@ -6699,13 +6701,16 @@ impl FrameEncoder {
             info
         };
 
-        // Single-slice (`depth == 1`) copy: `bytes_per_image` is
-        // `bytes_per_row * region_h` computed off the *final*
-        // (post-padding) row stride — the exact value the unix blit
-        // derived implicitly before the field existed, so the 2D wire is
-        // byte-identical.
+        // Single-slice (`depth == 1`) copy: `bytes_per_image` is the slice's
+        // block-row count times the *final* (post-padding) row stride. For a
+        // compressed level that is `block_height` times smaller than the
+        // pixel-row product.
         let info = CopyBufferToTextureInfo {
-            bytes_per_image: info.bytes_per_row.saturating_mul(info.region_h),
+            bytes_per_image: mtld3d_shared::blit_geometry::bytes_per_image(
+                info.bytes_per_row,
+                info.region_h,
+                block_height,
+            ),
             ..info
         };
         self.frame_blit_commands

@@ -50,9 +50,8 @@ fn set_display_sync_enabled_layout() {
 #[test]
 fn blit_texture_to_buffer_layout() {
     use super::BlitTextureToBufferParams;
-    // 3*u64 (handles) + 2*u64 (dst ptr/len) + 9*u32
-    // = 24 + 16 + 36 = 76, which the explicit pad0 rounds to 80, a
-    // multiple of the align-8.
+    // 3*u64 (handles) + 2*u64 (dst ptr/len) + 10*u32
+    // = 24 + 16 + 40 = 80, a multiple of the align-8.
     assert_eq!(core::mem::align_of::<BlitTextureToBufferParams>(), 8);
     assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 80);
 }
