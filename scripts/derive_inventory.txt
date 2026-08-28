@@ -156,6 +156,7 @@ windows/d3d9/src/device.rs DeviceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/device.rs RtBinding Clone
 windows/d3d9/src/device.rs SnapshotDirty Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/device.rs StretchSurfaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/d3d9/src/device.rs TextureCreateArgs Clone,Copy
 windows/d3d9/src/draw.rs AttrSnapshot Clone,Copy
 windows/d3d9/src/draw.rs CurrentSnapshotPtr Clone,Copy
 windows/d3d9/src/draw.rs DepthScissorFlags Clone,Copy,Debug,Default,PartialEq,Eq

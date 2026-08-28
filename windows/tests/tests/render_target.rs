@@ -1336,6 +1336,71 @@ fn color_fill_render_target_texture_succeeds() {
 }
 
 #[test]
+fn fresh_default_offscreen_plain_round_trips_through_lock_rect() {
+    // A DEFAULT offscreen plain is lockable, so it owns its level-0 staging
+    // from creation on. Three locks a fresh surface has to serve out of that
+    // staging: a read-only one on a surface nothing has written, a write, and
+    // the read after it, with no draw, ColorFill or StretchRect in between. A
+    // ColorFill of a plain no lock has ever touched reads back the same way.
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, D3D_OK, "a DEFAULT offscreen plain describes");
+    assert_eq!(
+        (desc.width, desc.height),
+        (64, 64),
+        "at the requested extent"
+    );
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "in the requested pool");
+
+    let pitch_px = {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        assert!(
+            pitch_px >= 64,
+            "a read-only lock of a never-written plain maps a full row, got {pitch_px}",
+        );
+        pitch_px
+    };
+
+    let pattern: Vec<u32> = (0..pitch_px * 64)
+        .map(|i| 0xFF00_0000 | (i.wrapping_mul(7) & 0x00FF_FFFF))
+        .collect();
+    {
+        let mut locked = surface.lock_rect(0);
+        assert_eq!(
+            locked.pitch().cast_unsigned() / 4,
+            pitch_px,
+            "the pitch is stable across locks",
+        );
+        locked.write_u32(&pattern);
+    }
+    {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.as_u32(pattern.len()),
+            pattern.as_slice(),
+            "LockRect reads back what the lock before it wrote",
+        );
+    }
+
+    let fresh = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.color_fill_hr(&fresh, GREEN),
+        D3D_OK,
+        "ColorFill of a plain that has never been locked",
+    );
+    let locked = fresh.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((pitch_px * 64) as usize);
+    assert_eq!(
+        pixels[(32 * pitch_px + 32) as usize],
+        GREEN,
+        "the fill is visible to the lock that follows it",
+    );
+}
+
+#[test]
 fn color_fill_sub_rect_of_offscreen_plain_reads_back() {
     // A lockable DEFAULT offscreen-plain surface reads its fill back through
     // LockRect, so the fill has to be visible to the very next lock: inside the

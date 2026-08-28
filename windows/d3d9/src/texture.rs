@@ -101,8 +101,10 @@ bitflags::bitflags! {
         const CUBE = 1 << 3;
         /// The texture behind a `CreateOffscreenPlainSurface` surface.
         ///
-        /// D3D9 lets a game lock such a surface even in the default pool,
-        /// so its staging is never released after an upload.
+        /// D3D9 lets a game lock such a surface even in the default pool, so
+        /// its staging is never released: not after an upload, and not by the
+        /// create-time drop loop, which is why the flag is part of the create
+        /// info rather than set on the finished texture.
         const OFFSCREEN_PLAIN = 1 << 4;
         /// Created through `CreateVolumeTexture`, whatever its depth.
         ///
@@ -504,11 +506,6 @@ impl TextureInner {
             && !self.flags.contains(TextureFlags::OFFSCREEN_PLAIN)
             && !self.flags.contains(TextureFlags::DEPTH_FORMAT)
             && self.depth <= 1
-    }
-
-    /// Mark the texture as the backing of an offscreen-plain surface.
-    pub fn mark_offscreen_plain(&mut self) {
-        self.flags |= TextureFlags::OFFSCREEN_PLAIN;
     }
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
