@@ -34,6 +34,10 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
         DeviceCapsFlags::NATIVE_PACKED16,
         supports_native_packed16(&device),
     );
+    caps.set(
+        DeviceCapsFlags::FLOAT32_FILTERING,
+        supports_float32_filtering(&device),
+    );
     Some((name, registry_id, caps))
 }
 
@@ -55,6 +59,17 @@ pub fn supports_sampler_border(device: &ProtocolObject<dyn MTLDevice>) -> bool {
 /// `Bgra8Unorm` and expands texels on the CPU at upload time.
 pub fn supports_native_packed16(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.supportsFamily(MTLGPUFamily::Apple2)
+}
+
+/// True when single-precision float textures sample with linear filtering.
+///
+/// The query covers exactly `R32Float` / `RG32Float` / `RGBA32Float`; the
+/// half-float formats are filterable on every family Metal's pixel-format
+/// capability table lists for macOS, so they need no query. The PE side
+/// answers `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)` for R32F / G32R32F /
+/// A32B32G32R32F with this bit.
+pub fn supports_float32_filtering(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    device.supports32BitFloatFiltering()
 }
 
 /// Snapshot of the Metal device values the PE side needs.

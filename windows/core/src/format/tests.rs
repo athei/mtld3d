@@ -190,3 +190,68 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     assert_eq!(bgra.metal_pixel_format(), PixelFormat::Bgra8Unorm);
     assert_eq!(bgra.bytes_per_pixel(), 4);
 }
+
+#[test]
+fn only_the_single_precision_floats_depend_on_device_filtering() {
+    use mtld3d_types::{
+        D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_RENDERTARGET,
+    };
+
+    use super::supports_usage_query;
+
+    // Every usage shape that reaches the classifier, with and without the
+    // D3DUSAGE_QUERY_FILTER bit a title adds to it.
+    const PLAIN: [u32; 4] = [
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    ];
+    const HALF_FLOATS: [u32; 3] = [D3DFMT_R16F, D3DFMT_G16R16F, D3DFMT_A16B16G16R16F];
+    const SINGLE_FLOATS: [u32; 3] = [D3DFMT_R32F, D3DFMT_G32R32F, D3DFMT_A32B32G32R32F];
+
+    for float32_filtering in [true, false] {
+        for fmt in HALF_FLOATS.into_iter().chain(SINGLE_FLOATS) {
+            for usage in PLAIN {
+                // Without the filter bit the answer is the same on either
+                // device: renderability and blending are device-independent.
+                assert!(
+                    supports_usage_query(fmt, usage, float32_filtering),
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // Half floats filter on every GPU family.
+        for fmt in HALF_FLOATS {
+            for usage in PLAIN {
+                assert!(
+                    supports_usage_query(fmt, usage | D3DUSAGE_QUERY_FILTER, float32_filtering),
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // The single-precision three follow the device answer, in every
+        // usage shape the filter bit can be combined with.
+        for fmt in SINGLE_FLOATS {
+            for usage in PLAIN {
+                assert_eq!(
+                    supports_usage_query(fmt, usage | D3DUSAGE_QUERY_FILTER, float32_filtering),
+                    float32_filtering,
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // A format outside the float family is never gated.
+        assert!(supports_usage_query(
+            D3DFMT_A8R8G8B8,
+            D3DUSAGE_QUERY_FILTER,
+            float32_filtering
+        ));
+        assert!(supports_usage_query(
+            D3DFMT_A16B16G16R16,
+            D3DUSAGE_QUERY_FILTER,
+            float32_filtering
+        ));
+    }
+}
