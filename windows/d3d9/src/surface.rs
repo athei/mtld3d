@@ -2738,24 +2738,41 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
     let (width, height) = (inner.standalone_width, inner.standalone_height);
     let tex_handle = inner.live_color_handle();
     if bpp == 0 || width == 0 || height == 0 || tex_handle.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT read-back skipped: bpp={bpp} extent={width}x{height} color_handle={:#x} (staging left as-is)",
+            tex_handle.raw()
+        );
         return;
     }
     let bytes_per_row = mtld3d_core::format::linear_row_pitch(width, bpp);
     let needed = (bytes_per_row as usize).saturating_mul(height as usize);
     if needed == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT read-back skipped: zero byte size for {width}x{height} at {bpp} bpp (staging left as-is)"
+        );
         return;
     }
     let device_ptr = inner.device_inner;
     if device_ptr.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT read-back skipped: surface has no owning device (staging left as-is)"
+        );
         return;
     }
     // Borrow the staging (the blit destination) and the device separately;
     // `device_inner` is a distinct allocation from the `system_memory` PageBox,
     // so the two raw-pointer derefs never overlap.
     let Some(page) = inner.system_memory.as_mut() else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT read-back skipped: surface carries no CPU staging buffer"
+        );
         return;
     };
     if page.len() < needed {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT read-back skipped: staging {} bytes, {needed} needed for {width}x{height} at {bpp} bpp (staging left as-is)",
+            page.len()
+        );
         return;
     }
     let dst_ptr = page.as_mut_ptr() as u64;
@@ -2814,20 +2831,34 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
 /// never disagree.
 fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT staging upload skipped: unmapped surface format {:#x} (colour texture left as-is)",
+            inner.standalone_format
+        );
         return;
     };
     let bpp = fmt.bytes_per_pixel();
     let (width, height) = (inner.standalone_width, inner.standalone_height);
     let color_handle = inner.live_color_handle().raw();
     if bpp == 0 || width == 0 || height == 0 || color_handle == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT staging upload skipped: bpp={bpp} extent={width}x{height} color_handle={color_handle:#x} (colour texture left as-is)"
+        );
         return;
     }
     let Some(page) = inner.system_memory.as_ref() else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT staging upload skipped: surface carries no CPU staging buffer"
+        );
         return;
     };
     let pitch = mtld3d_core::format::linear_row_pitch(width, bpp);
     let needed = (pitch as usize).saturating_mul(height as usize);
     if page.len() < needed {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT staging upload skipped: staging {} bytes, {needed} needed for {width}x{height} at {bpp} bpp (colour texture left as-is)",
+            page.len()
+        );
         return;
     }
     // Copy the `pitch * height` bytes the lock just received into a heap buffer
@@ -2835,6 +2866,9 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     // must not borrow the surface's staging (no-thunk rule).
     let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
     if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "lockable RT staging upload skipped: surface has no owning device (colour texture left as-is)"
+        );
         return;
     }
     // SAFETY: `inner.device_inner` was stamped at `Self::new` from a live
