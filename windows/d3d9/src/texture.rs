@@ -829,26 +829,15 @@ impl TextureInner {
                 }
             }
         }
-        // A copy covering the whole destination level marks it whole; a
-        // partial one narrows the upload to the written union (2D only: the
-        // volume upload path has no sub-rect form and keeps whole-mip).
-        let whole = dx == 0
-            && dy == 0
-            && rw >= self.mip_width(dst_level)
-            && rh >= self.mip_height(dst_level);
-        if whole || self.depth > 1 {
-            self.mark_mip_dirty(dst_level);
-        } else {
-            self.mark_mip_dirty_rect(
-                dst_level,
-                DirtyRect {
-                    x: dx,
-                    y: dy,
-                    w: rw,
-                    h: rh,
-                },
-            );
-        }
+        self.mark_written_region(
+            dst_level,
+            DirtyRect {
+                x: dx,
+                y: dy,
+                w: rw,
+                h: rh,
+            },
+        );
         true
     }
 
@@ -942,8 +931,8 @@ impl TextureInner {
     /// Returns false for any other pair (caller falls back to a
     /// best-effort no-op) or an out-of-bounds region. Same-size only
     /// (`src_rect` extent equals the destination extent) — the caller rejects
-    /// scaling upstream. Marks `dst_level` dirty on success so a later
-    /// `flush_dirty_mips` uploads the converted pixels.
+    /// scaling upstream. Marks the written rectangle of `dst_level` dirty on
+    /// success so a later `flush_dirty_mips` uploads the converted pixels.
     pub fn convert_sub_region_from(
         &mut self,
         dst_level: usize,
@@ -985,6 +974,12 @@ impl TextureInner {
             dst_point.0.max(0).cast_unsigned(),
             dst_point.1.max(0).cast_unsigned(),
         );
+        // The region has to land inside the destination mip: a row that ran
+        // past its right edge would wrap into the next one, and the dirty
+        // rectangle recorded below has to describe a real part of the level.
+        if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
+            return false;
+        }
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let (src_bpp, dst_bpp) = (rgb_bpp(src_fmt), rgb_bpp(dst_fmt));
@@ -1041,18 +1036,27 @@ impl TextureInner {
                 encode_rgb_pixel(dst_fmt, rgba, out);
             }
         }
-        self.mark_mip_dirty(dst_level);
+        self.mark_written_region(
+            dst_level,
+            DirtyRect {
+                x: dx,
+                y: dy,
+                w: rw,
+                h: rh,
+            },
+        );
         true
     }
 
-    /// Copy a sub-rectangle of raw source bytes into `dst_level`'s CPU staging, marking it dirty.
+    /// Copy a sub-rectangle of raw source bytes into `dst_level`'s CPU staging.
     ///
     /// The bytes are a standalone system-memory offscreen surface's backing,
     /// laid out like a mip: `src_pitch` bytes/row. This is the `UpdateSurface`
     /// path for a `D3DPOOL_SYSTEMMEM` offscreen-plain *source* surface (which is
     /// not texture-backed, so [`Self::copy_sub_region_from`] cannot serve it).
-    /// Block-aware, mirroring `copy_sub_region_from`. Returns false on a missing
-    /// level or an out-of-bounds region.
+    /// Block-aware, mirroring `copy_sub_region_from`, down to marking only the
+    /// written rectangle dirty. Returns false on a missing level or an
+    /// out-of-bounds region.
     pub fn copy_bytes_to_staging_region(
         &mut self,
         dst_level: usize,
@@ -1091,6 +1095,12 @@ impl TextureInner {
             dst_point.0.max(0).cast_unsigned(),
             dst_point.1.max(0).cast_unsigned(),
         );
+        // The region has to land inside the destination mip: a row that ran
+        // past its right edge would wrap into the next one, and the dirty
+        // rectangle recorded below has to describe a real part of the level.
+        if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
+            return false;
+        }
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let src_blocks_per_row = src_w.div_ceil(bw) as usize;
@@ -1119,7 +1129,15 @@ impl TextureInner {
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
             }
         }
-        self.mark_mip_dirty(dst_level);
+        self.mark_written_region(
+            dst_level,
+            DirtyRect {
+                x: dx,
+                y: dy,
+                w: rw,
+                h: rh,
+            },
+        );
         true
     }
 
@@ -1832,6 +1850,23 @@ impl TextureInner {
                     h: bottom - y,
                 }
             }));
+        }
+    }
+
+    /// Mark the rectangle a staging write covered dirty, narrowing where it can.
+    ///
+    /// A write covering the whole destination level marks it whole; a partial
+    /// one narrows the upload to the written union. Volume levels always mark
+    /// whole: the upload path has no sub-rect form for them.
+    fn mark_written_region(&mut self, level: usize, rect: DirtyRect) {
+        let whole = rect.x == 0
+            && rect.y == 0
+            && rect.w >= self.mip_width(level)
+            && rect.h >= self.mip_height(level);
+        if whole || self.depth > 1 {
+            self.mark_mip_dirty(level);
+        } else {
+            self.mark_mip_dirty_rect(level, rect);
         }
     }
 
