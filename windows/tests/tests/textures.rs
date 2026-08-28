@@ -1095,6 +1095,63 @@ fn get_dc_on_a_released_default_pool_level_reads_the_level_back() {
     );
 }
 
+/// A draw under a held `GetDC` leaves the level's staging where the DIB is.
+///
+/// The `UnlockRect` marks the level dirty, so the first draw after it uploads
+/// the level and would release the staging the DC's DIB aliases: the DIB would
+/// then read and write a page nothing owns, and GDI's drawing would reach the
+/// texture nowhere. A held device context pins the level for its lifetime, so
+/// the upload `ReleaseDC` schedules carries what GDI drew.
+#[test]
+fn a_draw_under_a_held_device_context_keeps_the_level_staging() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const GREEN: u32 = 0xFF00_FF00;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[GREEN; TEXELS]);
+    }
+
+    // Nothing has uploaded the level yet, so the DC maps the pages the lock
+    // wrote rather than a re-materialised copy of them.
+    let surface = tex.surface_level(0);
+    let dc = surface.dc();
+    assert_eq!(
+        dc.get_pixel(0, 0),
+        GREEN_COLORREF,
+        "the DC reads the texels the lock wrote"
+    );
+    // Two draws while the DC is held: the first uploads the level and is the
+    // one that would release its staging, the second retires the upload job
+    // holding the only other reference to those pages.
+    for pass in ["first draw under the DC", "second draw under the DC"] {
+        assert_pixel_eq(sample_center(&h, &tex).to_pixel(), GREEN, pass);
+    }
+    assert_eq!(
+        dc.set_pixel(0, 0, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel stores full-scale channels exactly in an 8-8-8-8 DIB",
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+
+    // The quad spans the unit square over a 640x480 target, so texel (0, 0)
+    // covers x 0..10, y 0..7: read a point inside that band.
+    let painted = sample_at(&h, &tex, 5, 3);
+    assert!(
+        painted.r > 200 && painted.g < 50 && painted.b < 50,
+        "a draw samples the texel GDI painted through the held DC, got {painted:?}"
+    );
+    let untouched = sample_center(&h, &tex);
+    assert!(
+        untouched.r < 50 && untouched.g > 200 && untouched.b < 50,
+        "the texels GDI left alone still sample as the lock wrote them, got {untouched:?}"
+    );
+}
+
 /// `D3DLOCK_DISCARD` on a released default-pool level rewrites it whole.
 ///
 /// DISCARD declares the level's contents dead, so the lock takes the fresh

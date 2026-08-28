@@ -297,6 +297,12 @@ pub struct TextureInner {
     /// staging ([`TextureInner::staging_droppable_class`]), which pays neither
     /// the memory nor the bookkeeping.
     staging_coverage: Vec<StagingCoverage>,
+    /// Levels a device context currently maps (bit N = level N).
+    ///
+    /// A `GetDC` hands GDI a DIB over the level's staging pages, and
+    /// `ReleaseDC` keeps whatever GDI drew in them, so the level holds its
+    /// staging for as long as the DC does, exactly as a `LockRect` does.
+    dc_open: u32,
     /// Levels whose Metal texture holds pixels the CPU staging does not (bit N = level N).
     ///
     /// Set when the GPU writes a lockable level with no CPU mirror: a
@@ -484,11 +490,34 @@ impl TextureInner {
     /// holds the only bytes. Keeping ours doubles the footprint of every
     /// streamed texture inside a 32-bit game. Render targets, depth
     /// textures, cubes and volumes keep theirs (their copies serve other
-    /// paths); so do the lockable pools.
+    /// paths); so do the lockable pools. A level a `LockRect` or a `GetDC`
+    /// holds keeps its staging either way: both hand out a pointer into those
+    /// pages that stays live until the map is released.
     fn staging_droppable(&self, level: usize) -> bool {
         self.staging_droppable_class()
             && self.dropped_staging & (1u32 << level) == 0
             && !self.locked[level]
+            && !self.level_dc_open(level)
+    }
+
+    /// Whether a device context currently maps `level`.
+    const fn level_dc_open(&self, level: usize) -> bool {
+        level < u32::BITS as usize && self.dc_open & (1u32 << level) != 0
+    }
+
+    /// Record whether a device context maps `level`, pinning its staging while one does.
+    ///
+    /// A D3D9 mip chain tops out at 15 levels, so the mask covers every level a
+    /// texture can carry; the bound is a guard, not a limit anything reaches.
+    pub const fn set_level_dc_open(&mut self, level: usize, open: bool) {
+        if level >= u32::BITS as usize {
+            return;
+        }
+        if open {
+            self.dc_open |= 1u32 << level;
+        } else {
+            self.dc_open &= !(1u32 << level);
+        }
     }
 
     /// Whether every texel of `level` has been written since its staging was allocated.
@@ -2404,6 +2433,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         staging,
         dropped_staging: 0,
         staging_coverage: Vec::new(),
+        dc_open: 0,
         gpu_authoritative: 0,
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
