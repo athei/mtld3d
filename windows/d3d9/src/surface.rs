@@ -2808,6 +2808,14 @@ impl SurfaceInner {
         } else {
             ti.cube_lock_box(self.cube_face, level)?
         };
+        // Every released level of every texture aliases one placeholder page,
+        // so a DIB over it reads that page and its writes reach every other
+        // released level. `GetDC` re-materialises the level before it resolves
+        // the store, and `ReleaseDC` maps the level the `GetDC` held.
+        debug_assert!(
+            !crate::texture::is_dropped_staging_page(bits),
+            "a device context resolved the shared dropped-staging page as its pixel store"
+        );
         Some(SurfacePixels {
             bits,
             width: ti.mip_width(level),
@@ -2816,6 +2824,29 @@ impl SurfaceInner {
             d3d_format: tex.d3d_format(),
         })
     }
+}
+
+/// Re-materialise a released texture level before a device context maps it.
+///
+/// A `D3DPOOL_DEFAULT` level whose staging went once its upload retired holds
+/// its pixels on the GPU alone, and its staging slot points at the page every
+/// released level shares. A DC reads the level and keeps what GDI draws into
+/// it, so it takes the GPU read back a `LockRect` of the same level takes. A
+/// cube face is never released (a cube keeps its staging for the texture's
+/// life), and neither is the level of a surface that owns its parent texture,
+/// which has no pixels of its own to expose.
+fn refill_dc_texture_level(inner: &SurfaceInner) {
+    if inner.parent_texture.is_null()
+        || inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
+        || inner.cube_face != u32::MAX
+    {
+        return;
+    }
+    // SAFETY: `parent_texture` is non-null (checked above) and points to a live
+    // `Direct3DTexture9` whose refcount keeps it alive for as long as this
+    // surface is live; it is a distinct allocation from the surface inner.
+    let texture = unsafe { (*inner.parent_texture).inner_mut() };
+    texture.ensure_staging_for_dc(inner.mip_level as usize);
 }
 
 extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i32 {
@@ -2865,6 +2896,7 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     if inner.is_lockable_render_target() {
         refresh_lockable_rt_staging(inner);
     }
+    refill_dc_texture_level(inner);
     let Some(px) = inner.dc_pixels() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "IDirect3DSurface9::GetDC on a surface with no host pixel store → INVALIDCALL");
