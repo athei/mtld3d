@@ -426,8 +426,8 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
         if let Some(drawable) = drawable_opt {
             let drawable_texture = drawable.texture();
 
-            // HDR present: when the layer was configured for EDR at
-            // attach (RGBA16Float + ExtendedLinearDisplayP3 + wantsEDR),
+            // HDR present: when the layer is configured for EDR
+            // (RGBA16Float + an extended-linear colorspace + wantsEDR),
             // the drawable expects *linear* float values — a raw blit
             // copy of the game's gamma-encoded BGRA8 backbuffer into
             // an RGBA16Float drawable reinterprets the bytes and
@@ -473,14 +473,24 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 }
                 route => route,
             };
-            let hdr = super::macdrv::hdr_active();
+            // Reads what the main thread last published and queues the next
+            // refresh when due. Deriving it here would mean walking
+            // NSView.window on this thread, which is what crashes inside
+            // AppKit while the main thread rebuilds window and screen state.
+            // Polled every present, not only under HDR: the refresh it queues
+            // is also what reconciles the layer with the display the window is
+            // on, and a session that started SDR has to notice a panel with
+            // headroom appearing under it.
+            let current = super::macdrv::current_headroom();
+            // The layer follows that display, so its pixel format can change
+            // between two presents. Take the route from the drawable we are
+            // about to write rather than from a latch read a moment earlier: a
+            // float drawable must run the HDR pass whatever the latch says,
+            // and a BGRA8 drawable must not, because the HDR pipelines declare
+            // a float colour attachment.
+            let hdr = drawable_texture.pixelFormat() == MTLPixelFormat::RGBA16Float;
 
             let presented = if hdr {
-                // Reads what the main thread last published and queues the next
-                // refresh when due. Deriving it here would mean walking
-                // NSView.window on this thread, which is what used to crash
-                // inside AppKit a few seconds after a zone transition.
-                let current = super::macdrv::current_headroom();
                 match route {
                     PresentRoute::Upscale => encode_hdr_present_upscaled(
                         &cmd_buf,

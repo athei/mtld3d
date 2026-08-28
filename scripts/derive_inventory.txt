@@ -51,6 +51,7 @@ unix/unix/src/metal/command.rs PresentRoute Clone,Copy,PartialEq,Eq,Debug
 unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
+unix/unix/src/metal/macdrv.rs LayerMode Clone,Copy,Debug,PartialEq,Eq
 unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
