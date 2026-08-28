@@ -2194,6 +2194,104 @@ fn defi_int_constant_stays_a_baked_local_without_vs_i() {
 }
 
 #[test]
+fn dynamic_int_constant_inside_a_subroutine_declares_vs_i() {
+    // vs_3_0 {
+    //   dcl_position v0;
+    //   dcl_position oT0;
+    //   call l0;
+    //   ret;
+    //   label l0;
+    //     rep i0;
+    //       mov oT0, v0;
+    //     endrep;
+    //   ret;
+    // }
+    // The only iN read sits in the subroutine body, which `call`
+    // inline-expands into the entry point, so the emitted body references
+    // vs_i and the signature has to declare it.
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        opcode_token(OP_CALL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        opcode_token(OP_LABEL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_REP, 1),
+        src_token(TYPE_CONSTINT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDREP, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert!(
+        vs.uses_dynamic_int_constants(),
+        "an iN read reachable only through a call is still a dynamic integer constant"
+    );
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains(&format!(
+            "constant int4 *vs_i [[buffer({VS_INT_CONST_SLOT})]]"
+        )),
+        "the inlined `rep i0` must declare the vs_i buffer:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("vs_i[0]"),
+        "the inlined `rep i0` counter must read vs_i[0]:\n{vs_msl}"
+    );
+    // The substring assertions above cannot see an undeclared argument;
+    // Metal refuses the source outright when the body names vs_i and the
+    // signature does not.
+    metal_compile_or_fail(&vs_msl);
+}
+
+#[test]
+fn dynamic_int_constant_inside_a_subroutine_declares_ps_i() {
+    // ps_3_0 { call l0; ret; label l0; rep i0; mov oC0, c0; endrep; ret; }
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_CALL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        opcode_token(OP_LABEL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_REP, 1),
+        src_token(TYPE_CONSTINT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDREP, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    assert!(
+        ps.uses_dynamic_int_constants(),
+        "an iN read reachable only through a call is still a dynamic integer constant"
+    );
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains(&format!(
+            "constant int4 *ps_i [[buffer({PS_INT_CONST_SLOT})]]"
+        )),
+        "the inlined `rep i0` must declare the ps_i file:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains("ps_i[0]"),
+        "the inlined `rep i0` counter must read ps_i[0]:\n{ps_msl}"
+    );
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
 fn rep_emits_for_loop_without_al() {
     // vs_3_0 { defi i0, 8, 0, 0, 0; rep i0; mov r0, r1; endrep; ... }
     let bc = vec![
