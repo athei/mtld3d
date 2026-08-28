@@ -92,6 +92,28 @@ pub fn linear_to_srgb_rgba(rgba: [f32; 4]) -> [f32; 4] {
     [encode(rgba[0]), encode(rgba[1]), encode(rgba[2]), rgba[3]]
 }
 
+/// Repeat `pixel` across `dst`, filling every byte.
+///
+/// The `ColorFill` splat. Writes the pattern once and then doubles it with
+/// `copy_within`, so the fill runs at memcpy rate rather than one pixel at a
+/// time. A trailing partial pixel (a row that is not a whole number of
+/// pixels wide) is filled with the pattern's leading bytes, and an empty
+/// pattern leaves `dst` untouched.
+pub fn splat_pixel_pattern(dst: &mut [u8], pixel: &[u8]) {
+    let bpp = pixel.len();
+    if bpp == 0 || dst.is_empty() {
+        return;
+    }
+    let head = bpp.min(dst.len());
+    dst[..head].copy_from_slice(&pixel[..head]);
+    let mut filled = head;
+    while filled < dst.len() {
+        let take = filled.min(dst.len() - filled);
+        dst.copy_within(..take, filled);
+        filled += take;
+    }
+}
+
 /// Encode a D3DCOLOR into one pixel's destination-format bytes for `ColorFill`.
 ///
 /// Returns `None` for formats whose fill encoding isn't implemented yet (the

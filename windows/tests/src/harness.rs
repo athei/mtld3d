@@ -1850,6 +1850,33 @@ impl Harness {
         }
     }
 
+    /// `ColorFill` over `rect`, given as `(left, top, right, bottom)`. Returns the hr.
+    ///
+    /// The rect is clipped to the surface, so one that hangs over an edge
+    /// fills the part that lands on it.
+    pub fn color_fill_rect_hr(
+        &self,
+        surface: &Surface<'_>,
+        rect: (i32, i32, i32, i32),
+        color: u32,
+    ) -> i32 {
+        let rect = mtld3d_types::D3DRECT {
+            x1: rect.0,
+            y1: rect.1,
+            x2: rect.2,
+            y2: rect.3,
+        };
+        // SAFETY: vtable thunk; `&rect` outlives the call.
+        unsafe {
+            (self.dev_vtbl().color_fill)(
+                self.device,
+                surface.as_ptr(),
+                (&raw const rect).cast(),
+                color,
+            )
+        }
+    }
+
     /// `GetRenderTargetData` — copy a render target into a system-memory surface.
     ///
     /// Returns the hr; a destination outside `D3DPOOL_SYSTEMMEM` is INVALIDCALL.

@@ -14,6 +14,7 @@ use mtld3d_core::{
         self, FfVsLayout, InputSemantic, d3d_to_metal_primitive, fvf_to_elements,
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
     },
+    dirty_rect::DirtyRect,
     dxso::operand_token_count,
     ff_state::{FfState, FfVsDirty},
     format::{FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, map_d3d_format},
@@ -81,8 +82,8 @@ use super::{
         arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
     },
     encoder::{
-        BlitSide, EncoderThread, FrameData, FrameEncoder, FrameInit, Op, StagingWarmupEntry,
-        SubmitFence, TextureInfo, TextureUploadJob, VbibWarmupEntry,
+        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameEncoder, FrameInit, Op,
+        StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -6368,14 +6369,149 @@ fn resolve_stretch_surface(
     None
 }
 
+/// Resolve a `ColorFill` rect against the destination mip extent.
+///
+/// `rect` is the caller's `D3DRECT`; `None` fills the whole mip. Edges are
+/// clipped to the surface, so a rect that hangs over an edge fills the part
+/// that lands on it, and one that misses entirely returns `None` for the
+/// caller to treat as a no-op.
+fn color_fill_region(rect: Option<mtld3d_types::D3DRECT>, extent: (u32, u32)) -> Option<DirtyRect> {
+    let Some(r) = rect else {
+        return DirtyRect::full(extent.0, extent.1).clamp(extent.0, extent.1);
+    };
+    let x = r.x1.max(0).cast_unsigned();
+    let y = r.y1.max(0).cast_unsigned();
+    let right = r.x2.max(0).cast_unsigned();
+    let bottom = r.y2.max(0).cast_unsigned();
+    DirtyRect {
+        x,
+        y,
+        w: right.saturating_sub(x),
+        h: bottom.saturating_sub(y),
+    }
+    .clamp(extent.0, extent.1)
+}
+
+/// True when a `ColorFill` region lands on the destination's block grid.
+///
+/// A block-compressed fill that splits a block is `INVALIDCALL`; an edge that
+/// ends on the surface boundary is exempt, because the last block there is
+/// partial anyway. Uncompressed formats have a 1x1 grid, so this is inert.
+fn color_fill_block_aligned(region: DirtyRect, extent: (u32, u32), block: (u32, u32)) -> bool {
+    let (bw, bh) = (block.0.max(1), block.1.max(1));
+    if bw == 1 && bh == 1 {
+        return true;
+    }
+    let right = region.x + region.w;
+    let bottom = region.y + region.h;
+    region.x.is_multiple_of(bw)
+        && region.y.is_multiple_of(bh)
+        && (right.is_multiple_of(bw) || right == extent.0)
+        && (bottom.is_multiple_of(bh) || bottom == extent.1)
+}
+
+/// `ColorFill` a render target: paint the fill on the GPU.
+///
+/// The destination is a colour attachment on this device, so the fill is a
+/// one-off render pass through the clear machinery and the API thread writes
+/// no pixels at all. `info` is consumed because the destination kind travels
+/// into the encoder closure, which cannot reach the surface.
+fn color_fill_render_target(
+    dev: &mut DeviceInner,
+    info: StretchSurfaceInfo,
+    region: DirtyRect,
+    color: u32,
+) -> i32 {
+    // Device-aware: the clear-quad pipeline's colour format must match the
+    // attachment as it was created here (BGRA8 for an expanded 16-bit target).
+    let Some(format) =
+        crate::direct3d9::map_for_device(info.format).map(|m| m.metal_pixel_format())
+    else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill: render-target format {} unmapped → INVALIDCALL", info.format);
+        return D3DERR_INVALIDCALL;
+    };
+    let [r, g, b, a] = convert::d3dcolor_to_rgba_f32(color);
+    let fill = ColorFillTarget {
+        // Resolved in the closure below: a texture destination only creates
+        // its `MTLTexture` on the encoder thread.
+        texture: MetalHandle::NULL,
+        logical_size: (info.width, info.height),
+        format,
+        scale: info.scale,
+        subresource: (0, info.mip_level),
+        rect: (region.x, region.y, region.w, region.h),
+        rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
+    };
+    let kind = info.kind;
+    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
+        let texture = match kind {
+            // SAFETY: `get_or_create_texture` returns a Metal texture handle
+            // from the encoder's typed `texture_cache` via `.raw()`.
+            StretchKind::Texture(ti) => unsafe {
+                MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&ti))
+            },
+            // A depth-stencil surface never reaches here (`device_color_fill`
+            // rejects it), so both arms carry the colour handle.
+            StretchKind::Backbuffer(handle) | StretchKind::DepthStencil(handle) => handle,
+        };
+        enc.color_fill_target(&ColorFillTarget { texture, ..fill });
+    }));
+    D3D_OK
+}
+
+/// `ColorFill` a lockable `D3DPOOL_DEFAULT` offscreen-plain surface.
+///
+/// Its internal Metal texture is created shader-read-only, so it cannot be a
+/// colour attachment, and its read-back is a `LockRect` straight into CPU
+/// staging that no path refreshes from the GPU. The fill therefore lands in
+/// the staging on this thread and rides the ordinary upload to the texture,
+/// exactly like the write half of a `LockRect` / `UnlockRect` pair.
+fn color_fill_offscreen_plain(
+    dev: &mut DeviceInner,
+    parent: *mut Direct3DTexture9,
+    info: &StretchSurfaceInfo,
+    region: DirtyRect,
+    color: u32,
+) -> i32 {
+    // Encode the fill colour into the destination format. An unmapped format
+    // still succeeds but leaves the surface unfilled (the colour check, not
+    // the ColorFill return, is what would fail for those).
+    let Some(pixel) = convert::d3dcolor_fill_pixel_bytes(color, info.format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill: no fill encoding for format {} → surface left unfilled", info.format);
+        return D3D_OK;
+    };
+    if pixel.is_empty() {
+        return D3D_OK;
+    }
+    // SAFETY: `parent` is non-null (the caller classified this surface as
+    // texture-backed) and its refcount keeps it alive while the surface is
+    // alive; D3D9 objects are single-threaded so the access is exclusive.
+    let ti = unsafe { &mut *parent }.inner_mut();
+    let level = info.mip_level;
+    if !ti.fill_staging_region(
+        level as usize,
+        region.x,
+        region.y,
+        region.w,
+        region.h,
+        &pixel,
+    ) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill: staging fill of level {level} fell outside the mip → surface left unfilled");
+        return D3D_OK;
+    }
+    crate::texture::schedule_upload(ti, dev, level, region);
+    D3D_OK
+}
+
 extern "system" fn device_color_fill(
     this: *mut c_void,
     surface: *mut c_void,
     rect: *const c_void,
     color: u32,
 ) -> i32 {
-    use crate::surface::Direct3DSurface9;
-
     let _timer = device_timer(this, DeviceSubCategory::Frame);
     if surface.is_null() {
         return D3DERR_INVALIDCALL;
@@ -6390,146 +6526,43 @@ extern "system" fn device_color_fill(
             frame_dump::surface_label(surface)
         ));
     }
-    // SAFETY: `surface` is a live IDirect3DSurface9 per the D3D9 ABI.
-    let s = unsafe { &*surface.cast::<Direct3DSurface9>() };
-    let parent = s.parent_texture();
-    if parent.is_null() {
-        // Standalone colour surface (the implicit backbuffer or a
-        // CreateRenderTarget surface): fill its live colour MTLTexture directly.
-        // Only a whole-surface fill (NULL rect) is supported here — the only case
-        // the conformance suite exercises. A colour-less standalone surface
-        // (depth-stencil, or a system-memory offscreen-plain surface), or a
-        // sub-rect, is INVALIDCALL.
-        let color_handle = s.metal_color_handle();
-        if color_handle.is_null() || !rect.is_null() {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "ColorFill on a standalone surface without a colour handle (or with a sub-rect) → INVALIDCALL");
-            return D3DERR_INVALIDCALL;
-        }
-        let width = s.standalone_width();
-        let height = s.standalone_height();
-        let format = s.standalone_format();
-        // Encode the fill colour; an unmapped format still succeeds but leaves
-        // the surface unfilled (the colour check, not the HR, is what would fail).
-        let Some(pixel) = mtld3d_core::convert::d3dcolor_fill_pixel_bytes(color, format) else {
-            return D3D_OK;
-        };
-        let bpp = pixel.len();
-        if width == 0 || height == 0 || bpp == 0 {
-            return D3D_OK;
-        }
-        let mut tight = vec![0u8; width as usize * height as usize * bpp];
-        for chunk in tight.chunks_exact_mut(bpp) {
-            chunk.copy_from_slice(&pixel);
-        }
-        let handle = color_handle.raw();
-        let bpp_u = u32::try_from(bpp).expect("ColorFill bpp fits u32");
-        obj.inner().push_op(Box::new(move |enc: &mut FrameEncoder| {
-            enc.upload_bytes_to_color_handle(handle, &tight, width, height, bpp_u);
-        }));
-        return D3D_OK;
-    }
-    // SAFETY: `parent` non-null (checked); its refcount keeps it alive while
-    // the surface is alive, and D3D9 objects are single-threaded so the
-    // mutable access is exclusive.
-    let tex = unsafe { &mut *parent };
-    // D3D9: ColorFill on a texture surface is valid for a DEFAULT-pool render
-    // target AND for a DEFAULT-pool offscreen-plain surface (which owns its
-    // internal texture). Managed / sysmem / scratch and an ordinary DEFAULT
-    // texture-level surface are rejected.
-    if tex.d3d_pool() != D3DPOOL_DEFAULT
-        || (tex.d3d_usage() & D3DUSAGE_RENDERTARGET == 0 && !s.owns_parent_texture())
+    // SAFETY: vtable in-param; `rect` is *const D3DRECT per the D3D9 ABI.
+    let rect = unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(rect) };
+    let surf = surface.cast::<Direct3DSurface9>();
+    let Some(info) = resolve_stretch_surface(obj.inner(), surf) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill on a surface with no DEFAULT-pool backing → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    };
+    // D3D9: ColorFill takes a DEFAULT-pool render target (a texture level, a
+    // `CreateRenderTarget` surface or the back buffer) or a DEFAULT-pool
+    // offscreen-plain surface. Managed / sysmem / scratch, a depth-stencil
+    // surface and an ordinary DEFAULT texture level are all INVALIDCALL.
+    if info.pool != D3DPOOL_DEFAULT
+        || !info.flags.intersects(
+            StretchSurfaceFlags::IS_RENDER_TARGET | StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT,
+        )
     {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "ColorFill: surface is not a DEFAULT render target or offscreen-plain → INVALIDCALL");
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill: surface is not a DEFAULT render target or offscreen-plain → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
-    let level = s.mip_level();
-    let lvl = level as usize;
-    let width = tex.inner().mip_width(lvl);
-    let height = tex.inner().mip_height(lvl);
-    let format = tex.d3d_format();
-    // NULL rect fills the whole mip; otherwise fill the requested sub-rect.
-    let (origin_x, origin_y, region_w, region_h) = if rect.is_null() {
-        (0, 0, width, height)
-    } else {
-        // SAFETY: vtable in-param; `rect` is *const D3DRECT per the D3D9 ABI.
-        let r = unsafe { *rect.cast::<mtld3d_types::D3DRECT>() };
-        (
-            r.x1.max(0).cast_unsigned(),
-            r.y1.max(0).cast_unsigned(),
-            (r.x2 - r.x1).max(0).cast_unsigned(),
-            (r.y2 - r.y1).max(0).cast_unsigned(),
-        )
+    let extent = (info.width, info.height);
+    let Some(region) = color_fill_region(rect, extent) else {
+        return D3D_OK;
     };
-    // A block-compressed ColorFill sub-rect must land on the block grid;
-    // a misaligned rect is INVALIDCALL. Uncompressed formats have block 1×1 so
-    // this is inert.
-    if !rect.is_null()
-        && let Some(fmt) = map_d3d_format(format)
+    if let Some(fmt) = map_d3d_format(info.format)
+        && !color_fill_block_aligned(region, extent, (fmt.block_width(), fmt.block_height()))
     {
-        let (bw, bh) = (fmt.block_width(), fmt.block_height());
-        let x2 = origin_x + region_w;
-        let y2 = origin_y + region_h;
-        if (bw > 1 || bh > 1)
-            && (!origin_x.is_multiple_of(bw)
-                || !origin_y.is_multiple_of(bh)
-                || (!x2.is_multiple_of(bw) && x2 != width)
-                || (!y2.is_multiple_of(bh) && y2 != height))
-        {
-            return D3DERR_INVALIDCALL;
-        }
+        return D3DERR_INVALIDCALL;
     }
-    // Encode the fill colour into the destination format. Unsupported formats
-    // still succeed (the colour check, not the ColorFill return, is what fails
-    // for those) but leave the surface unfilled.
-    let Some(pixel) = mtld3d_core::convert::d3dcolor_fill_pixel_bytes(color, format) else {
-        return D3D_OK;
-    };
-    let bpp = pixel.len();
-    if region_w == 0 || region_h == 0 || bpp == 0 {
-        return D3D_OK;
+    if info.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+        return color_fill_render_target(obj.inner(), info, region, color);
     }
-    let pitch = region_w as usize * bpp;
-    // The upload job addresses its staging at the whole-mip convention
-    // `origin_y * pitch + origin_x * bpp`, so a sub-rect fill's read window
-    // extends past `pitch * region_h`. Size the page to cover the window and
-    // fill all of it with the pattern — every in-window byte must be fill
-    // colour, not uninitialised page tail.
-    let page_len = pitch * (region_h as usize + origin_y as usize) + origin_x as usize * bpp;
-    let mut page = PageBox::new_uninit(page_len);
-    for chunk in page.as_mut_slice().chunks_exact_mut(bpp) {
-        chunk.copy_from_slice(&pixel);
-    }
-    // A lockable DEFAULT offscreen-plain surface reads its fill back through
-    // LockRect (CPU staging), so mirror the fill into staging. The GPU upload
-    // below keeps the internal Metal texture coherent for StretchRect/sampling.
-    if s.owns_parent_texture() {
-        tex.inner_mut()
-            .fill_staging_region(lvl, origin_x, origin_y, region_w, region_h, &pixel);
-    }
-    let info = tex.inner().texture_info();
-    let job = TextureUploadJob {
-        info,
-        arc: Arc::new(page),
-        level,
-        destination_slice: 0,
-        staging_index: level as usize,
-        origin_x,
-        origin_y,
-        region_w,
-        region_h,
-        src_d3d_format: format,
-        src_pitch: u32::try_from(pitch).expect("ColorFill row pitch fits u32"),
-        bytes_per_pixel: u32::try_from(bpp).expect("ColorFill bpp fits u32"),
-        // ColorFill targets a 2D surface — single slice, so the encoder keeps
-        // the untouched 2D blit path.
-        depth: 1,
-        slice_pitch: 0,
-    };
-    obj.inner().push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_texture_upload(job);
-    }));
-    D3D_OK
+    // SAFETY: an offscreen-plain surface is texture-backed, so
+    // `resolve_stretch_surface` classified it off a non-null parent.
+    let parent = unsafe { &*surf }.parent_texture();
+    color_fill_offscreen_plain(obj.inner(), parent, &info, region, color)
 }
 
 extern "system" fn device_create_offscreen_plain_surface(

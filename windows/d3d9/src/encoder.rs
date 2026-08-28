@@ -220,6 +220,28 @@ pub struct BlitSide {
     pub mip: u32,
 }
 
+/// One `ColorFill` against a render-target texture, resolved on the API thread.
+///
+/// Built by `device_color_fill` and consumed by
+/// [`FrameEncoder::color_fill_target`] on the encoder thread, which cannot
+/// reach the device to re-derive the destination's scale or extent.
+pub struct ColorFillTarget {
+    /// Destination `MTLTexture`.
+    pub texture: MetalHandle<MTLTextureKind>,
+    /// Mip extent as D3D9 reports it; `scale` converts it to the texture's own.
+    pub logical_size: (u32, u32),
+    /// Metal format of the destination as it was created on this device.
+    pub format: PixelFormat,
+    /// What the destination is rasterized at relative to `logical_size`.
+    pub scale: RenderScale,
+    /// `(array slice, mip level)` of the destination subresource.
+    pub subresource: (u32, u32),
+    /// Fill rect in D3D9 coordinates, as `(x, y, width, height)`.
+    pub rect: (u32, u32, u32, u32),
+    /// Fill colour, one `f32::to_bits` per channel in RGBA order.
+    pub rgba: (u32, u32, u32, u32),
+}
+
 /// Parameter bag for `FrameEncoder::run_texture_upload`.
 ///
 /// Built by `texture::schedule_upload` on the API thread and consumed by
@@ -3725,6 +3747,81 @@ impl FrameEncoder {
             sx = src_rect.x, sy = src_rect.y, srw = src_rect.w, srh = src_rect.h,
             dw = dst_dims.0, dh = dst_dims.1,
             dx = dst_rect.x, dy = dst_rect.y, drw = dst_rect.w, drh = dst_rect.h,
+        );
+    }
+
+    /// `ColorFill` a render target: paint the fill colour over `fill.rect`.
+    ///
+    /// The destination is bound as a one-off colour attachment with no depth
+    /// and the ordinary clear machinery paints it, so a whole-surface fill
+    /// folds into `loadAction = Clear` and a sub-rect becomes one clear-quad
+    /// scissored to the rect. The device's own attachments and viewport are
+    /// saved and restored around the pass, exactly as `stretch_blit_scaled`
+    /// does, so a `ColorFill` mid-frame does not perturb the bound target.
+    ///
+    /// Being a pass rather than a blit also puts the fill in stream order:
+    /// a fill issued after this frame's draws lands after them.
+    ///
+    /// `note_color_read_back` marks the destination so the store-action
+    /// optimiser keeps the fill for whatever reads it later (a `StretchRect`
+    /// source, a `GetRenderTargetData`, the next frame).
+    pub fn color_fill_target(&mut self, fill: &ColorFillTarget) {
+        let (rx, ry, rw, rh) = fill.rect;
+        if fill.texture.is_null() || rw == 0 || rh == 0 {
+            return;
+        }
+        // Save the device's current attachments + viewport so the one-off
+        // destination pass doesn't perturb the live render target. The colour
+        // set comes back verbatim, scale and extra targets included.
+        let saved_color = self.pass_state.take_color_attachments();
+        let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_size = self.pass_state.current_depth_size();
+        let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
+        let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
+        let prev_viewport = self.pass_state.viewport();
+        let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
+
+        // Bind the destination alone, then scope the fill with the viewport:
+        // `clear_color_bounded_to_viewport` folds a viewport that covers the
+        // attachment into the load action and scissors a quad to it otherwise.
+        self.pass_state.set_color_render_target_subresource(
+            fill.texture,
+            fill.logical_size.0,
+            fill.logical_size.1,
+            fill.format,
+            fill.scale,
+            fill.subresource,
+        );
+        self.pass_state
+            .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+        self.pass_state.set_viewport(rx, ry, rw, rh, 0.0, 1.0);
+        self.pass_state.note_color_read_back(fill.texture);
+        let (r, g, b, a) = fill.rgba;
+        self.clear_color_bounded_to_viewport(r, g, b, a);
+        // A folded fill is still only a pending clear; materialise it here so
+        // it lands on this destination rather than on the restored one.
+        self.pass_state.ensure_pass_open();
+        self.end_current_pass("color_fill");
+
+        // Restore the device's previous attachments + viewport.
+        self.pass_state.restore_color_attachments(saved_color);
+        self.pass_state.set_depth_stencil_attachment(
+            prev_depth,
+            prev_depth_size,
+            prev_depth_sampleable,
+            prev_depth_has_stencil,
+        );
+        let (pvx, pvy, pvw, pvh) = prev_viewport;
+        self.pass_state
+            .set_viewport(pvx, pvy, pvw, pvh, prev_min_z, prev_max_z);
+
+        trace!(
+            target: BLIT_TRACE_TARGET,
+            "ColorFill dst={dst:#x} {lw}x{lh} rect={rx},{ry}+{rw}x{rh} level={level}",
+            dst = fill.texture.raw(),
+            lw = fill.logical_size.0,
+            lh = fill.logical_size.1,
+            level = fill.subresource.1,
         );
     }
 
