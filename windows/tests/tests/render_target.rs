@@ -1577,6 +1577,81 @@ fn stretch_rect_into_a_texture_level_is_visible_to_get_dc() {
 }
 
 #[test]
+fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
+    // The classic GDI-on-a-surface case: a game draws text or an overlay into
+    // a DEFAULT offscreen plain and copies the result somewhere. The plain's
+    // pixels live in the level-0 staging of the texture it owns, so the DC
+    // covers that store and reads the ColorFill that came before it, and what
+    // GDI drew through the DC survives ReleaseDC in both directions the
+    // surface can be read: a LockRect of the same staging, and a StretchRect
+    // into the back buffer, which reads the level's Metal texture instead.
+    const SIZE: u32 = 64;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    // GDI knows no alpha: SetPixel stores the three colour bytes and leaves
+    // the fourth at zero, so the pixel comes back as red with no alpha.
+    const GDI_RED: u32 = 0x00FF_0000;
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.color_fill_hr(&plain, GREEN),
+        D3D_OK,
+        "ColorFill the plain green"
+    );
+
+    let dc = plain.dc();
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        GREEN_COLORREF,
+        "the DC reads the fill the plain holds",
+    );
+    assert_eq!(
+        dc.set_pixel(10, 10, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel into the DC stores the colour it was handed",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    {
+        let locked = plain.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let px = locked.as_u32((pitch_px * SIZE) as usize);
+        assert_eq!(
+            px[(10 * pitch_px + 10) as usize],
+            GDI_RED,
+            "LockRect reads what GDI drew through the DC",
+        );
+        assert_eq!(
+            px[(32 * pitch_px + 32) as usize],
+            GREEN,
+            "and the fill everywhere GDI left alone",
+        );
+    }
+
+    let bb = h.render_target(0);
+    let rect = (0, 0, SIZE.cast_signed(), SIZE.cast_signed());
+    assert_eq!(
+        h.stretch_rect_rects(&plain, rect, &bb, rect, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 StretchRect from the plain into the back buffer",
+    );
+    // The back buffer is X8R8G8B8, so only its three colour channels carry a
+    // defined value; compare on those alone.
+    assert_rgb_close(
+        h.read_pixel(10, 10),
+        GDI_RED,
+        0,
+        "GDI's pixel reaches the back buffer",
+    );
+    assert_rgb_close(
+        h.read_pixel(32, 32),
+        GREEN,
+        0,
+        "and so does the fill around it",
+    );
+}
+
+#[test]
 fn color_fill_render_target_overwrites_earlier_draws() {
     // ColorFill on a render target is ordered against the draws around it: it
     // wipes what the frame already drew, and the draw after it blends against
