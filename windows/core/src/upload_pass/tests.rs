@@ -7,7 +7,8 @@
 
 use mtld3d_shared::mtl::PixelFormat;
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5,
+    D3DFMT_X8R8G8B8,
 };
 
 use super::{UploadDecode, is_expanded_upload, is_expansion, needs_render_target, upload_decode};
@@ -18,6 +19,7 @@ fn packed16_formats_decode_only_against_a_bgra8_texture() {
         (D3DFMT_R5G6B5, UploadDecode::R5G6B5),
         (D3DFMT_A1R5G5B5, UploadDecode::A1R5G5B5),
         (D3DFMT_A4R4G4B4, UploadDecode::A4R4G4B4),
+        (D3DFMT_X1R5G5B5, UploadDecode::X1R5G5B5),
     ] {
         assert_eq!(
             upload_decode(format, PixelFormat::Bgra8Unorm),
@@ -28,6 +30,11 @@ fn packed16_formats_decode_only_against_a_bgra8_texture() {
         assert!(is_expanded_upload(format, PixelFormat::Bgra8Unorm));
         assert_eq!(
             upload_decode(format, PixelFormat::B5G6R5Unorm),
+            None,
+            "{format:#x} on a native packed texture stays a blit"
+        );
+        assert_eq!(
+            upload_decode(format, PixelFormat::Bgr5A1Unorm),
             None,
             "{format:#x} on a native packed texture stays a blit"
         );
@@ -117,6 +124,8 @@ fn wire_values_match_the_shader_cases() {
     assert_eq!(UploadDecode::A1R5G5B5.wire(), 1);
     assert_eq!(UploadDecode::A4R4G4B4.wire(), 2);
     assert_eq!(UploadDecode::CopyBgra8.wire(), 3);
+    assert_eq!(UploadDecode::X1R5G5B5.wire(), 4);
     assert_eq!(UploadDecode::R5G6B5.bytes_per_texel(), 2);
+    assert_eq!(UploadDecode::X1R5G5B5.bytes_per_texel(), 2);
     assert_eq!(UploadDecode::CopyBgra8.bytes_per_texel(), 4);
 }

@@ -2962,6 +2962,8 @@ struct D3DKMT_DESTROYDCFROMMEMORY {
 const fn dc_format_info(d3d_format: u32) -> Option<(u16, Option<[u32; 3]>)> {
     match d3d_format {
         D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 => Some((32, None)),
+        // No colour format mapping backs R8G8B8, so no surface can be
+        // created in it and nothing reaches this arm yet.
         D3DFMT_R8G8B8 => Some((24, None)),
         D3DFMT_R5G6B5 => Some((16, Some([0x0000_f800, 0x0000_07e0, 0x0000_001f]))),
         // X1R5G5B5 and A1R5G5B5 share the GDI 5-5-5 mask set; the alpha /
