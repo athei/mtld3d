@@ -2826,15 +2826,16 @@ impl SurfaceInner {
     }
 }
 
-/// Re-materialise a released texture level before a device context maps it.
+/// Re-materialise a texture level's pixels before a device context maps them.
 ///
-/// A `D3DPOOL_DEFAULT` level whose staging went once its upload retired holds
-/// its pixels on the GPU alone, and its staging slot points at the page every
-/// released level shares. A DC reads the level and keeps what GDI draws into
-/// it, so it takes the GPU read back a `LockRect` of the same level takes. A
-/// cube face is never released (a cube keeps its staging for the texture's
-/// life), and neither is the level of a surface that owns its parent texture,
-/// which has no pixels of its own to expose.
+/// Two conditions leave a `D3DPOOL_DEFAULT` level's pixels on the GPU alone: a
+/// `StretchRect` blit claimed the level for the GPU and never touched its
+/// staging, or the staging went once its upload retired and its slot now points
+/// at the page every released level shares. A DC reads the level and keeps what
+/// GDI draws into it, so it takes the same GPU reads a `LockRect` of the level
+/// takes. A cube face is never released (a cube keeps its staging for the
+/// texture's life), and a surface that owns its parent texture has no pixels of
+/// its own to expose.
 fn refill_dc_texture_level(inner: &SurfaceInner) {
     if inner.parent_texture.is_null()
         || inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
@@ -2846,7 +2847,7 @@ fn refill_dc_texture_level(inner: &SurfaceInner) {
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.ensure_staging_for_dc(inner.mip_level as usize);
+    texture.materialize_level_for_dc(inner.mip_level as usize);
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.
