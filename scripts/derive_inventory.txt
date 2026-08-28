@@ -98,6 +98,7 @@ windows/core/src/dxso/ir.rs WriteMask Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/opcode.rs Opcode Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/ff_state.rs FfVsDirty Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/ff_state.rs FogConfig Clone,Copy
+windows/core/src/format.rs StandaloneSurfaceKind Clone,Copy
 windows/core/src/fullscreen_resize.rs ExternalResizeAction Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/gpu_caps.rs GpuCaps Clone,Copy,Debug
 windows/core/src/ids.rs BufferId Clone,Copy,PartialEq,Eq,Hash,Debug

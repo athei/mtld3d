@@ -1833,26 +1833,53 @@ impl DeviceInner {
     /// Charge a standalone `D3DPOOL_DEFAULT` surface against the VRAM total.
     ///
     /// The surfaces `CreateRenderTarget` and `CreateDepthStencilSurface` hand
-    /// out own a real Metal texture without a `TextureInner`, so the texture
+    /// out own real Metal textures without a `TextureInner`, so the texture
     /// registry never sees them; without this they would cost nothing in the
-    /// figure `GetAvailableTextureMem` reports. `surface_bytes` is the same
-    /// formula [`Self::deregister_standalone_surface`] refunds with, fed the
-    /// dimensions and format the surface reports through `GetDesc`.
-    pub fn register_standalone_surface(&self, width: u32, height: u32, d3d_format: u32) {
+    /// figure `GetAvailableTextureMem` reports. `standalone_surface_bytes` is
+    /// the same formula [`Self::deregister_standalone_surface`] refunds with,
+    /// fed the dimensions, format and sample count the surface reports through
+    /// `GetDesc`, so a multisampled surface gives back exactly what it took.
+    pub fn register_standalone_surface(
+        &self,
+        width: u32,
+        height: u32,
+        d3d_format: u32,
+        sample_count: u32,
+        kind: mtld3d_core::format::StandaloneSurfaceKind,
+    ) {
         self.vram_bytes_used.fetch_add(
-            mtld3d_core::format::surface_bytes(width, height, d3d_format),
+            mtld3d_core::format::standalone_surface_bytes(
+                width,
+                height,
+                d3d_format,
+                sample_count,
+                kind,
+            ),
             Ordering::AcqRel,
         );
     }
 
-    /// Refund a standalone surface's bytes as it retires its Metal texture.
+    /// Refund a standalone surface's bytes as it retires its Metal textures.
     ///
     /// Called from the colour and depth retire arms of `finalize_surface`,
     /// which are gated exactly as the two creation sites that charged the
     /// surface, so the total returns to where it started.
-    pub fn deregister_standalone_surface(&self, width: u32, height: u32, d3d_format: u32) {
+    pub fn deregister_standalone_surface(
+        &self,
+        width: u32,
+        height: u32,
+        d3d_format: u32,
+        sample_count: u32,
+        kind: mtld3d_core::format::StandaloneSurfaceKind,
+    ) {
         self.vram_bytes_used.fetch_sub(
-            mtld3d_core::format::surface_bytes(width, height, d3d_format),
+            mtld3d_core::format::standalone_surface_bytes(
+                width,
+                height,
+                d3d_format,
+                sample_count,
+                kind,
+            ),
             Ordering::AcqRel,
         );
     }
@@ -5228,11 +5255,19 @@ fn create_color_target_surface(
         render_scale: scale,
         multi_sample,
     });
-    // The surface owns a DEFAULT-pool Metal texture no `TextureInner` covers,
-    // so charge it here; `finalize_surface`'s colour retire arm refunds it.
+    // The surface owns DEFAULT-pool Metal textures no `TextureInner` covers,
+    // so charge them here; `finalize_surface`'s colour retire arm refunds
+    // them. Above one sample that is the single-sample texture plus the
+    // multisampled companion beside it.
     // SAFETY: `device_inner` is the live owning device, non-null for every
     // caller of this fn.
-    unsafe { &*device_inner }.register_standalone_surface(width, height, format);
+    unsafe { &*device_inner }.register_standalone_surface(
+        width,
+        height,
+        format,
+        u32::from(multi_sample.sample_count),
+        mtld3d_core::format::StandaloneSurfaceKind::ColorTarget,
+    );
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone render-target
     // surface at refcount 1.
@@ -5437,9 +5472,15 @@ extern "system" fn device_create_depth_stencil_surface(
     );
     // Same accounting as a standalone colour target: a real Metal depth
     // texture with no `TextureInner` behind it, refunded by
-    // `finalize_surface`'s depth retire arm.
-    obj.inner()
-        .register_standalone_surface(width, height, format);
+    // `finalize_surface`'s depth retire arm. There is no resolve companion
+    // here, so above one sample the one texture is simply that much larger.
+    obj.inner().register_standalone_surface(
+        width,
+        height,
+        format,
+        u32::from(multi_sample.sample_count),
+        mtld3d_core::format::StandaloneSurfaceKind::DepthStencil,
+    );
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live standalone depth-stencil
     // surface at refcount 1.
