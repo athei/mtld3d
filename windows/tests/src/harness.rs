@@ -1824,6 +1824,36 @@ impl Harness {
         Some(Surface::from_raw(out))
     }
 
+    /// `StretchRect` between explicit `(left, top, right, bottom)` rects. Returns the hr.
+    pub fn stretch_rect_rects(
+        &self,
+        src: &Surface<'_>,
+        src_rect: (i32, i32, i32, i32),
+        dst: &Surface<'_>,
+        dst_rect: (i32, i32, i32, i32),
+        filter: u32,
+    ) -> i32 {
+        let to_rect = |r: (i32, i32, i32, i32)| mtld3d_types::D3DRECT {
+            x1: r.0,
+            y1: r.1,
+            x2: r.2,
+            y2: r.3,
+        };
+        let (src_rect, dst_rect) = (to_rect(src_rect), to_rect(dst_rect));
+        // SAFETY: vtable thunk; both surfaces are live and both rects are stack
+        // locals that outlive the call.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                (&raw const src_rect).cast(),
+                dst.as_ptr(),
+                (&raw const dst_rect).cast(),
+                filter,
+            )
+        }
+    }
+
     /// `StretchRect` over whole surfaces (null rects). Returns the hr.
     pub fn stretch_rect(&self, src: &Surface<'_>, dst: &Surface<'_>, filter: u32) -> i32 {
         // SAFETY: vtable thunk; both surfaces are live, null rects = whole surface.
