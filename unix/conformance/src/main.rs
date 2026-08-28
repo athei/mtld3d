@@ -67,9 +67,11 @@ fn real_main() -> Result<ExitCode, String> {
     }
 
     let mut current: BTreeMap<(Arch, Subtest), SubtestResult> = BTreeMap::new();
+    let mut validation_errors = 0;
     for &subtest in &subtests {
-        let result = run::run_subtest(&config.wine, &config.exe, config.arch, subtest)?;
-        current.insert((config.arch, subtest), result);
+        let run = run::run_subtest(&config.wine, &config.exe, config.arch, subtest)?;
+        validation_errors += run.validation_errors;
+        current.insert((config.arch, subtest), run.result);
     }
 
     // Assets (baseline.txt) live in the crate directory by default; --assets
@@ -129,17 +131,37 @@ fn real_main() -> Result<ExitCode, String> {
     let classes = triage::load(&assets)?;
     let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
+    Ok(verdict(&report, validation_errors))
+}
+
+/// Turn a run's diff report and its Metal-validation error count into an exit code.
+///
+/// Three independent verdicts, each fatal on its own: a regression vs the
+/// baseline, a baseline that overstates reality, and any Metal API-validation
+/// error line the leg logged. The validation gate is orthogonal to the per-site
+/// counts: a leg that starts misusing Metal while every count holds still has
+/// to fail.
+fn verdict(report: &diff::Report, validation_errors: usize) -> ExitCode {
+    let validation_failed = run::validation_gate_failed(validation_errors);
+    if validation_failed {
+        println!(
+            "conformance: METAL VALIDATION - {validation_errors} error line(s) logged; every \
+             metal-validation: line above is API misuse to fix"
+        );
+    }
     if report.regressed {
         println!("conformance: REGRESSIONS detected");
-        Ok(ExitCode::from(1))
     } else if report.stale {
         println!(
             "conformance: STALE BASELINE - some sites read below their pins; run `make conformance-baseline` and re-triage"
         );
-        Ok(ExitCode::from(1))
-    } else {
+    } else if !validation_failed {
         println!("conformance: no regressions vs baseline");
-        Ok(ExitCode::SUCCESS)
+    }
+    if validation_failed || report.regressed || report.stale {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

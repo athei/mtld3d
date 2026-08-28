@@ -52,7 +52,11 @@ performance hint, not misuse (a resource bound to an encoder no draw went on to
 read, a state setter overwritten before the next draw), and a leg emits
 thousands of them, so leaving them on buried the error lines in output that
 looked identical. A `metal-validation:` line therefore means the layer
-committed API misuse, and a new one is a regression to chase.
+committed API misuse, so any of them fails the leg. The expected number is
+zero, kept as a constant in the runner next to the reporting code rather than
+in `baseline.txt`, which records machine-owned per-site counts and nothing
+else. There is no tolerance to keep in step: a leg that logs a line has started
+misusing Metal, and the fix is the misuse, not the number.
 
 This is **not** part of `make test`: many checks fail by design (see below), so
 it is a tracked-score tool, not a pass/fail gate on zero. The runner exits
@@ -64,6 +68,11 @@ baseline.txt overstate reality, and the surplus becomes a budget a later
 regression can hide in. The fix for a stale baseline is `make
 conformance-baseline` plus the matching triage edit here, not a code hunt. The
 `flaky` and `ceiling` classes are the two tolerances (see below).
+
+Metal validation is the third verdict, and it is independent of the counts: a
+leg that logged any `metal-validation:` line exits non-zero even when every
+site holds its pin, because API misuse is invisible to a pass/fail count. A
+`--update-baseline` or `--repeat` run never gates, so neither one applies it.
 
 ## What the baseline records — and where classes live
 

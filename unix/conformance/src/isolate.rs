@@ -99,7 +99,7 @@ fn characterize(
     for i in 1..=repeat {
         // Liveness to stderr — a full subtest can take many seconds.
         eprintln!("  [{arch}/{subtest}] run {i}/{repeat}…");
-        let result = run::run_subtest(wine, exe, arch, subtest)?;
+        let result = run::run_subtest(wine, exe, arch, subtest)?.result;
         agg.runs += 1;
         if result.crash {
             agg.crash_runs += 1;
