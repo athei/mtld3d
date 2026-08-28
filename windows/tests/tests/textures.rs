@@ -1461,6 +1461,35 @@ fn update_texture_keeps_cube_faces_independent() {
     );
 }
 
+/// `UpdateTexture` accepts a source whose levels are still mapped.
+///
+/// The per-endpoint rejection `UpdateSurface` applies does not carry over to
+/// the container entry point: D3D9 validates no lock state on `UpdateTexture`,
+/// and an application that leaves one level of a mip chain mapped while
+/// updating the chain gets the copy and `D3D_OK`. Rejecting the call would be
+/// a divergence, so the accepting answer is pinned here.
+#[test]
+fn update_texture_accepts_a_source_with_a_level_locked() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let src = h.create_texture(4, 4, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(4, 4, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    src.lock_rect(0, 0).write::<u32>(&[GREEN; 16]);
+
+    let held = src.lock_rect(1, 0);
+    assert_eq!(
+        h.update_texture_hr(&src, &dst),
+        0,
+        "UpdateTexture with the second source level mapped"
+    );
+    drop(held);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        GREEN,
+        "top level after the update",
+    );
+}
+
 /// Sample the volume bound on stage 0 at texcoord `(0.5, 0.5, w)` with point filtering.
 fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
     const WHITE: u32 = 0xFFFF_FFFF;
