@@ -4263,8 +4263,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // binds its surface as the depth target during the shadow pass, and
     // samples it as a regular texture during the lit pass. Mapping table
     // `map_d3d_format` is color-only — depth formats route through
-    // `map_d3d_depth_format` and a constrained create path (no staging,
-    // no mip chain, fixed levels=1).
+    // `map_d3d_depth_format` and a create path of their own: no CPU staging,
+    // and a mip chain, when one is asked for, that only the GPU can fill.
     if mtld3d_core::format::is_depth_format(format) {
         return create_depth_texture_path(&DepthTextureCreateInfo {
             this,
@@ -4494,25 +4494,37 @@ struct DepthTextureCreateInfo {
 
 /// Sub-path of `device_create_texture` for depth-format textures (sampleable shadow maps).
 ///
-/// D3D9 spec accepts `CreateTexture(format=Dxx, usage=D3DUSAGE_DEPTHSTENCIL)`
-/// — the resulting texture is bindable as a depth attachment via
-/// `IDirect3DTexture9::GetSurfaceLevel` + `SetDepthStencilSurface`, AND
-/// sampleable in shaders. Without it, games that bump shadow quality
-/// silently fail to allocate shadow maps and the lit pass samples stale
-/// texture-slot contents (visible flicker).
+/// D3D9 accepts `CreateTexture(format=Dxx, usage=D3DUSAGE_DEPTHSTENCIL)`: the
+/// resulting texture is bindable as a depth attachment through
+/// `IDirect3DTexture9::GetSurfaceLevel` + `SetDepthStencilSurface` and
+/// sampleable in shaders. Without it, games that bump shadow quality silently
+/// fail to allocate shadow maps and the lit pass samples stale texture-slot
+/// contents (visible flicker). The colour mapping table `map_d3d_format`
+/// carries no depth entries, so a depth format routes through
+/// `map_d3d_depth_format` and this path instead.
 ///
-/// Constraints (`ConvertD3D9DepthFormat` path):
-/// - `usage` must include `D3DUSAGE_DEPTHSTENCIL`. Color-only depth
-///   textures aren't a thing.
-/// - `pool` must be `D3DPOOL_DEFAULT` — depth textures live on the GPU
+/// Rejected with `D3DERR_INVALIDCALL`:
+/// - `usage` without `D3DUSAGE_DEPTHSTENCIL`. A depth format is creatable
+///   only as a depth attachment.
+/// - `pool` other than `D3DPOOL_DEFAULT`. Depth textures live on the GPU
 ///   only.
-/// - `levels` must be 1. Shadow maps don't carry mip chains; Metal's
-///   `generateMipmaps` rejects depth formats anyway.
-/// - No DYNAMIC / RENDERTARGET / AUTOGENMIPMAP — incompatible with
-///   depth attachments.
+/// - `D3DUSAGE_DYNAMIC`, `D3DUSAGE_RENDERTARGET`, `D3DUSAGE_AUTOGENMIPMAP`.
+///   None of the three fits a depth attachment: there is no CPU upload path,
+///   the colour and depth usages are exclusive, and Metal's `generateMipmaps`
+///   refuses depth formats.
+/// - A format with no `map_d3d_depth_format` entry.
 ///
-/// The created texture has no PE-side staging buffer (`LockRect` is
-/// rejected at the texture level — see `texture::texture_lock_rect`).
+/// `levels` follows the colour path's rule: 0 requests the full chain down to
+/// one texel (`compute_mip_count`), and any other value is the level count,
+/// taken as given. A mip chain on a depth texture is an engine's depth
+/// pyramid, every level rendered into through `GetSurfaceLevel(n)` bound as
+/// the depth attachment, because with `generateMipmaps` unavailable nothing
+/// else can fill one.
+///
+/// The created texture has no PE-side staging buffer, so its per-level
+/// tracking arrays are sized from the level count rather than from the
+/// staging vector, and `LockRect` is rejected at the texture level (see
+/// `texture::texture_lock_rect`).
 fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     let DepthTextureCreateInfo {
         this,
