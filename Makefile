@@ -393,6 +393,18 @@ configure-test-prefix:
 	$(WINE) reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
 	$(WINE) reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
 	$(WINE) reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
+	# A wineserver session enumerates the display once, when its desktop
+	# starts, and serves that geometry to every process in it afterwards. The
+	# session the first `reg add` boots to create the prefix enumerates it
+	# before RetinaMode is written, so a test process attaching to that session
+	# reads monitor geometry in the point space rather than the physical-pixel
+	# one the keys above pin. End it, so the next session enumerates with the
+	# keys in place: `-k` shuts the server down cleanly, flushing the registry
+	# on the way out, and `-w` covers the case where it had to be killed
+	# outright. Both precede the persistent server below, which never
+	# terminates on its own, so a `-w` after it would never return.
+	-$(WINESERVER) -k >/dev/null 2>&1
+	-$(WINESERVER) -w >/dev/null 2>&1
 	# Pre-boot a persistent wineserver so individual test processes attach to it
 	# instead of each paying boot cost (and briefly holding its stdio). Both
 	# lines detach stdio: the persistent server (and the winedevice.exe residents

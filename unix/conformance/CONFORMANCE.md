@@ -242,6 +242,17 @@ validate against a mode list because no mode is set). The harness pins
 emulated mode switching and Retina mode so window-management assertions use a
 stable physical-pixel coordinate space.
 
+Both pins are registry values, and a wineserver session enumerates the display
+once, when its desktop starts, and serves that geometry to every process in it
+afterwards. A pin therefore only takes effect in a session that started after
+it was written, and the session that creates a prefix predates them by
+construction, so `configure-test-prefix` ends that session once the keys are
+in. Without it the first leg in a fresh prefix runs against monitor geometry
+in the point space: `test_window_position` 15023 and `test_reset_fullscreen`
+4903 fail outright, and the desktop-mode `ceiling` sites read 0 because the
+mode change the test asks for is accepted, exactly as on the CI runner's
+virtual display.
+
 Two refinements landed 2026-08 after the CI runner exposed them (its virtual
 display accepts the mode changes this machine's macdrv rejects, so the tests
 walk further):
