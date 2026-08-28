@@ -473,6 +473,7 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
         dst_ptr: params.dst_ptr,
         dst_len: params.dst_len,
         mip_level: params.mip_level,
+        slice: params.slice,
         origin_x: params.origin_x,
         origin_y: params.origin_y,
         width: params.width,

@@ -571,7 +571,7 @@ pub enum BlitCommandType {
 
 /// Fixed-size blit command struct.
 ///
-/// 80 bytes, aligned to 8. Field semantics depend on `cmd`:
+/// 88 bytes, aligned to 8. Field semantics depend on `cmd`:
 ///
 /// - `CopyBufferToTexture`: `src_handle` = buffer, `dst_handle` =
 ///   texture, `mip_level` / `origin_x,y` / `region_w,h` /
@@ -584,9 +584,10 @@ pub enum BlitCommandType {
 ///   `mip_level` selects the mip. `origin_x` / `origin_y` are the
 ///   *source* origin; `region_w` / `region_h` are the region size; the
 ///   *destination* origin is packed into `dst_offset` as `(dst_y as
-///   u64) << 32 | dst_x as u64`. For a full-mip preserve blit emit
-///   src origin = (0, 0), region = (`mip_w`, `mip_h`), `dst_offset` = 0
-///   (dst origin (0, 0)). `bytes_per_row` / `byte_size` unused.
+///   u64) << 32 | dst_x as u64`; `dst_slice` selects the destination
+///   array slice. For a full-mip preserve blit emit src origin = (0, 0),
+///   region = (`mip_w`, `mip_h`), `dst_offset` = 0 (dst origin (0, 0)).
+///   `bytes_per_row` / `byte_size` unused.
 /// - `CopyBufferToBuffer`: `src_handle` / `dst_handle` = buffers,
 ///   `src_offset` / `dst_offset` = byte offsets, `byte_size` = copy
 ///   size in bytes. `mip_level` / `origin_*` / `region_*` /
@@ -623,8 +624,12 @@ pub struct BlitCommand {
     /// different level of the destination. Unused (0) for the other command
     /// types.
     pub dst_mip_level: u32,
-    /// Explicit tail padding to the 8-byte stride.
-    pub pad0: u32,
+    /// Destination array slice for `CopyTextureToTexture`.
+    ///
+    /// A cube face's `D3DCUBEMAP_FACES` index; zero for a 2D or volume
+    /// destination and for the other command types. Last field of the struct,
+    /// which lands its size on the 8-byte stride.
+    pub dst_slice: u32,
 }
 
 /// Inputs for `BlitCommand::copy_buffer_to_texture`.
@@ -682,7 +687,7 @@ impl BlitCommand {
             depth: info.depth,
             bytes_per_image: info.bytes_per_image,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         }
     }
 
@@ -716,15 +721,15 @@ impl BlitCommand {
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: mip_level,
-            pad0: 0,
+            dst_slice: 0,
         }
     }
 
     /// Sub-rect `blit.copyFromTexture(...).toTexture(...)`.
     ///
     /// `blit.copyFromTexture(src, sourceSlice: 0, level: mip, origin:
-    /// (src_x, src_y, 0), size: (w, h, 1), toTexture: dst, destSlice: 0,
-    /// level: dst_mip, origin: (dst_x, dst_y, 0))`. Used by
+    /// (src_x, src_y, 0), size: (w, h, 1), toTexture: dst, destSlice:
+    /// dst_slice, level: dst_mip, origin: (dst_x, dst_y, 0))`. Used by
     /// `IDirect3DDevice9::StretchRect` for 1:1 same-format copies
     /// between two textures (scaling is not supported).
     #[must_use]
@@ -745,7 +750,7 @@ impl BlitCommand {
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: info.dst_mip_level,
-            pad0: 0,
+            dst_slice: info.dst_slice,
         }
     }
 
@@ -772,7 +777,7 @@ impl BlitCommand {
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         }
     }
 
@@ -799,7 +804,7 @@ impl BlitCommand {
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         }
     }
 
@@ -828,7 +833,7 @@ impl BlitCommand {
             depth: 0,
             bytes_per_image: 0,
             dst_mip_level: 0,
-            pad0: 0,
+            dst_slice: 0,
         }
     }
 }
@@ -853,6 +858,10 @@ pub struct CopyTextureSubRectInfo {
     pub mip_level: u32,
     /// Destination mip level.
     pub dst_mip_level: u32,
+    /// Destination array slice.
+    ///
+    /// A cube face's `D3DCUBEMAP_FACES` index; zero for a 2D destination.
+    pub dst_slice: u32,
     pub src_origin_x: u32,
     pub src_origin_y: u32,
     pub dst_origin_x: u32,

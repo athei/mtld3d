@@ -6238,6 +6238,9 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         dst_ptr: read.dst_ptr,
         dst_len: read.dst_len,
         mip_level: read.level,
+        // Every readback routed through here reads a standalone colour texture
+        // or a 2D texture level, neither of which carries a second array slice.
+        slice: 0,
         origin_x: 0,
         origin_y: 0,
         width: read.width,
@@ -6245,6 +6248,7 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         bytes_per_row: read.bytes_per_row,
         source_width: read.full_width,
         source_height: read.full_height,
+        pad0: 0,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -6507,21 +6511,22 @@ extern "system" fn device_stretch_rect(
     let render_quad = scaling || cross_format;
 
     // Both transports below write only the destination's Metal texture, and a
-    // texture-backed destination (an offscreen plain or a render-target texture
-    // level) reads its pixels back through the CPU staging a `LockRect` or a
-    // `GetDC` maps. Claim the level for the GPU so the next map reads the copy
-    // rather than the staging it left behind. The render quad binds the
-    // destination as a colour attachment, so it claims only a destination that
-    // carries `D3DUSAGE_RENDERTARGET`: claiming one the quad cannot write would
-    // trade stale pixels for uninitialised ones. Every render-quad pair that
-    // gets this far has such a destination, the rejections above having
-    // answered `INVALIDCALL` (a scale into one that is not a render target) or
-    // taken the CPU converter (a cross-format copy into an offscreen plain).
+    // texture-backed destination (an offscreen plain, a render-target texture
+    // level or a cube face) reads its pixels back through the CPU staging a
+    // `LockRect` or a `GetDC` maps. Claim that subresource for the GPU so the
+    // next map reads the copy rather than the staging it left behind. The
+    // render quad binds the destination as a colour attachment, so it claims
+    // only a destination that carries `D3DUSAGE_RENDERTARGET`: claiming one the
+    // quad cannot write would trade stale pixels for uninitialised ones. Every
+    // render-quad pair that gets this far has such a destination, the
+    // rejections above having answered `INVALIDCALL` (a scale into one that is
+    // not a render target) or taken the CPU converter (a cross-format copy into
+    // an offscreen plain).
     let dst_renderable = dst_info
         .flags
         .contains(StretchSurfaceFlags::IS_RENDER_TARGET);
     if matches!(dst_info.kind, StretchKind::Texture(_)) && (!render_quad || dst_renderable) {
-        claim_stretch_dst_for_gpu(dst_surf, &dst_info);
+        claim_dst_subresource_for_gpu(dst_surf, &dst_info);
     }
 
     let mip_level = src_info.mip_level;
@@ -6552,28 +6557,29 @@ extern "system" fn device_stretch_rect(
     D3D_OK
 }
 
-/// Claim a `StretchRect` destination level for the GPU.
+/// Claim a `StretchRect` or `ColorFill` destination subresource for the GPU.
 ///
 /// A texture-backed destination carries CPU staging, and both the 1:1 blit and
 /// the render quad write only its Metal texture, so a `LockRect` or a `GetDC`
-/// of the level has to read it back instead of serving the staging the copy
-/// never touched. Every source kind lands here, including one with no CPU
-/// staging of its own to copy from.
-/// Marking is all this does; the read happens at the next map.
-fn claim_stretch_dst_for_gpu(
+/// of that subresource has to read it back instead of serving the staging the
+/// write never reached. The claim is per (face, level): a cube face's five
+/// siblings keep whatever their own staging holds. Every source kind lands
+/// here, including one with no CPU staging of its own to copy from. Marking is
+/// all this does; the read happens at the next map.
+fn claim_dst_subresource_for_gpu(
     dst_surf: *mut crate::surface::Direct3DSurface9,
     dst_info: &StretchSurfaceInfo,
 ) {
     if dst_surf.is_null() {
         return;
     }
-    // SAFETY: caller-supplied live `Direct3DSurface9*` from the StretchRect
-    // thunk (non-null checked above).
+    // SAFETY: caller-supplied live `Direct3DSurface9*` from the StretchRect or
+    // ColorFill thunk (non-null checked above).
     let dst_parent = unsafe { (*dst_surf).parent_texture() };
     if dst_parent.is_null() {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "StretchRect: texture-backed destination has no parent texture → \
+            "StretchRect/ColorFill: texture-backed destination has no parent texture → \
              its staging keeps what it held"
         );
         return;
@@ -6582,7 +6588,7 @@ fn claim_stretch_dst_for_gpu(
     // kept alive by the destination surface's reference.
     unsafe { &mut *dst_parent }
         .inner_mut()
-        .mark_level_gpu_authoritative(dst_info.mip_level as usize);
+        .mark_subresource_gpu_authoritative(dst_info.slice, dst_info.mip_level as usize);
 }
 
 /// CPU-side cross-format `StretchRect` into an offscreen-plain destination.
@@ -6923,6 +6929,7 @@ fn emit_stretch_rect_blit(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                dst_slice: dst_info.slice,
                 region_w,
                 region_h,
             },
@@ -6958,6 +6965,7 @@ fn emit_stretch_rect_blit(
                 rect: src_region,
                 dims: src_dims,
                 mip: src_info.mip_level,
+                slice: 0,
                 msaa: MetalHandle::NULL,
                 msaa_srgb: MetalHandle::NULL,
                 sample_count: 1,
@@ -6967,6 +6975,7 @@ fn emit_stretch_rect_blit(
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_info.mip_level,
+                slice: dst_info.slice,
                 msaa: dst_info.msaa,
                 msaa_srgb: dst_info.msaa_srgb,
                 sample_count: dst_info.sample_count,
@@ -6994,6 +7003,7 @@ fn emit_stretch_rect_blit(
             src_origin_y: src_region.y,
             dst_origin_x: dst_region.x,
             dst_origin_y: dst_region.y,
+            dst_slice: dst_info.slice,
             region_w: src_region.w,
             region_h: src_region.h,
         },
@@ -7051,6 +7061,16 @@ fn emit_same_texture_stretch(
         filter,
     } = params;
     let dst_mip = dst_info.mip_level;
+    // Both endpoints are one texture and the copy names no source slice, so it
+    // stays on slice 0: a cube whose two surfaces name different faces needs
+    // the source slice on the wire before this path can address a face.
+    if dst_info.slice != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "StretchRect: a copy inside one cube texture reads and writes face 0, \
+             whatever faces its two surfaces name"
+        );
+    }
     let route = same_surface_route(src_region, dst_region, src_mip, dst_mip);
     if route == SameSurfaceRoute::Skip {
         mtld3d_shared::log_once_info!(
@@ -7072,6 +7092,7 @@ fn emit_same_texture_stretch(
                 src_origin_y: src_region.y,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                dst_slice: 0,
                 region_w: src_region.w,
                 region_h: src_region.h,
             },
@@ -7125,6 +7146,7 @@ fn emit_same_texture_stretch(
             src_origin_y: src_region.y,
             dst_origin_x: 0,
             dst_origin_y: 0,
+            dst_slice: 0,
             region_w: src_region.w,
             region_h: src_region.h,
         },
@@ -7141,6 +7163,7 @@ fn emit_same_texture_stretch(
                 },
                 dims: (scratch_w, scratch_h),
                 mip: 0,
+                slice: 0,
                 msaa: MetalHandle::NULL,
                 msaa_srgb: MetalHandle::NULL,
                 sample_count: 1,
@@ -7150,6 +7173,7 @@ fn emit_same_texture_stretch(
                 rect: dst_region,
                 dims: dst_dims,
                 mip: dst_mip,
+                slice: 0,
                 msaa: dst_info.msaa,
                 msaa_srgb: dst_info.msaa_srgb,
                 sample_count: dst_info.sample_count,
@@ -7169,6 +7193,7 @@ fn emit_same_texture_stretch(
                 src_origin_y: 0,
                 dst_origin_x: dst_region.x,
                 dst_origin_y: dst_region.y,
+                dst_slice: 0,
                 region_w: dst_region.w,
                 region_h: dst_region.h,
             },
@@ -7222,6 +7247,11 @@ struct StretchSurfaceInfo {
     scale: mtld3d_core::render_scale::RenderScale,
     format: u32,
     mip_level: u32,
+    /// Array slice the surface addresses within its backing texture.
+    ///
+    /// A cube face's `D3DCUBEMAP_FACES` index; zero for every other surface
+    /// kind, which occupies one slice.
+    slice: u32,
     /// D3DPOOL_* of the backing resource.
     ///
     /// `StretchRect` requires both surfaces in `D3DPOOL_DEFAULT`.
@@ -7299,6 +7329,7 @@ fn resolve_stretch_surface(
             scale: tex.inner().render_scale(),
             format: tex.d3d_format(),
             mip_level: level,
+            slice: s.cube_face().unwrap_or(0),
             pool: tex.d3d_pool(),
             flags,
             autogen_texture_id: (tex.inner().autogen_mipmap() && level == 0)
@@ -7323,6 +7354,7 @@ fn resolve_stretch_surface(
             scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
+            slice: 0,
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_RENDER_TARGET,
             autogen_texture_id: None,
@@ -7345,6 +7377,7 @@ fn resolve_stretch_surface(
             scale: s.render_scale(),
             format: s.standalone_format(),
             mip_level: 0,
+            slice: 0,
             pool: D3DPOOL_DEFAULT,
             flags: StretchSurfaceFlags::IS_DEPTH_STENCIL,
             autogen_texture_id: None,
@@ -7433,7 +7466,7 @@ fn color_fill_render_target(
         logical_size: (info.width, info.height),
         format,
         scale: info.scale,
-        subresource: (0, info.mip_level),
+        subresource: (info.slice, info.mip_level),
         rect: (region.x, region.y, region.w, region.h),
         rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
         regenerate_mipmaps: info.autogen_texture_id.is_some(),
@@ -7552,6 +7585,12 @@ extern "system" fn device_color_fill(
         return D3DERR_INVALIDCALL;
     }
     if info.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+        // The fill runs as a render pass over the destination's Metal texture
+        // and never touches its CPU staging, so a texture-backed destination
+        // hands the next map a read back rather than the staging it left.
+        if matches!(info.kind, StretchKind::Texture(_)) {
+            claim_dst_subresource_for_gpu(surf, &info);
+        }
         return color_fill_render_target(obj.inner(), info, region, color);
     }
     // SAFETY: an offscreen-plain surface is texture-backed, so

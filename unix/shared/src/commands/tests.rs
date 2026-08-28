@@ -3,7 +3,8 @@
 //! The PE side writes these structs and the unix side decodes them, so every bit packing is a
 //! two-sided contract. Among those built and read back here: index count, index type and instance
 //! count share `param_d`, index offset and signed base vertex share `param_c`, and a blit
-//! destination folds its slice or its origin into `BlitCommand::dst_offset`. One test asserts
+//! destination folds its slice or its origin into `BlitCommand::dst_offset`, and a
+//! texture-to-texture copy names its destination slice in `dst_slice`. One test asserts
 //! `BlitCommand`'s 8-byte alignment and 88-byte size at run time; a layout change fails that test.
 
 use super::*;
@@ -256,6 +257,7 @@ fn copy_texture_to_texture_sub_rect_packs_dst_origin() {
         dst_texture: 0xBBBB,
         mip_level: 2,
         dst_mip_level: 1,
+        dst_slice: 3,
         src_origin_x: 16,
         src_origin_y: 32,
         dst_origin_x: 100,
@@ -268,6 +270,10 @@ fn copy_texture_to_texture_sub_rect_packs_dst_origin() {
     assert_eq!(cmd.dst_handle, 0xBBBB);
     assert_eq!(cmd.mip_level, 2);
     assert_eq!(cmd.dst_mip_level, 1);
+    assert_eq!(
+        cmd.dst_slice, 3,
+        "the destination cube face rides its own field"
+    );
     assert_eq!(cmd.origin_x, 16);
     assert_eq!(cmd.origin_y, 32);
     assert_eq!(cmd.region_w, 64);

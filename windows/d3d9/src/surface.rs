@@ -2413,12 +2413,14 @@ fn backbuffer_lock_readback(
         width: w,
         height: h,
         bytes_per_row,
+        slice: 0,
         // `x/y/w/h` are a sub-rect of the full logical surface, which is what
         // `parse_surface_rect` clamped them against. The unix side resolves the
         // whole frame to this size before cropping, so the sub-rect lands where
         // the game expects and `bytes_per_row` above stays logical.
         source_width: full_w,
         source_height: full_h,
+        pad0: 0,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -2478,11 +2480,13 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
         width: w,
         height: h,
         bytes_per_row,
+        slice: 0,
         // Whole-surface read at its logical size; a scaled back buffer's
         // texture is smaller and gets resolved up to this first, so the DIB
         // this seeds is the size `GetDC` promised.
         source_width: w,
         source_height: h,
+        pad0: 0,
     };
     if unix_call(&mut params) != 0 {
         return None;
@@ -2776,12 +2780,14 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         width,
         height,
         bytes_per_row,
+        slice: 0,
         // Whole-surface read. A lockable render target's texture is created at
         // the extent D3D9 reports (it declines `render.scale`, so its staging
         // and its texture are one size), so the region already equals the
         // texture and the unix side skips the resolve.
         source_width: width,
         source_height: height,
+        pad0: 0,
     };
     let status = unix_call(&mut params);
     if status != 0 {
@@ -3134,27 +3140,33 @@ impl SurfaceInner {
     }
 }
 
-/// Re-materialise a texture level's pixels before a device context maps them.
+/// Re-materialise a texture subresource's pixels before a device context maps them.
 ///
-/// Two conditions leave a `D3DPOOL_DEFAULT` level's pixels on the GPU alone: a
-/// `StretchRect` blit claimed the level for the GPU and never touched its
-/// staging, or the staging went once its upload retired and its slot now points
-/// at the page every released level shares. A DC reads the level and keeps what
-/// GDI draws into it, so it takes the same GPU reads a `LockRect` of the level
-/// takes. An offscreen plain reaches its level through the texture it owns and
-/// takes them the same way: a `StretchRect` or a `ColorFill` claims it exactly
-/// as it claims any other texture level. A cube face is skipped, never being
-/// released (a cube keeps its staging for the texture's life) and never being
-/// claimed.
+/// Two conditions leave a `D3DPOOL_DEFAULT` subresource's pixels on the GPU
+/// alone: a `StretchRect` blit or a `ColorFill` claimed it for the GPU and never
+/// touched its staging, or the staging went once its upload retired and its slot
+/// now points at the page every released level shares. A DC reads the pixels and
+/// keeps what GDI draws into them, so it takes the same GPU reads a `LockRect` of
+/// the subresource takes. An offscreen plain reaches its level through the
+/// texture it owns and takes them the same way: a `StretchRect` or a `ColorFill`
+/// claims it exactly as it claims any other texture level. Only the claim half
+/// reaches a cube face, which keeps its staging for the texture's life.
 fn refill_dc_texture_level(inner: &SurfaceInner) {
-    if inner.parent_texture.is_null() || inner.cube_face != u32::MAX {
+    if inner.parent_texture.is_null() {
         return;
     }
+    // A 2D level surface carries no face; its texture keeps one staging
+    // allocation per level, which the mask indexes as face zero.
+    let face = if inner.cube_face == u32::MAX {
+        0
+    } else {
+        inner.cube_face
+    };
     // SAFETY: `parent_texture` is non-null (checked above) and points to a live
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.materialize_level_for_dc(inner.mip_level as usize);
+    texture.materialize_subresource_for_dc(face, inner.mip_level as usize);
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.
@@ -3162,9 +3174,9 @@ fn refill_dc_texture_level(inner: &SurfaceInner) {
 /// The DIB aliases the level's staging pages directly and `ReleaseDC` keeps
 /// what GDI drew in them, so an upload that retires while the DC is open must
 /// not release the level: the DIB would alias a page nothing owns and the
-/// drawing would reach the GPU nowhere. Guarded like
-/// [`refill_dc_texture_level`], whose call it pairs with: the level classes it
-/// skips never release their staging in the first place.
+/// drawing would reach the GPU nowhere. It pairs with
+/// [`refill_dc_texture_level`] and skips the level classes that never release
+/// their staging in the first place.
 fn pin_dc_texture_level(inner: &SurfaceInner, open: bool) {
     if inner.parent_texture.is_null()
         || inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)

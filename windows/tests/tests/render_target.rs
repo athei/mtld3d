@@ -1810,6 +1810,99 @@ fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
 }
 
 #[test]
+fn stretch_rect_into_a_cube_face_is_visible_to_that_face_get_dc() {
+    // A StretchRect into a cube face's surface writes that face's slice of the
+    // cube's Metal texture and never its CPU staging, so a GetDC on the face has
+    // to read that face back. Face 0 is filled red and face 3 is blitted green:
+    // a claim without a face dimension leaves face 3's staging stale, and a
+    // destination slice without a face lands the blit on face 0.
+    const EDGE: u32 = 64;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let src = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&src, GREEN),
+        D3D_OK,
+        "fill the source green"
+    );
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(
+        h.stretch_rect(&src, &face3, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from a render target into a cube face",
+    );
+
+    let last = (EDGE - 1).cast_signed();
+    let dc = face3.dc();
+    for (x, y, name) in [(0, 0, "first texel"), (last, last, "last texel")] {
+        assert_eq!(
+            dc.get_pixel(x, y),
+            GREEN_COLORREF,
+            "face 3's DC reads the blit's {name}"
+        );
+    }
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 3");
+    // A cube map's faces share one DC lock, so face 0 is readable only once
+    // face 3's device context is gone.
+    let dc = face0.dc();
+    assert_eq!(
+        dc.get_pixel(0, 0),
+        RED_COLORREF,
+        "the blit into face 3 left face 0 alone"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 0");
+}
+
+#[test]
+fn color_fill_of_a_cube_face_reaches_that_face_alone() {
+    // ColorFill on a cube face's surface runs a render pass over that face's
+    // slice and leaves the face's CPU staging untouched, so the GetDC that reads
+    // it back has to name the same face. Two faces are filled different colours:
+    // a fill without a face writes both into face 0, and a DC without the claim
+    // reads the staging neither fill reached.
+    const EDGE: u32 = 32;
+    const BLUE_COLORREF: u32 = 0x00FF_0000;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face2 = cube.surface(2, 0);
+    let face5 = cube.surface(5, 0);
+    assert_eq!(h.color_fill_hr(&face2, BLUE), D3D_OK, "fill face 2 blue");
+    assert_eq!(h.color_fill_hr(&face5, RED), D3D_OK, "fill face 5 red");
+
+    let dc = face2.dc();
+    assert_eq!(
+        dc.get_pixel(1, 1),
+        BLUE_COLORREF,
+        "face 2 keeps its own fill"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 2");
+    let dc = face5.dc();
+    assert_eq!(
+        dc.get_pixel(1, 1),
+        RED_COLORREF,
+        "face 5 keeps its own fill"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 5");
+}
+
+#[test]
 fn color_fill_render_target_overwrites_earlier_draws() {
     // ColorFill on a render target is ordered against the draws around it: it
     // wipes what the frame already drew, and the draw after it blends against
