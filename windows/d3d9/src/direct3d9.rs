@@ -1311,6 +1311,7 @@ extern "system" fn d3d9_create_device(
         width: render_width,
         height: render_height,
         texture_handle: MetalHandle::NULL,
+        srgb_texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
     if status != 0 {
@@ -1344,6 +1345,7 @@ extern "system" fn d3d9_create_device(
         view_handle: layer_params.view_handle,
         layer_handle: layer_params.layer_handle,
         backbuffer_handle: bb_params.texture_handle,
+        backbuffer_srgb_handle: bb_params.srgb_texture_handle,
         depth_stencil_handle: depth_handle,
         depth_stencil_format: if depth_handle.is_null() {
             0
@@ -1359,6 +1361,7 @@ extern "system" fn d3d9_create_device(
             device_handle: cq_params.device_handle,
             queue_handle: cq_params.queue_handle,
             backbuffer_handle: bb_params.texture_handle,
+            backbuffer_srgb_handle: bb_params.srgb_texture_handle,
             layer_handle: layer_params.layer_handle,
             view_handle: layer_params.view_handle,
             // Logical, paired with the scale below: `PassState::reset_frame`

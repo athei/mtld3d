@@ -864,6 +864,13 @@ bitflags::bitflags! {
 /// [`PassState::reset_frame`]).
 pub struct FrameReset {
     pub backbuffer: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer`, or null when there is none.
+    ///
+    /// Registered as the back buffer's twin every frame, so a
+    /// `D3DRS_SRGBWRITEENABLE` draw straight onto the swap chain attaches it
+    /// and Metal encodes after the blender. Re-supplied per frame because
+    /// `Reset` and an auto-resize replace the pair together.
+    pub backbuffer_srgb: MetalHandle<MTLTextureKind>,
     /// Logical back-buffer size, the resolution D3D9 reports.
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
@@ -1266,6 +1273,7 @@ impl PassState {
     pub fn reset_frame(&mut self, reset: &FrameReset) {
         let &FrameReset {
             backbuffer,
+            backbuffer_srgb,
             backbuffer_size,
             backbuffer_format,
             depth_texture,
@@ -1311,6 +1319,15 @@ impl PassState {
         self.current_extra_color = [ExtraColorSlot::NONE; 3];
         self.current_extra_present_mask = 0;
         self.current_extra_attachments = ExtraColorAttachments::NONE;
+        // Re-register the back buffer's sRGB twin every frame. `Reset` and an
+        // auto-resize replace the pair together and destroy the old view with
+        // the old texture, so a registration naming the retired one must not
+        // survive the swap.
+        if self.backbuffer_texture != backbuffer {
+            let stale = self.twin_of(self.backbuffer_texture);
+            self.drop_srgb_twin(stale);
+        }
+        self.store_srgb_twin(backbuffer_srgb, backbuffer);
         // The frame's colour binding changed wholesale; re-resolve the sRGB
         // views the fresh binding implies.
         self.recompute_srgb_write();
@@ -1747,21 +1764,46 @@ impl PassState {
         twin: MetalHandle<MTLTextureKind>,
         base: MetalHandle<MTLTextureKind>,
     ) {
-        if !twin.is_null() && !base.is_null() {
-            self.srgb_twin_to_base.insert(twin, base);
-            self.srgb_base_to_twin.insert(base, twin);
+        if self.store_srgb_twin(twin, base) {
             self.apply_srgb_write_change();
         }
     }
 
     /// Drop a twin registration when its texture is destroyed or renamed.
     pub fn unregister_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) {
-        if !twin.is_null()
-            && let Some(base) = self.srgb_twin_to_base.remove(&twin)
-        {
-            self.srgb_base_to_twin.remove(&base);
+        if self.drop_srgb_twin(twin) {
             self.apply_srgb_write_change();
         }
+    }
+
+    /// Record a base → twin pair in both directions; `true` when it landed.
+    ///
+    /// Split from [`Self::register_srgb_twin`] so `reset_frame`, which
+    /// re-registers the back buffer's pair every frame, can update the maps
+    /// without the pass-boundary check it is in the middle of redoing anyway.
+    fn store_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        if twin.is_null() || base.is_null() {
+            return false;
+        }
+        self.srgb_twin_to_base.insert(twin, base);
+        self.srgb_base_to_twin.insert(base, twin);
+        true
+    }
+
+    /// Forget a base → twin pair; `true` when one was registered.
+    fn drop_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) -> bool {
+        if twin.is_null() {
+            return false;
+        }
+        let Some(base) = self.srgb_twin_to_base.remove(&twin) else {
+            return false;
+        };
+        self.srgb_base_to_twin.remove(&base);
+        true
     }
 
     /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.

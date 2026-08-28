@@ -2083,6 +2083,7 @@ impl FrameEncoder {
         self.pass_state
             .reset_frame(&mtld3d_core::passes::FrameReset {
                 backbuffer: frame.backbuffer_handle,
+                backbuffer_srgb: frame.backbuffer_srgb_handle,
                 backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
                 backbuffer_format: frame.backbuffer_format,
                 depth_texture: frame.depth_texture,
@@ -2893,6 +2894,45 @@ impl FrameEncoder {
     /// multiple passes against different formats don't share a pipeline.
     pub const fn current_color_format(&self) -> PixelFormat {
         self.pass_state.current_color_format()
+    }
+
+    /// Register a live sRGB twin view so a colour target bound later can attach it.
+    pub fn register_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        self.pass_state.register_srgb_twin(twin, base);
+    }
+
+    /// Park a standalone colour target's textures on the retention queue.
+    ///
+    /// Called when the surface that owns them finalizes. The sRGB twin goes
+    /// first (it holds a retain on the base) and its registration is dropped
+    /// with it, so no later binding can resolve a view whose storage is gone.
+    /// Both destroys are gated on the current submit seq, since a pass or
+    /// blit already encoded this frame may still name either handle.
+    pub fn retire_color_target(
+        &mut self,
+        base: MetalHandle<MTLTextureKind>,
+        srgb: MetalHandle<MTLTextureKind>,
+    ) {
+        self.pass_state.unregister_srgb_twin(srgb);
+        let seq = self.current_submit_seq;
+        for handle in [srgb, base] {
+            if handle.is_null() {
+                continue;
+            }
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: handle.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq,
+                    from_texture: true,
+                });
+        }
     }
 
     /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.
@@ -7189,6 +7229,8 @@ pub struct FrameData {
     device_handle: MetalHandle<MTLDeviceKind>,
     queue_handle: MetalHandle<MTLCommandQueueKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the back buffer; see `FrameInit`.
+    backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
@@ -7317,6 +7359,8 @@ pub struct FrameInit {
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub queue_handle: MetalHandle<MTLCommandQueueKind>,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the back buffer, attached under `D3DRS_SRGBWRITEENABLE`.
+    pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     pub view_handle: MetalHandle<NSViewKind>,
     /// The frame's **logical** back-buffer width, the one D3D9 reports.
@@ -7355,6 +7399,7 @@ impl FrameData {
             device_handle: init.device_handle,
             queue_handle: init.queue_handle,
             backbuffer_handle: init.backbuffer_handle,
+            backbuffer_srgb_handle: init.backbuffer_srgb_handle,
             layer_handle: init.layer_handle,
             view_handle: init.view_handle,
             backbuffer_width: init.backbuffer_width,

@@ -694,3 +694,85 @@ fn srgb_write_blends_in_linear_then_encodes() {
     );
     assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
 }
+
+/// The back buffer takes the same linear blend as an offscreen target.
+///
+/// Source-engine titles blend decals, glass and particles straight onto the
+/// swap chain, so the back buffer needs the sRGB view as much as a
+/// render-target texture does. Same arithmetic as
+/// `srgb_write_blends_in_linear_then_encodes`, without the copy.
+#[test]
+fn srgb_write_blends_in_linear_on_the_backbuffer() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear mid-grey");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xBFCD_CDCD,
+        3,
+        "the back buffer must blend on linear values too",
+    );
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+}
+
+/// A `CreateRenderTarget` surface takes the same linear blend.
+///
+/// It carries its own Metal colour texture rather than a texture's, so it
+/// needs its own sRGB view; the pixels come back through
+/// `GetRenderTargetData` while it is still the bound target.
+#[test]
+fn srgb_write_blends_in_linear_on_a_standalone_render_target() {
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear RT mid-grey");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(32, 32),
+        0xBFCD_CDCD,
+        3,
+        "a standalone render target must blend on linear values too",
+    );
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+}

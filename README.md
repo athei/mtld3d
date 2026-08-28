@@ -87,10 +87,10 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   (Metal has none, so it is applied at the sample site), sRGB read (32-bit and
   compressed formats) and sRGB write, alpha test, scissor, separate alpha
   blend, blend factor, color write masks. `D3DRS_SRGBWRITEENABLE` binds the
-  render target's sRGB view, so the encode happens after the blender as the
-  `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises; a target with no sRGB
-  Metal format keeps a pixel-shader encode, which is exact only for opaque
-  draws, and so does the back buffer, which carries no sRGB view yet.
+  render target's sRGB view, back buffer included, so the encode happens after
+  the blender as the `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises; a target
+  whose format has no sRGB Metal counterpart keeps a pixel-shader encode, which
+  is exact only for opaque draws.
 - **Multiple render targets**: four simultaneous targets with independent
   formats and write masks, post-pixel-shader blending on each, and Clear
   reaching every bound target.

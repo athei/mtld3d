@@ -45,7 +45,7 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 64);
-    assert!(core::mem::size_of::<CreateBackbufferParams>() == 32);
+    assert!(core::mem::size_of::<CreateBackbufferParams>() == 40);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
     assert!(core::mem::size_of::<PassDescriptor>() == 168);
@@ -299,6 +299,14 @@ pub struct CreateBackbufferParams {
     pub width: u32,                                // in
     pub height: u32,                               // in
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Eagerly-created sRGB twin view of `texture_handle`.
+    ///
+    /// The back buffer is `Bgra8Unorm`, which has an sRGB counterpart, so
+    /// this is never NULL on success. The render pass attaches it in place
+    /// of the base texture under `D3DRS_SRGBWRITEENABLE`, which is what
+    /// gives the encode its D3D9 position, after the blender. Destroyed
+    /// with the base texture.
+    pub srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 
 impl Thunk for CreateBackbufferParams {
@@ -744,6 +752,11 @@ pub struct CreateColorTargetParams {
     // allow: FFI struct padding; pub for cross-crate field-init.
     pub pad0: u32,
     pub texture_handle: MetalHandle<MTLTextureKind>, // out
+    /// Eagerly-created sRGB twin view of `texture_handle`.
+    ///
+    /// NULL when the format has no sRGB counterpart. Same role as
+    /// `CreateBackbufferParams::srgb_texture_handle`.
+    pub srgb_texture_handle: MetalHandle<MTLTextureKind>, // out
 }
 
 impl Thunk for CreateColorTargetParams {

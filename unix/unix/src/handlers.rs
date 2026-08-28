@@ -282,13 +282,16 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateBackbufferParams = &mut params;
 
-    if let Some(handle) = metal::create_backbuffer(
+    if let Some((handle, srgb_handle)) = metal::create_backbuffer(
         params.device_handle,
         params.queue_handle,
         params.width,
         params.height,
     ) {
         params.texture_handle = handle;
+        // SAFETY: `create_backbuffer` transfers a retain into `srgb_handle`
+        // (0 when the format has no sRGB twin).
+        params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
         // debug, not info — fires per-frame during a Reset-driven
         // window drag. The CreateDevice + AttachMetalLayer info
         // lines already cover the boot-time milestone.
@@ -489,13 +492,16 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateColorTargetParams = &mut params;
 
-    if let Some(handle) = metal::create_color_target(
+    if let Some((handle, srgb_handle)) = metal::create_color_target(
         params.device_handle,
         params.width,
         params.height,
         params.pixel_format,
     ) {
         params.texture_handle = handle;
+        // SAFETY: `create_color_target` transfers a retain into `srgb_handle`
+        // (0 when the format has no sRGB twin).
+        params.srgb_texture_handle = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
         STATUS_SUCCESS
     } else {
         error!(target: LOG_TARGET, "failed to create color target texture");

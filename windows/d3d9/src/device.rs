@@ -300,6 +300,11 @@ pub struct DeviceInner {
     view_handle: MetalHandle<NSViewKind>,
     layer_handle: MetalHandle<CAMetalLayerKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_handle`, attached under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Created with the back buffer and destroyed with it, so the two always
+    /// name the same storage.
+    backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     depth_stencil_handle: MetalHandle<MTLTextureKind>,
     depth_stencil_format: u32,
     /// Scene / depth-binding boolean state (`DEPTH_EXPLICITLY_UNBOUND` / `IN_SCENE`).
@@ -1295,6 +1300,7 @@ impl DeviceInner {
             device_handle: self.device_handle,
             queue_handle: self.queue_handle,
             backbuffer_handle: self.backbuffer_handle,
+            backbuffer_srgb_handle: self.backbuffer_srgb_handle,
             layer_handle: self.layer_handle,
             view_handle: self.view_handle,
             // Logical, paired with the scale: `PassState::reset_frame` derives
@@ -1483,11 +1489,15 @@ impl DeviceInner {
                 ),
                 RtBinding::StandaloneColor {
                     handle,
+                    srgb,
                     format,
                     has_alpha,
                     width,
                     height,
-                } => (handle, width, height, format, has_alpha, 0, 0),
+                } => {
+                    enc.register_srgb_twin(srgb, handle);
+                    (handle, width, height, format, has_alpha, 0, 0)
+                }
                 RtBinding::Texture {
                     info,
                     has_alpha,
@@ -2022,8 +2032,13 @@ impl DeviceInner {
     /// The old handle is destroyed by the caller via `DestroyResourcesBulk`
     /// *before* this setter; the next `fresh_frame` stamps the new handle
     /// into the outgoing `FrameData`.
-    pub const fn set_backbuffer_handle(&mut self, handle: MetalHandle<MTLTextureKind>) {
+    pub const fn set_backbuffer_handle(
+        &mut self,
+        handle: MetalHandle<MTLTextureKind>,
+        srgb_handle: MetalHandle<MTLTextureKind>,
+    ) {
         self.backbuffer_handle = handle;
+        self.backbuffer_srgb_handle = srgb_handle;
     }
 
     /// Update the implicit depth/stencil Metal handle after `device_reset` recreates it.
@@ -2160,8 +2175,9 @@ impl DeviceInner {
         self.flush_current_frame_blocking();
         self.encoder_reset();
 
-        let old_handles: [u64; 2] = [
+        let old_handles: [u64; 3] = [
             self.backbuffer_handle.raw(),
+            self.backbuffer_srgb_handle.raw(),
             self.depth_stencil_handle.raw(),
         ];
         let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
@@ -2170,7 +2186,7 @@ impl DeviceInner {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
                 pad0: 0,
                 handles_ptr: live.as_ptr() as u64,
-                count: u32::try_from(live.len()).expect("at most 2 handles"),
+                count: u32::try_from(live.len()).expect("at most 3 handles"),
                 pad1: 0,
             };
             unix_call(&mut destroy);
@@ -2184,6 +2200,7 @@ impl DeviceInner {
             width: self.render_scale.dimension(new_width),
             height: self.render_scale.dimension(new_height),
             texture_handle: MetalHandle::NULL,
+            srgb_texture_handle: MetalHandle::NULL,
         };
         let status = unix_call(&mut bb_params);
         if status != 0 || bb_params.texture_handle.is_null() {
@@ -2191,11 +2208,11 @@ impl DeviceInner {
                 target: LOG_TARGET,
                 "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) — device unusable",
             );
-            self.set_backbuffer_handle(MetalHandle::NULL);
+            self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_depth_stencil_handle(MetalHandle::NULL);
             return;
         }
-        self.set_backbuffer_handle(bb_params.texture_handle);
+        self.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
 
         if self.depth_stencil_format != 0 {
             let Some(pixel_format) =
@@ -2258,6 +2275,8 @@ pub struct DeviceCreateInfo {
     pub view_handle: MetalHandle<NSViewKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_handle`; see `DeviceInner`.
+    pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
     pub depth_stencil_handle: MetalHandle<MTLTextureKind>,
     pub depth_stencil_format: u32,
     pub backbuffer_width: u32,
@@ -2327,6 +2346,7 @@ impl Direct3DDevice9 {
             view_handle: info.view_handle,
             layer_handle: info.layer_handle,
             backbuffer_handle: info.backbuffer_handle,
+            backbuffer_srgb_handle: info.backbuffer_srgb_handle,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
             flags: DeviceFlags::empty(),
@@ -2465,6 +2485,12 @@ impl DeviceInner {
     /// surface.
     pub const fn backbuffer_handle(&self) -> MetalHandle<MTLTextureKind> {
         self.backbuffer_handle
+    }
+
+    /// sRGB twin view of the back buffer, attached under `D3DRS_SRGBWRITEENABLE`.
+    #[must_use]
+    pub const fn backbuffer_srgb_handle(&self) -> MetalHandle<MTLTextureKind> {
+        self.backbuffer_srgb_handle
     }
 
     pub const fn backbuffer_width(&self) -> u32 {
@@ -2651,6 +2677,11 @@ enum RtBinding {
     /// the hard-wired backbuffer `Bgra8Unorm`.
     StandaloneColor {
         handle: MetalHandle<MTLTextureKind>,
+        /// sRGB twin view of `handle`, or null when the format has none.
+        ///
+        /// Registered with the pass state when the target is bound, so a
+        /// `D3DRS_SRGBWRITEENABLE` draw onto it attaches the twin.
+        srgb: MetalHandle<MTLTextureKind>,
         format: mtld3d_shared::mtl::PixelFormat,
         /// Whether the surface's D3D format has a real alpha channel.
         ///
@@ -2892,6 +2923,20 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
                 let ti = unsafe { &mut *ti_ptr };
                 ti.detach_from_device();
             }
+        }
+        // The back buffer's sRGB twin view has no slot on the queue-destroy
+        // thunk, so it goes first; the view holds a retain on the base
+        // texture that thunk then releases.
+        if !device_inner.backbuffer_srgb_handle.is_null() {
+            let handle = device_inner.backbuffer_srgb_handle.raw();
+            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                pad0: 0,
+                handles_ptr: (&raw const handle) as u64,
+                count: 1,
+                pad1: 0,
+            };
+            unix_call(&mut destroy);
         }
         let mut params = DestroyCommandQueueParams {
             device_handle: device_inner.device_handle,
@@ -3546,7 +3591,11 @@ fn reset_recreate_resources(
 
     // 2. Destroy the old backbuffer + depth/stencil. Bulk thunk so the
     //    two handles cross the PE/Unix boundary in one call.
-    let old_handles: [u64; 2] = [dev.backbuffer_handle.raw(), dev.depth_stencil_handle.raw()];
+    let old_handles: [u64; 3] = [
+        dev.backbuffer_handle.raw(),
+        dev.backbuffer_srgb_handle.raw(),
+        dev.depth_stencil_handle.raw(),
+    ];
     let live_count = old_handles.iter().filter(|&&h| h != 0).count();
     if live_count > 0 {
         let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
@@ -3554,7 +3603,7 @@ fn reset_recreate_resources(
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
             pad0: 0,
             handles_ptr: live.as_ptr() as u64,
-            count: u32::try_from(live.len()).expect("at most 2 handles"),
+            count: u32::try_from(live.len()).expect("at most 3 handles"),
             pad1: 0,
         };
         unix_call(&mut destroy);
@@ -3576,15 +3625,16 @@ fn reset_recreate_resources(
         width: dev.render_scale.dimension(pp.back_buffer_width),
         height: dev.render_scale.dimension(pp.back_buffer_height),
         texture_handle: MetalHandle::NULL,
+        srgb_texture_handle: MetalHandle::NULL,
     };
     let status = unix_call(&mut bb_params);
     if status != 0 || bb_params.texture_handle.is_null() {
         error!(target: LOG_TARGET, "Reset: CreateBackbuffer failed (0x{status:08X}) — device unusable");
-        dev.set_backbuffer_handle(MetalHandle::NULL);
+        dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
         return Err(D3DERR_INVALIDCALL);
     }
-    dev.set_backbuffer_handle(bb_params.texture_handle);
+    dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
 
     // 5. Recreate depth/stencil if the device had one. Format is taken
     //    from the saved depth_stencil_format captured at CreateDevice;
@@ -4767,6 +4817,7 @@ fn create_color_target_surface(
         pixel_format: mapping.metal_pixel_format(),
         pad0: 0,
         texture_handle: MetalHandle::NULL,
+        srgb_texture_handle: MetalHandle::NULL,
     };
     if unix_call(&mut params) != 0 || params.texture_handle.is_null() {
         return None;
@@ -4774,6 +4825,7 @@ fn create_color_target_surface(
     let surf = Direct3DSurface9::new_color_target(
         device_inner,
         params.texture_handle,
+        params.srgb_texture_handle,
         width,
         height,
         format,
@@ -6811,6 +6863,7 @@ extern "system" fn device_set_render_target(
             let has_alpha = mapping.as_ref().is_none_or(FormatMapping::has_alpha);
             RtBinding::StandaloneColor {
                 handle: standalone_color,
+                srgb: surface_ref.metal_color_srgb_handle(),
                 format: fmt,
                 has_alpha,
                 width: desc.width,

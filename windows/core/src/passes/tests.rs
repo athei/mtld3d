@@ -30,11 +30,16 @@ fn backbuffer() -> MetalHandle<MTLTextureKind> {
 fn depth() -> MetalHandle<MTLTextureKind> {
     tex(0x2000)
 }
+/// The back buffer's sRGB twin view, as the device supplies it every frame.
+fn backbuffer_srgb() -> MetalHandle<MTLTextureKind> {
+    tex(0x1001)
+}
 
 fn fresh() -> PassState {
     let mut s = PassState::new();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -51,6 +56,7 @@ fn fresh_scaled() -> PassState {
     let mut s = PassState::new();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -173,6 +179,7 @@ fn frame_sampled_textures_clears_on_reset_frame() {
     assert!(s.texture_sampled_this_frame(atlas));
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -503,6 +510,7 @@ fn reset_frame_drops_pending_clears() {
     assert!(s.pending_color_clear().is_some());
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1143,6 +1151,7 @@ fn rule_a_reset_frame_re_arms_dontcare() {
     // seen set was reset.
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -1238,6 +1247,7 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
     assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3325,6 +3335,7 @@ fn blit_written_set_resets_with_the_frame() {
     s.take_pending_leading_blits();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3432,6 +3443,7 @@ fn continuation_loads_targets_drawn_before_the_flush() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3463,6 +3475,7 @@ fn a_real_present_still_dontcares_first_use() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3496,6 +3509,7 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
     s.end_current_pass("test");
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3677,6 +3691,7 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
     // bind of the stale handle no longer implicates the base.
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
         depth_texture: depth(),
@@ -3821,4 +3836,56 @@ fn a_clear_only_pass_does_not_coalesce_across_an_srgb_view_change() {
     ));
     assert!(s.passes()[0].color_srgb_texture.is_null());
     assert_eq!(s.passes()[1].color_attachment_texture(), twin);
+}
+
+/// The back buffer's sRGB twin is registered from the frame reset.
+///
+/// A `D3DRS_SRGBWRITEENABLE` draw straight onto the swap chain therefore
+/// attaches the twin, exactly as one onto a render-target texture does. The
+/// pair is re-supplied every frame because `Reset` and an auto-resize
+/// replace both halves together.
+#[test]
+fn the_backbuffer_attaches_its_srgb_twin() {
+    let mut s = fresh();
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    assert_eq!(s.current_color_format(), PixelFormat::Bgra8UnormSrgb);
+    s.ensure_pass_open();
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), backbuffer());
+    assert_eq!(pass.color_attachment_texture(), backbuffer_srgb());
+}
+
+/// A replaced back buffer drops the retired twin's registration.
+///
+/// `Reset` destroys the old texture and its view together, so a later
+/// binding must not be able to resolve the dead one.
+#[test]
+fn replacing_the_backbuffer_forgets_the_retired_twin() {
+    let mut s = fresh();
+    let fresh_bb = tex(0x1100);
+    let fresh_twin = tex(0x1101);
+    s.reset_frame(&FrameReset {
+        backbuffer: fresh_bb,
+        backbuffer_srgb: fresh_twin,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s.set_srgb_write_enabled(true);
+    s.ensure_pass_open();
+    assert_eq!(s.passes()[0].color_attachment_texture(), fresh_twin);
+    // The retired pair is gone: rebinding the old texture finds no twin.
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    assert!(!s.pass_srgb_write());
 }
