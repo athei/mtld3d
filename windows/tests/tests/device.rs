@@ -4,7 +4,8 @@
 //! (state-default restore, resize, malformed input).
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, assert_pixel_eq,
+    Harness, HarnessConfig, TexturedVertex, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    assert_pixel_eq,
 };
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
@@ -12,9 +13,10 @@ use mtld3d_types::{
     D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
     D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F,
     D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_PARAMETERS, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN,
+    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS,
+    D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
     D3DRTYPE_TEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
     D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
     D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
@@ -691,6 +693,143 @@ fn reset_clears_scene_state() {
         D3DERR_INVALIDCALL,
         "EndScene after Reset must be INVALIDCALL"
     );
+}
+
+/// A full-target quad whose texture coordinates address a cube's +X face.
+///
+/// The whole face carries one colour, so the sampled texel does not depend on
+/// where the coordinate lands within it.
+const fn cube_face_quad() -> [CubeQuadVertex; 6] {
+    [
+        cube_quad_vertex(-1.0, 1.0),
+        cube_quad_vertex(1.0, 1.0),
+        cube_quad_vertex(-1.0, -1.0),
+        cube_quad_vertex(1.0, 1.0),
+        cube_quad_vertex(1.0, -1.0),
+        cube_quad_vertex(-1.0, -1.0),
+    ]
+}
+
+/// A full-target quad with UVs spanning the unit square and one vertex colour.
+fn flat_quad(color: u32) -> [TexturedVertex; 6] {
+    let v = |x: f32, y: f32, u: f32, v: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+        u,
+        v,
+    };
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+#[repr(C)]
+struct CubeQuadVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+    u: f32,
+    v: f32,
+    w: f32,
+}
+
+const fn cube_quad_vertex(x: f32, y: f32) -> CubeQuadVertex {
+    CubeQuadVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 1.0,
+        v: 0.0,
+        w: 0.0,
+    }
+}
+
+#[test]
+fn reset_clears_the_stage_cube_binding_mask() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    const BLACK: u32 = 0xFF00_0000;
+    // D3DFVF_TEXCOORDSIZE3(0), the three-component texcoord a cube sample needs.
+    const TEXCOORDSIZE3_0: u32 = 0x0001_0000;
+
+    let h = Harness::new();
+
+    // A cube on stage 0, sampled once so the stage's cached cube bit is live
+    // going into the Reset. Managed pool, so the texture may outlive the Reset.
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut face = cube.lock_rect(0, 0, 0);
+        face.write_u32(&[RED; 16]);
+    }
+    assert_eq!(h.set_cube_texture(0, &cube), 0, "SetTexture(cube)");
+    h.select_texture_stage(0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | TEXCOORDSIZE3_0),
+        0,
+        "SetFVF for the cube draw"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &cube_face_quad()),
+            0,
+            "cube draw"
+        );
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), RED, "cube sample before Reset");
+
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset must succeed");
+
+    // Reset unbinds every stage, and the first draw after it rebuilds the
+    // shader variant key from the per-stage kind masks. A cube bit carried
+    // over from before the Reset describes a stage that now holds nothing.
+    h.select_diffuse_stage(0);
+    // Reset restores the D3D9 default `D3DRS_LIGHTING = TRUE`, which the
+    // normal-less vertices below would light to black.
+    assert_eq!(
+        h.set_render_state(D3DRS_LIGHTING, 0),
+        0,
+        "SetRenderState(LIGHTING)"
+    );
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF for the diffuse draw"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(BLUE)),
+            0,
+            "diffuse draw with stage 0 unbound"
+        );
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), BLUE, "diffuse draw after Reset");
+
+    // The stage the cube held samples a 2D texture as a 2D texture.
+    let flat = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut level = flat.lock_rect(0, 0);
+        level.write_u32(&[GREEN; 16]);
+    }
+    assert_eq!(h.set_texture(0, &flat), 0, "SetTexture(2D)");
+    h.select_texture_stage(0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(0xFFFF_FFFF)),
+            0,
+            "2D draw"
+        );
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), GREEN, "2D sample after Reset");
 }
 
 #[test]

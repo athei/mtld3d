@@ -303,7 +303,10 @@ impl StageBindings {
 
     /// Release and null every texture slot.
     ///
-    /// Used from the device release path.
+    /// Used from the device release path and, through
+    /// [`Self::reset_to_defaults`], from `Reset`. Every cached per-slot mask
+    /// reads zero afterwards: no slot holds a texture, so none of the kind
+    /// predicates the masks cache can hold.
     pub fn teardown(&mut self) {
         for slot in &mut self.textures {
             *slot = CachedComPtr::null();
@@ -311,6 +314,7 @@ impl StageBindings {
         self.bound_mask = 0;
         self.depth_mask = 0;
         self.volume_mask = 0;
+        self.cube_mask = 0;
         self.fetch_mask = 0;
     }
 
