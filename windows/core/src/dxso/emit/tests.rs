@@ -16,8 +16,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    VariantFlags, VariantKey, declared_ps_samplers, emit_ps_programmable, emit_vs_programmable,
-    emit_vs_programmable_named,
+    VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers, emit_ps_programmable,
+    emit_vs_programmable, emit_vs_programmable_named,
 };
 use crate::dxso::{ir::TextureType, parser::parse};
 
@@ -3175,7 +3175,8 @@ fn programmable_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         END_TOKEN,
     ];
     let vs = parse(&bc).expect("vs_1_1 parse");
-    let msl = emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3).expect("emit");
+    let msl = emit_vs_programmable_named(&vs, "clip_vs", u16::MAX, 3, VsSamplerKinds::default())
+        .expect("emit");
     assert!(
         msl.contains("float clip_distance [[clip_distance]] [3];"),
         "VS Varyings must declare three clip lanes:\n{msl}"
@@ -4368,4 +4369,126 @@ fn a_depth_bound_slot_stays_depth2d_over_the_volume_and_cube_masks() {
         "a depth-bound volume-declared slot binds depth2d:\n{depth}"
     );
     metal_compile_or_fail(&depth);
+}
+
+/// `vs_3_0 { dcl_<dim> s0; dcl_position v0; texldl r0, c0, s0; mov oPos, r0; }`
+///
+/// `dcl` selects the declared sampler dimension in bits 27..30 of the usage
+/// token: `0x9000_0000` is 2D, `0x9800_0000` cube, `0xa000_0000` volume.
+fn vertex_fetch_shader(dcl: u32) -> Vec<u32> {
+    vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_TEXLDL, 3),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]
+}
+
+#[test]
+fn vertex_fetch_slot_bound_to_a_volume_texture_types_the_argument_3d() {
+    // The shader declares `dcl_2d s0`, the game binds a volume texture to
+    // D3DVERTEXTEXTURESAMPLER0. Metal type-checks the binding against the
+    // signature, so the argument and the coordinate follow the binding.
+    let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
+    let kinds = VsSamplerKinds {
+        volume_mask: 0b0001,
+        cube_mask: 0,
+    };
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    assert!(
+        msl.contains("texture3d<float> s0 [[texture(0)]]"),
+        "a volume binding types the argument texture3d:\n{msl}"
+    );
+    assert!(
+        msl.contains("s0.sample(samp0, (vs_c[0]).xyz, level((vs_c[0]).w))"),
+        "a volume binding samples with a three-component coord:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn vertex_fetch_slot_bound_to_a_2d_texture_types_the_argument_2d() {
+    // The mirror direction: the shader declares `dcl_volume s0` and the game
+    // binds an ordinary 2D texture. Typing from the declaration would emit
+    // `texture3d<float>` sampled with a `float2`, which does not even
+    // compile, so the whole vertex library would be lost.
+    let vs = parse(&vertex_fetch_shader(0xa000_0000)).expect("vs_3_0 parse");
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default())
+        .expect("emit");
+    assert!(
+        msl.contains("texture2d<float> s0 [[texture(0)]]"),
+        "a 2D binding types the argument texture2d:\n{msl}"
+    );
+    assert!(
+        msl.contains("s0.sample(samp0, (vs_c[0]).xy, level((vs_c[0]).w))"),
+        "a 2D binding samples with a two-component coord:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
+    let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
+    let kinds = VsSamplerKinds {
+        volume_mask: 0,
+        cube_mask: 0b0001,
+    };
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    assert!(
+        msl.contains("texturecube<float> s0 [[texture(0)]]"),
+        "a cube binding types the argument texturecube:\n{msl}"
+    );
+    assert!(
+        msl.contains("s0.sample(samp0, (vs_c[0]).xyz, level((vs_c[0]).w))"),
+        "a cube binding samples with a three-component coord:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn vertex_sampler_kinds_reads_one_slot_at_a_time() {
+    let mut kinds = VsSamplerKinds::default();
+    kinds.set_slot(1, true, false);
+    kinds.set_slot(3, false, true);
+    assert_eq!(
+        kinds.kind(0),
+        TextureType::Texture2D,
+        "untouched slot is 2D"
+    );
+    assert_eq!(kinds.kind(1), TextureType::Texture3D, "slot 1 volume");
+    assert_eq!(
+        kinds.kind(2),
+        TextureType::Texture2D,
+        "untouched slot is 2D"
+    );
+    assert_eq!(kinds.kind(3), TextureType::TextureCube, "slot 3 cube");
+    assert_eq!(
+        kinds.kind(4),
+        TextureType::Texture2D,
+        "D3D9 defines four vertex fetch slots; past them reads 2D"
+    );
+    kinds.set_slot(1, false, false);
+    assert_eq!(
+        kinds.kind(1),
+        TextureType::Texture2D,
+        "unbinding a slot returns it to 2D"
+    );
+    assert_eq!(
+        kinds,
+        VsSamplerKinds {
+            volume_mask: 0,
+            cube_mask: 0b1000
+        }
+    );
 }

@@ -75,6 +75,7 @@ windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/emit.rs EmitContextFlags Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/emit.rs VariantFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/dxso/emit.rs VariantKey Clone,Copy,Debug,Default,PartialEq,Eq,Hash
+windows/core/src/dxso/emit.rs VsSamplerKinds Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfPsKey Clone,Debug,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfStage Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfVsFlags Clone,Copy,Debug,PartialEq,Eq,Hash
@@ -179,7 +180,7 @@ windows/d3d9/src/encoder.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 windows/d3d9/src/encoder.rs FrameDataFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/encoder.rs FrameEncoderFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/encoder.rs MipStagingBuffer Clone,Default
-windows/d3d9/src/encoder.rs PsSamplerDecls Clone,Copy
+windows/d3d9/src/encoder.rs PsSamplerDecls Clone,Copy,Default
 windows/d3d9/src/encoder.rs StageLibHandles Clone,Copy
 windows/d3d9/src/encoder.rs SubmitMode Clone,Copy,PartialEq,Eq
 windows/d3d9/src/encoder.rs TextureInfo Clone

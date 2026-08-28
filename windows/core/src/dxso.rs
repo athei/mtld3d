@@ -22,9 +22,9 @@ mod parser;
 pub const LOG_TARGET: &str = "mtld3d::dxso";
 
 pub use emit::{
-    DEFAULT_PS_ENTRY, DEFAULT_VS_ENTRY, EmitError, VariantFlags, VariantKey, bound_sampler_type,
-    declared_ps_samplers, emit_ps_programmable, emit_ps_programmable_named, emit_vs_programmable,
-    emit_vs_programmable_named,
+    DEFAULT_PS_ENTRY, DEFAULT_VS_ENTRY, EmitError, VariantFlags, VariantKey, VsSamplerKinds,
+    bound_sampler_type, declared_ps_samplers, emit_ps_programmable, emit_ps_programmable_named,
+    emit_vs_programmable, emit_vs_programmable_named,
 };
 pub use ff::{
     FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_ps_ff_named, emit_vs_ff,

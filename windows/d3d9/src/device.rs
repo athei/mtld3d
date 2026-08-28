@@ -15,7 +15,7 @@ use mtld3d_core::{
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
     },
     dirty_rect::DirtyRect,
-    dxso::operand_token_count,
+    dxso::{VsSamplerKinds, operand_token_count},
     ff_state::{FfState, FfVsDirty},
     format::{
         FormatMapping, compute_mip_count, compute_mip_size, is_dxt_format, linear_mip_size,
@@ -568,6 +568,13 @@ pub struct DeviceInner {
     vertex_textures: [CachedComPtr<crate::texture::Direct3DTexture9, Bound>; 4],
     /// Sampler state for the vertex slots, for `GetSamplerState`.
     vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
+    /// Texture kind bound at each vertex fetch slot.
+    ///
+    /// Maintained by `set_vertex_texture_slot` alongside the slot write and
+    /// folded into `VsSource::Programmable::sampler_kinds`, so the vertex
+    /// emitter types each `[[texture(n)]]` argument from the texture the
+    /// draw binds rather than from the shader's `dcl_*`.
+    vertex_texture_kinds: VsSamplerKinds,
     /// The last texture-backed depth-stencil bind, as `(texture, width, height)`.
     ///
     /// Read by the `depth.aliasSameSize` carry: a bind of a *different*
@@ -1075,6 +1082,16 @@ impl DeviceInner {
     /// Release every vertex fetch slot's bound-texture refcount at device teardown.
     pub fn teardown_vertex_textures(&mut self) {
         self.vertex_textures = [const { CachedComPtr::null() }; 4];
+        self.vertex_texture_kinds = VsSamplerKinds::default();
+    }
+
+    /// Texture kind bound at each of the four vertex fetch slots.
+    ///
+    /// Folded into the programmable VS source, hence into the VS library and
+    /// disk keys.
+    #[must_use]
+    pub const fn vertex_texture_kinds(&self) -> VsSamplerKinds {
+        self.vertex_texture_kinds
     }
 
     /// One vertex-slot sampler state value, for `GetSamplerState` and capture.
@@ -1114,6 +1131,23 @@ impl DeviceInner {
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
         self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
+        // The kind decides the emitted argument type, so a swap that changes
+        // it needs a fresh VS source (hence a fresh library). An unbound slot
+        // reads 2D, which is the kind of the black fallback the draw binds.
+        let (volume, cube) = if tex.is_null() {
+            (false, false)
+        } else {
+            // SAFETY: non-null per the branch, and live per D3D9 lifetime
+            // rules; the kind flags are read through a shared reference.
+            let bound = unsafe { &*tex };
+            (bound.is_volume(), bound.is_cube())
+        };
+        let mut kinds = self.vertex_texture_kinds;
+        kinds.set_slot(slot, volume, cube);
+        if kinds != self.vertex_texture_kinds {
+            self.vertex_texture_kinds = kinds;
+            self.mark_snapshot_dirty(SnapshotDirty::VS_SOURCE);
+        }
         let id = if tex.is_null() {
             None
         } else {
@@ -2595,6 +2629,7 @@ impl Direct3DDevice9 {
             stage_bindings: StageBindings::new(&info.sampler_states),
             vertex_textures: [const { CachedComPtr::null() }; 4],
             vertex_sampler_states: [mtld3d_types::sampler_state_defaults(); 4],
+            vertex_texture_kinds: VsSamplerKinds::default(),
             last_sized_depth: None,
             recording_state_block: None,
             pending_display_sync_enabled: None,
@@ -10454,6 +10489,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 uses_int_const: vs_obj.uses_int_const(),
                 uses_bool_const: vs_obj.uses_bool_const(),
                 clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
+                sampler_kinds: dev.vertex_texture_kinds(),
             })
         }
     } else {
