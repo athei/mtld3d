@@ -1,12 +1,17 @@
 //! Unit tests for the texture-staging decisions.
 //!
 //! Several cases per arm of `decide_lock_action`: flag priority, the uncontended shortcut,
-//! `D3DLOCK_DISCARD`, and whole-mip renames with `D3DUSAGE_DYNAMIC` dropping the CPU preserve.
-//! The partial arms mostly resolve to `WriteInPlace`; only an unaligned compressed rect forces
-//! a preserve, since the encoder widens its read to the whole mip. The `texture_lock_offset`
-//! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
-//! The `staging_droppable_class` cases walk the pool, usage and shape combinations, since every
-//! class outside the one that releases is a level whose only copy of some byte is the staging.
+//! `D3DLOCK_DISCARD` where it is honoured (a whole-mip Lock of a default-pool texture) and
+//! where it is dropped (a partial Lock, the managed and system-memory pools), and whole-mip
+//! renames preserving whichever pool the texture is in. The partial arms mostly resolve to
+//! `WriteInPlace`; only an unaligned compressed rect forces a preserve, since the encoder widens
+//! its read to the whole mip. The `honoured_lock_flags` cases pin the two conditions on their
+//! own. The `texture_lock_offset` cases pin block-row arithmetic: a pixel-row index times a
+//! block-row pitch runs past the end. The `staging_droppable_class` cases walk the pool, usage
+//! and shape combinations, since every class outside the one that releases is a level whose only
+//! copy of some byte is the staging.
+
+use mtld3d_types::{D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM};
 
 use super::*;
 
@@ -28,27 +33,24 @@ fn full() -> DirtyRect {
     DirtyRect::full(MIP_W, MIP_H)
 }
 
+fn shape(block: (u32, u32)) -> MipShape {
+    MipShape {
+        mip_w: MIP_W,
+        mip_h: MIP_H,
+        block_w: block.0,
+        block_h: block.1,
+    }
+}
+
 fn decide(
     flags: u32,
-    usage: u32,
+    pool: u32,
     rect: Option<DirtyRect>,
     slot: u64,
     coh: u64,
     block: (u32, u32),
 ) -> LockAction {
-    decide_lock_action(
-        coh,
-        slot,
-        flags,
-        usage,
-        rect,
-        MipShape {
-            mip_w: MIP_W,
-            mip_h: MIP_H,
-            block_w: block.0,
-            block_h: block.1,
-        },
-    )
+    decide_lock_action(coh, slot, flags, pool, rect, shape(block))
 }
 
 // ── flag-priority arms (uncompressed) ──
@@ -58,7 +60,7 @@ fn readonly_in_place_contended() {
     assert_eq!(
         decide(
             D3DLOCK_READONLY,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -73,7 +75,7 @@ fn nooverwrite_in_place_contended() {
     assert_eq!(
         decide(
             D3DLOCK_NOOVERWRITE,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -88,8 +90,8 @@ fn nooverwrite_wins_over_discard() {
     assert_eq!(
         decide(
             D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
-            NO_USAGE,
-            Some(rect(8, 8, 16, 16)),
+            D3DPOOL_DEFAULT,
+            None,
             IN_FLIGHT_SEQ,
             COHERENT,
             (1, 1)
@@ -105,7 +107,7 @@ fn never_uploaded_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             0,
             0,
@@ -121,7 +123,7 @@ fn equal_seqs_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             COHERENT,
             COHERENT,
@@ -136,8 +138,25 @@ fn retired_slot_in_place_even_with_default_flags() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
+            RETIRED_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn uncontended_whole_mip_discard_in_place() {
+    // Nothing reads the staging, so even an honoured DISCARD keeps the box:
+    // the game overwrites it in place and no allocation is needed.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            None,
             RETIRED_SEQ,
             COHERENT,
             (1, 1)
@@ -149,28 +168,11 @@ fn retired_slot_in_place_even_with_default_flags() {
 // ── DISCARD arms ──
 
 #[test]
-fn discard_partial_contended_freshbox_none() {
-    assert_eq!(
-        decide(
-            D3DLOCK_DISCARD,
-            NO_USAGE,
-            Some(rect(8, 8, 16, 16)),
-            IN_FLIGHT_SEQ,
-            COHERENT,
-            (1, 1)
-        ),
-        LockAction::FreshBox {
-            preserve: PreserveKind::None
-        }
-    );
-}
-
-#[test]
 fn discard_full_mip_contended_freshbox_none() {
     assert_eq!(
         decide(
             D3DLOCK_DISCARD,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             None,
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -183,32 +185,12 @@ fn discard_full_mip_contended_freshbox_none() {
 }
 
 #[test]
-fn discard_compressed_unaligned_freshbox_none() {
-    // DISCARD short-circuits before the alignment check; bytes
-    // don't matter when the game promised "throw it all out".
+fn discard_full_rect_contended_freshbox_none() {
+    // An explicit rect spanning the mip is a whole-mip Lock too.
     assert_eq!(
         decide(
             D3DLOCK_DISCARD,
-            NO_USAGE,
-            Some(rect(2, 2, 13, 13)),
-            IN_FLIGHT_SEQ,
-            COHERENT,
-            (4, 4)
-        ),
-        LockAction::FreshBox {
-            preserve: PreserveKind::None
-        }
-    );
-}
-
-// ── whole-mip arms ──
-
-#[test]
-fn whole_mip_dynamic_contended_freshbox_none() {
-    assert_eq!(
-        decide(
-            DEFAULT_FLAGS,
-            D3DUSAGE_DYNAMIC,
+            D3DPOOL_DEFAULT,
             Some(full()),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -221,16 +203,85 @@ fn whole_mip_dynamic_contended_freshbox_none() {
 }
 
 #[test]
-fn whole_mip_writeonly_alone_contended_freshbox_cpu() {
-    // `D3DUSAGE_WRITEONLY` isn't documented for `CreateTexture`,
-    // so we don't honour it as a no-readback hint here. Without
-    // `D3DUSAGE_DYNAMIC` the lock falls into the preserve arm.
-    // (Pin the contract — see module-doc.)
-    use mtld3d_types::D3DUSAGE_WRITEONLY;
+fn discard_partial_contended_is_dropped() {
+    // A partial DISCARD cannot be honoured: the bytes outside the rect stay
+    // part of the level, so the Lock is served as a plain partial one.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn discard_compressed_unaligned_freshbox_cpu() {
+    // Dropped DISCARD, then the alignment guard: the encoder's full-mip
+    // fallback reads outside the rect, so the old bytes are carried over.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            Some(rect(2, 2, 13, 13)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_whole_mip_managed_contended_freshbox_cpu() {
+    // A managed level is served from its staging for its whole life, so
+    // its DISCARD is dropped and the rename preserves.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_MANAGED,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_whole_mip_systemmem_contended_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_SYSTEMMEM,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+// ── whole-mip arms ──
+
+#[test]
+fn whole_mip_default_contended_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            D3DUSAGE_WRITEONLY,
+            D3DPOOL_DEFAULT,
             Some(full()),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -243,11 +294,11 @@ fn whole_mip_writeonly_alone_contended_freshbox_cpu() {
 }
 
 #[test]
-fn whole_mip_default_contended_freshbox_cpu() {
+fn whole_mip_managed_contended_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_MANAGED,
             Some(full()),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -264,7 +315,7 @@ fn whole_mip_via_none_rect_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             None,
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -285,7 +336,7 @@ fn partial_default_contended_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -296,11 +347,11 @@ fn partial_default_contended_in_place() {
 }
 
 #[test]
-fn partial_dynamic_contended_in_place() {
+fn partial_managed_contended_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            D3DUSAGE_DYNAMIC,
+            D3DPOOL_MANAGED,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -319,7 +370,7 @@ fn compressed_aligned_partial_contended_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -330,11 +381,11 @@ fn compressed_aligned_partial_contended_in_place() {
 }
 
 #[test]
-fn compressed_aligned_partial_dynamic_in_place() {
+fn compressed_aligned_partial_managed_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            D3DUSAGE_DYNAMIC,
+            D3DPOOL_MANAGED,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -350,7 +401,7 @@ fn compressed_unaligned_origin_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(2, 2, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -368,7 +419,7 @@ fn compressed_unaligned_size_freshbox_cpu() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 13, 13)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -381,15 +432,13 @@ fn compressed_unaligned_size_freshbox_cpu() {
 }
 
 #[test]
-fn compressed_unaligned_dynamic_freshbox_cpu() {
-    // DYNAMIC does NOT downgrade to None here — encoder
-    // fallback reads outside-rect bytes; uninit there would
-    // corrupt the MTLTexture. DYNAMIC is the game's promise,
-    // not the GPU's.
+fn compressed_unaligned_managed_freshbox_cpu() {
+    // The pool does not change the guard: the encoder fallback reads
+    // outside-rect bytes, uninit there would corrupt the MTLTexture.
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            D3DUSAGE_DYNAMIC,
+            D3DPOOL_MANAGED,
             Some(rect(2, 2, 13, 13)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -420,7 +469,7 @@ fn compressed_partial_extends_to_mip_edge_in_place() {
             COHERENT,
             IN_FLIGHT_SEQ,
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(DirtyRect {
                 x: 0,
                 y: 0,
@@ -444,7 +493,7 @@ fn compressed_partial_extends_to_mip_edge_in_place() {
             COHERENT,
             IN_FLIGHT_SEQ,
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(DirtyRect {
                 x: 0,
                 y: 0,
@@ -471,7 +520,7 @@ fn compressed_uncontended_unaligned_in_place() {
     assert_eq!(
         decide(
             DEFAULT_FLAGS,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(2, 2, 13, 13)),
             RETIRED_SEQ,
             COHERENT,
@@ -489,8 +538,8 @@ fn unknown_high_bits_pass_through() {
     assert_eq!(
         decide(
             unknown | D3DLOCK_DISCARD,
-            NO_USAGE,
-            Some(rect(8, 8, 16, 16)),
+            D3DPOOL_DEFAULT,
+            None,
             IN_FLIGHT_SEQ,
             COHERENT,
             (1, 1)
@@ -502,7 +551,7 @@ fn unknown_high_bits_pass_through() {
     assert_eq!(
         decide(
             unknown,
-            NO_USAGE,
+            D3DPOOL_DEFAULT,
             Some(rect(8, 8, 16, 16)),
             IN_FLIGHT_SEQ,
             COHERENT,
@@ -510,6 +559,79 @@ fn unknown_high_bits_pass_through() {
         ),
         LockAction::WriteInPlace
     );
+}
+
+// ── honoured_lock_flags ──
+
+#[test]
+fn whole_mip_default_pool_keeps_discard() {
+    let flags = D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK;
+    assert_eq!(
+        honoured_lock_flags(flags, D3DPOOL_DEFAULT, None, shape((1, 1))),
+        flags
+    );
+    assert_eq!(
+        honoured_lock_flags(flags, D3DPOOL_DEFAULT, Some(full()), shape((1, 1))),
+        flags
+    );
+}
+
+#[test]
+fn partial_lock_drops_discard_and_keeps_the_rest() {
+    let flags = D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | mtld3d_types::D3DLOCK_NOSYSLOCK;
+    assert_eq!(
+        honoured_lock_flags(
+            flags,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            shape((1, 1))
+        ),
+        D3DLOCK_NOOVERWRITE | mtld3d_types::D3DLOCK_NOSYSLOCK
+    );
+}
+
+#[test]
+fn cpu_pools_drop_discard_even_whole_mip() {
+    for pool in [
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert_eq!(
+            honoured_lock_flags(D3DLOCK_DISCARD, pool, None, shape((1, 1))),
+            DEFAULT_FLAGS,
+            "pool {pool}"
+        );
+    }
+}
+
+#[test]
+fn flags_without_discard_pass_through_unchanged() {
+    let flags = D3DLOCK_READONLY | mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE;
+    assert_eq!(
+        honoured_lock_flags(
+            flags,
+            D3DPOOL_MANAGED,
+            Some(rect(0, 0, 8, 8)),
+            shape((1, 1))
+        ),
+        flags
+    );
+}
+
+#[test]
+fn a_rect_reaching_past_the_mip_is_whole() {
+    // `parse_rect` clamps, so an oversized rect is the whole mip; the
+    // tolerance keeps an unclamped one from being read as partial.
+    assert!(is_whole_mip(
+        Some(rect(0, 0, MIP_W + 8, MIP_H)),
+        shape((1, 1))
+    ));
+    assert!(!is_whole_mip(Some(rect(1, 0, MIP_W, MIP_H)), shape((1, 1))));
+    assert!(!is_whole_mip(
+        Some(rect(0, 0, MIP_W - 1, MIP_H)),
+        shape((1, 1))
+    ));
 }
 
 // ── texture_lock_offset ──
@@ -616,8 +738,8 @@ fn discard_is_the_only_flag_that_skips_the_readback() {
 #[test]
 fn lockable_pools_are_never_droppable() {
     for pool in [
-        mtld3d_types::D3DPOOL_MANAGED,
-        mtld3d_types::D3DPOOL_SYSTEMMEM,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
         mtld3d_types::D3DPOOL_SCRATCH,
     ] {
         assert!(

@@ -1085,10 +1085,11 @@ fn fill_locked_rect(locked: &LockedRect<'_>, w: usize, h: usize, color: u32) {
     }
 }
 
-/// Bind `tex`, sample it across the backbuffer, return the four quadrant centres.
+/// Bind `tex` for point-sampled full-screen draws and hand back the quad.
 ///
-/// Clockwise from the top left, the order [`QUADRANTS`] lists them in.
-fn sample_quadrants(h: &Harness, tex: &Texture<'_>) -> [u32; 4] {
+/// Split out of [`sample_quadrants`] for the tests that lock between two
+/// draws of one scene.
+fn bind_for_quadrant_draws(h: &Harness, tex: &Texture<'_>) -> [TexturedVertex; 6] {
     assert_eq!(h.set_texture(0, tex), 0, "SetTexture");
     h.select_texture_stage(0);
     point_clamp(h);
@@ -1097,7 +1098,24 @@ fn sample_quadrants(h: &Harness, tex: &Texture<'_>) -> [u32; 4] {
         0,
         "SetFVF"
     );
-    let quad = fullscreen_quad();
+    fullscreen_quad()
+}
+
+/// The four quadrant centres of the back buffer, in the order [`QUADRANTS`] lists them.
+fn read_quadrants(h: &Harness) -> [u32; 4] {
+    [
+        h.read_pixel(160, 120),
+        h.read_pixel(480, 120),
+        h.read_pixel(480, 360),
+        h.read_pixel(160, 360),
+    ]
+}
+
+/// Bind `tex`, sample it across the backbuffer, return the four quadrant centres.
+///
+/// Clockwise from the top left, the order [`QUADRANTS`] lists them in.
+fn sample_quadrants(h: &Harness, tex: &Texture<'_>) -> [u32; 4] {
+    let quad = bind_for_quadrant_draws(h, tex);
     h.render_once(BLACK, |d| {
         assert_eq!(
             d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
@@ -1105,12 +1123,35 @@ fn sample_quadrants(h: &Harness, tex: &Texture<'_>) -> [u32; 4] {
             "sample draw"
         );
     });
-    [
-        h.read_pixel(160, 120),
-        h.read_pixel(480, 120),
-        h.read_pixel(480, 360),
-        h.read_pixel(160, 360),
-    ]
+    read_quadrants(h)
+}
+
+/// Draw `tex`, run `lock_and_write` while that draw's upload is in flight, draw again.
+///
+/// The lock lands between two draws of one scene, so the level's previous
+/// upload has been submitted and not retired: the shape in which a Lock
+/// renames its staging instead of writing in place. What the second draw
+/// samples is what the back buffer holds afterwards.
+fn lock_under_in_flight_upload(
+    h: &Harness,
+    tex: &Texture<'_>,
+    lock_and_write: impl FnOnce(),
+) -> [u32; 4] {
+    let quad = bind_for_quadrant_draws(h, tex);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "draw before the lock"
+        );
+        lock_and_write();
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "draw after the lock"
+        );
+    });
+    read_quadrants(h)
 }
 
 /// The four quadrants of a 64x64 level: colour, source rect, name.
@@ -1518,6 +1559,264 @@ fn discard_lock_of_a_released_default_pool_level_rewrites_it() {
         SECOND,
         "discard rewrite",
     );
+}
+
+/// A whole-level lock without `D3DLOCK_DISCARD` keeps the texels the game does not rewrite.
+///
+/// The level is DEFAULT-pool DYNAMIC and its previous upload is still in
+/// flight, which is where the lock renames its staging. D3D9 hands a plain
+/// lock the level's current contents whatever the usage says, and a game
+/// that locks a whole page to rewrite a few blocks of it relies on that: the
+/// three quadrants the lock does not touch must sample back as they were.
+#[test]
+fn dynamic_whole_level_lock_without_discard_keeps_the_texels_it_does_not_rewrite() {
+    const SIZE: u32 = 64;
+    const BASE: u32 = 0xFFFF_0000;
+    const REPAINT: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    tex.lock_rect(0, 0)
+        .write_u32(&[BASE; (SIZE * SIZE) as usize]);
+    let sampled = lock_under_in_flight_upload(&h, &tex, || {
+        tex.lock_rect(0, 0)
+            .write_u32_rect(32, 32, &[REPAINT; 32 * 32]);
+    });
+    assert_pixel_eq(sampled[0], REPAINT, "the rewritten quadrant");
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(sampled[i], BASE, name);
+    }
+}
+
+/// A `D3DLOCK_DISCARD` sub-rect lock leaves the rest of the level alone.
+///
+/// A discard of part of a level cannot be honoured, so the lock is served as
+/// a plain partial one: the flag is dropped, the quadrant is written in place
+/// and the other three keep their texels. The previous upload is in flight so
+/// the lock is the contended kind, where a fresh staging would otherwise be
+/// handed out. The quadrant's own upload carries only its rect, so the GPU
+/// copy hides a staging with holes in it until something publishes the whole
+/// level again; a later whole-level lock does exactly that, and the three
+/// quadrants have to come through it as well.
+#[test]
+fn partial_discard_lock_leaves_the_rest_of_the_level_alone() {
+    const SIZE: u32 = 64;
+    const BASE: u32 = 0xFFFF_0000;
+    const REPAINT: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    tex.lock_rect(0, 0)
+        .write_u32(&[BASE; (SIZE * SIZE) as usize]);
+    let (_, rect, _) = QUADRANTS[0];
+    let sampled = lock_under_in_flight_upload(&h, &tex, || {
+        tex.lock_rect_partial(0, &rect, D3DLOCK_DISCARD)
+            .write_u32_rect(32, 32, &[REPAINT; 32 * 32]);
+    });
+    assert_pixel_eq(sampled[0], REPAINT, "the rewritten quadrant");
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(sampled[i], BASE, name);
+    }
+
+    // A whole-level lock that rewrites the same quadrant publishes the
+    // staging in full: what it holds outside that quadrant is what the level
+    // shows afterwards.
+    let republished = lock_under_in_flight_upload(&h, &tex, || {
+        tex.lock_rect(0, 0)
+            .write_u32_rect(32, 32, &[REPAINT; 32 * 32]);
+    });
+    assert_pixel_eq(
+        republished[0],
+        REPAINT,
+        "the rewritten quadrant, republished",
+    );
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(republished[i], BASE, &format!("{name}, republished"));
+    }
+}
+
+/// `D3DLOCK_DISCARD` on a managed level is ignored.
+///
+/// A managed level is served from its staging for its whole life and every
+/// later re-upload publishes all of it, so its contents are never dead. The
+/// lock preserves them like a plain one: a whole-level DISCARD lock that
+/// rewrites one quadrant leaves the other three as they were.
+#[test]
+fn discard_lock_of_a_managed_level_is_ignored() {
+    const SIZE: u32 = 64;
+    const BASE: u32 = 0xFFFF_0000;
+    const REPAINT: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0)
+        .write_u32(&[BASE; (SIZE * SIZE) as usize]);
+    let sampled = lock_under_in_flight_upload(&h, &tex, || {
+        tex.lock_rect(0, D3DLOCK_DISCARD)
+            .write_u32_rect(32, 32, &[REPAINT; 32 * 32]);
+    });
+    assert_pixel_eq(sampled[0], REPAINT, "the rewritten quadrant");
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(sampled[i], BASE, name);
+    }
+}
+
+/// One solid DXT1 block: both endpoints `color565`, every index 0.
+const fn dxt1_solid_block(color565: u16) -> [u8; 8] {
+    let [lo, hi] = color565.to_le_bytes();
+    [lo, hi, lo, hi, 0, 0, 0, 0]
+}
+
+/// A full-screen quad whose direction coordinates sweep the `+X` cube face.
+///
+/// D3D9 maps `+X` with `s = -z` and `t = -y`, so the top-left of the screen
+/// looks along `(1, 1, 1)` and reads the face's top-left texel.
+const fn positive_x_face_quad() -> [CubeVertex; 6] {
+    const fn v(x: f32, y: f32, dir_y: f32, dir_z: f32) -> CubeVertex {
+        CubeVertex {
+            x,
+            y,
+            z: 0.5,
+            color: 0xFFFF_FFFF,
+            u: 1.0,
+            v: dir_y,
+            w: dir_z,
+        }
+    }
+    [
+        v(-1.0, 1.0, 1.0, 1.0),
+        v(1.0, 1.0, 1.0, -1.0),
+        v(-1.0, -1.0, -1.0, 1.0),
+        v(1.0, 1.0, 1.0, -1.0),
+        v(1.0, -1.0, -1.0, -1.0),
+        v(-1.0, -1.0, -1.0, 1.0),
+    ]
+}
+
+/// A partial lock's `UnlockRect` publishes the rect it named, on every upload path.
+///
+/// Each quadrant is locked while the previous draw's upload is in flight and
+/// sampled after the next one, so every lock is a contended partial lock and
+/// every upload carries one quadrant: through the uncompressed blit with its
+/// origin offset, through the block-compressed blit on a block-aligned rect,
+/// and through the cube form of the same bookkeeping. A wrong origin or pitch
+/// in any of them lands a quadrant somewhere else.
+#[test]
+fn partial_locks_publish_their_own_rect_on_every_upload_path() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    // DXT1: a 32x32 quadrant is 8 rows of 8 blocks, 64 bytes per block row.
+    const DXT1_COLORS: [u16; 4] = [0xF800, 0x07E0, 0x001F, 0xFFE0];
+    let h = Harness::new();
+
+    let tex = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    tex.lock_rect(0, 0).write_u32(&[BLACK; TEXELS]);
+    let quad = bind_for_quadrant_draws(&h, &tex);
+    h.render_once(BLACK, |d| {
+        for (color, rect, name) in QUADRANTS {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "draw before {name}"
+            );
+            tex.lock_rect_partial(0, &rect, 0)
+                .write_u32_rect(32, 32, &[color; 32 * 32]);
+        }
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "final uncompressed draw"
+        );
+    });
+    let sampled = read_quadrants(&h);
+    for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate() {
+        assert_pixel_eq(sampled[i], color, &format!("A8R8G8B8 {name}"));
+    }
+
+    let dxt = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_DXT1,
+        D3DPOOL_DEFAULT,
+    );
+    dxt.lock_rect(0, 0).write::<u8>(&[0; TEXELS / 2]);
+    let quad = bind_for_quadrant_draws(&h, &dxt);
+    h.render_once(BLACK, |d| {
+        for (i, (_, rect, name)) in QUADRANTS.into_iter().enumerate() {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "draw before {name}"
+            );
+            let block = dxt1_solid_block(DXT1_COLORS[i]);
+            let bytes: Vec<u8> = block.iter().copied().cycle().take(64 * 8).collect();
+            dxt.lock_rect_partial(0, &rect, 0)
+                .write_u8_rect(64, 8, &bytes);
+        }
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "final DXT1 draw"
+        );
+    });
+    let sampled = read_quadrants(&h);
+    for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate() {
+        assert_pixel_approx(sampled[i], color, 8, &format!("DXT1 {name}"));
+    }
+
+    let cube = h.create_cube_texture_owned(SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    cube.lock_rect(0, 0, 0).write_u32(&[BLACK; TEXELS]);
+    assert_eq!(h.set_cube_texture(0, &cube), 0, "SetTexture cube");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+        0,
+        "SetFVF cube"
+    );
+    let quad = positive_x_face_quad();
+    h.render_once(BLACK, |d| {
+        for (color, rect, name) in QUADRANTS {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "draw before {name}"
+            );
+            cube.lock_rect_partial(0, 0, &rect, 0)
+                .write_u32_rect(32, 32, &[color; 32 * 32]);
+        }
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "final cube draw"
+        );
+    });
+    let sampled = read_quadrants(&h);
+    for (i, (color, _, name)) in QUADRANTS.into_iter().enumerate() {
+        assert_pixel_eq(sampled[i], color, &format!("cube +X {name}"));
+    }
+    assert_eq!(h.clear_texture(0), 0, "unbind the cube");
 }
 
 /// An `UpdateSurface` from system memory reaches the very next draw.

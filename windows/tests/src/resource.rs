@@ -671,21 +671,35 @@ impl CubeTexture<'_> {
     /// Panics if `LockRect` fails.
     #[must_use]
     pub fn lock_rect(&self, face: u32, level: u32, flags: u32) -> LockedRect<'_> {
+        self.lock_inner(face, level, core::ptr::null(), flags)
+    }
+
+    /// Lock a sub-rectangle of one cube face and mip level.
+    ///
+    /// `rect` is a `D3DRECT`-style `[left, top, right, bottom]`.
+    ///
+    /// # Panics
+    /// Panics if `LockRect` fails.
+    #[must_use]
+    pub fn lock_rect_partial(
+        &self,
+        face: u32,
+        level: u32,
+        rect: &[i32; 4],
+        flags: u32,
+    ) -> LockedRect<'_> {
+        self.lock_inner(face, level, rect.as_ptr().cast::<c_void>(), flags)
+    }
+
+    fn lock_inner(&self, face: u32, level: u32, rect: *const c_void, flags: u32) -> LockedRect<'_> {
         let mut locked = D3DLOCKED_RECT {
             pitch: 0,
             bits: core::ptr::null_mut(),
         };
-        // SAFETY: live cube texture and writable lock out-param.
-        let hr = unsafe {
-            (self.vtbl().lock_rect)(
-                self.ptr,
-                face,
-                level,
-                &raw mut locked,
-                core::ptr::null(),
-                flags,
-            )
-        };
+        // SAFETY: live cube texture, writable lock out-param, and `rect` is
+        // null or points at a caller-owned `[i32; 4]` in D3DRECT layout.
+        let hr =
+            unsafe { (self.vtbl().lock_rect)(self.ptr, face, level, &raw mut locked, rect, flags) };
         expect_ok(hr, "CubeTexture LockRect");
         LockedRect {
             owner: LockOwner::Cube {
@@ -1569,6 +1583,51 @@ impl LockedRect<'_> {
         // (caller's contract); the &mut borrow makes the write exclusive.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.bits.cast::<u32>(), data.len());
+        }
+    }
+
+    /// Write a `w`x`h` block of `u32` pixels at the mapped span's origin, row by row.
+    ///
+    /// Each row starts [`Self::pitch`] bytes after the previous one. For a
+    /// lock whose row stride exceeds `w * 4`: a sub-rect lock, or a whole-level
+    /// lock a test writes only part of. `texels` is the block, tightly packed
+    /// row by row.
+    ///
+    /// # Panics
+    /// Panics if `texels` is not exactly `w * h` pixels. The caller must ensure
+    /// the block fits within the locked region.
+    pub fn write_u32_rect(&mut self, w: usize, h: usize, texels: &[u32]) {
+        assert_eq!(texels.len(), w * h, "one block of texels");
+        let pitch = usize::try_from(self.pitch).expect("positive pitch");
+        for (y, row) in texels.chunks_exact(w).enumerate() {
+            // SAFETY: the lock maps `h` rows at `bits` with `pitch` row stride
+            // (caller's contract), so row `y` starts inside the mapping.
+            let dst = unsafe { self.bits.cast::<u8>().add(y * pitch) };
+            // SAFETY: the row holds at least `w` u32s (caller's contract) and
+            // the &mut borrow makes the write exclusive.
+            unsafe { core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, w * 4) };
+        }
+    }
+
+    /// Write `rows` rows of `row_bytes` bytes each at the mapped span's origin, row by row.
+    ///
+    /// The byte form of [`Self::write_u32_rect`], for block-compressed
+    /// formats: a row is one row of blocks and [`Self::pitch`] the block-row
+    /// stride. `bytes` is the block, tightly packed row by row.
+    ///
+    /// # Panics
+    /// Panics if `bytes` is not exactly `row_bytes * rows` long. The caller
+    /// must ensure the block fits within the locked region.
+    pub fn write_u8_rect(&mut self, row_bytes: usize, rows: usize, bytes: &[u8]) {
+        assert_eq!(bytes.len(), row_bytes * rows, "one block of bytes");
+        let pitch = usize::try_from(self.pitch).expect("positive pitch");
+        for (y, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            // SAFETY: the lock maps `rows` rows at `bits` with `pitch` row
+            // stride (caller's contract), so row `y` starts inside the mapping.
+            let dst = unsafe { self.bits.cast::<u8>().add(y * pitch) };
+            // SAFETY: the row holds at least `row_bytes` bytes (caller's
+            // contract) and the &mut borrow makes the write exclusive.
+            unsafe { core::ptr::copy_nonoverlapping(row.as_ptr(), dst, row_bytes) };
         }
     }
 

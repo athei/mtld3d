@@ -15,6 +15,9 @@
 //! 2x2 they share; a source level twice the destination's in both dimensions comes back halved;
 //! and a region whose destination origin sits mid-level comes back as the part that still fits,
 //! which is the shape the format-converting copy takes.
+//!
+//! Two drive `union`: disjoint rects come back as the box enclosing both, and a rect inside
+//! another comes back as the outer one.
 
 use super::{DirtyRect, clip_copy_region};
 
@@ -246,4 +249,46 @@ fn clip_copy_region_trims_a_region_landing_mid_destination_level() {
             }
         ))
     );
+}
+
+#[test]
+fn union_of_disjoint_rects_is_their_bounding_box() {
+    let a = DirtyRect {
+        x: 0,
+        y: 0,
+        w: 8,
+        h: 8,
+    };
+    let b = DirtyRect {
+        x: 24,
+        y: 16,
+        w: 8,
+        h: 4,
+    };
+    let expected = DirtyRect {
+        x: 0,
+        y: 0,
+        w: 32,
+        h: 20,
+    };
+    assert_eq!(a.union(b), expected);
+    assert_eq!(b.union(a), expected);
+}
+
+#[test]
+fn union_with_a_contained_rect_is_the_outer_one() {
+    let outer = DirtyRect {
+        x: 4,
+        y: 4,
+        w: 32,
+        h: 32,
+    };
+    let inner = DirtyRect {
+        x: 8,
+        y: 8,
+        w: 4,
+        h: 4,
+    };
+    assert_eq!(outer.union(inner), outer);
+    assert_eq!(inner.union(outer), outer);
 }

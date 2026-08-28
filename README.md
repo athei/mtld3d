@@ -172,6 +172,19 @@ memory headroom, or the games that rely on the looser behaviour:
   test suite probes this and reports it in some runs, so the rationale is
   written up in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) like every
   other kept divergence.
+- **A partial `LockRect` of a texture level hands back a pointer into staging
+  an upload may still be reading**, unless the game passed
+  `D3DLOCK_NOOVERWRITE` or `D3DLOCK_READONLY`. The same trade as the buffer
+  entry above, on the same kind of caller: a font atlas or a lightmap page
+  written a few rectangles at a time, each rectangle uploaded by the next
+  draw. D3D9 would stall or rename until that upload retires; here the write
+  lands in place, and a game whose rectangle overlaps an upload the GPU has not
+  reached yet can see a frame of wrong texels, with nothing in the log. The
+  `in-place` row of the perf grid's texture section counts the arm firing. A
+  whole-level lock is not part of this: it is renamed, and its contents are
+  preserved whatever the texture's usage says, because a game that locks a
+  whole dynamic page to rewrite a few blocks of it relies on that (Half-Life
+  2's lightmap pages under animated light styles).
 - **A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
   no CPU copy of its contents** once an upload has carried every byte to the
   GPU. D3D9 preserves a buffer's contents across a plain `Lock` whatever its
