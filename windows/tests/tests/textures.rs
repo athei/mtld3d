@@ -1302,6 +1302,63 @@ fn discard_lock_of_a_released_default_pool_level_rewrites_it() {
     );
 }
 
+/// An `UpdateSurface` from system memory reaches the very next draw.
+///
+/// The staging write only reaches the GPU through the bind-time
+/// `flush_dirty_mips`, which the API thread runs while it rebuilds a dirty
+/// snapshot. Two draws inside one scene with nothing but the update between
+/// them leave the snapshot clean, so the update has to dirty it itself or the
+/// second draw samples the texels the first one saw.
+#[test]
+fn update_surface_from_system_memory_reaches_the_next_draw() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dst = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let level = dst.surface_level(0);
+
+    let first = h.create_offscreen_plain_surface(2, 2, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    first.lock_rect(0).write_u32(&[GREEN; 4]);
+    assert_eq!(
+        h.update_surface_hr(&first, &level),
+        0,
+        "first UpdateSurface"
+    );
+    // Binds the texture, arms the sampler and submits the first upload, so the
+    // frame below starts from the state this leaves behind.
+    assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "first fill");
+
+    let second = h.create_offscreen_plain_surface(2, 2, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    second.lock_rect(0).write_u32(&[RED; 4]);
+
+    // The first draw consumes the frame-start snapshot dirtiness; the update is
+    // then the only call before the second draw, which covers the backbuffer
+    // again.
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "draw before the update"
+        );
+        assert_eq!(
+            d.update_surface_hr(&second, &level),
+            0,
+            "second UpdateSurface"
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "draw after the update"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        RED,
+        "the draw after the update must sample the updated texels",
+    );
+}
+
 #[test]
 fn update_texture_keeps_cube_faces_independent() {
     let h = Harness::new();
