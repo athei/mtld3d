@@ -3,6 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 
 use mtld3d_core::{
     dirty_rect::{DirtyRect, clip_copy_region},
+    format::block_row_pitch,
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::PageBox,
@@ -167,7 +168,9 @@ pub struct TextureInner {
     /// at the reported back-buffer size, which is the game's main view and
     /// shares the back buffer's `render.scale`. `width`/`height` and every mip
     /// dimension stay logical, so `GetLevelDesc` and the game's coordinates are
-    /// unaffected; only [`TextureInner::texture_info`] converts.
+    /// unaffected; only what measures the Metal texture itself converts, its
+    /// create extent in [`TextureInner::texture_info`] and the memory charge in
+    /// [`TextureInner::allocated_bytes`].
     render_scale: RenderScale,
     /// App-set `SetAutoGenFilterType` value, round-tripped by `GetAutoGenFilterType`.
     ///
@@ -750,13 +753,17 @@ impl TextureInner {
     /// Summed as `row_pitch * ceil(mip_h / block_h)` per level (the same
     /// slice-size formula `lock_box` uses). Drives `GetAvailableTextureMem`
     /// accounting for `D3DPOOL_DEFAULT` resources.
+    ///
+    /// The chain that occupies memory is the Metal one, so a texture whose
+    /// levels are rasterized at `render.scale` is charged the scaled chain
+    /// while its per-level arrays keep the logical dimensions `GetLevelDesc`
+    /// reports.
     pub fn allocated_bytes(&self) -> u64 {
         let bh = self.block_h.max(1);
         let one_face = (0..self.levels as usize)
             .map(|level| {
-                let row_pitch = u64::from(self.mip_bytes_per_row[level]);
-                let block_rows = u64::from(self.mip_heights[level].div_ceil(bh));
-                row_pitch.saturating_mul(block_rows)
+                let (pitch, height) = self.level_charge_extent(level);
+                u64::from(pitch).saturating_mul(u64::from(height.div_ceil(bh)))
             })
             .sum::<u64>();
         if self.flags.contains(TextureFlags::CUBE) {
@@ -764,6 +771,23 @@ impl TextureInner {
         } else {
             one_face
         }
+    }
+
+    /// Row pitch and texel row count one mip level is charged on.
+    ///
+    /// The level's own arrays at the identity scale. Under `render.scale` the
+    /// level occupies the extent its Metal counterpart was created at, so both
+    /// are re-measured there, on the pitch formula the arrays themselves were
+    /// built with.
+    fn level_charge_extent(&self, level: usize) -> (u32, u32) {
+        if self.render_scale.is_identity() {
+            return (self.mip_bytes_per_row[level], self.mip_heights[level]);
+        }
+        let width = self.render_scale.dimension(self.mip_widths[level]);
+        (
+            block_row_pitch(width, self.block_w, self.block_bytes, self.bytes_per_pixel),
+            self.render_scale.dimension(self.mip_heights[level]),
+        )
     }
 
     /// True for `D3DPOOL_DEFAULT` textures.

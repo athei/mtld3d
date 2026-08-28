@@ -23,11 +23,12 @@
 use mtld3d_tests::{Harness, PosColorVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8,
-    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_POINTLIST,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE,
-    D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT,
+    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
+    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
+    D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -699,4 +700,87 @@ fn a_standalone_target_at_the_backbuffer_size_fills_and_copies_in_reported_coord
     assert_pixel_eq(h.read_pixel(460, 340), RED, "inside, near the bottom-right");
     assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside, above and left");
     assert_pixel_eq(h.read_pixel(600, 440), BLUE, "outside, below and right");
+}
+
+/// A depth texture at the back-buffer size is charged the chain it occupies.
+///
+/// Such a texture is the depth buffer of the main view, so its Metal levels are
+/// created at `render.scale` of the reported size while `GetLevelDesc` keeps
+/// answering with the size the application asked for. The texture-memory budget
+/// follows the memory, not the descriptor. A texture of any other size is an
+/// intermediate the game picked a resolution for and costs what it asked for at
+/// every scale.
+///
+/// Pins its own scale (a clean half, so both extents are exact) rather than
+/// inheriting the run's: at the identity there is nothing to convert, and this
+/// has to fail in the ordinary `make test` if it regresses.
+#[test]
+fn a_depth_texture_at_the_backbuffer_size_is_charged_its_scaled_chain() {
+    // A size that is not the back buffer's, for the texture that keeps its own.
+    const OWN_SIZE: u32 = 256;
+
+    // The harness process owns its environment and no other thread runs yet;
+    // extend the suite-wide config with the scale under test. The parser keeps
+    // the last segment, so this wins over a `make test SCALE=<n>` run too.
+    let merged = format!(
+        "{};render.scale=0.5",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness
+    // and with it the config read are only constructed below).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    // One level of a four-byte depth format, at half of each reported edge.
+    let scaled_bytes = (width / 2) * 4 * (height / 2);
+    let base = h.available_texture_mem();
+    assert!(base > 4 * scaled_bytes, "budget {base} leaves room");
+
+    let cost = {
+        let depth = h.create_texture(
+            width,
+            height,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D24S8,
+            D3DPOOL_DEFAULT,
+        );
+        let (hr, desc) = depth.surface_level(0).desc();
+        assert_eq!(hr, 0, "GetDesc on the depth level");
+        assert_eq!(
+            (desc.width, desc.height),
+            (width, height),
+            "the level reports the requested size whatever the scale",
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        cost, scaled_bytes,
+        "a back-buffer-sized depth texture costs the chain its Metal levels hold"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing it gives those bytes back"
+    );
+
+    // A size of its own is not the main view, so such a texture keeps its
+    // resolution and is charged all of it.
+    let own_cost = {
+        let _shadow = h.create_texture(
+            OWN_SIZE,
+            OWN_SIZE,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D24S8,
+            D3DPOOL_DEFAULT,
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        own_cost,
+        OWN_SIZE * OWN_SIZE * 4,
+        "a shadow map costs the size it asked for"
+    );
 }
