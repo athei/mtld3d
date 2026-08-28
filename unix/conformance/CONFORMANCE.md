@@ -217,38 +217,41 @@ pin). Every other tag is documentation, so a correction between `real`,
 
 #### Desktop mode switching, and how fullscreen honors the requested size
 
-A fullscreen device takes a borderless window over the monitor and never
-changes the display mode. Wine's mac driver would hand a mode change to
-`CGDisplaySetDisplayMode`, reconfiguring the user's screen and rearranging
-every other window, and dodging that would depend on the `EmulateModeset`
-registry setting the user has to know about. It also leaves the z-order alone:
-raising the window to the topmost level deadlocks winemac (see
+A fullscreen device sets the display mode the app asked for through user32,
+as native does, then takes a borderless window over the monitor. The
+mode-set is meant to stay virtual: with Wine's `EmulateModeset` on (the
+harness pins it, and so does the launcher) win32u leaves the physical display
+alone, answers the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, the
+client rect and every mouse coordinate in the mode, and scales the window
+onto the physical monitor; without it the mac driver would hand the change to
+`CGDisplaySetDisplayMode` and switch the whole desktop. The device leaves the
+z-order alone: raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
-When the app requests an enumerable display mode, the back buffer keeps it,
-exactly as it would under a real mode-set, and present scales it to the
-drawable (MetalFX when enlarging, the same resample `render.scale` rides).
-That keeps the D3D9 half of the contract at the requested mode: the default
-viewport and scissor, the reported present parameters, and the device's and
-swap chain's `GetDisplayMode` all agree with the size the app rendered for.
-(Until 2026-08 the back buffer instead followed the monitor-covering window;
-apps that sized their viewport from their own request rendered into a
-corner.) A request that matches no enumerable mode still follows the window:
-native would reject it, so nothing can depend on it being honored, and the
-apps that make such requests (WoW's windowed-to-fullscreen toggle carries its
-window size) size their rendering and mouse handling from the window — the
-window-sized back buffer is the assignment that keeps them consistent.
+The mode list `EnumAdapterModes` serves is seeded from `EnumDisplaySettingsW`,
+so an enumerable mode is one win32u accepts by construction. When the app
+requests one, the device sets it and the back buffer is that mode; present
+scales it to the drawable, which stays at the display's size (MetalFX when
+enlarging, the same resample `render.scale` rides). Both halves of the
+contract then agree with the size the app rendered for: the default viewport
+and scissor, the reported present parameters, the device's and swap chain's
+`GetDisplayMode`, and the Win32 metrics and mouse. (Until 2026-08 the back
+buffer honored the mode under a monitor-sized window, which kept the D3D9
+half right and left mouse input in monitor space; before that it followed the
+window and apps that sized their viewport from their own request rendered
+into a corner.) A request that matches no enumerable mode still follows the
+window: native would reject it, so nothing can depend on it being honored,
+and the apps that make such requests (WoW's windowed-to-fullscreen toggle
+carries its window size) size their rendering and mouse handling from the
+window, so the window-sized back buffer is the assignment that keeps them
+consistent. We still do not reject such a request, which is the one
+`expected` site left in this area.
 
-What the emulation cannot deliver is the Win32 half of a real mode-set:
-the desktop mode, `GetSystemMetrics`, `GetMonitorInfo`, and window rects
-derived from them keep the monitor's native resolution, and mouse input
-arrives in window coordinates rather than mode coordinates. Every site
-asserting that half — the desktop mode following a create, `GetSystemMetrics`
-reporting it, the device window adopting the mode's rect — is `expected`
-under this decision, as is rejecting a non-enumerable mode (we do not
-validate against a mode list because no mode is set). The harness pins
-emulated mode switching and Retina mode so window-management assertions use a
-stable physical-pixel coordinate space.
+The focus half follows native too: `WM_ACTIVATEAPP FALSE` puts the registry
+mode back and `WM_ACTIVATEAPP TRUE` sets the mode and re-covers the monitor
+again; the window is never minimised and the device is never lost. The
+harness pins emulated mode switching and Retina mode so window-management
+assertions use a stable physical-pixel coordinate space.
 
 Both pins are registry values, and a wineserver session enumerates the display
 once, when its desktop starts, and serves that geometry to every process in it
@@ -266,23 +269,28 @@ display accepts the mode changes this machine's macdrv rejects, so the tests
 walk further):
 
 - **One source of display truth.** `EnumAdapterModes` / `GetAdapterDisplayMode`
-  seed from `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` — the same view
-  win32u validates `ChangeDisplaySettingsW` against and derives
-  `GetMonitorInfoW` from — instead of `NSScreen`. On this machine the two
-  agree under the pinned Retina mode; on the runner's virtual display they
-  disagreed by exactly 2x (Win32 2048x1536, `NSScreen` 1024x768), which split
-  `GetDisplayMode` from the monitor rect (test_get_display_mode 14472/14474)
-  and fed the tests modes that user32 then refused.
-- **Registry-mode restore.** The one direction of the mode contract compatible
-  with never modesetting: when a fullscreen device loses focus
-  (`WM_ACTIVATEAPP FALSE`) or leaves fullscreen (windowed `Reset`, final
-  release) and the current mode differs from the registry mode — the app
-  changed it through user32, we never did — the device puts the registry mode
-  back (`ChangeDisplaySettingsW(NULL, 0)`), as native does. Locally this is
-  dormant (the tests' own mode changes fail first, so current always equals
-  registry); on the runner it covers test_wndproc 4261/4302/4328/4329 and
-  test_mode_change 5563/5593. A fullscreen `Reset` still does not modeset, so
-  the sites asserting the mode follows a Reset stay `expected`.
+  come from `EnumDisplaySettingsW`, the same view win32u validates
+  `ChangeDisplaySettingsW` against and derives `GetMonitorInfoW` from,
+  instead of `NSScreen`: the current mode for `GetAdapterDisplayMode` (read
+  live, so it follows a mode-set), the enumerated list for
+  `EnumAdapterModes` (so a mode a game picks is one user32 accepts). On this
+  machine the two views agree under the pinned Retina mode; on the runner's
+  virtual display they disagreed by exactly 2x (Win32 2048x1536, `NSScreen`
+  1024x768), which split `GetDisplayMode` from the monitor rect
+  (test_get_display_mode 14472/14474) and fed the tests modes that user32
+  then refused. Seeding the list from user32 is also what made the tests'
+  own `ChangeDisplaySettingsW` calls succeed here (test_wndproc 4161/4231,
+  test_reset 2234-2238, test_mode_change), since they pick their mode from
+  `EnumAdapterModes`.
+- **The mode contract.** A fullscreen device sets the requested mode
+  (2026-08), so the Win32 half of the contract holds: the desktop mode
+  follows a create or Reset, `GetSystemMetrics` and the window rect report
+  it, and the registry mode comes back when the device loses focus
+  (`WM_ACTIVATEAPP FALSE`), leaves fullscreen (windowed `Reset`, final
+  release) or the process exits. Where we diverge from native on purpose:
+  the mode is set again on `WM_ACTIVATEAPP TRUE` rather than at the app's
+  next `Reset`, because the device is never reported lost and so nothing
+  would prompt that `Reset` (test_wndproc 4302).
 
 ### The `real` backlog (empty)
 
@@ -310,20 +318,23 @@ baseline.
 ### device.c/test_wndproc
 Sites: 4207=expected 4212=expected 4214=expected 4219=expected
 Sites: 4223=expected 4248=expected 4257=expected 4293=expected
-Sites: 4298=expected 4319=expected 4340=expected 4410=expected 4420=expected
+Sites: 4298=expected 4302=expected 4319=expected 4340=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
 Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=expected 4475=flaky
 Sites: 4480=flaky
 
-4161/4231 are the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call
-failing before any D3D9 object is involved (`ceiling`: on a display that
-accepts the CDS — a CI runner's — they read zero). With `EmulateModeset=Y`, Wine does
-not deliver the requested desktop mode. No mtld3d code participates. The rest
-of the fullscreen focus lifecycle we
+4161/4231 are the test's own `ChangeDisplaySettingsW(CDS_FULLSCREEN)` call,
+before any D3D9 object is involved; they read zero now that the mode the
+test picks from `EnumAdapterModes` is one user32 accepts, and stay `ceiling`
+pins from when it was not. The rest of the fullscreen focus lifecycle we
 deliberately do not drive: no focus/foreground mutation (4212/4214), no focus-
 window subclass (4223/4572), no WM_* activation/mode message generation
-(4207/4248/4293/4319/4340/4410/4432/4525/4545), no focus-window minimize
+(4207/4248/4293/4319/4340/4432/4525/4545), no focus-window minimize
 (4420), device-never-lost TestCooperativeLevel (4257/4298/4424/4487).
+4302 (both iterations) expects the desktop still at the registry mode after
+the app is re-activated, native leaving the mode-set to the app's next
+`Reset`; we set the device's mode again on `WM_ACTIVATEAPP TRUE`, because a
+device that is never lost gives the app no reason to `Reset`.
 Caveat on 4219: it fails because OUR cursor wndproc subclass replaced the
 device window's proc — a deliberate, load-bearing hook we keep (cursor
 realization), not a missing feature.
@@ -356,28 +367,25 @@ line moves only with that decision.
 mtld3d does not call `SetWindowPos` or `MoveWindow` on those paths.
 
 ### device.c/test_reset
-Sites: 2126=expected 2127=expected 2179=expected 2180=expected
 Sites: 2234=ceiling 2237=ceiling 2238=ceiling 2250=ceiling
 Sites: 2251=ceiling
 
-Everything fullscreen in this cluster follows from one decision: we never
-change the desktop mode. The back buffer honors the resolution it was asked
-for, so the request-side assertions (the default viewport matching the
-request at 2133/2134 and 2172/2173, `GetPresentParameters` reporting it at
-2187/2189) pass; what remains `expected` is the Win32 half:
+The fullscreen half of this cluster passes since a fullscreen device sets
+the requested mode: the request-side assertions (the default viewport
+matching the request at 2133/2134 and 2172/2173, `GetPresentParameters`
+reporting it at 2187/2189) and the Win32 half (2126/2127, 2179/2180,
+2250/2251 reading the mode back from `GetSystemMetrics(SM_CXSCREEN)`).
+2234/2237/2238 are the test's own `ChangeDisplaySettingsW` call, before any
+D3D9 object is involved; it succeeds now that the mode it picks from
+`EnumAdapterModes` is one user32 accepts. All five stay `ceiling` pins from
+when they failed here.
 
-- 2126/2127, 2179/2180, 2250/2251 read `GetSystemMetrics(SM_CXSCREEN)` and
-  expect the requested mode. The desktop keeps its own resolution.
-- 2234/2237/2238 are the test's own `ChangeDisplaySettingsW` call failing,
-  before any D3D9 object is involved. Not ours to implement. These and
-  2250/2251 are `ceiling`: a CI runner's display accepts the CDS and they
-  read zero there.
-
-The fullscreen Resets to a non-enumerable mode (32x32, 801x600) now return
+The fullscreen Resets to a non-enumerable mode (32x32, 801x600) return
 INVALIDCALL, for a reason that has nothing to do with the resolution: each
 zeroes its whole `D3DPRESENT_PARAMETERS`, so `BackBufferFormat` is
 `D3DFMT_UNKNOWN`, which a fullscreen Reset has to reject. The resolution
-itself is still not validated against a mode list, since no mode is set.
+itself is not validated against the mode list; such a request follows the
+window instead.
 
 The windowed API contract in this test passes: Reset rejects an outstanding
 app reference to a DEFAULT-pool resource or an implicit surface, and a
@@ -439,26 +447,28 @@ the flag also covers (5179/5197/5238) now succeed inside their todo blocks,
 which the runner does not count.
 
 ### device.c/test_mode_change
-Sites: 5509=ceiling 5533=ceiling 5537=ceiling 5542=expected 5584=ceiling
+Sites: 5509=ceiling 5533=ceiling 5537=ceiling 5584=ceiling
 Sites: 5602=ceiling 5622=ceiling 5636=ceiling 5639=ceiling 5646=ceiling
-Sites: 5662=expected 5671=ceiling 5674=ceiling
+Sites: 5671=ceiling 5674=ceiling
 
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
-All fail under the same decision: physical mode switching is disabled. Most
-are `ceiling` rather than `expected` because they read zero on a CI runner,
-whose display accepts the CDS calls and whose registry-mode restore then
-satisfies the later assertions; 5542 and 5662 fail there too and stay
-`expected`. 5552/5554 (the back buffer must keep the size a fullscreen create
-asked for across an external mode change) pass now that the back buffer
-honors the request and never follows the window.
+The whole cluster passes since a fullscreen device sets and restores the
+mode and the test's own CDS calls pick a mode user32 accepts; the `ceiling`
+pins date from when physical mode switching was disabled and they failed
+here while reading zero on a CI runner. 5552/5554 (the back buffer must keep
+the size a fullscreen create asked for across an external mode change) pass
+because the back buffer honors the request and never follows the window.
 
 ### device.c/test_device_window_reset
 Sites: 5968=expected
 
-The device window must adopt the *requested mode's* rect across a fullscreen
-Reset. Ours adopts the monitor rect instead, since there is no mode. (5951 and
-5971, which check that the window covers the screen at all, now pass.)
+After a Reset that retargets a fullscreen device from the focus window to a
+separate device window, that window must adopt the fullscreen rect. Ours is
+left at its own size (raw output: "Expected (0,0)-(3456,2234), got
+(0,0)-(1728,1117)"); the same count before and after the mode-set landed, so
+the retarget path is what misses. 5951 and 5971, which check that the window
+covers the screen at all, pass.
 
 ### device.c/test_occlusion_query
 Sites: 6780=expected
@@ -551,25 +561,18 @@ DEPTHSTENCIL create succeeds with it. The test's inference from the first
 answer to the second create is the cap-blind step; our responses are each
 the conformant one for the capability set we advertise.
 
-### device.c/test_get_display_mode
-Sites: 14383=expected 14384=expected 14480=expected 14482=expected
-Sites: 14491=expected 14493=expected
+### device.c/test_cursor_clipping
+Sites: 14930=ceiling
 
-All one decision. A fullscreen device's and swap chain's `GetDisplayMode`
-report the honored mode (14378/14379, 14390/14391 pass) and a windowed
-device's reports the desktop mode, so the windowed halves of
-14480/14482 and 14491/14493 pass too. What remains: `GetAdapterDisplayMode`
-must report the *switched* desktop mode after a fullscreen create
-(14383/14384), and the fullscreen halves of 14480-14493 expect
-`GetDisplayMode` to equal the monitor rect because a real mode-set would
-have shrunk the monitor to the mode. We change no mode, so the monitor keeps
-its native size while the device reports the mode it honored.
-
-Raw output confirms the remaining halves: 14480-14493 fail only as
-"Adapter 0 test 1" (the CREATE_DEVICE_FULLSCREEN iteration), "Expect width
-3456, got 640", deterministic, not a GetMonitorInfoW environment cascade.
-Their sibling sites 14451/14454 and 14472/14474 pass with the harness's
-pinned Retina mode.
+After a fullscreen device is created at a mode of another aspect than the
+display's, the cursor clip must equal the virtual screen, i.e. the mode.
+Under Wine's emulated mode-set win32u clips the foreground fullscreen window
+to the physical monitor and reports that rect mapped back into the mode,
+which for 640x480 on a 3:2 panel reads "(-51,0)-(691,480)": the letterbox
+bars are inside the clip. That is win32u's mapping, not ours; the device
+sets the mode exactly as native does. `ceiling` because it reads zero on a
+display whose aspect the mode matches (the CI runner's 4:3 virtual display
+has no letterbox for 640x480).
 
 ### device.c/init_d3d9on12_modules
 Sites: 15088=ceiling

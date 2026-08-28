@@ -4,8 +4,8 @@
 //! (state-default restore, resize, malformed input).
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, TexturedVertex, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-    assert_pixel_eq,
+    Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
@@ -1004,12 +1004,12 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
 
-    let (screen_w, screen_h) = Harness::screen_size();
-    // An enumerable non-monitor mode keeps the backbuffer assertion below
-    // sharp: the window must adopt the monitor rect while the back buffer
-    // must not.
+    // 640x480 is an enumerable mode, so the Reset sets it and the monitor
+    // rect the window adopts is the mode's. Read after the transition: the
+    // metric answers in the mode while one is set.
     let mut pp = fullscreen_params(hwnd, 640, 480);
     assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+    let (screen_w, screen_h) = Harness::screen_size();
 
     let rect = h.window_rect();
     assert_eq!(
@@ -1041,7 +1041,7 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     assert_eq!(
         (bb.width, bb.height),
         (640, 480),
-        "backbuffer keeps the requested mode; the window covers the monitor",
+        "backbuffer is the requested mode; the window covers the monitor, which is the mode",
     );
 
     // Back to windowed: the window we took over is handed back as it was.
@@ -1123,10 +1123,10 @@ fn nowindowchanges_leaves_the_device_window_alone() {
 #[test]
 fn reset_fullscreen_honors_an_enumerable_mode() {
     let h = Harness::new();
-    let (screen_w, screen_h) = Harness::screen_size();
-    // 640x480 is served by EnumAdapterModes, so the back buffer keeps the
-    // requested mode and a game that sizes its viewport from its own request
-    // covers the frame. Present scales the back buffer to the drawable.
+    // 640x480 is served by EnumAdapterModes, so the Reset sets that mode and
+    // the back buffer keeps the requested size; a game that sizes its viewport
+    // from its own request covers the frame. Present scales the back buffer
+    // to the drawable, which stays at the display's size.
     let mut pp = fullscreen_params(h.hwnd(), 640, 480);
     assert_eq!(
         h.reset_params(&mut pp),
@@ -1151,6 +1151,7 @@ fn reset_fullscreen_honors_an_enumerable_mode() {
         (640, 480),
         "default viewport covers the requested back buffer",
     );
+    let (screen_w, screen_h) = Harness::screen_size();
     let rect = h.window_rect();
     assert_eq!(
         (
@@ -1158,7 +1159,7 @@ fn reset_fullscreen_honors_an_enumerable_mode() {
             u32::try_from(rect.bottom - rect.top).expect("height is positive")
         ),
         (screen_w, screen_h),
-        "the window still covers the monitor",
+        "the window covers the monitor, which is the mode while one is set",
     );
 
     // A second fullscreen Reset at another mode takes the recreate path: the
@@ -1210,9 +1211,10 @@ fn reset_fullscreen_non_mode_request_follows_the_window() {
 
 #[test]
 fn create_fullscreen_honors_the_requested_resolution() {
-    let (screen_w, screen_h) = Harness::screen_size();
     let h = Harness::fullscreen(640, 480);
 
+    // Read after the create: the metric answers in the mode while one is set.
+    let (screen_w, screen_h) = Harness::screen_size();
     let rect = h.window_rect();
     assert_eq!(
         (
@@ -1220,7 +1222,7 @@ fn create_fullscreen_honors_the_requested_resolution() {
             u32::try_from(rect.bottom - rect.top).expect("height is positive")
         ),
         (screen_w, screen_h),
-        "a fullscreen create covers the monitor",
+        "a fullscreen create covers the monitor, which is the mode",
     );
     let (bb_hr, bb) = h.back_buffer(0).desc();
     assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
@@ -1284,6 +1286,113 @@ fn fullscreen_window_reasserts_monitor_rect_after_external_resize() {
         (bb.width, bb.height),
         (640, 480),
         "the back buffer never follows an external resize",
+    );
+}
+
+/// A fullscreen device sets the requested mode through user32, like native.
+///
+/// The test prefix runs with Wine's `EmulateModeset`, so the mode-set is
+/// virtual: win32u answers every metric in the mode and maps mouse input
+/// into it. The invariant that keeps a game's clicks on its UI is the client
+/// rect equalling the back buffer, which only a mode-set can produce while
+/// the window covers the monitor.
+#[test]
+fn reset_fullscreen_sets_the_display_mode() {
+    let h = Harness::new();
+    let native = Harness::current_display_mode();
+    let windowed_client = h.client_size();
+    assert_ne!(
+        native,
+        (640, 480),
+        "the desktop is not already at the test mode"
+    );
+
+    let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+    assert_eq!(
+        Harness::current_display_mode(),
+        (640, 480),
+        "a fullscreen Reset at an enumerable mode sets that display mode",
+    );
+    assert_eq!(
+        Harness::screen_size(),
+        (640, 480),
+        "GetSystemMetrics answers in the mode",
+    );
+    assert_eq!(
+        h.client_size(),
+        (640, 480),
+        "the client rect is the mode, so mouse coordinates arrive in back-buffer space",
+    );
+    let rect = h.window_rect();
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (640, 480),
+        "the window covers the monitor, which is the mode",
+    );
+    let (bb_hr, bb) = h.back_buffer(0).desc();
+    assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen backbuffer");
+    assert_eq!((bb.width, bb.height), (640, 480), "back buffer is the mode");
+
+    assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+    assert_eq!(
+        Harness::current_display_mode(),
+        native,
+        "leaving fullscreen restores the registry display mode",
+    );
+    assert_eq!(
+        h.client_size(),
+        windowed_client,
+        "the windowed client rect comes back with the desktop mode",
+    );
+
+    let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "second fullscreen Reset");
+    assert_eq!(
+        Harness::current_display_mode(),
+        (640, 480),
+        "mode set again"
+    );
+    drop(h);
+    assert_eq!(
+        Harness::current_display_mode(),
+        native,
+        "releasing a fullscreen device restores the registry display mode",
+    );
+}
+
+/// The focus half of the mode contract: restore on deactivation, re-set on activation.
+#[test]
+fn fullscreen_device_restores_the_mode_on_deactivation_and_re_sets_it_on_activation() {
+    let native = Harness::current_display_mode();
+    let h = Harness::fullscreen(640, 480);
+    assert_eq!(
+        Harness::current_display_mode(),
+        (640, 480),
+        "fullscreen create sets the mode"
+    );
+
+    h.send_window_message(WM_ACTIVATEAPP, 0, 0);
+    assert_eq!(
+        Harness::current_display_mode(),
+        native,
+        "WM_ACTIVATEAPP FALSE puts the registry display mode back",
+    );
+
+    // The re-set is posted from the activation and runs when the game next
+    // pumps messages, so it can never run inside a Reset in flight.
+    h.send_window_message(WM_ACTIVATEAPP, 1, 0);
+    assert!(h.pump(), "no WM_QUIT expected");
+    assert_eq!(
+        Harness::current_display_mode(),
+        (640, 480),
+        "WM_ACTIVATEAPP TRUE re-sets the device's mode",
+    );
+    let rect = h.window_rect();
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (640, 480),
+        "the window covers the monitor again",
     );
 }
 

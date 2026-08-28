@@ -206,6 +206,7 @@ const WM_SETCURSOR: u32 = 0x0020;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_ACTIVATEAPP: u32 = 0x001C;
 const WM_SIZE: u32 = 0x0005;
+const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WA_INACTIVE: u32 = 0;
 const HTCLIENT: usize = 1;
 
@@ -218,6 +219,15 @@ const HTCLIENT: usize = 1;
 /// `lParam` carries the client size like `WM_SIZE`.
 /// `WM_APP` range, consumed by the subclass and never forwarded.
 const WM_APP_REASSERT_FULLSCREEN: u32 = 0x8000 + 0x03D9;
+
+/// Private message: re-set the display mode and re-cover after an activation.
+///
+/// Posted (never sent) from the `WM_ACTIVATEAPP TRUE` handler. That message
+/// can arrive synchronously inside the device's own `SetWindowPos` while it
+/// enters fullscreen, and inside a game's `Reset`; deferring the re-assert to
+/// the next pump keeps it out of both. `WM_APP` range, consumed by the
+/// subclass and never forwarded.
+const WM_APP_REACTIVATE_FULLSCREEN: u32 = 0x8000 + 0x03DA;
 
 // ── Per-window subclass back-pointers ──
 
@@ -664,8 +674,11 @@ pub extern "system" fn device_set_cursor_properties(
         return D3DERR_INVALIDCALL;
     }
     // D3D9 caps cursor dimensions at the current adapter display mode (the
-    // resolution `GetAdapterDisplayMode` reports), not the backbuffer size.
-    let (mode_width, mode_height) = crate::direct3d9::adapter_display_mode_dims();
+    // resolution `GetAdapterDisplayMode` reports right now, which is the
+    // game's mode while a fullscreen device has one set), not the backbuffer
+    // size.
+    let mode = crate::direct3d9::current_adapter_display_mode();
+    let (mode_width, mode_height) = (mode.width, mode.height);
     if width > mode_width || height > mode_height {
         warn!(
             target: LOG_TARGET,
@@ -879,6 +892,16 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         return def_window_proc(hwnd, msg, wp, lp);
     }
 
+    // While the device itself is moving the window through a fullscreen
+    // transition (mode-set, cover, restore), every message but the mode
+    // change goes to the default proc instead of the game, as native D3D9
+    // does: a device filters the messages its own window management sends.
+    // Games answer `WM_SIZE` by calling `Reset`, which would recurse into
+    // the transition that sent it.
+    if crate::fullscreen::driving_window() && msg != WM_DISPLAYCHANGE {
+        return def_window_proc(hwnd, msg, wp, lp);
+    }
+
     if msg == WM_SETCURSOR {
         // SAFETY: `dev_ptr` is this window's `DEVICE_INSTANCES` entry,
         // installed by `install_subclass`; it's null-checked above and
@@ -946,19 +969,26 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             "wndproc WM_ACTIVATE: state={activate_state} activating={activating} dirty_now={} tid={}",
             cur.dirty(), current_thread_id(),
         );
-    } else if msg == WM_ACTIVATEAPP && wp == 0 {
-        // Focus-loss half of the D3D9 fullscreen mode contract: when the app
-        // deactivates while a fullscreen device is live, native D3D9 puts
-        // the registry display mode back.
-        // `WM_ACTIVATEAPP FALSE` reaches every top-level window of the
-        // deactivated thread, so the subclassed device window sees it even
-        // when the focus window was the active one. No-op when nothing
-        // changed the mode — the common case, since mtld3d never modesets.
+    } else if msg == WM_ACTIVATEAPP {
+        // The D3D9 fullscreen mode contract, both halves. Deactivation puts
+        // the registry display mode back, as native D3D9 does; the window
+        // stays where it is (no minimise, no device loss). Activation re-sets
+        // the device's mode and re-covers the monitor, deferred to the next
+        // pump (see `WM_APP_REACTIVATE_FULLSCREEN`). `WM_ACTIVATEAPP` reaches
+        // every top-level window of the thread, so the subclassed device
+        // window sees it even when the focus window was the active one.
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
         // lifetime of the subclass.
         let is_fullscreen = unsafe { (*dev_ptr).fullscreen_window().is_some() };
-        if is_fullscreen {
+        if is_fullscreen && wp == 0 {
             crate::fullscreen::restore_registry_mode();
+        } else if is_fullscreen {
+            debug!(
+                target: LOG_TARGET,
+                "wndproc WM_ACTIVATEAPP TRUE on a fullscreen device; re-assert posted tid={}",
+                current_thread_id(),
+            );
+            post_message(hwnd, WM_APP_REACTIVATE_FULLSCREEN, 0, 0);
         }
     } else if msg == WM_SIZE {
         // Implicit client-area resize from Wine's macdrv (e.g. macOS
@@ -1033,6 +1063,15 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
         dev.reassert_fullscreen_cover(new_width, new_height);
+        return 0;
+    } else if msg == WM_APP_REACTIVATE_FULLSCREEN {
+        // Deferred half of the WM_ACTIVATEAPP branch above. Our own message,
+        // consumed here; a stale post after the device left fullscreen is a
+        // no-op, and a same-mode re-assert sets nothing (compare-first).
+        // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
+        // lifetime of the subclass.
+        let dev = unsafe { &mut *dev_ptr };
+        dev.reactivate_fullscreen();
         return 0;
     }
 

@@ -2351,6 +2351,32 @@ impl Harness {
         win32::screen_size()
     }
 
+    /// The primary display's current mode, from `EnumDisplaySettingsW`.
+    ///
+    /// The mode a fullscreen device sets through user32 and restores on the
+    /// way out; Win32's answer, so it pins the mode-set rather than what
+    /// d3d9 reports.
+    #[must_use]
+    pub fn current_display_mode() -> (u32, u32) {
+        win32::current_display_mode()
+    }
+
+    /// user32 `GetClientRect` — the device window's client size.
+    ///
+    /// The space mouse coordinates arrive in, so equality with the back
+    /// buffer is what keeps a game's clicks where its UI is drawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an inverted client rect, which Win32 never reports.
+    pub fn client_size(&self) -> (u32, u32) {
+        let rect = win32::client_rect(self.hwnd);
+        (
+            u32::try_from(rect.right - rect.left).expect("client width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("client height is positive"),
+        )
+    }
+
     /// `IDirect3DDevice9::GetDisplayMode(0)` into a `D3DDISPLAYMODE`. Returns the hr.
     pub fn display_mode(&self, mode: &mut mtld3d_types::D3DDISPLAYMODE) -> i32 {
         // SAFETY: vtable thunk; `mode` is writable for the call.

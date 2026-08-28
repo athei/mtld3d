@@ -40,8 +40,11 @@ unsafe extern "system" {
     fn GetCursor() -> usize;
     fn SetCursor(cursor: usize) -> usize;
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
+    fn GetClientRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
+    fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
+    -> i32;
     fn SetWindowPos(
         hwnd: usize,
         insert_after: usize,
@@ -263,6 +266,9 @@ pub struct Rect {
     pub bottom: i32,
 }
 
+/// `WM_ACTIVATEAPP` — the app-level activation message a fullscreen device answers.
+pub const WM_ACTIVATEAPP: u32 = 0x001C;
+
 /// `GWL_STYLE` — a window's style bits.
 pub const GWL_STYLE: i32 = -16;
 /// `GWL_EXSTYLE` — a window's extended style bits.
@@ -293,6 +299,92 @@ pub fn window_long(hwnd: usize, index: i32) -> u32 {
     // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
     // index is one of the documented constants.
     unsafe { GetWindowLongA(hwnd, index) }.cast_unsigned()
+}
+
+/// `GetClientRect` — a window's client area, origin (0, 0).
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+pub fn client_rect(hwnd: usize) -> Rect {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and `rect`
+    // is an owned local.
+    let ok = unsafe { GetClientRect(hwnd, &raw mut rect) };
+    assert!(ok != 0, "GetClientRect failed");
+    rect
+}
+
+/// Win32 `DEVMODEW`, display-device shape, as `EnumDisplaySettingsW` fills it.
+///
+/// Only the two resolution fields are read; everything before them has to be
+/// laid out exactly so they land where the API writes them.
+#[repr(C)]
+struct DevModeW {
+    device_name: [u16; 32],
+    spec_version: u16,
+    driver_version: u16,
+    size: u16,
+    driver_extra: u16,
+    fields: u32,
+    position_x: i32,
+    position_y: i32,
+    display_orientation: u32,
+    display_fixed_output: u32,
+    color: i16,
+    duplex: i16,
+    y_resolution: i16,
+    tt_option: i16,
+    collate: i16,
+    form_name: [u16; 32],
+    log_pixels: u16,
+    bits_per_pel: u32,
+    pels_width: u32,
+    pels_height: u32,
+    display_flags: u32,
+    display_frequency: u32,
+    icm_method: u32,
+    icm_intent: u32,
+    media_type: u32,
+    dither_type: u32,
+    reserved1: u32,
+    reserved2: u32,
+    panning_width: u32,
+    panning_height: u32,
+}
+
+/// `DEVMODEW`'s ABI size, which the API reads back out of `size`.
+const DEV_MODE_SIZE: u16 = 220;
+const _: () = assert!(size_of::<DevModeW>() == DEV_MODE_SIZE as usize);
+
+/// The primary display's current mode (`EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`).
+///
+/// This is the mode a fullscreen device sets and puts back, read through the
+/// same user32 entry point Wine's own display tests use.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+pub fn current_display_mode() -> (u32, u32) {
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
+    // valid value.
+    let mut dm: DevModeW = unsafe { core::mem::zeroed() };
+    dm.size = DEV_MODE_SIZE;
+    // SAFETY: Win32 thunk; a null device name selects the primary display
+    // and `dm` is an owned local with `size` set per the API contract.
+    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), ENUM_CURRENT_SETTINGS, &raw mut dm) };
+    assert!(
+        ok != 0,
+        "EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS) failed"
+    );
+    (dm.pels_width, dm.pels_height)
 }
 
 /// The primary display's current resolution (`SM_CXSCREEN` / `SM_CYSCREEN`).
