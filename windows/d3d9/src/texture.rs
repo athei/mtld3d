@@ -563,6 +563,17 @@ impl TextureInner {
         self.mip_heights[level]
     }
 
+    /// What this texture's Metal levels are rasterized at, relative to what D3D9 reports.
+    ///
+    /// Fixed when the texture is created and carried for its whole life, so a
+    /// command that has to convert a coordinate for this texture asks the
+    /// texture rather than re-deriving the answer from the device's current
+    /// back-buffer size. [`Self::render_extent`] is this applied to the base
+    /// level.
+    pub const fn render_scale(&self) -> RenderScale {
+        self.render_scale
+    }
+
     /// Base-level extent of the backing Metal texture.
     ///
     /// `mip_width`/`mip_height` report the logical size D3D9 answers with. A

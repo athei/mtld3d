@@ -6367,8 +6367,8 @@ struct StretchSurfaceInfo {
     height: u32,
     /// What this endpoint's texture is rasterized at relative to `width`/`height`.
     ///
-    /// Resolved on the API thread, where the device is reachable, so the
-    /// encoder-thread blit body can convert each endpoint without having to
+    /// Resolved on the API thread, where the backing resource is reachable, so
+    /// the encoder-thread body can convert each endpoint without having to
     /// re-derive which surfaces `render.scale` applies to.
     scale: mtld3d_core::render_scale::RenderScale,
     format: u32,
@@ -6430,15 +6430,15 @@ fn resolve_stretch_surface(
             tex.inner().mip_width(lvl_idx),
             tex.inner().mip_height(lvl_idx),
         );
-        // Only a render-target or depth-stencil texture ever inherits the back
-        // buffer's scale; one the game uploads pixels into keeps the size its
-        // CPU-side layout assumes.
-        let is_target = (tex.d3d_usage() & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0;
         return Some(StretchSurfaceInfo {
             kind: StretchKind::Texture(info),
             width,
             height,
-            scale: dev.scale_for_created_target(width, height, is_target),
+            // The texture's own scale, not one re-derived from the device: it
+            // is what its Metal levels were created at, it holds for every
+            // level rather than only the one that matches the back buffer, and
+            // it does not move when the back buffer is resized under it.
+            scale: tex.inner().render_scale(),
             format: tex.d3d_format(),
             mip_level: level,
             pool: tex.d3d_pool(),
