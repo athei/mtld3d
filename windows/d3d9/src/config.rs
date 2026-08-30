@@ -38,8 +38,8 @@ fn load() -> Mtld3dConfig {
         .filter(|s| !s.trim().is_empty());
     let profile = app_profile();
     let file_src = read_conf_file();
-    if env_override.is_some() {
-        info!(target: LOG_TARGET, "mtld3d.conf: applying MTLD3D_CONFIG overrides");
+    if let Some(env) = &env_override {
+        info!(target: LOG_TARGET, "mtld3d.conf: applying MTLD3D_CONFIG overrides: {env}");
     }
     let cfg = parse(
         profile,

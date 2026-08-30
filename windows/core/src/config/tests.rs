@@ -32,7 +32,7 @@ fn defaults_match_documented_values() {
     assert!(d.log_dir.is_empty());
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
-    assert!(d.query_flush_immediate);
+    assert!(!d.query_flush_immediate);
     assert!(!d.buffer_ignore_lock_bounds);
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);

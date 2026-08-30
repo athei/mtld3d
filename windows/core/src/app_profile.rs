@@ -41,8 +41,21 @@ static PROFILES: &[AppProfile] = &[
         company: Some("Rockstar Games"),
         product: Some("Grand Theft Auto IV"),
         original_filename: None,
-        settings: "adapter.spoof=amd;caps.dfFormats=false;\
-                   query.flushImmediate=false;depth.aliasSameSize=true",
+        settings: "adapter.spoof=amd;caps.dfFormats=false;depth.aliasSameSize=true",
+    },
+    // World of Warcraft, the 1.12 and 3.3.5 clients alike. Both use the
+    // `GetData(D3DGETDATA_FLUSH)` poll loop as a GPU fence after every
+    // loading-screen upload batch and never read the count it returns, so the
+    // spec-correct wait only costs them seconds per load; the immediate answer
+    // keeps that time and changes nothing they render. The sun and moon lens
+    // flares read their queries without FLUSH and still get the real counts.
+    AppProfile {
+        name: "wow",
+        exe: "WoW.exe",
+        company: Some("Blizzard Entertainment"),
+        product: Some("World of Warcraft"),
+        original_filename: None,
+        settings: "query.flushImmediate=true",
     },
 ];
 
@@ -117,16 +130,17 @@ impl AppIdentity {
 
 /// The built-in profile for this application, if it has one.
 ///
-/// Logs the outcome either way: which profile took effect, or that none did.
-/// Both answers are the first thing to establish when a game behaves
-/// differently than its options say it should.
+/// Logs the outcome either way: which profile took effect and the options it
+/// sets, or that none did. Both answers are the first thing to establish when a
+/// game behaves differently than its options say it should.
 #[must_use]
 pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
     let profile = PROFILES.iter().find(|p| p.matches(id));
     match profile {
         Some(p) => info!(
             target: LOG_TARGET,
-            "app profile: {} matched {} ({}, {})", p.name, id.exe, id.company, id.product
+            "app profile: {} matched {} ({}, {}): {}",
+            p.name, id.exe, id.company, id.product, p.settings
         ),
         None => info!(target: LOG_TARGET, "app profile: none for {}", id.exe),
     }

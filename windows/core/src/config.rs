@@ -111,15 +111,14 @@ pub struct Mtld3dConfig {
     pub skip_shaders: Vec<u64>,
     /// Return `S_OK` immediately on `GetData(D3DGETDATA_FLUSH)` for a `Pending` occlusion query.
     ///
-    /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted`.
-    /// Default: `true` — D3D9-era games use the FLUSH-poll loop as a
-    /// poor-man's GPU fence to work around 2004-era drivers that lacked
-    /// resource hazard tracking. Metal tracks hazards explicitly, so the
-    /// fence buys nothing and just throttles our API thread (the
-    /// project's bottleneck). Flip to `false` to restore the
-    /// spec-correct kernel wait if a game ever needs the actual
-    /// pixel count immediately after FLUSH. File key:
-    /// `query.flushImmediate`.
+    /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted` and
+    /// answers with the permissive count instead. Default: `false`, the
+    /// spec-correct wait, because an engine that polls with FLUSH reads the
+    /// count it gets back (a pixel-visibility fraction, an occlusion cull).
+    /// `true` is for a title that uses the poll loop only as a GPU fence and
+    /// never reads the number: the `wow` profile sets it, since both clients
+    /// fence every loading-screen upload batch that way and the wait costs
+    /// seconds per load. File key: `query.flushImmediate`.
     pub query_flush_immediate: bool,
     /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
     ///
@@ -289,7 +288,7 @@ impl Default for Mtld3dConfig {
             log_dir: String::new(),
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
-            query_flush_immediate: true,
+            query_flush_immediate: false,
             depth_alias_same_size: false,
             buffer_ignore_lock_bounds: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
