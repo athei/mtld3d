@@ -206,6 +206,16 @@ impl BufferBacking {
         self.page_box.as_ref().map_or(0, |b| b.as_ptr() as u64)
     }
 
+    /// The current backing allocation's identity; `0` once released.
+    ///
+    /// Pairs with [`Self::ptr`] in the draw snapshot so the encoder's
+    /// `bytesNoCopy` wrapper cache can tell a re-used address from the
+    /// allocation it wrapped (see `PageBox::generation`).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.page_box.as_ref().map_or(0, PageBox::generation)
+    }
+
     /// The backing's padded length, which outlives the bytes themselves.
     #[must_use]
     pub const fn padded_len(&self) -> u64 {

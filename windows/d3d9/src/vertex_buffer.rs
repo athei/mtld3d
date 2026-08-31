@@ -242,6 +242,11 @@ impl VertexBufferInner {
         self.backing.ptr()
     }
 
+    /// The current backing allocation's identity (see `BufferBacking::generation`).
+    pub fn current_backing_generation(&self) -> u64 {
+        self.backing.generation()
+    }
+
     pub const fn current_backing_len(&self) -> u64 {
         self.backing.padded_len()
     }

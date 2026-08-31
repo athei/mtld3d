@@ -230,6 +230,17 @@ pub const fn bypasses_local_cache(padded: usize) -> bool {
 /// Sized to the next page multiple of `logical_len`; both the raw pointer
 /// and the reported length are safe to hand to Metal via
 /// `newBufferWithBytesNoCopy:`.
+/// Monotonic identity for every fresh [`PageBox`] allocation.
+///
+/// The global allocator can hand a freed allocation's address back to a
+/// later one, and a `bytesNoCopy` `MTLBuffer` cached against the address
+/// alone would then pair GPU-pinned pages of the dead allocation with CPU
+/// writes into the new one. The generation names the allocation, not the
+/// address, so identity checks survive address reuse. A pool re-acquire
+/// keeps the parked allocation's value: parked pages were never freed, so
+/// they stay resident and coherent.
+static PAGE_BOX_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub struct PageBox {
     ptr: NonNull<u8>,
     /// Rounded-up page multiple.
@@ -240,6 +251,8 @@ pub struct PageBox {
     logical_len: usize,
     /// Layout used for `alloc` — stored so `Drop` can match `dealloc`.
     layout: Layout,
+    /// This allocation's [`PAGE_BOX_GENERATION`] stamp.
+    generation: u64,
 }
 
 // SAFETY: PageBox owns a heap allocation with no interior sharing. Transferring
@@ -279,6 +292,7 @@ impl PageBox {
             len,
             logical_len,
             layout,
+            generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
         }
     }
 
@@ -304,6 +318,7 @@ impl PageBox {
             len,
             logical_len,
             layout,
+            generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
         }
     }
 
@@ -314,6 +329,12 @@ impl PageBox {
 
     pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
+    }
+
+    /// The allocation's identity stamp (see `PAGE_BOX_GENERATION`).
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Borrow the full padded region as a slice.

@@ -5162,6 +5162,7 @@ extern "system" fn device_create_vertex_buffer(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
     // SAFETY: vtable out-param; `vb` is *mut *mut c_void per IDirect3DDevice9 ABI.
@@ -5239,6 +5240,7 @@ extern "system" fn device_create_index_buffer(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
     // SAFETY: vtable out-param; `ib` is *mut *mut c_void per IDirect3DDevice9 ABI.
@@ -10022,6 +10024,7 @@ fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> Strea
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         offset: bound.stream_offset(s),
         stride: bound.stream_stride(s),
         freq: bound.stream_freq(s),
@@ -10065,6 +10068,7 @@ fn snapshot_bound_index_source(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         offset: start_index * index_stride,
         index_count,
         index_type,
