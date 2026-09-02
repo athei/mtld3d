@@ -19,7 +19,7 @@ use mtld3d_core::{
         FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
     },
     ids::{BufferId, ProgramId},
-    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
+    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, VertexBufferBind, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
     pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
@@ -2227,10 +2227,26 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     );
                     return;
                 }
-                if enc
-                    .last_bound()
-                    .vertex_buffer_changed(slot, buffer_handle, b.offset)
-                {
+                let bind = enc.last_bound().vertex_buffer_changed(
+                    slot,
+                    buffer_handle,
+                    b.offset,
+                    b.backing_generation,
+                );
+                if bind == VertexBufferBind::ReusedHandle {
+                    // The dedup would have kept the wrapper this address used
+                    // to name bound; that wrapper was destroyed inside this
+                    // pass, which the retention schedule is meant to rule out.
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                         buffer {:#x} generation {}: rebinding instead of deduplicating",
+                        b.buffer_id.raw(),
+                        b.backing_generation
+                    );
+                }
+                let vb_emitted = bind != VertexBufferBind::Same;
+                if vb_emitted {
                     enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
                 }
                 // Record this draw's VB read range so a later overlapping

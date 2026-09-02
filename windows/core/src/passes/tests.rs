@@ -213,32 +213,84 @@ fn frame_sampled_textures_ignores_null_bind() {
 fn inline_slot0_bind_forces_next_bound_vertex_buffer_reemit() {
     let mut cache = LastBoundCache::new();
     // First bind of a real VB handle reports a change and caches it.
-    assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
-    // A redundant rebind of the same (handle, offset) would be skipped.
-    assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Changed
+    );
+    // A redundant rebind of the same (handle, offset, generation) is skipped.
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Same
+    );
     // An inline slot-0 bind (setVertexBytes) clobbers the Metal binding;
     // invalidating the cache must force the next bound draw to re-emit
     // even though it targets the same (handle, offset).
     cache.invalidate_vertex_buffer();
-    assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Changed
+    );
+}
+
+#[test]
+fn reused_handle_over_another_generation_is_rebound() {
+    let mut cache = LastBoundCache::new();
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Changed
+    );
+    // Same object address and offset, but a wrapper over a different
+    // allocation: the bind goes out again and the cache moves on.
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 2),
+        VertexBufferBind::ReusedHandle
+    );
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 2),
+        VertexBufferBind::Same
+    );
 }
 
 #[test]
 fn vertex_buffer_slots_are_tracked_independently() {
     let mut cache = LastBoundCache::new();
-    assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
-    assert!(cache.vertex_buffer_changed(1, 0xBEEF, 16));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Changed
+    );
+    assert_eq!(
+        cache.vertex_buffer_changed(1, 0xBEEF, 16, 1),
+        VertexBufferBind::Changed
+    );
     // Slot 1's bind leaves slot 0's cache intact, and vice versa.
-    assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
-    assert!(!cache.vertex_buffer_changed(1, 0xBEEF, 16));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Same
+    );
+    assert_eq!(
+        cache.vertex_buffer_changed(1, 0xBEEF, 16, 1),
+        VertexBufferBind::Same
+    );
     // Invalidating slot 0 (inline UP bytes) does not touch slot 1.
     cache.invalidate_vertex_buffer();
-    assert!(cache.vertex_buffer_changed(0, 0xDEAD, 0));
-    assert!(!cache.vertex_buffer_changed(1, 0xBEEF, 16));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Changed
+    );
+    assert_eq!(
+        cache.vertex_buffer_changed(1, 0xBEEF, 16, 1),
+        VertexBufferBind::Same
+    );
     // A null-stream inline bind at slot 1 forgets only slot 1.
     cache.invalidate_vertex_buffer_slot(1);
-    assert!(cache.vertex_buffer_changed(1, 0xBEEF, 16));
-    assert!(!cache.vertex_buffer_changed(0, 0xDEAD, 0));
+    assert_eq!(
+        cache.vertex_buffer_changed(1, 0xBEEF, 16, 1),
+        VertexBufferBind::Changed
+    );
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xDEAD, 0, 1),
+        VertexBufferBind::Same
+    );
 }
 
 #[test]
@@ -933,7 +985,7 @@ fn last_bound_reset_clears_everything() {
     c.ps_constants_changed(&[5, 6, 7, 8]);
     c.ps_alpha_ref_changed(&[9, 10, 11, 12]);
     c.ps_fog_color_changed(&[13, 14, 15, 16]);
-    c.vertex_buffer_changed(0, 0xEEEE, 32);
+    c.vertex_buffer_changed(0, 0xEEEE, 32, 1);
     c.scissor_rect_changed((1, 2, 3, 4));
     c.blend_color_changed(0xFF11_2233);
     c.reset();
@@ -946,7 +998,10 @@ fn last_bound_reset_clears_everything() {
     assert!(c.ps_constants_changed(&[5, 6, 7, 8]));
     assert!(c.ps_alpha_ref_changed(&[9, 10, 11, 12]));
     assert!(c.ps_fog_color_changed(&[13, 14, 15, 16]));
-    assert!(c.vertex_buffer_changed(0, 0xEEEE, 32));
+    assert_eq!(
+        c.vertex_buffer_changed(0, 0xEEEE, 32, 1),
+        VertexBufferBind::Changed
+    );
     assert!(c.scissor_rect_changed((1, 2, 3, 4)));
     assert!(c.blend_color_changed(0xFF11_2233));
 }
@@ -989,12 +1044,24 @@ fn last_bound_inline_bytes_reset_keeps_capacity() {
 #[test]
 fn last_bound_vertex_buffer_dedup() {
     let mut c = LastBoundCache::new();
-    assert!(c.vertex_buffer_changed(0, 0xAAAA, 0));
-    assert!(!c.vertex_buffer_changed(0, 0xAAAA, 0));
+    assert_eq!(
+        c.vertex_buffer_changed(0, 0xAAAA, 0, 1),
+        VertexBufferBind::Changed
+    );
+    assert_eq!(
+        c.vertex_buffer_changed(0, 0xAAAA, 0, 1),
+        VertexBufferBind::Same
+    );
     // Same handle, different offset → changed.
-    assert!(c.vertex_buffer_changed(0, 0xAAAA, 64));
+    assert_eq!(
+        c.vertex_buffer_changed(0, 0xAAAA, 64, 1),
+        VertexBufferBind::Changed
+    );
     // Same offset, different handle → changed.
-    assert!(c.vertex_buffer_changed(0, 0xBBBB, 64));
+    assert_eq!(
+        c.vertex_buffer_changed(0, 0xBBBB, 64, 1),
+        VertexBufferBind::Changed
+    );
 }
 
 #[test]
@@ -1083,7 +1150,10 @@ fn debug_guard_in_sync_across_every_tracked_slot() {
     shadow.record(&Command::set_fragment_texture(0x7E10, 3));
     assert!(cache.fragment_sampler_changed(3, 0x5A77));
     shadow.record(&Command::set_fragment_sampler_state(0x5A77, 3));
-    assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x40));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xBEEF, 0x40, 1),
+        VertexBufferBind::Changed
+    );
     shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x40, 0));
     assert!(cache.scissor_rect_changed((7, 9, 1024, 768)));
     shadow.record(&Command::set_scissor_rect(7, 9, 1024, 768));
@@ -1103,7 +1173,10 @@ fn debug_guard_in_sync_after_inline_slot0_invalidate() {
     let mut cache = LastBoundCache::new();
     let mut shadow = DebugBoundShadow::default();
 
-    assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xBEEF, 0x10, 1),
+        VertexBufferBind::Changed
+    );
     shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
     cache.debug_assert_in_sync(&shadow);
 
@@ -1113,7 +1186,10 @@ fn debug_guard_in_sync_after_inline_slot0_invalidate() {
     cache.debug_assert_in_sync(&shadow);
 
     // The next bound draw re-binds the same buffer and stays in sync.
-    assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xBEEF, 0x10, 1),
+        VertexBufferBind::Changed
+    );
     shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
     cache.debug_assert_in_sync(&shadow);
 }
@@ -1127,9 +1203,15 @@ fn debug_guard_tracks_every_vertex_stream_slot() {
     let mut cache = LastBoundCache::new();
     let mut shadow = DebugBoundShadow::default();
 
-    assert!(cache.vertex_buffer_changed(0, 0xBEEF, 0x10));
+    assert_eq!(
+        cache.vertex_buffer_changed(0, 0xBEEF, 0x10, 1),
+        VertexBufferBind::Changed
+    );
     shadow.record(&Command::set_vertex_buffer(0xBEEF, 0x10, 0));
-    assert!(cache.vertex_buffer_changed(1, 0xCAFE, 0x20));
+    assert_eq!(
+        cache.vertex_buffer_changed(1, 0xCAFE, 0x20, 1),
+        VertexBufferBind::Changed
+    );
     shadow.record(&Command::set_vertex_buffer(0xCAFE, 0x20, 1));
     cache.debug_assert_in_sync(&shadow);
 

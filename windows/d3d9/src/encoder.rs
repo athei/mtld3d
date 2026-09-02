@@ -5994,12 +5994,33 @@ impl FrameEncoder {
                     removed.last_submit_seq.max(last_submit_seq),
                 )
             }
-            Some(state) if state.backing_ptr == backing_ptr => {
+            Some(state)
+                if state.backing_ptr == backing_ptr
+                    && state.backing_generation == page_box.generation() =>
+            {
                 let removed = self.buffer_cache.remove(&buffer_id).expect("just checked");
                 (
                     removed.mtl_buffer,
                     removed.last_submit_seq.max(last_submit_seq),
                 )
+            }
+            // The address matches but the allocation does not: the entry
+            // wraps a later backing at the retained one's address, and
+            // taking it would destroy a wrapper draws still bind. The
+            // ownership rules make this unreachable (a retained box is alive
+            // and so cannot share an address with a live one); the check
+            // keeps that a local fact rather than a lifetime argument.
+            Some(state) if state.backing_ptr == backing_ptr => {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "intake_vbib_retention: buffer {:#x} retired backing {backing_ptr:#x} \
+                     generation {} while the cache wraps generation {} at that address; \
+                     the cache entry stays",
+                    buffer_id.raw(),
+                    page_box.generation(),
+                    state.backing_generation
+                );
+                (MetalHandle::NULL, last_submit_seq)
             }
             _ => (MetalHandle::NULL, last_submit_seq),
         };
