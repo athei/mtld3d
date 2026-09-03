@@ -36,9 +36,8 @@
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
-//! keeps moving; every present, and a timer for when presents stop, notices
-//! the pointer moving with no events arriving and hides the sprite until
-//! events resume. And when such a tool
+//! keeps moving; every present notices the pointer moving with no events
+//! arriving and hides the sprite until events resume. And when such a tool
 //! ends, the window server shows the standard arrow rather than the cursor
 //! Wine set, which Wine never re-applies because its handle did not change;
 //! the first event after a capture asks the PE side for its null-then-set
@@ -73,10 +72,7 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{
-    NSDictionary, NSNotification, NSNotificationCenter, NSRunLoop, NSRunLoopCommonModes, NSString,
-    NSTimer,
-};
+use objc2_foundation::{NSDictionary, NSNotification, NSNotificationCenter, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
     MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
@@ -117,19 +113,14 @@ enum Content {
     },
 }
 
-/// How often the timer checks the pointer for moving without events reaching us, seconds.
-///
-/// The timer is the fallback for a game that has stopped presenting; while
-/// it presents, every frame runs the same check for free. Ten times a
-/// second, with a tolerance so the system folds it into other wakeups.
-const CAPTURE_TICK_SECONDS: f64 = 0.1;
-
 /// How long without a mouse event before a moved pointer counts as captured.
 ///
 /// A moving pointer delivers an event every few milliseconds, so a gap this
 /// long with the pointer elsewhere than the last event put it means someone
-/// else is receiving the events. Checked every present, so this is also the
-/// delay before the sprite goes away.
+/// else is receiving the events. Checked every present and nowhere else (a
+/// game that shows its cursor but presents nothing is frozen, and no timer
+/// is worth a wakeup for that), so this is also the delay before the sprite
+/// goes away.
 const CAPTURE_SILENCE_MS: u128 = 60;
 
 /// When the last mouse event reached this process, nanoseconds since [`EPOCH`].
@@ -214,9 +205,8 @@ fn capture_suspected() -> bool {
 
 /// Run the capture check from the present path; no wakeup of its own.
 ///
-/// Called once per present on the submit thread. When it is the first to
-/// notice, it flags the capture and asks the main thread to hide the sprite;
-/// the timer does the same for a game that has stopped presenting.
+/// Called once per present on the submit thread. When it notices, it flags
+/// the capture and asks the main thread to hide the sprite.
 pub fn poll_capture_from_present() {
     if CAPTURED.load(Ordering::Relaxed) || !capture_suspected() {
         return;
@@ -569,24 +559,6 @@ fn sync_overlay_on_main() {
             overlay.sync_position(mtm);
         }
     });
-}
-
-/// The capture timer: the present-path check for a game that has stopped presenting.
-///
-/// **Main thread only.** Runs for every device. The software cursor hides
-/// its sprite for the duration; the hardware cursor needs nothing until the
-/// capture ends.
-fn on_capture_tick_main() {
-    if CAPTURED.load(Ordering::Relaxed) || !capture_suspected() {
-        return;
-    }
-    if CAPTURED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        debug!(target: LOG_TARGET, "cursor: pointer moves without events, another process has it");
-        sync_overlay_on_main();
-    }
 }
 
 /// The overlay window and everything rendered into it. **Main thread only.**
@@ -1031,27 +1003,6 @@ fn upload_sprite_texture(
     Some(texture)
 }
 
-/// Install the capture tick, a repeating timer on the main run loop. **Main thread only.**
-///
-/// Part of the pointer watch, so it runs for every device. Added in the
-/// common modes so it keeps firing while the main thread tracks a drag. The
-/// timer is leaked for the process lifetime like the observers.
-fn install_capture_tick() {
-    let block = RcBlock::new(|_: NonNull<NSTimer>| on_capture_tick_main());
-    // SAFETY: objc2 typed binding; the run loop copies the block.
-    let timer =
-        unsafe { NSTimer::timerWithTimeInterval_repeats_block(CAPTURE_TICK_SECONDS, true, &block) };
-    // Let the system fire it together with other wakeups: a capture noticed
-    // half a tick late costs nothing, a timer that cannot drift costs power.
-    timer.setTolerance(CAPTURE_TICK_SECONDS / 2.0);
-    // SAFETY: reading Foundation's run-loop-mode constant, an immutable static.
-    let mode = unsafe { NSRunLoopCommonModes };
-    // SAFETY: objc2 typed binding; the run loop retains the timer, and the
-    // timer is leaked below so the block it holds outlives every tick.
-    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, mode) };
-    core::mem::forget(timer);
-}
-
 /// Install the pointer watch: the mouse-move monitor and the activation observers.
 ///
 /// **Main thread only.** Called at every attach and installed once per
@@ -1063,7 +1014,6 @@ pub fn install_pointer_watch() {
     if POINTER_WATCH_INSTALLED.replace(true) {
         return;
     }
-    install_capture_tick();
     let monitor = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
         on_pointer_event_main();
         event.as_ptr()
