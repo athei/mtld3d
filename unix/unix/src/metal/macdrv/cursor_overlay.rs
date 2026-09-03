@@ -12,8 +12,11 @@
 //! window frame change makes `AppKit` re-resolve the cursor for the pointer's
 //! location, and with no cursor of our own to offer it lands on the arrow over
 //! the game's blank cursor on every mouse move; a layer moving inside a fixed
-//! window is invisible to that machinery. Show and hide park and unpark the
-//! same layer, so nothing at the window level changes at click rate either.
+//! window is invisible to that machinery. Show and hide swap the layer's
+//! pixels, a sprite or a transparent clear, so its surface stays in the
+//! window's scene: taking a surface out from above the game layer is free,
+//! putting one back costs the game's next present a refresh, and a game
+//! hiding the cursor while a button is held would pay that on every click.
 //!
 //! Threads. The thunk runs on the API thread and only writes [`SHARED`] and
 //! queues one main-thread apply, coalesced through [`APPLY_PENDING`] so a burst
@@ -75,15 +78,24 @@ use crate::metal::{command, present};
 /// shows every apply with the sprite, visibility and layer mode it landed.
 const LOG_TARGET: &str = "mtld3d::unix::cursor";
 
-/// Where the sprite layer sits while hidden: far outside any window.
-///
-/// Parking the layer instead of hiding the window keeps show and hide at the
-/// cost of one layer property write, which is what a cursor moving under a
-/// held mouse button needs at click rate.
+/// Where the sprite layer sits before it has ever been positioned.
 const PARKED: CGPoint = CGPoint {
     x: -100_000.0,
     y: -100_000.0,
 };
+
+/// What the sprite layer's drawable currently shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Content {
+    /// Nothing yet, or the last present was a transparent clear.
+    Transparent,
+    /// A sprite, tone-mapped for a layer mode and a headroom.
+    Sprite {
+        hash: u64,
+        mode: LayerMode,
+        peak: f32,
+    },
+}
 
 /// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
 ///
@@ -348,7 +360,7 @@ fn on_pointer_event_main() {
             return;
         };
         if let Some(overlay) = slot.as_mut()
-            && overlay.applied_hash != 0
+            && overlay.wanted.is_some()
         {
             overlay.sync_position(mtm);
         }
@@ -363,25 +375,14 @@ struct Overlay {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// One `MTLTexture` per sprite hash, uploaded on first render.
     textures: FxHashMap<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
-    /// The sprite currently rendered into the layer, `0` = none.
-    applied_hash: u64,
-    /// The headroom the rendered sprite was tone-mapped for.
-    applied_peak: f32,
+    /// What the layer's drawable shows right now.
+    content: Content,
     /// The layer configuration in place; `None` until the first apply.
     mode: Option<LayerMode>,
-    geometry: SpriteGeometry,
-    flags: OverlayFlags,
-}
-
-bitflags::bitflags! {
-    /// The overlay's two booleans.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    struct OverlayFlags: u8 {
-        /// The sprite layer sits under the pointer rather than parked away.
-        const SHOWN = 1 << 0;
-        /// The PE side's last word was "visible".
-        const WANTED_VISIBLE = 1 << 1;
-    }
+    /// The sprite the PE side wants shown, `None` until one was uploaded.
+    wanted: Option<(u64, SpriteGeometry)>,
+    /// The PE side's last word on visibility.
+    wanted_visible: bool,
 }
 
 impl Overlay {
@@ -474,11 +475,10 @@ impl Overlay {
             layer,
             queue,
             textures: FxHashMap::default(),
-            applied_hash: 0,
-            applied_peak: 1.0,
+            content: Content::Transparent,
             mode: None,
-            geometry: SpriteGeometry::default(),
-            flags: OverlayFlags::empty(),
+            wanted: None,
+            wanted_visible: false,
         })
     }
 
@@ -489,34 +489,16 @@ impl Overlay {
         } else {
             LayerMode::Sdr
         };
-        let mode_changed = self.mode != Some(mode);
-        if mode_changed {
+        if self.mode != Some(mode) {
             self.reconfigure_layer(mtm, mode);
         }
-        let peak = f32::from_bits(CURRENT_HEADROOM_BITS.load(Ordering::Relaxed));
-        self.flags.set(OverlayFlags::WANTED_VISIBLE, wanted.visible);
-
+        self.wanted_visible = wanted.visible;
         if wanted.hash == 0 {
             // Nothing to show, and after a detach nothing to keep either.
-            if self.applied_hash != 0 {
-                self.textures.clear();
-                self.applied_hash = 0;
-            }
+            self.textures.clear();
+            self.wanted = None;
         } else if let Some(geometry) = wanted.geometry {
-            let stale = wanted.hash != self.applied_hash
-                || mode_changed
-                || peak_changed(self.applied_peak, peak);
-            if stale && self.render(wanted.hash, geometry, mode, peak) {
-                self.applied_hash = wanted.hash;
-                self.applied_peak = peak;
-                self.geometry = geometry;
-                debug!(
-                    target: LOG_TARGET,
-                    "cursor: sprite {:#018x} rendered ({:.0}x{:.0} pt, hotspot ({:.0},{:.0}), {mode:?}, peak {peak:.2}x)",
-                    wanted.hash, geometry.width, geometry.height,
-                    geometry.hotspot_x, geometry.hotspot_y,
-                );
-            }
+            self.wanted = Some((wanted.hash, geometry));
         } else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -563,9 +545,47 @@ impl Overlay {
         );
     }
 
+    /// Present the pixels `content` names, if the drawable does not show them already.
+    ///
+    /// The layer's surface stays in the window's scene either way: hidden is a
+    /// transparent clear, never a removed layer.
+    fn ensure_content(&mut self, content: Content) {
+        if self.content == content {
+            return;
+        }
+        let presented = match content {
+            Content::Transparent => self.present_transparent(),
+            Content::Sprite { hash, mode, peak } => {
+                let Some((_, geometry)) = self.wanted.filter(|(wanted, _)| *wanted == hash) else {
+                    return;
+                };
+                self.render(hash, geometry, mode, peak)
+            }
+        };
+        if presented {
+            self.content = content;
+            debug!(target: LOG_TARGET, "cursor: overlay shows {content:?}");
+        }
+    }
+
+    /// Present a transparent drawable: the hidden state.
+    fn present_transparent(&self) -> bool {
+        let Some(drawable) = self.layer.nextDrawable() else {
+            return false;
+        };
+        let Some(cmd_buf) = self.queue.commandBuffer() else {
+            return false;
+        };
+        cmd_buf.setLabel(Some(&NSString::from_str("mtld3d-cursor-clear")));
+        command::clear_cursor_drawable(&cmd_buf, &drawable.texture());
+        cmd_buf.presentDrawable(ProtocolObject::from_ref(&*drawable));
+        cmd_buf.commit();
+        true
+    }
+
     /// Render sprite `hash` into the overlay's drawable, sized to the sprite.
     ///
-    /// `false` leaves the applied state alone so the next apply retries: the
+    /// `false` leaves the content state alone so the next event retries: the
     /// drawable pool can be momentarily empty, and a missing texture upload is
     /// reported once.
     fn render(&mut self, hash: u64, geometry: SpriteGeometry, mode: LayerMode, peak: f32) -> bool {
@@ -617,14 +637,19 @@ impl Overlay {
         }
         cmd_buf.presentDrawable(ProtocolObject::from_ref(&*drawable));
         cmd_buf.commit();
+        debug!(
+            target: LOG_TARGET,
+            "cursor: sprite {hash:#018x} rendered ({:.0}x{:.0} pt, hotspot ({:.0},{:.0}), {mode:?}, peak {peak:.2}x)",
+            geometry.width, geometry.height, geometry.hotspot_x, geometry.hotspot_y,
+        );
         true
     }
 
-    /// Level, position and visibility against the pointer and the game window as they are now.
+    /// Level, position and content against the pointer and the game window as they are now.
     fn sync_position(&mut self, mtm: MainThreadMarker) {
         let game = retain_bound_view().and_then(|view| view.window().map(|window| (view, window)));
         let Some((view, game_window)) = game else {
-            self.set_shown(false, PARKED);
+            self.ensure_content(Content::Transparent);
             return;
         };
         // Wine re-levels its windows across fullscreen transitions; stay one
@@ -650,7 +675,7 @@ impl Overlay {
         let mut inputs = VisibilityInputs::empty();
         inputs.set(
             VisibilityInputs::WANTED,
-            self.flags.contains(OverlayFlags::WANTED_VISIBLE) && self.applied_hash != 0,
+            self.wanted_visible && self.wanted.is_some(),
         );
         inputs.set(
             VisibilityInputs::APP_ACTIVE,
@@ -663,30 +688,43 @@ impl Overlay {
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
         let shown = overlay_visible(inputs);
-        let position = if shown {
-            let local = self.window.convertPointFromScreen(mouse);
-            let (x, y) = sprite_origin((local.x, local.y), self.geometry);
-            CGPoint { x, y }
-        } else {
-            PARKED
+        let Some((hash, geometry)) = self.wanted else {
+            self.ensure_content(Content::Transparent);
+            return;
         };
-        self.set_shown(shown, position);
+        // Follow the pointer whenever it is over the game, shown or not: the
+        // position write is free and keeps a hidden sprite where it will
+        // reappear.
+        if inputs.contains(VisibilityInputs::POINTER_INSIDE) {
+            let local = self.window.convertPointFromScreen(mouse);
+            let (x, y) = sprite_origin((local.x, local.y), geometry);
+            self.set_position(CGPoint { x, y });
+        }
+        if shown {
+            let mode = self.mode.unwrap_or(LayerMode::Sdr);
+            let peak = f32::from_bits(CURRENT_HEADROOM_BITS.load(Ordering::Relaxed));
+            // Re-render on a sprite or layer-mode change, and on a headroom
+            // move worth it; otherwise the drawable already shows this sprite.
+            let peak = match self.content {
+                Content::Sprite {
+                    hash: h,
+                    mode: m,
+                    peak: p,
+                } if h == hash && m == mode && !peak_changed(p, peak) => p,
+                _ => peak,
+            };
+            self.ensure_content(Content::Sprite { hash, mode, peak });
+        } else {
+            self.ensure_content(Content::Transparent);
+        }
     }
 
-    /// Move the sprite layer, under the pointer or parked, without an implicit animation.
-    fn set_shown(&mut self, shown: bool, position: CGPoint) {
-        let was_shown = self.flags.contains(OverlayFlags::SHOWN);
-        if !shown && !was_shown {
-            return;
-        }
+    /// Move the sprite layer without an implicit animation.
+    fn set_position(&self, position: CGPoint) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         self.layer.setPosition(position);
         CATransaction::commit();
-        if was_shown != shown {
-            self.flags.set(OverlayFlags::SHOWN, shown);
-            debug!(target: LOG_TARGET, "cursor: overlay {}", if shown { "shown" } else { "hidden" });
-        }
     }
 }
 

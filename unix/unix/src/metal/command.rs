@@ -906,21 +906,43 @@ fn clear_drawable(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     drawable: &ProtocolObject<dyn MTLTexture>,
 ) {
+    clear_texture(cmd_buf, drawable, 1.0, "mtld3d-present-clear");
+}
+
+/// Clear the software cursor's drawable to transparent black.
+///
+/// The hidden state of the overlay: the layer keeps a surface in the window's
+/// scene, it just carries nothing, so the compositor's arrangement above the
+/// game layer does not change when the cursor comes back.
+pub fn clear_cursor_drawable(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+) {
+    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear");
+}
+
+/// One empty render pass that clears `texture` to black at `alpha`.
+fn clear_texture(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    alpha: f64,
+    label: &str,
+) {
     let pass_desc = MTLRenderPassDescriptor::new();
     // SAFETY: `colorAttachments()` returns a non-null descriptor array;
     // subscript 0 is always valid.
     let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
-    color0.setTexture(Some(drawable));
+    color0.setTexture(Some(texture));
     color0.setLoadAction(MTLLoadAction::Clear);
     color0.setClearColor(MTLClearColor {
         red: 0.0,
         green: 0.0,
         blue: 0.0,
-        alpha: 1.0,
+        alpha,
     });
     color0.setStoreAction(MTLStoreAction::Store);
     if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
-        let label = objc2_foundation::NSString::from_str("mtld3d-present-clear");
+        let label = objc2_foundation::NSString::from_str(label);
         enc.setLabel(Some(&label));
         enc.endEncoding();
     }
