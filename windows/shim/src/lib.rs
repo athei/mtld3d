@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 
 use log::{error, info};
-use mtld3d_shared::identity;
+use mtld3d_shared::{WriteLogParams, identity};
 
 const LOG_TARGET: &str = "mtld3d::shim";
 
@@ -25,8 +25,39 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
         return 1;
     }
 
-    mtld3d_shared::init_logger();
+    // The dispatcher stub initialises the unix call on first use, so the
+    // sink is usable from here; the unix side keeps the line for the
+    // process's log file.
+    mtld3d_shared::init_logger_to(Box::new(LogSink));
     attach_process(instance)
+}
+
+/// The shim's `env_logger` target: each line straight through `WriteLog`.
+///
+/// The shim logs a line or two at load; a synchronous thunk per line is
+/// cheaper than a queue and thread of its own.
+struct LogSink;
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(len) = u32::try_from(buf.len()) else {
+            return Ok(buf.len());
+        };
+        let mut params = WriteLogParams {
+            ptr: buf.as_ptr() as usize as u64,
+            len,
+            pad0: 0,
+        };
+        let _ = dispatch_unix_call(
+            <WriteLogParams as mtld3d_shared::Thunk>::CODE,
+            (&raw mut params).cast::<c_void>(),
+        );
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[unsafe(no_mangle)]

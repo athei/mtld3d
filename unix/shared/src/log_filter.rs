@@ -5,22 +5,18 @@
 /// thunk on the unix side). `try_init` is idempotent so repeat calls silently
 /// no-op.
 ///
-/// Forces `WriteStyle::Always` on every target: the PE side runs inside
-/// Wine where stderr-is-a-TTY auto-detection returns false even when
-/// macOS fd 2 is a real terminal, and we want consistent colour across
-/// all three linkage units. `NO_COLOR=1` opts out — `env_logger` only reads
-/// it under `WriteStyle::Auto`, so we have to pre-resolve the choice here.
+/// Every line goes to the process's log file (see the `OpenLog` thunk), so
+/// no target ever colours: `WriteStyle::Never` on all three linkage units
+/// keeps escape sequences out of the file.
 pub fn init_logger() {
     init(None);
 }
 
 /// Register `env_logger` writing every formatted line into `sink`.
 ///
-/// The PE side uses this with a sink that crosses to the unix side: a game a
-/// launcher spawned often has no usable Windows standard handles, so the
-/// default stderr target would discard every line, while the unix side's
-/// stderr is the launcher's log regardless. Filter and style match
-/// [`init_logger`].
+/// The PE side uses this with a sink that crosses to the unix side, which
+/// owns the process's log file; the unix side uses it with the file itself.
+/// Filter and style match [`init_logger`].
 pub fn init_logger_to(sink: Box<dyn std::io::Write + Send + 'static>) {
     init(Some(sink));
 }
@@ -28,13 +24,10 @@ pub fn init_logger_to(sink: Box<dyn std::io::Write + Send + 'static>) {
 fn init(sink: Option<Box<dyn std::io::Write + Send + 'static>>) {
     let user = std::env::var("RUST_LOG").ok();
     let filter = resolved_log_filter(user.as_deref());
-    let style = if std::env::var_os("NO_COLOR").is_some() {
-        env_logger::WriteStyle::Never
-    } else {
-        env_logger::WriteStyle::Always
-    };
     let mut builder = env_logger::Builder::new();
-    builder.parse_filters(&filter).write_style(style);
+    builder
+        .parse_filters(&filter)
+        .write_style(env_logger::WriteStyle::Never);
     if let Some(sink) = sink {
         builder.target(env_logger::Target::Pipe(sink));
     }

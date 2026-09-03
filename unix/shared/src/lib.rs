@@ -8,6 +8,7 @@ pub mod ftol;
 pub mod identity;
 mod log_filter;
 mod log_helpers;
+pub mod log_paths;
 pub mod mtl;
 pub mod mtl_handle;
 mod params;
@@ -30,9 +31,10 @@ pub use params::{
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
     ExtraColorAttachmentParams, ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams,
-    InitLoggerParams, PassDescriptor, SetDisplaySyncEnabledParams, StartGpuCaptureParams,
-    StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams,
+    InitLoggerParams, OpenLogParams, PassDescriptor, SetDisplaySyncEnabledParams,
+    StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
+    WriteLogParams,
 };
 
 #[repr(u32)]
@@ -64,6 +66,7 @@ pub enum Thunks {
     CreateTextureSliceView,
     GetTaskFaults,
     WriteLog,
+    OpenLog,
 }
 
 pub trait Thunk {

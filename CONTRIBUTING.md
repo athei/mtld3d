@@ -71,7 +71,9 @@ and still shows as passing means that hook is not in place.
 So capture with a plain redirect, in this order, `make test > out.log 2>&1`, and
 judge the run by grepping per-test results on both architectures rather than by
 the summary or by `$?`. Every test name appears once per architecture, and the
-occasional `LEAK` line is benign.
+occasional `LEAK` line is benign. The runner's output carries the harness's own
+lines only; mtld3d's log of each test process is a file, `<test>-<pid>.log` under
+`mtld3d-logs` next to the test executable in `windows/target`.
 
 ## Which suite is right when they disagree
 

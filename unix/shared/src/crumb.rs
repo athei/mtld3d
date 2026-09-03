@@ -189,17 +189,18 @@ mod enabled {
         unsafe { core::ptr::write(entry_ptr, new_entry) };
     }
 
-    /// Dump the last `n` entries to the side's stderr sink.
+    /// Dump the last `n` entries to the side's write sink.
     ///
-    /// Async-signal-safe: only `write` (unix) / `WriteFile` (PE), no
-    /// allocator, no locks. Tolerates torn writes on the most recent slot
-    /// (skipped if `seq` doesn't match the expected position).
+    /// Async-signal-safe: only a raw `write` on the unix side and the
+    /// synchronous log thunk on the PE side, no allocator, no locks.
+    /// Tolerates torn writes on the most recent slot (skipped if `seq`
+    /// doesn't match the expected position).
     #[inline]
-    /// Route every dump line through `sink` as well as stderr.
+    /// Route every dump line through `sink`.
     ///
-    /// The PE side installs its unix log thunk here: a launcher-spawned
-    /// game has no stderr handle, so a dump written only there is lost.
-    /// No-op on unix, where stderr is the log already.
+    /// The PE side installs its synchronous unix log thunk here, the unix
+    /// side the raw-descriptor writer of its log file; until a sink is set
+    /// the unix side falls back to fd 2 and the PE side drops the line.
     pub fn set_write_sink(sink: fn(&[u8])) {
         platform::set_write_sink(sink);
     }
@@ -300,7 +301,12 @@ mod enabled {
 
         use super::{Entry, FILE_SIZE, Header};
 
-        pub fn set_write_sink(_sink: fn(&[u8])) {}
+        /// Where dump lines go, see `enabled::set_write_sink`.
+        static WRITE_SINK: std::sync::OnceLock<fn(&[u8])> = std::sync::OnceLock::new();
+
+        pub fn set_write_sink(sink: fn(&[u8])) {
+            let _ = WRITE_SINK.set(sink);
+        }
 
         pub fn current_tid() -> u32 {
             // SAFETY: pthread_self is async-signal-safe.
@@ -313,6 +319,12 @@ mod enabled {
         }
 
         pub fn write_str(bytes: &[u8]) {
+            // The sink writes the process's log file on its raw descriptor
+            // (async-signal-safe); until one is set, fd 2 is all there is.
+            if let Some(sink) = WRITE_SINK.get() {
+                sink(bytes);
+                return;
+            }
             // SAFETY: write(2) on fd 2 is async-signal-safe.
             unsafe {
                 let _ = libc::write(2, bytes.as_ptr().cast::<c_void>(), bytes.len());
@@ -386,9 +398,8 @@ mod enabled {
         const PAGE_READWRITE: u32 = 0x04;
         const FILE_MAP_WRITE: u32 = 0x02;
         const INVALID_HANDLE_VALUE: *mut c_void = !0usize as *mut c_void;
-        const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
-        /// Extra destination for dump lines, see `enabled::set_write_sink`.
+        /// Where dump lines go, see `enabled::set_write_sink`.
         static WRITE_SINK: std::sync::OnceLock<fn(&[u8])> = std::sync::OnceLock::new();
 
         pub fn set_write_sink(sink: fn(&[u8])) {
@@ -421,14 +432,6 @@ mod enabled {
                 dw_number_of_bytes_to_map: u32,
             ) -> *mut c_void;
             fn GetCurrentThreadId() -> u32;
-            fn GetStdHandle(n_std_handle: u32) -> *mut c_void;
-            fn WriteFile(
-                h_file: *mut c_void,
-                lp_buffer: *const u8,
-                n_number_of_bytes_to_write: u32,
-                lp_number_of_bytes_written: *mut u32,
-                lp_overlapped: *mut c_void,
-            ) -> i32;
         }
 
         pub fn current_tid() -> u32 {
@@ -437,24 +440,11 @@ mod enabled {
         }
 
         pub fn write_str(bytes: &[u8]) {
+            // The sink is the synchronous `WriteLog` thunk, which lands in
+            // the process's log file; a PE side without one has nowhere a
+            // dump line could go.
             if let Some(sink) = WRITE_SINK.get() {
                 sink(bytes);
-            }
-            // SAFETY: kernel32 WriteFile on the std error handle. Wine
-            // routes fd 2 and STD_ERROR_HANDLE to the same terminal.
-            unsafe {
-                let h = GetStdHandle(STD_ERROR_HANDLE);
-                if h.is_null() || h == INVALID_HANDLE_VALUE {
-                    return;
-                }
-                let mut written = 0u32;
-                let _ = WriteFile(
-                    h,
-                    bytes.as_ptr(),
-                    u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-                    &raw mut written,
-                    core::ptr::null_mut(),
-                );
             }
         }
 

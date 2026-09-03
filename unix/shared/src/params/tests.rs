@@ -40,6 +40,14 @@ fn attach_metal_layer_layout() {
 }
 
 #[test]
+fn open_log_layout() {
+    use super::OpenLogParams;
+    // 2*u64 + 4*u32 = 16 + 16 = 32
+    assert_eq!(core::mem::align_of::<OpenLogParams>(), 8);
+    assert_eq!(core::mem::size_of::<OpenLogParams>(), 32);
+}
+
+#[test]
 fn set_display_sync_enabled_layout() {
     use super::SetDisplaySyncEnabledParams;
     // u64 + u32 + u32 = 8 + 4 + 4 = 16

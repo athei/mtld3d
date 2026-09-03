@@ -27,7 +27,7 @@ A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) 
 
 A dedicated **submit thread** (one per device) executes the `SubmitFrame` thunk — the cross-boundary command replay, the `nextDrawable` wait, present, and commit — overlapping the encoder's build of the next frame. The frame crosses as an owned `FramePayload` holding every buffer the thunk aliases by raw pointer; two payloads ping-pong over a cap-1 work channel, so render-ahead is bounded at one frame. Rare synchronous submits (`Reset`, mid-frame flushes, GPU capture) first drain the submit thread to idle, then run the thunk inline on the encoder thread — the two paths never call `SubmitFrame` concurrently and present order is preserved.
 
-A **log thread** (one per process) is the only thread that thunks for logging. d3d9.dll's `env_logger` sink pushes each formatted line onto an unbounded channel and returns, so a log line costs the API and encoder threads an allocation and a queue push; the log thread drains the queue and forwards every line through the `WriteLog` thunk to the process's unix stderr, the stream wine's own debug output and the unix side's logger use, whatever Windows standard handles the process was started with. The thread starts from the first `Direct3DCreate9`, never from `DllMain` (loader lock); lines logged before that wait in the queue.
+A **log thread** (one per process) is the only thread that thunks for logging. d3d9.dll's `env_logger` sink pushes each formatted line onto an unbounded channel and returns, so a log line costs the API and encoder threads an allocation and a queue push; the log thread drains the queue and forwards every line through the `WriteLog` thunk into the process's log file, which the unix side owns and its own logger and crash handler write too. The thread starts from the first `Direct3DCreate9`, never from `DllMain` (loader lock), after the resolved `mtld3d.conf` has named the file's location through the `OpenLog` thunk; lines logged before that wait in the queue on the PE side and in the file sink's backlog on the unix side, so the file starts with the identity lines.
 
 ```
 API thread                     Encoder thread              Submit thread
@@ -120,7 +120,7 @@ Counter aggregation — mixing these up misreads the log:
 - **Cache-size snapshots**: point-in-time at window emit, neither averaged nor summed.
 - **Peak counters** (`peak …` cells): max value on any single frame in the window.
 
-ANSI colour by default. Override with `NO_COLOR=1` (no escapes when redirecting to a file) or `CLICOLOR_FORCE=1`. Auto-detection via `is_terminal()` is not used: under Wine the Windows console check returns false even when macOS fd 2 is a real TTY.
+No ANSI colour anywhere: every line goes to the process's log file, and `env_logger` is told so (`WriteStyle::Never`) rather than left to auto-detect a terminal, which under Wine would be wrong in both directions.
 
 ### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
 

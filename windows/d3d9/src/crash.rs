@@ -52,7 +52,6 @@ const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xC000_0409;
 const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -295,14 +294,6 @@ unsafe extern "system" {
         buffer: *mut MemoryBasicInformation,
         length: usize,
     ) -> usize;
-    fn GetStdHandle(handle: u32) -> *mut c_void;
-    fn WriteFile(
-        h_file: *mut c_void,
-        buf: *const u8,
-        n: u32,
-        written: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
 }
 
 /// Install the VEH and the panic hook. Idempotent.
@@ -519,25 +510,9 @@ fn emit_fatal(code: u32, addr: *mut c_void) {
 }
 
 fn write_stderr(bytes: &[u8]) {
-    // The unix side first: a launcher-spawned game has no usable stderr
-    // handle, so that route is the one that reaches the launcher's log.
+    // Synchronously through the unix side, into the process's log file: a
+    // launcher-spawned game has no usable stderr handle of its own.
     crate::log_sink::write_raw(bytes);
-    // SAFETY: kernel32 stable export.
-    let h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
-    if h.is_null() {
-        return;
-    }
-    let mut written = 0u32;
-    // SAFETY: WriteFile on STD_ERROR_HANDLE with a valid buffer slice.
-    unsafe {
-        let _ = WriteFile(
-            h,
-            bytes.as_ptr(),
-            u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-            &raw mut written,
-            core::ptr::null_mut(),
-        );
-    }
 }
 
 fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {

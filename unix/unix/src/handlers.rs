@@ -8,7 +8,7 @@ use mtld3d_shared::{
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle,
+    GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, OpenLogParams,
     SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
     VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
     mtl::{DestroyKind, QuadPipelineKind},
@@ -33,7 +33,9 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
     // here rather than each callee carrying its own idempotency flag.
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        mtld3d_shared::init_logger();
+        // Every line goes to the process's log file once `OpenLog` names
+        // it; the file sink keeps the lines logged before that.
+        mtld3d_shared::init_logger_to(Box::new(crate::log_file::FileSink));
         log_identity();
         // Latch the unix-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
         // from `RUST_LOG`. Per-cdylib because each cdylib has its own
@@ -42,6 +44,7 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
         // Map the shared crash crumb (cfg-gated no-op in production) and
         // install the always-on signal handler.
         mtld3d_shared::crumb::init();
+        mtld3d_shared::crumb::set_write_sink(crate::log_file::write_bytes);
         crate::crash::install();
         // Declare to macOS that we're a latency-critical game, not idle UI, so
         // it keeps the process out of App Nap / display throttling and the
@@ -54,11 +57,9 @@ pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
 
 /// `WriteLog`: the sink behind the PE-side logger.
 ///
-/// Writes the formatted line to this process's unix stderr, the stream wine's
-/// own debug output uses, so d3d9.dll lines land next to the unix side's
-/// whatever Windows standard handles the process was started with (a game a
-/// launcher spawned often has none, and `std::io::stderr` on the PE side
-/// would discard the line).
+/// Writes the formatted line into this process's log file, next to the unix
+/// side's own lines; the PE side has no usable standard handles of its own
+/// when a launcher spawned the game.
 pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut WriteLogParams.
     let Some(params) = (unsafe { InPtrMut::<WriteLogParams>::opt(args) }) else {
@@ -71,10 +72,41 @@ pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
     // duration; the pointer is non-zero per the check above.
     let bytes =
         unsafe { core::slice::from_raw_parts(params.ptr as *const u8, params.len as usize) };
-    let mut stderr = std::io::stderr().lock();
-    if std::io::Write::write_all(&mut stderr, bytes).is_err() {
-        return STATUS_UNSUCCESSFUL;
+    crate::log_file::write_all(bytes);
+    STATUS_SUCCESS
+}
+
+/// `OpenLog`: where this process's log file and GPU traces go, once per process.
+///
+/// The lines logged since `InitLogger` wait in the file sink's backlog for
+/// this, so the PE side sends it before it starts its own log thread. The
+/// file itself appears with the first line written after this.
+pub extern "C" fn open_log_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut OpenLogParams.
+    let Some(params) = (unsafe { InPtrMut::<OpenLogParams>::opt(args) }) else {
+        return -1;
+    };
+    if params.dir_ptr == 0 || params.dir_len == 0 || params.stem_ptr == 0 {
+        // The PE side found no usable location; its warn said why.
+        crate::log_file::fall_back_to_stderr();
+        return STATUS_SUCCESS;
     }
+    // SAFETY: PE supplied `dir_ptr`/`dir_len` as a byte slice valid for the
+    // call duration; the pointer is non-zero per the check above.
+    let dir = unsafe {
+        core::slice::from_raw_parts(params.dir_ptr as *const u8, params.dir_len as usize)
+    };
+    // SAFETY: same contract for `stem_ptr`/`stem_len`.
+    let stem = unsafe {
+        core::slice::from_raw_parts(params.stem_ptr as *const u8, params.stem_len as usize)
+    };
+    let (Ok(dir), Ok(stem)) = (core::str::from_utf8(dir), core::str::from_utf8(stem)) else {
+        warn!(target: LOG_TARGET, "OpenLog: the location is not UTF-8, logging to stderr");
+        crate::log_file::fall_back_to_stderr();
+        return STATUS_UNSUCCESSFUL;
+    };
+    let path = crate::log_file::open(dir, stem, params.pid);
+    info!(target: LOG_TARGET, "log file: {}", path.display());
     STATUS_SUCCESS
 }
 

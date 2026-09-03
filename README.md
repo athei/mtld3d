@@ -446,10 +446,10 @@ gets one `[dump]` line at info level for every D3D9 event of those frames
 that a GPU trace cannot show: render-target, depth-stencil, viewport and
 scissor changes, clears, surface copies, occlusion query traffic, and every
 draw with the states that decide its pass shape, its shaders and its
-textures. At the same time a Metal GPU trace of the same frames lands at
-`/tmp/mtld3d_capture.gputrace`, overwritten by the next press; the process
-needs `MTL_CAPTURE_ENABLED=1` in its environment for that half (the launcher
-passes it through), otherwise the log says so and the dump still runs. The
+textures. At the same time a Metal GPU trace of the same frames lands beside
+the process's log file as `<exe>-<pid>-<n>.gputrace`, numbered per press; the
+process needs `MTL_CAPTURE_ENABLED=1` in its environment for that half (the
+launcher passes it through), otherwise the log says so and the dump still runs. The
 two sides name each other: each `frame end` line carries the label of the
 frame's command buffer, and every dumped draw sits in a `draw N` debug group
 in the trace, so `gpudebug`'s `find` or Xcode's search lands on it directly.
@@ -457,6 +457,14 @@ in the trace, so `gpudebug`'s `find` or Xcode's search lands on it directly.
 Each cdylib initializes the logger independently and idempotently; `mtld3d.so`
 has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger`
 thunk from its init path.
+
+Every line goes to a file, never to the process's standard streams: a game a
+launcher spawned has no usable ones, and a launcher's own log dies with its
+pipe. Each process writes `<exe>-<pid>.log` into `mtld3d-logs` beside the
+executable, so a launch never overwrites the log of the one before it, and
+the GPU traces F12 captures land next to it as `<exe>-<pid>-<n>.gputrace`.
+`log.dir` in `mtld3d.conf` moves the directory; the file appears with the
+first line written, so a process that logs nothing leaves nothing behind.
 
 ## Contributing
 

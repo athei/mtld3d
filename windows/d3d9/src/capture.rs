@@ -20,8 +20,8 @@
 //! `take_request()` and arms `frame_dump_present`, which marks the first
 //! and last frame of the run with `FrameDataFlags::GPU_CAPTURE_START` /
 //! `GPU_CAPTURE_STOP`. The encoder thread brackets those frames with the
-//! `StartGpuCapture` / `StopGpuCapture` thunks. Output is
-//! `/tmp/mtld3d_capture.gputrace`, overwritten per press.
+//! `StartGpuCapture` / `StopGpuCapture` thunks. The trace lands next to
+//! the process's log file, numbered per press.
 //!
 //! [`FrameDump::FRAMES`]: crate::device::frame_dump::FrameDump::FRAMES
 

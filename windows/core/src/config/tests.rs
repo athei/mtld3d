@@ -28,6 +28,7 @@ fn defaults_match_documented_values() {
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
     assert!(d.shader_cache_enable);
+    assert!(d.log_dir.is_empty());
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
     assert!(d.query_flush_immediate);
@@ -311,6 +312,14 @@ fn quoted_string_value_preserves_inner_whitespace() {
 fn unquoted_string_value_is_trimmed() {
     let cfg = parse(None, "debug.bytecodeDumpDir = /tmp/x\n", None);
     assert_eq!(cfg.bytecode_dump_dir, "/tmp/x");
+}
+
+#[test]
+fn log_dir_is_a_plain_string() {
+    let cfg = parse(None, "log.dir = logs\\mtld3d\n", None);
+    assert_eq!(cfg.log_dir, "logs\\mtld3d");
+    let cfg = parse(None, "", Some("log.dir=C:\\mtld3d-logs"));
+    assert_eq!(cfg.log_dir, "C:\\mtld3d-logs");
 }
 
 #[test]
