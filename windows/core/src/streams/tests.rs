@@ -91,3 +91,56 @@ fn instanced_read_bytes_round_up_and_saturate() {
         u32::MAX
     );
 }
+
+#[test]
+fn zero_stride_binds_one_constant_element() {
+    // D3D9: a zero `SetStreamSource` stride feeds every vertex the element at
+    // the stream offset; Metal spells that as a `Constant` layout.
+    assert_eq!(
+        bound_stream_layout(0, 28, STREAM_FREQ_DEFAULT),
+        StreamLayout {
+            stride: 28,
+            step: VertexStepFunction::Constant,
+            step_rate: 0,
+        }
+    );
+    // The stride wins over an instancing frequency: one element either way.
+    assert_eq!(
+        bound_stream_layout(0, 12, D3DSTREAMSOURCE_INSTANCEDATA | 2),
+        StreamLayout {
+            stride: 12,
+            step: VertexStepFunction::Constant,
+            step_rate: 0,
+        }
+    );
+}
+
+#[test]
+fn non_zero_stride_steps_per_frequency_word() {
+    assert_eq!(
+        bound_stream_layout(48, 36, STREAM_FREQ_DEFAULT),
+        StreamLayout {
+            stride: 48,
+            step: VertexStepFunction::PerVertex,
+            step_rate: 1,
+        }
+    );
+    assert_eq!(
+        bound_stream_layout(12, 12, D3DSTREAMSOURCE_INSTANCEDATA | 2),
+        StreamLayout {
+            stride: 12,
+            step: VertexStepFunction::PerInstance,
+            step_rate: 2,
+        }
+    );
+}
+
+#[test]
+fn layout_stride_widens_below_the_consumed_extent() {
+    assert_eq!(layout_stride(48, 36), 48);
+    assert_eq!(layout_stride(36, 36), 36);
+    // A stride below the consumed extent is unencodable in Metal: widened.
+    assert_eq!(layout_stride(16, 28), 28);
+    // Zero is the declaration extent for the inline (UP) path.
+    assert_eq!(layout_stride(0, 28), 28);
+}

@@ -10,6 +10,8 @@
 use mtld3d_shared::mtl::VertexStepFunction;
 use mtld3d_types::{D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, MAX_STREAMS};
 
+use crate::pipeline_state::StreamLayout;
+
 /// Mask of the count half of a frequency word.
 ///
 /// Both flag bits sit above it; the runtime ignores bits 23..30.
@@ -137,6 +139,57 @@ pub const fn instanced_stream_read_bytes(
     match elements.checked_mul(stride) {
         Some(bytes) => bytes,
         None => u32::MAX,
+    }
+}
+
+/// The stride a stream's vertex buffer layout steps by.
+///
+/// The application's stride wins when it covers the extent of the declaration
+/// elements the shader consumes on that stream (it can exceed it when the
+/// vertex struct carries fields past them). A zero stride returns the extent:
+/// the inline (UP) path has no other span, and [`bound_stream_layout`] pairs it
+/// with a `Constant` step. A non-zero stride smaller than the consumed extent
+/// means the shader reads an attribute past the end of each vertex, which
+/// Metal rejects as a pipeline, so the layout is widened to the extent with a
+/// warning; the affected draw fetches wrong data either way.
+#[must_use]
+pub fn layout_stride(app_stride: u32, extent: u32) -> u32 {
+    if app_stride == 0 {
+        return extent;
+    }
+    if app_stride < extent {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "stream stride {app_stride} below the consumed declaration extent {extent}; layout widened to the extent"
+        );
+        return extent;
+    }
+    app_stride
+}
+
+/// The vertex buffer layout of a stream with a vertex buffer bound.
+///
+/// `app_stride` and `freq` are the stream's `SetStreamSource` stride and
+/// `SetStreamSourceFreq` word, `extent` the span of the declaration elements
+/// the shader consumes on it. A zero stride is D3D9's way of binding one
+/// element to a whole draw: every vertex and instance reads the element at the
+/// stream offset, whatever the frequency word says, which Metal spells as a
+/// `Constant` layout (there is no zero-stride layout, and stepping such a
+/// stream per vertex would fetch past the buffer's end). Any other stride
+/// steps per the frequency word.
+#[must_use]
+pub fn bound_stream_layout(app_stride: u32, extent: u32, freq: u32) -> StreamLayout {
+    if app_stride == 0 {
+        return StreamLayout {
+            stride: extent,
+            step: VertexStepFunction::Constant,
+            step_rate: 0,
+        };
+    }
+    let (step, step_rate) = stream_step(freq);
+    StreamLayout {
+        stride: layout_stride(app_stride, extent),
+        step,
+        step_rate,
     }
 }
 
