@@ -12,7 +12,8 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use super::{
-    Sprite, SpriteGeometry, VisibilityInputs, overlay_visible, peak_changed, rect_contains,
+    CAPTURE_SILENCE_MS, HEAL_SILENCE_MS, Sprite, SpriteGeometry, VisibilityInputs,
+    heal_after_silence, overlay_visible, peak_changed, pointer_captured, rect_contains,
     sprite_origin,
 };
 
@@ -80,6 +81,30 @@ fn an_occluded_or_miniaturized_game_window_hides_the_overlay() {
     assert!(!overlay_visible(shown | VisibilityInputs::OCCLUDED));
     assert!(!overlay_visible(shown | VisibilityInputs::MINIATURIZED));
     assert!(!overlay_visible(VisibilityInputs::empty()));
+}
+
+#[test]
+fn a_captured_pointer_hides_the_overlay() {
+    let shown =
+        VisibilityInputs::WANTED | VisibilityInputs::APP_ACTIVE | VisibilityInputs::POINTER_INSIDE;
+    assert!(!overlay_visible(shown | VisibilityInputs::CAPTURED));
+}
+
+#[test]
+fn pointer_is_captured_only_when_it_moves_without_events() {
+    assert!(pointer_captured(CAPTURE_SILENCE_MS, true));
+    assert!(pointer_captured(CAPTURE_SILENCE_MS * 10, true));
+    // Idle pointer: silence is just idleness.
+    assert!(!pointer_captured(CAPTURE_SILENCE_MS * 10, false));
+    // Moving with events flowing: the events are what we saw it with.
+    assert!(!pointer_captured(CAPTURE_SILENCE_MS - 1, true));
+}
+
+#[test]
+fn only_a_long_silence_re_sets_the_blank_cursor() {
+    assert!(heal_after_silence(HEAL_SILENCE_MS));
+    assert!(!heal_after_silence(HEAL_SILENCE_MS - 1));
+    assert!(!heal_after_silence(8));
 }
 
 #[test]

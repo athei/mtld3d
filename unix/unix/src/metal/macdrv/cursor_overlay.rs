@@ -32,6 +32,16 @@
 //! its client rectangle and its screen are read from the bound view at every
 //! event, so in-game resolution changes, windowed/fullscreen switches and
 //! display moves need no signal from the PE side.
+//!
+//! Two things the pointer can do without telling this process, both handled
+//! here. A system tool that takes the pointer (the interactive screenshot
+//! crosshair) delivers no mouse events to the application while the pointer
+//! keeps moving; a low-rate tick notices the pointer moving with no events
+//! arriving and hides the sprite until events resume. And when such a tool
+//! ends, the window server shows the standard arrow rather than the blank
+//! cursor Wine set, which Wine never re-applies because its handle did not
+//! change; the first event after such a silence re-sets a blank cursor of
+//! our own while the sprite is shown.
 
 use core::{cell::RefCell, ptr::NonNull};
 use std::{
@@ -40,6 +50,7 @@ use std::{
         LazyLock, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use block2::RcBlock;
@@ -48,15 +59,20 @@ use mtld3d_shared::{
     SetCursorOverlayParams,
     mtl::{ColorSpacePolicy, CursorOverlayFlags},
 };
-use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    AllocAnyThread, MainThreadMarker, MainThreadOnly, rc::Retained, runtime::ProtocolObject,
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
-    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
-    NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSCursor, NSEvent,
+    NSEventMask, NSImage, NSScreen, NSView, NSWindow, NSWindowAnimationBehavior,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSDictionary, NSNotification, NSNotificationCenter, NSString};
+use objc2_foundation::{
+    NSDictionary, NSNotification, NSNotificationCenter, NSRunLoop, NSRunLoopCommonModes, NSString,
+    NSTimer,
+};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
     MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
@@ -95,6 +111,37 @@ enum Content {
         mode: LayerMode,
         peak: f32,
     },
+}
+
+/// How often the pointer is checked for moving without events reaching us, seconds.
+///
+/// Four times a second is enough to take the sprite away within a quarter
+/// second of a system tool grabbing the pointer, and costs one `mouseLocation`
+/// read per tick.
+const CAPTURE_TICK_SECONDS: f64 = 0.25;
+
+/// How long without a mouse event before a moved pointer counts as captured.
+const CAPTURE_SILENCE_MS: u128 = 200;
+
+/// How long a silence has to be for the next event to re-set the blank cursor.
+///
+/// Anything that borrows the pointer, the screenshot crosshair included,
+/// silences this process for longer than that and can leave a visible cursor
+/// behind; an idle pointer that resumes moving costs one cursor set.
+const HEAL_SILENCE_MS: u128 = 500;
+
+/// Whether the first event after a silence should re-set the blank cursor.
+const fn heal_after_silence(silence_ms: u128) -> bool {
+    silence_ms >= HEAL_SILENCE_MS
+}
+
+/// Whether the pointer moved while no mouse event reached this process.
+///
+/// A system tool that takes the pointer (the screenshot crosshair) leaves the
+/// application eventless while the pointer keeps moving; that is the only way
+/// the two disagree.
+const fn pointer_captured(silence_ms: u128, pointer_moved: bool) -> bool {
+    pointer_moved && silence_ms >= CAPTURE_SILENCE_MS
 }
 
 /// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
@@ -186,6 +233,8 @@ bitflags::bitflags! {
         const OCCLUDED = 1 << 3;
         /// The game window sits in the Dock.
         const MINIATURIZED = 1 << 4;
+        /// A system tool has the pointer: it moves while no events reach us.
+        const CAPTURED = 1 << 5;
     }
 }
 
@@ -193,7 +242,11 @@ bitflags::bitflags! {
 const fn overlay_visible(inputs: VisibilityInputs) -> bool {
     inputs.contains(VisibilityInputs::WANTED.union(VisibilityInputs::APP_ACTIVE))
         && inputs.contains(VisibilityInputs::POINTER_INSIDE)
-        && !inputs.intersects(VisibilityInputs::OCCLUDED.union(VisibilityInputs::MINIATURIZED))
+        && !inputs.intersects(
+            VisibilityInputs::OCCLUDED
+                .union(VisibilityInputs::MINIATURIZED)
+                .union(VisibilityInputs::CAPTURED),
+        )
 }
 
 /// The sprite layer's origin that puts the sprite's hotspot under the pointer.
@@ -362,6 +415,40 @@ fn on_pointer_event_main() {
         if let Some(overlay) = slot.as_mut()
             && overlay.wanted.is_some()
         {
+            let silence_ms = overlay.last_event.0.elapsed().as_millis();
+            overlay.last_event = (Instant::now(), NSEvent::mouseLocation());
+            if overlay.captured {
+                overlay.captured = false;
+                debug!(target: LOG_TARGET, "cursor: mouse events resumed, pointer released");
+            }
+            overlay.sync_position(mtm);
+            if heal_after_silence(silence_ms) {
+                overlay.heal_system_cursor();
+            }
+        }
+    });
+}
+
+/// The capture tick: hide the sprite while a system tool has the pointer. **Main thread only.**
+fn on_capture_tick_main() {
+    // SAFETY: the timer fires on the main run loop.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    OVERLAY.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return;
+        };
+        let Some(overlay) = slot.as_mut() else {
+            return;
+        };
+        if overlay.captured || !matches!(overlay.content, Content::Sprite { .. }) {
+            return;
+        }
+        let (at, seen) = overlay.last_event;
+        let now = NSEvent::mouseLocation();
+        let moved = (now.x - seen.x).abs() > 0.5 || (now.y - seen.y).abs() > 0.5;
+        if pointer_captured(at.elapsed().as_millis(), moved) {
+            overlay.captured = true;
+            debug!(target: LOG_TARGET, "cursor: pointer moves without events, hiding the sprite");
             overlay.sync_position(mtm);
         }
     });
@@ -383,6 +470,12 @@ struct Overlay {
     wanted: Option<(u64, SpriteGeometry)>,
     /// The PE side's last word on visibility.
     wanted_visible: bool,
+    /// Our one-pixel transparent cursor, set over whatever replaced Wine's blank.
+    blank: Retained<NSCursor>,
+    /// When the last mouse event reached us, and where the pointer was then.
+    last_event: (Instant, CGPoint),
+    /// The pointer is moving without events reaching us: a system tool has it.
+    captured: bool,
 }
 
 impl Overlay {
@@ -465,6 +558,18 @@ impl Overlay {
         window.orderFrontRegardless();
 
         install_input_hooks();
+        install_capture_tick();
+        let blank = NSCursor::initWithImage_hotSpot(
+            NSCursor::alloc(),
+            &NSImage::initWithSize(
+                NSImage::alloc(),
+                CGSize {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            ),
+            CGPoint { x: 0.0, y: 0.0 },
+        );
         info!(
             target: LOG_TARGET,
             "cursor: overlay window created over ({:.0},{:.0}) {:.0}x{:.0} (borderless, click-through)",
@@ -479,6 +584,9 @@ impl Overlay {
             mode: None,
             wanted: None,
             wanted_visible: false,
+            blank,
+            last_event: (Instant::now(), NSEvent::mouseLocation()),
+            captured: false,
         })
     }
 
@@ -687,6 +795,7 @@ impl Overlay {
         );
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
+        inputs.set(VisibilityInputs::CAPTURED, self.captured);
         let shown = overlay_visible(inputs);
         let Some((hash, geometry)) = self.wanted else {
             self.ensure_content(Content::Transparent);
@@ -717,6 +826,22 @@ impl Overlay {
         } else {
             self.ensure_content(Content::Transparent);
         }
+    }
+
+    /// Put a blank cursor back after something else may have set a visible one.
+    ///
+    /// The window server keeps whatever the last process set: a system tool
+    /// that borrowed the pointer leaves the standard arrow behind, and Wine
+    /// does not re-apply a cursor whose handle did not change. Called on the
+    /// first event after a silence, so a tool that still holds the pointer is
+    /// never fought; only while the sprite is shown, so a cursor the game set
+    /// through user32 while its own cursor is hidden is left alone.
+    fn heal_system_cursor(&self) {
+        if !matches!(self.content, Content::Sprite { .. }) {
+            return;
+        }
+        self.blank.set();
+        debug!(target: LOG_TARGET, "cursor: events resumed after a silence, blank cursor re-set");
     }
 
     /// Move the sprite layer without an implicit animation.
@@ -807,6 +932,23 @@ fn upload_sprite_texture(
     }
     drop(shared);
     Some(texture)
+}
+
+/// Install the capture tick, a repeating timer on the main run loop. **Main thread only.**
+///
+/// Added in the common modes so it keeps firing while the main thread tracks
+/// a drag. The timer is leaked for the process lifetime like the observers.
+fn install_capture_tick() {
+    let block = RcBlock::new(|_: NonNull<NSTimer>| on_capture_tick_main());
+    // SAFETY: objc2 typed binding; the run loop copies the block.
+    let timer =
+        unsafe { NSTimer::timerWithTimeInterval_repeats_block(CAPTURE_TICK_SECONDS, true, &block) };
+    // SAFETY: reading Foundation's run-loop-mode constant, an immutable static.
+    let mode = unsafe { NSRunLoopCommonModes };
+    // SAFETY: objc2 typed binding; the run loop retains the timer, and the
+    // timer is leaked below so the block it holds outlives every tick.
+    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, mode) };
+    core::mem::forget(timer);
 }
 
 /// Install the mouse-move monitor and the activation observers. **Main thread only.**
