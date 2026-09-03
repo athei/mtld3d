@@ -82,6 +82,12 @@ pub struct Mtld3dConfig {
     ///
     /// Default: `true`. File key: `shaderCache.enable`.
     pub shader_cache_enable: bool,
+    /// Directory the process's log file and GPU traces go into.
+    ///
+    /// Resolved against the executable's directory; an absolute path stands
+    /// as is. Empty string = `mtld3d-logs` beside the executable. Default:
+    /// `""`. File key: `log.dir`.
+    pub log_dir: String,
     /// Directory to dump raw DXSO bytecode into on first sight of each shader id.
     ///
     /// Empty string = disabled. Default: `""`. File key:
@@ -269,6 +275,7 @@ impl Default for Mtld3dConfig {
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
             shader_cache_enable: true,
+            log_dir: String::new(),
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
             query_flush_immediate: true,
@@ -390,6 +397,7 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: shaderCache.enable = {}", cfg.shader_cache_enable
     );
+    info!(target: crate::LOG_TARGET, "config: log.dir = {:?}", cfg.log_dir);
     info!(
         target: crate::LOG_TARGET,
         "config: debug.bytecodeDumpDir = {:?}", cfg.bytecode_dump_dir
@@ -468,6 +476,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
         "shaderCache.enable" => assign_bool(source, key, value, &mut cfg.shader_cache_enable),
+        "log.dir" => value.clone_into(&mut cfg.log_dir),
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),

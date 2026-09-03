@@ -2,7 +2,7 @@
 //!
 //! Installed once from `init_logger_handler`. Catches SIGSEGV, SIGBUS,
 //! SIGABRT. The handler is async-signal-safe — it only calls
-//! `libc::write` on fd 2 and `mtld3d_shared::crumb::dump_recent` (which is
+//! `libc::write` on the log file's descriptor and `mtld3d_shared::crumb::dump_recent` (which is
 //! itself async-signal-safe). On a fatal signal in OUR code the handler:
 //!
 //! 1. Writes a single-line fatal banner identifying the signal and the
@@ -224,9 +224,13 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     }
     push(&mut buf, &mut pos, b"\n");
 
-    // SAFETY: write(2) on fd 2 is async-signal-safe.
+    // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
     unsafe {
-        let _ = libc::write(2, buf.as_ptr().cast::<c_void>(), pos);
+        let _ = libc::write(
+            crate::log_file::raw_fd(),
+            buf.as_ptr().cast::<c_void>(),
+            pos,
+        );
     }
 
     // Faulting thread name. For a teardown race the *which thread* (API vs
@@ -251,9 +255,9 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         push(&mut b, &mut p, b"[mtld3d::unix] thread=");
         push(&mut b, &mut p, &name[..nlen.min(96)]);
         push(&mut b, &mut p, b"\n");
-        // SAFETY: write(2) on fd 2 is async-signal-safe.
+        // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
-            let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
+            let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
     }
 
@@ -270,14 +274,14 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         push(&mut b, &mut p, b"[mtld3d::unix] fault_pc=");
         push_hex(&mut b, &mut p, rip);
         push(&mut b, &mut p, b"\n");
-        // SAFETY: write(2) on fd 2 is async-signal-safe.
+        // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
-            let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
+            let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
         let mut frame = [rip as *mut c_void; 1];
         // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd` is
-        // async-signal-safe (resolves via `dladdr`, no malloc) and writes to fd 2.
-        unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, 2) };
+        // async-signal-safe (resolves via `dladdr`, no malloc) and writes to the log descriptor.
+        unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
     }
 
     // For a jump-through-garbage fault (`fault_pc` is a tiny/invalid value), the
@@ -304,9 +308,9 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         push(&mut b, &mut p, b" sp=");
         push_hex(&mut b, &mut p, sp);
         push(&mut b, &mut p, b"\n");
-        // SAFETY: write(2) on fd 2 is async-signal-safe.
+        // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
-            let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
+            let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
         let ret = caller_pc(ctx, sp);
         if ret != 0 {
@@ -316,14 +320,14 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
             push(&mut rb, &mut rp, CALLER_LABEL);
             push_hex(&mut rb, &mut rp, ret);
             push(&mut rb, &mut rp, b"\n");
-            // SAFETY: write(2) on fd 2 is async-signal-safe.
+            // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
             unsafe {
-                let _ = libc::write(2, rb.as_ptr().cast::<c_void>(), rp);
+                let _ = libc::write(crate::log_file::raw_fd(), rb.as_ptr().cast::<c_void>(), rp);
             }
             let mut frame = [ret as *mut c_void; 1];
             // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd` is
-            // async-signal-safe (resolves via `dladdr`) and writes to fd 2.
-            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, 2) };
+            // async-signal-safe (resolves via `dladdr`) and writes to the log descriptor.
+            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
         }
     }
 
@@ -331,7 +335,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 
     // Native backtrace of the faulting thread. `backtrace` only walks frame
     // pointers (no allocation) and `backtrace_symbols_fd` resolves each via
-    // `dladdr` straight to fd 2 — both async-signal-safe (unlike
+    // `dladdr` straight to the log descriptor — both async-signal-safe (unlike
     // `backtrace_symbols`, which mallocs). Symbolises our `.so`, Wine, and
     // system frames (Metal/CoreAnimation), turning a bare fault address into a
     // call chain.
@@ -341,13 +345,17 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     let n = unsafe { backtrace(frames.as_mut_ptr(), FRAME_CAP) };
     if n > 0 {
         const HDR: &[u8] = b"[mtld3d::unix] native backtrace:\n";
-        // SAFETY: write(2) on fd 2 is async-signal-safe.
+        // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
-            let _ = libc::write(2, HDR.as_ptr().cast::<c_void>(), HDR.len());
+            let _ = libc::write(
+                crate::log_file::raw_fd(),
+                HDR.as_ptr().cast::<c_void>(),
+                HDR.len(),
+            );
         }
         // SAFETY: `frames[..n]` were filled by `backtrace`; `backtrace_symbols_fd`
         // is async-signal-safe and writes the resolved frames to fd 2.
-        unsafe { backtrace_symbols_fd(frames.as_ptr(), n, 2) };
+        unsafe { backtrace_symbols_fd(frames.as_ptr(), n, crate::log_file::raw_fd()) };
     }
 
     // Last resort for a jump-to-NULL whose frame chain is broken: scan the raw
@@ -362,9 +370,13 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         let sp = mcontext_u64(ctx, SP_OFFSET);
         if sp != 0 {
             const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
-            // SAFETY: write(2) on fd 2 is async-signal-safe.
+            // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
             unsafe {
-                let _ = libc::write(2, HDR.as_ptr().cast::<c_void>(), HDR.len());
+                let _ = libc::write(
+                    crate::log_file::raw_fd(),
+                    HDR.as_ptr().cast::<c_void>(),
+                    HDR.len(),
+                );
             }
             scan_stack_for_our_frames(sp);
         }
@@ -406,7 +418,7 @@ fn scan_stack_for_our_frames(sp: u64) {
             let mut frame = [addr as *mut c_void; 1];
             // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd`
             // resolves via `dladdr` and writes to fd 2.
-            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, 2) };
+            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
             printed += 1;
         }
         slot += 1;
@@ -419,9 +431,13 @@ fn scan_stack_for_our_frames(sp: u64) {
     // real guest call chain (its 0x4xxxxx–0x7xxxxx return addresses) is shown,
     // mapped to modules by their logged load bases.
     //
-    // SAFETY: write(2) on fd 2 is async-signal-safe.
+    // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
     unsafe {
-        let _ = libc::write(2, GUEST_HDR.as_ptr().cast::<c_void>(), GUEST_HDR.len());
+        let _ = libc::write(
+            crate::log_file::raw_fd(),
+            GUEST_HDR.as_ptr().cast::<c_void>(),
+            GUEST_HDR.len(),
+        );
     }
     let mut guest_printed = 0u32;
     let mut slot = 0usize;
@@ -439,9 +455,9 @@ fn scan_stack_for_our_frames(sp: u64) {
             push(&mut b, &mut p, b"  g=");
             push_hex(&mut b, &mut p, u64::from(guest_addr));
             push(&mut b, &mut p, b"\n");
-            // SAFETY: write(2) on fd 2 is async-signal-safe.
+            // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
             unsafe {
-                let _ = libc::write(2, b.as_ptr().cast::<c_void>(), p);
+                let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
             }
             guest_printed += 1;
         }

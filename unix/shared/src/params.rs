@@ -83,6 +83,29 @@ impl Thunk for WriteLogParams {
     const CODE: u32 = Thunks::WriteLog as u32;
 }
 
+/// Where this process's log file and GPU traces go, sent once per process.
+///
+/// `Direct3DCreate9` resolves `mtld3d.conf` long after `InitLogger` fired
+/// from `DllMain`, so the location travels separately. `dir` is the unix
+/// path of the log directory, `stem` the executable's file name without its
+/// extension, both UTF-8 without a terminator and kept alive by the PE side
+/// for the call; `pid` names the process. The unix side opens
+/// `<dir>/<stem>-<pid>.log` on the first line it writes and numbers the
+/// traces `<dir>/<stem>-<pid>-<n>.gputrace`.
+#[repr(C, align(8))]
+pub struct OpenLogParams {
+    pub dir_ptr: u64,  // in: *const u8
+    pub stem_ptr: u64, // in: *const u8
+    pub dir_len: u32,  // in: byte count
+    pub stem_len: u32, // in: byte count
+    pub pid: u32,
+    pub pad0: u32,
+}
+
+impl Thunk for OpenLogParams {
+    const CODE: u32 = Thunks::OpenLog as u32;
+}
+
 #[repr(C, align(8))]
 pub struct GetDeviceInfoParams {
     pub name_ptr: u64,
@@ -238,7 +261,9 @@ impl Thunk for WaitForGpuRetireParams {
 
 /// Begin a Metal GPU frame capture writing a `.gputrace` document to disk.
 ///
-/// The path is hard-coded to `/tmp/mtld3d_capture.gputrace`.
+/// The trace goes next to the process's log file, numbered per capture
+/// (`<stem>-<pid>-<n>.gputrace`), or to `/tmp/mtld3d_capture.gputrace` when
+/// no log location was named.
 ///
 /// Apple requires the process to have launched with `MTL_CAPTURE_ENABLED=1`;
 /// without it the unix-side handler logs a warn and returns without

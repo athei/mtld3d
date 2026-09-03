@@ -5,6 +5,7 @@ use strum::{EnumCount, VariantArray};
 
 mod crash;
 mod handlers;
+mod log_file;
 mod metal;
 
 /// `log` target used by every call inside this crate.
@@ -73,6 +74,7 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::CreateTextureSliceView => arp!(handlers::create_texture_slice_view_handler),
         Thunks::GetTaskFaults => arp!(handlers::get_task_faults_handler),
         Thunks::WriteLog => arp!(handlers::write_log_handler),
+        Thunks::OpenLog => arp!(handlers::open_log_handler),
     }
 }
 

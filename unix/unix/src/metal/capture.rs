@@ -5,13 +5,15 @@ use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
-const CAPTURE_PATH: &str = "/tmp/mtld3d_capture.gputrace";
+/// Where a trace goes when the process has no log directory yet.
+const FALLBACK_PATH: &str = "/tmp/mtld3d_capture.gputrace";
 
 /// Begin a Metal GPU frame capture.
 ///
 /// The capture object is the device passed in (covers all command queues
-/// on it). Output is a `.gputrace` document at `CAPTURE_PATH`, openable
-/// in Xcode.
+/// on it). Output is a `.gputrace` document next to the process's log file,
+/// numbered per press (`log_file::next_trace_path`), or at `FALLBACK_PATH`
+/// when no log location was named; openable in Xcode or with `gpudebug`.
 ///
 /// Apple gates this on `MTL_CAPTURE_ENABLED=1` at process launch; when
 /// the env is unset `startCaptureWithDescriptor` returns an error which
@@ -38,17 +40,22 @@ pub fn start_capture(device_handle: MetalHandle<MTLDeviceKind>) {
     unsafe { desc.setCaptureObject(Some(device.as_ref())) };
     desc.setDestination(MTLCaptureDestination::GPUTraceDocument);
 
+    let path = crate::log_file::next_trace_path().map_or_else(
+        || FALLBACK_PATH.to_owned(),
+        |p| p.to_string_lossy().into_owned(),
+    );
     // Trace path must not exist; remove a stale one from a prior run.
-    let _ = std::fs::remove_dir_all(CAPTURE_PATH);
-    let _ = std::fs::remove_file(CAPTURE_PATH);
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
 
-    let path_ns = NSString::from_str(CAPTURE_PATH);
+    let path_ns = NSString::from_str(&path);
     let url = NSURL::fileURLWithPath(&path_ns);
     desc.setOutputURL(Some(&url));
 
     match manager.startCaptureWithDescriptor_error(&desc) {
         Ok(()) => {
-            info!(target: LOG_TARGET, "started GPU capture → {CAPTURE_PATH}");
+            info!(target: LOG_TARGET, "started GPU capture → {path}");
+            *CURRENT_PATH.lock().expect("capture path mutex poisoned") = Some(path);
         }
         Err(err) => {
             let msg = err.localizedDescription();
@@ -68,5 +75,16 @@ pub fn stop_capture() {
         return;
     }
     manager.stopCapture();
-    info!(target: LOG_TARGET, "stopped GPU capture → {CAPTURE_PATH}");
+    let path = CURRENT_PATH
+        .lock()
+        .expect("capture path mutex poisoned")
+        .take();
+    info!(
+        target: LOG_TARGET,
+        "stopped GPU capture → {}",
+        path.as_deref().unwrap_or(FALLBACK_PATH)
+    );
 }
+
+/// The path of the capture in progress, for the stop line.
+static CURRENT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
