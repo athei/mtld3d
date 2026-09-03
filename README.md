@@ -324,10 +324,13 @@ published to crates.io.
 Frame pointers are off by default; `FP=1 make` forces them on for the guest-pc
 sampling profiler, whose stack walks follow the guest frame-pointer chain.
 
-`make install` copies the PE DLLs into `lib/wine/{i386,x86_64}-windows/` and
-the `.so` into `lib/wine/{x86_64,aarch64}-unix/`, stamping the Wine-builtin
-signature onto the `d3d9.dll` copies, because the loader ignores unsigned PEs
-on the builtin search path. The build outputs themselves stay unsigned so they
+`make install` copies the PE DLLs into `{i386,x86_64}-windows/` and the `.so`
+into `{x86_64,aarch64}-unix/` under the tree the Wine build reads mtld3d from:
+`lib/wine/d3d9/mtld3d/` in a bundle with a compat database, which keeps every
+Direct3D implementation in its own subtree and leaves only fake-module markers
+in the default dirs (the install re-stamps those), or `lib/wine/` itself in an
+older tree. The `d3d9.dll` copies get the Wine-builtin signature, because the
+loader ignores unsigned PEs on the builtin search path. The build outputs themselves stay unsigned so they
 can also serve as a native DLL override, and `make bundle` packs both flavors
 into `windows/target/mtld3d.tar.xz`. Debug symbols travel with every binary, a
 `.pdb` beside each PE and a `.dSYM` beside the `.so` (`make` runs `dsymutil`,
