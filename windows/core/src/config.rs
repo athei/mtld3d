@@ -7,7 +7,10 @@
 //! --target x86_64-apple-darwin`.
 
 use log::info;
-use mtld3d_shared::{log_once_warn, mtl::ColorSpacePolicy};
+use mtld3d_shared::{
+    log_once_warn,
+    mtl::{ColorSpacePolicy, SoftwareCursorPolicy},
+};
 
 use crate::app_profile::AppProfile;
 
@@ -78,6 +81,13 @@ pub struct Mtld3dConfig {
     /// user's chosen multiplier (still clamped to `[1, 8]` at use
     /// site). File key: `cursor.scale` (`auto` | positive integer).
     pub cursor_scale: CursorScale,
+    /// Draw the cursor in the unix-side overlay window instead of the hardware HCURSOR.
+    ///
+    /// Default: [`SoftwareCursorPolicy::Auto`] — on when the HDR present path
+    /// is active, off otherwise; `On` / `Off` force it. Resolved on the unix
+    /// side at device creation. File key: `cursor.software`
+    /// (`auto` | `true` | `false`).
+    pub cursor_software: SoftwareCursorPolicy,
     /// Use the persistent on-disk shader cache.
     ///
     /// Default: `true`. File key: `shaderCache.enable`.
@@ -274,6 +284,7 @@ impl Default for Mtld3dConfig {
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
+            cursor_software: SoftwareCursorPolicy::Auto,
             shader_cache_enable: true,
             log_dir: String::new(),
             bytecode_dump_dir: String::new(),
@@ -395,6 +406,11 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: cursor.software = {}",
+        cursor_software_label(cfg.cursor_software)
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: shaderCache.enable = {}", cfg.shader_cache_enable
     );
     info!(target: crate::LOG_TARGET, "config: log.dir = {:?}", cfg.log_dir);
@@ -467,6 +483,14 @@ fn cursor_scale_label(s: CursorScale) -> String {
     }
 }
 
+const fn cursor_software_label(p: SoftwareCursorPolicy) -> &'static str {
+    match p {
+        SoftwareCursorPolicy::Auto => "auto",
+        SoftwareCursorPolicy::On => "true",
+        SoftwareCursorPolicy::Off => "false",
+    }
+}
+
 fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
     match key {
         "debug.capsAll" => assign_bool(source, key, value, &mut cfg.caps_all),
@@ -475,6 +499,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
+        "cursor.software" => assign_cursor_software(source, value, &mut cfg.cursor_software),
         "shaderCache.enable" => assign_bool(source, key, value, &mut cfg.shader_cache_enable),
         "log.dir" => value.clone_into(&mut cfg.log_dir),
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
@@ -515,6 +540,19 @@ fn assign_cursor_scale(source: &str, value: &str, slot: &mut CursorScale) {
             target: crate::LOG_TARGET,
             "{source}: 'cursor.scale = {value}' is not 'auto' or a positive integer → kept {kept}",
             kept = cursor_scale_label(*slot)
+        ),
+    }
+}
+
+fn assign_cursor_software(source: &str, value: &str, slot: &mut SoftwareCursorPolicy) {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => *slot = SoftwareCursorPolicy::Auto,
+        "true" => *slot = SoftwareCursorPolicy::On,
+        "false" => *slot = SoftwareCursorPolicy::Off,
+        other => log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'cursor.software = {other}' is not auto, true or false → kept {kept}",
+            kept = cursor_software_label(*slot)
         ),
     }
 }

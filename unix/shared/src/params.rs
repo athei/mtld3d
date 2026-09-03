@@ -2,9 +2,10 @@ use super::{
     Thunk, Thunks,
     mtl::{
         AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
-        ColorSpacePolicy, ColorWriteMask, CompareFunc, DepthResolveFilter, DestroyKind,
-        DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat, StageTag, StencilOp,
-        StorageMode, StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
+        ColorSpacePolicy, ColorWriteMask, CompareFunc, CursorOverlayFlags, DepthResolveFilter,
+        DestroyKind, DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat,
+        SoftwareCursorPolicy, StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage,
+        VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -44,7 +45,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 72);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 80);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
@@ -209,10 +210,51 @@ pub struct AttachMetalLayerParams {
     /// main thread, outside any thunk, so it cannot be ordered against a
     /// device teardown. `0` disables the republish.
     pub backing_scale_ptr: u64, // in: *const AtomicU32 (PE static, process lifetime)
+    /// `cursor.software` from `mtld3d.conf`.
+    ///
+    /// Resolved on the unix side against the layer mode attach picked, since
+    /// `Auto` means "on when the present path is HDR" and only the unix side
+    /// knows that. PE side reads this from `CONFIG.cursor_software`.
+    pub software_cursor: SoftwareCursorPolicy, // in
+    /// Whether this device draws its cursor through the overlay window.
+    ///
+    /// Non-zero = the PE side keeps the Win32 cursor blank over the client
+    /// area and ships cursor bitmaps and visibility through
+    /// `SetCursorOverlay`; zero = the hardware HCURSOR path. Resolved once per
+    /// device at attach and held for its lifetime.
+    pub software_cursor_active: u32, // out
 }
 
 impl Thunk for AttachMetalLayerParams {
     const CODE: u32 = Thunks::AttachMetalLayer as u32;
+}
+
+/// Wanted state of the software cursor overlay: which sprite, and whether it shows.
+///
+/// Sent from the API thread on every `ShowCursor` and `SetCursorProperties`
+/// while the software cursor is active. `hash` names the sprite (never `0`);
+/// `pixels_ptr` carries its BGRA bytes the first time the PE side sends a hash
+/// and is `0` afterwards, the unix side keeping every sprite it has been
+/// handed. Sprite pixels are already upscaled by `scale` (pixels per point),
+/// the hotspot is in sprite pixels. The handler stores the state and queues one
+/// main-thread apply; it never blocks on `AppKit`, which is what lets this
+/// thunk run on the API thread.
+#[repr(C, align(8))]
+pub struct SetCursorOverlayParams {
+    pub hash: u64,                 // in: sprite identity, never 0
+    pub pixels_ptr: u64,           // in: *const u8 BGRA rows, 0 = sprite already uploaded
+    pub pixels_len: u32,           // in: byte count = width * height * 4
+    pub width: u32,                // in: sprite width in pixels
+    pub height: u32,               // in: sprite height in pixels
+    pub x_hotspot: u32,            // in: in sprite pixels
+    pub y_hotspot: u32,            // in: in sprite pixels
+    pub scale: u32,                // in: sprite pixels per point, 1..=8
+    pub flags: CursorOverlayFlags, // in
+    pub pad0: u32,
+}
+
+impl Thunk for SetCursorOverlayParams {
+    const CODE: u32 = Thunks::SetCursorOverlay as u32;
 }
 
 /// Update `CAMetalLayer.displaySyncEnabled` on an already-attached layer.

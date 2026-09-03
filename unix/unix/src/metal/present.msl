@@ -46,6 +46,16 @@ constant float L_SDR = 100.0;
 constant float P_SDR = 5.4395284707f;
 constant float LOG_P_SDR = 1.6937747f; // log(P_SDR)
 
+// sRGB → linear EOTF (IEC 61966-2-1, piecewise). Shared by every HDR stage,
+// frame and cursor alike, so the two can never disagree on the decode.
+inline float3 srgb_eotf(float3 encoded) {
+    return select(
+        pow((encoded + 0.055) / 1.055, float3(2.4)),
+        encoded / 12.92,
+        encoded <= float3(0.04045)
+    );
+}
+
 fragment float4 mtld3d_present_ps_hdr_passthrough(
     VsOut in [[stage_in]],
     texture2d<float> src [[texture(0)]]
@@ -53,13 +63,7 @@ fragment float4 mtld3d_present_ps_hdr_passthrough(
     constexpr sampler s(coord::normalized, filter::linear,
                         address::clamp_to_edge);
     float4 sample = src.sample(s, in.uv);
-    // sRGB → linear EOTF (IEC 61966-2-1, piecewise).
-    float3 lin = select(
-        pow((sample.rgb + 0.055) / 1.055, float3(2.4)),
-        sample.rgb / 12.92,
-        sample.rgb <= float3(0.04045)
-    );
-    return float4(lin, sample.a);
+    return float4(srgb_eotf(sample.rgb), sample.a);
 }
 
 // BT.709 linear-light → LMS (combined BT.709 → BT.2020 → LMS).
@@ -124,21 +128,10 @@ inline float3 pq_eotf(float3 pq) {
     return 10000.0f * pow(num / den, float3(1.0f / M1));
 }
 
-fragment float4 mtld3d_present_ps_hdr_bt2446(
-    VsOut in [[stage_in]],
-    texture2d<float> src [[texture(0)]],
-    constant HdrUniforms& u [[buffer(0)]]
-) {
-    constexpr sampler s(coord::normalized, filter::linear,
-                        address::clamp_to_edge);
-    float4 sample = src.sample(s, in.uv);
-    // sRGB → linear EOTF (IEC 61966-2-1, piecewise).
-    float3 lin = select(
-        pow((sample.rgb + 0.055) / 1.055, float3(2.4)),
-        sample.rgb / 12.92,
-        sample.rgb <= float3(0.04045)
-    );
-
+// BT.2446 Method A in ICtCp on one linear BT.709 pixel. Shared by the frame
+// and the cursor sprite, which is what keeps the cursor exactly as bright as
+// the UI it hovers over.
+inline float3 bt2446_ictcp(float3 lin, constant HdrUniforms& u) {
     // ── BT.2446 Method A in ICtCp ──
     // Run the inverse tone-map curve on BT.709 luminance (`yp_sdr →
     // yp_c → yp_p → yp_hdr → y_hdr_linear`). Then transplant the new
@@ -191,5 +184,56 @@ fragment float4 mtld3d_present_ps_hdr_bt2446(
     // Back to normalised linear BT.709 (1.0 = paper-white = 100 nits).
     // The layer's `ExtendedLinear*` tag will gamut-convert + OETF-encode
     // for the actual display.
-    return float4(max(rgb_nits_out, float3(0.0f)) / L_SDR, sample.a);
+    return max(rgb_nits_out, float3(0.0f)) / L_SDR;
+}
+
+fragment float4 mtld3d_present_ps_hdr_bt2446(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(bt2446_ictcp(srgb_eotf(sample.rgb), u), sample.a);
+}
+
+// ── Cursor sprite stages ──
+//
+// The software cursor's sprite onto the overlay window's own drawable, sized
+// to the sprite so every fragment lands on its texel. The sprite carries
+// straight alpha (a D3D9 A8R8G8B8 cursor surface); Core Animation composites
+// premultiplied, so each stage multiplies colour by alpha after the colour
+// transform its frame twin applies. The compositor blends the window, the
+// pass itself needs no blend state.
+
+fragment float4 mtld3d_cursor_ps_copy(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(sample.rgb * sample.a, sample.a);
+}
+
+fragment float4 mtld3d_cursor_ps_hdr_passthrough(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(srgb_eotf(sample.rgb) * sample.a, sample.a);
+}
+
+fragment float4 mtld3d_cursor_ps_hdr_bt2446(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(bt2446_ictcp(srgb_eotf(sample.rgb), u) * sample.a, sample.a);
 }

@@ -9,8 +9,8 @@ use mtld3d_tests::{
     WS_VISIBLE, assert_pixel_eq, enumerate_display_sizes,
 };
 use mtld3d_types::{
-    D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
-    D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
+    D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
+    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
     D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
     D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
@@ -1724,6 +1724,110 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
         h.thread_cursor(),
         class_arrow,
         "hidden again: WM_SETCURSOR forwarded to the class cursor",
+    );
+}
+
+/// Turn the software cursor on for this test process.
+///
+/// Must run before the first `Harness` (the config is read once at factory
+/// bring-up). nextest runs each test in its own process, so the append is
+/// test-local. The suite pins `color.hdr.enable=false`, under which the
+/// default `auto` resolves to the hardware cursor; this forces the overlay.
+fn force_software_cursor() {
+    let merged = format!(
+        "{};cursor.software=true",
+        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
+    );
+    // SAFETY: single-threaded at this point in the test process (the harness
+    // and with it the config read are only constructed afterwards).
+    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+}
+
+#[test]
+fn software_cursor_never_pushes_a_null_thread_cursor() {
+    // With the software cursor on, the overlay window draws the cursor and the
+    // Win32 cursor is a blank HCURSOR that is never taken away: a show pushes
+    // the blank (a real handle, distinct from the class arrow the forwarded
+    // WM_SETCURSOR applies while hidden) and a hide pushes nothing, so the
+    // WindowServer cursor plane never toggles. The hardware path pins the
+    // opposite in `cursor_realization_recovers_from_external_clobber`.
+    const WM_SETCURSOR: u32 = 0x0020;
+    /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
+    const WM_MOUSEMOVE_LP: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    force_software_cursor();
+    let h = Harness::new();
+    let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
+
+    let bitmap = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+
+    // Hidden: forwarded like the hardware path, the class arrow applies.
+    h.set_thread_cursor(0);
+    h.send_window_message(WM_SETCURSOR, h.hwnd(), lp_client_move);
+    let class_arrow = h.thread_cursor();
+    assert_ne!(
+        class_arrow, 0,
+        "hidden: WM_SETCURSOR must still be forwarded"
+    );
+
+    assert_eq!(h.show_cursor(true), 0, "cursor starts hidden");
+    let blank = h.thread_cursor();
+    assert_ne!(blank, 0, "ShowCursor(TRUE) must realize the blank HCURSOR");
+    assert_ne!(blank, class_arrow, "the blank is not the class arrow");
+
+    assert_eq!(h.show_cursor(false), 1);
+    assert_eq!(
+        h.thread_cursor(),
+        blank,
+        "ShowCursor(FALSE) must leave the blank in place, never push null",
+    );
+
+    // A show after something else took the thread cursor re-asserts the blank.
+    h.set_thread_cursor(0);
+    assert_eq!(h.show_cursor(true), 0);
+    assert_eq!(
+        h.thread_cursor(),
+        blank,
+        "ShowCursor(TRUE) re-asserts the blank"
+    );
+}
+
+#[test]
+fn software_cursor_presents_with_the_sprite_shown() {
+    // The overlay path end to end inside the harness: a sprite upload, a
+    // main-thread window creation, a sprite render, and show/hide/show across
+    // presents. Nothing of it may disturb the frame, and a cursor change
+    // (second bitmap) ships a second sprite.
+    force_software_cursor();
+    let h = Harness::new();
+
+    let first = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    assert_eq!(h.set_cursor_properties_hr(2, 3, &first), D3D_OK);
+    assert_eq!(h.show_cursor(true), 0);
+    for _ in 0..20 {
+        assert_eq!(h.clear(D3DCLEAR_TARGET, 0xFF00_80FF, 1.0, 0), D3D_OK);
+        assert_eq!(h.present(), D3D_OK);
+    }
+    assert_eq!(
+        h.read_pixel(5, 5) & 0x00FF_FFFF,
+        0x0000_80FF,
+        "frame unaffected"
+    );
+
+    assert_eq!(h.show_cursor(false), 1);
+    assert_eq!(h.present(), D3D_OK);
+    let second = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    assert_eq!(h.set_cursor_properties_hr(0, 0, &second), D3D_OK);
+    assert_eq!(h.show_cursor(true), 0);
+    for _ in 0..20 {
+        assert_eq!(h.clear(D3DCLEAR_TARGET, 0xFF40_C020, 1.0, 0), D3D_OK);
+        assert_eq!(h.present(), D3D_OK);
+    }
+    assert_eq!(
+        h.read_pixel(5, 5) & 0x00FF_FFFF,
+        0x0040_C020,
+        "frame unaffected"
     );
 }
 

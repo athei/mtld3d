@@ -1419,9 +1419,12 @@ extern "system" fn d3d9_create_device(
         return D3DERR_INVALIDCALL;
     }
     let (cursor_scale, scale_origin) = resolve_cursor_scale(layer_params.backing_scale);
+    let software_cursor = layer_params.software_cursor_active != 0;
     info!(
         target: LOG_TARGET,
-        "hardware cursor scale: {cursor_scale}x ({scale_origin})"
+        "cursor: {} at {cursor_scale}x ({scale_origin}; cursor.software = {:?})",
+        if software_cursor { "software overlay" } else { "hardware HCURSOR" },
+        crate::config::CONFIG.cursor_software,
     );
 
     // `render.scale` splits the back buffer in two from here on: `pp` keeps
@@ -1575,6 +1578,7 @@ extern "system" fn d3d9_create_device(
         },
         hwnd: hwnd as *mut c_void,
         cursor_scale,
+        software_cursor,
         fullscreen,
     });
 
@@ -1634,6 +1638,8 @@ fn attach_metal_layer(
         max_fps: crate::config::CONFIG.present_max_fps,
         metalfx_available: 0,
         backing_scale_ptr: (&raw const DISPLAY_BACKING_SCALE) as u64,
+        software_cursor: crate::config::CONFIG.cursor_software,
+        software_cursor_active: 0,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);

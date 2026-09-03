@@ -748,6 +748,42 @@ pub enum ColorSpacePolicy {
     Accurate = 1,
 }
 
+/// `cursor.software` policy crossing PE→Unix on `AttachMetalLayerParams`.
+///
+/// Picked from `mtld3d.conf` (`cursor.software = auto | true | false`). The
+/// unix side resolves it against the layer mode it just configured and answers
+/// with `software_cursor_active`: `Auto` follows the HDR present path, because
+/// the overlay window sends the game window through the compositor, a cost an
+/// EDR layer already pays and an SDR direct-to-display window does not.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum SoftwareCursorPolicy {
+    Auto = 0,
+    On = 1,
+    Off = 2,
+}
+
+impl SoftwareCursorPolicy {
+    /// Whether the software cursor is in use for a device whose layer is HDR or not.
+    #[must_use]
+    pub const fn resolve(self, hdr_active: bool) -> bool {
+        match self {
+            Self::Auto => hdr_active,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
+bitflags! {
+    /// Wanted state carried by `SetCursorOverlayParams`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct CursorOverlayFlags: u32 {
+        /// The game's cursor is shown; clear = the overlay hides its sprite.
+        const VISIBLE = 1 << 0;
+    }
+}
+
 bitflags! {
     /// `MTLColorWriteMask` wire encoding.
     ///

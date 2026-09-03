@@ -21,6 +21,7 @@ unix/shared/src/mtl.rs ColorSpacePolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromR
 unix/shared/src/mtl.rs ColorWriteMask Clone,Copy,Debug,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs CompareFunc Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs CullMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs CursorOverlayFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 unix/shared/src/mtl.rs DepthResolveFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs DestroyKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs DeviceCapsFlags Clone,Copy,Debug,Default,PartialEq,Eq
@@ -31,6 +32,7 @@ unix/shared/src/mtl.rs MipFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs SoftwareCursorPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StageTag Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StencilOp Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs StorageMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr

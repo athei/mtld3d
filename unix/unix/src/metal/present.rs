@@ -49,7 +49,10 @@ use crate::LOG_TARGET;
 
 /// MSL source for the present-pass library.
 ///
-/// One library, one shared vertex stage, **three fragment entry points**:
+/// One library, one shared vertex stage, **three frame fragment entry points**
+/// and their three cursor twins (`mtld3d_cursor_ps_*`: the same colour
+/// transform, then straight alpha premultiplied for the overlay window's
+/// compositor):
 ///
 /// - `mtld3d_present_ps_copy`: sample the source backbuffer and return it
 ///   unchanged. Source and destination are both gamma-encoded 8-bit, so
@@ -117,16 +120,37 @@ const PRESENT_MSL: &str = include_str!("present.msl");
 /// `Send + Sync`. Handles leak at process exit — these are process-lifetime
 /// objects, the same as the device and command queue.
 ///
-/// Three pipeline states share one MSL library, one per fragment entry
+/// Six pipeline states share one MSL library, one per fragment entry
 /// point. `copy` writes the SDR drawable format; the two HDR states write
 /// the EDR one. A layer is one format or the other for its lifetime, so
 /// the unused pipelines cost one compile each and nothing else, cheaper
-/// than the per-format map the extra generality would need.
+/// than the per-format map the extra generality would need. The `cursor_*`
+/// trio are the software cursor's sprite passes, same formats, same
+/// transforms, premultiplied output.
 #[derive(Clone, Copy)]
 pub struct PresentPipelines {
-    pub copy: u64,        // MTLRenderPipelineState*
-    pub passthrough: u64, // MTLRenderPipelineState*
-    pub bt2446: u64,      // MTLRenderPipelineState*
+    pub copy: u64,               // MTLRenderPipelineState*
+    pub passthrough: u64,        // MTLRenderPipelineState*
+    pub bt2446: u64,             // MTLRenderPipelineState*
+    pub cursor_copy: u64,        // MTLRenderPipelineState*
+    pub cursor_passthrough: u64, // MTLRenderPipelineState*
+    pub cursor_bt2446: u64,      // MTLRenderPipelineState*
+}
+
+/// The BT.2446 fragment uniform block for a target peak, as the shader reads it.
+///
+/// `{ l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one }`, 16 bytes. BT.2446-A
+/// takes the target peak in nits, not a multiplier; Apple anchors scRGB `1.0`
+/// at 100 nits, so `L_hdr = peak × 100`. The three derived terms only depend
+/// on it and are hoisted out of the fragment stage. One function for the frame
+/// and the cursor sprite, so the two can never disagree on the curve.
+#[must_use]
+pub fn hdr_uniforms(peak: f32) -> [f32; 4] {
+    let l_hdr_nits = peak * 100.0;
+    let p_hdr = 32.0_f32.mul_add((l_hdr_nits / 10000.0).powf(1.0 / 2.4), 1.0);
+    let log2_p_hdr = p_hdr.log2();
+    let inv_p_minus_one = 1.0 / (p_hdr - 1.0);
+    [l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one]
 }
 
 static PIPELINES: OnceLock<PresentPipelines> = OnceLock::new();
@@ -182,10 +206,16 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
     let ps_copy_name = NSString::from_str("mtld3d_present_ps_copy");
     let ps_passthrough_name = NSString::from_str("mtld3d_present_ps_hdr_passthrough");
     let ps_bt2446_name = NSString::from_str("mtld3d_present_ps_hdr_bt2446");
+    let cursor_copy_name = NSString::from_str("mtld3d_cursor_ps_copy");
+    let cursor_passthrough_name = NSString::from_str("mtld3d_cursor_ps_hdr_passthrough");
+    let cursor_bt2446_name = NSString::from_str("mtld3d_cursor_ps_hdr_bt2446");
     let vs = library.newFunctionWithName(&vs_name)?;
     let ps_copy = library.newFunctionWithName(&ps_copy_name)?;
     let ps_passthrough = library.newFunctionWithName(&ps_passthrough_name)?;
     let ps_bt2446 = library.newFunctionWithName(&ps_bt2446_name)?;
+    let ps_cursor_copy = library.newFunctionWithName(&cursor_copy_name)?;
+    let ps_cursor_passthrough = library.newFunctionWithName(&cursor_passthrough_name)?;
+    let ps_cursor_bt2446 = library.newFunctionWithName(&cursor_bt2446_name)?;
 
     let copy = build_pipeline(
         device,
@@ -208,6 +238,27 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
         MTLPixelFormat::RGBA16Float,
         "mtld3d-present-pipeline-hdr-bt2446",
     )?;
+    let cursor_copy = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_copy,
+        MTLPixelFormat::BGRA8Unorm,
+        "mtld3d-present-pipeline-cursor-copy",
+    )?;
+    let cursor_passthrough = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_passthrough,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-cursor-hdr-passthrough",
+    )?;
+    let cursor_bt2446 = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_bt2446,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-cursor-hdr-bt2446",
+    )?;
 
     // Library and functions are kept alive by the pipeline states
     // (Metal copies what it needs at pipeline-state creation time).
@@ -218,10 +269,16 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
     let _ = ps_copy;
     let _ = ps_passthrough;
     let _ = ps_bt2446;
+    let _ = ps_cursor_copy;
+    let _ = ps_cursor_passthrough;
+    let _ = ps_cursor_bt2446;
 
     let pipeline_copy_handle = Retained::into_raw(copy) as u64;
     let pipeline_passthrough_handle = Retained::into_raw(passthrough) as u64;
     let pipeline_bt2446_handle = Retained::into_raw(bt2446) as u64;
+    let cursor_copy_handle = Retained::into_raw(cursor_copy) as u64;
+    let cursor_passthrough_handle = Retained::into_raw(cursor_passthrough) as u64;
+    let cursor_bt2446_handle = Retained::into_raw(cursor_bt2446) as u64;
     // Sanity: a raw pointer cast through `Retained::into_raw` can't be
     // null, but proving that to the type system requires the
     // conversion below; the `NonNull` is purely a debug-time guard
@@ -229,11 +286,17 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
     debug_assert!(NonNull::new(pipeline_copy_handle as *mut u8).is_some());
     debug_assert!(NonNull::new(pipeline_passthrough_handle as *mut u8).is_some());
     debug_assert!(NonNull::new(pipeline_bt2446_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_copy_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_passthrough_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_bt2446_handle as *mut u8).is_some());
 
     Some(PresentPipelines {
         copy: pipeline_copy_handle,
         passthrough: pipeline_passthrough_handle,
         bt2446: pipeline_bt2446_handle,
+        cursor_copy: cursor_copy_handle,
+        cursor_passthrough: cursor_passthrough_handle,
+        cursor_bt2446: cursor_bt2446_handle,
     })
 }
 

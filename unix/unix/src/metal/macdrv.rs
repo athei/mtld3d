@@ -8,7 +8,7 @@ use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
     MetalHandle,
-    mtl::ColorSpacePolicy,
+    mtl::{ColorSpacePolicy, SoftwareCursorPolicy},
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
 };
 use objc2::{
@@ -18,6 +18,10 @@ use objc2::{
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
+
+mod cursor_overlay;
+
+pub use cursor_overlay::set_cursor_overlay;
 
 /// Whether the bound `CAMetalLayer` currently carries the EDR configuration.
 ///
@@ -205,6 +209,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
     PRESENT_PACING_BITS.store(0, Ordering::Relaxed);
     CURRENT_BACKING_SCALE.store(0, Ordering::Relaxed);
     BACKING_SCALE_SINK_PTR.store(0, Ordering::Relaxed);
+    cursor_overlay::detach();
 }
 
 /// Whether a headroom refresh is already queued on the main thread.
@@ -826,6 +831,8 @@ pub struct LayerAttachRequest {
     /// with nothing to publish into, which is what a headless smoke test
     /// that never built one looks like.
     pub backing_scale_sink_ptr: u64,
+    /// `cursor.software`, resolved here against the layer mode attach picks.
+    pub software_cursor: SoftwareCursorPolicy,
 }
 
 /// Resolved `CAMetalLayer`-relevant capabilities of the `NSScreen` the bound view lives on.
@@ -833,6 +840,10 @@ pub struct LayerAttachRequest {
 pub struct DisplayCaps {
     /// `NSScreen.backingScaleFactor` rounded + clamped to `[1, 8]`.
     pub backing_scale: u32,
+    /// Whether the device draws its cursor through the overlay window.
+    ///
+    /// `cursor.software` resolved against the layer mode; `Auto` follows HDR.
+    pub software_cursor_active: bool,
 }
 
 /// Which of the two `CAMetalLayer` configurations a display asks for.
@@ -1005,6 +1016,31 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
     }
 }
 
+/// Run a closure on `AppKit`'s main thread without waiting for it.
+///
+/// The asynchronous twin of [`run_on_main_thread_sync`], for callers that must
+/// not put the main run loop in their critical path: the thunk that carries the
+/// software cursor's state runs on the API thread, and the display
+/// reconciliation runs on the submit thread's cadence. The closure is boxed and
+/// handed to libdispatch, which runs it once on the main queue and frees it.
+fn run_on_main_thread_async<F: FnOnce() + Send + 'static>(f: F) {
+    extern "C" fn thunk<F: FnOnce()>(ctx: *mut c_void) {
+        // SAFETY: `ctx` is the `Box<F>` leaked below; libdispatch hands it to
+        // the work function exactly once, so taking it back here is the one
+        // and only owner.
+        let f = unsafe { Box::from_raw(ctx.cast::<F>()) };
+        f();
+    }
+    let ctx = Box::into_raw(Box::new(f));
+    // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton, a valid
+    // `dispatch_queue_t` for the process lifetime; `ctx` is a heap allocation
+    // owned by the queued block until `thunk` consumes it.
+    unsafe {
+        let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
+        dispatch_async_f(main_q, ctx.cast::<c_void>(), thunk::<F>);
+    }
+}
+
 /// Resolves HWND → `CAMetalLayer` via Wine's macdrv.
 ///
 /// Returns (`view_handle`, `layer_handle`, `display_caps`).
@@ -1034,6 +1070,7 @@ pub fn attach_metal_layer(
         hdr_enable,
         color_space,
         backing_scale_sink_ptr,
+        software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
         return None;
@@ -1102,6 +1139,14 @@ pub fn attach_metal_layer(
                 hdr_enable,
             );
             HDR_ACTIVE.store(mode == LayerMode::Hdr, Ordering::Relaxed);
+            // The software cursor rides the same decision: the overlay window
+            // is a compositing cost an EDR layer already pays.
+            let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
+            info!(
+                target: LOG_TARGET,
+                "cursor: software overlay {} (cursor.software = {software_cursor:?}, layer {mode:?})",
+                if software_cursor_active { "on" } else { "off" },
+            );
             configure_metal_layer(
                 layer,
                 device_handle.raw(),
@@ -1128,7 +1173,11 @@ pub fn attach_metal_layer(
             // SAFETY: as the comment above; macdrv handed us a retained
             // `CAMetalLayer` pointer.
             let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(layer as u64) };
-            Some((view_handle, layer_handle, hint.caps))
+            let caps = DisplayCaps {
+                backing_scale: hint.caps.backing_scale,
+                software_cursor_active,
+            };
+            Some((view_handle, layer_handle, caps))
         }
     };
 
@@ -1455,7 +1504,10 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     colorspace_flags.set(ColorspaceFlags::IS_HDR, colorspace_is_hdr);
     colorspace_flags.set(ColorspaceFlags::IS_WIDE_GAMUT, colorspace_is_wide_gamut);
     DisplayHint {
-        caps: DisplayCaps { backing_scale },
+        caps: DisplayCaps {
+            backing_scale,
+            software_cursor_active: false,
+        },
         edr_potential,
         screen_name,
         native_colorspace,
@@ -1645,6 +1697,7 @@ fn refresh_headroom_on_main() {
         follow_screen_backing_scale(screen);
     }
     log_headroom_change_if_any(headroom, &view_obj);
+    cursor_overlay::reconcile_on_main();
 }
 
 /// Emit one `info!` line when the live headroom drifts more than 5% from the last logged value.
