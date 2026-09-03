@@ -8,9 +8,9 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5,
-    D3DFMT_A4R4G4B4, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_INTZ,
-    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_X1R5G5B5,
-    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFMT_A4R4G4B4, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_DXT5,
+    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
+    D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
     D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY,
     D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
     D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
@@ -837,6 +837,34 @@ fn system_memory_surfaces_are_rejected_as_render_targets() {
         D3DERR_INVALIDCALL,
         "SYSTEMMEM texture level",
     );
+}
+
+/// A format that is not colour-renderable cannot be created as a render target.
+///
+/// `CheckDeviceFormat` answers `NOTAVAILABLE` for every one of these next to
+/// `D3DUSAGE_RENDERTARGET`, so the create has to refuse the caller that skipped
+/// the probe rather than hand back a texture nothing can draw into. The cost of
+/// leniency is not a wrong pixel: Metal's render-pipeline validation refuses a
+/// non-renderable colour attachment with an abort, so the first draw into such a
+/// texture takes the process down.
+#[test]
+fn create_texture_rejects_a_render_target_in_a_non_renderable_format() {
+    let h = Harness::new();
+    for format in [
+        D3DFMT_DXT1,
+        D3DFMT_DXT5,
+        D3DFMT_ATI1,
+        D3DFMT_L8,
+        D3DFMT_A4R4G4B4,
+    ] {
+        let (hr, ptr) =
+            h.try_create_texture(64, 64, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "CreateTexture(format={format:#x}, RENDERTARGET)"
+        );
+        assert!(ptr.is_null(), "format {format:#x} returned a texture");
+    }
 }
 
 #[test]

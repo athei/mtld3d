@@ -4507,19 +4507,23 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    // A packed 16-bit format that is renderable in general but not on this
-    // device (no native packed formats — the texture would be BGRA8-backed,
-    // and rendering into that backing breaks Lock/readback fidelity) cannot
-    // carry D3DUSAGE_RENDERTARGET. `CheckDeviceFormat` already answers
-    // NOTAVAILABLE for the combination; this rejects the caller that skipped
-    // the probe. Deliberately NOT the general `is_render_target_format` gate:
-    // formats outside that list keep today's lenient create on every device.
-    if usage_rt
-        && crate::direct3d9::is_render_target_format(format)
-        && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16)
-    {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateTexture(format={format}, RENDERTARGET) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
+    // A create's usage has to agree with the answer `CheckDeviceFormat` gives
+    // for the same format, so a format that is not colour-renderable cannot
+    // carry D3DUSAGE_RENDERTARGET; this rejects the caller that skipped the
+    // probe. Two groups fail it: the sampling-only formats, block-compressed
+    // ones included, which no D3D9 device rendered into, and the packed 16-bit
+    // members on a device that expansion-backs them, where rendering into the
+    // BGRA8 backing would break Lock/readback fidelity. Neither can be passed
+    // through, because Metal's render-pipeline validation refuses a
+    // non-renderable colour attachment with an abort rather than a returned
+    // error: a lenient create costs the process at the first draw into the
+    // texture instead of costing the application one handled failure here.
+    if usage_rt && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16) {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: u64::from(format),
+            "reject CreateTexture(format={format}, RENDERTARGET) → INVALIDCALL (format is not colour-renderable on this device)"
+        );
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
