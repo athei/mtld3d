@@ -37,7 +37,10 @@
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
 //! keeps moving; every present notices the pointer moving with no events
-//! arriving and hides the sprite until events resume. And when such a tool
+//! arriving and hides the sprite until events resume. The check is asked only
+//! while the game shows its cursor and winemac is not clipping it: in either
+//! other state the game owns the pointer and the events stay away from the
+//! application by design (mouselook clips the cursor for the drag). And when such a tool
 //! ends, the window server shows the standard arrow rather than the cursor
 //! Wine set, which Wine never re-applies because its handle did not change;
 //! the first event after a capture asks the PE side for its null-then-set
@@ -64,7 +67,11 @@ use mtld3d_shared::{
     SetCursorOverlayParams,
     mtl::{ColorSpacePolicy, CursorOverlayFlags},
 };
-use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    MainThreadMarker, MainThreadOnly, extern_class, extern_methods,
+    rc::Retained,
+    runtime::{AnyClass, NSObject, ProtocolObject},
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
     NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
@@ -149,6 +156,48 @@ static LAST_EVENT_POS: AtomicU64 = AtomicU64::new(0);
 /// and whenever the game hides its cursor.
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 
+extern_class!(
+    /// winemac's application controller, read for its cursor-clipping state.
+    ///
+    /// Declared here because no binding crate carries Wine's classes. Only
+    /// the two members below are touched, both part of the driver's own
+    /// header for as long as it has clipped the cursor; the class is looked
+    /// up by name before use so a driver without it reads as never clipping.
+    #[unsafe(super(NSObject))]
+    #[name = "WineApplicationController"]
+    struct WineApplicationController;
+);
+
+impl WineApplicationController {
+    extern_methods!(
+        #[unsafe(method(sharedController))]
+        #[unsafe(method_family = none)]
+        fn shared_controller() -> Option<Retained<Self>>;
+
+        #[unsafe(method(clippingCursor))]
+        #[unsafe(method_family = none)]
+        fn clipping_cursor(&self) -> bool;
+    );
+}
+
+/// Whether the running driver has a `WineApplicationController` class at all.
+static HAS_WINE_CONTROLLER: LazyLock<bool> =
+    LazyLock::new(|| AnyClass::get(c"WineApplicationController").is_some());
+
+/// Whether winemac is clipping the cursor right now.
+///
+/// While it does, it disassociates the pointer from the mouse and its event
+/// tap consumes the moves, so no mouse event reaches the application
+/// whatever the pointer does; a game turning the camera with a hidden cursor
+/// clips it for the drag and unclips a little after showing it again.
+/// Readable from any thread: the answer is one flag the main thread owns,
+/// and a stale read only delays a capture by one check.
+fn wine_clips_cursor() -> bool {
+    *HAS_WINE_CONTROLLER
+        && WineApplicationController::shared_controller()
+            .is_some_and(|controller| controller.clipping_cursor())
+}
+
 /// The game shows its cursor, in either cursor mode.
 ///
 /// The capture checks run only while it does: a game that hides its cursor
@@ -186,7 +235,7 @@ fn note_event(position: CGPoint) {
 /// Callable from any thread: the answer is the whole message, and a stale
 /// read only delays it by one check.
 fn capture_suspected() -> bool {
-    if !CURSOR_SHOWN.load(Ordering::Relaxed) {
+    if !CURSOR_SHOWN.load(Ordering::Relaxed) || wine_clips_cursor() {
         return false;
     }
     let at = LAST_EVENT_NS.load(Ordering::Acquire);
@@ -226,8 +275,9 @@ pub fn poll_capture_from_present() {
 /// application eventless while the pointer keeps moving. A pointer that sits
 /// away from the last event but no longer moves was warped there by the game
 /// (`SetCursorPos`), which generates no event either and must not hide the
-/// cursor. Only asked while the game shows its cursor; with it hidden the
-/// game owns the pointer and Wine may keep the events from the application.
+/// cursor. Only asked while the game shows its cursor and Wine is not
+/// clipping it; either way otherwise the game owns the pointer and the events
+/// legitimately stay away from the application.
 const fn pointer_captured(
     silence_ms: u128,
     moved_since_event: bool,

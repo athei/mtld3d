@@ -233,7 +233,7 @@ case "${1:-}" in
         'pub(crate) visibility' "$file"
     banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
         'extern "stdcall"' "$file"
-    banned 'msg_send!|class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
+    banned 'msg_send!|(^|[^_A-Za-z0-9])class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
         'untyped Obj-C selector' "$file"
     banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
         'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$file"
@@ -283,7 +283,7 @@ banned 'pub\(crate\)' 'No pub(crate) — use module hierarchy' \
     'pub(crate) visibility' "$@"
 banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
     'extern "stdcall"' "$@"
-banned 'msg_send!|class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
+banned 'msg_send!|(^|[^_A-Za-z0-9])class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
     'untyped Obj-C selector' "$@"
 banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
     'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$@"
