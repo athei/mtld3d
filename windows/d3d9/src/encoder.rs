@@ -1273,6 +1273,14 @@ struct BufferGpuState {
     is_staged: bool,
     backing_ptr: u64,
     length: u64,
+    /// Identity of the backing allocation the wrapper was created over.
+    ///
+    /// A cache hit needs it to match alongside the address: the allocator
+    /// can hand a freed backing's address to a later allocation, and the
+    /// `bytesNoCopy` wrapper pins the dead allocation's pages, so an
+    /// address-only match pairs GPU reads with pages the CPU no longer
+    /// writes (issue #76's garbled text). Meaningless for `Staged` (0).
+    backing_generation: u64,
     /// Max submit seq this wrapper has been bound into a Draw for.
     ///
     /// Used when the cache entry is evicted to retention.
@@ -1803,6 +1811,7 @@ impl FrameEncoder {
                             is_staged: true,
                             backing_ptr: 0,
                             length: warmup.backing_len,
+                            backing_generation: 0,
                             last_submit_seq: current_seq,
                         });
                     }
@@ -1817,6 +1826,7 @@ impl FrameEncoder {
                         is_staged: staged,
                         backing_ptr: if staged { 0 } else { warmup.backing_ptr },
                         length: warmup.backing_len,
+                        backing_generation: if staged { 0 } else { warmup.backing_generation },
                         last_submit_seq: current_seq,
                     });
                     // `Direct`: fresh `bytesNoCopy` wrapper — notify the
@@ -5712,6 +5722,7 @@ impl FrameEncoder {
         buffer_id: BufferId,
         backing_ptr: u64,
         backing_len: u64,
+        backing_generation: u64,
     ) -> u64 {
         let current_seq = self.current_submit_seq;
         if let Some(state) = self.buffer_cache.get_mut(&buffer_id) {
@@ -5752,7 +5763,10 @@ impl FrameEncoder {
                 );
                 return fresh.raw();
             }
-            if state.backing_ptr == backing_ptr && state.length == backing_len {
+            if state.backing_ptr == backing_ptr
+                && state.length == backing_len
+                && state.backing_generation == backing_generation
+            {
                 let mtl_buffer = state.mtl_buffer;
                 if current_seq > state.last_submit_seq {
                     // First bind of this buffer this frame — assume the
@@ -5817,6 +5831,7 @@ impl FrameEncoder {
                 is_staged: false,
                 backing_ptr,
                 length: backing_len,
+                backing_generation,
                 last_submit_seq: current_seq,
             },
         );
@@ -5994,12 +6009,33 @@ impl FrameEncoder {
                     removed.last_submit_seq.max(last_submit_seq),
                 )
             }
-            Some(state) if state.backing_ptr == backing_ptr => {
+            Some(state)
+                if state.backing_ptr == backing_ptr
+                    && state.backing_generation == page_box.generation() =>
+            {
                 let removed = self.buffer_cache.remove(&buffer_id).expect("just checked");
                 (
                     removed.mtl_buffer,
                     removed.last_submit_seq.max(last_submit_seq),
                 )
+            }
+            // The address matches but the allocation does not: the entry
+            // wraps a later backing at the retained one's address, and
+            // taking it would destroy a wrapper draws still bind. The
+            // ownership rules make this unreachable (a retained box is alive
+            // and so cannot share an address with a live one); the check
+            // keeps that a local fact rather than a lifetime argument.
+            Some(state) if state.backing_ptr == backing_ptr => {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "intake_vbib_retention: buffer {:#x} retired backing {backing_ptr:#x} \
+                     generation {} while the cache wraps generation {} at that address; \
+                     the cache entry stays",
+                    buffer_id.raw(),
+                    page_box.generation(),
+                    state.backing_generation
+                );
+                (MetalHandle::NULL, last_submit_seq)
             }
             _ => (MetalHandle::NULL, last_submit_seq),
         };
@@ -7954,6 +7990,8 @@ pub struct VbibWarmupEntry {
     pub buffer_id: BufferId,
     pub backing_ptr: u64,
     pub backing_len: u64,
+    /// The backing allocation's identity (see `PageBox::generation`).
+    pub backing_generation: u64,
     /// Decides the create path.
     ///
     /// `Direct` → one `bytesNoCopy` wrapper (today's zero-copy bind);

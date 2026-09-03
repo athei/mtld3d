@@ -3863,9 +3863,20 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             dev.flags.insert(DeviceFlags::NOT_RESET);
             return hr;
         }
+        // Deliver every op queued since the last Present before the reseed
+        // below replaces `current_frame`. The queue holds work whose
+        // bookkeeping already advanced (texture and Staged-buffer uploads
+        // scheduled at bind time cleared their dirty bits when they were
+        // queued), so dropping it loses that content on the GPU side for
+        // good: the game believes it uploaded and never rewrites it. HL2's
+        // cached VGUI text meshes rode exactly this queue through its
+        // same-size windowed/fullscreen Reset, which is issue #76's garbled
+        // menu text. The resized path flushes inside
+        // `reset_recreate_resources`.
+        dev.flush_current_frame_blocking();
         debug!(
             target: LOG_TARGET,
-            "Reset: dims unchanged ({}x{}) — skipping flush + texture recreate cycle, applying state defaults only",
+            "Reset: dims unchanged ({}x{}), flushed pending ops, skipping the texture recreate cycle",
             dev.backbuffer_width, dev.backbuffer_height,
         );
     }
@@ -3881,17 +3892,20 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
     dev.set_present_params(stored);
 
-    // 7. Reset device state to D3D9 defaults. Cursor + silent-write
-    //    warn latches survive (per-spec / process-lifetime telemetry).
-    dev.reset_to_defaults();
-    dev.flags.remove(DeviceFlags::NOT_RESET);
-
-    // 8. Reseed `current_frame` so it carries the new backbuffer/depth
+    // 7. Reseed `current_frame` so it carries the new backbuffer/depth
     //    handles. The post-flush frame still referenced the destroyed
     //    pre-Reset textures; without this, the next Present would
     //    submit a freed MTLTexture pointer (status=0xc0000005 on the
-    //    unix side).
+    //    unix side). Runs before the state defaults: `reset_to_defaults`
+    //    pushes ops (default viewport, unbinds), and pushing them first
+    //    would hand them to the reseed to throw away, so this keeps the
+    //    order `apply_auto_resize` already uses.
     dev.reseed_current_frame();
+
+    // 8. Reset device state to D3D9 defaults. Cursor + silent-write
+    //    warn latches survive (per-spec / process-lifetime telemetry).
+    dev.reset_to_defaults();
+    dev.flags.remove(DeviceFlags::NOT_RESET);
 
     // 9. Defer the PresentationInterval change to the next frame's first
     //    `nextDrawable`. Mutating `displaySyncEnabled` synchronously here
@@ -5165,6 +5179,7 @@ extern "system" fn device_create_vertex_buffer(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
     // SAFETY: vtable out-param; `vb` is *mut *mut c_void per IDirect3DDevice9 ABI.
@@ -5242,6 +5257,7 @@ extern "system" fn device_create_index_buffer(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
     // SAFETY: vtable out-param; `ib` is *mut *mut c_void per IDirect3DDevice9 ABI.
@@ -10020,6 +10036,7 @@ fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> Strea
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         offset: bound.stream_offset(s),
         stride: bound.stream_stride(s),
         freq: bound.stream_freq(s),
@@ -10063,6 +10080,7 @@ fn snapshot_bound_index_source(
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
         backing_len: inner.current_backing_len(),
+        backing_generation: inner.current_backing_generation(),
         offset: start_index * index_stride,
         index_count,
         index_type,

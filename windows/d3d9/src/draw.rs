@@ -19,7 +19,7 @@ use mtld3d_core::{
         FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
     },
     ids::{BufferId, ProgramId},
-    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, null_texture_tex_sentinel},
+    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, VertexBufferBind, null_texture_tex_sentinel},
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
     pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
@@ -120,6 +120,8 @@ pub struct StreamBinding {
     pub buffer_id: BufferId,
     pub backing_ptr: u64,
     pub backing_len: u64,
+    /// The backing allocation's identity (see `PageBox::generation`).
+    pub backing_generation: u64,
     pub offset: u32,
     pub stride: u32,
     /// Raw `SetStreamSourceFreq` word of this stream (flags + count).
@@ -249,6 +251,8 @@ pub enum IndexSource {
         buffer_id: BufferId,
         backing_ptr: u64,
         backing_len: u64,
+        /// The backing allocation's identity (see `PageBox::generation`).
+        backing_generation: u64,
         offset: u32,
         index_count: u32,
         index_type: IndexType,
@@ -2217,8 +2221,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     // attributes: nothing to bind.
                     continue;
                 }
-                let buffer_handle =
-                    enc.ensure_vbib_mtl_buffer(b.buffer_id, b.backing_ptr, b.backing_len);
+                let buffer_handle = enc.ensure_vbib_mtl_buffer(
+                    b.buffer_id,
+                    b.backing_ptr,
+                    b.backing_len,
+                    b.backing_generation,
+                );
                 if buffer_handle == 0 {
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for VB");
                     mtld3d_shared::log_once_trace_by!(
@@ -2229,10 +2237,26 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     );
                     return;
                 }
-                if enc
-                    .last_bound()
-                    .vertex_buffer_changed(slot, buffer_handle, b.offset)
-                {
+                let bind = enc.last_bound().vertex_buffer_changed(
+                    slot,
+                    buffer_handle,
+                    b.offset,
+                    b.backing_generation,
+                );
+                if bind == VertexBufferBind::ReusedHandle {
+                    // The dedup would have kept the wrapper this address used
+                    // to name bound; that wrapper was destroyed inside this
+                    // pass, which the retention schedule is meant to rule out.
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                         buffer {:#x} generation {}: rebinding instead of deduplicating",
+                        b.buffer_id.raw(),
+                        b.backing_generation
+                    );
+                }
+                let vb_emitted = bind != VertexBufferBind::Same;
+                if vb_emitted {
                     enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
                 }
                 // Record this draw's VB read range so a later overlapping
@@ -2382,12 +2406,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             buffer_id,
             backing_ptr,
             backing_len,
+            backing_generation,
             offset,
             index_count,
             index_type,
             base_vertex,
         } => {
-            let buffer_handle = enc.ensure_vbib_mtl_buffer(buffer_id, backing_ptr, backing_len);
+            let buffer_handle =
+                enc.ensure_vbib_mtl_buffer(buffer_id, backing_ptr, backing_len, backing_generation);
             if buffer_handle == 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for IB");
                 mtld3d_shared::log_once_trace_by!(

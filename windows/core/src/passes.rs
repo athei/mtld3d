@@ -4967,6 +4967,20 @@ impl Default for PassState {
     }
 }
 
+/// What `LastBoundCache::vertex_buffer_changed` decided for a stream slot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VertexBufferBind {
+    /// The same wrapper at the same offset is bound: no command.
+    Same,
+    /// A different binding: emit `setVertexBuffer`.
+    Changed,
+    /// Same handle and offset over another backing generation: emit.
+    ///
+    /// The handle is a reused object address, so the wrapper it named
+    /// before was destroyed inside this pass; the caller reports it.
+    ReusedHandle,
+}
+
 /// Per-render-pass last-bound state cache.
 ///
 /// Skips redundant `setFragmentSamplerState` / `setFragmentTexture` /
@@ -5020,11 +5034,14 @@ pub struct LastBoundCache {
     ///
     /// Set only while a bound stage carries a non-zero bias.
     ps_lod_bias: Vec<u8>,
-    /// Vertex stream slots 0..16 — bound `MTLBuffer` handle + byte offset each.
+    /// Vertex stream slots 0..16 — bound `MTLBuffer` handle, byte offset, backing generation.
     ///
-    /// Indexed by D3D9 stream, which is the Metal vertex buffer slot. `(0, _)`
-    /// is the unset sentinel (Metal buffer handles are never zero).
-    vertex_buffers: [(u64, u32); VERTEX_STREAM_SLOTS as usize],
+    /// Indexed by D3D9 stream, which is the Metal vertex buffer slot.
+    /// `(0, _, _)` is the unset sentinel (Metal buffer handles are never
+    /// zero). The generation is the backing allocation's identity behind the
+    /// handle: a handle is a raw object address, and an address reused by a
+    /// later wrapper must not read as the same binding.
+    vertex_buffers: [(u64, u32, u64); VERTEX_STREAM_SLOTS as usize],
     /// Resolved `(x, y, w, h)` scissor rect.
     ///
     /// `None` is the unset sentinel — a brand-new render encoder has no
@@ -5068,7 +5085,7 @@ impl LastBoundCache {
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
             ps_lod_bias: Vec::new(),
-            vertex_buffers: [(0, 0); VERTEX_STREAM_SLOTS as usize],
+            vertex_buffers: [(0, 0, 0); VERTEX_STREAM_SLOTS as usize],
             scissor_rect: None,
             blend_color: 0xFFFF_FFFF,
             depth_bias_bits: (0, 0),
@@ -5098,7 +5115,7 @@ impl LastBoundCache {
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
         self.ps_lod_bias.clear();
-        self.vertex_buffers = [(0, 0); VERTEX_STREAM_SLOTS as usize];
+        self.vertex_buffers = [(0, 0, 0); VERTEX_STREAM_SLOTS as usize];
         self.scissor_rect = None;
         self.blend_color = 0xFFFF_FFFF;
         self.depth_bias_bits = (0, 0);
@@ -5184,16 +5201,28 @@ impl LastBoundCache {
     /// Whether vertex stream `slot` needs a `setVertexBuffer` for `(handle, offset)`.
     ///
     /// Records the binding when it does. `slot` is the D3D9 stream index,
-    /// below [`VERTEX_STREAM_SLOTS`].
+    /// below [`VERTEX_STREAM_SLOTS`]. `generation` is the backing allocation
+    /// behind `handle`: the same handle and offset over a different
+    /// generation is a reused object address, and the bind is re-emitted
+    /// rather than deduplicated onto the wrapper the address used to name.
     #[inline]
-    pub const fn vertex_buffer_changed(&mut self, slot: u32, handle: u64, offset: u32) -> bool {
+    pub const fn vertex_buffer_changed(
+        &mut self,
+        slot: u32,
+        handle: u64,
+        offset: u32,
+        generation: u64,
+    ) -> VertexBufferBind {
         let cur = &mut self.vertex_buffers[slot as usize];
         if cur.0 == handle && cur.1 == offset {
-            false
-        } else {
-            *cur = (handle, offset);
-            true
+            if cur.2 == generation {
+                return VertexBufferBind::Same;
+            }
+            *cur = (handle, offset, generation);
+            return VertexBufferBind::ReusedHandle;
         }
+        *cur = (handle, offset, generation);
+        VertexBufferBind::Changed
     }
 
     /// Forget the vertex buffer bound at stream slot 0.
@@ -5217,7 +5246,7 @@ impl LastBoundCache {
     /// the draw path fed inline zero bytes because nothing was bound to it.
     #[inline]
     pub const fn invalidate_vertex_buffer_slot(&mut self, slot: u32) {
-        self.vertex_buffers[slot as usize] = (0, 0);
+        self.vertex_buffers[slot as usize] = (0, 0, 0);
     }
 
     #[inline]
@@ -5456,7 +5485,9 @@ impl LastBoundCache {
             shadow.cull_mode,
             "cull-mode cache desync (cache vs encoder-emitted)"
         );
-        for (slot, (&(cache_h, cache_off), &emitted)) in self
+        // The generation behind the handle is a cache-side key only; the
+        // emitted command carries handle and offset.
+        for (slot, (&(cache_h, cache_off, _), &emitted)) in self
             .vertex_buffers
             .iter()
             .zip(&shadow.vertex_buffers)

@@ -854,6 +854,74 @@ const fn cube_quad_vertex(x: f32, y: f32) -> CubeQuadVertex {
     }
 }
 
+/// An upload queued before a same-size `Reset` still reaches the GPU.
+///
+/// A draw's bind-time flush queues the texture upload onto the pending frame
+/// and clears the mip's dirty bit; with no `Present` in between, that op is
+/// still queued when `Reset` replaces the frame. Dropping it with the
+/// bookkeeping already advanced loses the level's content on the GPU for
+/// good: the game believes it uploaded and never rewrites it. HL2's cached
+/// VGUI text meshes ride exactly this queue through the same-size Reset its
+/// windowed toggle issues, which is issue #76's garbled menu text.
+#[test]
+fn reset_same_size_keeps_uploads_queued_before_it() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLACK: u32 = 0xFF00_0000;
+
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut level = tex.lock_rect(0, 0);
+        level.write_u32(&[RED; 16]);
+    }
+    // Bind and draw without presenting: the draw schedules the upload onto
+    // the pending frame and spends the dirty bit.
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture before Reset");
+    h.select_texture_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING off");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF for the pre-Reset draw"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene before Reset");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(0xFFFF_FFFF)),
+        0,
+        "pre-Reset draw"
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene before Reset");
+
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset must succeed");
+
+    // The dirty bit is spent, so only the pre-Reset upload can have put the
+    // texels on the GPU; a Reset that dropped the queued op samples nothing.
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture after Reset");
+    h.select_texture_stage(0);
+    assert_eq!(
+        h.set_render_state(D3DRS_LIGHTING, 0),
+        0,
+        "LIGHTING off again"
+    );
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF for the post-Reset draw"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(0xFFFF_FFFF)),
+            0,
+            "post-Reset draw"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        RED,
+        "the upload queued before the Reset must survive it",
+    );
+}
+
 #[test]
 fn reset_clears_the_stage_cube_binding_mask() {
     const RED: u32 = 0xFFFF_0000;
