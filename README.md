@@ -464,7 +464,8 @@ pipe. Each process writes `<exe>-<pid>.log` into `mtld3d-logs` beside the
 executable, so a launch never overwrites the log of the one before it, and
 the GPU traces F12 captures land next to it as `<exe>-<pid>-<n>.gputrace`.
 `log.dir` in `mtld3d.conf` moves the directory; the file appears with the
-first line written, so a process that logs nothing leaves nothing behind.
+first line written, so a process that logs nothing leaves nothing behind, and
+the directory keeps only the ten newest logs and the ten newest traces.
 
 ## Contributing
 
