@@ -24,7 +24,10 @@ use mtld3d_core::{
     pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
     shader_cache,
-    streams::{instance_count, instanced_stream_read_bytes, is_instance_data, stream_step},
+    streams::{
+        bound_stream_layout, instance_count, instanced_stream_read_bytes, is_instance_data,
+        layout_stride,
+    },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, build_vs_draw_bytes},
 };
 use mtld3d_shared::{
@@ -166,29 +169,6 @@ impl VertexSource {
     }
 }
 
-/// The stride a stream's vertex buffer layout steps by.
-///
-/// The application's `SetStreamSource` stride wins when it covers the
-/// extent of the declaration elements the shader consumes on that stream
-/// (it can exceed it when the vertex struct carries fields past them). A
-/// zero stride means the application left it to the declaration. A non-zero
-/// stride smaller than the consumed extent means the shader reads an
-/// attribute past the end of each vertex — Metal rejects such a pipeline,
-/// so the layout is widened to the extent with a warning; the affected
-/// draw fetches wrong data either way.
-fn layout_stride(app_stride: u32, extent: u32) -> u32 {
-    if app_stride == 0 {
-        return extent;
-    }
-    if app_stride < extent {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "stream stride {app_stride} below the consumed declaration extent {extent}; layout widened to the extent"
-        );
-        return extent;
-    }
-    app_stride
-}
-
 /// Zero bytes fed to a stream the declaration reads but nothing is bound to.
 ///
 /// Bound inline at the stream's slot under a `Constant` layout, so every
@@ -218,14 +198,7 @@ fn stream_layouts(
                 step: VertexStepFunction::PerVertex,
                 step_rate: 1,
             },
-            StreamFeed::Buffer(b) => {
-                let (step, step_rate) = stream_step(b.freq);
-                StreamLayout {
-                    stride: layout_stride(b.stride, extent),
-                    step,
-                    step_rate,
-                }
-            }
+            StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
             StreamFeed::Null => StreamLayout {
                 stride: extent,
                 step: VertexStepFunction::Constant,
@@ -1625,10 +1598,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     drop(t_lookup);
     let shaders = ShaderRef { vs, ps, variant };
     enc.maybe_log_pass_shader(shaders, stage_bindings);
-    // One vertex buffer layout per stream the declaration reads: stride from
-    // the binding (or the declaration extent), step function from the
-    // stream's `SetStreamSourceFreq`, a constant zero feed where nothing is
-    // bound. Part of the pipeline identity.
+    // One vertex buffer layout per stream the declaration reads: stride and
+    // step function from the binding (a zero stride is one constant element,
+    // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
+    // feed where nothing is bound. Part of the pipeline identity.
     let layouts = stream_layouts(&vertex_source, &attrs);
     enc.maybe_emit_draw_trace(
         shaders,

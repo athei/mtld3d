@@ -258,6 +258,60 @@ fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
     );
 }
 
+/// A zero stride feeds every vertex the element at the stream offset.
+///
+/// D3D9 defines a `SetStreamSource` stride of 0 as one element for the whole
+/// draw, the way an engine binds a small zero-filled buffer to a stream its
+/// shader declares but the mesh does not carry. Stream 1 holds four offsets,
+/// only the second of which keeps the triangle on screen, and is bound at
+/// that element with stride 0: every vertex must read it. Stepping the
+/// stream per vertex instead would move two of the three vertices off
+/// screen (and, past the buffer's end, fetch out of bounds).
+#[test]
+fn zero_stride_stream_feeds_every_vertex_the_element_at_its_offset() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&pos_stream0_offset_stream1());
+    let vs = h.create_vertex_shader(&VS_INSTANCED);
+    let ps = h.create_pixel_shader(&PS_CONST);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "red constant"
+    );
+
+    let far = PosVertex {
+        x: 5.0,
+        y: 5.0,
+        z: 0.0,
+    };
+    let none = PosVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let offsets = [far, none, far, far];
+    let stride = stride_of::<PosVertex>();
+    let tri = centered_triangle();
+    let positions = h.create_vertex_buffer(stride * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    positions.lock(0, 0, 0).write(&tri);
+    let constant = h.create_vertex_buffer(stride * 4, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    constant.lock(0, 0, 0).write(&offsets);
+    assert_eq!(h.set_stream_source(0, &positions, 0, stride), D3D_OK);
+    assert_eq!(h.set_stream_source(1, &constant, stride, 0), D3D_OK);
+
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "every vertex reads the zero offset at the bound element"
+    );
+}
+
 /// The `SetStreamSourceFreq` / `GetStreamSourceFreq` contract.
 ///
 /// Defaults to 1 on every stream, rejects the combinations the runtime

@@ -61,8 +61,9 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   for the fixed-function pipeline and clip-space for vertex shaders, gated by
   `D3DRS_CLIPPING` and carried by `D3DSBT_ALL` state blocks.
 - **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
-  per-stream offsets and strides; a declared stream with nothing bound reads
-  zeros, as on hardware.
+  per-stream offsets and strides; a zero stride feeds every vertex the element
+  at the stream offset, and a declared stream with nothing bound reads zeros,
+  as on hardware.
 - **Hardware instancing**: `SetStreamSourceFreq` with `INDEXEDDATA` /
   `INSTANCEDATA`, including per-instance step rates, on the indexed draws
   (D3D9 never instances a non-indexed draw).
