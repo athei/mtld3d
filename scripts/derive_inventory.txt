@@ -54,6 +54,10 @@ unix/unix/src/metal/macdrv.rs ColorspaceFlags Clone,Copy,Debug,Default,PartialEq
 unix/unix/src/metal/macdrv.rs DisplayCaps Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerColorRefs Clone,Copy
 unix/unix/src/metal/macdrv.rs LayerMode Clone,Copy,Debug,PartialEq,Eq
+unix/unix/src/metal/macdrv/cursor_overlay.rs OverlayFlags Clone,Copy,Debug,Default,PartialEq,Eq
+unix/unix/src/metal/macdrv/cursor_overlay.rs SpriteGeometry Clone,Copy,Debug,Default,PartialEq
+unix/unix/src/metal/macdrv/cursor_overlay.rs VisibilityInputs Clone,Copy,Debug,Default,PartialEq,Eq
+unix/unix/src/metal/macdrv/cursor_overlay.rs WantedSnapshot Clone,Copy
 unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash

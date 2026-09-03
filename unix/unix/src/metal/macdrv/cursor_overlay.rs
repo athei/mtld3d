@@ -3,10 +3,17 @@
 //! The PE side keeps the Win32 cursor blank while `cursor.software` is on and
 //! sends the cursor's sprite and visibility through the `SetCursorOverlay`
 //! thunk; this module draws that sprite in a borderless, click-through
-//! `NSWindow` that rides one level above the game window and follows the
-//! pointer. The hardware cursor plane is never toggled, and under HDR the
-//! sprite goes through the same tone map as the frame, so the cursor is as
-//! bright as the UI it hovers over.
+//! `NSWindow` one level above the game window. The hardware cursor plane is
+//! never toggled, and under HDR the sprite goes through the same tone map as
+//! the frame, so the cursor is as bright as the UI it hovers over.
+//!
+//! The window never moves with the pointer: it covers the whole screen the
+//! game window is on, and the sprite is a `CAMetalLayer` moved inside it. A
+//! window frame change makes `AppKit` re-resolve the cursor for the pointer's
+//! location, and with no cursor of our own to offer it lands on the arrow over
+//! the game's blank cursor on every mouse move; a layer moving inside a fixed
+//! window is invisible to that machinery. Show and hide park and unpark the
+//! same layer, so nothing at the window level changes at click rate either.
 //!
 //! Threads. The thunk runs on the API thread and only writes [`SHARED`] and
 //! queues one main-thread apply, coalesced through [`APPLY_PENDING`] so a burst
@@ -46,13 +53,13 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
+use objc2_foundation::{NSDictionary, NSNotification, NSNotificationCenter, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
     MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -67,6 +74,23 @@ use crate::metal::{command, present};
 /// Inherits `mtld3d::unix` filters by prefix; `mtld3d::unix::cursor=debug`
 /// shows every apply with the sprite, visibility and layer mode it landed.
 const LOG_TARGET: &str = "mtld3d::unix::cursor";
+
+/// Where the sprite layer sits while hidden: far outside any window.
+///
+/// Parking the layer instead of hiding the window keeps show and hide at the
+/// cost of one layer property write, which is what a cursor moving under a
+/// held mouse button needs at click rate.
+const PARKED: CGPoint = CGPoint {
+    x: -100_000.0,
+    y: -100_000.0,
+};
+
+/// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
+///
+/// With `MTL_HUD_ENABLED` in the environment the HUD attaches to every
+/// `CAMetalLayer` in the process, and on a cursor-sized layer that presents
+/// once per sprite it is a black box reading "inf" over the cursor.
+const HUD_MODE_OFF: &str = "disabled";
 
 /// A cursor bitmap as the PE side shipped it: tight BGRA rows, already upscaled.
 struct Sprite {
@@ -160,10 +184,11 @@ const fn overlay_visible(inputs: VisibilityInputs) -> bool {
         && !inputs.intersects(VisibilityInputs::OCCLUDED.union(VisibilityInputs::MINIATURIZED))
 }
 
-/// The overlay window's frame origin that puts the sprite's hotspot under the pointer.
+/// The sprite layer's origin that puts the sprite's hotspot under the pointer.
 ///
-/// Cocoa screen coordinates grow upwards and a window's origin is its bottom
-/// left, while the hotspot is measured from the sprite's top left.
+/// `mouse` and the result are in the overlay window's coordinates, which grow
+/// upwards with the origin at the bottom left like the screen's, while the
+/// hotspot is measured from the sprite's top left.
 const fn sprite_origin(mouse: (f64, f64), geometry: SpriteGeometry) -> (f64, f64) {
     (
         mouse.0 - geometry.hotspot_x,
@@ -333,6 +358,7 @@ fn on_pointer_event_main() {
 /// The overlay window and everything rendered into it. **Main thread only.**
 struct Overlay {
     window: Retained<NSWindow>,
+    /// The sprite: a sublayer of the window's content layer, moved per event.
     layer: Retained<CAMetalLayer>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// One `MTLTexture` per sprite hash, uploaded on first render.
@@ -351,7 +377,7 @@ bitflags::bitflags! {
     /// The overlay's two booleans.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct OverlayFlags: u8 {
-        /// The window is at full alpha.
+        /// The sprite layer sits under the pointer rather than parked away.
         const SHOWN = 1 << 0;
         /// The PE side's last word was "visible".
         const WANTED_VISIBLE = 1 << 1;
@@ -379,14 +405,20 @@ impl Overlay {
         layer.setAllowsNextDrawableTimeout(true);
         layer.setPresentsWithTransaction(false);
         layer.setName(Some(&NSString::from_str("mtld3d-cursor-overlay")));
+        // Positioned by its bottom-left corner, like the window it lives in.
+        layer.setAnchorPoint(CGPoint { x: 0.0, y: 0.0 });
+        layer.setPosition(PARKED);
+        let hud = NSDictionary::from_slices::<NSString>(
+            &[&NSString::from_str("mode")],
+            &[&*NSString::from_str(HUD_MODE_OFF)],
+        );
+        // SAFETY: an `NSDictionary<NSString, NSString>` is an `NSDictionary`
+        // of objects; the erased view is what the setter is declared with.
+        let hud = unsafe { Retained::cast_unchecked::<NSDictionary>(hud) };
+        // SAFETY: objc2 typed binding; the dictionary is copied by the layer.
+        unsafe { layer.setDeveloperHUDProperties(Some(&hud)) };
 
-        let frame = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize {
-                width: 1.0,
-                height: 1.0,
-            },
-        };
+        let frame = overlay_frame(mtm);
         // SAFETY: standard NSWindow initialiser on a fresh allocation; the
         // borderless mask and buffered backing are the documented values for
         // an overlay, and `defer = false` gives the window its server-side
@@ -414,13 +446,19 @@ impl Overlay {
                 | NSWindowCollectionBehavior::IgnoresCycle
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
-        // Hidden by alpha, never by ordering out: show/hide happens at click
-        // rate and an ordering change is the class of cost this replaces.
-        window.setAlphaValue(0.0);
-
-        let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
-        // Layer-hosting: our layer is the view's layer, sized with it.
-        view.setLayer(Some(&layer));
+        let view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: frame.size,
+            },
+        );
+        // Layer-hosting: a plain content layer sized with the view carries the
+        // sprite as a sublayer, so moving the sprite touches no view or window
+        // geometry.
+        let host = CALayer::new();
+        host.addSublayer(&layer);
+        view.setLayer(Some(&host));
         view.setWantsLayer(true);
         window.setContentView(Some(&view));
         window.orderFrontRegardless();
@@ -428,7 +466,8 @@ impl Overlay {
         install_input_hooks();
         info!(
             target: LOG_TARGET,
-            "cursor: overlay window created (borderless, click-through, alpha-hidden)",
+            "cursor: overlay window created over ({:.0},{:.0}) {:.0}x{:.0} (borderless, click-through)",
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
         );
         Some(Self {
             window,
@@ -541,9 +580,12 @@ impl Overlay {
             }
         };
         let scale = f64::from(sprite_scale(hash));
-        self.window.setContentSize(CGSize {
-            width: geometry.width,
-            height: geometry.height,
+        self.layer.setBounds(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: geometry.width,
+                height: geometry.height,
+            },
         });
         self.layer.setContentsScale(scale);
         self.layer.setDrawableSize(CGSize {
@@ -578,11 +620,11 @@ impl Overlay {
         true
     }
 
-    /// Level, position and alpha against the pointer and the game window as they are now.
+    /// Level, position and visibility against the pointer and the game window as they are now.
     fn sync_position(&mut self, mtm: MainThreadMarker) {
         let game = retain_bound_view().and_then(|view| view.window().map(|window| (view, window)));
         let Some((view, game_window)) = game else {
-            self.set_shown(false);
+            self.set_shown(false, PARKED);
             return;
         };
         // Wine re-levels its windows across fullscreen transitions; stay one
@@ -590,6 +632,18 @@ impl Overlay {
         let level = game_window.level() + 1;
         if self.window.level() != level {
             self.window.setLevel(level);
+        }
+        // Follow the game window onto another screen. A window frame change
+        // costs one cursor re-resolution by AppKit, which is why it is done
+        // only here and never per event.
+        let frame = overlay_frame(mtm);
+        if self.window.frame() != frame {
+            self.window.setFrame_display(frame, false);
+            info!(
+                target: LOG_TARGET,
+                "cursor: overlay window moved over ({:.0},{:.0}) {:.0}x{:.0}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            );
         }
         let mouse = NSEvent::mouseLocation();
         let client = game_window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
@@ -609,21 +663,52 @@ impl Overlay {
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
         let shown = overlay_visible(inputs);
-        if shown {
-            let (x, y) = sprite_origin((mouse.x, mouse.y), self.geometry);
-            self.window.setFrameOrigin(CGPoint { x, y });
-        }
-        self.set_shown(shown);
+        let position = if shown {
+            let local = self.window.convertPointFromScreen(mouse);
+            let (x, y) = sprite_origin((local.x, local.y), self.geometry);
+            CGPoint { x, y }
+        } else {
+            PARKED
+        };
+        self.set_shown(shown, position);
     }
 
-    fn set_shown(&mut self, shown: bool) {
-        if self.flags.contains(OverlayFlags::SHOWN) == shown {
+    /// Move the sprite layer, under the pointer or parked, without an implicit animation.
+    fn set_shown(&mut self, shown: bool, position: CGPoint) {
+        let was_shown = self.flags.contains(OverlayFlags::SHOWN);
+        if !shown && !was_shown {
             return;
         }
-        self.window.setAlphaValue(if shown { 1.0 } else { 0.0 });
-        self.flags.set(OverlayFlags::SHOWN, shown);
-        debug!(target: LOG_TARGET, "cursor: overlay {}", if shown { "shown" } else { "hidden" });
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        self.layer.setPosition(position);
+        CATransaction::commit();
+        if was_shown != shown {
+            self.flags.set(OverlayFlags::SHOWN, shown);
+            debug!(target: LOG_TARGET, "cursor: overlay {}", if shown { "shown" } else { "hidden" });
+        }
     }
+}
+
+/// The frame the overlay window covers: the screen the game window is on.
+///
+/// The main screen when the game window is not on any (mid-move between
+/// displays) or no game window is bound; the window follows on the next event.
+fn overlay_frame(mtm: MainThreadMarker) -> CGRect {
+    let screen = retain_bound_view()
+        .and_then(|view| view.window())
+        .and_then(|window| window.screen())
+        .or_else(|| NSScreen::mainScreen(mtm));
+    screen.map_or(
+        CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        },
+        |screen| screen.frame(),
+    )
 }
 
 /// The `scale` the PE side upscaled sprite `hash` by, `1` if it is gone.
