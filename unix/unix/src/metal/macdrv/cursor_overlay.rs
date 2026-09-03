@@ -136,13 +136,14 @@ const CAPTURE_SILENCE_MS: u128 = 60;
 /// checks on the main and submit threads. `u64::MAX` until the first event.
 static LAST_EVENT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Where the pointer was at the previous capture check, packed like [`LAST_EVENT_POS`].
+/// The last winemac warp the capture check has accounted for, as `f64` bits.
 ///
-/// A capture has the pointer moving between checks; a warp the game asked
-/// for (`SetCursorPos` after a mouselook drag) is one jump followed by a
-/// still pointer, and generates no event either. Comparing consecutive
-/// checks is what tells them apart.
-static LAST_CHECK_POS: AtomicU64 = AtomicU64::new(0);
+/// winemac records the uptime of its last `SetCursorPos` warp; a value the
+/// check has not seen yet means the pointer was moved by the game, not by
+/// another process, and the pointer's position becomes the new one to
+/// measure motion from. `0` before any warp, which is also what winemac
+/// reports once it has seen an event newer than its warp.
+static LAST_WARP_SEEN_BITS: AtomicU64 = AtomicU64::new(0);
 
 /// Where the pointer was at the last mouse event: `x` bits high, `y` bits low.
 ///
@@ -177,6 +178,10 @@ impl WineApplicationController {
         #[unsafe(method(clippingCursor))]
         #[unsafe(method_family = none)]
         fn clipping_cursor(&self) -> bool;
+
+        #[unsafe(method(lastSetCursorPositionTime))]
+        #[unsafe(method_family = none)]
+        fn last_set_cursor_position_time(&self) -> f64;
     );
 }
 
@@ -196,6 +201,20 @@ fn wine_clips_cursor() -> bool {
     *HAS_WINE_CONTROLLER
         && WineApplicationController::shared_controller()
             .is_some_and(|controller| controller.clipping_cursor())
+}
+
+/// The uptime of winemac's last `SetCursorPos` warp, `0.0` when none is outstanding.
+///
+/// The game moving the pointer through Wine is the one pointer move that
+/// neither comes from the mouse nor from another process; winemac records
+/// its time so its own mouse handling can discard the events the warp
+/// crosses, and the capture check reads the same record.
+fn wine_last_warp_uptime() -> f64 {
+    if !*HAS_WINE_CONTROLLER {
+        return 0.0;
+    }
+    WineApplicationController::shared_controller()
+        .map_or(0.0, |controller| controller.last_set_cursor_position_time())
 }
 
 /// The game shows its cursor, in either cursor mode.
@@ -223,7 +242,10 @@ fn unpack_point(bits: u64) -> (f64, f64) {
     (f64::from(f32::from_bits(x)), f64::from(f32::from_bits(y)))
 }
 
-/// Record a mouse event's time and pointer position for the capture checks.
+/// Record the pointer's last legitimate position and its time for the capture checks.
+///
+/// A mouse event that reached the application, or a warp winemac made for
+/// the game; either is the pointer being where the game expects it.
 fn note_event(position: CGPoint) {
     let ns = u64::try_from(EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
     LAST_EVENT_POS.store(pack_point(position), Ordering::Relaxed);
@@ -238,18 +260,23 @@ fn capture_suspected() -> bool {
     if !CURSOR_SHOWN.load(Ordering::Relaxed) || wine_clips_cursor() {
         return false;
     }
+    let now = NSEvent::mouseLocation();
+    // A warp the game asked for since the last check moved the pointer
+    // legitimately: where it is now is where motion is measured from, and
+    // the silence is measured from now.
+    let warp_bits = wine_last_warp_uptime().to_bits();
+    if warp_bits != 0 && LAST_WARP_SEEN_BITS.swap(warp_bits, Ordering::Relaxed) != warp_bits {
+        note_event(now);
+        return false;
+    }
     let at = LAST_EVENT_NS.load(Ordering::Acquire);
     if at == u64::MAX {
         return false;
     }
     let silence_ms = EPOCH.elapsed().as_nanos().saturating_sub(u128::from(at)) / 1_000_000;
-    let now = NSEvent::mouseLocation();
-    let now_bits = pack_point(now);
     let (seen_x, seen_y) = unpack_point(LAST_EVENT_POS.load(Ordering::Relaxed));
-    let (prev_x, prev_y) = unpack_point(LAST_CHECK_POS.swap(now_bits, Ordering::Relaxed));
-    let moved_since_event = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
-    let moved_since_check = (now.x - prev_x).abs() > 0.5 || (now.y - prev_y).abs() > 0.5;
-    pointer_captured(silence_ms, moved_since_event, moved_since_check)
+    let moved = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
+    pointer_captured(silence_ms, moved)
 }
 
 /// Run the capture check from the present path; no wakeup of its own.
@@ -269,21 +296,17 @@ pub fn poll_capture_from_present() {
     }
 }
 
-/// Whether the pointer is moving while no mouse event reaches this process.
+/// Whether the pointer moved away from its last legitimate position with no event since.
 ///
 /// A system tool that takes the pointer (the screenshot crosshair) leaves the
-/// application eventless while the pointer keeps moving. A pointer that sits
-/// away from the last event but no longer moves was warped there by the game
-/// (`SetCursorPos`), which generates no event either and must not hide the
-/// cursor. Only asked while the game shows its cursor and Wine is not
-/// clipping it; either way otherwise the game owns the pointer and the events
-/// legitimately stay away from the application.
-const fn pointer_captured(
-    silence_ms: u128,
-    moved_since_event: bool,
-    moved_since_check: bool,
-) -> bool {
-    moved_since_event && moved_since_check && silence_ms >= CAPTURE_SILENCE_MS
+/// application eventless while the pointer keeps moving. The last legitimate
+/// position is where the last mouse event or the last winemac warp put the
+/// pointer, so a `SetCursorPos` by the game counts as the game's own move
+/// rather than another process's. Only asked while the game shows its cursor
+/// and Wine is not clipping it; either way otherwise the game owns the
+/// pointer and the events legitimately stay away from the application.
+const fn pointer_captured(silence_ms: u128, moved: bool) -> bool {
+    moved && silence_ms >= CAPTURE_SILENCE_MS
 }
 
 /// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
