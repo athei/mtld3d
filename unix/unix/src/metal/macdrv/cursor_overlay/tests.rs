@@ -12,9 +12,8 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use super::{
-    CAPTURE_SILENCE_MS, HEAL_SILENCE_MS, Sprite, SpriteGeometry, VisibilityInputs,
-    heal_after_silence, overlay_visible, peak_changed, pointer_captured, rect_contains,
-    sprite_origin,
+    CAPTURE_SILENCE_MS, Sprite, SpriteGeometry, VisibilityInputs, overlay_visible, peak_changed,
+    pointer_captured, rect_contains, sprite_origin,
 };
 
 fn geometry() -> SpriteGeometry {
@@ -98,13 +97,6 @@ fn pointer_is_captured_only_when_it_moves_without_events() {
     assert!(!pointer_captured(CAPTURE_SILENCE_MS * 10, false));
     // Moving with events flowing: the events are what we saw it with.
     assert!(!pointer_captured(CAPTURE_SILENCE_MS - 1, true));
-}
-
-#[test]
-fn only_a_long_silence_re_sets_the_blank_cursor() {
-    assert!(heal_after_silence(HEAL_SILENCE_MS));
-    assert!(!heal_after_silence(HEAL_SILENCE_MS - 1));
-    assert!(!heal_after_silence(8));
 }
 
 #[test]

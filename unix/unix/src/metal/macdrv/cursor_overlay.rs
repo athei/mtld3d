@@ -36,13 +36,14 @@
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
-//! keeps moving; a low-rate tick notices the pointer moving with no events
+//! keeps moving; a fast tick notices the pointer moving with no events
 //! arriving and hides the sprite until events resume. And when such a tool
 //! ends, the window server shows the standard arrow rather than the cursor
 //! Wine set, which Wine never re-applies because its handle did not change;
-//! the first event after such a silence re-applies the cursor the
-//! application last set. That pointer watch serves the hardware cursor too,
-//! so it is installed at attach for every device, overlay or not.
+//! the first event after a capture asks the PE side for its null-then-set
+//! kick, which makes Wine re-apply through a handle change. That pointer
+//! watch serves the hardware cursor too, so it is installed at attach for
+//! every device, overlay or not.
 
 use core::{
     cell::{Cell, RefCell},
@@ -66,8 +67,8 @@ use mtld3d_shared::{
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
-    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSCursor, NSEvent,
-    NSEventMask, NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
+    NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -85,8 +86,8 @@ use rustc_hash::FxHashMap;
 
 use super::{
     COLOR_SPACE_POLICY, CURRENT_HEADROOM_BITS, HDR_ACTIVE, LayerColorRefs, LayerMode,
-    apply_layer_color, retain_bound_layer, retain_bound_view, run_on_main_thread_async,
-    screen_color_profile, window_occluded,
+    apply_layer_color, request_cursor_kick, retain_bound_layer, retain_bound_view,
+    run_on_main_thread_async, screen_color_profile, window_occluded,
 };
 use crate::metal::{command, present};
 
@@ -117,25 +118,17 @@ enum Content {
 
 /// How often the pointer is checked for moving without events reaching us, seconds.
 ///
-/// Four times a second is enough to take the sprite away within a quarter
-/// second of a system tool grabbing the pointer, and costs one `mouseLocation`
-/// read per tick.
-const CAPTURE_TICK_SECONDS: f64 = 0.25;
+/// Ten times a second takes the sprite away within about a fifth of a second
+/// of a system tool grabbing the pointer, for one `mouseLocation` read per
+/// tick; the timer's tolerance lets the system fold it into other wakeups.
+const CAPTURE_TICK_SECONDS: f64 = 0.1;
 
 /// How long without a mouse event before a moved pointer counts as captured.
-const CAPTURE_SILENCE_MS: u128 = 200;
-
-/// How long a silence has to be for the next event to re-apply the application's cursor.
 ///
-/// Anything that borrows the pointer, the screenshot crosshair included,
-/// silences this process for longer than that and can leave its own cursor
-/// behind; an idle pointer that resumes moving costs one cursor set.
-const HEAL_SILENCE_MS: u128 = 500;
-
-/// Whether the first event after a silence should re-apply the application's cursor.
-const fn heal_after_silence(silence_ms: u128) -> bool {
-    silence_ms >= HEAL_SILENCE_MS
-}
+/// A moving pointer delivers an event every few milliseconds, so a gap this
+/// long with the pointer elsewhere than the last event put it means someone
+/// else is receiving the events.
+const CAPTURE_SILENCE_MS: u128 = 100;
 
 /// Whether the pointer moved while no mouse event reached this process.
 ///
@@ -384,6 +377,8 @@ thread_local! {
     static LAST_EVENT: Cell<Option<(Instant, CGPoint)>> = const { Cell::new(None) };
     /// Whether the pointer watch has been installed.
     static POINTER_WATCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// The pointer is moving without events reaching us: a system tool has it.
+    static CAPTURED: Cell<bool> = const { Cell::new(false) };
     /// The overlay's `AppKit` and Metal objects; main thread only, by construction.
     ///
     /// Every access is from a block dispatched to the main queue or from an
@@ -415,18 +410,20 @@ fn apply_on_main_inner(create_if_missing: bool) {
 
 /// Mouse moved or dragged, or the application (de)activated. **Main thread only.**
 ///
-/// Runs for every device whatever its cursor mode: the silence heal is what
-/// puts the hardware cursor back after a system tool borrowed the pointer.
+/// Runs for every device whatever its cursor mode: the end of a capture is
+/// what puts the hardware cursor back after a system tool borrowed the pointer.
 fn on_pointer_event_main() {
     // SAFETY: local event monitors and notification blocks run on the main thread.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    let silence_ms = LAST_EVENT.with(|last| {
-        let silence = last.get().map(|(at, _)| at.elapsed().as_millis());
-        last.set(Some((Instant::now(), NSEvent::mouseLocation())));
-        silence
-    });
-    if silence_ms.is_some_and(heal_after_silence) {
-        heal_application_cursor();
+    LAST_EVENT.with(|last| last.set(Some((Instant::now(), NSEvent::mouseLocation()))));
+    if CAPTURED.replace(false) {
+        // The other process's cursor is still on screen; Wine only replaces
+        // it on a handle change, which the PE side's kick provides.
+        request_cursor_kick();
+        debug!(
+            target: LOG_TARGET,
+            "cursor: mouse events resumed, pointer released, cursor re-apply requested",
+        );
     }
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
@@ -435,51 +432,38 @@ fn on_pointer_event_main() {
         if let Some(overlay) = slot.as_mut()
             && overlay.wanted.is_some()
         {
-            if overlay.captured {
-                overlay.captured = false;
-                debug!(target: LOG_TARGET, "cursor: mouse events resumed, pointer released");
-            }
             overlay.sync_position(mtm);
         }
     });
 }
 
-/// Re-apply the cursor this application last set. **Main thread only.**
+/// The capture tick: notice a pointer moving without events reaching us. **Main thread only.**
 ///
-/// The window server keeps whatever the last process set: a system tool that
-/// borrowed the pointer leaves the standard arrow behind, and Wine does not
-/// re-apply a cursor whose handle did not change. `AppKit` still remembers the
-/// application's own cursor, Wine's game cursor or its blank, and setting it
-/// again is an image swap, never a cursor-plane toggle. Called on the first
-/// event after a silence, so a tool that still holds the pointer is never
-/// fought.
-fn heal_application_cursor() {
-    NSCursor::currentCursor().set();
-    debug!(target: LOG_TARGET, "cursor: events resumed after a silence, application cursor re-set");
-}
-
-/// The capture tick: hide the sprite while a system tool has the pointer. **Main thread only.**
+/// Runs for every device. The software cursor hides its sprite for the
+/// duration; the hardware cursor needs nothing until the capture ends.
 fn on_capture_tick_main() {
     // SAFETY: the timer fires on the main run loop.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    if CAPTURED.get() {
+        return;
+    }
+    let Some((at, seen)) = LAST_EVENT.with(Cell::get) else {
+        return;
+    };
+    let now = NSEvent::mouseLocation();
+    let moved = (now.x - seen.x).abs() > 0.5 || (now.y - seen.y).abs() > 0.5;
+    if !pointer_captured(at.elapsed().as_millis(), moved) {
+        return;
+    }
+    CAPTURED.set(true);
+    debug!(target: LOG_TARGET, "cursor: pointer moves without events, another process has it");
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             return;
         };
-        let Some(overlay) = slot.as_mut() else {
-            return;
-        };
-        if overlay.captured || !matches!(overlay.content, Content::Sprite { .. }) {
-            return;
-        }
-        let Some((at, seen)) = LAST_EVENT.with(Cell::get) else {
-            return;
-        };
-        let now = NSEvent::mouseLocation();
-        let moved = (now.x - seen.x).abs() > 0.5 || (now.y - seen.y).abs() > 0.5;
-        if pointer_captured(at.elapsed().as_millis(), moved) {
-            overlay.captured = true;
-            debug!(target: LOG_TARGET, "cursor: pointer moves without events, hiding the sprite");
+        if let Some(overlay) = slot.as_mut()
+            && overlay.wanted.is_some()
+        {
             overlay.sync_position(mtm);
         }
     });
@@ -501,8 +485,6 @@ struct Overlay {
     wanted: Option<(u64, SpriteGeometry)>,
     /// The PE side's last word on visibility.
     wanted_visible: bool,
-    /// The pointer is moving without events reaching us: a system tool has it.
-    captured: bool,
 }
 
 impl Overlay {
@@ -584,7 +566,6 @@ impl Overlay {
         window.setContentView(Some(&view));
         window.orderFrontRegardless();
 
-        install_capture_tick();
         info!(
             target: LOG_TARGET,
             "cursor: overlay window created over ({:.0},{:.0}) {:.0}x{:.0} (borderless, click-through)",
@@ -599,7 +580,6 @@ impl Overlay {
             mode: None,
             wanted: None,
             wanted_visible: false,
-            captured: false,
         })
     }
 
@@ -808,7 +788,7 @@ impl Overlay {
         );
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
-        inputs.set(VisibilityInputs::CAPTURED, self.captured);
+        inputs.set(VisibilityInputs::CAPTURED, CAPTURED.get());
         let shown = overlay_visible(inputs);
         let Some((hash, geometry)) = self.wanted else {
             self.ensure_content(Content::Transparent);
@@ -933,13 +913,17 @@ fn upload_sprite_texture(
 
 /// Install the capture tick, a repeating timer on the main run loop. **Main thread only.**
 ///
-/// Added in the common modes so it keeps firing while the main thread tracks
-/// a drag. The timer is leaked for the process lifetime like the observers.
+/// Part of the pointer watch, so it runs for every device. Added in the
+/// common modes so it keeps firing while the main thread tracks a drag. The
+/// timer is leaked for the process lifetime like the observers.
 fn install_capture_tick() {
     let block = RcBlock::new(|_: NonNull<NSTimer>| on_capture_tick_main());
     // SAFETY: objc2 typed binding; the run loop copies the block.
     let timer =
         unsafe { NSTimer::timerWithTimeInterval_repeats_block(CAPTURE_TICK_SECONDS, true, &block) };
+    // Let the system fire it together with other wakeups: a capture noticed
+    // half a tick late costs nothing, a timer that cannot drift costs power.
+    timer.setTolerance(CAPTURE_TICK_SECONDS / 2.0);
     // SAFETY: reading Foundation's run-loop-mode constant, an immutable static.
     let mode = unsafe { NSRunLoopCommonModes };
     // SAFETY: objc2 typed binding; the run loop retains the timer, and the
@@ -959,6 +943,7 @@ pub fn install_pointer_watch() {
     if POINTER_WATCH_INSTALLED.replace(true) {
         return;
     }
+    install_capture_tick();
     let monitor = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
         on_pointer_event_main();
         event.as_ptr()

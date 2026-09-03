@@ -45,7 +45,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 80);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
@@ -223,6 +223,15 @@ pub struct AttachMetalLayerParams {
     /// `SetCursorOverlay`; zero = the hardware HCURSOR path. Resolved once per
     /// device at attach and held for its lifetime.
     pub software_cursor_active: u32, // out
+    /// Address of a PE-side `AtomicU32` the unix side sets to ask for a cursor re-apply.
+    ///
+    /// Set to non-zero when the pointer comes back after another process held
+    /// it (a system tool such as the screenshot crosshair), which leaves that
+    /// process's cursor on screen. Wine re-applies its cursor only on a handle
+    /// change, so the PE side answers a set flag with its null-then-set kick
+    /// at the next `WM_SETCURSOR` or `ShowCursor(TRUE)`, taking the flag back
+    /// to zero. Same backing contract as `backing_scale_ptr`. `0` disables it.
+    pub cursor_kick_ptr: u64, // in: *const AtomicU32 (PE static, process lifetime)
 }
 
 impl Thunk for AttachMetalLayerParams {

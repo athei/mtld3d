@@ -209,6 +209,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
     PRESENT_PACING_BITS.store(0, Ordering::Relaxed);
     CURRENT_BACKING_SCALE.store(0, Ordering::Relaxed);
     BACKING_SCALE_SINK_PTR.store(0, Ordering::Relaxed);
+    CURSOR_KICK_SINK_PTR.store(0, Ordering::Relaxed);
     cursor_overlay::detach();
 }
 
@@ -672,6 +673,12 @@ static CURRENT_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
 /// first attach.
 static BACKING_SCALE_SINK_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// Address of the PE-side `AtomicU32` that asks for a cursor re-apply.
+///
+/// Latched at attach from `AttachMetalLayerParams::cursor_kick_ptr`, the same
+/// contract as [`BACKING_SCALE_SINK_PTR`]. `0` before the first attach.
+static CURSOR_KICK_SINK_PTR: AtomicUsize = AtomicUsize::new(0);
+
 /// Present-throttle request resolved PE-side.
 ///
 /// The guest's vsync ask (`D3DPRESENT_PARAMETERS::PresentationInterval`
@@ -806,6 +813,23 @@ fn screen_max_hz(screen: &objc2_app_kit::NSScreen) -> f64 {
     f64::from(as_u32)
 }
 
+/// Ask the PE side to re-apply the game's cursor through Wine.
+///
+/// Called when the pointer comes back after another process held it. The
+/// store is `Release` against the PE side's `AcqRel` swap; the flag is the
+/// whole message.
+fn request_cursor_kick() {
+    let sink = CURSOR_KICK_SINK_PTR.load(Ordering::Relaxed);
+    if sink == 0 {
+        return;
+    }
+    // SAFETY: the PE side backs this address with a static `AtomicU32` in its
+    // own image, readable for every write from here; see
+    // [`BACKING_SCALE_SINK_PTR`] for the lifetime argument.
+    let sink = unsafe { &*(sink as *const AtomicU32) };
+    sink.store(1, Ordering::Release);
+}
+
 /// Publish a backing scale into the PE-side sink, when one has been handed over.
 ///
 /// The store is `Relaxed`: the value stands alone, the PE side reads it once
@@ -846,6 +870,8 @@ pub struct LayerAttachRequest {
     /// with nothing to publish into, which is what a headless smoke test
     /// that never built one looks like.
     pub backing_scale_sink_ptr: u64,
+    /// Where a cursor re-apply request is written on the PE side, `0` = nowhere.
+    pub cursor_kick_sink_ptr: u64,
     /// `cursor.software`, resolved here against the layer mode attach picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
@@ -1084,6 +1110,7 @@ pub fn attach_metal_layer(
         hdr_enable,
         color_space,
         backing_scale_sink_ptr,
+        cursor_kick_sink_ptr,
         software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
@@ -1145,6 +1172,11 @@ pub fn attach_metal_layer(
                 Ordering::Relaxed,
             );
             publish_backing_scale(backing_scale);
+            CURSOR_KICK_SINK_PTR.store(
+                usize::try_from(cursor_kick_sink_ptr)
+                    .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+                Ordering::Relaxed,
+            );
             // Decide HDR vs SDR layer configuration from the panel's
             // static potential + the user's `color.hdr.enable` setting. Latch
             // the result as the configuration the layer now carries — the

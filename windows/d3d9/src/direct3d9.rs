@@ -63,6 +63,16 @@ static ADAPTER_MODES: LazyLock<AdapterModes> = LazyLock::new(build_adapter_modes
 /// attach publishes.
 static DISPLAY_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
 
+/// Set by the unix side when the pointer comes back from another process.
+///
+/// A system tool that borrows the pointer (the screenshot crosshair) leaves
+/// its own cursor on screen, and Wine re-applies its cursor only on a handle
+/// change. The cursor module takes the flag at the next `WM_SETCURSOR` or
+/// `ShowCursor(TRUE)` and answers it with the null-then-set kick. Backed by a
+/// static for the same reason as [`DISPLAY_BACKING_SCALE`]: the writer is the
+/// `AppKit` main thread outside any thunk.
+static CURSOR_KICK: AtomicU32 = AtomicU32::new(0);
+
 // Adapter color formats enumerated. X8R8G8B8 = "32-bit" in most game UIs
 // (32-bit container, 24 useful color bits), R5G6B5 = "16-bit".
 // A2R10G10B10 deliberately excluded — CAMetalLayer is hardcoded BGRA8;
@@ -1640,6 +1650,7 @@ fn attach_metal_layer(
         backing_scale_ptr: (&raw const DISPLAY_BACKING_SCALE) as u64,
         software_cursor: crate::config::CONFIG.cursor_software,
         software_cursor_active: 0,
+        cursor_kick_ptr: (&raw const CURSOR_KICK) as u64,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);
@@ -1720,6 +1731,14 @@ fn warn_unsupported_backbuffer_format(format: u32) {
             "CreateDevice: back_buffer_format {format:#x} requested but layer/backbuffer is hardcoded BGRA8Unorm — substituting"
         );
     }
+}
+
+/// Take the pending cursor re-apply request, if the unix side left one.
+///
+/// See [`CURSOR_KICK`]. `Acquire` pairs with the unix side's `Release`
+/// store; the flag is the whole message, so nothing else is read behind it.
+pub fn take_cursor_kick() -> bool {
+    CURSOR_KICK.swap(0, Ordering::AcqRel) != 0
 }
 
 /// Wine's retina factor for the layer (2 in retina mode, else 1), or `None` before attach.

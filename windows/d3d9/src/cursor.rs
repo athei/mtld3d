@@ -980,6 +980,12 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
     }
     if next {
         cur.set_force_visible_after_resize(false);
+        // A pointer that came back from another process while the cursor was
+        // hidden: the game's cursor was not on screen to kick then, so the
+        // show pushes null first and Wine re-applies on the handle change.
+        if crate::direct3d9::take_cursor_kick() {
+            set_cursor(null_mut());
+        }
     }
     cur.set_visible(next);
     // Realize on EVERY call, not only on transitions: a transition-gated
@@ -1074,7 +1080,9 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // the message is FORWARDED below (native d3d9 never intercepts
             // WM_SETCURSOR): the game shows its own cursor — WoW's login
             // screen never calls ShowCursor(TRUE) and relies on exactly that.
-            let was_dirty = cur.dirty();
+            // The unix side asks for the same kick when the pointer comes
+            // back from another process, which left its own cursor behind.
+            let was_dirty = cur.dirty() || crate::direct3d9::take_cursor_kick();
             let started = Instant::now();
             if was_dirty {
                 cur.set_dirty(false);
