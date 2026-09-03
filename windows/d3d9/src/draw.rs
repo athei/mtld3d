@@ -1249,6 +1249,13 @@ fn skip_shader_hashes() -> &'static [u64] {
     &crate::config::CONFIG.skip_shaders
 }
 
+/// Close the `draw N` debug group `emit_draw` opened for a dumped draw.
+fn close_dump_group(enc: &mut FrameEncoder, dump_draw: Option<u32>) {
+    if dump_draw.is_some() {
+        enc.emit_command(Command::pop_debug_group());
+    }
+}
+
 /// Encoder-thread draw dispatch.
 ///
 /// Pulls the cumulative state from `enc.current_snapshot` (updated by
@@ -1262,6 +1269,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         vertex_source,
         index_source,
     } = draw;
+    // Taken up front: a draw dropped below must not leave its frame-dump
+    // index for the next draw to wear.
+    let dump_draw = enc.take_dump_draw();
     // Per-draw cost breakdown: six `CycleAddTimer` scopes tile `emit_draw`
     // end to end so the perf summary's "Closures (op)" row decomposes into
     // resolve / pipeline / state / probe / samplers / binds. Each guard holds
@@ -2351,6 +2361,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if matches!(index_source, IndexSource::Generated { .. }) {
         enc.bump_fan_generated();
     }
+    // While the F12 dump runs, the Metal draw sits in a `draw N` debug group
+    // so the trace node and the `[dump] draw N` line name each other.
+    if let Some(index) = dump_draw {
+        enc.emit_command(Command::push_debug_group(index));
+    }
     let verts = match index_source {
         IndexSource::None {
             start_vertex,
@@ -2381,6 +2396,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     "drop: IB buffer {:#x} wrap failed",
                     buffer_id.raw(),
                 );
+                close_dump_group(enc, dump_draw);
                 return;
             }
             // Record this draw's IB read range so a later overlapping
@@ -2416,12 +2432,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             let Ok(base_vertex) = i32::try_from(start_vertex) else {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "draw dropped: triangle fan start vertex {start_vertex} exceeds the base vertex range");
+                close_dump_group(enc, dump_draw);
                 return;
             };
             let buffer_handle = enc.fan_index_buffer(primitive_count);
             if buffer_handle == 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "draw dropped: the shared triangle fan index buffer could not be created");
+                close_dump_group(enc, dump_draw);
                 return;
             }
             let index_count = primitive_count * 3;
@@ -2479,6 +2497,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             index_count
         }
     };
+    close_dump_group(enc, dump_draw);
     drop(t_draw);
     drop(t_binds);
 

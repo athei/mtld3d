@@ -87,8 +87,8 @@ use super::{
         arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
     },
     encoder::{
-        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameEncoder, FrameInit, Op,
-        StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
+        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameDataFlags, FrameEncoder,
+        FrameInit, Op, StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -664,7 +664,7 @@ pub struct DeviceInner {
     /// every frame starts with `snapshot_dirty == all()` so every field is
     /// freshly populated before the cached state is composed.
     snapshot_cache: CurrentSnapshot,
-    /// The Ctrl+Shift+D one-frame draw-state dump, see `frame_dump`.
+    /// The F12 draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
@@ -1398,10 +1398,27 @@ impl DeviceInner {
 
     /// Stamp per-frame counters + `submit_seq` onto `frame`, swap it in for `current_frame`.
     ///
-    /// Returns the stamped outgoing frame ready to hand to the encoder.
-    /// Shared between `Present` and `flush_current_frame_blocking`.
-    fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> FrameData {
+    /// Returns the stamped outgoing frame ready to hand to the encoder and
+    /// the `submit_seq` it carries. Shared between `Present` and
+    /// `flush_current_frame_blocking`.
+    fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> (FrameData, u64) {
         let mut frame = core::mem::replace(&mut self.current_frame, new_frame);
+        // An F12 run ends with the frame the closing `Present` submits. A
+        // mid-frame flush sends the marked frame out early, so its stop mark
+        // moves onto the continuation; the start mark stays with the first
+        // piece, the encoder keeps capturing until it sees the stop.
+        // `reseed_current_frame` (Reset) replaces the continuation without
+        // passing through here, so a Reset inside a dumped run drops the
+        // migrated stop and the capture ends with the process instead.
+        if no_present
+            && frame
+                .gpu_capture_marks()
+                .contains(FrameDataFlags::GPU_CAPTURE_STOP)
+        {
+            frame.clear_gpu_capture_stop();
+            self.current_frame
+                .mark_gpu_capture(FrameDataFlags::GPU_CAPTURE_STOP);
+        }
         // Pre-reserve the new frame's ops Vec to the running peak so
         // it never reallocs in steady-state — and so that a post-burst
         // dip doesn't shrink capacity (causing the next burst to
@@ -1469,7 +1486,7 @@ impl DeviceInner {
         {
             self.push_depth_binding_op(binding, is_sampleable, has_stencil, sample_count);
         }
-        frame
+        (frame, this_seq)
     }
 
     /// Submit the current frame's accumulated ops synchronously.
@@ -1481,7 +1498,7 @@ impl DeviceInner {
     /// is not consumed.
     pub fn flush_current_frame_blocking(&mut self) {
         let fresh = self.fresh_frame();
-        let frame = self.stamp_and_swap(fresh, true);
+        let (frame, _) = self.stamp_and_swap(fresh, true);
         self.encoder.mid_frame_submit(frame);
     }
 
@@ -1705,7 +1722,7 @@ impl DeviceInner {
     /// release.
     pub fn mid_frame_submit_for_retention(&mut self) {
         let fresh = self.fresh_frame();
-        let frame = self.stamp_and_swap(fresh, true);
+        let (frame, _) = self.stamp_and_swap(fresh, true);
         self.encoder.mid_frame_submit_for_retention(frame);
     }
 
@@ -1766,7 +1783,7 @@ impl DeviceInner {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
-        let frame = self.stamp_and_swap(new_frame, false);
+        let (frame, seq) = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
@@ -1774,7 +1791,7 @@ impl DeviceInner {
         // when it drops at end of scope.
         let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         self.encoder.send_frame(frame);
-        self.frame_dump_present(crate::capture::take_frame_dump_request());
+        self.frame_dump_present(crate::capture::take_request(), seq);
         self.mem_watch_present();
     }
 
@@ -7920,22 +7937,6 @@ extern "system" fn device_set_render_target(
             "SetRenderTarget({index}, {})",
             frame_dump::surface_label(surface)
         ));
-        // Extra targets feed later passes (a deferred G-buffer's side
-        // planes), and small offscreen targets hold derived data (visibility
-        // probes, sky maps) consumed out of band; queue both for the
-        // frame-end content readback.
-        if !surface.is_null() {
-            // SAFETY: `surface` is a live IDirect3DSurface9 per the ABI.
-            let parent = unsafe { (*surface.cast::<Direct3DSurface9>()).parent_texture() };
-            if !parent.is_null() {
-                // SAFETY: a surface keeps its parent texture alive.
-                let tex = unsafe { &*parent };
-                let small = tex.inner().mip_width(0) <= 512 && tex.inner().mip_height(0) <= 512;
-                if index > 0 || small {
-                    dev.frame_dump_note_readback(tex);
-                }
-            }
-        }
     }
 
     if surface.is_null() {
@@ -8784,6 +8785,12 @@ extern "system" fn device_set_viewport(this: *mut c_void, viewport: *const c_voi
         rec.record(StateOp::Viewport(v));
         return D3D_OK;
     }
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "SetViewport {},{}+{}x{} z=[{},{}]",
+            v.x, v.y, v.width, v.height, v.min_z, v.max_z
+        ));
+    }
     dev.set_viewport(v);
     D3D_OK
 }
@@ -9504,6 +9511,11 @@ extern "system" fn device_set_scissor_rect(this: *mut c_void, rect: *const c_voi
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::ScissorRect([rect_x, rect_y, rect_w, rect_h]));
         return D3D_OK;
+    }
+    if dev.frame_dump.active {
+        dev.frame_dump_event(&format!(
+            "SetScissorRect [{rect_x},{rect_y},{rect_w},{rect_h}]"
+        ));
     }
     dev.set_scissor_rect([rect_x, rect_y, rect_w, rect_h]);
     // scissor_rect is the only piece of RenderStateSnapshot affected.
@@ -10275,6 +10287,11 @@ fn bump_const_delta(
 fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let dirty = obj.inner().snapshot_dirty;
     if dirty.is_empty() {
+        // A draw with the same state as its predecessor still gets its dump
+        // line and its trace marker; the cached snapshot is its state.
+        if obj.inner().frame_dump.active {
+            obj.inner().frame_dump_draw();
+        }
         return;
     }
 

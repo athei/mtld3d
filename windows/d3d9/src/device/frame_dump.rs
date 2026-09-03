@@ -1,18 +1,24 @@
-//! One-frame per-draw state dump, armed by Ctrl+Shift+D (see `crate::capture`).
+//! Per-draw D3D9 state dump for a short run of frames, armed by F12 (see `crate::capture`).
 //!
 //! The silent-write audit reports the states a game sets that we never
 //! read; it cannot tell whether a consumed state produced the pass the game
-//! meant. This dump lists, for exactly one frame, every render-target and
-//! depth-stencil bind, every clear and every draw with the states that
-//! decide pass shape (depth, stencil, blend, cull, colour mask, alpha test,
-//! bias), the bound shaders and the bound textures. It logs at info level,
-//! so a play session needs no environment change: press Ctrl+Shift+D, read the log.
+//! meant. This dump lists, for [`FrameDump::FRAMES`] consecutive frames,
+//! every render-target and depth-stencil bind, viewport and scissor change,
+//! clear, copy, query and draw with the states that decide pass shape
+//! (depth, stencil, blend, cull, colour mask, alpha test, bias), the bound
+//! shaders and the bound textures. It logs at info level, so a play session
+//! needs no environment change: press F12, read the log.
+//!
+//! The same press captures the same frames into a Metal GPU trace, which
+//! holds everything the dump deliberately leaves out (pipeline state,
+//! bindings, buffer and texture bytes, shader source, load/store actions).
+//! The two name each other: the frame end line carries the label of the
+//! frame's command buffer, and every dumped draw sits in a `draw N` debug
+//! group in the trace.
 
 use core::ffi::c_void;
 
 use log::info;
-use mtld3d_core::page_box::PageBox;
-use mtld3d_shared::MetalHandle;
 use mtld3d_types::{
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_BLENDOP,
     D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS,
@@ -29,6 +35,7 @@ use super::{DepthBinding, DeviceInner, RtBinding};
 use crate::{
     LOG_TARGET,
     draw::{PsSource, VsSource},
+    encoder::FrameDataFlags,
 };
 
 /// Label a surface pointer by its backing texture for a dump event.
@@ -64,14 +71,6 @@ pub fn surface_label(surface: *mut c_void) -> String {
     )
 }
 
-/// One texture the dump reads back and summarizes at frame end.
-pub struct DumpReadback {
-    id: mtld3d_core::ids::TextureId,
-    d3d_format: u32,
-    width: u32,
-    height: u32,
-}
-
 /// Whether the dump is running and how many draws it has listed.
 pub struct FrameDump {
     /// The current frame is being dumped.
@@ -80,16 +79,10 @@ pub struct FrameDump {
     pub draws: u32,
     /// Frames still to dump after the current one.
     ///
-    /// The chord captures a short run of consecutive frames rather than a
+    /// A press captures a short run of consecutive frames rather than a
     /// single one, so cross-frame resource flow (a depth texture written in
     /// frame N and consumed in frame N+1) is visible in one capture.
     pub frames_remaining: u32,
-    /// Textures to read back and summarize at frame end.
-    ///
-    /// Every depth texture a draw sampled and every extra render target
-    /// bound above slot 0: their contents decide occlusion-style effects,
-    /// and only a readback can say whether the bytes are sane.
-    pub readback: Vec<DumpReadback>,
 }
 
 impl FrameDump {
@@ -97,15 +90,14 @@ impl FrameDump {
         active: false,
         draws: 0,
         frames_remaining: 0,
-        readback: Vec::new(),
     };
 
-    /// Consecutive frames one Ctrl+Shift+D press captures.
+    /// Consecutive frames one F12 press dumps and captures.
     pub const FRAMES: u32 = 3;
 }
 
 impl DeviceInner {
-    /// Whether a one-frame dump is currently running.
+    /// Whether a dump is currently running.
     ///
     /// For callers outside the device module that want to skip building an
     /// event string when no dump is armed.
@@ -114,16 +106,25 @@ impl DeviceInner {
         self.frame_dump.active
     }
 
-    /// Close the dumped frame at `Present` and arm the next one if the chord asked.
+    /// Close the dumped frame at `Present` and arm the next one if F12 asked.
     ///
-    /// A chord press starts a [`FrameDump::FRAMES`]-frame capture; a capture
-    /// already running continues until its remaining-frame count is spent.
-    pub fn frame_dump_present(&mut self, arm_next: bool) {
+    /// `seq` is the `submit_seq` of the frame just sent; the unix side labels
+    /// its command buffer `mtld3d-frame-{seq:#x}`, so the frame end line
+    /// names the node a GPU trace shows it under. A mid-frame flush inside a
+    /// dumped frame submits its own command buffer with its own seq; only
+    /// the closing one is named here.
+    ///
+    /// A press starts a [`FrameDump::FRAMES`]-frame run; a run already going
+    /// continues until its remaining-frame count is spent. The frame armed
+    /// here is the one about to be built, so it also receives the GPU
+    /// capture marks of its position in the run: the first frame starts the
+    /// capture, the last one stops it, and the trace covers exactly the
+    /// dumped frames.
+    pub fn frame_dump_present(&mut self, arm_next: bool, seq: u64) {
         let carried = if self.frame_dump.active {
-            self.frame_dump_run_readbacks();
             info!(
                 target: LOG_TARGET,
-                "[dump] frame end: {} draws",
+                "[dump] frame end: {} draws, command buffer mtld3d-frame-{seq:#x}",
                 self.frame_dump.draws
             );
             self.frame_dump.frames_remaining
@@ -135,241 +136,24 @@ impl DeviceInner {
             active: remaining > 0,
             draws: 0,
             frames_remaining: remaining.saturating_sub(1),
-            readback: Vec::new(),
         };
         if self.frame_dump.active {
+            let index = FrameDump::FRAMES - remaining + 1;
             info!(
                 target: LOG_TARGET,
-                "[dump] frame start ({} of {})",
-                FrameDump::FRAMES - remaining + 1,
+                "[dump] frame start ({index} of {})",
                 FrameDump::FRAMES
             );
-        }
-    }
-
-    /// Queue a texture for the frame-end readback while a dump is running.
-    ///
-    /// Deduplicates by id; anything past a small cap is dropped so a frame
-    /// binding many depth textures cannot stall the present for long.
-    pub fn frame_dump_note_readback(&mut self, tex: &crate::texture::Direct3DTexture9) {
-        const CAP: usize = 14;
-        if !self.frame_dump.active {
-            return;
-        }
-        let id = tex.texture_id();
-        if self.frame_dump.readback.len() >= CAP
-            || self.frame_dump.readback.iter().any(|r| r.id == id)
-        {
-            return;
-        }
-        let inner = tex.inner();
-        self.frame_dump.readback.push(DumpReadback {
-            id,
-            d3d_format: tex.d3d_format(),
-            width: inner.mip_width(0),
-            height: inner.mip_height(0),
-        });
-    }
-
-    /// Read back and summarize every noted texture; called at frame end.
-    ///
-    /// Each texture is resolved to its Metal handle through a frame op, the
-    /// frame is flushed to the GPU, and the pixels are copied to a host
-    /// buffer. Four-byte formats only: the depth formats and R32F log float
-    /// statistics (garbage shows as absurd ranges or NaN counts), everything
-    /// else logs a few raw pixels.
-    fn frame_dump_run_readbacks(&mut self) {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-
-        let targets = std::mem::take(&mut self.frame_dump.readback);
-        for t in &targets {
-            let label = format!("{:?}/{:#x} {}x{}", t.id, t.d3d_format, t.width, t.height);
-            // The depth fourccs read back as their Depth32Float substrate;
-            // `bytes_per_pixel` calls them 0 because they have no lock pitch.
-            let is_depth = matches!(
-                t.d3d_format,
-                mtld3d_types::D3DFMT_INTZ | mtld3d_types::D3DFMT_DF24 | mtld3d_types::D3DFMT_DF16
-            );
-            let bpp = if is_depth {
-                4
-            } else {
-                mtld3d_core::format::map_d3d_format(t.d3d_format).map_or(0, |m| m.bytes_per_pixel())
-            };
-            if !matches!(bpp, 2 | 4) || t.width == 0 || t.height == 0 {
-                info!(target: LOG_TARGET, "[dump] readback {label}: skipped ({bpp} bytes/px)");
-                continue;
+            let (start, stop) = mtld3d_core::present::capture_marks(index, FrameDump::FRAMES);
+            let mut marks = FrameDataFlags::empty();
+            if start {
+                marks.insert(FrameDataFlags::GPU_CAPTURE_START);
             }
-            let slot = Arc::new(AtomicU64::new(0));
-            let slot_op = Arc::clone(&slot);
-            let snap_slot = Arc::new(AtomicU64::new(0));
-            let snap_slot_op = Arc::clone(&snap_slot);
-            let id = t.id;
-            self.push_op(Box::new(move |enc| {
-                let h = enc.get_texture_handle_by_id(id);
-                if h != 0 {
-                    // SAFETY: `h` is a live retained MTLTexture handle from
-                    // the encoder texture cache.
-                    enc.note_color_read_back(unsafe { MetalHandle::new(h) });
-                    // A depth attachment sampled by draws is read through a
-                    // snapshot copy; its contents are what those draws saw.
-                    snap_slot_op.store(enc.depth_snapshot_handle(h), Ordering::Release);
-                }
-                slot_op.store(h, Ordering::Release);
-            }));
-            self.flush_current_frame_blocking();
-            for (h, what) in [
-                (slot.load(Ordering::Acquire), ""),
-                (snap_slot.load(Ordering::Acquire), " snapshot"),
-            ] {
-                if h == 0 {
-                    if what.is_empty() {
-                        info!(target: LOG_TARGET, "[dump] readback {label}: no Metal texture");
-                    }
-                    continue;
-                }
-                let bytes_per_row = t.width * bpp;
-                let len = bytes_per_row as usize * t.height as usize;
-                // The unix side wraps the destination in `newBufferWithBytesNoCopy`,
-                // which takes a page-aligned base and a page-multiple length, so the
-                // destination is a `PageBox` and the wrapper sees its padded length.
-                let mut buf = PageBox::new_zeroed(len);
-                let hr = super::blit_handle_to_systemmem(
-                    self,
-                    &super::SystemMemReadback {
-                        // SAFETY: `h` is non-zero (checked above) and a live retained
-                        // MTLTexture handle from the encoder texture cache.
-                        tex_handle: unsafe { MetalHandle::new(h) },
-                        dst_ptr: buf.as_mut_ptr() as u64,
-                        dst_len: buf.len() as u64,
-                        level: 0,
-                        slice: 0,
-                        width: t.width,
-                        height: t.height,
-                        bytes_per_row,
-                        full_width: t.width,
-                        full_height: t.height,
-                    },
-                );
-                if hr != 0 {
-                    info!(
-                        target: LOG_TARGET,
-                        "[dump] readback {label}{what}: blit failed {hr:#x}"
-                    );
-                    continue;
-                }
-                let full = format!("{label}{what}");
-                // The blit writes the image rows from the start of the backing; the
-                // page padding past them is not part of the texture.
-                let image = &buf.as_slice()[..len];
-                if bpp == 2 {
-                    frame_dump_log_readback_f16(&full, image);
-                } else {
-                    frame_dump_log_readback(&full, t, image);
-                }
+            if stop {
+                marks.insert(FrameDataFlags::GPU_CAPTURE_STOP);
             }
+            self.current_frame.mark_gpu_capture(marks);
         }
-    }
-}
-
-/// Decode one IEEE half-precision value to `f32`.
-///
-/// The readback path is diagnostics-only, so a plain bit-level expansion
-/// (sign, 5-bit exponent, 10-bit mantissa, subnormals flushed through the
-/// scale) beats pulling in a half-float dependency.
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = f32::from(u8::from(bits & 0x8000 != 0)).mul_add(-2.0, 1.0);
-    let exp = i32::from((bits >> 10) & 0x1F);
-    let mant = f32::from(bits & 0x3FF);
-    match exp {
-        0 => sign * mant * 2f32.powi(-24),
-        0x1F => {
-            if mant == 0.0 {
-                sign * f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        _ => sign * (1024.0 + mant) * 2f32.powi(exp - 25),
-    }
-}
-
-/// Log the statistics line for one read-back 2-byte (`R16F`) texture.
-fn frame_dump_log_readback_f16(label: &str, buf: &[u8]) {
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    let mut sum = 0.0f64;
-    let mut nan = 0u32;
-    let mut finite = 0u32;
-    for c in buf.chunks_exact(2) {
-        let v = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
-        if v.is_nan() {
-            nan += 1;
-            continue;
-        }
-        finite += 1;
-        min = min.min(v);
-        max = max.max(v);
-        sum += f64::from(v);
-    }
-    let mean = sum / f64::from(finite.max(1));
-    info!(
-        target: LOG_TARGET,
-        "[dump] readback {label}: f16 min={min:.6} max={max:.6} mean={mean:.6} nan={nan}"
-    );
-}
-
-/// Log the statistics line for one read-back texture.
-fn frame_dump_log_readback(label: &str, t: &DumpReadback, buf: &[u8]) {
-    let is_float = matches!(
-        t.d3d_format,
-        mtld3d_types::D3DFMT_R32F
-            | mtld3d_types::D3DFMT_INTZ
-            | mtld3d_types::D3DFMT_DF24
-            | mtld3d_types::D3DFMT_DF16
-    );
-    let px = |x: u32, y: u32| {
-        let idx = (y * t.width + x) as usize * 4;
-        u32::from_le_bytes([buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]])
-    };
-    let (cx, cy) = (t.width / 2, t.height / 2);
-    if is_float {
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        let mut sum = 0.0f64;
-        let mut nan = 0u32;
-        let mut finite = 0u32;
-        for c in buf.chunks_exact(4) {
-            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if v.is_nan() {
-                nan += 1;
-                continue;
-            }
-            finite += 1;
-            min = min.min(v);
-            max = max.max(v);
-            sum += f64::from(v);
-        }
-        let mean = sum / f64::from(finite.max(1));
-        info!(
-            target: LOG_TARGET,
-            "[dump] readback {label}: f32 min={min:.6} max={max:.6} mean={mean:.6} nan={nan} \
-             center={:.6} q1={:.6} q3={:.6}",
-            f32::from_bits(px(cx, cy)),
-            f32::from_bits(px(t.width / 4, t.height / 4)),
-            f32::from_bits(px(3 * t.width / 4, 3 * t.height / 4))
-        );
-    } else {
-        info!(
-            target: LOG_TARGET,
-            "[dump] readback {label}: raw center={:#010x} tl={:#010x} tr={:#010x} \
-             bl={:#010x} br={:#010x}",
-            px(cx, cy),
-            px(t.width / 4, t.height / 4),
-            px(3 * t.width / 4, t.height / 4),
-            px(t.width / 4, 3 * t.height / 4),
-            px(3 * t.width / 4, 3 * t.height / 4)
-        );
     }
 }
 
@@ -424,9 +208,15 @@ impl DeviceInner {
     }
 
     /// Log the assembled draw state; called once per draw while a dump runs.
+    ///
+    /// Also tags the draw for the encoder, which wraps its Metal draw in a
+    /// `draw {seq}` debug group; the closure op lands ahead of the draw op
+    /// in the same op stream, so the tag reaches `emit_draw` with the draw.
     pub fn frame_dump_draw(&mut self) {
         let seq = self.frame_dump.draws;
         self.frame_dump.draws += 1;
+        self.push_op(Box::new(move |enc| enc.set_dump_draw(seq)));
+        let vp = self.viewport();
         let rs = |i: u32| self.render_state(i as usize);
 
         let (rt, ds) = self.frame_dump_target_labels();
@@ -450,7 +240,6 @@ impl DeviceInner {
         let depth = bindings.depth_sampler_mask();
         let fetch = bindings.depth_fetch_mask();
         let mut textures = String::new();
-        let mut note: Vec<*const crate::texture::Direct3DTexture9> = Vec::new();
         for stage in 0..16usize {
             if bound & (1u16 << stage) == 0 {
                 continue;
@@ -469,9 +258,6 @@ impl DeviceInner {
             } else {
                 ""
             };
-            if !kind.is_empty() {
-                note.push(std::ptr::from_ref(tex));
-            }
             let inner = tex.inner();
             let _ = std::fmt::Write::write_fmt(
                 &mut textures,
@@ -513,7 +299,7 @@ impl DeviceInner {
             "[dump] draw {seq}: rt={rt} ds={ds}/{:#x} vs={vs} ps={ps} \
              z=[{},{},{}] blend=[{},{},{},{} sep={} {},{},{}] cull={} cw=[{:#x},{:#x},{:#x},{:#x}] \
              alpha=[{},{},{}] stencil=[{},{},{:#x},{:#x},{:#x} {},{},{} two={} ccw={},{},{},{}] \
-             bias=[{:#x},{:#x}] scissor={} tex=[{}]",
+             bias=[{:#x},{:#x}] vp={},{}+{}x{} scissor={} tex=[{}]",
             self.snapshot_cache.depth_stencil.bits(),
             rs(D3DRS_ZENABLE),
             rs(D3DRS_ZWRITEENABLE),
@@ -549,14 +335,13 @@ impl DeviceInner {
             rs(D3DRS_CCW_STENCILPASS),
             rs(D3DRS_DEPTHBIAS),
             rs(D3DRS_SLOPESCALEDEPTHBIAS),
+            vp.x,
+            vp.y,
+            vp.width,
+            vp.height,
             rs(D3DRS_SCISSORTESTENABLE),
             textures.trim_start(),
         );
-        for tex in note {
-            // SAFETY: collected above from live bound stages on this thread;
-            // nothing between there and here can release them.
-            self.frame_dump_note_readback(unsafe { &*tex });
-        }
         // Draws that fetch raw depth reconstruct positions from shared PS
         // constants (screen scale, linearization); print the window those
         // shaders read so wrong uploads are visible next to the draw.

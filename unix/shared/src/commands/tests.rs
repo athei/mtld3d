@@ -229,6 +229,20 @@ fn set_stencil_reference_roundtrip() {
 }
 
 #[test]
+fn debug_group_roundtrip() {
+    let push = Command::push_debug_group(345);
+    assert_eq!(push.cmd, CommandType::PushDebugGroup as u32);
+    assert_eq!(push.param_a, 345);
+    let pop = Command::pop_debug_group();
+    assert_eq!(pop.cmd, CommandType::PopDebugGroup as u32);
+    assert_eq!(
+        CommandType::from_repr(25),
+        Some(CommandType::PushDebugGroup)
+    );
+    assert_eq!(CommandType::from_repr(26), Some(CommandType::PopDebugGroup));
+}
+
+#[test]
 fn set_blend_color_roundtrip() {
     let cmd = Command::set_blend_color(0.25, 0.5, 0.75, 1.0);
     assert_eq!(cmd.cmd, CommandType::SetBlendColor as u32);

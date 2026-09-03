@@ -438,6 +438,19 @@ fallback paths, `error!` for unexpected internal failures, `trace!` for
 per-call breadcrumbs, `debug!` for routine per-call noise useful in deep
 debugging.
 
+Pressing F12 in a game records the next three frames twice over. The log
+gets one `[dump]` line at info level for every D3D9 event of those frames
+that a GPU trace cannot show: render-target, depth-stencil, viewport and
+scissor changes, clears, surface copies, occlusion query traffic, and every
+draw with the states that decide its pass shape, its shaders and its
+textures. At the same time a Metal GPU trace of the same frames lands at
+`/tmp/mtld3d_capture.gputrace`, overwritten by the next press; the process
+needs `MTL_CAPTURE_ENABLED=1` in its environment for that half (the launcher
+passes it through), otherwise the log says so and the dump still runs. The
+two sides name each other: each `frame end` line carries the label of the
+frame's command buffer, and every dumped draw sits in a `draw N` debug group
+in the trace, so `gpudebug`'s `find` or Xcode's search lands on it directly.
+
 Each cdylib initializes the logger independently and idempotently; `mtld3d.so`
 has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger`
 thunk from its init path.

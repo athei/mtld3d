@@ -41,3 +41,24 @@ fn enabled_polarity() {
     assert!(!DisplaySync::Off.enabled());
     assert!(DisplaySync::Fallthrough.enabled());
 }
+
+#[test]
+fn capture_marks_bracket_the_run() {
+    use super::capture_marks;
+    assert_eq!(capture_marks(1, 3), (true, false));
+    assert_eq!(capture_marks(2, 3), (false, false));
+    assert_eq!(capture_marks(3, 3), (false, true));
+}
+
+#[test]
+fn capture_marks_one_frame_run_starts_and_stops() {
+    use super::capture_marks;
+    assert_eq!(capture_marks(1, 1), (true, true));
+}
+
+#[test]
+fn capture_marks_outside_the_run_carry_nothing() {
+    use super::capture_marks;
+    assert_eq!(capture_marks(0, 3), (false, false));
+    assert_eq!(capture_marks(4, 3), (false, false));
+}

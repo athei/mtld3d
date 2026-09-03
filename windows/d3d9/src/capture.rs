@@ -1,32 +1,36 @@
-//! F12 hotkey poll for one-shot Metal GPU frame capture.
+//! F12 hotkey poll: one press arms the frame dump and the Metal GPU capture.
 //!
-//! Apple gates capture itself on `MTL_CAPTURE_ENABLED=1` at process
-//! launch — no mtld3d-side env guard needed; without the Apple env, the
-//! unix-side `start_capture` handler logs a warn and returns. Polling
-//! cost is one `GetAsyncKeyState` syscall per `Present()` (~100 ns),
-//! free in practice.
+//! Both diagnostics cover the same [`FrameDump::FRAMES`] consecutive frames
+//! (see `device::frame_dump`): the dump logs the D3D9-level events a GPU
+//! trace cannot know, the trace holds everything Metal saw, and the dump's
+//! draw numbering and frame labels name the trace's nodes.
 //!
-//! Flow: `device_present` → `poll()` → on F12 rising-edge sets
-//! `CAPTURE_REQUESTED`. The encoder thread reads + clears the flag at
-//! the next frame and brackets `run_frame` with `StartGpuCapture` /
-//! `StopGpuCapture` thunks. Output is `/tmp/mtld3d_capture.gputrace`.
+//! Apple gates the capture itself on `MTL_CAPTURE_ENABLED=1` at process
+//! launch, so there is no mtld3d-side env guard; without the Apple env the
+//! unix-side `start_capture` handler logs a warn and returns, and the dump
+//! still runs. Polling cost is one `GetAsyncKeyState` syscall per
+//! `Present()` (~100 ns), free in practice.
+//!
+//! A plain function key is a weak trigger on a Mac (F11 is the system's
+//! "show desktop" key, others double as media keys); F12 is the one Apple
+//! leaves alone and the one Xcode uses for the same purpose.
+//!
+//! Flow: `device_present` → `poll()` → on the F12 rising edge sets
+//! `CAPTURE_REQUESTED`; the same `Present` takes it through
+//! `take_request()` and arms `frame_dump_present`, which marks the first
+//! and last frame of the run with `FrameDataFlags::GPU_CAPTURE_START` /
+//! `GPU_CAPTURE_STOP`. The encoder thread brackets those frames with the
+//! `StartGpuCapture` / `StopGpuCapture` thunks. Output is
+//! `/tmp/mtld3d_capture.gputrace`, overwritten per press.
+//!
+//! [`FrameDump::FRAMES`]: crate::device::frame_dump::FrameDump::FRAMES
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const VK_F12: i32 = 0x7B;
-const VK_SHIFT: i32 = 0x10;
-const VK_CONTROL: i32 = 0x11;
-/// The `D` key: Ctrl+Shift+D arms the one-frame draw-state dump.
-///
-/// A plain function key is a bad trigger on a Mac: F11 is the system's
-/// "show desktop" key, and others double as media keys.
-const VK_D: i32 = 0x44;
 
 static CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static F12_DOWN_LAST: AtomicBool = AtomicBool::new(false);
-/// Ctrl+Shift+D asked for a one-frame draw-state dump (`device::frame_dump`).
-static FRAME_DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static DUMP_CHORD_DOWN_LAST: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -39,28 +43,18 @@ fn key_down(vkey: i32) -> bool {
     unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
 }
 
-/// Poll the trigger keys once per present, firing on the press transition.
+/// Poll the trigger key once per present, firing on the press transition.
 ///
-/// Idempotent across frames where a key is held down.
+/// Idempotent across frames where the key is held down.
 pub fn poll() {
     let down = key_down(VK_F12);
     let was_down = F12_DOWN_LAST.swap(down, Ordering::Relaxed);
     if down && !was_down {
         CAPTURE_REQUESTED.store(true, Ordering::Release);
     }
-    let chord = key_down(VK_CONTROL) && key_down(VK_SHIFT) && key_down(VK_D);
-    let was_chord = DUMP_CHORD_DOWN_LAST.swap(chord, Ordering::Relaxed);
-    if chord && !was_chord {
-        FRAME_DUMP_REQUESTED.store(true, Ordering::Release);
-    }
 }
 
-/// Take the pending Ctrl+Shift+D request, if any; the next frame is then dumped.
-pub fn take_frame_dump_request() -> bool {
-    FRAME_DUMP_REQUESTED.swap(false, Ordering::AcqRel)
-}
-
-/// Encoder-thread side: read-and-clear. Returns true once per F12 press.
+/// Take the pending F12 request, if any; the next frames are then dumped and captured.
 pub fn take_request() -> bool {
     CAPTURE_REQUESTED.swap(false, Ordering::AcqRel)
 }

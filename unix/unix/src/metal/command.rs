@@ -2127,9 +2127,25 @@ fn encode_pass(
             )
         };
 
+        // Frame-dump debug groups open around a draw. A push whose draw the
+        // PE side then dropped never gets its pop, so the depth is tracked
+        // here and any group still open is closed before `endEncoding`.
+        let mut debug_group_depth: u32 = 0;
         for (i, cmd) in commands.iter().enumerate() {
             mtld3d_shared::crumb!("pass:cmd", u64::from(cmd.cmd), i as u64);
             match CommandType::from_repr(cmd.cmd) {
+                Some(CommandType::PushDebugGroup) => {
+                    let label =
+                        objc2_foundation::NSString::from_str(&format!("draw {}", cmd.param_a));
+                    encoder.pushDebugGroup(&label);
+                    debug_group_depth += 1;
+                }
+                Some(CommandType::PopDebugGroup) => {
+                    if debug_group_depth > 0 {
+                        encoder.popDebugGroup();
+                        debug_group_depth -= 1;
+                    }
+                }
                 Some(CommandType::SetRenderPipelineState) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLRenderPipelineState address.
                     let Some(pipeline) =
@@ -2599,6 +2615,9 @@ fn encode_pass(
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "unknown command type {t}", t = cmd.cmd);
                 }
             }
+        }
+        for _ in 0..debug_group_depth {
+            encoder.popDebugGroup();
         }
     }
 
