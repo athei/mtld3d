@@ -40,5 +40,18 @@ pub const fn display_sync_for(interval: u32) -> DisplaySync {
     }
 }
 
+/// Which capture marks frame `index` of a `total`-frame diagnostic run carries.
+///
+/// Returns `(start, stop)`: the first frame of the run starts the GPU
+/// capture, the last one stops it, and a one-frame run does both. Frames
+/// are numbered from 1; an index outside the run carries nothing.
+#[must_use]
+pub const fn capture_marks(index: u32, total: u32) -> (bool, bool) {
+    if index == 0 || index > total {
+        return (false, false);
+    }
+    (index == 1, index == total)
+}
+
 #[cfg(test)]
 mod tests;

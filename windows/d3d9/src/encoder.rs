@@ -714,6 +714,13 @@ bitflags::bitflags! {
         /// Also latched when any open/write failure makes further attempts
         /// pointless.
         const CACHE_DISABLED = 1 << 2;
+        /// A Metal GPU capture is open: every frame runs `SubmitMode::Sync`.
+        ///
+        /// Set on `FrameDataFlags::GPU_CAPTURE_START`, cleared after the frame
+        /// carrying `GPU_CAPTURE_STOP`, so the `SubmitFrame` thunks of the
+        /// whole run execute inline on the encoder thread between the
+        /// `StartGpuCapture` and `StopGpuCapture` thunks.
+        const GPU_CAPTURING = 1 << 3;
     }
 }
 
@@ -846,6 +853,13 @@ pub struct FrameEncoder {
     /// `begin_frame` so `PassState::reset_frame` keeps the seen-rt sets when
     /// the D3D9 frame did not actually end at the flush. Encoder-thread only.
     prev_submit_no_present: bool,
+    /// Frame-dump index of the draw about to be emitted, while a dump runs.
+    ///
+    /// Set by the closure op `frame_dump_draw` pushes ahead of the draw op,
+    /// taken by `emit_draw`, which wraps the Metal draw in a `draw N` debug
+    /// group so the trace node and the `[dump] draw N` line name each other.
+    /// `None` outside a dump; cleared in `begin_frame`.
+    dump_draw: Option<u32>,
     /// Arc clones of staging `PageBoxes` referenced by blits emitted this frame.
     ///
     /// Moved into `pending_blit_retention` at submit time with the frame's
@@ -1458,6 +1472,7 @@ impl FrameEncoder {
             submit_payloads_total: 0,
             last_submit_status: 0,
             prev_submit_no_present: false,
+            dump_draw: None,
             current_blit_retention: Vec::new(),
             pending_blit_retention: VecDeque::new(),
             coherent_seq_ptr: 0,
@@ -2217,6 +2232,7 @@ impl FrameEncoder {
         self.frame_blit_commands.clear();
         self.upload_pass_textures.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.dump_draw = None;
         mtld3d_shared::crumb!("phase:BfRecl");
         self.reclaim_retired_blit_retention();
         if frame.coherent_seq_ptr != 0 {
@@ -2746,15 +2762,14 @@ impl FrameEncoder {
         self.depth_write_epoch += 1;
     }
 
-    /// Metal handle of the snapshot copy kept for a depth attachment, or 0.
-    ///
-    /// Diagnostics only: the frame dump reads the copy back, since that is
-    /// what depth-sampling draws actually saw.
-    #[must_use]
-    pub fn depth_snapshot_handle(&self, src_raw: u64) -> u64 {
-        self.depth_snapshots
-            .get(&src_raw)
-            .map_or(0, |s| s.handle.raw())
+    /// Tag the next draw with its frame-dump index; see `dump_draw`.
+    pub const fn set_dump_draw(&mut self, index: u32) {
+        self.dump_draw = Some(index);
+    }
+
+    /// Take the frame-dump index tagged for the draw being emitted, if any.
+    pub const fn take_dump_draw(&mut self) -> Option<u32> {
+        self.dump_draw.take()
     }
 
     /// Resolve the bound depth attachment into `dst` (the RESZ hack).
@@ -7993,6 +8008,19 @@ bitflags::bitflags! {
         /// texture safe to read from the subsequent readback-blit command
         /// buffer.
         const NO_PRESENT = 1 << 1;
+        /// First frame of an F12 run: start the Metal GPU capture before it.
+        ///
+        /// Set by `frame_dump_present` on the frame it arms. The encoder
+        /// drains the submit thread, starts the capture and runs every frame
+        /// synchronously until `GPU_CAPTURE_STOP` so each `SubmitFrame`
+        /// thunk falls inside the bracket.
+        const GPU_CAPTURE_START = 1 << 2;
+        /// Last frame of an F12 run: stop the Metal GPU capture after it.
+        ///
+        /// When a mid-frame flush sends the flagged frame out early,
+        /// `stamp_and_swap` moves this bit onto the fresh continuation so the
+        /// capture ends with the piece the closing `Present` submits.
+        const GPU_CAPTURE_STOP = 1 << 3;
     }
 }
 
@@ -8284,6 +8312,23 @@ impl FrameData {
         } else {
             self.flags.difference(FrameDataFlags::NO_PRESENT)
         };
+    }
+
+    /// Add GPU-capture marks (`GPU_CAPTURE_START` / `GPU_CAPTURE_STOP`) to the frame.
+    pub const fn mark_gpu_capture(&mut self, marks: FrameDataFlags) {
+        self.flags = self.flags.union(marks);
+    }
+
+    /// The GPU-capture marks the frame carries, if any.
+    #[must_use]
+    pub const fn gpu_capture_marks(&self) -> FrameDataFlags {
+        self.flags
+            .intersection(FrameDataFlags::GPU_CAPTURE_START.union(FrameDataFlags::GPU_CAPTURE_STOP))
+    }
+
+    /// Drop the `GPU_CAPTURE_STOP` mark, for moving it onto a continuation frame.
+    pub const fn clear_gpu_capture_stop(&mut self) {
+        self.flags = self.flags.difference(FrameDataFlags::GPU_CAPTURE_STOP);
     }
 
     pub const fn set_submit_fence(&mut self, fence: &SubmitFence) {
@@ -8726,24 +8771,7 @@ fn encoder_thread_main(
             Ok(EncoderMessage::Frame(frame)) => {
                 frame_counter += 1;
                 mtld3d_shared::crumb!("phase:RecvFrame");
-                let capture = crate::capture::take_request();
-                if capture {
-                    // Capture must bracket the actual `SubmitFrame` thunk,
-                    // which `Async` runs on the submit thread. Drain the
-                    // submit thread so prior frames are committed, then run
-                    // this frame synchronously so Start/Stop wrap its
-                    // inline execute on the encoder thread.
-                    enc.drain_submit_thread();
-                    let mut p = mtld3d_shared::StartGpuCaptureParams {
-                        device_handle: enc.device_handle,
-                    };
-                    let _ = unix_call(&mut p);
-                    run_frame(&mut enc, frame, frame_counter, SubmitMode::Sync);
-                    let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
-                    let _ = unix_call(&mut p);
-                } else {
-                    run_frame(&mut enc, frame, frame_counter, SubmitMode::Async);
-                }
+                run_frame_bracketed(&mut enc, frame, frame_counter, SubmitMode::Async);
             }
             Ok(EncoderMessage::MidFrameSubmit { frame, done }) => {
                 frame_counter += 1;
@@ -8752,14 +8780,14 @@ fn encoder_thread_main(
                 // on Metal's in-order queue, so every prior async frame must
                 // be committed first.
                 enc.drain_submit_thread();
-                run_frame(&mut enc, frame, frame_counter, SubmitMode::Sync);
+                run_frame_bracketed(&mut enc, frame, frame_counter, SubmitMode::Sync);
                 let _ = done.send(());
             }
             Ok(EncoderMessage::MidFrameSubmitForRetention { frame, done }) => {
                 frame_counter += 1;
                 mtld3d_shared::crumb!("phase:RecvMidRet");
                 enc.drain_submit_thread();
-                run_frame(&mut enc, frame, frame_counter, SubmitMode::Sync);
+                run_frame_bracketed(&mut enc, frame, frame_counter, SubmitMode::Sync);
                 // Wait for our just-submitted seq to retire on the GPU
                 // so `coherent_seq` covers it; then drain so the freed
                 // bytes are back in the global allocator before the
@@ -8827,6 +8855,38 @@ fn encoder_thread_main(
                 break;
             }
         }
+    }
+}
+
+/// Run one frame inside the F12 GPU-capture bracket when it carries the marks.
+///
+/// The capture must wrap the actual `SubmitFrame` thunk, which `Async`
+/// runs on the submit thread. On `GPU_CAPTURE_START` the submit thread is
+/// drained so prior frames are committed, the capture starts, and every
+/// frame until `GPU_CAPTURE_STOP` runs `Sync` so its inline execute on this
+/// thread sits between the two capture thunks. A mid-frame flush of a
+/// marked frame arrives through the `MidFrameSubmit*` arms, which is why
+/// all three frame arms go through here.
+fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, mode: SubmitMode) {
+    let marks = frame.gpu_capture_marks();
+    if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
+        enc.drain_submit_thread();
+        let mut p = mtld3d_shared::StartGpuCaptureParams {
+            device_handle: enc.device_handle,
+        };
+        let _ = unix_call(&mut p);
+        enc.flags.insert(FrameEncoderFlags::GPU_CAPTURING);
+    }
+    let mode = if enc.flags.contains(FrameEncoderFlags::GPU_CAPTURING) {
+        SubmitMode::Sync
+    } else {
+        mode
+    };
+    run_frame(enc, frame, fc, mode);
+    if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
+        let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
+        let _ = unix_call(&mut p);
+        enc.flags.remove(FrameEncoderFlags::GPU_CAPTURING);
     }
 }
 

@@ -110,6 +110,15 @@ pub enum CommandType {
     /// it as a shader argument is what lets the upload ignore the linear
     /// texture row alignment a blit copy would have to satisfy.
     SetFragmentBuffer = 24,
+    /// `encoder.pushDebugGroup("draw N")`
+    ///
+    /// Emitted only while the F12 frame dump runs, around the Metal draw
+    /// of dumped draw `param_a`, so the `[dump] draw N` log line and the
+    /// draw's node in a GPU trace name each other. Costs nothing when no
+    /// dump is armed.
+    PushDebugGroup = 25,
+    /// `encoder.popDebugGroup()`, closing a [`CommandType::PushDebugGroup`].
+    PopDebugGroup = 26,
 }
 
 /// Dimensionality of the opaque-black texture a null-texture bind selects.
@@ -479,6 +488,30 @@ impl Command {
         Self {
             cmd: CommandType::SetStencilReference as u32,
             param_a: value,
+            param_b: 0,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.pushDebugGroup("draw {draw_index}")`, a frame-dump marker.
+    #[must_use]
+    pub const fn push_debug_group(draw_index: u32) -> Self {
+        Self {
+            cmd: CommandType::PushDebugGroup as u32,
+            param_a: draw_index,
+            param_b: 0,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.popDebugGroup()`, closing the frame-dump marker.
+    #[must_use]
+    pub const fn pop_debug_group() -> Self {
+        Self {
+            cmd: CommandType::PopDebugGroup as u32,
+            param_a: 0,
             param_b: 0,
             param_c: 0,
             param_d: 0,
