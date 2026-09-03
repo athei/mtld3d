@@ -1056,29 +1056,57 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
     }
 }
 
+/// The run-loop mode winemac's main thread sits in while it waits on the game thread.
+///
+/// `-[WineApplicationController waitUntilQueryDone:timeout:processEvents:]`
+/// runs the main run loop in this private mode, and Wine adds its own request
+/// source to it beside the common modes. Nothing registered in the common
+/// modes only, the main dispatch queue included, runs while it does.
+const WINE_QUERY_WAIT_MODE: &str = "WineAppWaitQueryResponseMode";
+
 /// Run a closure on `AppKit`'s main thread without waiting for it.
 ///
 /// The asynchronous twin of [`run_on_main_thread_sync`], for callers that must
 /// not put the main run loop in their critical path: the thunk that carries the
 /// software cursor's state runs on the API thread, and the display
-/// reconciliation runs on the submit thread's cadence. The closure is boxed and
-/// handed to libdispatch, which runs it once on the main queue and frees it.
+/// reconciliation runs on the submit thread's cadence.
+///
+/// Goes through the main run loop rather than the main dispatch queue, in the
+/// common modes and in [`WINE_QUERY_WAIT_MODE`]: the dispatch queue is drained
+/// in the common modes only, so a closure queued there while Wine waits on the
+/// game thread runs at the next event instead of now. The closure runs once
+/// and is dropped with the block.
 fn run_on_main_thread_async<F: FnOnce() + Send + 'static>(f: F) {
-    extern "C" fn thunk<F: FnOnce()>(ctx: *mut c_void) {
-        // SAFETY: `ctx` is the `Box<F>` leaked below; libdispatch hands it to
-        // the work function exactly once, so taking it back here is the one
-        // and only owner.
-        let f = unsafe { Box::from_raw(ctx.cast::<F>()) };
-        f();
-    }
-    let ctx = Box::into_raw(Box::new(f));
-    // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton, a valid
-    // `dispatch_queue_t` for the process lifetime; `ctx` is a heap allocation
-    // owned by the queued block until `thunk` consumes it.
-    unsafe {
-        let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
-        dispatch_async_f(main_q, ctx.cast::<c_void>(), thunk::<F>);
-    }
+    use block2::RcBlock;
+    use objc2_core_foundation::{CFArray, CFRunLoop, CFString, kCFRunLoopCommonModes};
+
+    let Some(main) = CFRunLoop::main() else {
+        return;
+    };
+    // The perform-block API takes an `Fn`; the closure runs once, so it moves
+    // out of a slot the block owns.
+    let slot = Mutex::new(Some(f));
+    let block = RcBlock::new(move || {
+        if let Some(f) = slot.lock().ok().and_then(|mut slot| slot.take()) {
+            f();
+        }
+    });
+    // SAFETY: reading Core Foundation's mode constant, an immutable static.
+    let common = unsafe { kCFRunLoopCommonModes };
+    let wine_mode = CFString::from_static_str(WINE_QUERY_WAIT_MODE);
+    let modes: Vec<&objc2_core_foundation::CFType> = common
+        .into_iter()
+        .map(AsRef::as_ref)
+        .chain(core::iter::once(wine_mode.as_ref()))
+        .collect();
+    let modes = CFArray::from_objects(&modes);
+    // SAFETY: the main run loop is valid for the process lifetime; the mode
+    // argument is an array of mode names, which the API accepts in place of a
+    // single mode; the block is copied by the run loop.
+    unsafe { main.perform_block(Some(modes.as_ref()), Some(&block)) };
+    // A run loop that is asleep in one of those modes only notices the block
+    // once something wakes it.
+    main.wake_up();
 }
 
 /// Resolves HWND → `CAMetalLayer` via Wine's macdrv.

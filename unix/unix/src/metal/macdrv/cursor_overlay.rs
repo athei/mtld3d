@@ -284,6 +284,12 @@ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| {
 /// toggles the cursor; the apply reads the latest wanted state when it runs.
 static APPLY_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// When the pending apply was queued, nanoseconds since [`EPOCH`].
+///
+/// The apply logs how long it waited for the main thread at debug level,
+/// which is the number that says whether a cursor change landed late.
+static APPLY_QUEUED_NS: AtomicU64 = AtomicU64::new(0);
+
 /// The sprite's extent and hotspot in points, the window's coordinate unit.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct SpriteGeometry {
@@ -432,6 +438,8 @@ fn queue_apply() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        let ns = u64::try_from(EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        APPLY_QUEUED_NS.store(ns, Ordering::Relaxed);
         run_on_main_thread_async(apply_on_main);
     }
 }
@@ -439,6 +447,13 @@ fn queue_apply() {
 /// The queued apply: creates the overlay on first use. **Main thread only.**
 fn apply_on_main() {
     APPLY_PENDING.store(false, Ordering::Release);
+    let queued_ns = APPLY_QUEUED_NS.load(Ordering::Relaxed);
+    let waited_us = EPOCH
+        .elapsed()
+        .as_nanos()
+        .saturating_sub(u128::from(queued_ns))
+        / 1_000;
+    debug!(target: LOG_TARGET, "cursor: apply ran {waited_us} us after it was queued");
     apply_on_main_inner(true);
 }
 
