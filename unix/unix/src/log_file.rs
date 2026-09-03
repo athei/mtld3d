@@ -14,18 +14,26 @@
 //! known, not when it is named: a process that logs nothing (`RUST_LOG=off`,
 //! the conformance runner) leaves no empty file behind. A location that
 //! cannot be created or opened falls back to stderr with one line saying so.
+//!
+//! The directory keeps the [`KEEP`] newest logs and the [`KEEP`] newest
+//! traces: creating a log or a trace first removes the oldest of its kind
+//! past that count, so a game launched every day does not pile up files.
 
 use core::ffi::c_void;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
     os::fd::AsRawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Mutex,
         atomic::{AtomicI32, AtomicU32, Ordering},
     },
+    time::SystemTime,
 };
+
+/// Logs, and separately traces, the directory keeps; older ones go.
+const KEEP: usize = 10;
 
 /// Bytes the backlog keeps while the location is pending.
 ///
@@ -117,9 +125,12 @@ pub fn fall_back_to_stderr() {
 }
 
 /// Create the file at `path` and write the backlog, or explain why not.
+///
+/// Makes room first: the oldest logs beyond [`KEEP`] minus this one go.
 fn create(path: &PathBuf, backlog: &[u8], truncated: bool) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        prune(parent, "log", KEEP - 1);
     }
     let mut file = OpenOptions::new()
         .append(true)
@@ -238,8 +249,49 @@ pub fn next_trace_path() -> Option<PathBuf> {
         );
         return None;
     }
+    prune(&dir, "gputrace", KEEP - 1);
     Some(path)
 }
+
+/// Remove the oldest entries in `dir` with extension `ext` beyond the newest `keep`.
+///
+/// Age is the modification time; entries whose metadata cannot be read are
+/// left alone. A trace is a directory bundle, a log a file; both go whole.
+///
+/// Nothing here logs, on purpose: the log-file creation calls this under
+/// the sink's mutex, and a log line from inside would re-enter the sink and
+/// deadlock. A removal that fails (two processes sharing one directory can
+/// race for the same file) is simply tried again at the next creation.
+fn prune(dir: &Path, ext: &str, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut aged: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
+        .filter_map(|p| {
+            let modified = std::fs::metadata(&p).ok()?.modified().ok()?;
+            Some((modified, p))
+        })
+        .collect();
+    if aged.len() <= keep {
+        return;
+    }
+    // Newest last; a tie keeps the order stable by name.
+    aged.sort();
+    let doomed = aged.len() - keep;
+    for (_, path) in aged.into_iter().take(doomed) {
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests;
 
 /// The unix side's `env_logger` target.
 pub struct FileSink;
