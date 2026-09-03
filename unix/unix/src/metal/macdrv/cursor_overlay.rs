@@ -154,8 +154,17 @@ static LAST_EVENT_POS: AtomicU64 = AtomicU64::new(0);
 
 /// The pointer is moving without events reaching us: another process has it.
 ///
-/// Set by whichever capture check notices first, cleared by the next event.
+/// Set by whichever capture check notices first, cleared by the next event
+/// and whenever the game hides its cursor.
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// The game shows its cursor, in either cursor mode.
+///
+/// The capture checks run only while it does: a game that hides its cursor
+/// owns the pointer for as long as it likes (mouselook, raw input) and there
+/// is no cursor of ours or Wine's on screen for another process to replace,
+/// so a pointer moving with no events reaching us means nothing then.
+static CURSOR_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// The instant [`LAST_EVENT_NS`] counts from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -186,6 +195,9 @@ fn note_event(position: CGPoint) {
 /// Callable from any thread: the answer is the whole message, and a stale
 /// read only delays it by one check.
 fn capture_suspected() -> bool {
+    if !CURSOR_SHOWN.load(Ordering::Relaxed) {
+        return false;
+    }
     let at = LAST_EVENT_NS.load(Ordering::Acquire);
     if at == u64::MAX {
         return false;
@@ -223,8 +235,9 @@ pub fn poll_capture_from_present() {
 /// A system tool that takes the pointer (the screenshot crosshair) leaves the
 /// application eventless while the pointer keeps moving. A pointer that sits
 /// away from the last event but no longer moves was warped there by the game
-/// (`SetCursorPos` after a mouselook drag), which generates no event either
-/// and must not hide the cursor.
+/// (`SetCursorPos`), which generates no event either and must not hide the
+/// cursor. Only asked while the game shows its cursor; with it hidden the
+/// game owns the pointer and Wine may keep the events from the application.
 const fn pointer_captured(
     silence_ms: u128,
     moved_since_event: bool,
@@ -283,6 +296,12 @@ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| {
 /// Bounds the main queue to one outstanding apply however fast the API thread
 /// toggles the cursor; the apply reads the latest wanted state when it runs.
 static APPLY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// When the pending apply was queued, nanoseconds since [`EPOCH`].
+///
+/// The apply logs how long it waited for the main thread at debug level,
+/// which is the number that says whether a cursor change landed late.
+static APPLY_QUEUED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The sprite's extent and hotspot in points, the window's coordinate unit.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -374,6 +393,17 @@ fn peak_changed(applied: f32, current: f32) -> bool {
 /// copied here, so the PE buffer only has to live for the call. Never blocks
 /// on the main thread.
 pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>) {
+    let visible = params.flags.contains(CursorOverlayFlags::VISIBLE);
+    CURSOR_SHOWN.store(visible, Ordering::Relaxed);
+    if !visible {
+        // The game took the pointer back; whatever another process did with
+        // it meanwhile is over as far as the cursor on screen is concerned.
+        CAPTURED.store(false, Ordering::Relaxed);
+    }
+    if params.flags.contains(CursorOverlayFlags::HARDWARE) {
+        // Visibility only: the hardware cursor path has no sprite.
+        return;
+    }
     {
         let mut shared = lock_shared();
         if let Some(pixels) = pixels {
@@ -391,7 +421,7 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
         }
         shared.wanted = Wanted {
             hash: params.hash,
-            visible: params.flags.contains(CursorOverlayFlags::VISIBLE),
+            visible,
         };
     }
     queue_apply();
@@ -403,6 +433,8 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
 /// `AppKit` observers; the next device's PE side has an empty uploaded set of
 /// its own and re-sends what it shows.
 pub fn detach() {
+    CURSOR_SHOWN.store(false, Ordering::Relaxed);
+    CAPTURED.store(false, Ordering::Relaxed);
     {
         let mut shared = lock_shared();
         shared.sprites.clear();
@@ -432,6 +464,8 @@ fn queue_apply() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        let ns = u64::try_from(EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        APPLY_QUEUED_NS.store(ns, Ordering::Relaxed);
         run_on_main_thread_async(apply_on_main);
     }
 }
@@ -439,6 +473,13 @@ fn queue_apply() {
 /// The queued apply: creates the overlay on first use. **Main thread only.**
 fn apply_on_main() {
     APPLY_PENDING.store(false, Ordering::Release);
+    let queued_ns = APPLY_QUEUED_NS.load(Ordering::Relaxed);
+    let waited_us = EPOCH
+        .elapsed()
+        .as_nanos()
+        .saturating_sub(u128::from(queued_ns))
+        / 1_000;
+    debug!(target: LOG_TARGET, "cursor: apply ran {waited_us} us after it was queued");
     apply_on_main_inner(true);
 }
 

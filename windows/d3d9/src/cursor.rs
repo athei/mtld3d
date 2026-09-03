@@ -471,12 +471,19 @@ impl CursorState {
         }
     }
 
-    /// Ship the current visibility to the overlay (software mode); a no-op otherwise.
+    /// Ship the current visibility to the unix side.
+    ///
+    /// Software mode names the sprite too; the hardware path sends visibility
+    /// alone, which the unix side's pointer watch needs to know whatever
+    /// draws the cursor.
     fn push_overlay_state(&self) {
-        if !self.software() || self.hash == 0 {
-            return;
+        if self.software() {
+            if self.hash != 0 {
+                send_overlay_state(self.hash, self.overlay_flags(), None);
+            }
+        } else {
+            send_overlay_state(0, self.overlay_flags() | CursorOverlayFlags::HARDWARE, None);
         }
-        send_overlay_state(self.hash, self.overlay_flags(), None);
     }
 
     /// The flags word `SetCursorOverlay` carries: the *effective* visibility.
@@ -1017,7 +1024,12 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
         0
     };
     cur.charge_call_us(set_cursor_us);
-    cur.push_overlay_state();
+    // The hardware path sends visibility on transitions only, beside the
+    // SetCursor it already makes; software mode sends every call, coalesced
+    // on the unix side.
+    if cur.software() || prev != next {
+        cur.push_overlay_state();
+    }
     if prev != next {
         cur.probe.last_transition = Some((Instant::now(), next));
     }

@@ -781,6 +781,11 @@ bitflags! {
     pub struct CursorOverlayFlags: u32 {
         /// The game's cursor is shown; clear = the overlay hides its sprite.
         const VISIBLE = 1 << 0;
+        /// Visibility only, from the hardware cursor path: no sprite, `hash` is 0.
+        ///
+        /// The unix side's pointer watch needs to know when the game shows
+        /// its cursor whatever draws it; the overlay itself is left alone.
+        const HARDWARE = 1 << 1;
     }
 }
 

@@ -241,7 +241,9 @@ impl Thunk for AttachMetalLayerParams {
 /// Wanted state of the software cursor overlay: which sprite, and whether it shows.
 ///
 /// Sent from the API thread on every `ShowCursor` and `SetCursorProperties`
-/// while the software cursor is active. `hash` names the sprite (never `0`);
+/// while the software cursor is active, and on `ShowCursor` transitions
+/// with `CursorOverlayFlags::HARDWARE` set (visibility only, `hash` 0) while
+/// the hardware cursor is. `hash` names the sprite (never `0` otherwise);
 /// `pixels_ptr` carries its BGRA bytes the first time the PE side sends a hash
 /// and is `0` afterwards, the unix side keeping every sprite it has been
 /// handed. Sprite pixels are already upscaled by `scale` (pixels per point),

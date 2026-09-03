@@ -12,7 +12,7 @@ use mtld3d_shared::{
     SetCursorOverlayParams, SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams,
     TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
     WriteLogParams, identity,
-    mtl::{DestroyKind, QuadPipelineKind},
+    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
@@ -236,7 +236,8 @@ pub extern "C" fn set_cursor_overlay_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<SetCursorOverlayParams>::opt(args) }) else {
         return -1;
     };
-    if params.hash == 0 {
+    let hardware = params.flags.contains(CursorOverlayFlags::HARDWARE);
+    if params.hash == 0 && !hardware {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "SetCursorOverlay: hash 0 names no sprite → ignored"
