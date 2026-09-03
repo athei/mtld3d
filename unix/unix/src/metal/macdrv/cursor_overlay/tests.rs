@@ -90,13 +90,20 @@ fn a_captured_pointer_hides_the_overlay() {
 }
 
 #[test]
-fn pointer_is_captured_only_when_it_moves_without_events() {
-    assert!(pointer_captured(CAPTURE_SILENCE_MS, true));
-    assert!(pointer_captured(CAPTURE_SILENCE_MS * 10, true));
+fn pointer_is_captured_only_when_it_keeps_moving_without_events() {
+    assert!(pointer_captured(CAPTURE_SILENCE_MS, true, true));
+    assert!(pointer_captured(CAPTURE_SILENCE_MS * 10, true, true));
     // Idle pointer: silence is just idleness.
-    assert!(!pointer_captured(CAPTURE_SILENCE_MS * 10, false));
+    assert!(!pointer_captured(CAPTURE_SILENCE_MS * 10, false, false));
     // Moving with events flowing: the events are what we saw it with.
-    assert!(!pointer_captured(CAPTURE_SILENCE_MS - 1, true));
+    assert!(!pointer_captured(CAPTURE_SILENCE_MS - 1, true, true));
+}
+
+#[test]
+fn a_warped_pointer_that_sits_still_is_not_captured() {
+    // The game moved the pointer with SetCursorPos, which generates no event:
+    // it is away from the last event but not moving between checks.
+    assert!(!pointer_captured(CAPTURE_SILENCE_MS * 10, true, false));
 }
 
 #[test]

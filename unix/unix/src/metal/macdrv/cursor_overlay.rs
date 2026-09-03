@@ -138,6 +138,14 @@ const CAPTURE_SILENCE_MS: u128 = 60;
 /// checks on the main and submit threads. `u64::MAX` until the first event.
 static LAST_EVENT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Where the pointer was at the previous capture check, packed like [`LAST_EVENT_POS`].
+///
+/// A capture has the pointer moving between checks; a warp the game asked
+/// for (`SetCursorPos` after a mouselook drag) is one jump followed by a
+/// still pointer, and generates no event either. Comparing consecutive
+/// checks is what tells them apart.
+static LAST_CHECK_POS: AtomicU64 = AtomicU64::new(0);
+
 /// Where the pointer was at the last mouse event: `x` bits high, `y` bits low.
 ///
 /// The two coordinates are `f32` so one `u64` carries both and a reader
@@ -183,10 +191,13 @@ fn capture_suspected() -> bool {
         return false;
     }
     let silence_ms = EPOCH.elapsed().as_nanos().saturating_sub(u128::from(at)) / 1_000_000;
-    let (seen_x, seen_y) = unpack_point(LAST_EVENT_POS.load(Ordering::Relaxed));
     let now = NSEvent::mouseLocation();
-    let moved = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
-    pointer_captured(silence_ms, moved)
+    let now_bits = pack_point(now);
+    let (seen_x, seen_y) = unpack_point(LAST_EVENT_POS.load(Ordering::Relaxed));
+    let (prev_x, prev_y) = unpack_point(LAST_CHECK_POS.swap(now_bits, Ordering::Relaxed));
+    let moved_since_event = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
+    let moved_since_check = (now.x - prev_x).abs() > 0.5 || (now.y - prev_y).abs() > 0.5;
+    pointer_captured(silence_ms, moved_since_event, moved_since_check)
 }
 
 /// Run the capture check from the present path; no wakeup of its own.
@@ -207,13 +218,19 @@ pub fn poll_capture_from_present() {
     }
 }
 
-/// Whether the pointer moved while no mouse event reached this process.
+/// Whether the pointer is moving while no mouse event reaches this process.
 ///
 /// A system tool that takes the pointer (the screenshot crosshair) leaves the
-/// application eventless while the pointer keeps moving; that is the only way
-/// the two disagree.
-const fn pointer_captured(silence_ms: u128, pointer_moved: bool) -> bool {
-    pointer_moved && silence_ms >= CAPTURE_SILENCE_MS
+/// application eventless while the pointer keeps moving. A pointer that sits
+/// away from the last event but no longer moves was warped there by the game
+/// (`SetCursorPos` after a mouselook drag), which generates no event either
+/// and must not hide the cursor.
+const fn pointer_captured(
+    silence_ms: u128,
+    moved_since_event: bool,
+    moved_since_check: bool,
+) -> bool {
+    moved_since_event && moved_since_check && silence_ms >= CAPTURE_SILENCE_MS
 }
 
 /// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
@@ -1010,10 +1027,18 @@ pub fn install_pointer_watch() {
         on_pointer_event_main();
         event.as_ptr()
     });
+    // Presses and releases count as events too: the last event's position
+    // has to be fresh when a game warps the pointer on release.
     let mask = NSEventMask::MouseMoved
         | NSEventMask::LeftMouseDragged
         | NSEventMask::RightMouseDragged
-        | NSEventMask::OtherMouseDragged;
+        | NSEventMask::OtherMouseDragged
+        | NSEventMask::LeftMouseDown
+        | NSEventMask::LeftMouseUp
+        | NSEventMask::RightMouseDown
+        | NSEventMask::RightMouseUp
+        | NSEventMask::OtherMouseDown
+        | NSEventMask::OtherMouseUp;
     // SAFETY: objc2 typed binding; AppKit copies the block and the returned
     // token is leaked below so the monitor is never removed.
     let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &monitor) };
