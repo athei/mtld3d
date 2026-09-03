@@ -262,41 +262,79 @@ install: install-windows-i686 install-windows-x86_64 install-unix-x64 install-un
 # leg installs the one PE arch it exercises plus the one unix `.so` its Wine
 # loads, and only `install` (and `bundle`) covers everything.
 #
+# A Wine tree holds mtld3d in one of two layouts. A tree bundled with a compat
+# database keeps every Direct3D implementation in its own subtree and picks one
+# per process: `lib/wine/d3d9/mtld3d/<arch>` is prepended to the builtin search
+# and the default dirs carry only fake-module markers (winebuild
+# `--fake-module`, the placeholder wineboot stamps into the prefix so the
+# prepended tree's DLL loads). An older tree loads straight from the default
+# dirs. `MTLD3D_TREE` names the subtree a given root uses, and each leaf writes
+# into it, re-stamping the markers in the new layout so a root whose markers
+# an earlier install overwrote is whole again.
+#
 # The d3d9.dll copies under lib/wine get the builtin signature in place: the
 # loader ignores unsigned PEs on the builtin search path. Symbols travel with
 # each binary, the `.pdb` beside every PE and the `.dSYM` beside the `.so`, so a
 # local crash symbolicates against the installed files with no extra flags.
+define MTLD3D_TREE
+if [ -d $(1)/lib/wine/d3d9/mtld3d ]; then echo $(1)/lib/wine/d3d9/mtld3d; else echo $(1)/lib/wine; fi
+endef
+
 install-windows-i686: windows-i686
 	for dir in $(INSTALL_DIRS); do \
-		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$dir/lib/wine/i386-windows/ ; \
-		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$dir/lib/wine/i386-windows/ ; \
-		$(WINEBUILD) --builtin $$dir/lib/wine/i386-windows/d3d9.dll ; \
+		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+		mkdir -p $$tree/i386-windows ; \
+		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$tree/i386-windows/ ; \
+		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$tree/i386-windows/ ; \
+		$(WINEBUILD) --builtin $$tree/i386-windows/d3d9.dll ; \
+		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -f $$dir/lib/wine/i386-windows/d3d9.pdb $$dir/lib/wine/i386-windows/mtld3d.pdb ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/d3d9.dll   -m32 --dll $$tree/i386-windows/d3d9.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/i386-windows/mtld3d.dll -m32 --dll $$tree/i386-windows/mtld3d.dll ; \
+		fi ; \
 	done
 
 install-windows-x86_64: windows-x86_64
 	for dir in $(INSTALL_DIRS); do \
-		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
-		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
-		$(WINEBUILD) --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
+		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+		mkdir -p $$tree/x86_64-windows ; \
+		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$tree/x86_64-windows/ ; \
+		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$tree/x86_64-windows/ ; \
+		$(WINEBUILD) --builtin $$tree/x86_64-windows/d3d9.dll ; \
+		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -f $$dir/lib/wine/x86_64-windows/d3d9.pdb $$dir/lib/wine/x86_64-windows/mtld3d.pdb ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d9.dll   -m64 --dll $$tree/x86_64-windows/d3d9.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/mtld3d.dll -m64 --dll $$tree/x86_64-windows/mtld3d.dll ; \
+		fi ; \
 	done
 
 # Both unix arches create the directory the Wine tree lacks: a Wine only ever
 # loads the one matching its own build, so the other copy is inert, and a tree
-# that later gains an arm64 loader is already served.
+# that later gains an arm64 loader is already served. In the subtree layout the
+# default unix dir carries no mtld3d.so at all, so one an earlier install left
+# there goes.
 install-unix-x64: unix-x64
 	for dir in $(INSTALL_DIRS); do \
-		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_x64) ; \
-		cp $(OUT_unix_x64)/mtld3d.so        $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
-		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$dir/lib/wine/$(UNIX_WINEDIR_x64)/ ; \
+		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+		mkdir -p $$tree/$(UNIX_WINEDIR_x64) ; \
+		cp $(OUT_unix_x64)/mtld3d.so        $$tree/$(UNIX_WINEDIR_x64)/ ; \
+		rm -rf $$tree/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$tree/$(UNIX_WINEDIR_x64)/ ; \
+		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
+		fi ; \
 	done
 
 install-unix-arm64: unix-arm64
 	for dir in $(INSTALL_DIRS); do \
-		mkdir -p $$dir/lib/wine/$(UNIX_WINEDIR_arm64) ; \
-		cp $(OUT_unix_arm64)/mtld3d.so      $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
-		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/ ; \
+		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+		mkdir -p $$tree/$(UNIX_WINEDIR_arm64) ; \
+		cp $(OUT_unix_arm64)/mtld3d.so      $$tree/$(UNIX_WINEDIR_arm64)/ ; \
+		rm -rf $$tree/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $$tree/$(UNIX_WINEDIR_arm64)/ ; \
+		if [ $$tree != $$dir/lib/wine ]; then \
+			rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
+		fi ; \
 	done
 
 # Distribution bundle, serving both install routes (see INSTALL.md, which is
