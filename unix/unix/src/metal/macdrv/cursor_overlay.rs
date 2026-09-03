@@ -36,8 +36,9 @@
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
-//! keeps moving; a fast tick notices the pointer moving with no events
-//! arriving and hides the sprite until events resume. And when such a tool
+//! keeps moving; every present, and a timer for when presents stop, notices
+//! the pointer moving with no events arriving and hides the sprite until
+//! events resume. And when such a tool
 //! ends, the window server shows the standard arrow rather than the cursor
 //! Wine set, which Wine never re-applies because its handle did not change;
 //! the first event after a capture asks the PE side for its null-then-set
@@ -53,7 +54,7 @@ use std::{
     collections::hash_map::Entry,
     sync::{
         LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -116,19 +117,95 @@ enum Content {
     },
 }
 
-/// How often the pointer is checked for moving without events reaching us, seconds.
+/// How often the timer checks the pointer for moving without events reaching us, seconds.
 ///
-/// Ten times a second takes the sprite away within about a fifth of a second
-/// of a system tool grabbing the pointer, for one `mouseLocation` read per
-/// tick; the timer's tolerance lets the system fold it into other wakeups.
+/// The timer is the fallback for a game that has stopped presenting; while
+/// it presents, every frame runs the same check for free. Ten times a
+/// second, with a tolerance so the system folds it into other wakeups.
 const CAPTURE_TICK_SECONDS: f64 = 0.1;
 
 /// How long without a mouse event before a moved pointer counts as captured.
 ///
 /// A moving pointer delivers an event every few milliseconds, so a gap this
 /// long with the pointer elsewhere than the last event put it means someone
-/// else is receiving the events.
-const CAPTURE_SILENCE_MS: u128 = 100;
+/// else is receiving the events. Checked every present, so this is also the
+/// delay before the sprite goes away.
+const CAPTURE_SILENCE_MS: u128 = 60;
+
+/// When the last mouse event reached this process, nanoseconds since [`EPOCH`].
+///
+/// Written by the pointer watch on the main thread, read by the capture
+/// checks on the main and submit threads. `u64::MAX` until the first event.
+static LAST_EVENT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Where the pointer was at the last mouse event: `x` bits high, `y` bits low.
+///
+/// The two coordinates are `f32` so one `u64` carries both and a reader
+/// never sees an `x` from one event next to a `y` from another.
+static LAST_EVENT_POS: AtomicU64 = AtomicU64::new(0);
+
+/// The pointer is moving without events reaching us: another process has it.
+///
+/// Set by whichever capture check notices first, cleared by the next event.
+static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// The instant [`LAST_EVENT_NS`] counts from.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn pack_point(point: CGPoint) -> u64 {
+    // Screen coordinates fit `f32` with room to spare; the lost fraction is
+    // far below the half-point movement threshold.
+    let x = super::bounded_cast::f64_to_f32(point.x).to_bits();
+    let y = super::bounded_cast::f64_to_f32(point.y).to_bits();
+    (u64::from(x) << 32) | u64::from(y)
+}
+
+fn unpack_point(bits: u64) -> (f64, f64) {
+    let x = u32::try_from(bits >> 32).expect("the high word is 32 bits");
+    let y = u32::try_from(bits & u64::from(u32::MAX)).expect("masked to 32 bits");
+    (f64::from(f32::from_bits(x)), f64::from(f32::from_bits(y)))
+}
+
+/// Record a mouse event's time and pointer position for the capture checks.
+fn note_event(position: CGPoint) {
+    let ns = u64::try_from(EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+    LAST_EVENT_POS.store(pack_point(position), Ordering::Relaxed);
+    LAST_EVENT_NS.store(ns, Ordering::Release);
+}
+
+/// Whether the pointer has moved since the last event with no event for the silence period.
+///
+/// Callable from any thread: the answer is the whole message, and a stale
+/// read only delays it by one check.
+fn capture_suspected() -> bool {
+    let at = LAST_EVENT_NS.load(Ordering::Acquire);
+    if at == u64::MAX {
+        return false;
+    }
+    let silence_ms = EPOCH.elapsed().as_nanos().saturating_sub(u128::from(at)) / 1_000_000;
+    let (seen_x, seen_y) = unpack_point(LAST_EVENT_POS.load(Ordering::Relaxed));
+    let now = NSEvent::mouseLocation();
+    let moved = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
+    pointer_captured(silence_ms, moved)
+}
+
+/// Run the capture check from the present path; no wakeup of its own.
+///
+/// Called once per present on the submit thread. When it is the first to
+/// notice, it flags the capture and asks the main thread to hide the sprite;
+/// the timer does the same for a game that has stopped presenting.
+pub fn poll_capture_from_present() {
+    if CAPTURED.load(Ordering::Relaxed) || !capture_suspected() {
+        return;
+    }
+    if CAPTURED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        debug!(target: LOG_TARGET, "cursor: pointer moves without events, another process has it");
+        run_on_main_thread_async(sync_overlay_on_main);
+    }
+}
 
 /// Whether the pointer moved while no mouse event reached this process.
 ///
@@ -370,15 +447,8 @@ fn snapshot_wanted() -> WantedSnapshot {
 }
 
 thread_local! {
-    /// When the last mouse event reached this process, and where the pointer was then.
-    ///
-    /// Written by the pointer watch and read by the capture tick, both on the
-    /// main thread. `None` until the first event.
-    static LAST_EVENT: Cell<Option<(Instant, CGPoint)>> = const { Cell::new(None) };
     /// Whether the pointer watch has been installed.
     static POINTER_WATCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
-    /// The pointer is moving without events reaching us: a system tool has it.
-    static CAPTURED: Cell<bool> = const { Cell::new(false) };
     /// The overlay's `AppKit` and Metal objects; main thread only, by construction.
     ///
     /// Every access is from a block dispatched to the main queue or from an
@@ -413,10 +483,8 @@ fn apply_on_main_inner(create_if_missing: bool) {
 /// Runs for every device whatever its cursor mode: the end of a capture is
 /// what puts the hardware cursor back after a system tool borrowed the pointer.
 fn on_pointer_event_main() {
-    // SAFETY: local event monitors and notification blocks run on the main thread.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    LAST_EVENT.with(|last| last.set(Some((Instant::now(), NSEvent::mouseLocation()))));
-    if CAPTURED.replace(false) {
+    note_event(NSEvent::mouseLocation());
+    if CAPTURED.swap(false, Ordering::AcqRel) {
         // The other process's cursor is still on screen; Wine only replaces
         // it on a handle change, which the PE side's kick provides.
         request_cursor_kick();
@@ -425,6 +493,14 @@ fn on_pointer_event_main() {
             "cursor: mouse events resumed, pointer released, cursor re-apply requested",
         );
     }
+    sync_overlay_on_main();
+}
+
+/// Bring the overlay, if there is one, in line with the pointer. **Main thread only.**
+fn sync_overlay_on_main() {
+    // SAFETY: every caller runs on the main thread (a main-queue block or an
+    // AppKit callback).
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             return;
@@ -437,36 +513,22 @@ fn on_pointer_event_main() {
     });
 }
 
-/// The capture tick: notice a pointer moving without events reaching us. **Main thread only.**
+/// The capture timer: the present-path check for a game that has stopped presenting.
 ///
-/// Runs for every device. The software cursor hides its sprite for the
-/// duration; the hardware cursor needs nothing until the capture ends.
+/// **Main thread only.** Runs for every device. The software cursor hides
+/// its sprite for the duration; the hardware cursor needs nothing until the
+/// capture ends.
 fn on_capture_tick_main() {
-    // SAFETY: the timer fires on the main run loop.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    if CAPTURED.get() {
+    if CAPTURED.load(Ordering::Relaxed) || !capture_suspected() {
         return;
     }
-    let Some((at, seen)) = LAST_EVENT.with(Cell::get) else {
-        return;
-    };
-    let now = NSEvent::mouseLocation();
-    let moved = (now.x - seen.x).abs() > 0.5 || (now.y - seen.y).abs() > 0.5;
-    if !pointer_captured(at.elapsed().as_millis(), moved) {
-        return;
+    if CAPTURED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        debug!(target: LOG_TARGET, "cursor: pointer moves without events, another process has it");
+        sync_overlay_on_main();
     }
-    CAPTURED.set(true);
-    debug!(target: LOG_TARGET, "cursor: pointer moves without events, another process has it");
-    OVERLAY.with(|cell| {
-        let Ok(mut slot) = cell.try_borrow_mut() else {
-            return;
-        };
-        if let Some(overlay) = slot.as_mut()
-            && overlay.wanted.is_some()
-        {
-            overlay.sync_position(mtm);
-        }
-    });
 }
 
 /// The overlay window and everything rendered into it. **Main thread only.**
@@ -788,7 +850,7 @@ impl Overlay {
         );
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
-        inputs.set(VisibilityInputs::CAPTURED, CAPTURED.get());
+        inputs.set(VisibilityInputs::CAPTURED, CAPTURED.load(Ordering::Relaxed));
         let shown = overlay_visible(inputs);
         let Some((hash, geometry)) = self.wanted else {
             self.ensure_content(Content::Transparent);

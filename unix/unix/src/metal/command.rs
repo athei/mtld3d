@@ -482,6 +482,9 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // on, and a session that started SDR has to notice a panel with
             // headroom appearing under it.
             let current = super::macdrv::current_headroom();
+            // The pointer check rides the present cadence so a system tool
+            // taking the pointer is noticed without a wakeup of its own.
+            super::macdrv::poll_capture_from_present();
             // The layer follows that display, so its pixel format can change
             // between two presents. Take the route from the drawable we are
             // about to write rather than from a latch read a moment earlier: a

@@ -21,7 +21,7 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 mod cursor_overlay;
 
-pub use cursor_overlay::set_cursor_overlay;
+pub use cursor_overlay::{poll_capture_from_present, set_cursor_overlay};
 
 /// Whether the bound `CAMetalLayer` currently carries the EDR configuration.
 ///
