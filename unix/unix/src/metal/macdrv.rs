@@ -324,6 +324,7 @@ fn install_occlusion_tracking(view: *mut c_void) {
         // SAFETY: inside the main-thread dispatch above.
         let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
         install_screen_params_filter(mtm);
+        cursor_overlay::install_pointer_watch();
     });
 }
 
@@ -763,21 +764,35 @@ fn min_present_duration_change(
     (target.to_bits() != applied_seconds.to_bits()).then_some(target)
 }
 
-/// Round and clamp an `NSScreen.backingScaleFactor` into the range the PE side takes.
+/// Round and clamp the Wine layer's `contentsScale` into the range the PE side takes.
 ///
-/// macOS reports the factor as an integer already; the clamp bounds the
-/// HCURSOR upscaler downstream, which asserts `[1, 8]`.
-fn backing_scale_from(screen_scale: f64) -> u32 {
-    bounded_cast::f64_to_u32_saturating(screen_scale.round()).clamp(1, 8)
+/// winemac sets the metal layer's `contentsScale` to 2 in retina mode and 1
+/// otherwise, whatever the display's own factor: that is the number of Wine
+/// pixels per point, and so how much smaller than a point the game's cursor
+/// pixels come out. The clamp bounds the HCURSOR upscaler downstream, which
+/// asserts `[1, 8]`.
+fn backing_scale_from(contents_scale: f64) -> u32 {
+    bounded_cast::f64_to_u32_saturating(contents_scale.round()).clamp(1, 8)
 }
 
-/// The backing scale to publish when the window's display no longer matches it.
+/// The cursor scale to publish when the layer no longer matches it.
 ///
-/// `Some(scale)` when the screen asks for a different factor than the one
+/// `Some(scale)` when the layer asks for a different factor than the one
 /// last published, `None` while they agree.
-fn backing_scale_change(applied: u32, screen_scale: f64) -> Option<u32> {
-    let target = backing_scale_from(screen_scale);
+fn backing_scale_change(applied: u32, contents_scale: f64) -> Option<u32> {
+    let target = backing_scale_from(contents_scale);
     (target != applied).then_some(target)
+}
+
+/// The `contentsScale` of Wine's metal layer: 2 in retina mode, 1 otherwise.
+///
+/// A plain property read; the value is set once by winemac when it creates
+/// the layer and changed only by a retina-mode switch.
+fn layer_contents_scale(layer: *mut c_void) -> f64 {
+    // SAFETY: `layer` is the `CAMetalLayer` pointer winemac handed out, alive
+    // for as long as the metal view it belongs to.
+    let layer = unsafe { Retained::retain(layer.cast::<objc2_quartz_core::CAMetalLayer>()) };
+    layer.map_or(1.0, |layer| layer.contentsScale())
 }
 
 /// A screen's refresh ceiling in Hz, from `NSScreen.maximumFramesPerSecond`.
@@ -835,10 +850,10 @@ pub struct LayerAttachRequest {
     pub software_cursor: SoftwareCursorPolicy,
 }
 
-/// Resolved `CAMetalLayer`-relevant capabilities of the `NSScreen` the bound view lives on.
+/// What attach answers the PE side about the display and the cursor.
 #[derive(Clone, Copy)]
 pub struct DisplayCaps {
-    /// `NSScreen.backingScaleFactor` rounded + clamped to `[1, 8]`.
+    /// The Wine layer's `contentsScale` rounded + clamped to `[1, 8]`: 2 in retina mode, else 1.
     pub backing_scale: u32,
     /// Whether the device draws its cursor through the overlay window.
     ///
@@ -906,10 +921,9 @@ bitflags::bitflags! {
 
 /// Bundle of `NSScreen`-derived properties used at attach time.
 ///
-/// `caps` is the PE-side wire return (`backing_scale` only); the other
-/// fields drive HDR-vs-SDR layer configuration entirely unix-side.
+/// All of them drive layer configuration unix-side; what travels back to the
+/// PE side comes from the layer, not the screen.
 struct DisplayHint {
-    caps: DisplayCaps,
     /// `maximumPotentialExtendedDynamicRangeColorComponentValue` — static panel ceiling.
     ///
     /// Drives the SDR-vs-HDR layer-config decision.
@@ -1045,8 +1059,8 @@ fn run_on_main_thread_async<F: FnOnce() + Send + 'static>(f: F) {
 ///
 /// Returns (`view_handle`, `layer_handle`, `display_caps`).
 /// Display-caps field:
-/// - `backing_scale` is `NSWindow.backingScaleFactor` rounded + clamped
-///   to `[1, 8]`; falls back to `1` on any lookup failure.
+/// - `backing_scale` is the Wine metal layer's `contentsScale` rounded +
+///   clamped to `[1, 8]`: 2 when the prefix runs in retina mode, else 1.
 ///
 /// Side effect: latches the unix-side `HDR_ACTIVE` global to `true`
 /// when the display has EDR potential and `hdr_enable` is set (resolved
@@ -1119,13 +1133,18 @@ pub fn attach_metal_layer(
             // that was not attached yet, and needs the guest's vsync ask, the
             // user's frame cap and the value the PE side is already using.
             PRESENT_PACING_BITS.store(pack_pacing(&pacing), Ordering::Relaxed);
-            CURRENT_BACKING_SCALE.store(hint.caps.backing_scale, Ordering::Relaxed);
+            // The cursor scale follows Wine's retina mode, which the layer
+            // carries as its contents scale, not the display's own factor: in
+            // non-retina mode macOS already doubles everything the game draws,
+            // its cursor included.
+            let backing_scale = backing_scale_from(layer_contents_scale(layer));
+            CURRENT_BACKING_SCALE.store(backing_scale, Ordering::Relaxed);
             BACKING_SCALE_SINK_PTR.store(
                 usize::try_from(backing_scale_sink_ptr)
                     .expect("PE wire pointer fits host address space (unix is 64-bit)"),
                 Ordering::Relaxed,
             );
-            publish_backing_scale(hint.caps.backing_scale);
+            publish_backing_scale(backing_scale);
             // Decide HDR vs SDR layer configuration from the panel's
             // static potential + the user's `color.hdr.enable` setting. Latch
             // the result as the configuration the layer now carries — the
@@ -1174,7 +1193,7 @@ pub fn attach_metal_layer(
             // `CAMetalLayer` pointer.
             let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(layer as u64) };
             let caps = DisplayCaps {
-                backing_scale: hint.caps.backing_scale,
+                backing_scale,
                 software_cursor_active,
             };
             Some((view_handle, layer_handle, caps))
@@ -1417,17 +1436,10 @@ impl MacdrvFuncs {
 
 /// Gather the `NSScreen` properties of the screen the bound view lives on.
 ///
-/// Reads the screen's `backingScaleFactor`, `colorSpace`, EDR potential,
-/// refresh ceiling and `localizedName`; returns them as a [`DisplayHint`].
-/// `backing_scale` is the only field that travels back to PE — rounded and
-/// clamped to `[1, 8]` (macOS guarantees the factor is integer); the rest
-/// drive layer configuration unix-side.
-///
-/// The scale comes from the *screen*, not the window, because its PE-side
-/// consumer is the cursor upscale: the hardware cursor is composited by
-/// `WindowServer` on top of the framebuffer rather than rasterised into the
-/// `NSWindow`, so a cursor bitmap lands at 1:1 physical pixels and
-/// `NSWindow.backingScaleFactor` never applies to it.
+/// Reads the screen's `colorSpace`, EDR potential, refresh ceiling and
+/// `localizedName`; returns them as a [`DisplayHint`]. All of them drive
+/// layer configuration unix-side; the cursor scale the PE side consumes comes
+/// from the Wine layer instead (see [`layer_contents_scale`]).
 ///
 /// The colorspace flows through to `configure_metal_layer_inner` and drives
 /// the layer's `colorspace` property — SDR uses it directly (identity = max
@@ -1464,10 +1476,9 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     // layer configuration decision at attach.
     // Construct the per-screen bundle inline. The map_or default
     // covers the no-screen path (view==null, mainScreen() None) —
-    // backing scale falls back to 1, potential to 1.0 (no EDR), no
-    // colorspace, no profile name, both diagnostic flags off.
+    // potential falls back to 1.0 (no EDR), no colorspace, no profile
+    // name, both diagnostic flags off.
     let (
-        screen_scale,
         edr_potential,
         screen_name,
         native_colorspace,
@@ -1476,7 +1487,7 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
         colorspace_is_wide_gamut,
     ) = screen
         .as_deref()
-        .map_or((1.0_f64, 1.0_f64, None, None, None, false, false), |s| {
+        .map_or((1.0_f64, None, None, None, false, false), |s| {
             // The CGColorSpace (for layer setColorspace) and its gamut
             // label, plus is_hdr/is_wide_gamut flags for the
             // HDR-tagged-but-no-EDR asymmetry diagnostic.
@@ -1486,7 +1497,6 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
                 .as_deref()
                 .is_some_and(CGColorSpace::is_wide_gamut_rgb);
             (
-                s.backingScaleFactor(),
                 s.maximumPotentialExtendedDynamicRangeColorComponentValue(),
                 Some(s.localizedName().to_string()),
                 cg_cs,
@@ -1496,7 +1506,6 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
             )
         });
 
-    let backing_scale = backing_scale_from(screen_scale);
     // The panel ceiling drives the present-throttle duration computed at
     // attach; a display move re-derives it from the same helper.
     let panel_max_hz = screen.as_deref().map_or(0.0_f64, screen_max_hz);
@@ -1504,10 +1513,6 @@ fn view_display_caps(view: *mut c_void) -> DisplayHint {
     colorspace_flags.set(ColorspaceFlags::IS_HDR, colorspace_is_hdr);
     colorspace_flags.set(ColorspaceFlags::IS_WIDE_GAMUT, colorspace_is_wide_gamut);
     DisplayHint {
-        caps: DisplayCaps {
-            backing_scale,
-            software_cursor_active: false,
-        },
         edr_potential,
         screen_name,
         native_colorspace,
@@ -1694,7 +1699,7 @@ fn refresh_headroom_on_main() {
     if let Some(screen) = screen.as_deref() {
         follow_screen_layer_mode(screen);
         follow_screen_present_throttle(screen);
-        follow_screen_backing_scale(screen);
+        follow_layer_backing_scale();
     }
     log_headroom_change_if_any(headroom, &view_obj);
     cursor_overlay::reconcile_on_main();
@@ -2183,29 +2188,31 @@ fn follow_screen_present_throttle(screen: &objc2_app_kit::NSScreen) {
     );
 }
 
-/// Re-derive the backing scale for the screen the window is on. **Main thread only.**
+/// Re-derive the cursor scale from the Wine layer's `contentsScale`. **Main thread only.**
 ///
-/// The PE side takes the scale as a property of the display and drives the
-/// hardware-cursor upscale from it, so a move between a retina panel and a
-/// 1x one leaves the pointer at twice or half the size the display asks for
-/// until the new value is published.
+/// The PE side drives the cursor upscale from it. winemac sets the scale from
+/// its retina mode, so this only ever changes with that mode, but the read is
+/// one property and rides the same reconciliation as everything else the
+/// display decides.
 ///
-/// A session that stays on one display reads back the scale it already
-/// published, and nothing is stored or logged.
-fn follow_screen_backing_scale(screen: &objc2_app_kit::NSScreen) {
+/// A session whose mode stays put reads back the scale it already published,
+/// and nothing is stored or logged.
+fn follow_layer_backing_scale() {
     if !display_state_is_latched() {
         return;
     }
+    let Some(layer) = retain_bound_layer() else {
+        return;
+    };
     let applied = CURRENT_BACKING_SCALE.load(Ordering::Relaxed);
-    let Some(scale) = backing_scale_change(applied, screen.backingScaleFactor()) else {
+    let Some(scale) = backing_scale_change(applied, layer.contentsScale()) else {
         return;
     };
     CURRENT_BACKING_SCALE.store(scale, Ordering::Relaxed);
     publish_backing_scale(scale);
     info!(
         target: LOG_TARGET,
-        "present: '{}' has a {scale}x backing scale (was {applied}x), republished to the guest",
-        screen.localizedName(),
+        "present: the Wine layer's contents scale is {scale}x (was {applied}x), cursor scale republished to the guest",
     );
 }
 

@@ -1722,10 +1722,10 @@ fn warn_unsupported_backbuffer_format(format: u32) {
     }
 }
 
-/// The backing scale of the display the layer is on, or `None` before attach.
+/// Wine's retina factor for the layer (2 in retina mode, else 1), or `None` before attach.
 ///
 /// See [`DISPLAY_BACKING_SCALE`]. `Present` reads it once per frame so a
-/// display move reaches the cursor upscale without a thunk of its own.
+/// change reaches the cursor upscale without a thunk of its own.
 pub fn display_backing_scale() -> Option<u32> {
     match DISPLAY_BACKING_SCALE.load(Ordering::Relaxed) {
         0 => None,
@@ -1733,18 +1733,19 @@ pub fn display_backing_scale() -> Option<u32> {
     }
 }
 
-/// Match the hardware cursor bitmap to the display's retina factor by default.
+/// Match the cursor bitmap to Wine's retina factor by default.
 ///
-/// Wine's HCURSOR path then produces a proportionally-sized pointer on a
-/// retina Mac. `cursor.scale` in `mtld3d.conf` overrides: `auto` (the default)
-/// follows `backingScaleFactor`; a positive integer forces a fixed multiplier.
-/// Both paths clamp to `[1, 8]` — the downstream HCURSOR builder asserts that
-/// range. Resolved again on every display move, so the override keeps
-/// overriding on the display the window arrived at.
+/// In retina mode the game draws at physical pixels and a cursor pixel comes
+/// out at half a point, so the bitmap is doubled; in non-retina mode macOS
+/// already doubles everything the game draws and the bitmap stays. The same
+/// factor feeds the hardware HCURSOR and the software sprite. `cursor.scale`
+/// in `mtld3d.conf` overrides: `auto` (the default) follows the retina mode; a
+/// positive integer forces a fixed multiplier. Both paths clamp to `[1, 8]`,
+/// the range the downstream HCURSOR builder asserts.
 pub fn resolve_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
     let scale = crate::config::CONFIG.cursor_scale.resolve(backing_scale);
     let origin = match crate::config::CONFIG.cursor_scale {
-        mtld3d_core::config::CursorScale::Auto => "auto from display backingScaleFactor",
+        mtld3d_core::config::CursorScale::Auto => "auto from the Wine retina mode",
         mtld3d_core::config::CursorScale::Fixed(_) => "cursor.scale override",
     };
     (scale, origin)

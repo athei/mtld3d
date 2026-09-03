@@ -74,11 +74,11 @@ pub struct Mtld3dConfig {
     /// display's native `CGColorSpace`, max-vibrance rendering. File
     /// key: `color.space` (`passthrough` | `accurate`).
     pub color_space: ColorSpacePolicy,
-    /// Hardware-cursor (`HCURSOR`) bitmap enlargement factor.
+    /// Cursor bitmap enlargement factor, hardware HCURSOR and software sprite alike.
     ///
-    /// Default: [`CursorScale::Auto`] — derive from the display's
-    /// `NSWindow.backingScaleFactor`. `Fixed(n)` overrides with the
-    /// user's chosen multiplier (still clamped to `[1, 8]` at use
+    /// Default: [`CursorScale::Auto`] — follow Wine's retina mode (2 when
+    /// the prefix runs in retina mode, else 1). `Fixed(n)` overrides with
+    /// the user's chosen multiplier (still clamped to `[1, 8]` at use
     /// site). File key: `cursor.scale` (`auto` | positive integer).
     pub cursor_scale: CursorScale,
     /// Draw the cursor in the unix-side overlay window instead of the hardware HCURSOR.
@@ -241,10 +241,10 @@ pub enum AdapterSpoof {
 
 /// `cursor.scale` policy.
 ///
-/// `Auto` derives the multiplier from the display's
-/// `backingScaleFactor`; `Fixed(n)` forces it to `n` (still clamped to
-/// `[1, 8]` at the use site to match the HCURSOR bitmap downstream's
-/// expected range).
+/// `Auto` takes the multiplier from Wine's retina mode, 2 when it is on
+/// and 1 otherwise; `Fixed(n)` forces it to `n` (still clamped to `[1, 8]`
+/// at the use site to match the HCURSOR bitmap downstream's expected
+/// range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorScale {
     Auto,
@@ -252,12 +252,12 @@ pub enum CursorScale {
 }
 
 impl CursorScale {
-    /// Resolve the HCURSOR upscale factor for a display's backing scale.
+    /// Resolve the cursor upscale factor for Wine's retina factor.
     ///
-    /// Called again whenever the window lands on a display of another
-    /// backing scale, so `Fixed` has to keep answering with the user's
-    /// number: a setting that pins the cursor size means pinned, on every
-    /// display. The clamp is the range the HCURSOR builder accepts.
+    /// Called again whenever the unix side republishes the factor, so
+    /// `Fixed` has to keep answering with the user's number: a setting that
+    /// pins the cursor size means pinned. The clamp is the range the HCURSOR
+    /// builder accepts.
     #[must_use]
     pub const fn resolve(self, backing_scale: u32) -> u32 {
         let requested = match self {

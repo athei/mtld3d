@@ -157,12 +157,13 @@ pub struct AttachMetalLayerParams {
     pub height: u32,                                 // in: backbuffer height
     pub view_handle: MetalHandle<NSViewKind>,        // out: macdrv_metal_view (for cleanup)
     pub layer_handle: MetalHandle<CAMetalLayerKind>, // out
-    /// `NSWindow.backingScaleFactor` for the attached window.
+    /// Wine's retina factor for the attached window: 2 in retina mode, else 1.
     ///
-    /// Rounded to an integer and clamped to `[1, 8]`. Consumed by the
-    /// PE-side cursor upscaler so a retina display gets a
-    /// proportionally-sized HCURSOR bitmap (Wine's Win32 cursor path
-    /// doesn't participate in the OS's retina upscale).
+    /// The Wine metal layer's `contentsScale`, rounded and clamped to
+    /// `[1, 8]`. Consumed by the PE-side cursor upscaler: in retina mode the
+    /// game draws at physical pixels and its cursor comes out at half a
+    /// point per pixel, while in non-retina mode macOS already doubles
+    /// everything the game draws, the cursor included.
     pub backing_scale: u32, // out
     /// The vsync request from `D3DPRESENT_PARAMETERS::PresentationInterval`.
     ///
@@ -201,9 +202,8 @@ pub struct AttachMetalLayerParams {
     pub metalfx_available: u32, // out
     /// Address of a PE-side `AtomicU32` that receives a changed `backing_scale`.
     ///
-    /// `backing_scale` above answers for the display the window is on at
-    /// attach; the window can move to one with another scale afterwards. The
-    /// unix side stores the new value here whenever its display-follow
+    /// `backing_scale` above answers for the layer as attach found it. The
+    /// unix side stores a new value here whenever its display-follow
     /// reconciliation derives one, so the PE-side cursor upscale picks it up
     /// without a second thunk. Backed by a static in the PE image rather than
     /// a device-owned allocation: the reconciliation runs on the `AppKit`
