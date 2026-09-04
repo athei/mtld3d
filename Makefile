@@ -218,9 +218,11 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
+	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
+	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
 	clippy-native audit doc doc-windows doc-unix check clean upgrade \
-	upgrade-incompat setup setup-rust setup-dev setup-xwin \
+	upgrade-incompat setup setup-rust setup-dev setup-xwin setup-pe-cc \
 	setup-rosetta \
 	xwin-dir fetch
 
