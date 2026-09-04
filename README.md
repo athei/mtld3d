@@ -1,310 +1,286 @@
 # mtld3d
 
-Direct3D 9 translation layer for Wine on macOS, backed by Metal.
+Direct3D 9 for Wine on macOS, backed by Metal.
 
-mtld3d replaces Wine's built-in `d3d9.dll` with an implementation that
-translates D3D9 calls through Wine's PE/Unix boundary into Metal command
-buffers on the host. The pure-Rust core (`mtld3d-core`) handles DXSO → MSL
-shader translation, render-pass scheduling, and fixed-function state.
+mtld3d replaces Wine's `d3d9.dll`. The PE side implements the D3D9 API and
+translates it into Metal command buffers that a native library executes on the
+host. The goal is the fastest Direct3D 9 implementation for Wine on macOS.
+Direct3D 8 on the same core is planned. Every other Direct3D version is a
+non-goal: D3D10 and later are already served on macOS by Apple's D3DMetal and
+by DXMT.
 
-## Goal
+Conformance serves speed rather than defining it. The implementation is
+developed against Wine's d3d9 test suite and every divergence is triaged and
+written down, but where matching D3D9 exactly would cost frame time, speed
+wins as long as no game breaks. Those trades are listed under
+[Kept divergences](#kept-divergences), each with its `mtld3d.conf` knob where
+one makes sense.
 
-mtld3d aims to be the **fastest** Direct3D 9 implementation for Wine on macOS.
-Direct3D 8, on the same core, is planned and part of that goal. Every other
-Direct3D version is a non-goal; D3D10/11/12 are already well served on macOS by
-Apple's D3DMetal and by DXMT.
+Apple Silicon is what is developed and tested. Intel Macs are a goal, not a
+claim: the paths for a GPU without unified memory exist but have not run on
+real hardware.
 
-Conformance serves that goal rather than defining it: the implementation is
-developed against Wine's d3d9 test suite and every divergence it reports is
-triaged and written down (see [Testing](#testing)). But where matching D3D9
-exactly would cost frame time, speed wins, as long as the divergence does not
-keep a game from running. Those trades are listed under
-[Faster than conformant](#faster-than-conformant), and where a knob makes sense
-they are revertible from `mtld3d.conf`.
+## Requirements
 
-Apple Silicon is what is developed and tested today. Intel Macs are a goal, not
-a claim: the non-uniform-memory paths are written but unverified on real
-hardware.
+| Requirement | Notes |
+| --- | --- |
+| macOS 15 or newer | Apple Silicon. |
+| Wine 8.0 or newer, or CrossOver 24 or newer | Needs the current WoW64 loader. |
+| A 64-bit prefix or bottle | 32-bit games run in it through WoW64. |
+| Rosetta 2 | For an x86_64 Wine, which most builds are. An arm64 Wine translates x86 itself (FEX) and does not need it. |
+
+D3D9-era games do their floating-point math in x87 instructions, which
+Rosetta 2 translates slowly. Under an x86_64 Wine, run the game with
+[x87sidecar](https://github.com/athei/x87sidecar), a JIT that replaces
+Rosetta's x87 handling. The Wine builds from
+[wine-build](https://github.com/athei/wine-build) carry the patch its
+cooperative attach mode needs.
 
 ## Installation
 
-Download the release bundle (`mtld3d.tar.xz`) from
-[GitHub Releases](https://github.com/athei/mtld3d/releases).
+Download `mtld3d.tar.xz` from
+[GitHub Releases](https://github.com/athei/mtld3d/releases). It ships two
+ways to load the same binaries:
 
-[`INSTALL.md`](INSTALL.md), which also ships inside the bundle, has the
-requirements and the walkthroughs for both routes: **builtin**, which drops
-into a Wine installation you own and replaces the stock d3d9 for that whole
-tree, and **native override**, loaded per game through `d3d9=native` while the
-Wine installation stays untouched, which is what
-[CrossOver](https://www.codeweavers.com/crossover) bottles use. It also covers
-[x87sidecar](https://github.com/athei/x87sidecar), worth running under an
-x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
+| Route | Use it when | Cost |
+| --- | --- | --- |
+| Builtin | You own the Wine installation: your own build, a package, an app-bundled Wine. | Replaces the stock d3d9 for that whole Wine tree, and a Wine update wipes it. Not possible on CrossOver. |
+| Native override | CrossOver, or a stock Wine whose own d3d9 should keep serving other applications. | A `d3d9=native` registry override per prefix plus a `d3d9.dll` copy per game or per prefix. |
+
+[`INSTALL.md`](INSTALL.md), also inside the bundle, has the steps for stock
+Wine and for CrossOver bottles, including the prefix markers a hand-installed
+builtin needs.
+
+To confirm mtld3d is loaded, open the newest file in `mtld3d-logs` next to the
+game executable. Every run starts with
+
+```
+[mtld3d::shim] mtld3d.dll <version> <id>, unix call initialized
+[mtld3d::d3d9] d3d9.dll <version> <id> loaded at <address>
+```
+
+Without them `d3d9.dll` never mapped, and the troubleshooting section of
+`INSTALL.md` walks through the causes.
+
+## Configuration
+
+Runtime options live in `mtld3d.conf`, read once at `Direct3DCreate9` from
+the directory of the running `.exe`, so a change needs a restart. The
+[sample](mtld3d.conf) in the repository root documents every option. A
+missing file is fine: defaults apply. Every key can also be set at launch
+through the `MTLD3D_CONFIG` environment variable, a semicolon-separated list
+of `key=value` entries that wins over the file.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `render.scale` | `1.0` | Render at a fraction of the presented size and let MetalFX upscale on the way to the screen. `0.75` is a good first try. |
+| `present.maxFps` | `0` | Frame-rate ceiling in Hz, independent of vsync. `0` is uncapped. |
+| `color.hdr.enable` | `true` | Use the HDR present path on a display with EDR headroom. |
+| `color.space` | `passthrough` | Tag the layer with the display's own colorspace, or with sRGB (`accurate`). |
+| `cursor.software` | `auto` | Draw the cursor in an overlay window instead of the hardware cursor. `auto` is on under HDR only. |
+| `cursor.scale` | `auto` | Cursor bitmap enlargement. `auto` doubles it in Wine's retina mode. |
+| `shaderCache.enable` | `true` | Persist compiled shaders in `mtld3d_shaders.bin` next to the `.exe`. |
+| `log.dir` | `mtld3d-logs` next to the `.exe` | Where log files and GPU traces go. |
+| `query.flushImmediate` | `false` | Answer `GetData(D3DGETDATA_FLUSH)` at once instead of waiting for the GPU. |
+| `depth.aliasSameSize` | `false` | A newly bound depth texture of the same size inherits the previous one's contents. |
+| `buffer.ignoreLockBounds` | `false` | Upload a whole static buffer on every Lock instead of the range it announced. |
+| `memory.vbibRetentionCapMB` | `512` | Cap on vertex and index buffer backings retained while the GPU reads them. |
+| `memory.vramBudgetMB` | `1024` (32-bit), `0` (64-bit) | Ceiling on the video memory `GetAvailableTextureMem` reports. |
+| `memory.pageboxPoolCapMB` | `128` | Recycle pool for retired dynamic buffer backings. |
+| `adapter.spoof` | `none` | Report the adapter as `nvidia` or `amd`. |
+| `caps.dfFormats` | `true` | Advertise the DF16 and DF24 depth formats. |
+
+The `debug.*` keys (`capsAll`, `expandPacked16`, `float32Filtering`,
+`bytecodeDumpDir`, `skipShaders`) are diagnostics and documented in the sample
+only.
+
+Below the file and the environment sits a third layer. A few games need
+options nobody should have to discover, so mtld3d ships profiles for them,
+matched on the executable name plus the version resource its vendor linked in.
+A profile only supplies starting values; the file and the environment override
+it key by key. `RUST_LOG=mtld3d::d3d9=info` names the profile that matched.
+
+| Profile | Application | What it sets and why |
+| --- | --- | --- |
+| `gta-iv` | Grand Theft Auto IV | `adapter.spoof=amd`: the renderer stalls in its own identifier parsing on the NVIDIA identity. `caps.dfFormats=false`: with DF advertised next to INTZ it picks a mixed depth path no hardware of its era offered. `depth.aliasSameSize=true`: its late alpha, sky and glow passes z-test an INTZ texture against depth rendered into a same-size sibling. |
+| `wow` | World of Warcraft, 1.12 and 3.3.5 clients | `query.flushImmediate=true`: both clients poll `GetData(D3DGETDATA_FLUSH)` as a GPU fence after every loading-screen upload batch and never read the count, so the spec-correct wait would cost seconds per load. |
+
+## Fullscreen and display modes
+
+A fullscreen device sets the display mode the game picked, as native D3D9
+does, and covers the monitor with a borderless window. That mode-set is meant
+to stay virtual. Set Wine's `EmulateModeset` key in the prefix:
+
+```sh
+wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /d Y /f
+```
+
+win32u reads the key whatever the driver, once per session, so set it before
+launching the game and let the previous Wine session exit first. With it, the
+physical display keeps its resolution, the game window is scaled onto it, and
+mouse input is mapped into the mode, so clicks land where the game drew its
+UI. A mode of another aspect than the display's is letterboxed. Without the
+key, Wine's mac driver hands the mode-set to the display and the whole desktop
+switches resolution.
+
+The resolution list a game sees carries sizes of the display's own aspect
+only, largest first and at most 15 per colour format, because Wine's full list
+overflows menus built for a driver's short one. Any mode Wine accepts stays
+settable whether listed or not. A request that matches no mode, such as a size
+a game derived from its own window, follows the window instead.
+
+`render.scale` multiplies on top of the mode: a 1600x900 setting at `0.75`
+rasterizes 1200x675 and MetalFX upscales it to the screen in one pass. A
+fullscreen game is never told it lost its device on a focus change: the
+desktop mode comes back on deactivation and the game's mode is set again on
+activation, with no `D3DERR_DEVICELOST` in between.
+
+## HDR and the cursor
+
+On a display with EDR headroom the layer is upgraded to extended dynamic range
+and present routes through an inverse tone-mapping pass (BT.2446-A in ICtCp)
+whose peak follows the display's live headroom. This is on by default;
+`color.hdr.enable=false` forces the SDR path. A display without EDR headroom
+runs the SDR path either way.
+
+macOS has no HDR hardware cursor, so under HDR the game's cursor bitmap is
+drawn through the same tone map in a transparent overlay window that follows
+the pointer. That is what `cursor.software=auto` resolves to. The overlay also
+never toggles the hardware cursor plane, which on stock Wine delays a present
+per show or hide, so `cursor.software=true` is worth trying on SDR for a game
+that hides the cursor while a mouse button is held. `cursor.scale` enlarges the
+bitmap; `auto` doubles it in Wine's retina mode, where it would otherwise come
+out at half size.
+
+## Logging and diagnostics
+
+Every line of both halves of mtld3d goes to a file, never to the process's
+standard streams. Each process writes `<exe>-<pid>.log` into `mtld3d-logs`
+beside the executable, `<pid>` being the macOS process id, so a launch never
+overwrites the log of the one before it. The directory keeps the ten newest
+logs and the ten newest GPU traces; `log.dir` moves it.
+
+`RUST_LOG` filters the log. Unset, everything logs at `info`. All targets sit
+under `mtld3d::*` and match by prefix, so `RUST_LOG=mtld3d=warn` is the single
+switch for the whole project and `RUST_LOG=mtld3d=warn,mtld3d::unix=trace`
+narrows one part.
+
+| Target | Scope |
+| --- | --- |
+| `mtld3d::d3d9` | The D3D9 API implementation, `d3d9.dll`. |
+| `mtld3d::dxso` | The DXSO to MSL shader translator. |
+| `mtld3d::shim` | The unix-call shim, `mtld3d.dll`. |
+| `mtld3d::unix` | The Metal side, `mtld3d.so`. |
+| `mtld3d::perf` | 5-second performance summary, `PERF=1` builds only. |
+
+`warn` covers unimplemented paths and fallbacks, `info` one-shot milestones,
+`debug` and `trace` per-call detail. The narrower diagnostic targets are
+listed in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+Pressing F12 in a game records the next three frames: one `[dump]` log line
+per D3D9 event a GPU trace cannot show (target and viewport changes, clears,
+copies, query traffic, every draw with its shaders and textures), and a Metal
+GPU trace of the same frames beside the log file as
+`<exe>-<pid>-<n>.gputrace`. The trace needs `MTL_CAPTURE_ENABLED=1` in the
+game's environment; without it the log says so and the dump still runs.
+
+## Tested games
+
+| Game | Status | Notes |
+| --- | --- | --- |
+| World of Warcraft 1.12 | Plays | The primary target. `wow` profile. |
+| World of Warcraft 3.3.5a | Plays | `wow` profile. |
+| Half-Life 2 | Plays | |
+| Grand Theft Auto IV | Plays | `gta-iv` profile. |
+| 3DMark05 | Runs end to end | |
+| Unigine Tropics | Runs | |
+| Gunmetal | Starts and benchmarks | |
+
+Games that fail are tracked as `game-compat` issues in the
+[tracker](https://github.com/athei/mtld3d/issues); reports are welcome.
 
 ## Status
 
-### Implemented
+### Supported
 
-- **Programmable pipeline**: vertex and pixel shader models 1.x through 3.0
-  (DXSO bytecode → MSL translation), including vPos/vFace, flat shading, and
-  the D3D9 half-pixel rasterization convention.
-- **Fixed-function pipeline**, vertex and pixel: lighting (directional, point,
-  spot), texture-coordinate generation, the full texture-stage cascade,
-  material color sources, hardware vertex blending.
-- **Fog**: vertex fog and per-pixel table fog, across the fixed-function,
-  pre-transformed (RHW), and programmable paths.
-- **All four draw paths**: DrawPrimitive / DrawIndexedPrimitive and both UP
-  variants, every primitive type including triangle fans (rewritten as
-  triangle lists, which Metal lacks).
-- **Points**: `D3DRS_POINTSIZE`, per-vertex PSIZE and `oPts`, the min/max
-  clamp, eye-distance scaling, and point sprites through `[[point_coord]]`.
-- **User clip planes**: six planes through `[[clip_distance]]`, world-space
-  for the fixed-function pipeline and clip-space for vertex shaders, gated by
-  `D3DRS_CLIPPING` and carried by `D3DSBT_ALL` state blocks.
-- **Vertex streams**: all sixteen `SetStreamSource` streams feed a draw, with
-  per-stream offsets and strides; a zero stride feeds every vertex the element
-  at the stream offset, and a declared stream with nothing bound reads zeros,
-  as on hardware.
-- **Hardware instancing**: `SetStreamSourceFreq` with `INDEXEDDATA` /
-  `INSTANCEDATA`, including per-instance step rates, on the indexed draws
-  (D3D9 never instances a non-indexed draw).
-- **State blocks**: recorded (Begin/End) and D3DSBT_* snapshots.
-- **Queries**: occlusion queries backed by real Metal visibility results; event
-  queries.
-- **Resources**: DXT1–5 and ATI1 compressed textures, the common uncompressed
-  integer and float formats, cube and volume textures, mipmap auto-generation,
-  managed-pool dirty-region uploads, StretchRect (including cross-format blits
-  via a conversion pass and YUY2/UYVY to RGB decoding), GetDC read-back. The
-  two system-memory pools, `D3DPOOL_SYSTEMMEM` and `D3DPOOL_SCRATCH`, hold
-  their bytes CPU-side and allocate no Metal texture, so a resource that
-  only Locks, feeds `UpdateTexture` / `UpdateSurface` or receives
-  `GetRenderTargetData` costs no video memory; binding one for sampling,
-  which D3D9 permits, allocates one then.
-- **Depth**: sampleable depth textures (INTZ, DF16, DF24) with hardware
-  shadow-compare PCF, depth bias and slope-scale bias, depth clamp for
-  pre-transformed geometry.
-- **Stencil**: the full test, both faces, and every stencil operation, with
-  `Clear(D3DCLEAR_STENCIL)` bounded to the viewport independently of depth.
-- **Sampling and output**: anisotropic filtering, per-sampler mipmap LOD bias
-  (Metal has none, so it is applied at the sample site), sRGB read (32-bit and
-  compressed formats) and sRGB write, alpha test, scissor, separate alpha
-  blend, blend factor, color write masks. `D3DRS_SRGBWRITEENABLE` binds the
-  render target's sRGB view, back buffer included, so the encode happens after
-  the blender as the `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises; a target
-  whose format has no sRGB Metal counterpart keeps a pixel-shader encode, which
-  is exact only for opaque draws.
-- **Multiple render targets**: four simultaneous targets with independent
-  formats and write masks, post-pixel-shader blending on each, and Clear
-  reaching every bound target.
-- **Multisampling**: `CheckDeviceMultiSampleType` reports the sample counts the
-  Metal device accepts (2x and 4x everywhere, 8x where the device offers it),
-  with `D3DMULTISAMPLE_NONMASKABLE` mapped onto the same ladder. A multisampled
-  swap chain, `CreateRenderTarget` or `CreateDepthStencilSurface` renders into a
-  multisampled attachment and resolves into the single-sample surface every
-  other operation reads, so Present, `StretchRect`, `GetRenderTargetData` and
-  sampling all see the resolved image. `D3DRS_MULTISAMPLEMASK` narrows the
-  samples a draw writes.
-- **Presentation**: windowed and fullscreen swap chains, adapter mode
-  enumeration, hardware or software color cursors, and MetalFX upscaling on the
-  way to the screen with `render.scale` choosing the render resolution. A render target or
-  depth-stencil the game creates at the reported back-buffer size rasterizes at
-  that same scale, so a depth resolve into an INTZ texture stays a same-size
-  copy. Fullscreen never changes the display mode; what it does instead is
-  under [Display-mode switching](#deliberately-not-implemented).
-- **HDR**: on an EDR-capable display the layer is upgraded to
-  `extendedDynamicRange` and present routes through a BT.2446-A
-  inverse-tone-mapping pass in ICtCp, its peak following the display's live
-  headroom. On by default; `color.hdr.enable` and `color.space` control it. The
-  cursor follows: with `cursor.software` at its default `auto`, an HDR device
-  draws the game's cursor bitmap through the same tone map in a transparent
-  overlay window, since macOS has no HDR hardware cursor. The overlay also
-  never toggles the hardware cursor plane, which on stock Wine costs a late
-  present per show or hide, so it can be forced on for SDR too.
+| Area | What works |
+| --- | --- |
+| Shaders | Vertex and pixel shader models 1.x through 3.0 through DXSO to MSL translation, including vPos, vFace, flat shading and the half-pixel rasterization fixup. Compiled shaders are cached on disk by content hash. |
+| Fixed function | Vertex and pixel: lighting (directional, point, spot), texture-coordinate generation, the full texture-stage cascade, material colour sources, hardware vertex blending. Vertex and table fog on every path, pre-transformed geometry included. |
+| Draws | All four draw calls and every primitive type; triangle fans are rewritten as lists, which Metal lacks. Points with `D3DRS_POINTSIZE`, per-vertex size, scaling and point sprites. Six user clip planes. All sixteen vertex streams with per-stream offsets and strides, and hardware instancing through `SetStreamSourceFreq`. |
+| State | Recorded and `D3DSBT_*` state blocks; occlusion queries on Metal visibility results; event queries. |
+| Resources | DXT1 to DXT5 and ATI1 compressed textures, the common integer and float formats, cube and volume textures, mipmap auto-generation, managed-pool dirty-region uploads, `StretchRect` with format conversion and YUY2/UYVY decoding, `GetDC`. The system-memory and scratch pools live CPU-side and allocate no Metal texture until bound for sampling. |
+| Depth and stencil | Sampleable depth (INTZ, DF16, DF24) with hardware shadow compare, depth bias and slope-scale bias, depth clamp for pre-transformed geometry. The full stencil test, both faces, every operation. |
+| Sampling and output | Anisotropic filtering, per-sampler LOD bias, sRGB read and write (the write through the target's sRGB view, so it happens after blending), alpha test, scissor, separate alpha blend, blend factor, colour write masks. |
+| Multiple render targets | Four targets with independent formats and write masks, blending on each, `Clear` reaching all of them. |
+| Multisampling | 2x and 4x everywhere, 8x where the device offers it, on swap chains, render targets and depth-stencil surfaces, resolved for every consumer. `D3DRS_MULTISAMPLEMASK`. |
+| Presentation | Windowed and fullscreen swap chains, mode enumeration, hardware and software cursors, MetalFX upscaling with `render.scale`, HDR output. |
 
 ### Not implemented yet
 
-Missing features a D3D9 application can reasonably want. Each fails cleanly,
-with an absent cap bit or a documented error return, so applications take their
-own fallback paths instead of breaking:
+Each of these fails cleanly, with an absent cap bit or a documented error
+return, so applications take their own fallback paths.
 
-- **Non-solid fill modes** (Metal has no native wireframe).
-- **TIMESTAMP and the other niche query types**: creation reports NOTAVAILABLE,
-  as the spec allows.
-- **Scaled, sub-rect and format-converting depth→depth StretchRect**: the
-  whole-surface 1:1 copy between two same-format DEFAULT-pool depth-stencil
-  surfaces is implemented, including the resolve out of a multisampled source;
-  a source or destination rect short of the full surface, a size mismatch, a
-  differing depth format, or a multisampled destination returns INVALIDCALL.
-
-### Faster than conformant
-
-Divergences from D3D9 kept on purpose, because closing them costs frame time,
-memory headroom, or the games that rely on the looser behaviour:
-
-- **`IDirect3DTexture9::LockRect` serves a level of a `D3DPOOL_DEFAULT` 2D
-  texture created without `D3DUSAGE_DYNAMIC`**, which D3D9 rejects through that
-  entry point as well as through the level's `IDirect3DSurface9::LockRect`
-  (here only the surface entry point rejects it; cube and volume locks reject
-  it as D3D9 does), because a game that streams into a DEFAULT texture it never
-  marked `D3DUSAGE_DYNAMIC` would otherwise lose every upload it makes that
-  way. The cost is system memory: that texture class is the one whose per-level
-  staging is released once its upload retires, so serving the lock re-creates
-  the buffer, and a *partial* lock taken after such a release leaves the pixels
-  outside its rect no longer matching the GPU copy (warned once per texture).
-- **`GetData(D3DGETDATA_FLUSH)` can answer immediately** for a pending
-  occlusion query instead of blocking until the GPU has the count, under
-  `query.flushImmediate = true`. The default is the spec-correct wait; the
-  `wow` profile turns the immediate answer on, because both World of Warcraft
-  clients use the poll loop only as a fence after every loading-screen upload
-  batch and never read the count.
-- **Depth stores are elided** where nothing reads the buffer back, so content
-  that relies on depth surviving a pass it never cleared can read stale depth.
-  Preserving it unconditionally would cost the optimization on every frame of
-  every game that does clear, which is all of the tested ones.
-- **A partial `Lock` of a dynamic vertex or index buffer hands back a pointer
-  into memory a queued draw may still be reading**, unless the game passed
-  `D3DLOCK_DISCARD` or locked the whole buffer. On D3D9 the runtime keeps the
-  game's writes from landing under a draw the GPU has not reached yet, and
-  `D3DLOCK_NOOVERWRITE` is how a game opts out of that protection; here it is
-  the other way round, so a game that locks a sub-range and expects the
-  runtime to manage the timing can get corrupted geometry for a frame, with
-  nothing in the log. Matching D3D9 means either stalling until the draw
-  retires or renaming the backing on every such `Lock`, and a dynamic buffer is
-  precisely the one a UI or particle batcher locks dozens of times per frame.
-  The rename-and-retain path those extra locks would run through has already
-  been observed peaking around 1.4 GB of retained backings, which is why
-  `memory.vbibRetentionCapMB` exists and why hitting that cap forces a
-  mid-frame GPU sync. So this one trades memory headroom rather than frame
-  time, and it has no knob: turning it on is the memory growth. Wine's d3d9
-  test suite probes this and reports it in some runs, so the rationale is
-  written up in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) like every
-  other kept divergence.
-- **A partial `LockRect` of a texture level hands back a pointer into staging
-  an upload may still be reading**, unless the game passed
-  `D3DLOCK_NOOVERWRITE` or `D3DLOCK_READONLY`. The same trade as the buffer
-  entry above, on the same kind of caller: a font atlas or a lightmap page
-  written a few rectangles at a time, each rectangle uploaded by the next
-  draw. D3D9 would stall or rename until that upload retires; here the write
-  lands in place, and a game whose rectangle overlaps an upload the GPU has not
-  reached yet can see a frame of wrong texels, with nothing in the log. The
-  `in-place` row of the perf grid's texture section counts the arm firing. A
-  whole-level lock is not part of this: it is renamed, and its contents are
-  preserved whatever the texture's usage says, because a game that locks a
-  whole dynamic page to rewrite a few blocks of it relies on that (Half-Life
-  2's lightmap pages under animated light styles).
-- **A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
-  no CPU copy of its contents** once an upload has carried every byte to the
-  GPU. D3D9 preserves a buffer's contents across a plain `Lock` whatever its
-  usage said, so a title that locks such a buffer and reads back through the
-  pointer sees zeros rather than what it wrote, and one that writes past the
-  window it announced loses the bytes outside it; the log carries a warning the
-  first time a backing is released and again the first time a lock lands on a
-  re-created one. What it buys is the reason the divergence is here: inside a
-  large-address-aware i386 title those copies have been measured near a gigabyte
-  of the same 4 GiB the title needs for its own data, and running out of it
-  crashes the process. `buffer.ignoreLockBounds` keeps the copy for a title that
-  provably writes outside its announced windows. `DrawIndexedPrimitive` on a
-  triangle fan is the one path that still needs an index buffer's bytes on the
-  CPU, because Metal has no fan primitive and the fan is rewritten as a triangle
-  list; a released index buffer has them copied back off the GPU, which costs
-  one mid-frame submit and one GPU wait, and the copy is then held for the
-  buffer's life so no buffer stalls twice.
-
-- **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** The state asks the
-  rasterizer to drop to a single sample for one draw on a multisampled target.
-  Metal ties a pipeline's `rasterSampleCount` to the sample count of the pass's
-  attachments and offers no per-draw override, so honouring it would mean
-  rendering the draw into a separate single-sampled target and compositing it
-  back. `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how
-  D3D9 tells an application the toggle is unavailable, and the first write is
-  logged.
+| Feature | Behaviour |
+| --- | --- |
+| Non-solid fill modes | Metal has no wireframe. The state is accepted, warned once and drawn solid. |
+| Timestamp and other niche query types | Creation reports `D3DERR_NOTAVAILABLE`, as the spec allows. |
+| Scaled, sub-rect or converting depth-to-depth `StretchRect` | The whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces works, including a multisample resolve; anything else returns `D3DERR_INVALIDCALL`. |
 
 ### Deliberately not implemented
 
-- **D3D9Ex**: no Direct3DCreate9Ex, no shared resource handles, no D3D9On12.
-  The extended interface is a different contract (device removal, OS-managed
-  memory) built for the Vista+ compositor; the games this project targets are
-  plain D3D9.
-- **Physical display-mode switching**: a fullscreen device sets the display
-  mode the game picked through user32, as native D3D9 does, but that mode is
-  meant to stay virtual. Set `HKCU\Software\Wine\X11 Driver\EmulateModeset`
-  to `Y` in the prefix (win32u reads this key whatever the driver; the
-  launcher and the test prefix set it): win32u then leaves the physical
-  display alone, scales the game window onto it and maps mouse input into the
-  mode, so a game's clicks land where its UI is drawn, while the back buffer
-  is the mode and present scales the frame to the display (MetalFX when
-  enlarging). A mode of another aspect than the display's is letterboxed, with
-  the desktop showing in the bars and the menu bar staying, since the window no
-  longer covers the screen; the game's resolution list carries the display's
-  own modes, which fill it. That list carries only sizes of the display's own
-  aspect (largest first, at most 15 per colour format): a letterboxed mode is
-  no menu entry, and Wine's mode list is long where era menus were built for
-  a driver's short one, WoW 1.12's resolution dropdown overflowing past 32
-  entries. A game that reads its list
-  from user32's `EnumDisplaySettings` instead of `EnumAdapterModes` (WoW 1.12
-  does) sees the same bounded list: d3d9 redirects the main module's
-  `EnumDisplaySettings` imports at load, leaving user32's own list intact. Any
-  size in Wine's list stays settable, listed or not. Without the key Wine's
-  mac driver hands the
-  mode-set to `CGDisplaySetDisplayMode` and the whole desktop switches
-  resolution. A request matching no mode user32 accepts, which a mode-set
-  would reject, follows the window instead: games that ask for such sizes
-  derived them from their window and keep sizing their rendering and input
-  from it.
-- **The fullscreen focus lifecycle**: no device loss on deactivation, no
-  focus-window subclassing, no synthesized activation messages, no minimise.
-  What the device does answer is the mode contract: deactivation puts the
-  registry display mode back and activation sets the game's mode and re-covers
-  the monitor again, both as native does. Presentation is
-  a composited Metal layer and no exclusive mode is ever taken, so a lost
-  display is never a lost device: `TestCooperativeLevel` reports `D3D_OK`
-  across a focus change and only ever reports `D3DERR_DEVICENOTRESET`, which is
-  real, after a failed `Reset`. Reporting a loss that did not happen would make
-  every fullscreen game release and rebuild its whole `D3DPOOL_DEFAULT` working
-  set on each activation change, for a device that lost nothing.
-- **Software paths**: no reference or software rasterizer, no software vertex
-  processing, no RegisterSoftwareDevice. HAL on the default Metal device is the
-  only device type; multi-adapter setups are not enumerated. ProcessVertices
-  transforms through the current FVF; an explicit vertex-declaration source is
-  rejected.
-- **Legacy remnants**: N-patch/RT-patch tessellation, vertex tweening,
-  palettized textures, gamma ramp. Dead features in real-world content,
-  accepted or rejected per spec but non-functional.
+| Feature | Why |
+| --- | --- |
+| D3D9Ex | No `Direct3DCreate9Ex`, shared handles or D3D9On12. The extended interface is a different contract, built for the Vista compositor, and the games this project targets are plain D3D9. |
+| Physical display-mode switching | The mode a fullscreen game picks is meant to stay virtual, see [Fullscreen and display modes](#fullscreen-and-display-modes). |
+| Device loss | Presentation is a composited Metal layer and no exclusive mode is taken, so a lost display is never a lost device. `TestCooperativeLevel` reports `D3D_OK` across focus changes and `D3DERR_DEVICENOTRESET` only after a failed `Reset`. Reporting a loss that did not happen would make every fullscreen game rebuild its DEFAULT-pool working set on each activation change. No focus-window subclassing, no minimise. |
+| Software paths | No reference or software rasterizer, no software vertex processing, no `RegisterSoftwareDevice`. HAL on the default Metal device is the only device; other adapters are not enumerated. `ProcessVertices` transforms through the current FVF and rejects an explicit declaration. |
+| Legacy remnants | N-patch and RT-patch tessellation, vertex tweening, palettized textures, gamma ramp. Accepted or rejected per spec, non-functional. |
 
-### Testing
+### Kept divergences
 
-mtld3d is developed and tested against **World of Warcraft 1.12 and 3.3.5a**
-under Wine and CrossOver. No other games have been exercised yet; reports are
-welcome.
+Divergences from D3D9 kept on purpose because closing them costs frame time,
+memory, or the games that rely on the looser behaviour. The full rationale for
+each sits with its conformance sites in
+[`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md).
 
-Beyond the game workloads it is hardened against **Wine's d3d9 test suite**,
-the de-facto D3D9 conformance suite. `make conformance` runs it against the
+| Divergence | Why | Knob |
+| --- | --- | --- |
+| `IDirect3DTexture9::LockRect` serves a level of a DEFAULT-pool 2D texture created without `D3DUSAGE_DYNAMIC`, which D3D9 rejects. The surface entry point, cube and volume locks still reject it. | A game that streams into such a texture would otherwise lose every upload. The cost is system memory: the level's staging, released once its upload retires, is re-created, and a partial lock after that release leaves the pixels outside its rect out of step with the GPU copy (warned once per texture). | none |
+| `GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once instead of waiting for the GPU. | Off by default. A title that uses the poll loop only as a GPU fence and never reads the count pays API-thread time for nothing; the `wow` profile turns it on. | `query.flushImmediate` |
+| Depth stores are elided where nothing reads the buffer back. | Content relying on depth surviving a pass it never cleared can read stale depth. Preserving it unconditionally costs the optimization on every frame of every game that does clear, which is all tested ones. | none |
+| A partial `Lock` of a dynamic vertex or index buffer without `D3DLOCK_DISCARD` returns a pointer into memory a queued draw may still read. | D3D9 keeps the game's writes from landing under a draw the GPU has not reached; here `D3DLOCK_NOOVERWRITE` semantics apply by default. Matching D3D9 means stalling or renaming the backing on every such lock, and a dynamic buffer is what a UI or particle batcher locks dozens of times per frame. The rename path has been measured peaking near 1.4 GB of retained backings, which is why `memory.vbibRetentionCapMB` exists. | none |
+| A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or `D3DLOCK_READONLY` returns a pointer into staging an upload may still read. | The same trade for a font atlas or lightmap page written a few rectangles at a time. A whole-level lock is renamed and its contents preserved, because Half-Life 2's lightmap pages rely on that. | none |
+| A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps no CPU copy once every byte has reached the GPU. | D3D9 preserves contents across a plain `Lock` whatever the usage says, so a title that reads back through the pointer sees zeros, and one that writes past its announced window loses those bytes (warned once). Inside a large-address-aware 32-bit title those copies measured near a gigabyte of the 4 GiB the title needs itself. An indexed triangle fan on a released index buffer copies it back off the GPU once, at one mid-frame GPU wait. | `buffer.ignoreLockBounds` keeps the copy |
+| `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. | Metal ties the sample count to the pass's attachments with no per-draw override. `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9 says the toggle is unavailable, and the first write is logged. | none |
+
+## Conformance and tests
+
+Beyond the games, mtld3d is hardened against Wine's d3d9 test suite, the
+de-facto D3D9 conformance suite. `make conformance` runs it against the
 installed builtin, one runner process per PE architecture, and gates on a
 per-site baseline; every remaining divergence is classified with a written
-rationale, the ones kept for speed included, in
-[`unix/conformance/CONFORMANCE.md`](unix/conformance/CONFORMANCE.md). The unit
-and end-to-end suites (`make test`) run the pure-Rust core natively on the host
-and the full stack under Wine.
+rationale in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md), the ones
+kept for speed included. `make test` runs the unit tests of the pure-Rust
+core natively on the host and the end-to-end suite, listed in
+[`COVERAGE.md`](windows/tests/COVERAGE.md), under Wine.
 
 ## Building from source
 
-mtld3d builds and runs on **Apple Silicon macOS**. `mtld3d.so` ships as both an
-x86_64 and an arm64 Mach-O, since Wine loads it from the `lib/wine/<cpu>-unix`
-directory matching its own build; the PE side is x86 either way, translated by
-**Rosetta 2** under an x86_64 Wine and by FEX under an arm64 one. The Metal
-backend targets **macOS 15** or newer (`unix/.cargo/config.toml` pins
-`MACOSX_DEPLOYMENT_TARGET = 15.0`).
+mtld3d builds on Apple Silicon macOS and targets macOS 15 or newer
+(`unix/.cargo/config.toml` pins the deployment target). The PE side is built
+for i386 and x86_64; `mtld3d.so` ships as both an x86_64 and an arm64 Mach-O,
+because Wine loads it from the `lib/wine/<cpu>-unix` directory matching its
+own build.
 
-Two things have to exist before a build: a **Wine** build or install providing
+Two things have to exist before a build: a Wine build or install providing
 `wine`, `winebuild` and `wineserver` plus its development tree
-(`lib/wine/{i386,x86_64}-windows/` and `libwinecrt0.a`), and **rustup**.
-Everything else is `make setup`'s job.
-
+(`lib/wine/{i386,x86_64}-windows/` and `libwinecrt0.a`), and rustup.
 `WINE_SDK` points at that Wine tree and must be exported before any target,
-including `make setup`: the Makefile takes the Wine binaries from it by
-absolute path, `windows/shim/build.rs` reads `libwinecrt0.a` and `ntdll.a`
-there for linking, and `make conformance` finds Wine's d3d9 test binaries in
-it. `WINE_INSTALL_DIR` is a second tree `make install` copies into, alongside
-`WINE_SDK` itself.
+`make setup` included: the Makefile takes the Wine binaries from it, the shim's
+build script links against `libwinecrt0.a` and `ntdll.a` there, and
+`make conformance` finds Wine's d3d9 test binaries in it. `WINE_INSTALL_DIR`
+names a second tree `make install` also copies into.
 
 ```sh
 make setup              # one-time toolchain bootstrap
@@ -323,37 +299,28 @@ make upgrade            # cargo update (semver-compatible) in both workspaces
 make upgrade-incompat   # cargo upgrade --incompatible + cargo update
 ```
 
-Every leg is also its own CI job, with the toolchains and tools the Makefile
-leaves floating for a developer pinned in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-
-`make setup` is the one-time bootstrap: both rustup toolchains (stable, 1.97 or
-newer per `rust-version` in the manifests, for everything; nightly only for
-`make fmt`, whose `rustfmt.toml` uses nightly-only options) with the four
-cross-compilation targets, the cargo tools, the PE
-linker and archiver as symlinks onto the toolchain's own `rust-lld` and
-`llvm-ar`, Rosetta 2 if it is missing, and the pinned Windows SDK splatted to
-`/opt/xwin` (~3 GB, and one `sudo` prompt to create that root-owned directory).
-It does not install Wine. The internal crates are path dependencies and are not
-published to crates.io.
-
-Frame pointers are off by default; `FP=1 make` forces them on for the guest-pc
-sampling profiler, whose stack walks follow the guest frame-pointer chain.
+`make setup` installs both rustup toolchains (stable, 1.97 or newer, for
+everything; nightly for `make fmt` only) with the four cross-compilation
+targets, the cargo tools, the PE linker and archiver as symlinks onto the
+toolchain's own `rust-lld` and `llvm-ar`, Rosetta 2 if it is missing, and the
+pinned Windows SDK under `/opt/xwin` (about 3 GB, one `sudo` prompt for that
+root-owned directory). It does not install Wine. `FP=1 make` turns frame
+pointers on for the guest-pc sampling profiler.
 
 `make install` copies the PE DLLs into `{i386,x86_64}-windows/` and the `.so`
-into `{x86_64,aarch64}-unix/` under the tree the Wine build reads mtld3d from:
-`lib/wine/d3d9/mtld3d/` in a bundle with a compat database, which keeps every
-Direct3D implementation in its own subtree and leaves only fake-module markers
-in the default dirs (the install re-stamps those), or `lib/wine/` itself in an
-older tree. The `d3d9.dll` copies get the Wine-builtin signature, because the
-loader ignores unsigned PEs on the builtin search path. The build outputs themselves stay unsigned so they
-can also serve as a native DLL override, and `make bundle` packs both flavors
-into `windows/target/mtld3d.tar.xz`. Debug symbols travel with every binary, a
-`.pdb` beside each PE and a `.dSYM` beside the `.so` (`make` runs `dsymutil`,
-since Mach-O DWARF otherwise stays behind in the object files); `make bundle`
-writes them as `windows/target/mtld3d-debug.tar.xz`, and every DLL logs its
-release and linker-assigned image ID on load, so a crash report names the
-archive that symbolicates it.
+into `{x86_64,aarch64}-unix/` under the tree the Wine build reads mtld3d
+from: `lib/wine/d3d9/mtld3d/` in a build with a compat database, which keeps
+every Direct3D implementation in its own subtree, or `lib/wine/` itself in an
+older tree. The installed `d3d9.dll` copies get the Wine-builtin signature,
+because the loader ignores unsigned PEs on the builtin search path; the build
+outputs stay unsigned so they can also serve as a native override.
+
+`make bundle` packs both flavours into `windows/target/mtld3d.tar.xz` and the
+debug symbols (a `.pdb` beside each PE, a `.dSYM` beside the `.so`) into
+`windows/target/mtld3d-debug.tar.xz`. Every DLL logs its release and image ID
+on load, so a crash report names the archive that symbolicates it. Every make
+leg is also a CI job, with the toolchains pinned in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Architecture
 
@@ -362,141 +329,25 @@ game.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 (PE, i386 or x64: one chain per arch)  (Mach-O, Wine's own arch)
 ```
 
-- `d3d9.dll`: D3D9 API implementation, COM vtables, caps, state management.
-- `mtld3d.dll`: PE shim that owns Wine's unix-call globals and exports `mtld3d_unix_call`.
-- `mtld3d.so`: native macOS side, a pure Metal abstraction layer.
-- `mtld3d-core`: host-testable pure-Rust rlib linked into `d3d9.dll`.
-
-At runtime the frame flows through a three-thread pipeline:
-
-```
-API thread (the game's)     Encoder thread            Submit thread
-───────────────────────     ──────────────            ─────────────
-record frame N+1        →   encode frame N        →   submit + present frame N−1
-```
-
-- The **API thread** is the game's own render thread and the frame-time
-  bottleneck, so it never waits on translation, Metal, or the GPU: each call
-  only snapshots the state it needs into a closure on the frame's op list.
-- The **encoder thread** (one per device) runs those closures: D3D9 → Metal
-  translation, render-pass scheduling and load/store optimization, pipeline and
-  sampler caches, lazy resource creation and texture uploads.
-- The **submit thread** crosses the PE/Unix boundary to replay the finished
-  command stream, waits for the drawable, presents and commits.
-
-Each hand-off has capacity one, so the pipeline never runs more than one frame
-ahead per stage: backpressure, not queueing, bounds latency.
-
-For the boundary contract, the threading details, perf instrumentation, and the
-shader/heap debugging toolkits, see
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-## Workspaces
-
-Two Cargo workspaces, one per target platform: `windows/` builds the PE side
-for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, `unix/` the Mach-O
-side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (the latter is also
-the native test target). Open each in its own editor window for rust-analyzer
-to work. The shipped crates (both workspaces also hold test, types, and
-conformance support crates):
-
-| Crate         | Workspace  | Output                                                  |
-|---------------|------------|---------------------------------------------------------|
-| `d3d9`        | `windows/` | `d3d9.dll`                                              |
-| `mtld3d`      | `windows/` | `mtld3d.dll`                                            |
-| `mtld3d-core` | `windows/` | rlib (linked into `d3d9.dll`)                           |
-| `mtld3d-unix` | `unix/`    | `mtld3d.so`                                             |
-| `shared`      | `unix/`    | rlib (shared by `d3d9.dll`, `mtld3d.dll`, `mtld3d.so`)  |
-
-`mtld3d-core` holds every platform-independent helper (DXSO → MSL emission, the
-render-pass state machine, the slab allocator, format / FVF / vertex-decl /
-dirty-rect math, fixed-function state) and compiles for the macOS host as well
-as PE, so `cargo test -p mtld3d-core --target aarch64-apple-darwin` runs its
-unit tests natively instead of through Wine.
-
-`unix/shared` is the crate every linkage unit depends on, primarily for the
-PE↔Unix wire format (the `Command` enum, the `Thunks` enum, param structs,
-typed `mtl::` wire values). Pure data and pure-Rust helpers only, no FFI and no
-`#[link]`, so both workspaces can depend on it cleanly.
-
-## Configuration and logging
-
-User-facing runtime options live in the optional `mtld3d.conf`, read once at
-`Direct3DCreate9` from the directory of the running `.exe`, so a change needs a
-restart. The sample in the repo root documents every option, its default, and
-the `MTLD3D_CONFIG` environment override that beats the file.
-
-Below both sits a third layer: a handful of games need options nobody should
-have to discover, so mtld3d ships built-in profiles for them. A profile is
-matched on the executable name plus the version resource its vendor linked in,
-so it follows the game wherever it is installed and never fires on an unrelated
-program of the same name. It only supplies starting values, and both the file
-and the environment override it key by key.
-`RUST_LOG=mtld3d::d3d9=info` names the profile that matched.
-
-| Profile | Application | What it sets and why |
-|---|---|---|
-| `gta-iv` | Grand Theft Auto IV | `adapter.spoof=amd`, because the renderer branches on the reported vendor and stalls in its own identifier parsing on the NVIDIA identity. `caps.dfFormats=false`, because with the DF fourccs advertised it picks a mixed DF24 plus INTZ depth path that no hardware of its era offered. `depth.aliasSameSize=true`, because its late alpha, sky and glow passes z-test one INTZ depth texture against scene depth rendered into a same-size sibling. |
-| `wow` | World of Warcraft (1.12 and 3.3.5 clients) | `query.flushImmediate=true`, because both clients poll `GetData(D3DGETDATA_FLUSH)` as a GPU fence after every loading-screen upload batch and never read the count, so the spec-correct wait would cost seconds per load for nothing. |
-
-Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*`
-and `env_logger` matches by `::`-separated prefix, so `RUST_LOG=mtld3d=warn` is
-the single switch for the whole project; narrow it per target, for example
-`RUST_LOG=mtld3d=warn,mtld3d::unix=trace`.
-
-| Target                  | Scope                                                                 |
-|-------------------------|-----------------------------------------------------------------------|
-| `mtld3d::d3d9`          | `windows/d3d9/` + `windows/core/` (everything except `dxso` and `perf`) |
-| `mtld3d::d3d9::cursor`  | hardware cursor (HCURSOR) lifecycle, bitmap cache, wndproc            |
-| `mtld3d::unix::cursor`  | software cursor overlay window: sprite renders, show/hide, layer mode |
-| `mtld3d::dxso`          | DXSO → MSL emitter                                                    |
-| `mtld3d::perf`          | 5-second averaged performance summary (`PERF=1` builds only)          |
-| `mtld3d::shim`          | Wine unix-call PE shim DLL                                            |
-| `mtld3d::unix`          | Metal-side `.so`                                                      |
-
-Levels: `info!` for one-shot milestones, `warn!` for unimplemented stubs and
-fallback paths, `error!` for unexpected internal failures, `trace!` for
-per-call breadcrumbs, `debug!` for routine per-call noise useful in deep
-debugging.
-
-Pressing F12 in a game records the next three frames twice over. The log
-gets one `[dump]` line at info level for every D3D9 event of those frames
-that a GPU trace cannot show: render-target, depth-stencil, viewport and
-scissor changes, clears, surface copies, occlusion query traffic, and every
-draw with the states that decide its pass shape, its shaders and its
-textures. At the same time a Metal GPU trace of the same frames lands beside
-the process's log file as `<exe>-<pid>-<n>.gputrace`, numbered per press; the
-process needs `MTL_CAPTURE_ENABLED=1` in its environment for that half (the
-launcher passes it through), otherwise the log says so and the dump still runs. The
-two sides name each other: each `frame end` line carries the label of the
-frame's command buffer, and every dumped draw sits in a `draw N` debug group
-in the trace, so `gpudebug`'s `find` or Xcode's search lands on it directly.
-
-Each cdylib initializes the logger independently and idempotently; `mtld3d.so`
-has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger`
-thunk from its init path.
-
-Every line goes to a file, never to the process's standard streams: a game a
-launcher spawned has no usable ones, and a launcher's own log dies with its
-pipe. Each process writes `<exe>-<pid>.log` into `mtld3d-logs` beside the
-executable, `<pid>` being the macOS process id `ps` shows (not Wine's, which
-repeats from launch to launch), so a launch never overwrites the log of the
-one before it, and the GPU traces F12 captures land next to it as
-`<exe>-<pid>-<n>.gputrace`.
-`log.dir` in `mtld3d.conf` moves the directory; the file appears with the
-first line written, so a process that logs nothing leaves nothing behind, and
-the directory keeps only the ten newest logs and the ten newest traces.
+`d3d9.dll` implements the API and holds every piece of D3D9 knowledge,
+`mtld3d.dll` is the PE shim that owns Wine's unix-call globals, and
+`mtld3d.so` is a pure Metal abstraction layer on the host. At runtime a frame
+flows through three threads: the game's own API thread only snapshots state
+into closures, an encoder thread translates them into Metal commands, and a
+submit thread crosses the boundary to replay, present and commit. Each
+hand-off has capacity one, so the pipeline never runs more than one frame
+ahead per stage. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the
+boundary contract, the threading model, the workspace layout, the logging
+targets and the debugging toolkits.
 
 ## Contributing
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md) is the operating manual: what to read
-before changing anything, the gates and how to read their output, how
-conformance work is organised, and what a pull request is expected to contain.
-The development conventions themselves live in
-[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
-
-The short version: **`make check`** and **`make test`** are green before every
-commit, and one pull request is one clearly defined change.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) is the operating manual: the gates and
+how to read their output, how conformance work is organised, and what a pull
+request is expected to contain. The conventions live in
+[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md). The short version: `make check`
+and `make test` are green before every commit, and one pull request is one
+change.
 
 ## License
 
