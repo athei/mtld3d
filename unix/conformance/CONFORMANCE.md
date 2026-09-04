@@ -228,9 +228,11 @@ onto the physical monitor; without it the mac driver would hand the change to
 z-order alone: raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
-The mode list `EnumAdapterModes` serves is seeded from `EnumDisplaySettingsW`,
-so an enumerable mode is one win32u accepts by construction. When the app
-requests one, the device sets it and the back buffer is that mode; present
+The mode list `EnumAdapterModes` serves is a bounded subset of
+`EnumDisplaySettingsW`'s, so an enumerated mode is one win32u accepts by
+construction, and a fullscreen request for any mode in the full list is set
+whether or not the bounded list carries it. When the app requests one, the
+device sets it and the back buffer is that mode; present
 scales it to the drawable, which stays at the display's size (MetalFX when
 enlarging, the same resample `render.scale` rides). Both halves of the
 contract then agree with the size the app rendered for: the default viewport
@@ -239,7 +241,7 @@ and scissor, the reported present parameters, the device's and swap chain's
 buffer honored the mode under a monitor-sized window, which kept the D3D9
 half right and left mouse input in monitor space; before that it followed the
 window and apps that sized their viewport from their own request rendered
-into a corner.) A request that matches no enumerable mode still follows the
+into a corner.) A request that matches no mode user32 accepts still follows the
 window: native would reject it, so nothing can depend on it being honored,
 and the apps that make such requests (WoW's windowed-to-fullscreen toggle
 carries its window size) size their rendering and mouse handling from the
@@ -272,8 +274,9 @@ walk further):
   come from `EnumDisplaySettingsW`, the same view win32u validates
   `ChangeDisplaySettingsW` against and derives `GetMonitorInfoW` from,
   instead of `NSScreen`: the current mode for `GetAdapterDisplayMode` (read
-  live, so it follows a mode-set), the enumerated list for
-  `EnumAdapterModes` (so a mode a game picks is one user32 accepts). On this
+  live, so it follows a mode-set), a bounded subset of the enumerated list
+  for `EnumAdapterModes` (so a mode a game picks is one user32 accepts, and a
+  menu built for a driver's short list does not overflow). On this
   machine the two views agree under the pinned Retina mode; on the runner's
   virtual display they disagreed by exactly 2x (Win32 2048x1536, `NSScreen`
   1024x768), which split `GetDisplayMode` from the monitor rect
@@ -380,7 +383,7 @@ D3D9 object is involved; it succeeds now that the mode it picks from
 `EnumAdapterModes` is one user32 accepts. All five stay `ceiling` pins from
 when they failed here.
 
-The fullscreen Resets to a non-enumerable mode (32x32, 801x600) return
+The fullscreen Resets to a mode user32 rejects (32x32, 801x600) return
 INVALIDCALL, for a reason that has nothing to do with the resolution: each
 zeroes its whole `D3DPRESENT_PARAMETERS`, so `BackBufferFormat` is
 `D3DFMT_UNKNOWN`, which a fullscreen Reset has to reject. The resolution

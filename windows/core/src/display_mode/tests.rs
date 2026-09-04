@@ -1,4 +1,4 @@
-use super::{ModeRequest, mode_set_attempts, select_mode_sizes};
+use super::{ModeRequest, mode_set_attempts, select_mode_sizes, served_mode_sizes};
 
 const MBP: (u32, u32) = (3456, 2234);
 
@@ -77,4 +77,52 @@ fn degenerate_sizes_are_dropped() {
 #[test]
 fn an_empty_enumeration_serves_the_desktop_mode_alone() {
     assert_eq!(select_mode_sizes(MBP, []), vec![MBP]);
+}
+
+#[test]
+fn a_settable_list_within_the_bound_is_served_as_is() {
+    let settable = [MBP, (640, 480), (1920, 1200)];
+    assert_eq!(served_mode_sizes(&settable, 3), settable.to_vec());
+    assert_eq!(served_mode_sizes(&settable, 100), settable.to_vec());
+}
+
+#[test]
+fn the_bound_keeps_the_desktop_then_the_panel_modes_then_the_largest() {
+    // 2336x1510 is a panel mode (the desktop's aspect) and outranks the larger
+    // 2560x1600; the two largest of the rest fill the remaining slots and the
+    // small synthesised sizes are what gets dropped.
+    let settable = [
+        MBP,
+        (640, 480),
+        (800, 600),
+        (1024, 768),
+        (1920, 1080),
+        (2336, 1510),
+        (1280, 720),
+        (2560, 1600),
+        (2992, 1934),
+    ];
+    assert_eq!(
+        served_mode_sizes(&settable, 5),
+        vec![MBP, (2992, 1934), (2336, 1510), (2560, 1600), (1920, 1080)]
+    );
+}
+
+#[test]
+fn sizes_of_equal_pixel_count_keep_their_enumeration_order() {
+    let settable = [MBP, (1440, 1000), (1600, 900), (640, 480)];
+    assert_eq!(
+        served_mode_sizes(&settable, 3),
+        vec![MBP, (1440, 1000), (1600, 900)]
+    );
+}
+
+#[test]
+fn a_bound_of_zero_still_serves_the_desktop() {
+    assert_eq!(served_mode_sizes(&[MBP, (640, 480)], 0), vec![MBP]);
+}
+
+#[test]
+fn an_empty_settable_list_serves_nothing() {
+    assert!(served_mode_sizes(&[], 5).is_empty());
 }

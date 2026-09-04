@@ -1072,7 +1072,7 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
 
-    // 640x480 is an enumerable mode, so the Reset sets it and the monitor
+    // 640x480 is a settable mode (one user32 accepts), so the Reset sets it and the monitor
     // rect the window adopts is the mode's. Read after the transition: the
     // metric answers in the mode while one is set.
     let mut pp = fullscreen_params(hwnd, 640, 480);
@@ -1189,9 +1189,10 @@ fn nowindowchanges_leaves_the_device_window_alone() {
 }
 
 #[test]
-fn reset_fullscreen_honors_an_enumerable_mode() {
+fn reset_fullscreen_honors_a_settable_mode() {
     let h = Harness::new();
-    // 640x480 is served by EnumAdapterModes, so the Reset sets that mode and
+    // 640x480 is a mode user32 accepts (whether or not the bounded list
+    // EnumAdapterModes serves carries it), so the Reset sets that mode and
     // the back buffer keeps the requested size; a game that sizes its viewport
     // from its own request covers the frame. Present scales the back buffer
     // to the drawable, which stays at the display's size.
@@ -1199,7 +1200,7 @@ fn reset_fullscreen_honors_an_enumerable_mode() {
     assert_eq!(
         h.reset_params(&mut pp),
         D3D_OK,
-        "fullscreen Reset at an enumerable mode must succeed",
+        "fullscreen Reset at a settable mode must succeed",
     );
     assert_eq!(
         (pp.back_buffer_width, pp.back_buffer_height),
@@ -1380,7 +1381,7 @@ fn reset_fullscreen_sets_the_display_mode() {
     assert_eq!(
         Harness::current_display_mode(),
         (640, 480),
-        "a fullscreen Reset at an enumerable mode sets that display mode",
+        "a fullscreen Reset at a settable mode sets that display mode",
     );
     assert_eq!(
         Harness::screen_size(),

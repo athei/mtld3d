@@ -230,11 +230,16 @@ memory headroom, or the games that rely on the looser behaviour:
   enlarging). A mode of another aspect than the display's is letterboxed, with
   the desktop showing in the bars and the menu bar staying, since the window no
   longer covers the screen; the game's resolution list carries the display's
-  own modes, which fill it. Without the key Wine's mac driver hands the
+  own modes, which fill it. That list is bounded (15 sizes per colour format,
+  the display's own modes and then the largest), because Wine's mode list is
+  long and era menus were built for a driver's short one: WoW 1.12's
+  resolution dropdown overflows past 32 entries. Any size in Wine's list stays
+  settable, listed or not. Without the key Wine's mac driver hands the
   mode-set to `CGDisplaySetDisplayMode` and the whole desktop switches
-  resolution. A request matching no enumerable mode, which a mode-set would
-  reject, follows the window instead: games that ask for such sizes derived
-  them from their window and keep sizing their rendering and input from it.
+  resolution. A request matching no mode user32 accepts, which a mode-set
+  would reject, follows the window instead: games that ask for such sizes
+  derived them from their window and keep sizing their rendering and input
+  from it.
 - **The fullscreen focus lifecycle**: no device loss on deactivation, no
   focus-window subclassing, no synthesized activation messages, no minimise.
   What the device does answer is the mode contract: deactivation puts the

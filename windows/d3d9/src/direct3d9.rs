@@ -5,7 +5,12 @@ use core::{
 use std::sync::LazyLock;
 
 use log::{error, info, trace, warn};
-use mtld3d_core::{caps, display_mode::ModeRequest, format_probe::FormatProbeKey, multisample};
+use mtld3d_core::{
+    caps,
+    display_mode::{MAX_SERVED_SIZES, ModeRequest, select_mode_sizes, served_mode_sizes},
+    format_probe::FormatProbeKey,
+    multisample,
+};
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
@@ -35,15 +40,16 @@ use super::{
     unix_call::unix_call,
 };
 
-// Dynamic display-mode list served by GetAdapterModeCount / EnumAdapterModes /
-// GetAdapterDisplayMode. Built once, on the first enumeration call or the
-// first fullscreen device, from the Win32 mode list (`EnumDisplaySettingsW`,
-// see `build_adapter_modes`): a fullscreen device sets the mode a game picks
-// through user32, so the list a game picks from has to be the list user32
-// validates against. The first entry is the desktop mode at the time the
-// list was built and doubles as the current adapter display mode, which is
-// why the list is forced before the first mode-set.
-static ADAPTER_MODES: LazyLock<Vec<D3DDISPLAYMODE>> = LazyLock::new(build_adapter_modes);
+// The display-mode table behind GetAdapterModeCount / EnumAdapterModes /
+// GetAdapterDisplayMode and the fullscreen mode-set. Built once, on the first
+// enumeration call or the first fullscreen device, from the Win32 mode list
+// (`EnumDisplaySettingsW`, see `build_adapter_modes`): a fullscreen device
+// sets the mode a game picks through user32, so the list a game picks from
+// has to be the list user32 validates against. The first entry is the
+// desktop mode at the time the table was built and doubles as the current
+// adapter display mode, which is why the table is forced before the first
+// mode-set.
+static ADAPTER_MODES: LazyLock<AdapterModes> = LazyLock::new(build_adapter_modes);
 
 /// Backing scale of the display the Metal layer's window is on.
 ///
@@ -76,7 +82,7 @@ const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
 ///
 /// A windowed back buffer requested as `D3DFMT_UNKNOWN` resolves to this.
 pub fn adapter_display_format() -> u32 {
-    ADAPTER_MODES[0].format
+    ADAPTER_MODES.served[0].format
 }
 
 /// The adapter's display mode right now, as `GetAdapterDisplayMode` reports it.
@@ -87,7 +93,7 @@ pub fn adapter_display_format() -> u32 {
 /// rect from. The format is the table's, the one colour format the desktop
 /// is advertised at; a failed query falls back to the table's desktop entry.
 pub fn current_adapter_display_mode() -> D3DDISPLAYMODE {
-    let desktop = ADAPTER_MODES[0];
+    let desktop = ADAPTER_MODES.served[0];
     crate::fullscreen::current_display_mode().map_or(desktop, |mode| D3DDISPLAYMODE {
         width: mode.width,
         height: mode.height,
@@ -111,7 +117,7 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
         let refresh_rate = if pp.full_screen_refresh_rate_in_hz != 0 {
             pp.full_screen_refresh_rate_in_hz
         } else {
-            ADAPTER_MODES[0].refresh_rate
+            ADAPTER_MODES.served[0].refresh_rate
         };
         D3DDISPLAYMODE {
             width: pp.back_buffer_width,
@@ -124,7 +130,21 @@ pub fn reported_display_mode(pp: &D3DPRESENT_PARAMETERS) -> D3DDISPLAYMODE {
     }
 }
 
-fn build_adapter_modes() -> Vec<D3DDISPLAYMODE> {
+/// The mode table: what a fullscreen device may set and what games enumerate.
+struct AdapterModes {
+    /// Every size a fullscreen request may set, desktop first.
+    ///
+    /// Win32's list under [`select_mode_sizes`]' filters, the set user32
+    /// accepts a mode-set for.
+    settable: Vec<(u32, u32)>,
+    /// The entries `GetAdapterModeCount` / `EnumAdapterModes` serve.
+    ///
+    /// The settable sizes bounded to [`MAX_SERVED_SIZES`], repeated once per
+    /// adapter format; entry 0 is the desktop mode.
+    served: Vec<D3DDISPLAYMODE>,
+}
+
+fn build_adapter_modes() -> AdapterModes {
     // Both the host mode and the candidates come from the Win32 view
     // (`EnumDisplaySettingsW` → win32u), NOT from `NSScreen` or a table of
     // our own: win32u validates a fullscreen device's `ChangeDisplaySettingsW`
@@ -151,7 +171,8 @@ fn build_adapter_modes() -> Vec<D3DDISPLAYMODE> {
         .iter()
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
         .map(|mode| (mode.width, mode.height));
-    let sizes = mtld3d_core::display_mode::select_mode_sizes((host_w, host_h), candidates);
+    let settable = select_mode_sizes((host_w, host_h), candidates);
+    let sizes = served_mode_sizes(&settable, MAX_SERVED_SIZES);
     if enumerated.is_empty() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -174,25 +195,29 @@ fn build_adapter_modes() -> Vec<D3DDISPLAYMODE> {
 
     info!(
         target: LOG_TARGET,
-        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz aspect={host_aspect:.3}; {} sizes kept \
-         of {} enumerated modes, {} entries",
-        sizes.len(),
+        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz aspect={host_aspect:.3}; {} sizes \
+         settable of {} enumerated modes, {} served ({} entries)",
+        settable.len(),
         enumerated.len(),
+        sizes.len(),
         modes.len()
     );
-    modes
+    AdapterModes {
+        settable,
+        served: modes,
+    }
 }
 
 /// The display mode a fullscreen request asks the device to set.
 ///
-/// `Some` for an enumerable mode, which is one user32 accepts by
-/// construction (the mode table is seeded from its list); `None` for a
-/// request that is no display mode, which follows the window instead. The
+/// `Some` for a settable mode, which is one user32 accepts by construction
+/// (the mode table is seeded from its list); `None` for a request that is
+/// no display mode, which follows the window instead. The
 /// refresh rate is the game's, 0 for "any". Reading the table here also
 /// builds it before the first mode-set, so its desktop entry is the
 /// desktop's.
 pub fn fullscreen_mode_request(pp: &D3DPRESENT_PARAMETERS) -> Option<ModeRequest> {
-    is_enumerable_mode(pp.back_buffer_width, pp.back_buffer_height).then_some(ModeRequest {
+    is_settable_mode(pp.back_buffer_width, pp.back_buffer_height).then_some(ModeRequest {
         width: pp.back_buffer_width,
         height: pp.back_buffer_height,
         refresh_hz: pp.full_screen_refresh_rate_in_hz,
@@ -744,8 +769,14 @@ extern "system" fn d3d9_get_adapter_mode_count(
         warn!(target: LOG_TARGET, "reject GetAdapterModeCount(adapter={adapter}, format={format}) → 0");
         return 0;
     }
-    let count = u32::try_from(ADAPTER_MODES.iter().filter(|m| m.format == format).count())
-        .expect("ADAPTER_MODES is a small static table");
+    let count = u32::try_from(
+        ADAPTER_MODES
+            .served
+            .iter()
+            .filter(|m| m.format == format)
+            .count(),
+    )
+    .expect("ADAPTER_MODES is a small static table");
     mtld3d_shared::log_once_trace_by!(
         target: DISPLAY_TRACE_TARGET,
         key: u64::from(format),
@@ -769,6 +800,7 @@ extern "system" fn d3d9_enum_adapter_modes(
         return D3DERR_INVALIDCALL;
     }
     let Some(entry) = ADAPTER_MODES
+        .served
         .iter()
         .filter(|m| m.format == format)
         .nth(mode as usize)
@@ -1159,12 +1191,11 @@ fn client_rect_dims(hwnd: *mut c_void) -> Option<(u32, u32)> {
 /// `true` when `width`x`height` is a mode `EnumAdapterModes` serves.
 ///
 /// The membership test behind the fullscreen honor-or-follow split in
-/// [`resolve_backbuffer_dims`]. Format-agnostic: the mode table repeats every
-/// size once per adapter format.
-pub fn is_enumerable_mode(width: u32, height: u32) -> bool {
-    ADAPTER_MODES
-        .iter()
-        .any(|m| m.width == width && m.height == height)
+/// [`resolve_backbuffer_dims`]. Answered against every settable size, not
+/// only the bounded list games enumerate: a game's own config may name a
+/// mode its menu no longer lists, and user32 accepts it all the same.
+pub fn is_settable_mode(width: u32, height: u32) -> bool {
+    ADAPTER_MODES.settable.contains(&(width, height))
 }
 
 /// Resolve the back buffer's *logical* size.
@@ -1172,14 +1203,14 @@ pub fn is_enumerable_mode(width: u32, height: u32) -> bool {
 /// Logical size is what D3D9 reports and the space every game-supplied
 /// coordinate lives in. Three rules, keyed on who decides the resolution:
 ///
-/// - **Fullscreen, requesting an enumerable mode**: the request stands. The
+/// - **Fullscreen, requesting a settable mode**: the request stands. The
 ///   device has set that mode, so the client rect is the request too and
 ///   viewports, scissors and mouse coordinates all live in one space; the
 ///   display keeps its own size and present resolves the difference at the
 ///   drawable (`MetalFX` when enlarging), the same resample `render.scale`
 ///   rides. When user32 refused the mode-set the request still stands under
 ///   a monitor-sized client rect, which the log line below records. A
-///   request that is *not* an enumerable mode is one native would reject
+///   request that is *not* a settable mode is one native would reject
 ///   outright, so no game can depend on it being honored; such games carry
 ///   their window size into the request and size their rendering and input
 ///   from the window, so the client rect wins there, the lenient answer that
@@ -1199,7 +1230,7 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
         // Callers reject a zero-dimension fullscreen request before the window
         // moves, so the request is always concrete here.
         let client = client_rect_dims(hwnd as *mut c_void);
-        if is_enumerable_mode(pp.back_buffer_width, pp.back_buffer_height) {
+        if is_settable_mode(pp.back_buffer_width, pp.back_buffer_height) {
             // With the mode set the client rect is the request; this line
             // only fires for the fallback where user32 refused the mode, and
             // is the breadcrumb tying an upscaled frame with monitor-space
@@ -1223,7 +1254,7 @@ pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
         if pp.back_buffer_width != client_w || pp.back_buffer_height != client_h {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "fullscreen device: requested {}x{} is not an enumerable display mode, so the \
+                "fullscreen device: requested {}x{} is no display mode user32 accepts, so the \
                  back buffer follows the window ({}x{}) instead",
                 pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
             );
