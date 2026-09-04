@@ -342,28 +342,52 @@ jobs:
           file "$W"
           "$W" --version || echo "wine --version exit $?"
           otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
-          echo "== boot"
-          WINEPREFIX="$RUNNER_TEMP/pfx" WINEDEBUG=+timestamp,+seh,+process capped 90 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1
+          # abort() interposed: the process that aborts prints the host
+          # backtrace of the call and exits, instead of Wine turning the
+          # signal into an exception it then loops on. Interposing through
+          # dyld reaches every call bound at load time, which covers Wine's
+          # own images; a call from inside the shared cache would not show.
+          cat > "$RUNNER_TEMP/abort_bt.c" <<'EOF'
+          #include <execinfo.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+          static void write_str(const char *s) { write(2, s, strlen(s)); }
+          __attribute__((noreturn)) static void my_abort(void) {
+              void *frames[64];
+              int n = backtrace(frames, 64);
+              write_str("== abort() called, host backtrace:\n");
+              backtrace_symbols_fd(frames, n, 2);
+              for (int i = 0; i < n; i++) {
+                  Dl_info info;
+                  if (dladdr(frames[i], &info) && info.dli_fname) {
+                      char line[512];
+                      snprintf(line, sizeof line, "  frame %d: %s + 0x%lx\n", i, info.dli_fname,
+                               (unsigned long)((char *)frames[i] - (char *)info.dli_fbase));
+                      write_str(line);
+                  }
+              }
+              _exit(134);
+          }
+          typedef struct { const void *replacement; const void *replacee; } interpose_t;
+          __attribute__((used)) static const interpose_t interposers[]
+              __attribute__((section("__DATA,__interpose"))) = { { (const void *)my_abort, (const void *)abort } };
+          EOF
+          clang -dynamiclib -arch x86_64 -o "$RUNNER_TEMP/abort_bt.dylib" "$RUNNER_TEMP/abort_bt.c" && echo "interposer built"
+          echo "== boot with abort() interposed"
+          WINEPREFIX="$RUNNER_TEMP/pfx" DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/abort_bt.dylib" WINEDEBUG=+timestamp,+seh,+process capped 90 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1
           echo "boot: reg add exit $?"
-          grep -a 'NtCreateUserProcess.*pid\|EXCEPTION_WINE_ASSERTION' "$RUNNER_TEMP/wine-macdrv.log" | head -12 | cut -c1-200
-          echo "== the processes left behind"
-          ps -ax -o pid,pcpu,rss,command | grep -a 'wine' | grep -av grep | cut -c1-160
-          # The host stack of every Wine process that survived the boot: the
-          # one caught in the fault loop still has the frames that called
-          # abort() beneath the handler, and `sample` reads them from outside.
-          for pid in $(pgrep -f 'explorer.exe|wineboot|services.exe|rundll32'); do
-            echo "== sample of $pid: $(ps -o command= -p "$pid" | cut -c1-80)"
-            sudo sample "$pid" 2 -mayDie -file "$RUNNER_TEMP/sample-$pid.txt" > /dev/null 2>&1 || echo "sample failed"
-            grep -aE 'Call graph|^ +[0-9]+ Thread|abort|assert|dyld|objc|CoreFoundation|AppKit|Metal|wine|ntdll|win32u|explorer|\.so|\.dylib' "$RUNNER_TEMP/sample-$pid.txt" | head -70 | cut -c1-200
-          done
+          grep -a 'NtCreateUserProcess.*pid\|EXCEPTION_WINE_ASSERTION' "$RUNNER_TEMP/wine-macdrv.log" | head -8 | cut -c1-160
+          echo "== the abort"
+          grep -aA80 'abort() called' "$RUNNER_TEMP/wine-macdrv.log" | head -100 | cut -c1-200
+          ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | head -3
           reap
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wine-trace-${{ matrix.runner }}
-          path: |
-            ${{ runner.temp }}/wine-macdrv.log
-            ${{ runner.temp }}/sample-*.txt
+          path: ${{ runner.temp }}/wine-macdrv.log
           retention-days: 7
           if-no-files-found: ignore
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
