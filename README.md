@@ -24,7 +24,7 @@ real hardware.
 
 | Requirement | Notes |
 | --- | --- |
-| macOS 15 or newer | Apple Silicon. |
+| macOS 15 or newer | Apple Silicon or Intel. |
 | Wine 8.0 or newer, or CrossOver 24 or newer | Needs the current WoW64 loader. |
 | A 64-bit prefix or bottle | 32-bit games run in it through WoW64. |
 | Rosetta 2 | For an x86_64 Wine, which most builds are. An arm64 Wine translates x86 itself (FEX) and does not need it. |
