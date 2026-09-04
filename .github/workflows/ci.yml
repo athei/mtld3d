@@ -308,6 +308,20 @@ jobs:
           print("pixel after clear (bgra): \(px)")
           EOF
           swift "$RUNNER_TEMP/probe.swift"
+      # The pinned Wine bundle itself: the loader, a registry write that boots a
+      # fresh prefix, and what the prefix holds afterwards, all unsilenced.
+      - name: Wine
+        run: |
+          mkdir -p "$HOME/wine-sdk"
+          curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
+            "https://github.com/athei/wine-build/releases/download/${{ env.WINE_RELEASE }}/wine-${{ env.WINE_RELEASE }}-macos-x86_64.tar.xz"
+          tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
+          W="$HOME/wine-sdk/wine/bin/wine"
+          file "$W"
+          "$W" --version || echo "wine --version exit $?"
+          "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f || echo "reg add exit $?"
+          ls -la "$HOME/.wine" "$HOME/.wine/drive_c" 2>/dev/null || true
+          "$HOME/wine-sdk/wine/bin/wineserver" -k || true
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
           cat > "$RUNNER_TEMP/packed.swift" <<'EOF'

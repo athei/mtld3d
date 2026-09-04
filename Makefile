@@ -489,15 +489,22 @@ MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
 # wine.inf's `11,,*` wildcard stamps its marker along with every other builtin.
 # A prefix that predates the install does not get one and cannot load mtld3d;
 # `wineboot -u`, or deleting it and re-running, fixes that.
+# $(1) = the `reg add` arguments. Captured and shown only on failure.
+define WINE_REG_ADD
+out=$$($(WINE) reg add $(1) 2>&1) || { echo "wine reg add $(1) failed:" >&2; echo "$$out" >&2; exit 1; }
+endef
+
 configure-test-prefix:
 	# Keep automated tests non-interactive and independent of mutable prefix
 	# display settings. EmulateModeset prevents physical host mode changes;
 	# RetinaMode keeps Win32 monitor geometry in the same physical-pixel space
 	# as mtld3d's adapter modes. The first `reg add` also creates the prefix if
-	# it does not exist yet, which is the case on a fresh machine.
-	$(WINE) reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1
-	$(WINE) reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f >/dev/null 2>&1
-	$(WINE) reg add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f >/dev/null 2>&1
+	# it does not exist yet, which is the case on a fresh machine. Quiet when
+	# it works, since the prefix boot chatters; everything Wine said when it
+	# does not, since that is the only account of why.
+	$(call WINE_REG_ADD,'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f)
+	$(call WINE_REG_ADD,'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /t REG_SZ /d Y /f)
+	$(call WINE_REG_ADD,'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d Y /f)
 	# A wineserver session enumerates the display once, when its desktop
 	# starts, and serves that geometry to every process in it afterwards. The
 	# session the first `reg add` boots to create the prefix enumerates it
