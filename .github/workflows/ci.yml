@@ -635,6 +635,55 @@ jobs:
               let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
               print("cross-pass multisample depth resolve (stored, then loaded and resolved), centre:", v, "(want 0.5)")
           }
+          // 9. A resolve target loaded as an attachment by the next encoder of the same command buffer:
+          //    pass P stores the destination at 1.0, pass A draws a multisample depth at 0.5, pass B resolves
+          //    it into the destination, pass C loads the destination and draws red at 0.75 under less.
+          //    Red means the load saw 1.0 (the resolve was not seen), blue means it saw 0.5.
+          for withBlit in [false, true] {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let c = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let cb = queue.makeCommandBuffer()!
+              let pp = MTLRenderPassDescriptor()
+              pp.depthAttachment.texture = rs; pp.depthAttachment.loadAction = .clear; pp.depthAttachment.clearDepth = 1.0; pp.depthAttachment.storeAction = .store
+              pp.stencilAttachment.texture = rs; pp.stencilAttachment.loadAction = .clear; pp.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: pp)!.endEncoding()
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: b2)!.endEncoding()
+              if withBlit { let bl = cb.makeBlitCommandEncoder()!; bl.endEncoding() }
+              let cc = MTLRenderPassDescriptor()
+              cc.colorAttachments[0].texture = c; cc.colorAttachments[0].loadAction = .clear; cc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); cc.colorAttachments[0].storeAction = .store
+              cc.depthAttachment.texture = rs; cc.depthAttachment.loadAction = .load; cc.depthAttachment.storeAction = .store
+              cc.stencilAttachment.texture = rs; cc.stencilAttachment.loadAction = .load; cc.stencilAttachment.storeAction = .store
+              let p1 = MTLRenderPipelineDescriptor()
+              p1.vertexFunction = lib.makeFunction(name: "tri"); p1.fragmentFunction = lib.makeFunction(name: "solid")
+              p1.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p1.depthAttachmentPixelFormat = .depth32Float_stencil8; p1.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let pso1 = try! d.makeRenderPipelineState(descriptor: p1)
+              let less = MTLDepthStencilDescriptor(); less.depthCompareFunction = .less; less.isDepthWriteEnabled = false
+              let e3 = cb.makeRenderCommandEncoder(descriptor: cc)!
+              e3.setRenderPipelineState(pso1); e3.setDepthStencilState(d.makeDepthStencilState(descriptor: less)!)
+              zv = 0.75; e3.setVertexBytes(&zv, length: 4, index: 0); e3.setFragmentBytes(&col, length: 16, index: 0)
+              e3.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e3.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("resolve target loaded by the next encoder (\(withBlit ? "blit encoder between" : "no encoder between")):", px(readback(c, bpp: 4), W, 8, 8), "(blue = resolve seen, red = stale 1.0)")
+          }
           // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
           do {
               let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
