@@ -349,6 +349,7 @@ jobs:
           # own images; a call from inside the shared cache would not show.
           cat > "$RUNNER_TEMP/abort_bt.c" <<'EOF'
           #include <execinfo.h>
+          #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
           #include <unistd.h>
