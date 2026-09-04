@@ -4,8 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
-  # So a branch can be run through the whole matrix before it has a PR.
+  # So a branch can be run through the whole matrix before it has a PR, or
+  # only through the runner probe at the bottom.
   workflow_dispatch:
+    inputs:
+      probe_only:
+        description: Run only the probe-metal job.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,6 +53,7 @@ jobs:
   # conformance runner for both host arches. Primes the caches the check job
   # restores too.
   build:
+    if: ${{ !inputs.probe_only }}
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -79,6 +86,7 @@ jobs:
   # the production profile's fat LTO is exercised here rather than first
   # failing when a release is cut.
   check:
+    if: ${{ !inputs.probe_only }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -327,8 +335,15 @@ jobs:
           W="$HOME/wine-sdk/wine/bin/wine"
           file "$W"
           "$W" --version || echo "wine --version exit $?"
-          "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f || echo "reg add exit $?"
-          ls -la "$HOME/.wine" "$HOME/.wine/drive_c" 2>/dev/null || true
+          # What the bundle was built for and what this machine offers.
+          otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION\|LC_VERSION_MIN' | head -12
+          sysctl -n machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
+          ls "$HOME/wine-sdk/wine/lib/wine" | head
+          ls "$HOME/wine-sdk/wine/lib/wine/x86_64-windows" | head -5
+          # The prefix boot, with the loader narrating every module it opens.
+          WINEDEBUG=+loaddll,+module,+process,+virtual "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | head -150 || true
+          echo "reg add pipeline exit ${PIPESTATUS[0]}"
+          ls -la "$HOME/.wine" "$HOME/.wine/drive_c" "$HOME/.wine/drive_c/windows" 2>/dev/null || true
           "$HOME/wine-sdk/wine/bin/wineserver" -k || true
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
