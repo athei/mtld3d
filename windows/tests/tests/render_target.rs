@@ -3276,6 +3276,23 @@ fn get_render_target_data_writes_rows_at_the_reported_pitch() {
     const SENTINEL: u16 = 0xAAAA;
 
     let h = Harness::new();
+    // A device without Metal's packed 16-bit pixel formats does not advertise
+    // them as render targets and rejects the create to match, which leaves
+    // nothing to read back. That contract is pinned in `expand16`.
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        mtld3d_types::D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) != D3D_OK
+    {
+        assert_ne!(
+            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
+            D3D_OK,
+            "a 16-bit render target is rejected where the caps deny it"
+        );
+        return;
+    }
     let backbuffer = h.render_target(0);
     let rt = h.create_render_target(W, H, D3DFMT_R5G6B5);
     assert_eq!(h.set_render_target(0, &rt), 0, "bind the R5G6B5 target");

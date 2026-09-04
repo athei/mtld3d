@@ -7,7 +7,7 @@
 //! rejected before it can drop unselected subtests from the baseline.
 
 use super::parse_args;
-use crate::model::{Arch, Subtest};
+use crate::model::{Arch, Subtest, Variant};
 
 fn args(tokens: &[&str]) -> std::vec::IntoIter<String> {
     tokens
@@ -35,6 +35,16 @@ fn parses_flags_and_update() {
         config.assets.as_deref().and_then(std::path::Path::to_str),
         Some("/a")
     );
+}
+
+#[test]
+fn variant_defaults_to_native_and_parses_intel() {
+    let config = parse_args(base(&[])).unwrap();
+    assert_eq!(config.variant, Variant::Native);
+    let config = parse_args(base(&["--variant", "intel"])).unwrap();
+    assert_eq!(config.variant, Variant::Intel);
+    let err = parse_args(base(&["--variant", "amd"])).unwrap_err();
+    assert!(err.contains("unknown variant"), "{err}");
 }
 
 #[test]

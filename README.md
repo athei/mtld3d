@@ -265,6 +265,11 @@ kept for speed included. `make test` runs the unit tests of the pure-Rust
 core natively on the host and the end-to-end suite, listed in
 [`COVERAGE.md`](windows/tests/COVERAGE.md), under Wine.
 
+Both suites also run under the device answers an Intel/AMD Mac gives, forced
+through the `intel.*` keys in `mtld3d.conf`: `make test INTEL=1` and
+`make conformance-intel`, so the Intel code paths can be exercised on a machine
+without Intel hardware.
+
 ## Building from source
 
 mtld3d builds on Apple Silicon macOS and targets macOS 15 or newer

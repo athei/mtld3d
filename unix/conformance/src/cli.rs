@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{Arch, Subtest};
+use crate::model::{Arch, Subtest, Variant};
 
 /// Parsed invocation options.
 #[derive(Debug)]
@@ -15,6 +15,12 @@ pub struct Config {
     pub exe: PathBuf,
     /// `--arch`: which architecture `exe` is, i.e. the label results record under.
     pub arch: Arch,
+    /// `--variant`: which device answers the run is measured under.
+    ///
+    /// `native` (the default) runs against the device's own capabilities;
+    /// `intel` forces every `intel.*` config key on and records under a
+    /// separate baseline leg.
+    pub variant: Variant,
     /// `--assets`: the directory holding `baseline.txt` / `CONFORMANCE.md`.
     ///
     /// `None` means "use the crate directory" (resolved by the caller).
@@ -31,12 +37,13 @@ pub struct Config {
 /// Parse CLI args (excluding `argv[0]`).
 ///
 /// Recognised flags: `--update-baseline`, `--wine <path>`, `--exe <path>`,
-/// `--arch <arch>`, `--assets <dir>`, `--only <subtest>`, `--repeat <N>`.
+/// `--arch <arch>`, `--variant <native|intel>`, `--assets <dir>`,
+/// `--only <subtest>`, `--repeat <N>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
 /// invocation runs one test binary, which is what lets a 32-bit and a 64-bit CI
-/// job be two independent processes. `--assets` defaults to the crate
-/// directory. `--only`/`--repeat>1` are mutually exclusive with
+/// job be two independent processes. `--variant` defaults to `native` and
+/// `--assets` to the crate directory. `--only`/`--repeat>1` are mutually exclusive with
 /// `--update-baseline` (a filtered re-baseline would drop the unselected
 /// subtests from `baseline.txt`).
 ///
@@ -50,6 +57,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut wine: Option<PathBuf> = None;
     let mut exe: Option<PathBuf> = None;
     let mut arch: Option<Arch> = None;
+    let mut variant = Variant::Native;
     let mut assets: Option<PathBuf> = None;
     let mut only: Option<Subtest> = None;
     let mut repeat: u32 = 1;
@@ -71,6 +79,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                     .next()
                     .ok_or_else(|| "--arch needs an arch".to_owned())?;
                 arch = Some(value.parse::<Arch>()?);
+            }
+            "--variant" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--variant needs native|intel".to_owned())?;
+                variant = value.parse::<Variant>()?;
             }
             "--assets" => {
                 let value = args
@@ -111,6 +125,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
         wine,
         exe,
         arch,
+        variant,
         assets,
         only,
         repeat,

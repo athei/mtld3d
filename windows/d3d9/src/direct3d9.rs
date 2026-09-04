@@ -724,7 +724,7 @@ pub fn device_caps_flags() -> DeviceCapsFlags {
 ///
 /// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
 /// formats A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 are backed by
-/// `Bgra8Unorm` instead and widened by the GPU upload pass. `debug.expandPacked16` forces the
+/// `Bgra8Unorm` instead and widened by the GPU upload pass. `intel.expandPacked16` forces the
 /// expansion path on any device so it can be exercised on Apple Silicon; it
 /// folds in here so every consumer (format mapping, `CheckDeviceFormat`,
 /// create gates) flips together.
@@ -752,19 +752,19 @@ pub fn native_packed16_supported() -> bool {
 /// those three with it, so an engine that probes before picking a scene
 /// format takes its own fallback instead of sampling a format the device
 /// point-samples. The half-float members are filterable on every family and
-/// are unaffected. `debug.float32Filtering = false` forces the negative
+/// are unaffected. `intel.denyFloat32Filtering = true` forces the negative
 /// answer on any device so the path can be exercised on Apple Silicon.
 fn float32_filtering_supported() -> bool {
     let supported = device_info()
         .caps
         .contains(DeviceCapsFlags::FLOAT32_FILTERING)
-        && crate::config::CONFIG.float32_filtering;
+        && !crate::config::CONFIG.deny_float32_filtering;
     if !supported {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "32-bit float filtering unavailable (forced={}): R32F/G32R32F/A32B32G32R32F \
              answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER",
-            !crate::config::CONFIG.float32_filtering
+            crate::config::CONFIG.deny_float32_filtering
         );
     }
     supported
@@ -1703,10 +1703,14 @@ fn spawn_tsc_warmup() {
 fn spawn_encoder_and_prewarm(
     cq: &CreateCommandQueueParams,
 ) -> (EncoderThread, crate::shader_prewarm::PrewarmHandle) {
+    // The only place the snapshot is built: the `intel.*` overrides fold in
+    // here so the encoder and `DeviceInner::gpu_caps()` see one answer.
+    let cfg = &*crate::config::CONFIG;
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
         unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
-    };
+    }
+    .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
     let encoder = EncoderThread::spawn(gpu_caps);
     let prewarm = crate::shader_prewarm::spawn(cq.device_handle, encoder.prewarm_sender());
     (encoder, prewarm)

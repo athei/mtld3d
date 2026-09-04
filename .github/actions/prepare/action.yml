@@ -2,10 +2,11 @@ name: prepare
 description: Restore the shared caches and bring up exactly the toolchain one CI leg needs.
 
 # Every leg is one `make` target, so this holds no build logic: it restores the
-# caches the setup job primed and then calls the `setup-*` leaves the Makefile
-# already exposes. The inputs are what a leg needs, not what it is: a host-only
-# lint leg wants neither the MSVC SDK nor Rosetta, and only the e2e legs run
-# Wine at all.
+# caches the build job primed and then calls the `setup-*` leaves the Makefile
+# already exposes. The inputs are what a leg needs, not what it is: a lint leg
+# wants no Rosetta, and only the build leg saves the caches back. Test machines
+# use the `runner` action instead: they replay a staged build and need no
+# toolchain at all.
 inputs:
   pe:
     description: >
@@ -22,8 +23,8 @@ inputs:
     default: ''
   prime:
     description: >
-      This is the linear setup job: warm the cargo registry and save every cache
-      it touched. The legs that fan out afterwards only ever restore.
+      This is the build job: warm the cargo registry and save every cache it
+      touched. The check job only ever restores.
     default: 'false'
 
 runs:
@@ -44,7 +45,7 @@ runs:
       id: keys
       shell: bash
       run: |
-        pins=$(printf '%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" | shasum | cut -c1-16)
+        pins=$(printf '%s|%s|%s|%s' "$RUST_STABLE" "$RUST_NIGHTLY" "$CARGO_TOOLS" "$NEXTEST_VERSION" | shasum | cut -c1-16)
         echo "tools=tools-${{ runner.os }}-${{ runner.arch }}-$pins" >> "$GITHUB_OUTPUT"
 
     # Two caches, because the two halves of a cargo home change for different
@@ -108,6 +109,12 @@ runs:
       if: inputs.pe == 'true'
       shell: bash
       run: make setup-xwin
+
+    # The prebuilt nextest, pinned by ci.yml; lands in the cargo bin directory
+    # and so travels in the tools cache with the toolchains.
+    - name: nextest
+      shell: bash
+      run: make setup-nextest NEXTEST_VERSION="$NEXTEST_VERSION"
 
     - name: Restore the Wine SDK
       id: wine-cache

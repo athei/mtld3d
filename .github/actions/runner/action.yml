@@ -1,0 +1,69 @@
+name: runner
+description: Bring up a test machine that replays a staged build, with no toolchain of its own.
+
+# A test leg builds nothing: it takes the stage the build job packed and runs
+# the suites against the pinned Wine. So this holds the Wine SDK, Rosetta where
+# the machine is arm64, the nextest binary that replays the archives, and the
+# unpacked stage, and nothing else. The Makefile does the rest through
+# `STAGE=`.
+inputs:
+  wine-release:
+    description: wine-build release tag to download on a cache miss.
+    required: true
+  nextest-version:
+    description: nextest version to install from its prebuilt binaries.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Mandatory for every `make` call. Under $HOME rather than the workspace:
+    # checkout's `git clean` would take anything inside the workspace with it.
+    - name: Point WINE_SDK at the extracted bundle
+      shell: bash
+      run: |
+        echo "WINE_SDK=$HOME/wine-sdk/wine" >> "$GITHUB_ENV"
+        echo "STAGE=$RUNNER_TEMP/stage" >> "$GITHUB_ENV"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    # Restore-and-save: the build job primes this cache for its own arch only,
+    # so the first leg on the other arch downloads the bundle and saves it for
+    # the rest. `make install` writes into the tree afterwards, which is why
+    # the save happens on a miss right here rather than at the end of the job.
+    - name: Wine SDK
+      id: wine-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/wine-sdk
+        key: wine-${{ runner.os }}-${{ runner.arch }}-${{ inputs.wine-release }}
+
+    - name: Download the pinned Wine SDK
+      if: steps.wine-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/wine-sdk"
+        curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
+          "https://github.com/athei/wine-build/releases/download/${{ inputs.wine-release }}/wine-${{ inputs.wine-release }}-macos-x86_64.tar.xz"
+        tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
+
+    # The SDK is an x86_64 build and every PE it loads is x86 code; a no-op on
+    # an Intel machine.
+    - name: Rosetta
+      shell: bash
+      run: make setup-rosetta
+
+    - name: nextest
+      shell: bash
+      run: make setup-nextest NEXTEST_VERSION=${{ inputs.nextest-version }}
+
+    - name: Download the staged build
+      uses: actions/download-artifact@v4
+      with:
+        name: stage
+        path: ${{ runner.temp }}
+
+    - name: Unpack the staged build
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/stage"
+        tar -xf "$RUNNER_TEMP/mtld3d-stage.tar" -C "$RUNNER_TEMP/stage"

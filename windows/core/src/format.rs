@@ -273,7 +273,7 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 /// `map_d3d_format`, honouring whether the device has the packed 16-bit formats.
 ///
 /// On a device with native packed 16-bit support the answer is identical to
-/// `map_d3d_format`. Without it (Intel/AMD Mac2, or `debug.expandPacked16`),
+/// `map_d3d_format`. Without it (Intel/AMD Mac2, or `intel.expandPacked16`),
 /// the packed 16-bit D3D formats are backed by `Bgra8Unorm` instead;
 /// `bytes_per_pixel`/`block_bytes` stay 2 because they describe the SOURCE
 /// layout (Lock pitch, staging sizing — D3D9 Lock semantics are unchanged),

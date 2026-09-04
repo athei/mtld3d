@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     classify::Classification,
-    model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult},
+    model::{Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult},
     triage::DocSite,
 };
 
@@ -34,7 +34,7 @@ pub struct Report {
     pub text: String,
 }
 
-/// Compare `current` against `baseline` for every `(arch, subtest)`.
+/// Compare `current` against `baseline` for every `(leg, subtest)`.
 ///
 /// `classes` is the per-site triage loaded from CONFORMANCE.md — the diff
 /// consults it for the flaky tolerance and to flag baseline sites that have
@@ -43,14 +43,14 @@ pub struct Report {
 pub fn diff(
     baseline: &Baseline,
     classes: &BTreeMap<Site, DocSite>,
-    current: &BTreeMap<(Arch, Subtest), SubtestResult>,
+    current: &BTreeMap<(Leg, Subtest), SubtestResult>,
 ) -> Report {
     let mut text = String::new();
     let mut regressed = false;
     let mut stale = false;
-    for arch in Arch::ALL {
+    for leg in Leg::ALL {
         for subtest in Subtest::ALL {
-            let key = (arch, subtest);
+            let key = (leg, subtest);
             let Some(cur) = current.get(&key) else {
                 continue;
             };
@@ -154,7 +154,7 @@ pub fn diff(
             stale |= sub_stale;
             let _ = writeln!(
                 text,
-                "{arch}/{subtest}  baseline(failed={base_failed} crash={}) current(failed={cur_failed} crash={}) {status}",
+                "{leg}/{subtest}  baseline(failed={base_failed} crash={}) current(failed={cur_failed} crash={}) {status}",
                 u8::from(base_crash),
                 u8::from(cur.crash)
             );

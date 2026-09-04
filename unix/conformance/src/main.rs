@@ -31,7 +31,7 @@ use std::{
     process::ExitCode,
 };
 
-use crate::model::{Arch, Baseline, Subtest, SubtestResult};
+use crate::model::{Baseline, Leg, Subtest, SubtestResult};
 
 fn main() -> ExitCode {
     match real_main() {
@@ -46,7 +46,11 @@ fn main() -> ExitCode {
 fn real_main() -> Result<ExitCode, String> {
     let config = cli::parse_args(std::env::args().skip(1))?;
     let wine_version = run::wine_version(&config.wine);
-    println!("Wine: {wine_version} ({})", config.arch);
+    let leg = Leg {
+        arch: config.arch,
+        variant: config.variant,
+    };
+    println!("Wine: {wine_version} ({leg})");
 
     // `--only` narrows the subtest set; absent = all four.
     let subtests: Vec<Subtest> = config
@@ -56,22 +60,16 @@ fn real_main() -> Result<ExitCode, String> {
     // `--repeat N>1` is characterization, not a gate: run each selected subtest N
     // times and print a flap report, then exit 0 regardless of what fluttered.
     if config.repeat > 1 {
-        isolate::run_flap(
-            &config.wine,
-            &config.exe,
-            config.arch,
-            &subtests,
-            config.repeat,
-        )?;
+        isolate::run_flap(&config.wine, &config.exe, leg, &subtests, config.repeat)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut current: BTreeMap<(Arch, Subtest), SubtestResult> = BTreeMap::new();
+    let mut current: BTreeMap<(Leg, Subtest), SubtestResult> = BTreeMap::new();
     let mut validation_errors = 0;
     for &subtest in &subtests {
-        let run = run::run_subtest(&config.wine, &config.exe, config.arch, subtest)?;
+        let run = run::run_subtest(&config.wine, &config.exe, leg, subtest)?;
         validation_errors += run.validation_errors;
-        current.insert((config.arch, subtest), run.result);
+        current.insert((leg, subtest), run.result);
     }
 
     // Assets (baseline.txt) live in the crate directory by default; --assets
@@ -89,7 +87,7 @@ fn real_main() -> Result<ExitCode, String> {
             eprintln!("warning: ignoring unparseable prior baseline ({e}); new/dropped reporting incomplete");
             Baseline::default()
         });
-        let (next, summary) = merge::merge(&prior, config.arch, &current, wine_version);
+        let (next, summary) = merge::merge(&prior, leg, &current, wine_version);
         std::fs::write(&baseline_path, next.to_text())
             .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
         println!(
@@ -177,17 +175,17 @@ fn load_optional(path: &Path) -> Result<Baseline, String> {
 }
 
 /// Render fresh results as a plain per-subtest summary (no baseline to diff).
-fn render_current(current: &BTreeMap<(Arch, Subtest), SubtestResult>) -> String {
+fn render_current(current: &BTreeMap<(Leg, Subtest), SubtestResult>) -> String {
     let mut out = String::new();
-    for arch in Arch::ALL {
+    for leg in Leg::ALL {
         for subtest in Subtest::ALL {
-            let Some(cur) = current.get(&(arch, subtest)) else {
+            let Some(cur) = current.get(&(leg, subtest)) else {
                 continue;
             };
             let failed: u32 = cur.sites.values().sum();
             let _ = writeln!(
                 out,
-                "{arch}/{subtest}  failed={failed} crash={}",
+                "{leg}/{subtest}  failed={failed} crash={}",
                 u8::from(cur.crash)
             );
             for (site, count) in &cur.sites {

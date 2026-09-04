@@ -7,14 +7,14 @@
 //! green again) and which were dropped (their prose entries are now stale and
 //! must be removed).
 //!
-//! One run covers one architecture, so the merge is *arch-scoped*: the fresh
-//! results replace that arch's entries and every other arch is carried over
-//! untouched. Re-recording the whole file therefore means running each arch's
+//! One run covers one leg (an architecture under one variant), so the merge is
+//! *leg-scoped*: the fresh results replace that leg's entries and every other
+//! leg is carried over untouched. Re-recording the whole file means running each leg's
 //! baseline leg once, in either order.
 
 use std::collections::BTreeMap;
 
-use crate::model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult};
+use crate::model::{Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult};
 
 /// What a re-baseline changed, for the human-facing summary.
 #[derive(Default)]
@@ -30,16 +30,16 @@ pub struct MergeSummary {
     pub dropped_sites: Vec<Site>,
 }
 
-/// Build a new baseline from `fresh` results for `arch`.
+/// Build a new baseline from `fresh` results for `leg`.
 ///
-/// Entries the prior baseline holds for any *other* arch survive verbatim: a
-/// run only ever measured its own arch, so dropping the rest would record a
-/// regression-free score for tests that never ran.
+/// Entries the prior baseline holds for any *other* leg survive verbatim: a
+/// run only ever measured its own arch under its own variant, so dropping the
+/// rest would record a regression-free score for tests that never ran.
 #[must_use]
 pub fn merge(
     prior: &Baseline,
-    arch: Arch,
-    fresh: &BTreeMap<(Arch, Subtest), SubtestResult>,
+    leg: Leg,
+    fresh: &BTreeMap<(Leg, Subtest), SubtestResult>,
     wine_version: String,
 ) -> (Baseline, MergeSummary) {
     let mut next = Baseline {
@@ -47,7 +47,7 @@ pub fn merge(
         entries: prior
             .entries
             .iter()
-            .filter(|((a, _), _)| *a != arch)
+            .filter(|((l, _), _)| *l != leg)
             .map(|(&key, sub)| {
                 (
                     key,

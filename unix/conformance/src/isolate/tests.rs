@@ -7,7 +7,7 @@
 //! upstream flaky-marked sites stay in their own non-gating list.
 
 use super::{Aggregate, SiteFlap, render};
-use crate::model::{Arch, Site, Subtest};
+use crate::model::{Arch, Leg, Site, Subtest, Variant};
 
 fn site(line: u32) -> Site {
     Site {
@@ -52,7 +52,11 @@ fn report_separates_flapping_from_stable_and_lists_upstream_flaky() {
     agg.sites.insert(site(6516), flap_from(&[3, 3, 3, 3, 3]));
     agg.flaky_marked.insert(site(5406), 37);
 
-    let text = render(Arch::I686, Subtest::Device, &agg);
+    let leg = Leg {
+        arch: Arch::I686,
+        variant: Variant::Native,
+    };
+    let text = render(leg, Subtest::Device, &agg);
     assert!(
         text.contains("device.c:5368") && text.contains("<- FLAPS"),
         "{text}"

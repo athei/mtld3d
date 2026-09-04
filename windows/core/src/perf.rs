@@ -929,7 +929,7 @@ struct EncoderFrameCounters {
     ///
     /// Taken when a blit copy cannot express the upload: the texture's D3D
     /// format is packed 16-bit over a BGRA8 backing (a device without the
-    /// native packed formats, or `debug.expandPacked16`), or the staging row
+    /// native packed formats, or `intel.expandPacked16`), or the staging row
     /// pitch is under the device's linear texture alignment. The staging is
     /// read by a fragment function instead. One per upload, whatever the
     /// pass count (a volume upload opens one per slice), so the row still

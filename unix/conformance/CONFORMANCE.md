@@ -15,11 +15,25 @@ Because our `d3d9.dll` is installed as a Wine *builtin* (`make install`), runnin
 make conformance                # diff both arches vs baseline.txt
 make conformance-i686           # one arch, one runner process (what CI runs)
 make conformance-x86_64
-make conformance-baseline       # (re)record baseline.txt, both arches in sequence
+make conformance-intel          # both arches under the intel.* config keys
+make conformance-intel-i686     # one arch under the intel.* keys
+make conformance-baseline       # (re)record baseline.txt, all four legs in sequence
 ```
 
+A leg is one architecture under one variant. The `intel` variant
+(`--variant intel`) runs the same binary with every `intel.*` key of
+`mtld3d.conf` turned on, so the suite sees the answers an Intel/AMD Mac gives:
+packed 16-bit formats expanded, 32-bit float filtering denied, Managed
+buffers, the 256-byte linear texture alignment. Its results record under
+`[<arch>+intel/<subtest>]` entries of the same `baseline.txt`, and the sites
+share the classifications below, since a site's nature does not depend on the
+leg that hit it. The two keys that only change a code path and no answer,
+`intel.managedMemory` and `intel.linearAlign256`, must move no count at all;
+a site that fails only under the variant is expected to trace to one of the
+two caps keys.
+
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
-output to `<dir>/<arch>-<subtest>.log`. The normal run reduces output to per-site
+output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
 counts and drops the assertion text; the raw logs keep every
 `<file>.c:<line>: Test failed: Got <actual>, expected <expected>` message (plus
 the Metal-validation lines), which is what the per-cluster audit below was built
@@ -38,9 +52,10 @@ instead.
 The runner is the Rust tool `mtld3d-conformance` (`unix/conformance/`). It takes
 the loader and one test binary as explicit paths (`--wine`, `--exe`, plus
 `--arch` as the label to record under) and resolves nothing itself: every Wine
-location lives in the Makefile. One invocation therefore covers one
-architecture, which is what lets the 32-bit and 64-bit gates be separate CI
-jobs, and `--update-baseline` rewrites only its own arch's entries. It runs each
+location lives in the Makefile. One invocation therefore covers one leg,
+which is what lets the 32-bit and 64-bit gates, and the native and Intel
+variants, be separate CI jobs, and `--update-baseline` rewrites only its own
+leg's entries. It runs each
 subtest as its own process, so a crash in one cannot poison another's counts,
 with Metal API validation left on in `nslog` mode (it logs rather than aborting,
 so it cannot mask the failure counts) and with our logs and Wine's debug
@@ -191,9 +206,15 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **0 `real` · 92 `expected` ·
-3 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 8
-subtest-arches `crash=0`. (2026-08-27: device.c:15088 moved from `expected`
+re-checked before retagging. Headline: **3 `real` · 92 `expected` ·
+4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 16
+subtest-legs `crash=0`. (2026-09-04: the Intel legs, which run every subtest
+under the `intel.*` config keys, added device.c:3626, 7927 and 8181 as `real`
+(issues #362, #363) and visual.c:28024 as `caps`; no site moved under the two
+keys that change only a code path, `intel.managedMemory` and
+`intel.linearAlign256`. The `ceiling` and `flaky` pins of the native device
+legs are carried on the Intel legs at the same counts, since the environment
+they depend on is the same.) (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
 newly-running `srgbtexture_test` passes. 2026-08-28: honouring
@@ -301,13 +322,20 @@ walk further):
   next `Reset`, because the device is never reported lost and so nothing
   would prompt that `Reset` (test_wndproc 4302).
 
-### The `real` backlog (empty)
+### The `real` backlog
 
-No site is currently classified `real`. Every failing site is a recorded
-decision (`expected`), a capability we do not advertise (`caps`), a pin that
-reads zero on other hardware (`ceiling`), or a known flap (`flaky`), each with
-its rationale in the per-cluster section below. A site returns to `real` the
-moment a divergence is found that we intend to close.
+Three sites, all on the Intel legs only, none reachable on Apple Silicon:
+
+- device.c:3626 and device.c:7927, issue #362: `CheckDeviceType` and the
+  `AUTOGENMIPMAP` probe keep advertising 16-bit formats on a device that
+  cannot render them, while `CheckDeviceFormat(RENDERTARGET)` denies them.
+- device.c:8181, issue #363: `ValidateDevice` answers S_OK whatever the
+  sampler filters and the bound texture's filter capability are.
+
+Every other failing site is a recorded decision (`expected`), a capability we
+do not advertise (`caps`), a pin that reads zero on other hardware
+(`ceiling`), or a known flap (`flaky`), each with its rationale in the
+per-cluster section below.
 
 The `device` subtest used to die silently inside test_volume_get_container
 (a `GetContainer` that answered E_NOINTERFACE with a null container, which
@@ -539,7 +567,42 @@ Sites: 12689=expected 12694=expected
 CheckDepthStencilMatch(..., D3DFMT_D32): native returns NOTAVAILABLE; we
 return D3D_OK because D32 genuinely maps to Depth32Float and works. We
 advertise MORE than native here, deliberately; not an omitted-cap (`caps`)
-case, and our answer is truthful for our backend.
+case, and our answer is truthful for our backend. 12694 is the R5G6B5
+render-target row of that check, so it fires on the native legs only: on the
+Intel legs R5G6B5 is no render target and the answer is the NOTAVAILABLE the
+test expects.
+
+### device.c/test_check_device_type
+Sites: 3626=real
+
+Intel legs only. The test derives the expected `CheckDeviceType` answer from
+`CheckDeviceFormat(RENDERTARGET, back buffer)`: where the back-buffer format
+is no render target, the device type must be refused. On a device without
+the packed 16-bit formats we deny R5G6B5 / A1R5G5B5 as render targets and
+still accept them as back buffers, windowed and fullscreen, because
+`CreateDevice` serves any 16-bit back buffer through the BGRA8 layer format.
+The two answers contradict each other on that device (issue #362); on Apple
+Silicon both are yes and the site never fires.
+
+### device.c/test_mipmap_gen
+Sites: 7927=real
+
+Intel legs only. For a texture format the device does not render, the
+`AUTOGENMIPMAP` probe must answer `D3DOK_NOAUTOGEN`; we answer D3D_OK for
+A1R5G5B5 while denying it as a render target, because mip generation works on
+the BGRA8 backing the expansion path gives it. Same inconsistency as
+test_check_device_type, same issue (#362).
+
+### device.c/test_filter
+Sites: 8181=real
+
+Intel legs only. `ValidateDevice` is expected to answer
+`D3DERR_UNSUPPORTEDTEXTUREFILTER` for a stage whose mag or min filter is
+`D3DTEXF_NONE`, texture or not, and `E_FAIL` for a linear filter on a bound
+texture whose format the device does not filter. Ours answers S_OK with one
+pass unconditionally (issue #363). The test skips where A32B32G32R32F
+filters, which is every Apple GPU, and runs where the 32-bit float filter
+probe is negative, which the Intel legs force.
 
 ### device.c/test_miptree_layout
 Sites: 12784=expected 12823=expected
@@ -753,6 +816,17 @@ Sites: 27902=expected
 FLOAT→unorm rounding at exactly .5: Metal rounds 76.5 up (77), refrast
 truncates (76). A ±1 GPU rounding-convention difference with no cap branch;
 mimicking refrast exactly is not feasible or desirable.
+
+### visual.c/test_format_conversion
+Sites: 28024=caps
+
+Intel legs only. The test expects `CheckDeviceFormatConversion(YUY2,
+R5G6B5)` to answer D3D_OK, as every desktop driver does. A conversion
+destination has to be renderable, since the StretchRect quad draws into it,
+and on a device without the packed 16-bit formats R5G6B5 is no render target,
+so the answer is NOTAVAILABLE. That is the conformant answer for a device
+without the capability; the same rule is pinned by the e2e
+`check_format_conversion` test, which asks the device first.
 
 ### stateblock.c clusters
 

@@ -8771,12 +8771,21 @@ fn encoder_thread_main(
     prewarm_rx: &mpsc::Receiver<PrewarmPayload>,
     gpu_caps: GpuCaps,
 ) {
-    if !gpu_caps.unified_memory {
+    let apple = GpuCaps::apple_silicon_default();
+    if !gpu_caps.unified_memory
+        || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
+    {
+        let cfg = &*crate::config::CONFIG;
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "non-UMA Mac detected: hasUnifiedMemory=false, min_linear_texture_align={} \
-             — repack_blit_source_padded path active for tiny mips",
+            "Intel-family GPU paths active: unified_memory={} (forced={}), \
+             min_linear_texture_align={} (forced={}): CPU-visible buffers are Managed \
+             with didModifyRange after every write, tiny mips take the padded staging \
+             or the upload pass",
+            gpu_caps.unified_memory,
+            cfg.managed_memory,
             gpu_caps.min_linear_texture_align,
+            cfg.linear_align256,
         );
     }
     let mut enc = FrameEncoder::new(gpu_caps);
