@@ -34,12 +34,17 @@ env:
   MTL_HUD_ENABLED: "0"
 
 jobs:
-  # The linear part: one job downloads and builds the shared state (toolchains,
-  # the ~3 GB MSVC SDK splat, the Wine bundle, the cargo registry) and saves it
-  # to the cache, so the legs below start warm instead of a dozen runners racing
-  # to splat the same SDK.
+  # The linear part: one job per runner architecture downloads and builds the
+  # shared state (toolchains, the ~3 GB MSVC SDK splat, the Wine bundle, the
+  # cargo registry) and saves it to the cache, so the legs below start warm
+  # instead of a dozen runners racing to splat the same SDK. The caches are
+  # keyed by runner architecture, so the arm64 images share one set and the
+  # Intel image primes its own.
   setup:
-    runs-on: macos-26
+    strategy:
+      matrix:
+        runner: [macos-26, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -128,20 +133,36 @@ jobs:
       - run: make test-unit
 
   # The end-to-end suite: real PE binaries, run by the pinned Wine against a
-  # Metal device, one leg per PE arch and per variant. Needs everything, `wine`
-  # included, since the leg installs our builtin into the SDK tree and boots a
-  # prefix. The `intel` variant runs the same suite with every `intel.*` config
-  # key on, i.e. under the device answers an Intel/AMD Mac gives, so those code
-  # paths are exercised on the runner too.
+  # Metal device, one leg per image, PE arch and variant. Needs everything,
+  # `wine` included, since the leg installs our builtin into the SDK tree and
+  # boots a prefix.
+  #
+  # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
+  # on arm64, and the Intel image, whose paravirtual device has no unified
+  # memory, no packed 16-bit formats and a 256-byte linear texture alignment,
+  # so it runs the real Intel/AMD code paths with the strict Managed-memory
+  # semantics the forced runs cannot check. The `intel` variant runs the same
+  # suite with every `intel.*` config key on and only makes sense on an
+  # Apple-family device, so it runs on the newest arm64 image alone. The two
+  # older images are advisory until their first runs are read.
   test-e2e:
     needs: setup
-    runs-on: macos-26
-    timeout-minutes: 60
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.runner != 'macos-26' }}
     strategy:
       fail-fast: false
       matrix:
+        runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
-        variant: [native, intel]
+        variant: [native]
+        include:
+          - runner: macos-26
+            arch: i686
+            variant: intel
+          - runner: macos-26
+            arch: x86_64
+            variant: intel
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/prepare
@@ -173,16 +194,28 @@ jobs:
   # zero on this display; those carry the `ceiling` class, whose pin is a
   # cross-environment maximum.
   # The `intel` variant runs the suite under every `intel.*` config key and
-  # gates on its own `<arch>+intel` baseline entries.
+  # gates on its own `<arch>+intel` baseline entries, on the newest arm64
+  # image alone. The two older images run the native suite as advisory legs:
+  # the baseline carries no per-image entries yet, so their counts are read
+  # from the artifact until they are recorded and triaged.
   conformance:
     needs: setup
-    runs-on: macos-26
-    timeout-minutes: 45
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.runner != 'macos-26' }}
     strategy:
       fail-fast: false
       matrix:
+        runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
-        variant: [native, intel]
+        variant: [native]
+        include:
+          - runner: macos-26
+            arch: i686
+            variant: intel
+          - runner: macos-26
+            arch: x86_64
+            variant: intel
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/prepare
@@ -204,7 +237,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: conformance-raw-${{ matrix.variant }}-${{ matrix.arch }}
+          name: conformance-raw-${{ matrix.runner }}-${{ matrix.variant }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error

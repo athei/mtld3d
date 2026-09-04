@@ -204,11 +204,14 @@ The description is what survives, and for anything non-trivial it carries:
 4. At least one considered alternative, including the dead ends.
 5. Verification: the commands you ran and what a reviewer should look for.
 
-Every check leg runs per pull request, plus both end-to-end architectures, the
-bundle, and both conformance architectures. The conformance legs are advisory:
-the runner's GPU is paravirtual and diverges from the baseline in both
-directions, so read their artifact rather than their status, and run
-`make conformance` locally when your change touches the render or
+Every check leg runs per pull request, plus the end-to-end and conformance
+suites on three images: the newest macOS on arm64, the oldest macOS mtld3d
+supports on arm64, and the Intel image, whose device has no unified memory
+and none of the packed 16-bit formats, so it runs the Intel/AMD code paths
+for real. On the newest arm64 image both suites also run under every
+`intel.*` key. The newest image gates; the two older ones are advisory until
+their counts are recorded, so read their artifacts rather than their status,
+and run `make conformance` locally when your change touches the render or
 shader-emission path.
 
 The end-to-end legs run serially in CI on purpose, because parallel device
