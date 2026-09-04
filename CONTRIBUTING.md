@@ -12,7 +12,7 @@ at it.
 
 | File | What it owns |
 | --- | --- |
-| [`README.md`](README.md) | The goal, what is and is not implemented, and how to build, install, configure and log. |
+| [`README.md`](README.md) | The goal, the requirements, what plays, what is and is not implemented, and where everything else lives. |
 | [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The boundary contract: thunk versus command, stable backing for pointers the unix side dereferences, typed wire values, labelling Metal objects, the threading model, the perf counters and how to read them. |
 | [`unix/conformance/CONFORMANCE.md`](unix/conformance/CONFORMANCE.md) | The conformance suite: how the runner and the baseline work, what each classification means, and the current per-site audit with its rationales. |
@@ -92,9 +92,10 @@ operation that is valid.
 Speed is the goal and conformance serves it, so a divergence that buys frame time
 and breaks no game is allowed to stay. What is not allowed is a silent one.
 
-A kept divergence is a decision with three obligations: it goes in the README
-list of divergences kept on purpose, its conformance sites carry the rationale in
-`CONFORMANCE.md`, and where a knob makes sense it is revertible from
+A kept divergence is a decision with three obligations: it gets its line in
+the README's list of kept divergences, its rationale goes in the Kept
+divergences section of `CONFORMANCE.md` (plus the cluster prose where Wine's
+suite has a site for it), and where a knob makes sense it is revertible from
 `mtld3d.conf`. "It matches what we ship today" is not a justification for a
 change, because what we ship today may itself be the divergence. Prove a claim
 about observable behaviour with a test that fails before the change and passes
@@ -154,10 +155,11 @@ Each of these rots silently when it is left for later:
   cache key serves stale MSL, and the result looks like a rendering bug.
 - A new config key ships with its dispatch arm, its unit test, and its entry in
   the `mtld3d.conf` sample with the default and a short why.
-- A new built-in app profile ships with the rationale for every key it sets, a
-  test that resolves it from the version strings the shipped binary actually
-  carries, and its row in the README profile table. A profile that pins no
-  version field is not a profile, it is a name collision waiting to happen.
+- A new built-in app profile ships with the rationale for every key it sets as
+  the comment on its entry in `windows/core/src/app_profile.rs`, a test that
+  resolves it from the version strings the shipped binary actually carries, and
+  its line in the README profile list. A profile that pins no version field is
+  not a profile, it is a name collision waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
   (`scripts/audit.sh --update-derives`).
 

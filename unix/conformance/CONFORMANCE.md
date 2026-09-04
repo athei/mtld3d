@@ -97,6 +97,60 @@ leg that logged any `metal-validation:` line exits non-zero even when every
 site holds its pin, because API misuse is invisible to a pass/fail count. A
 `--update-baseline` or `--repeat` run never gates, so neither one applies it.
 
+## Kept divergences
+
+Divergences from D3D9 kept on purpose, because closing them costs frame time,
+memory, or a game that relies on the looser behaviour. The README lists them
+in one line each; this section is where the reasoning lives. Where Wine's
+suite observes a divergence, the cluster below carries the site-level detail
+and is named here; the rest have no conformance site and this is their only
+record. A knob, where one makes sense, is named with its default.
+
+- **`IDirect3DTexture9::LockRect` serves a level of a DEFAULT-pool 2D texture
+  created without `D3DUSAGE_DYNAMIC`**, which D3D9 rejects. The surface entry
+  point, cube and volume locks still reject it. A game that streams into such
+  a texture would otherwise lose every upload. The cost is system memory: the
+  level's staging, released once its upload retires, is re-created, and a
+  partial lock after that release leaves the pixels outside its rect out of
+  step with the GPU copy (warned once per texture). No knob.
+- **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
+  instead of waiting for the GPU. Off by default. A title that uses the poll
+  loop only as a GPU fence and never reads the count pays API-thread time for
+  nothing; the `wow` profile turns it on. Knob: `query.flushImmediate`,
+  default `false`.
+- **Depth stores are elided where nothing reads the buffer back.** Content
+  relying on depth surviving a pass it never cleared can read stale depth.
+  Preserving it unconditionally costs the optimization on every frame of every
+  game that does clear, which is all tested ones. Sites: `z_range_test` and
+  `texdepth_test` below (store-action Rule B). No knob.
+- **A partial `Lock` of a dynamic vertex or index buffer without
+  `D3DLOCK_DISCARD` returns a pointer into memory a queued draw may still
+  read.** D3D9 keeps the game's writes from landing under a draw the GPU has
+  not reached; here `D3DLOCK_NOOVERWRITE` semantics apply by default. Matching
+  D3D9 means stalling or renaming the backing on every such lock, and a
+  dynamic buffer is what a UI or particle batcher locks dozens of times per
+  frame. The rename path has been measured peaking near 1.4 GB of retained
+  backings, which is why `memory.vbibRetentionCapMB` exists. Site:
+  `test_map_synchronisation` below. No knob.
+- **A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
+  `D3DLOCK_READONLY` returns a pointer into staging an upload may still
+  read.** The same trade for a font atlas or lightmap page written a few
+  rectangles at a time. A whole-level lock is renamed and its contents
+  preserved, because Half-Life 2's lightmap pages rely on that. No knob.
+- **A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
+  no CPU copy once every byte has reached the GPU.** D3D9 preserves contents
+  across a plain `Lock` whatever the usage says, so a title that reads back
+  through the pointer sees zeros, and one that writes past its announced
+  window loses those bytes (warned once). Inside a large-address-aware 32-bit
+  title those copies measured near a gigabyte of the 4 GiB the title needs
+  itself. An indexed triangle fan on a released index buffer copies it back
+  off the GPU once, at one mid-frame GPU wait. Knob: `buffer.ignoreLockBounds`
+  keeps the copy, default `false`.
+- **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
+  count to the pass's attachments with no per-draw override.
+  `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
+  says the toggle is unavailable, and the first write is logged. No knob.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:
@@ -386,7 +440,8 @@ fullscreen game through releasing and rebuilding its whole `D3DPOOL_DEFAULT`
 working set on each activation change, which costs frame time and risks the
 game's own recreate path, for a device that lost nothing. The
 `D3DERR_DEVICENOTRESET` half is real and implemented: a failed `Reset`
-latches it until one succeeds. Also listed in the README's kept divergences.
+latches it until one succeeds. Listed under Deliberately not implemented
+in the README.
 
 4551 is `expected`, and follows from the same no-modeset decision as the
 message sites above. It reads a `WINDOWPOS` the test's wndproc only captures

@@ -69,13 +69,17 @@ through the bottle's DLL search path and never enters CrossOver's own
 
 ## Requirements
 
-- **Apple Silicon macOS 15** or newer.
+What the test suites run on in CI:
+
+- **macOS 15 or macOS 26**, on Apple Silicon or Intel.
+- A Wine from [wine-build](https://github.com/athei/wine-build), the release
+  CI pins, which is based on **CrossOver 26**. CrossOver 27 with its arm64 Wine
+  has been tested by hand. Older Wine or CrossOver releases are not expected to
+  work.
+- A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
 - **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, which
   is what most builds are: the game and the whole PE side are x86. An arm64
   Wine brings its own x86 translation (FEX) and does not need it.
-- A Wine with the current WoW64 loader: **Wine 8.0 or newer**, or
-  **CrossOver 24 or newer**.
-- A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
 
 ## x87 performance
 
@@ -308,3 +312,11 @@ driver switches the whole desktop to the game's mode.
 The resolution picked in the game's video options therefore sizes the frame.
 `render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
 pixels and upscaling the result to the screen.
+
+The resolution list a game sees carries sizes of the display's own aspect
+only, largest first and at most 15 per colour format, because Wine's full list
+overflows menus built for a driver's short one. Any mode Wine accepts stays
+settable whether listed or not. A request that matches no mode, such as a size
+a game derived from its own window, follows the window instead. A fullscreen
+game is never told it lost its device on a focus change: the desktop mode
+comes back on deactivation and the game's mode is set again on activation.
