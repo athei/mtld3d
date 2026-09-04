@@ -144,8 +144,10 @@ jobs:
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
   # INTEL=1`) and do not run here. Each suite is split in three hash-sharded
-  # partitions, so three machines share it. The two older images are advisory
-  # until their first runs are read.
+  # partitions, so three machines share it. The two older images are advisory:
+  # the arm64 one until its counts are recorded, the Intel one until what its
+  # first run found is fixed (#364, #365, #366: a texture usage bit its views
+  # need, a Shared texture it rejects, a sampler it never binds).
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
