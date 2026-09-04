@@ -351,11 +351,23 @@ jobs:
           sysctl -n machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
           ls "$HOME/wine-sdk/wine/lib/wine" | head
           ls "$HOME/wine-sdk/wine/lib/wine/x86_64-windows" | head -5
-          # The prefix boot, with the loader narrating every module it opens.
-          WINEDEBUG=+loaddll,+module,+process,+virtual "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | head -150 || true
-          echo "reg add pipeline exit ${PIPESTATUS[0]}"
+          # The prefix boot, with every process and module load, every exception
+          # and the time of each, kept whole as an artifact; the errors and the
+          # end of it inline.
+          WINEDEBUG=+timestamp,+loaddll,+process,+seh,+winediag "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-trace.log" 2>&1 || echo "reg add exit $?"
+          echo "== errors, warnings, exceptions"
+          grep -aE 'err:|warn:|seh:|winediag' "$RUNNER_TEMP/wine-trace.log" | head -60
+          echo "== last lines"
+          tail -60 "$RUNNER_TEMP/wine-trace.log"
           ls -la "$HOME/.wine" "$HOME/.wine/drive_c" "$HOME/.wine/drive_c/windows" 2>/dev/null || true
           "$HOME/wine-sdk/wine/bin/wineserver" -k || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wine-trace-${{ matrix.runner }}
+          path: ${{ runner.temp }}/wine-trace.log
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
           cat > "$RUNNER_TEMP/packed.swift" <<'EOF'
