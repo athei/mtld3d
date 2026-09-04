@@ -272,7 +272,13 @@ Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Headline: **3 `real` · 92 `expected` ·
 4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 16
-subtest-legs `crash=0`. (2026-09-04: the Intel legs, which run every subtest
+Apple-family subtest-legs `crash=0`. (2026-09-05: the `@mac2` legs, recorded
+on the Intel CI image, added 22 sites, every one `expected` and every one a
+property of that machine, its single-mode display or the GPU family, in the
+`test_mode_change`, `test_get_display_mode`, swizzle-format, `test_fetch4`,
+`fp_special_test`, `test_multisample_get_front_buffer_data` and
+`multisampled_depth_buffer_test` clusters; the eight `@mac2` subtest-legs are
+`crash=0` too.) (2026-09-04: the Intel legs, which run every subtest
 under the `intel.*` config keys, added device.c:3626, 7927 and 8181 as `real`
 (issues #362, #363) and visual.c:28024 as `caps`; no site moved under the two
 keys that change only a code path, `intel.managedMemory` and
@@ -554,6 +560,7 @@ which the runner does not count.
 Sites: 5509=ceiling 5533=ceiling 5537=ceiling 5584=ceiling
 Sites: 5602=ceiling 5622=ceiling 5636=ceiling 5639=ceiling 5646=ceiling
 Sites: 5671=ceiling 5674=ceiling
+Sites: 5598=expected 5618=expected 5641=expected 5676=expected 5900=expected
 
 Desktop display-mode-change lifecycle (`ChangeDisplaySettingsW` success,
 `EnumDisplaySettings` reflecting changes/restores, fullscreen window resize).
@@ -563,6 +570,21 @@ pins date from when physical mode switching was disabled and they failed
 here while reading zero on a CI runner. 5552/5554 (the back buffer must keep
 the size a fullscreen create asked for across an external mode change) pass
 because the back buffer honors the request and never follows the window.
+5598/5618/5641/5676/5900 ("Failed to restore display modes") fire on the
+`@mac2` legs only: the Intel CI image's paravirtual display lists a single
+mode, so user32 refuses the mode the test sets and the restore that follows
+it, and a fullscreen device there takes the non-mode path (the back buffer
+follows the window). Desktop mode switching is out of scope, so `expected`;
+a real Intel/AMD Mac lists its modes and reads zero here.
+
+### device.c/test_get_display_mode
+Sites: 14378=expected 14379=expected 14383=expected 14384=expected
+Sites: 14390=expected 14391=expected
+
+`@mac2` legs only. The test sets 640x480 through `ChangeDisplaySettingsW`
+and expects `GetDisplayMode` to answer it; the paravirtual display refuses
+the mode (see `test_mode_change` above) and the answer stays the desktop
+mode. The same scope decision as the desktop-mode cluster.
 
 ### device.c/test_device_window_reset
 Sites: 5968=expected
@@ -774,6 +796,7 @@ A32B32G32R32F) and L8 pass.
 
 ### visual.c/test_fetch4
 Sites: 15617=caps 15668=ceiling 15824=ceiling 15829=ceiling
+Sites: 15727=expected
 
 Fetch4 is an AMD vendor extension enabled via a magic FOURCC through
 D3DSAMP_MIPMAPLODBIAS; DF16/DF24 are vendor depth-texture FOURCCs we map to
@@ -781,7 +804,10 @@ Depth32. We deliberately advertise none of it; our output is the correct
 fetch4-off/format-absent result (accepted by the test only under broken()).
 15668/15824/15829 counts wobble with display environment, hence `ceiling` —
 keep the higher pin (a count-down is tolerated; a low pin makes the flutter-back a false
-regression).
+regression). 15727 (`@mac2` legs only) is the 3D section's `L8` volume
+texture, which reads its green and blue lanes through the channel swizzle
+the paravirtual device ignores (the swizzle cluster above): the sample
+carries red alone there.
 
 ### visual.c/fp_special_test
 Sites: 16433=expected
@@ -791,6 +817,25 @@ results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
 GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
 result matching no vendor's encoding. Matching a specific vendor is neither
 feasible nor desirable. No capability involved (old `caps` tag incoherent).
+The `@mac2` legs count three, not two: the paravirtual device encodes one
+more instruction's result its own way.
+
+### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats
+Sites: 5090=expected 5169=expected 6034=expected 20702=expected
+Sites: 20751=expected
+
+`@mac2` legs only, one mechanism. Every format whose D3D9 sample fills a
+lane the Metal format lacks (R32F's green and blue, G16R16's alpha, V8U8's
+blue and alpha, X8R8G8B8's alpha, L8's green and blue) is handed out as a
+texture view with a channel swizzle. The paravirtual device on the Intel CI
+image creates that view, reports the swizzle on it, and samples through the
+base texture's lanes anyway, measured in the workflow's probe job; every
+real GPU family applies the swizzle. So R32F reads its missing lanes as
+zero (5090), G16R16 its alpha as zero (5169), V8U8 its blue as the stored
+byte (20702, 20751), and the autogen X8R8G8B8 chain its padding byte as
+alpha (6034). A device limitation with no D3D9-side answer, so `expected`;
+none of these fire on the Apple family, and a real Intel/AMD Mac is expected
+to read zero here.
 
 ### visual.c/add_dirty_rect_test
 Sites: 19210=expected 19217=expected 19232=expected
@@ -801,6 +846,31 @@ sub-rect may refresh (19232). Our design uploads whole mips eagerly with
 self-tracked dirtiness and treats AddDirtyRect as a no-op — we show fresher
 data than required. Deliberate; the READONLY-first-lock upload defect that
 used to live here (19156/19163) is fixed.
+
+### visual.c/test_multisample_get_front_buffer_data
+Sites: 17167=expected 17169=expected 17179=expected 17181=expected
+
+`@mac2` legs only. After the `Reset` to a two-sample back buffer,
+`GetFrontBufferData` into a 640x480 system-memory surface answers
+`D3DERR_INVALIDCALL` there (17167, 17179) and the reads that follow see
+nothing (17169, 17181). The read-back measures the destination against the
+back buffer's extent, so the back buffer after that `Reset` is not 640x480
+on the paravirtual display, whose single mode makes the request a non-mode
+one (`test_mode_change` above); that mechanism is inferred from the
+rejection, not read from a trace. The Apple-family legs pass every site.
+
+### visual.c/multisampled_depth_buffer_test
+Sites: 17330=expected 17476=expected
+
+`@mac2` legs only. Both sections resolve a multisampled depth surface
+through `StretchRect` and then depth-test draws against the resolve target.
+The paravirtual device hands a later encoder of the same command buffer the
+content the resolve target held before the resolve (measured in the
+workflow's probe job, with and without an encoder in between); Apple GPUs
+see the resolve. The draws are therefore tested against the target's clear
+rather than the resolved scene. A device fault in Metal's ordering guarantee
+that no layer-side change short of a submit per resolve would mask, so
+`expected`; a real Intel/AMD Mac is expected to read zero here.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected
