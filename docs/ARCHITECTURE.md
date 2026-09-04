@@ -10,7 +10,7 @@ test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 (x64 PE)   (x64 PE)   (x64 PE)   (Mach-O, Wine's own arch)
 ```
 
-The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), so it is built and shipped for both `x86_64-apple-darwin` and `aarch64-apple-darwin`. x86_64 is what every Wine on macOS uses today; the arm64 artifact is groundwork for an arm64-native one.
+The PE column is fixed by the game; the `.so` follows the arch of the Wine build that loads it (Wine resolves unix libraries out of `lib/wine/<cpu>-unix`), so it is built and shipped for both `x86_64-apple-darwin` and `aarch64-apple-darwin`. An x86_64 Wine loads the first, with the PE side translated by Rosetta 2; an arm64 Wine loads the second and translates the PE side itself (FEX).
 
 - `d3d9.dll` — D3D9 API implementation. COM vtables, caps, state management. Calls Metal-level thunks via its internal `unix_call` caller stub (`windows/d3d9/src/unix_call.rs`).
 - `mtld3d.dll` — PE shim. Links winecrt0, owns Wine unix-call globals, exports `mtld3d_unix_call()`. Forwards every cross-boundary call from `d3d9.dll` into `mtld3d.so`.
@@ -18,6 +18,25 @@ The PE column is fixed by the game; the `.so` follows the arch of the Wine build
 - `mtld3d-core` — pure-Rust rlib linked into `d3d9.dll`. Host-testable.
 - `shared` — PE↔Unix wire-format definitions plus cross-linkage-unit helpers.
 - `types` — D3D9 type definitions (vtables, caps structs) shared between d3d9 and tests.
+
+## Workspaces and crates
+
+Two Cargo workspaces, one per target platform: `windows/` builds the PE side for `i686-pc-windows-msvc` and `x86_64-pc-windows-msvc`, `unix/` the Mach-O side for `x86_64-apple-darwin` and `aarch64-apple-darwin` (the latter is also the native test target). Open each in its own editor window for rust-analyzer to work.
+
+| Crate               | Workspace  | Output                                                 |
+|---------------------|------------|--------------------------------------------------------|
+| `d3d9`              | `windows/` | `d3d9.dll`                                             |
+| `mtld3d`            | `windows/` | `mtld3d.dll`, the shim                                 |
+| `mtld3d-core`       | `windows/` | rlib linked into `d3d9.dll`                            |
+| `mtld3d-types`      | `windows/` | rlib, D3D9 type definitions shared with the tests      |
+| `mtld3d-tests`      | `windows/` | the end-to-end suite                                   |
+| `mtld3d-unix`       | `unix/`    | `mtld3d.so`                                            |
+| `mtld3d-shared`     | `unix/`    | rlib shared by `d3d9.dll`, `mtld3d.dll` and `mtld3d.so` |
+| `mtld3d-conformance`| `unix/`    | the conformance runner                                 |
+
+`mtld3d-core` holds every platform-independent helper (DXSO to MSL emission, the render-pass state machine, the slab allocator, format / FVF / vertex-decl / dirty-rect math, fixed-function state) and compiles for the macOS host as well as PE, so `cargo test -p mtld3d-core --target aarch64-apple-darwin` runs its unit tests natively instead of through Wine.
+
+`mtld3d-shared` is the crate every linkage unit depends on, primarily for the PE/Unix wire format (the `Command` enum, the `Thunks` enum, param structs, typed `mtl::` wire values). Pure data and pure-Rust helpers only, no FFI and no `#[link]`, so both workspaces can depend on it cleanly. The internal crates are path dependencies and are not published to crates.io.
 
 ## Threading model
 
@@ -115,6 +134,39 @@ How to apply:
 Trait-import caveat: `setLabel` lives on different traits depending on the object. `MTLBuffer` / `MTLTexture` / `MTLSamplerState` / `MTLDepthStencilState` need `use objc2_metal::MTLResource;`. `MTLRenderCommandEncoder` / `MTLBlitCommandEncoder` need `use objc2_metal::MTLCommandEncoder;`. `MTLCommandBuffer` and `MTLCommandQueue` provide it on their own protocol traits, no extra import.
 
 Cost: one `format!` + one `NSString::from_str` + one objc dispatch per create call. Negligible — paid only at object-create time (cache miss / per-frame at most). Ship unconditionally; never gate on `cfg(debug_assertions)`.
+
+## Logging
+
+Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and `env_logger` matches by `::`-separated prefix, so `RUST_LOG=mtld3d=warn` is the single switch for the whole project; unset, everything logs at `info`. Levels: `info!` for one-shot milestones, `warn!` for unimplemented stubs and fallback paths, `error!` for unexpected internal failures, `trace!` for per-call breadcrumbs, `debug!` for routine per-call noise useful in deep debugging.
+
+| Target                    | Scope                                                                    |
+|---------------------------|--------------------------------------------------------------------------|
+| `mtld3d::d3d9`            | `windows/d3d9/` + `windows/core/` (everything except `dxso` and `perf`)  |
+| `mtld3d::d3d9::cursor`    | hardware cursor (HCURSOR) lifecycle, bitmap cache, wndproc               |
+| `mtld3d::d3d9::display`   | fullscreen mode-set and restore, display-mode enumeration probes (trace) |
+| `mtld3d::d3d9::passes`    | pass-break and pass-open probes, per-pass and per-RT shape rows (trace)  |
+| `mtld3d::d3d9::state`     | every RS/TSS/SAMP write the game makes (trace)                           |
+| `mtld3d::d3d9::cascade`   | shadow-map cascade summary per frame, caster writes vs samples (trace)   |
+| `mtld3d::d3d9::depth`     | depth-stencil binds, per-stage depth-sampler mask, load actions (trace)  |
+| `mtld3d::d3d9::tex`       | texture create, lock/unlock dirty flags, bind-time mip flush (trace)     |
+| `mtld3d::d3d9::blit`      | accepted `StretchRect` blits, including the scaling render path (trace)  |
+| `mtld3d::d3d9::draw`      | per-draw breadcrumb (trace)                                              |
+| `mtld3d::d3d9::sampler`   | sampler-state translation (trace)                                        |
+| `mtld3d::d3d9::caster`    | one row per unique shadow-caster pipeline state (trace)                  |
+| `mtld3d::d3d9::decal`     | the implicit decal-bias decision per (VS, PS) pair (trace)               |
+| `mtld3d::dxso`            | DXSO to MSL emitter (`trace` dumps the MSL)                              |
+| `mtld3d::perf`            | 5-second averaged performance summary (`PERF=1` builds only)             |
+| `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
+| `mtld3d::unix`            | Metal-side `.so`                                                         |
+| `mtld3d::unix::cursor`    | software cursor overlay window: sprite renders, show/hide, layer mode    |
+| `mtld3d::unix::present`   | presented-cadence probe, one row per frame (trace)                       |
+| `mtld3d::unix::depth`     | comparison-sampler creation, the unix mirror of `d3d9::depth` (trace)    |
+
+Each cdylib initializes the logger independently and idempotently; `mtld3d.so` has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger` thunk from its init path. Every line goes to the process's log file, `<exe>-<pid>.log` under `mtld3d-logs` beside the executable (`log.dir` moves it), never to the standard streams: a game a launcher spawned has no usable ones. `<pid>` is the macOS process id, so a launch never overwrites the log of the one before it; the directory keeps the ten newest logs and the ten newest traces, and the file appears with the first line written, so a process that logs nothing leaves nothing behind.
+
+### F12: three-frame dump and GPU capture
+
+Pressing F12 in a game records the next three frames twice over. The log gets one `[dump]` line at info level for every D3D9 event of those frames that a GPU trace cannot show: render-target, depth-stencil, viewport and scissor changes, clears, surface copies, occlusion query traffic, and every draw with the states that decide its pass shape, its shaders and its textures. At the same time a Metal GPU trace of the same frames lands beside the log file as `<exe>-<pid>-<n>.gputrace`, numbered per press; the process needs `MTL_CAPTURE_ENABLED=1` in its environment for that half, otherwise the log says so and the dump still runs. The two sides name each other: each `frame end` line carries the label of the frame's command buffer, and every dumped draw sits in a `draw N` debug group in the trace, so `gpudebug`'s `find` or Xcode's search lands on it directly.
 
 ## Perf infrastructure
 

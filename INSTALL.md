@@ -244,12 +244,13 @@ that launches the game; on CrossOver, set them under
 
 ## Troubleshooting
 
-**The two lines that say mtld3d is live.** Every run prints these before the
+**The two lines that say mtld3d is live.** Every run writes these into its
+log file (`mtld3d-logs/<exe>-<pid>.log` next to the executable) before the
 game draws anything, and no `RUST_LOG` setting is needed to see them:
 
 ```
 [mtld3d::shim] mtld3d.dll <version> <id>, unix call initialized
-[mtld3d::d3d9] d3d9.dll <version> <id> loaded
+[mtld3d::d3d9] d3d9.dll <version> <id> loaded at <address>
 ```
 
 If they are absent, `d3d9.dll` never mapped, and every other symptom follows
@@ -288,12 +289,22 @@ the report only means the game directory has no usable `dbghelp.dll`.
 
 ## Fullscreen
 
-Nothing to configure. A fullscreen game gets a borderless window covering the
-monitor, and the display mode is never changed: the desktop keeps its
-resolution, other windows are not rearranged, and there is no mode switch on
-the way in or out.
+A fullscreen game sets the display mode it picked, as on Windows, and gets a
+borderless window covering the monitor. To keep that mode-set virtual, so the
+desktop keeps its resolution and other windows stay where they are, set Wine's
+`EmulateModeset` key in the prefix (on CrossOver, through the bottle's `wine`
+as in the section above):
 
-Because the window covers the monitor either way, the resolution picked in the
-game's own video options has no effect in fullscreen (or in a maximized
-window). Set `render.scale` in `mtld3d.conf` instead to choose how many pixels
-are actually rendered; the result is upscaled to the screen.
+```sh
+wine reg add 'HKCU\Software\Wine\X11 Driver' /v EmulateModeset /d Y /f
+```
+
+win32u reads the key whatever the driver, once per Wine session, so set it
+before launching the game and let the previous session exit first. With it the
+game window is scaled onto the physical display, letterboxed if the aspect
+differs, and mouse input is mapped into the mode. Without it, Wine's mac
+driver switches the whole desktop to the game's mode.
+
+The resolution picked in the game's video options therefore sizes the frame.
+`render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
+pixels and upscaling the result to the screen.
