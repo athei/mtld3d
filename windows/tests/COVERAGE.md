@@ -20,8 +20,8 @@ rasterized spaces instead of staying in one of them, and `cursor.software` in
 `device.rs`.
 
 The whole suite also runs under every `intel.*` key at once with
-`make test INTEL=1`, the way it would on an Intel/AMD Mac, and CI runs that
-variant beside the native one. A test that asserts a capability answer asks the
+`make test INTEL=1`, the way it would on an Intel/AMD Mac, for a machine
+without Intel hardware. A test that asserts a capability answer asks the
 device first and asserts the answer it gets, so it holds under either variant
 and on real Intel hardware.
 

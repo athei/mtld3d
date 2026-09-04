@@ -211,14 +211,15 @@ runs every lint, doc and unit leg as steps of one job before building the
 bundle. The test machines carry no toolchain: they install the stage
 (`STAGE=<dir>`) and run the end-to-end and conformance suites on two images,
 the newest macOS on arm64 and the oldest macOS mtld3d supports on arm64. Each
-e2e suite is split across three machines (`PARTITION=K/N`). On the newest
-image both suites also run under every `intel.*` key. The newest image gates;
-the older one is advisory until its counts are recorded, so read its
+e2e suite is split across three machines (`PARTITION=K/N`). The newest image
+gates; the older one is advisory until its counts are recorded, so read its
 artifacts rather than its status, and run `make conformance` locally when
 your change touches the render or shader-emission path. The Intel image,
 whose device has no unified memory and none of the packed 16-bit formats,
 joins the matrices once the pinned Wine boots a prefix there; the manual
-`probe-metal` job is how an image is checked before it is added.
+`probe-metal` job is how an image is checked before it is added. The forced
+Intel answers (`make test INTEL=1`, `make conformance-intel`) are for a
+machine without Intel hardware and do not run in CI.
 
 The end-to-end legs run serially in CI on purpose, because parallel device
 creation aborts on a runner. A flake there is not fixed by re-enabling

@@ -127,21 +127,20 @@ jobs:
         run: make bundle
 
   # The end-to-end suite: the staged PE binaries, run by the pinned Wine
-  # against a Metal device, one leg per image, PE arch, variant and partition.
+  # against a Metal device, one leg per image, PE arch and partition.
   #
   # Two images today: the newest macOS on arm64 and the oldest macOS mtld3d
   # supports on arm64. The Intel image, whose paravirtual device has no
   # unified memory, no packed 16-bit formats and a 256-byte linear texture
-  # alignment, would run the real Intel/AMD code paths with the strict
-  # Managed-memory semantics the forced runs cannot check, and joins once the
-  # pinned Wine boots there. The `intel` variant runs the same
-  # suite with every `intel.*` config key on and only makes sense on an
-  # Apple-family device, so it runs on the newest arm64 image alone. Each
-  # suite is split in three hash-sharded partitions, so three machines share
-  # it. The older image is advisory until its first runs are read. The Intel
-  # image is not in the list yet: the pinned Wine cannot boot a prefix there
-  # (`could not load kernel32.dll, status c0000135`, see the probe job), and
-  # a leg that waits out wineboot's timer to fail is a machine wasted.
+  # alignment, runs the real Intel/AMD code paths with the strict
+  # Managed-memory semantics, and joins once the pinned Wine boots there: for
+  # now it cannot boot a prefix (`could not load kernel32.dll, status
+  # c0000135`, see the probe job), and a leg that waits out wineboot's timer
+  # to fail is a machine wasted. The forced Intel answers (`make test
+  # INTEL=1`) are a local tool for a machine without Intel hardware and do
+  # not run here. Each suite is split in three hash-sharded partitions, so
+  # three machines share it. The older image is advisory until its first
+  # runs are read.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -152,33 +151,7 @@ jobs:
       matrix:
         runner: [macos-26, macos-15]
         arch: [i686, x86_64]
-        variant: [native]
         partition: ['1/3', '2/3', '3/3']
-        include:
-          - runner: macos-26
-            arch: i686
-            variant: intel
-            partition: '1/3'
-          - runner: macos-26
-            arch: i686
-            variant: intel
-            partition: '2/3'
-          - runner: macos-26
-            arch: i686
-            variant: intel
-            partition: '3/3'
-          - runner: macos-26
-            arch: x86_64
-            variant: intel
-            partition: '1/3'
-          - runner: macos-26
-            arch: x86_64
-            variant: intel
-            partition: '2/3'
-          - runner: macos-26
-            arch: x86_64
-            variant: intel
-            partition: '3/3'
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -187,7 +160,7 @@ jobs:
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
       # windows/.config/nextest.toml.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -202,12 +175,12 @@ jobs:
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum. The `intel` variant runs the suite under every
-  # `intel.*` config key and gates on its own `<arch>+intel` baseline entries,
-  # on the newest arm64 image alone. The older image runs the native suite as
-  # an advisory leg: the baseline carries no per-image entries yet, so its
-  # counts are read from the artifact until they are recorded and triaged.
-  # The Intel image waits on the prefix boot, as for the e2e legs above.
+  # cross-environment maximum. The older image runs the suite as an advisory
+  # leg: the baseline carries no per-image entries yet, so its counts are
+  # read from the artifact until they are recorded and triaged. The Intel
+  # image waits on the prefix boot, as for the e2e legs above, and the
+  # forced Intel answers (`make conformance-intel`, the `<arch>+intel`
+  # baseline entries) are a local tool that does not run here.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -218,21 +191,13 @@ jobs:
       matrix:
         runner: [macos-26, macos-15]
         arch: [i686, x86_64]
-        variant: [native]
-        include:
-          - runner: macos-26
-            arch: i686
-            variant: intel
-          - runner: macos-26
-            arch: x86_64
-            variant: intel
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
-      - run: make conformance-${{ matrix.variant == 'intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
+      - run: make conformance-${{ matrix.arch }} STAGE="$STAGE"
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
@@ -246,7 +211,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: conformance-raw-${{ matrix.runner }}-${{ matrix.variant }}-${{ matrix.arch }}
+          name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error
