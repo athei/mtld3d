@@ -310,8 +310,15 @@ jobs:
           EOF
           swift "$RUNNER_TEMP/probe.swift"
       # The pinned Wine bundle itself: the loader, a registry write that boots a
-      # fresh prefix, and what the prefix holds afterwards, all unsilenced.
+      # fresh prefix, and what the prefix holds afterwards, all unsilenced. The
+      # environment is the Makefile's: without the mscoree/mshtml overrides a
+      # fresh prefix tries to install Wine Mono and Gecko, which on a headless
+      # machine waits out wineboot's five-minute boot timer.
       - name: Wine
+        env:
+          WINEDLLOVERRIDES: mscoree,mshtml=
+          WINEMSYNC: "1"
+          WINEDEBUG: "-all"
         run: |
           mkdir -p "$HOME/wine-sdk"
           curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
