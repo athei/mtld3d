@@ -462,8 +462,10 @@ thunk from its init path.
 Every line goes to a file, never to the process's standard streams: a game a
 launcher spawned has no usable ones, and a launcher's own log dies with its
 pipe. Each process writes `<exe>-<pid>.log` into `mtld3d-logs` beside the
-executable, so a launch never overwrites the log of the one before it, and
-the GPU traces F12 captures land next to it as `<exe>-<pid>-<n>.gputrace`.
+executable, `<pid>` being the macOS process id `ps` shows (not Wine's, which
+repeats from launch to launch), so a launch never overwrites the log of the
+one before it, and the GPU traces F12 captures land next to it as
+`<exe>-<pid>-<n>.gputrace`.
 `log.dir` in `mtld3d.conf` moves the directory; the file appears with the
 first line written, so a process that logs nothing leaves nothing behind, and
 the directory keeps only the ten newest logs and the ten newest traces.

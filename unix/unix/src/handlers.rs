@@ -105,7 +105,7 @@ pub extern "C" fn open_log_handler(args: *mut c_void) -> i32 {
         crate::log_file::fall_back_to_stderr();
         return STATUS_UNSUCCESSFUL;
     };
-    let path = crate::log_file::open(dir, stem, params.pid);
+    let path = crate::log_file::open(dir, stem);
     info!(target: LOG_TARGET, "log file: {}", path.display());
     STATUS_SUCCESS
 }

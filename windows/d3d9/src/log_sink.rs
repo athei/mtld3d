@@ -11,7 +11,9 @@
 //!
 //! [`open`] names that file's location first: the directory `log.dir` picks,
 //! or `mtld3d-logs` next to the executable, as a unix path the unix side can
-//! create, plus the executable's stem and the pid that make the file name.
+//! create, plus the executable's stem for the file name. The pid in the name
+//! is the unix side's own: the one this side sees is Wine's process id, which
+//! repeats from one launch to the next.
 
 use core::ffi::{c_char, c_void};
 use std::{
@@ -69,8 +71,6 @@ pub fn open(cfg: &mtld3d_core::config::Mtld3dConfig) {
         stem_ptr: stem.as_ptr() as usize as u64,
         dir_len,
         stem_len,
-        pid: std::process::id(),
-        pad0: 0,
     };
     unix_call(&mut params);
 }
