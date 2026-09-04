@@ -27,9 +27,9 @@
 //! request to `CGDisplaySetDisplayMode` and the whole desktop switches
 //! resolution, which is native behaviour but not what anyone wants on a Mac.
 //!
-//! Only an enumerable mode is set, since only those are in the list win32u
-//! validates against; the adapter mode table in `direct3d9` is seeded from
-//! that list so the two agree by construction. A request that is no display
+//! Only a settable mode is set, one in the list win32u validates against;
+//! the adapter mode table in `direct3d9` is seeded from that list so the two
+//! agree by construction, and games enumerate a bounded subset of it. A request that is no display
 //! mode at all (native would reject it) follows the client rect instead, and
 //! so does a maximized window, where the window manager sizes the window;
 //! `render.scale` decides how many pixels are rasterized in those cases. A
@@ -600,7 +600,7 @@ pub struct SavedWindow {
     guard: mtld3d_core::fullscreen_resize::ExternalResizeGuard,
     /// The display mode this session set, re-asserted on activation.
     ///
-    /// `None` when the request was no enumerable mode, or when user32 refused
+    /// `None` when the request was no settable mode, or when user32 refused
     /// it and the device fell back to the monitor-covering window.
     mode: Option<ModeRequest>,
     /// `false` under `D3DCREATE_NOWINDOWCHANGES`: the window is the app's.

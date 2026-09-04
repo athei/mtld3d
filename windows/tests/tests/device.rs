@@ -3,9 +3,10 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
+use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, assert_pixel_eq,
+    WS_VISIBLE, assert_pixel_eq, enumerate_display_sizes,
 };
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
@@ -77,6 +78,59 @@ fn adapter_mode_enumeration() {
         h.enum_adapter_modes(D3DFMT_X8R8G8B8, n + 10, &mut mode),
         0,
         "EnumAdapterModes out-of-range must reject",
+    );
+}
+
+#[test]
+fn the_main_module_enumerates_the_sizes_the_adapter_serves() {
+    // The test binary is the process's main module, so its own
+    // EnumDisplaySettingsW import is the one d3d9 redirects: the list it
+    // walks is user32's, thinned to the sizes EnumAdapterModes serves, each
+    // still at every depth and rate user32 lists it. The current mode stays
+    // readable through the same import.
+    let h = Harness::factory_only();
+    let mut served = Vec::new();
+    for index in 0..h.adapter_mode_count(D3DFMT_X8R8G8B8) {
+        let mut mode = D3DDISPLAYMODE {
+            width: 0,
+            height: 0,
+            refresh_rate: 0,
+            format: 0,
+        };
+        assert_eq!(
+            h.enum_adapter_modes(D3DFMT_X8R8G8B8, index, &mut mode),
+            D3D_OK,
+            "EnumAdapterModes({index})"
+        );
+        served.push((mode.width, mode.height));
+    }
+    assert!(
+        served.len() <= MAX_SERVED_SIZES,
+        "EnumAdapterModes serves at most the bound: {served:?}"
+    );
+
+    let enumerated = enumerate_display_sizes();
+    assert!(
+        !enumerated.is_empty(),
+        "the main module enumerates no display mode"
+    );
+    for size in &enumerated {
+        assert!(
+            served.contains(size),
+            "the main module enumerated {size:?}, which EnumAdapterModes does not serve"
+        );
+    }
+    let mut distinct = enumerated;
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert!(
+        distinct.len() <= MAX_SERVED_SIZES,
+        "the main module enumerates more sizes than the bound: {distinct:?}"
+    );
+    let current = Harness::current_display_mode();
+    assert!(
+        current.0 > 0 && current.1 > 0,
+        "ENUM_CURRENT_SETTINGS still answers"
     );
 }
 
@@ -1072,7 +1126,7 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
 
-    // 640x480 is an enumerable mode, so the Reset sets it and the monitor
+    // 640x480 is a settable mode (one user32 accepts), so the Reset sets it and the monitor
     // rect the window adopts is the mode's. Read after the transition: the
     // metric answers in the mode while one is set.
     let mut pp = fullscreen_params(hwnd, 640, 480);
@@ -1189,9 +1243,10 @@ fn nowindowchanges_leaves_the_device_window_alone() {
 }
 
 #[test]
-fn reset_fullscreen_honors_an_enumerable_mode() {
+fn reset_fullscreen_honors_a_settable_mode() {
     let h = Harness::new();
-    // 640x480 is served by EnumAdapterModes, so the Reset sets that mode and
+    // 640x480 is a mode user32 accepts (whether or not the bounded list
+    // EnumAdapterModes serves carries it), so the Reset sets that mode and
     // the back buffer keeps the requested size; a game that sizes its viewport
     // from its own request covers the frame. Present scales the back buffer
     // to the drawable, which stays at the display's size.
@@ -1199,7 +1254,7 @@ fn reset_fullscreen_honors_an_enumerable_mode() {
     assert_eq!(
         h.reset_params(&mut pp),
         D3D_OK,
-        "fullscreen Reset at an enumerable mode must succeed",
+        "fullscreen Reset at a settable mode must succeed",
     );
     assert_eq!(
         (pp.back_buffer_width, pp.back_buffer_height),
@@ -1380,7 +1435,7 @@ fn reset_fullscreen_sets_the_display_mode() {
     assert_eq!(
         Harness::current_display_mode(),
         (640, 480),
-        "a fullscreen Reset at an enumerable mode sets that display mode",
+        "a fullscreen Reset at a settable mode sets that display mode",
     );
     assert_eq!(
         Harness::screen_size(),
