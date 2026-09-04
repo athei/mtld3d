@@ -379,10 +379,21 @@ jobs:
           echo "== boot with abort() interposed"
           WINEPREFIX="$RUNNER_TEMP/pfx" DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/abort_bt.dylib" WINEDEBUG=+timestamp,+seh,+process capped 90 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1
           echo "boot: reg add exit $?"
-          grep -a 'NtCreateUserProcess.*pid\|EXCEPTION_WINE_ASSERTION' "$RUNNER_TEMP/wine-macdrv.log" | head -8 | cut -c1-160
           echo "== the abort"
-          grep -aA80 'abort() called' "$RUNNER_TEMP/wine-macdrv.log" | head -100 | cut -c1-200
-          ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | head -3
+          grep -aA30 'abort() called' "$RUNNER_TEMP/wine-macdrv.log" | grep -a 'frame' | head -12 | cut -c1-200
+          reap
+          # The abort sits in Metal under MoltenVK under win32u's display-device
+          # enumeration, which creates a Vulkan instance at prefix boot. Nothing
+          # here needs Vulkan, so the boot is tried again with the bundle's
+          # MoltenVK out of the way, which win32u treats as "no Vulkan".
+          echo "== boot without MoltenVK"
+          ls -la "$HOME/wine-sdk/wine/lib/external/" | grep -i 'vulkan\|molten'
+          mv "$HOME/wine-sdk/wine/lib/external/libMoltenVK.dylib" "$RUNNER_TEMP/libMoltenVK.dylib.away" && echo "MoltenVK moved away"
+          WINEPREFIX="$RUNNER_TEMP/pfx2" WINEDEBUG=-all capped 240 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f
+          echo "boot without MoltenVK: reg add exit $?"
+          WINEPREFIX="$RUNNER_TEMP/pfx2" capped 60 "$W" cmd /c ver 2>&1 | tail -2
+          ls "$RUNNER_TEMP/pfx2/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
+          WINEPREFIX="$RUNNER_TEMP/pfx2" capped 60 "$W" reg query 'HKCU\Software\Wine\Probe' 2>&1 | tail -3
           reap
       - uses: actions/upload-artifact@v4
         if: always()
