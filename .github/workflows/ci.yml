@@ -601,6 +601,40 @@ jobs:
               let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
               print("drawn multisample depth resolve (D32F_S8), resolved centre depth:", v, "(want 0.5)")
           }
+          // 8. A multisample depth stored by one pass and resolved by the next: pass A draws at 0.5 and
+          //    stores; pass B loads it with no colour attachment and no draw, store storeAndMultisampleResolve.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              let e2 = cb.makeRenderCommandEncoder(descriptor: b2)!; e2.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the cross-pass depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("cross-pass multisample depth resolve (stored, then loaded and resolved), centre:", v, "(want 0.5)")
+          }
           // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
           do {
               let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
