@@ -19,8 +19,10 @@ permissions:
 concurrency:
   # One bucket per ref, so a second push to a PR cancels the fan-out already
   # grinding on the commit it superseded. Not on main: every commit there gets a
-  # complete, attributable result rather than a cancelled one.
-  group: ci-${{ github.ref }}
+  # complete, attributable result rather than a cancelled one. A probe-only
+  # dispatch has its own bucket, so it neither waits for nor displaces a full
+  # run of the same branch.
+  group: ci-${{ github.ref }}-${{ inputs.probe_only && 'probe' || 'full' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Everything a run depends on that is not in the tree is pinned here, so a green
