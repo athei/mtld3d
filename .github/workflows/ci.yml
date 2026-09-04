@@ -127,16 +127,19 @@ jobs:
   # The end-to-end suite: the staged PE binaries, run by the pinned Wine
   # against a Metal device, one leg per image, PE arch, variant and partition.
   #
-  # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
-  # on arm64, and the Intel image, whose paravirtual device has no unified
-  # memory, no packed 16-bit formats and a 256-byte linear texture alignment,
-  # so it runs the real Intel/AMD code paths with the strict Managed-memory
-  # semantics the forced runs cannot check. The `intel` variant runs the same
+  # Two images today: the newest macOS on arm64 and the oldest macOS mtld3d
+  # supports on arm64. The Intel image, whose paravirtual device has no
+  # unified memory, no packed 16-bit formats and a 256-byte linear texture
+  # alignment, would run the real Intel/AMD code paths with the strict
+  # Managed-memory semantics the forced runs cannot check, and joins once the
+  # pinned Wine boots there. The `intel` variant runs the same
   # suite with every `intel.*` config key on and only makes sense on an
   # Apple-family device, so it runs on the newest arm64 image alone. Each
-  # suite is split in two hash-sharded partitions, so two machines share it;
-  # the `2` in the make line is the partition count and moves with the list.
-  # The two older images are advisory until their first runs are read.
+  # suite is split in three hash-sharded partitions, so three machines share
+  # it. The older image is advisory until its first runs are read. The Intel
+  # image is not in the list yet: the pinned Wine cannot boot a prefix there
+  # (`could not load kernel32.dll, status c0000135`, see the probe job), and
+  # a leg that waits out wineboot's timer to fail is a machine wasted.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -145,27 +148,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15, macos-15-intel]
+        runner: [macos-26, macos-15]
         arch: [i686, x86_64]
         variant: [native]
-        partition: [1, 2]
+        partition: ['1/3', '2/3', '3/3']
         include:
           - runner: macos-26
             arch: i686
             variant: intel
-            partition: 1
+            partition: '1/3'
           - runner: macos-26
             arch: i686
             variant: intel
-            partition: 2
+            partition: '2/3'
+          - runner: macos-26
+            arch: i686
+            variant: intel
+            partition: '3/3'
           - runner: macos-26
             arch: x86_64
             variant: intel
-            partition: 1
+            partition: '1/3'
           - runner: macos-26
             arch: x86_64
             variant: intel
-            partition: 2
+            partition: '2/3'
+          - runner: macos-26
+            arch: x86_64
+            variant: intel
+            partition: '3/3'
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -174,7 +185,7 @@ jobs:
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
       # windows/.config/nextest.toml.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }}/2 INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -191,10 +202,10 @@ jobs:
   # zero on this display; those carry the `ceiling` class, whose pin is a
   # cross-environment maximum. The `intel` variant runs the suite under every
   # `intel.*` config key and gates on its own `<arch>+intel` baseline entries,
-  # on the newest arm64 image alone. The two older images run the native
-  # suite as advisory legs: the baseline carries no per-image entries yet, so
-  # their counts are read from the artifact until they are recorded and
-  # triaged.
+  # on the newest arm64 image alone. The older image runs the native suite as
+  # an advisory leg: the baseline carries no per-image entries yet, so its
+  # counts are read from the artifact until they are recorded and triaged.
+  # The Intel image waits on the prefix boot, as for the e2e legs above.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -203,7 +214,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15, macos-15-intel]
+        runner: [macos-26, macos-15]
         arch: [i686, x86_64]
         variant: [native]
         include:
