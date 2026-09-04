@@ -84,8 +84,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
-    MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage,
+    MTLResource, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
 use rustc_hash::FxHashMap;
@@ -95,7 +94,7 @@ use super::{
     apply_layer_color, request_cursor_kick, retain_bound_layer, retain_bound_view,
     run_on_main_thread_async, screen_color_profile, window_occluded,
 };
-use crate::metal::{command, present};
+use crate::metal::{command, device::cpu_written_texture_storage, present};
 
 /// Log sub-target of the software cursor.
 ///
@@ -1086,11 +1085,12 @@ fn overlay_frame(mtm: MainThreadMarker) -> CGRect {
     )
 }
 
-/// Copy sprite `hash` out of [`SHARED`] into a shared-storage `MTLTexture`.
+/// Copy sprite `hash` out of [`SHARED`] into a CPU-writable `MTLTexture`.
 ///
-/// The lock is held across the `replaceRegion` copy, which is the only reader
-/// of the pixel bytes; the API thread's insert of a different sprite waits
-/// that long and no longer.
+/// The storage mode is the device's CPU-writable one (see
+/// [`cpu_written_texture_storage`]). The lock is held across the
+/// `replaceRegion` copy, which is the only reader of the pixel bytes; the API
+/// thread's insert of a different sprite waits that long and no longer.
 fn upload_sprite_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     hash: u64,
@@ -1106,7 +1106,7 @@ fn upload_sprite_texture(
     // SAFETY: plain property setter on a fresh descriptor.
     unsafe { desc.setHeight(sprite.height as usize) };
     desc.setUsage(MTLTextureUsage::ShaderRead);
-    desc.setStorageMode(MTLStorageMode::Shared);
+    desc.setStorageMode(cpu_written_texture_storage(device));
     let texture = device.newTextureWithDescriptor(&desc)?;
     texture.setLabel(Some(&NSString::from_str(&format!(
         "mtld3d-cursor-sprite-{hash:#x}"

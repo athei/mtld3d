@@ -17,20 +17,30 @@ make conformance-i686           # one arch, one runner process (what CI runs)
 make conformance-x86_64
 make conformance-intel          # both arches under the intel.* config keys
 make conformance-intel-i686     # one arch under the intel.* keys
-make conformance-baseline       # (re)record baseline.txt, all four legs in sequence
+make conformance-baseline       # (re)record this machine's four legs of baseline.txt in sequence
 ```
 
-A leg is one architecture under one variant. The `intel` variant
-(`--variant intel`) runs the same binary with every `intel.*` key of
+A leg is one architecture under one variant on one GPU family. The `intel`
+variant (`--variant intel`) runs the same binary with every `intel.*` key of
 `mtld3d.conf` turned on, so the suite sees the answers an Intel/AMD Mac gives:
 packed 16-bit formats expanded, 32-bit float filtering denied, Managed
 buffers, the 256-byte linear texture alignment. Its results record under
-`[<arch>+intel/<subtest>]` entries of the same `baseline.txt`, and the sites
-share the classifications below, since a site's nature does not depend on the
-leg that hit it. The two keys that only change a code path and no answer,
-`intel.managedMemory` and `intel.linearAlign256`, must move no count at all;
-a site that fails only under the variant is expected to trace to one of the
-two caps keys.
+`[<arch>+intel/<subtest>]` entries of the same `baseline.txt`. The GPU family
+is read from the machine, not chosen: an Apple Silicon Mac records the plain
+entries, an Intel/AMD Mac records `[<leg>@mac2/<subtest>]` entries, because
+the GPU underneath still decides what the suite sees past the forced answers
+(a tile-based Apple GPU elides depth stores and merges hidden overdraw before
+the visibility counter, encodes special floats its own way, and its validation
+layer applies different texture rules). The sites share the classifications
+below whatever the leg, since a site's nature does not depend on the leg that
+hit it. On the Apple family the two keys that only change a code path and no
+answer, `intel.managedMemory` and `intel.linearAlign256`, must move no count
+at all, and a site that fails only under the variant is expected to trace to
+one of the two caps keys. The `@mac2` entries are recorded by CI, whose
+Intel image is the one Mac2 machine the project runs on: dispatch the
+workflow with `record_intel_baseline` and copy the `@mac2` sections out of
+the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
+Silicon machine leaves them untouched, the merge being leg-scoped).
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site
@@ -266,9 +276,11 @@ subtest-legs `crash=0`. (2026-09-04: the Intel legs, which run every subtest
 under the `intel.*` config keys, added device.c:3626, 7927 and 8181 as `real`
 (issues #362, #363) and visual.c:28024 as `caps`; no site moved under the two
 keys that change only a code path, `intel.managedMemory` and
-`intel.linearAlign256`. The `ceiling` and `flaky` pins of the native device
-legs are carried on the Intel legs at the same counts, since the environment
-they depend on is the same.) (2026-08-27: device.c:15088 moved from `expected`
+`intel.linearAlign256`. On the Apple family the `ceiling` and `flaky` pins of
+the native device legs are carried on the Intel legs at the same counts, since
+the environment they depend on is the same; the `@mac2` legs, recorded on the
+Intel CI image, carry their own counts, see the family paragraph under
+"Running".) (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
 newly-running `srgbtexture_test` passes. 2026-08-28: honouring

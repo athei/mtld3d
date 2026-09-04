@@ -29,9 +29,10 @@ const MAX_TEXTURE_REPEAT: u32 = 8192;
 
 /// Anisotropic-filter tap count reachable through `D3DSAMP_MAXANISOTROPY`.
 ///
-/// Reaches `setMaxAnisotropy:` on `MTLSamplerDescriptor` unchanged, whose own
-/// ceiling is 16.
-const MAX_ANISOTROPY: u32 = 16;
+/// Also the ceiling `setMaxAnisotropy:` on `MTLSamplerDescriptor` accepts, so
+/// the sampler translation clamps to it: a title may set the state above what
+/// the caps advertise, and a descriptor past the ceiling is refused.
+pub const MAX_ANISOTROPY: u32 = 16;
 
 /// Largest homogeneous W the clipper accepts.
 const MAX_VERTEX_W: f32 = 1e10;

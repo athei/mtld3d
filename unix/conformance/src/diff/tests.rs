@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use super::diff;
 use crate::{
     classify::Classification,
-    model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
+    model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
     triage::DocSite,
 };
 
@@ -20,6 +20,7 @@ fn key() -> (Leg, Subtest) {
         Leg {
             arch: Arch::I686,
             variant: Variant::Native,
+            gpu: Gpu::Apple,
         },
         Subtest::Device,
     )

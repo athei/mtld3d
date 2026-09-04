@@ -5397,6 +5397,21 @@ pub const fn null_texture_tex_sentinel(kind: u64) -> u64 {
 /// bind to the slot is not deduped away.
 pub const NULL_TEXTURE_SAMPLER_SENTINEL: u64 = u64::MAX - 8;
 
+/// The last-bound key for a sampler handle about to be bound.
+///
+/// Handle 0 is a sampler state the device declined to create; the bind
+/// command still goes out and the unix side installs the default sampler in
+/// its place, so the cache records the default's sentinel rather than the 0
+/// every slot starts at, which would swallow the bind.
+#[must_use]
+pub const fn sampler_cache_key(handle: u64) -> u64 {
+    if handle == 0 {
+        NULL_TEXTURE_SAMPLER_SENTINEL
+    } else {
+        handle
+    }
+}
+
 #[cfg(debug_assertions)]
 #[derive(Default)]
 pub struct DebugBoundShadow {
@@ -5432,7 +5447,7 @@ impl DebugBoundShadow {
         } else if t == CommandType::SetFragmentTexture as u32 {
             self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
         } else if t == CommandType::SetFragmentSamplerState as u32 {
-            self.fragment_samplers[cmd.param_a as usize] = cmd.param_b;
+            self.fragment_samplers[cmd.param_a as usize] = sampler_cache_key(cmd.param_b);
         } else if t == CommandType::SetFragmentNullTexture as u32 {
             // Binds the opaque-black texture + default sampler; mirror the same
             // sentinels the draw path records so the cache and shadow agree.

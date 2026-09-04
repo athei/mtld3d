@@ -29,7 +29,8 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLDrawable, MTLIndexType,
     MTLLoadAction, MTLMultisampleDepthResolveFilter, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResource, MTLResourceOptions,
-    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport, MTLVisibilityResultMode,
+    MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -844,6 +845,31 @@ const fn present_route(
     }
 }
 
+/// The sampler state a bind command names, or the default sampler for handle 0.
+///
+/// Handle 0 is a sampler state the device declined to create. The draw still
+/// samples through that slot, and Metal requires a sampler behind every
+/// `[[sampler(n)]]` the fragment function declares, so the default sampler
+/// stands in: the draw filters differently from what the game asked, which
+/// is the state the creation failure already warned about, instead of
+/// running with an unbound argument.
+fn sampler_or_default(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    handle: u64,
+) -> Option<Retained<ProtocolObject<dyn MTLSamplerState>>> {
+    if handle != 0 {
+        // SAFETY: a non-zero bind handle is a previously-retained
+        // MTLSamplerState address.
+        return unsafe { MetalHandle::<MTLSamplerStateKind>::new(handle) }.into_retained();
+    }
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "sampler: a draw names a sampler state the device did not create; \
+         binding the default sampler in its place"
+    );
+    null_texture::default_sampler(&cmd_buf.device())
+}
+
 /// The 1:1 present blit, and the last resort when a shader route failed to encode.
 ///
 /// SDR only: the drawable and the backbuffer are both `BGRA8Unorm`, so the
@@ -857,6 +883,7 @@ const fn present_route(
 /// out-of-bounds copy. A clamped copy cannot fill a larger drawable, so the
 /// margin is cleared first, because undefined drawable memory reads as
 /// noise, and on an `RGBA16Float` layer that noise is magenta.
+
 fn encode_present_blit(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
@@ -2364,11 +2391,7 @@ fn encode_pass(
                     }
                 }
                 Some(CommandType::SetVertexSamplerState) => {
-                    // SAFETY: cmd.param_b is a previously-retained MTLSamplerState address.
-                    let Some(sampler) =
-                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(cmd.param_b) })
-                            .into_retained()
-                    else {
+                    let Some(sampler) = sampler_or_default(cmd_buf, cmd.param_b) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; `sampler` is retained for
@@ -2378,11 +2401,7 @@ fn encode_pass(
                     }
                 }
                 Some(CommandType::SetFragmentSamplerState) => {
-                    // SAFETY: cmd.param_b is a previously-retained MTLSamplerState address.
-                    let Some(sampler) =
-                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(cmd.param_b) })
-                            .into_retained()
-                    else {
+                    let Some(sampler) = sampler_or_default(cmd_buf, cmd.param_b) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; `sampler` is retained for
@@ -2413,11 +2432,7 @@ fn encode_pass(
                     else {
                         continue;
                     };
-                    // SAFETY: as above, for the shared default sampler.
-                    let Some(sampler) =
-                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) })
-                            .into_retained()
-                    else {
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; both are retained for the
@@ -2452,11 +2467,7 @@ fn encode_pass(
                     else {
                         continue;
                     };
-                    // SAFETY: as above, for the shared default sampler.
-                    let Some(sampler) =
-                        (unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) })
-                            .into_retained()
-                    else {
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; both are retained for the

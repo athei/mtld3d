@@ -9,16 +9,20 @@
 use std::collections::BTreeMap;
 
 use super::merge;
-use crate::model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant};
+use crate::model::{
+    Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant,
+};
 
 const I686: Leg = Leg {
     arch: Arch::I686,
     variant: Variant::Native,
+    gpu: Gpu::Apple,
 };
 
 const X64_INTEL: Leg = Leg {
     arch: Arch::X64,
     variant: Variant::Intel,
+    gpu: Gpu::Apple,
 };
 
 fn site(line: u32) -> Site {

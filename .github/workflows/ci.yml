@@ -12,6 +12,12 @@ on:
         description: Run only the probe-metal job.
         type: boolean
         default: false
+      record_intel_baseline:
+        description: >-
+          Re-record the Intel image's conformance legs into baseline.txt and
+          upload the file, instead of gating on it.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -144,10 +150,7 @@ jobs:
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
   # INTEL=1`) and do not run here. Each suite is split in three hash-sharded
-  # partitions, so three machines share it. The two older images are advisory:
-  # the arm64 one until its counts are recorded, the Intel one until what its
-  # first run found is fixed (#364, #365, #366: a texture usage bit its views
-  # need, a Shared texture it rejects, a sampler it never binds).
+  # partitions, so three machines share it. Every image gates.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -165,11 +168,8 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml. The advisory images tolerate a failing
-      # suite at this step, so the job and its check stay green and the
-      # failure is read from the step's own log.
+      # windows/.config/nextest.toml.
       - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }}
-        continue-on-error: ${{ matrix.runner != 'macos-26' }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -184,13 +184,12 @@ jobs:
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum. The two older images run the suite as advisory
-  # legs: the baseline carries no per-image entries yet, so their counts are
-  # read from the artifact until they are recorded and triaged. The Intel
-  # image runs the `intel` variant for the reason given above the e2e legs,
-  # and reads against the `<arch>+intel` baseline entries. On an Apple-family
-  # image that variant (`make conformance-intel`) is a local tool and does not
-  # run here.
+  # cross-environment maximum. The two arm64 images read the same entries.
+  # The Intel image runs the `intel` variant for the reason given above the
+  # e2e legs, and its GPU family gives it its own entries, `<arch>+intel@mac2`,
+  # which only it can record (the step below does, on request). On an
+  # Apple-family image that variant (`make conformance-intel`) is a local tool
+  # and does not run here.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -206,9 +205,12 @@ jobs:
         with:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
-      - run: make conformance-${{ matrix.runner == 'macos-15-intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
-        # As for the e2e legs: advisory images tolerate a failing run here.
-        continue-on-error: ${{ matrix.runner != 'macos-26' }}
+      # The Intel image reads and, on a `record_intel_baseline` dispatch,
+      # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
+      # family is a runner, so its counts are recorded here and committed from
+      # the artifact below (each arch's file carries its own leg; the merge is
+      # leg-scoped, so the two sections are copied in side by side).
+      - run: make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
@@ -224,6 +226,13 @@ jobs:
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/conformance-raw
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.record_intel_baseline && matrix.runner == 'macos-15-intel' }}
+        with:
+          name: baseline-mac2-${{ matrix.arch }}
+          path: unix/conformance/baseline.txt
           retention-days: 14
           if-no-files-found: error
 

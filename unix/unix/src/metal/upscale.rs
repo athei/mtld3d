@@ -44,7 +44,9 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLTexture};
+use objc2_metal::{
+    MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
+};
 use objc2_metal_fx::{
     MTLFXSpatialScaler, MTLFXSpatialScalerBase, MTLFXSpatialScalerColorProcessingMode,
     MTLFXSpatialScalerDescriptor,
@@ -223,6 +225,18 @@ fn scaler_for(
     // 1.0 precisely so this cannot happen. Declining beats asking Metal to
     // build a scaler it will refuse.
     if in_w > out_w || in_h > out_h {
+        return None;
+    }
+    // The scaler writes only into `Private` storage. A drawable is `Private`
+    // on a unified-memory device and not on the others, and `supportsDevice:`
+    // says nothing about that, so the destination is checked here; the caller
+    // falls to the present shader's stretch.
+    if dst.storageMode() != MTLStorageMode::Private {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "upscale: the destination texture is not Private storage, which MetalFX \
+             requires of its output; the present shader stretches instead"
+        );
         return None;
     }
 

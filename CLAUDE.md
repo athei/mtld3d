@@ -26,3 +26,11 @@ It points at the files that own the rules:
 `make check` and `make test` are the gates. `CONTRIBUTING.md` explains how to
 read a test run, which matters here: the runner is fail-fast and its summary
 undercounts.
+
+Every plan and every pull request is checked against those rules before it is
+presented or opened, section by section, and the check is written down. A
+plan carries a "Rules check" section that names what it introduces (a static,
+a config key, a wire field, a dependency, a derive, a lint suppression, a
+duplicate of something that already exists) and why each is allowed; a pull
+request's verification names the gates that enforce those rules and ran
+green. A plan or PR without that check is not ready.

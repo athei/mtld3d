@@ -192,3 +192,16 @@ fn lod_bias_bytes_carry_the_bias_and_its_exponent() {
     assert_eq!(row(0, 0).to_bits(), 0.0_f32.to_bits());
     assert_eq!(row(0, 1).to_bits(), 1.0_f32.to_bits());
 }
+
+#[test]
+fn anisotropy_clamps_to_the_advertised_ceiling() {
+    // SAFETY: tests; opaque values never dereferenced.
+    let dev = unsafe { MetalHandle::new(0xDEAD) };
+    let mut s = base();
+    s.max_anisotropy = 64;
+    let p = params_from_snapshot(&s, key_from_snapshot(&s), dev);
+    assert_eq!(p.max_anisotropy, MAX_ANISOTROPY);
+    s.max_anisotropy = 0;
+    let p = params_from_snapshot(&s, key_from_snapshot(&s), dev);
+    assert_eq!(p.max_anisotropy, 1);
+}

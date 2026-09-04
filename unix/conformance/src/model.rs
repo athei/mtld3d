@@ -33,14 +33,31 @@ pub enum Variant {
     Intel,
 }
 
-/// One runner process's identity: the architecture it ran and the device answers it ran under.
+/// The GPU family of the machine a run was measured on, in baseline-output order.
+///
+/// The `intel` variant forces the D3D9-visible answers of an Intel/AMD Mac,
+/// but the GPU underneath still decides what the suite sees past those
+/// answers: a tile-based Apple GPU elides depth stores and merges hidden
+/// overdraw before the visibility counter, an Apple GPU encodes special
+/// floats its own way, and the validation layer applies different texture
+/// rules per family. So the same leg reads different counts on the two
+/// families, and the baseline keeps an entry per family.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub enum Gpu {
+    Apple,
+    Mac2,
+}
+
+/// One runner process's identity: architecture, device answers, and the GPU family underneath.
 ///
 /// The baseline is keyed by leg and subtest, so a measurement under the Intel
-/// answers never overwrites the native one for the same architecture.
+/// answers never overwrites the native one for the same architecture, and a
+/// measurement on one GPU family never overwrites the other's.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Leg {
     pub arch: Arch,
     pub variant: Variant,
+    pub gpu: Gpu,
 }
 
 /// The four `d3d9_test.exe` subtests, in baseline-output order.
@@ -140,26 +157,45 @@ impl Variant {
     }
 }
 
+impl Gpu {
+    /// The GPU family of this machine.
+    ///
+    /// Read from the runner's own architecture: an Apple Silicon Mac carries
+    /// an Apple-family GPU and nothing else, an Intel Mac carries an Intel or
+    /// AMD GPU and never an Apple one, and the runner binary is always the
+    /// host's architecture.
+    #[must_use]
+    pub const fn host() -> Self {
+        if cfg!(target_arch = "aarch64") {
+            Self::Apple
+        } else {
+            Self::Mac2
+        }
+    }
+}
+
 impl Leg {
-    /// Every leg, in baseline-output order: both variants of each architecture.
-    pub const ALL: [Self; 4] = [
-        Self {
+    /// Every leg, in baseline-output order: both variants of each architecture on each GPU family.
+    pub const ALL: [Self; 8] = {
+        let mut all = [Self {
             arch: Arch::I686,
             variant: Variant::Native,
-        },
-        Self {
-            arch: Arch::I686,
-            variant: Variant::Intel,
-        },
-        Self {
-            arch: Arch::X64,
-            variant: Variant::Native,
-        },
-        Self {
-            arch: Arch::X64,
-            variant: Variant::Intel,
-        },
-    ];
+            gpu: Gpu::Apple,
+        }; 8];
+        let archs = [Arch::I686, Arch::X64];
+        let variants = [Variant::Native, Variant::Intel];
+        let gpus = [Gpu::Apple, Gpu::Mac2];
+        let mut i = 0;
+        while i < all.len() {
+            all[i] = Self {
+                arch: archs[i / 4],
+                variant: variants[(i / 2) % 2],
+                gpu: gpus[i % 2],
+            };
+            i += 1;
+        }
+        all
+    };
 }
 
 impl Subtest {
@@ -196,16 +232,29 @@ impl fmt::Display for Variant {
     }
 }
 
-/// `i686` for the native leg, `i686+intel` for the Intel one.
+impl fmt::Display for Gpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Apple => "apple",
+            Self::Mac2 => "mac2",
+        })
+    }
+}
+
+/// `i686` for the native leg, `i686+intel` for the Intel one, `@mac2` appended off Apple.
 ///
-/// The native form is the bare architecture so a baseline recorded before
-/// variants existed reads unchanged.
+/// The native form is the bare architecture and the Apple family is implicit,
+/// so a baseline recorded before variants or families existed reads unchanged.
 impl fmt::Display for Leg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.variant {
-            Variant::Native => write!(f, "{}", self.arch),
-            Variant::Intel => write!(f, "{}+{}", self.arch, self.variant),
+        write!(f, "{}", self.arch)?;
+        if self.variant == Variant::Intel {
+            write!(f, "+{}", self.variant)?;
         }
+        if self.gpu == Gpu::Mac2 {
+            write!(f, "@{}", self.gpu)?;
+        }
+        Ok(())
     }
 }
 
@@ -245,15 +294,31 @@ impl FromStr for Variant {
     }
 }
 
+impl FromStr for Gpu {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "apple" => Ok(Self::Apple),
+            "mac2" => Ok(Self::Mac2),
+            other => Err(format!("unknown gpu family {other:?}")),
+        }
+    }
+}
+
 impl FromStr for Leg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (s, gpu) = match s.split_once('@') {
+            Some((s, gpu)) => (s, gpu.parse::<Gpu>()?),
+            None => (s, Gpu::Apple),
+        };
         let (arch, variant) = match s.split_once('+') {
             Some((arch, variant)) => (arch.parse::<Arch>()?, variant.parse::<Variant>()?),
             None => (s.parse::<Arch>()?, Variant::Native),
         };
-        Ok(Self { arch, variant })
+        Ok(Self { arch, variant, gpu })
     }
 }
 
@@ -289,9 +354,10 @@ impl Baseline {
             "# live in CONFORMANCE.md ('Per-cluster classification'); a runner unit test\n",
         );
         out.push_str("# keeps the two files covering the same sites.\n");
-        out.push_str("# Format: \"[arch/subtest] crash=<0|1>\" header, then indented\n");
-        out.push_str("#         \"  <file>.c:<line> count=<n>\". An arch of the form\n");
-        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys.\n");
+        out.push_str("# Format: \"[leg/subtest] crash=<0|1>\" header, then indented\n");
+        out.push_str("#         \"  <file>.c:<line> count=<n>\". A leg of the form\n");
+        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys, and\n");
+        out.push_str("#         \"<leg>@mac2\" the run on an Intel/AMD GPU (no suffix: Apple).\n");
         out.push('\n');
         for (&(leg, subtest), sub) in &self.entries {
             let _ = writeln!(out, "[{leg}/{subtest}] crash={}", u8::from(sub.crash));
