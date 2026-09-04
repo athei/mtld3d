@@ -63,6 +63,16 @@ static ADAPTER_MODES: LazyLock<AdapterModes> = LazyLock::new(build_adapter_modes
 /// attach publishes.
 static DISPLAY_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
 
+/// Set by the unix side when the pointer comes back from another process.
+///
+/// A system tool that borrows the pointer (the screenshot crosshair) leaves
+/// its own cursor on screen, and Wine re-applies its cursor only on a handle
+/// change. The cursor module takes the flag at the next `WM_SETCURSOR` or
+/// `ShowCursor(TRUE)` and answers it with the null-then-set kick. Backed by a
+/// static for the same reason as [`DISPLAY_BACKING_SCALE`]: the writer is the
+/// `AppKit` main thread outside any thunk.
+static CURSOR_KICK: AtomicU32 = AtomicU32::new(0);
+
 // Adapter color formats enumerated. X8R8G8B8 = "32-bit" in most game UIs
 // (32-bit container, 24 useful color bits), R5G6B5 = "16-bit".
 // A2R10G10B10 deliberately excluded — CAMetalLayer is hardcoded BGRA8;
@@ -1419,9 +1429,12 @@ extern "system" fn d3d9_create_device(
         return D3DERR_INVALIDCALL;
     }
     let (cursor_scale, scale_origin) = resolve_cursor_scale(layer_params.backing_scale);
+    let software_cursor = layer_params.software_cursor_active != 0;
     info!(
         target: LOG_TARGET,
-        "hardware cursor scale: {cursor_scale}x ({scale_origin})"
+        "cursor: {} at {cursor_scale}x ({scale_origin}; cursor.software = {:?})",
+        if software_cursor { "software overlay" } else { "hardware HCURSOR" },
+        crate::config::CONFIG.cursor_software,
     );
 
     // `render.scale` splits the back buffer in two from here on: `pp` keeps
@@ -1575,6 +1588,7 @@ extern "system" fn d3d9_create_device(
         },
         hwnd: hwnd as *mut c_void,
         cursor_scale,
+        software_cursor,
         fullscreen,
     });
 
@@ -1634,6 +1648,9 @@ fn attach_metal_layer(
         max_fps: crate::config::CONFIG.present_max_fps,
         metalfx_available: 0,
         backing_scale_ptr: (&raw const DISPLAY_BACKING_SCALE) as u64,
+        software_cursor: crate::config::CONFIG.cursor_software,
+        software_cursor_active: 0,
+        cursor_kick_ptr: (&raw const CURSOR_KICK) as u64,
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);
@@ -1716,10 +1733,18 @@ fn warn_unsupported_backbuffer_format(format: u32) {
     }
 }
 
-/// The backing scale of the display the layer is on, or `None` before attach.
+/// Take the pending cursor re-apply request, if the unix side left one.
+///
+/// See [`CURSOR_KICK`]. `Acquire` pairs with the unix side's `Release`
+/// store; the flag is the whole message, so nothing else is read behind it.
+pub fn take_cursor_kick() -> bool {
+    CURSOR_KICK.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Wine's retina factor for the layer (2 in retina mode, else 1), or `None` before attach.
 ///
 /// See [`DISPLAY_BACKING_SCALE`]. `Present` reads it once per frame so a
-/// display move reaches the cursor upscale without a thunk of its own.
+/// change reaches the cursor upscale without a thunk of its own.
 pub fn display_backing_scale() -> Option<u32> {
     match DISPLAY_BACKING_SCALE.load(Ordering::Relaxed) {
         0 => None,
@@ -1727,18 +1752,19 @@ pub fn display_backing_scale() -> Option<u32> {
     }
 }
 
-/// Match the hardware cursor bitmap to the display's retina factor by default.
+/// Match the cursor bitmap to Wine's retina factor by default.
 ///
-/// Wine's HCURSOR path then produces a proportionally-sized pointer on a
-/// retina Mac. `cursor.scale` in `mtld3d.conf` overrides: `auto` (the default)
-/// follows `backingScaleFactor`; a positive integer forces a fixed multiplier.
-/// Both paths clamp to `[1, 8]` — the downstream HCURSOR builder asserts that
-/// range. Resolved again on every display move, so the override keeps
-/// overriding on the display the window arrived at.
+/// In retina mode the game draws at physical pixels and a cursor pixel comes
+/// out at half a point, so the bitmap is doubled; in non-retina mode macOS
+/// already doubles everything the game draws and the bitmap stays. The same
+/// factor feeds the hardware HCURSOR and the software sprite. `cursor.scale`
+/// in `mtld3d.conf` overrides: `auto` (the default) follows the retina mode; a
+/// positive integer forces a fixed multiplier. Both paths clamp to `[1, 8]`,
+/// the range the downstream HCURSOR builder asserts.
 pub fn resolve_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
     let scale = crate::config::CONFIG.cursor_scale.resolve(backing_scale);
     let origin = match crate::config::CONFIG.cursor_scale {
-        mtld3d_core::config::CursorScale::Auto => "auto from display backingScaleFactor",
+        mtld3d_core::config::CursorScale::Auto => "auto from the Wine retina mode",
         mtld3d_core::config::CursorScale::Fixed(_) => "cursor.scale override",
     };
     (scale, origin)

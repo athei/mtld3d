@@ -2574,6 +2574,11 @@ pub struct DeviceCreateInfo {
     /// from `AttachMetalLayerParams.backing_scale` on the unix side,
     /// clamped to `[1, 8]`. 1 is the no-op fast path.
     pub cursor_scale: u32,
+    /// Whether this device draws its cursor through the unix-side overlay window.
+    ///
+    /// Resolved at attach from `cursor.software` and the layer mode; fixed for
+    /// the device's lifetime.
+    pub software_cursor: bool,
     /// Window state saved before a fullscreen `CreateDevice` took the window over.
     ///
     /// `None` for a windowed device. The device holds it for as long as it
@@ -2659,7 +2664,7 @@ impl Direct3DDevice9 {
             scissor_rect: [0, 0, info.backbuffer_width, info.backbuffer_height],
             viewport,
             clip_planes: [[0.0; 4]; CLIP_PLANE_SLOTS],
-            cursor: CursorState::new(info.hwnd, info.cursor_scale),
+            cursor: CursorState::new(info.hwnd, info.cursor_scale, info.software_cursor),
             fullscreen: info.fullscreen,
             bound_rt: BoundRt::new(info.backbuffer_width, info.backbuffer_height),
             bound_buffers: BoundBuffers::new(),

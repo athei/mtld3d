@@ -9,7 +9,7 @@
 //! Every case here passes no app profile; the profile layer and its precedence against these
 //! two live in `app_profile/tests.rs`, where a profile can be built.
 
-use mtld3d_shared::mtl::ColorSpacePolicy;
+use mtld3d_shared::mtl::{ColorSpacePolicy, SoftwareCursorPolicy};
 
 use super::{AdapterSpoof, CursorScale, Mtld3dConfig, parse};
 
@@ -27,6 +27,7 @@ fn defaults_match_documented_values() {
     assert!(d.hdr_enable);
     assert_eq!(d.color_space, ColorSpacePolicy::Passthrough);
     assert_eq!(d.cursor_scale, CursorScale::Auto);
+    assert_eq!(d.cursor_software, SoftwareCursorPolicy::Auto);
     assert!(d.shader_cache_enable);
     assert!(d.log_dir.is_empty());
     assert!(d.bytecode_dump_dir.is_empty());
@@ -234,6 +235,42 @@ fn cursor_scale_resolves_into_the_hcursor_range() {
     assert_eq!(CursorScale::Auto.resolve(99), 8);
     assert_eq!(CursorScale::Fixed(0).resolve(2), 1);
     assert_eq!(CursorScale::Fixed(99).resolve(2), 8);
+}
+
+#[test]
+fn cursor_software_accepts_all_three_values_case_insensitive() {
+    let cfg = parse(None, "cursor.software = TRUE\n", None);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::On);
+
+    let cfg = parse(None, "cursor.software = False\n", None);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Off);
+
+    let cfg = parse(
+        None,
+        "cursor.software = true\ncursor.software = auto\n",
+        None,
+    );
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+}
+
+#[test]
+fn cursor_software_garbage_keeps_default() {
+    let cfg = parse(None, "cursor.software = maybe\n", None);
+    assert_eq!(cfg.cursor_software, SoftwareCursorPolicy::Auto);
+}
+
+#[test]
+fn cursor_software_auto_follows_the_hdr_path() {
+    assert!(SoftwareCursorPolicy::Auto.resolve(true));
+    assert!(!SoftwareCursorPolicy::Auto.resolve(false));
+}
+
+#[test]
+fn cursor_software_overrides_ignore_the_hdr_path() {
+    assert!(SoftwareCursorPolicy::On.resolve(false));
+    assert!(SoftwareCursorPolicy::On.resolve(true));
+    assert!(!SoftwareCursorPolicy::Off.resolve(false));
+    assert!(!SoftwareCursorPolicy::Off.resolve(true));
 }
 
 #[test]

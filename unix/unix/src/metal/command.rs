@@ -482,6 +482,9 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // on, and a session that started SDR has to notice a panel with
             // headroom appearing under it.
             let current = super::macdrv::current_headroom();
+            // The pointer check rides the present cadence so a system tool
+            // taking the pointer is noticed without a wakeup of its own.
+            super::macdrv::poll_capture_from_present();
             // The layer follows that display, so its pixel format can change
             // between two presents. Take the route from the drawable we are
             // about to write rather than from a latch read a moment earlier: a
@@ -906,21 +909,43 @@ fn clear_drawable(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     drawable: &ProtocolObject<dyn MTLTexture>,
 ) {
+    clear_texture(cmd_buf, drawable, 1.0, "mtld3d-present-clear");
+}
+
+/// Clear the software cursor's drawable to transparent black.
+///
+/// The hidden state of the overlay: the layer keeps a surface in the window's
+/// scene, it just carries nothing, so the compositor's arrangement above the
+/// game layer does not change when the cursor comes back.
+pub fn clear_cursor_drawable(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+) {
+    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear");
+}
+
+/// One empty render pass that clears `texture` to black at `alpha`.
+fn clear_texture(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    alpha: f64,
+    label: &str,
+) {
     let pass_desc = MTLRenderPassDescriptor::new();
     // SAFETY: `colorAttachments()` returns a non-null descriptor array;
     // subscript 0 is always valid.
     let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
-    color0.setTexture(Some(drawable));
+    color0.setTexture(Some(texture));
     color0.setLoadAction(MTLLoadAction::Clear);
     color0.setClearColor(MTLClearColor {
         red: 0.0,
         green: 0.0,
         blue: 0.0,
-        alpha: 1.0,
+        alpha,
     });
     color0.setStoreAction(MTLStoreAction::Store);
     if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
-        let label = objc2_foundation::NSString::from_str("mtld3d-present-clear");
+        let label = objc2_foundation::NSString::from_str(label);
         enc.setLabel(Some(&label));
         enc.endEncoding();
     }
@@ -1026,25 +1051,11 @@ fn encode_hdr_present(
     let (pipeline_handle, uniforms) = if peak <= 1.0 {
         (resources.passthrough, None)
     } else {
-        // Fragment uniform block consumed by the BT.2446 pipeline:
-        // { float l_hdr_nits; float p_hdr; float log2_p_hdr;
-        //   float inv_p_minus_one; } — 16 bytes. MSL alignment for
-        // `constant T&` requires 16-byte alignment; a stack array of
-        // four f32 is naturally aligned and fits.
-        //
-        // BT.2446-A takes the target peak in nits, not a multiplier;
-        // Apple anchors scRGB 1.0 = 100 nits, so L_hdr = peak × 100.
-        // `p_hdr`, `log2(p_hdr)` and `1 / (p_hdr - 1)` only depend on
-        // `l_hdr_nits`, so we pre-compute them once per frame on the
-        // CPU instead of re-deriving them in every fragment.
-        let l_hdr_nits = peak * 100.0;
-        let p_hdr = 32.0_f32.mul_add((l_hdr_nits / 10000.0).powf(1.0 / 2.4), 1.0);
-        let log2_p_hdr = p_hdr.log2();
-        let inv_p_minus_one = 1.0 / (p_hdr - 1.0);
-        (
-            resources.bt2446,
-            Some([l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one]),
-        )
+        // Fragment uniform block consumed by the BT.2446 pipeline, 16 bytes;
+        // MSL alignment for `constant T&` requires 16-byte alignment, and a
+        // stack array of four f32 is naturally aligned and fits. Computed once
+        // per frame on the CPU rather than in every fragment.
+        (resources.bt2446, Some(super::present::hdr_uniforms(peak)))
     };
     encode_present_pass(cmd_buf, src, dst, pipeline_handle, uniforms)
 }
@@ -1083,6 +1094,54 @@ fn encode_present_pass(
     pipeline_handle: u64,
     uniforms: Option<[f32; 4]>,
 ) -> bool {
+    // The fullscreen triangle covers every pixel, so nothing is loaded.
+    encode_fullscreen_pass(
+        cmd_buf,
+        src,
+        dst,
+        pipeline_handle,
+        uniforms,
+        MTLLoadAction::DontCare,
+        "mtld3d-present-pass",
+    )
+}
+
+/// Encode the software cursor's sprite pass: `src` (the sprite) onto `dst` (the overlay drawable).
+///
+/// The same fullscreen triangle as present, against a drawable sized to the
+/// sprite, so every fragment lands on its texel. The target is cleared to
+/// transparent first: the cursor pipelines write premultiplied colour and
+/// alpha and the overlay window shows whatever the pass did not cover.
+pub fn encode_cursor_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    pipeline_handle: u64,
+    uniforms: Option<[f32; 4]>,
+) -> bool {
+    encode_fullscreen_pass(
+        cmd_buf,
+        src,
+        dst,
+        pipeline_handle,
+        uniforms,
+        MTLLoadAction::Clear,
+        "mtld3d-cursor-pass",
+    )
+}
+
+/// One fullscreen-triangle pass sampling `src` across `dst` with `pipeline_handle`.
+///
+/// `MTLLoadAction::Clear` clears to transparent black.
+fn encode_fullscreen_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    pipeline_handle: u64,
+    uniforms: Option<[f32; 4]>,
+    load_action: MTLLoadAction,
+    label: &str,
+) -> bool {
     // SAFETY: pipeline_handle is a previously-retained MTLRenderPipelineState address.
     let Some(pipeline) =
         (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(pipeline_handle) })
@@ -1096,13 +1155,19 @@ fn encode_present_pass(
     // subscript 0 is always valid.
     let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
     color0.setTexture(Some(dst));
-    color0.setLoadAction(MTLLoadAction::DontCare); // fullscreen triangle covers every pixel
+    color0.setLoadAction(load_action);
+    color0.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 0.0,
+    });
     color0.setStoreAction(MTLStoreAction::Store);
 
     let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) else {
         return false;
     };
-    let label = objc2_foundation::NSString::from_str("mtld3d-present-pass");
+    let label = objc2_foundation::NSString::from_str(label);
     enc.setLabel(Some(&label));
     enc.setRenderPipelineState(&pipeline);
     // SAFETY: objc2 typed binding; `src` is a retained `MTLTexture` live

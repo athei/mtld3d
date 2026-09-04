@@ -9,9 +9,10 @@ use mtld3d_shared::{
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
     GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, OpenLogParams,
-    SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
-    mtl::{DestroyKind, QuadPipelineKind},
+    SetCursorOverlayParams, SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
+    WriteLogParams, identity,
+    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
@@ -193,11 +194,14 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         hdr_enable: params.hdr_enable != 0,
         color_space: params.color_space,
         backing_scale_sink_ptr: params.backing_scale_ptr,
+        cursor_kick_sink_ptr: params.cursor_kick_ptr,
+        software_cursor: params.software_cursor,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
         params.view_handle = view;
         params.layer_handle = layer;
         params.backing_scale = caps.backing_scale;
+        params.software_cursor_active = u32::from(caps.software_cursor_active);
         params.metalfx_available = u32::from(metal::upscale_is_supported(params.device_handle));
         info!(
             target: LOG_TARGET,
@@ -212,6 +216,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         params.view_handle = MetalHandle::NULL;
         params.layer_handle = MetalHandle::NULL;
         params.backing_scale = 1;
+        params.software_cursor_active = 0;
         error!(
             target: LOG_TARGET,
             "failed to attach Metal layer (hwnd=0x{:x})",
@@ -219,6 +224,51 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         );
         STATUS_UNSUCCESSFUL
     }
+}
+
+/// `SetCursorOverlay`: the software cursor's wanted sprite and visibility.
+///
+/// Runs on the API thread, so it only validates, hands the sprite bytes over
+/// to be copied when one came along, stores the wanted state and queues the
+/// main-thread apply. Nothing here waits on `AppKit`.
+pub extern "C" fn set_cursor_overlay_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut SetCursorOverlayParams.
+    let Some(params) = (unsafe { InPtr::<SetCursorOverlayParams>::opt(args) }) else {
+        return -1;
+    };
+    let hardware = params.flags.contains(CursorOverlayFlags::HARDWARE);
+    if params.hash == 0 && !hardware {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "SetCursorOverlay: hash 0 names no sprite → ignored"
+        );
+        return STATUS_UNSUCCESSFUL;
+    }
+    let pixels = if params.pixels_ptr == 0 {
+        None
+    } else {
+        let expected = u64::from(params.width) * u64::from(params.height) * 4;
+        if params.width == 0
+            || params.height == 0
+            || u64::from(params.pixels_len) != expected
+            || !(1..=8).contains(&params.scale)
+        {
+            warn!(
+                target: LOG_TARGET,
+                "SetCursorOverlay: rejected sprite {}x{} scale={} len={} (expected {expected} bytes)",
+                params.width, params.height, params.scale, params.pixels_len,
+            );
+            return STATUS_UNSUCCESSFUL;
+        }
+        // SAFETY: PE supplied `pixels_ptr`/`pixels_len` as a BGRA byte slice
+        // valid for the call duration; the pointer is non-zero per the branch
+        // and the length was just checked against the sprite's geometry.
+        Some(unsafe {
+            core::slice::from_raw_parts(params.pixels_ptr as *const u8, params.pixels_len as usize)
+        })
+    };
+    metal::set_cursor_overlay(&params, pixels);
+    STATUS_SUCCESS
 }
 
 pub extern "C" fn set_display_sync_enabled_handler(args: *mut c_void) -> i32 {

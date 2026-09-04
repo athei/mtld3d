@@ -31,10 +31,10 @@ pub use params::{
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
     ExtraColorAttachmentParams, ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams,
-    InitLoggerParams, OpenLogParams, PassDescriptor, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
-    WriteLogParams,
+    InitLoggerParams, OpenLogParams, PassDescriptor, SetCursorOverlayParams,
+    SetDisplaySyncEnabledParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
+    WaitForGpuRetireParams, WriteLogParams,
 };
 
 #[repr(u32)]
@@ -67,6 +67,7 @@ pub enum Thunks {
     GetTaskFaults,
     WriteLog,
     OpenLog,
+    SetCursorOverlay,
 }
 
 pub trait Thunk {

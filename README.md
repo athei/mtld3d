@@ -104,8 +104,8 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
   sampling all see the resolved image. `D3DRS_MULTISAMPLEMASK` narrows the
   samples a draw writes.
 - **Presentation**: windowed and fullscreen swap chains, adapter mode
-  enumeration, hardware color cursors, and MetalFX upscaling on the way to the
-  screen with `render.scale` choosing the render resolution. A render target or
+  enumeration, hardware or software color cursors, and MetalFX upscaling on the
+  way to the screen with `render.scale` choosing the render resolution. A render target or
   depth-stencil the game creates at the reported back-buffer size rasterizes at
   that same scale, so a depth resolve into an INTZ texture stays a same-size
   copy. Fullscreen never changes the display mode; what it does instead is
@@ -113,7 +113,12 @@ x86_64 Wine because Rosetta 2 is slow at the x87 math D3D9-era games do.
 - **HDR**: on an EDR-capable display the layer is upgraded to
   `extendedDynamicRange` and present routes through a BT.2446-A
   inverse-tone-mapping pass in ICtCp, its peak following the display's live
-  headroom. On by default; `color.hdr.enable` and `color.space` control it.
+  headroom. On by default; `color.hdr.enable` and `color.space` control it. The
+  cursor follows: with `cursor.software` at its default `auto`, an HDR device
+  draws the game's cursor bitmap through the same tone map in a transparent
+  overlay window, since macOS has no HDR hardware cursor. The overlay also
+  never toggles the hardware cursor plane, which on stock Wine costs a late
+  present per show or hide, so it can be forced on for SDR too.
 
 ### Not implemented yet
 
@@ -442,6 +447,7 @@ the single switch for the whole project; narrow it per target, for example
 |-------------------------|-----------------------------------------------------------------------|
 | `mtld3d::d3d9`          | `windows/d3d9/` + `windows/core/` (everything except `dxso` and `perf`) |
 | `mtld3d::d3d9::cursor`  | hardware cursor (HCURSOR) lifecycle, bitmap cache, wndproc            |
+| `mtld3d::unix::cursor`  | software cursor overlay window: sprite renders, show/hide, layer mode |
 | `mtld3d::dxso`          | DXSO → MSL emitter                                                    |
 | `mtld3d::perf`          | 5-second averaged performance summary (`PERF=1` builds only)          |
 | `mtld3d::shim`          | Wine unix-call PE shim DLL                                            |

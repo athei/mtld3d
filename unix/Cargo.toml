@@ -34,13 +34,18 @@ log = "0.4"
 objc2 = { version = "0.6", features = ["disable-encoding-assertions"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSApplication",
+    "NSColor",
     "NSColorSpace",
+    "NSEvent",
+    "NSGraphics",
     "NSResponder",
     "NSScreen",
     "NSView",
     "NSWindow",
+    "block2",
     "objc2-core-foundation",
     "objc2-core-graphics",
+    "objc2-quartz-core",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }

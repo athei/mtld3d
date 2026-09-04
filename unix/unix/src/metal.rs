@@ -23,7 +23,7 @@ pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_r
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
 pub use macdrv::{
     LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
-    set_display_sync_enabled,
+    set_cursor_overlay, set_display_sync_enabled,
 };
 pub use mtld3d_shared::perf::init_tracking_enabled;
 pub use pipeline::{create_render_pipeline, destroy_render_pipeline};
