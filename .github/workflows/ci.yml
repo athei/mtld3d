@@ -500,6 +500,19 @@ jobs:
               let v = b.withUnsafeBytes { $0.load(fromByteOffset: (8 * W + 8) * 4, as: Float.self) }
               print("multisample depth resolve, resolved centre depth:", v, "(want 0.25)")
           }
+          // 5. A depth plane nothing cleared: loaded DontCare on its first use, then a draw at 0.5 under lessEqual.
+          for df in [MTLPixelFormat.depth32Float_stencil8, .depth32Float] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(df, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .dontCare; rp.depthAttachment.storeAction = .store
+              if df == .depth32Float_stencil8 { rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store }
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: df, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("uncleared depth (\(df == .depth32Float ? "D32F" : "D32F_S8"), DontCare load), draw at 0.5 lessEqual, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(red = the plane read as far, blue = as near)")
+          }
           // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
           do {
               let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
