@@ -230,18 +230,19 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  # Manual only: what a hosted macOS runner exposes to Metal, on the Intel
-  # image and the arm64 macOS 15 image. The OS, the device, and the capability
-  # bits mtld3d branches on, then a clear pass and the one texture format the
-  # Mac2 family lacks. Run it before adding a runner label to the matrices
-  # above, since an image without a Metal device cannot run the e2e or
-  # conformance legs at all.
+  # Manual only: what a hosted macOS runner exposes to Metal, on every image
+  # the matrices above use. The OS, the device, and the capability bits
+  # mtld3d branches on, then a clear pass, the pinned Wine booting a prefix,
+  # and the one texture format the Mac2 family lacks. Run it before adding a
+  # runner label to the matrices, since an image without a Metal device
+  # cannot run the e2e or conformance legs at all, and the newest arm64 image
+  # is in the list as the reference every other row is read against.
   probe-metal:
     if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15-intel, macos-15]
+        runner: [macos-26, macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
