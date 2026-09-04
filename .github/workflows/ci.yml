@@ -532,6 +532,75 @@ jobs:
               e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
               print("uncleared depth (\(df == .depth32Float ? "D32F" : "D32F_S8"), DontCare load), draw at 0.5 lessEqual, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(red = the plane read as far, blue = as near)")
           }
+          // 6. The clear-quad shape on a combined depth-stencil attachment: viewport set, scissor to the
+          //    left half, a fragment-less pipeline that declares the stencil format, depth always/write,
+          //    then a red triangle at 0.5 under lessEqual over the full attachment. Once without and once
+          //    with an empty fragment function.
+          let src2 = """
+          #include <metal_stdlib>
+          using namespace metal;
+          fragment void nothing() {}
+          """
+          let lib2 = try! d.makeLibrary(source: src2, options: nil)
+          for withFragment in [false, true] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri")
+              p.fragmentFunction = withFragment ? lib2.makeFunction(name: "nothing") : nil
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm; p.colorAttachments[0].writeMask = []
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let quad = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let pc = MTLRenderPipelineDescriptor()
+              pc.vertexFunction = lib.makeFunction(name: "tri"); pc.fragmentFunction = lib.makeFunction(name: "solid")
+              pc.colorAttachments[0].pixelFormat = .rgba8Unorm
+              pc.depthAttachmentPixelFormat = .depth32Float_stencil8; pc.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let cover = try! d.makeRenderPipelineState(descriptor: pc)
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(W), height: Double(H), znear: 0, zfar: 1))
+              e.setRenderPipelineState(quad); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W / 2, height: H))
+              var zv: Float = 0.0; e.setVertexBytes(&zv, length: 4, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W, height: H))
+              e.setRenderPipelineState(cover); e.setDepthStencilState(dss(write: false))
+              zv = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("clear-quad shape on D32F_S8 (\(withFragment ? "empty fragment function" : "no fragment function")): left", px(b, W, 2, 8), "(want green) right", px(b, W, 13, 8), "(want red)")
+          }
+          // 7. A drawn multisample depth, resolved: 4x colour+depth pass cleared to 1.0, a triangle at 0.5
+          //    under always/write, store multisampleResolve on depth (sample0), then read the resolved depth.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let rsc = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = msc; rp.colorAttachments[0].resolveTexture = rsc; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].storeAction = .multisampleResolve
+              rp.depthAttachment.texture = ms; rp.depthAttachment.resolveTexture = rs; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .multisampleResolve; rp.depthAttachment.depthResolveFilter = .sample0
+              rp.stencilAttachment.texture = ms; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .dontCare
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the drawn depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("drawn multisample depth resolve (D32F_S8), resolved centre depth:", v, "(want 0.5)")
+          }
           // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
           do {
               let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
