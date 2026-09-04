@@ -152,7 +152,6 @@ jobs:
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    continue-on-error: ${{ matrix.runner != 'macos-26' }}
     strategy:
       fail-fast: false
       matrix:
@@ -166,8 +165,11 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml.
+      # windows/.config/nextest.toml. The advisory images tolerate a failing
+      # suite at this step, so the job and its check stay green and the
+      # failure is read from the step's own log.
       - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }}
+        continue-on-error: ${{ matrix.runner != 'macos-26' }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -193,7 +195,6 @@ jobs:
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    continue-on-error: ${{ matrix.runner != 'macos-26' }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,6 +207,8 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
       - run: make conformance-${{ matrix.runner == 'macos-15-intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
+        # As for the e2e legs: advisory images tolerate a failing run here.
+        continue-on-error: ${{ matrix.runner != 'macos-26' }}
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
