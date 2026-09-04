@@ -231,7 +231,11 @@ test_window_style 5220).
 The mode list `EnumAdapterModes` serves is a bounded subset of
 `EnumDisplaySettingsW`'s, so an enumerated mode is one win32u accepts by
 construction, and a fullscreen request for any mode in the full list is set
-whether or not the bounded list carries it. When the app requests one, the
+whether or not the bounded list carries it. The test binary, being the
+process's main module, enumerates the same bounded list through its own
+`EnumDisplaySettingsW` import (d3d9 redirects it at load; user32's list is
+untouched and `ENUM_CURRENT_SETTINGS` passes through), so a mode the test
+picks from either list is one user32 accepts. When the app requests one, the
 device sets it and the back buffer is that mode; present
 scales it to the drawable, which stays at the display's size (MetalFX when
 enlarging, the same resample `render.scale` rides). Both halves of the

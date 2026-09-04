@@ -129,6 +129,25 @@ pub fn served_mode_sizes(settable: &[(u32, u32)], max: usize) -> Vec<(u32, u32)>
         .collect()
 }
 
+/// The positions in a mode list of the modes whose size is served.
+///
+/// The list a game enumerates through `EnumDisplaySettings` is user32's,
+/// every depth and refresh rate of every size; the positions returned are
+/// those of the modes at a size in `served`, in the list's own order, so a
+/// game walking indices 0.. sees the served sizes and nothing else.
+#[must_use]
+pub fn served_mode_indices(
+    sizes: impl IntoIterator<Item = (u32, u32)>,
+    served: &[(u32, u32)],
+) -> Vec<u32> {
+    sizes
+        .into_iter()
+        .enumerate()
+        .filter(|(_, size)| served.contains(size))
+        .filter_map(|(index, _)| u32::try_from(index).ok())
+        .collect()
+}
+
 fn aspect((w, h): (u32, u32)) -> f64 {
     f64::from(w) / f64::from(h)
 }

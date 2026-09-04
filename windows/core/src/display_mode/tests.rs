@@ -1,4 +1,6 @@
-use super::{ModeRequest, mode_set_attempts, select_mode_sizes, served_mode_sizes};
+use super::{
+    ModeRequest, mode_set_attempts, select_mode_sizes, served_mode_indices, served_mode_sizes,
+};
 
 const MBP: (u32, u32) = (3456, 2234);
 
@@ -125,4 +127,28 @@ fn a_bound_of_zero_still_serves_the_desktop() {
 #[test]
 fn an_empty_settable_list_serves_nothing() {
     assert!(served_mode_sizes(&[], 5).is_empty());
+}
+
+#[test]
+fn served_indices_are_the_positions_of_served_sizes_in_list_order() {
+    // user32 lists every depth and rate of a size; each occurrence keeps
+    // its position, sizes not served leave gaps.
+    let list = [
+        (640, 480),
+        (1920, 1200),
+        (640, 480),
+        (1280, 1024),
+        (1920, 1200),
+        MBP,
+    ];
+    assert_eq!(
+        served_mode_indices(list, &[MBP, (1920, 1200)]),
+        vec![1, 4, 5]
+    );
+}
+
+#[test]
+fn no_served_size_in_the_list_yields_no_indices() {
+    assert!(served_mode_indices([(640, 480)], &[MBP]).is_empty());
+    assert!(served_mode_indices([], &[MBP]).is_empty());
 }

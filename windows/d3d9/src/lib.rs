@@ -14,6 +14,7 @@ mod encoder;
 mod fullscreen;
 mod index_buffer;
 mod log_sink;
+mod mode_list_hook;
 mod page_box_pool;
 mod pixel_shader;
 mod private_data;
@@ -129,6 +130,7 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
         // A FreeLibrary the process survives: take the process-wide pointers
         // into this image down with it.
         crash::uninstall();
+        mode_list_hook::uninstall();
     }
     if reason != DLL_PROCESS_ATTACH {
         return 1;
@@ -278,4 +280,5 @@ fn attach_process(instance: *mut c_void) {
     // during `DLL_PROCESS_ATTACH`; Win32 `DisableThreadLibraryCalls` is
     // safe to call from `DLL_PROCESS_ATTACH` with that module handle.
     unsafe { DisableThreadLibraryCalls(instance) };
+    mode_list_hook::install();
 }

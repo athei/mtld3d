@@ -137,11 +137,20 @@ struct AdapterModes {
     /// Win32's list under [`select_mode_sizes`]' filters, the set user32
     /// accepts a mode-set for.
     settable: Vec<(u32, u32)>,
+    /// The sizes games enumerate: the settable ones bounded to [`MAX_SERVED_SIZES`].
+    ///
+    /// Shared by `EnumAdapterModes` and the `EnumDisplaySettings` redirect
+    /// (`mode_list_hook`), so both menu paths show one list.
+    served_sizes: Vec<(u32, u32)>,
     /// The entries `GetAdapterModeCount` / `EnumAdapterModes` serve.
     ///
-    /// The settable sizes bounded to [`MAX_SERVED_SIZES`], repeated once per
-    /// adapter format; entry 0 is the desktop mode.
+    /// The served sizes once per adapter format; entry 0 is the desktop mode.
     served: Vec<D3DDISPLAYMODE>,
+}
+
+/// The sizes games enumerate, desktop first.
+pub fn served_sizes() -> &'static [(u32, u32)] {
+    &ADAPTER_MODES.served_sizes
 }
 
 fn build_adapter_modes() -> AdapterModes {
@@ -204,6 +213,7 @@ fn build_adapter_modes() -> AdapterModes {
     );
     AdapterModes {
         settable,
+        served_sizes: sizes,
         served: modes,
     }
 }

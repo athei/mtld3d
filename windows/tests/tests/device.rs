@@ -3,9 +3,10 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
+use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, assert_pixel_eq,
+    WS_VISIBLE, assert_pixel_eq, enumerate_display_sizes,
 };
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES, D3DDISPLAYMODE,
@@ -77,6 +78,59 @@ fn adapter_mode_enumeration() {
         h.enum_adapter_modes(D3DFMT_X8R8G8B8, n + 10, &mut mode),
         0,
         "EnumAdapterModes out-of-range must reject",
+    );
+}
+
+#[test]
+fn the_main_module_enumerates_the_sizes_the_adapter_serves() {
+    // The test binary is the process's main module, so its own
+    // EnumDisplaySettingsW import is the one d3d9 redirects: the list it
+    // walks is user32's, thinned to the sizes EnumAdapterModes serves, each
+    // still at every depth and rate user32 lists it. The current mode stays
+    // readable through the same import.
+    let h = Harness::factory_only();
+    let mut served = Vec::new();
+    for index in 0..h.adapter_mode_count(D3DFMT_X8R8G8B8) {
+        let mut mode = D3DDISPLAYMODE {
+            width: 0,
+            height: 0,
+            refresh_rate: 0,
+            format: 0,
+        };
+        assert_eq!(
+            h.enum_adapter_modes(D3DFMT_X8R8G8B8, index, &mut mode),
+            D3D_OK,
+            "EnumAdapterModes({index})"
+        );
+        served.push((mode.width, mode.height));
+    }
+    assert!(
+        served.len() <= MAX_SERVED_SIZES,
+        "EnumAdapterModes serves at most the bound: {served:?}"
+    );
+
+    let enumerated = enumerate_display_sizes();
+    assert!(
+        !enumerated.is_empty(),
+        "the main module enumerates no display mode"
+    );
+    for size in &enumerated {
+        assert!(
+            served.contains(size),
+            "the main module enumerated {size:?}, which EnumAdapterModes does not serve"
+        );
+    }
+    let mut distinct = enumerated;
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert!(
+        distinct.len() <= MAX_SERVED_SIZES,
+        "the main module enumerates more sizes than the bound: {distinct:?}"
+    );
+    let current = Harness::current_display_mode();
+    assert!(
+        current.0 > 0 && current.1 > 0,
+        "ENUM_CURRENT_SETTINGS still answers"
     );
 }
 

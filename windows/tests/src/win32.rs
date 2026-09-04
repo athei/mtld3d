@@ -387,6 +387,31 @@ pub fn current_display_mode() -> (u32, u32) {
     (dm.pels_width, dm.pels_height)
 }
 
+/// Every size the primary display enumerates through this binary's own user32 import.
+///
+/// Walks indices from 0 until user32 says the list ends, once per mode, so
+/// a size appears as many times as user32 lists it (once per depth and
+/// rate). Read through the test binary's import, which is the one d3d9
+/// redirects for the process's main module.
+#[must_use]
+pub fn enumerate_display_sizes() -> Vec<(u32, u32)> {
+    let mut sizes = Vec::new();
+    for mode_num in 0..u32::MAX {
+        // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
+        // valid value.
+        let mut dm: DevModeW = unsafe { core::mem::zeroed() };
+        dm.size = DEV_MODE_SIZE;
+        // SAFETY: Win32 thunk; a null device name selects the primary display
+        // and `dm` is an owned local with `size` set per the API contract.
+        let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+        if ok == 0 {
+            break;
+        }
+        sizes.push((dm.pels_width, dm.pels_height));
+    }
+    sizes
+}
+
 /// The primary display's current resolution (`SM_CXSCREEN` / `SM_CYSCREEN`).
 pub fn screen_size() -> (u32, u32) {
     const SM_CXSCREEN: i32 = 0;
