@@ -71,12 +71,17 @@ endif
 RUST_STABLE  ?= stable
 RUST_NIGHTLY ?= nightly
 
-# The cargo-installed tools a CI leg actually needs: `xwin` splats the MSVC SDK,
-# `cargo-nextest` runs every test leg. Floating here and pinned by ci.yml, same
-# split as the toolchains, because until this was a variable they were the one
-# input a run took from whatever the registry happened to hold that day.
-# Developer-only tooling is deliberately not in here, see `setup-dev`.
-CARGO_TOOLS ?= xwin cargo-nextest
+# The cargo-installed tools a build needs: `xwin` splats the MSVC SDK. Floating
+# here and pinned by ci.yml, same split as the toolchains, because until this
+# was a variable they were the one input a run took from whatever the registry
+# happened to hold that day. Developer-only tooling is deliberately not in here,
+# see `setup-dev`.
+CARGO_TOOLS ?= xwin
+# nextest runs every test leg and comes as a prebuilt universal binary
+# (`setup-nextest`) rather than through `cargo install`: a test runner that only
+# replays a staged build has no cargo at all, and a build machine saves the
+# compile. `latest` floats for a developer; ci.yml pins a version.
+NEXTEST_VERSION ?= latest
 
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
@@ -90,14 +95,38 @@ UNIX_TARGET_arm64  := aarch64-apple-darwin
 UNIX_WINEDIR_x64   := x86_64-unix
 UNIX_WINEDIR_arm64 := aarch64-unix
 # Native host target for unit tests + clippy — whatever this machine is
-# (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta.
-UNIX_NATIVE_TARGET  := $(shell rustc +$(RUST_STABLE) -vV | sed -n 's/^host: //p')
+# (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta. Expanded
+# where it is used rather than up front, so a test runner that replays a staged
+# build (`STAGE=`, below) and has no rustc at all still parses this file.
+UNIX_NATIVE_TARGET  = $(shell rustc +$(RUST_STABLE) -vV | sed -n 's/^host: //p')
+# The machine's own arch by the kernel's name, `arm64` or `x86_64`: which staged
+# conformance runner binary is the native one here.
+HOST_ARCH := $(shell uname -m)
 
 
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
 OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
 OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
 OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
+
+# `make stage` packs everything a test machine needs out of one build:
+# both PE arches, both unix `.so` builds, the nextest archives of the e2e suite
+# per PE arch, and the conformance runner for both host arches. `STAGE=<dir>`
+# then points the install, e2e and conformance targets at an unpacked stage
+# instead of a build: the OUT_* dirs become the staged ones, the build
+# prerequisites drop, nextest replays the archive through its standalone
+# binary, and the conformance runner is the staged binary for this machine.
+# That is how CI builds once on a fast machine and fans the suites out over
+# runners that carry no toolchain, and how a slow or old machine can run the
+# suites against a build made elsewhere.
+STAGE_DIR := $(CURDIR)/windows/target/stage
+STAGE_OUT := $(CURDIR)/windows/target/mtld3d-stage.tar
+ifdef STAGE
+OUT_i386       := $(STAGE)/i386-windows
+OUT_x64        := $(STAGE)/x86_64-windows
+OUT_unix_x64   := $(STAGE)/$(UNIX_WINEDIR_x64)
+OUT_unix_arm64 := $(STAGE)/$(UNIX_WINEDIR_arm64)
+endif
 
 XWIN_CACHE := $(HOME)/Library/Caches/xwin
 # What the splat in /opt/xwin actually holds, written there by `setup-xwin` and
@@ -115,24 +144,6 @@ XWIN_STAMP := /opt/xwin/.xwin-packages
 XWIN_CRT_VERSION := 14.44.17.14
 XWIN_SDK_VERSION := 10.0.26100
 
-# The C and C++ the PE targets carry (snmalloc, zstd) are compiled by the host
-# `c++` under cc-rs, and the MSVC STL of the CRT above refuses any clang whose
-# major is below 19. Apple's clang reports 21 on macOS 26 but 17 on the Xcode
-# 16 a macOS 15 machine or CI image ships, so on such a host the PE C/C++ goes
-# through Homebrew's LLVM instead: `setup-pe-cc` installs it, and the exports
-# below route cc-rs to it for the two PE targets only. The Rust side, the unix
-# `.so` and the linker are untouched. Nothing changes on a host whose clang is
-# new enough.
-PE_CC_MIN_CLANG  := 19
-HOST_CLANG_MAJOR := $(shell echo __clang_major__ | c++ -E -x c++ - 2>/dev/null | tail -1)
-HOST_CLANG_OLD   := $(shell test "$(HOST_CLANG_MAJOR)" -lt $(PE_CC_MIN_CLANG) 2>/dev/null && echo yes)
-ifeq ($(HOST_CLANG_OLD),yes)
-PE_CC_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
-export CC_i686_pc_windows_msvc    := $(PE_CC_PREFIX)/bin/clang
-export CXX_i686_pc_windows_msvc   := $(PE_CC_PREFIX)/bin/clang++
-export CC_x86_64_pc_windows_msvc  := $(PE_CC_PREFIX)/bin/clang
-export CXX_x86_64_pc_windows_msvc := $(PE_CC_PREFIX)/bin/clang++
-endif
 XWIN := xwin --accept-license --arch x86,x86_64 \
 	--crt-version $(XWIN_CRT_VERSION) --sdk-version $(XWIN_SDK_VERSION) \
 	--cache-dir $(XWIN_CACHE)
@@ -214,7 +225,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle configure-test-prefix \
+	bundle stage configure-test-prefix \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -222,7 +233,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
 	clippy-native audit doc doc-windows doc-unix check clean upgrade \
-	upgrade-incompat setup setup-rust setup-dev setup-xwin setup-pe-cc \
+	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
 
@@ -301,7 +312,7 @@ define MTLD3D_TREE
 if [ -d $(1)/lib/wine/d3d9/mtld3d ]; then echo $(1)/lib/wine/d3d9/mtld3d; else echo $(1)/lib/wine; fi
 endef
 
-install-windows-i686: windows-i686
+install-windows-i686: $(if $(STAGE),,windows-i686)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/i386-windows ; \
@@ -315,7 +326,7 @@ install-windows-i686: windows-i686
 		fi ; \
 	done
 
-install-windows-x86_64: windows-x86_64
+install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/x86_64-windows ; \
@@ -334,7 +345,7 @@ install-windows-x86_64: windows-x86_64
 # that later gains an arm64 loader is already served. In the subtree layout the
 # default unix dir carries no mtld3d.so at all, so one an earlier install left
 # there goes.
-install-unix-x64: unix-x64
+install-unix-x64: $(if $(STAGE),,unix-x64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_x64) ; \
@@ -346,7 +357,7 @@ install-unix-x64: unix-x64
 		fi ; \
 	done
 
-install-unix-arm64: unix-arm64
+install-unix-arm64: $(if $(STAGE),,unix-arm64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_arm64) ; \
@@ -416,6 +427,33 @@ bundle: all
 	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/
 	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows \
 		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
+
+# The test hand-off (see STAGE above): the install inputs laid out exactly as
+# the OUT_* dirs hold them, the e2e suite as nextest archives, and the
+# conformance runner for either host arch. A plain tar, since the artifact
+# store drops execute bits and the `.dSYM` directories otherwise.
+stage: all
+	rm -rf $(STAGE_DIR) $(STAGE_OUT)
+	mkdir -p $(STAGE_DIR)/i386-windows $(STAGE_DIR)/x86_64-windows
+	mkdir -p $(STAGE_DIR)/$(UNIX_WINEDIR_x64) $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)
+	mkdir -p $(STAGE_DIR)/tests $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
+	cp $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
+		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
+	cp $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
+		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb $(STAGE_DIR)/x86_64-windows/
+	cp $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
+	cp -R $(OUT_unix_x64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
+	cp $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
+	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
+	cd windows && cargo +$(RUST_STABLE) nextest archive -p mtld3d-tests --target $(PE_i386) \
+		--archive-file $(STAGE_DIR)/tests/e2e-i686.tar.zst
+	cd windows && cargo +$(RUST_STABLE) nextest archive -p mtld3d-tests --target $(PE_x64) \
+		--archive-file $(STAGE_DIR)/tests/e2e-x86_64.tar.zst
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_x64)
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_arm64)
+	cp unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/x86_64/
+	cp unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/arm64/
+	tar -cf $(STAGE_OUT) -C $(STAGE_DIR) .
 
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
@@ -501,17 +539,28 @@ test-unit:
 # one dependent test would otherwise hide every later test's behaviour there.
 # The default run keeps fail-fast: there the first failure is a regression to
 # fix, not a survey to read.
-E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast)
+#
+# PARTITION=K/N runs the K-th of N hash-sharded slices of the suite, so several
+# machines can split one arch's suite between them; the shard a test lands in
+# depends on its name alone, so the slices agree across machines and builds.
+E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast) $(if $(PARTITION),--partition hash:$(PARTITION))
+
+# From a build here, nextest builds and runs the package through cargo; from a
+# stage it replays the archive through its own binary, which needs no cargo,
+# and is told where this checkout's workspace is so its config resolves.
+NEXTEST       := $(if $(STAGE),cargo-nextest nextest,cargo +$(RUST_STABLE) nextest)
+E2E_SUITE_i686   := $(if $(STAGE),--archive-file $(STAGE)/tests/e2e-i686.tar.zst --workspace-remap $(CURDIR)/windows,-p mtld3d-tests --target $(PE_i386))
+E2E_SUITE_x86_64 := $(if $(STAGE),--archive-file $(STAGE)/tests/e2e-x86_64.tar.zst --workspace-remap $(CURDIR)/windows,-p mtld3d-tests --target $(PE_x64))
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_i386) $(E2E_NEXTEST_FLAGS)
+		$(NEXTEST) run $(E2E_SUITE_i686) $(E2E_NEXTEST_FLAGS)
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
 	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		cargo +$(RUST_STABLE) nextest run -p mtld3d-tests --target $(PE_x64) $(E2E_NEXTEST_FLAGS)
+		$(NEXTEST) run $(E2E_SUITE_x86_64) $(E2E_NEXTEST_FLAGS)
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts
@@ -524,8 +573,12 @@ test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 # runs the same four subtests for its arch. The `-intel` legs run the same
 # binary with `--variant intel`, which turns every `intel.*` config key on, and
 # record under their own `<arch>+intel` baseline entries.
-CONFORMANCE_RUN = cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance -- \
-	--wine $(WINE_SDK)/bin/wine
+# From a build here the runner is built and run through cargo; from a stage it
+# is the staged binary for this machine's arch. The assets directory is named
+# explicitly either way: the runner's compiled-in default is the crate path on
+# the machine that built it.
+CONFORMANCE_BIN = $(if $(STAGE),$(STAGE)/conformance/$(HOST_ARCH)/mtld3d-conformance,cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance --)
+CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --assets $(CURDIR)/unix/conformance
 
 # $(1) = arch (i686|x86_64), $(2) = extra runner args. Checks the exe up front
 # so a bundle that predates the published test binaries says so, rather than
@@ -669,7 +722,7 @@ upgrade-incompat:
 # for the same reason the test and lint targets are: a host-only leg needs
 # neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
 # stands alone and this is the everything-at-once aggregate.
-setup: setup-rust setup-dev setup-xwin setup-pe-cc setup-rosetta
+setup: setup-rust setup-nextest setup-dev setup-xwin setup-rosetta
 
 setup-rust:
 	@echo "==> rustup: install $(RUST_STABLE) and $(RUST_NIGHTLY) with the cross-compile targets"
@@ -682,9 +735,8 @@ setup-rust:
 	rustup target add --toolchain $(RUST_STABLE) \
 		$(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
 	rustup toolchain install $(RUST_NIGHTLY) --profile minimal --component rustfmt
-	# `--locked`: cargo-nextest refuses to build any other way (it ships a
-	# tripwire crate that fails the compile), and taking every tool's own
-	# lockfile is what makes a CI runner and a laptop install the same thing.
+	# `--locked`: taking every tool's own lockfile is what makes a CI runner and
+	# a laptop install the same thing.
 	# The toolchain is named rather than left to the exported RUSTUP_TOOLCHAIN
 	# because cargo warns about the implicit override here, once per package it
 	# builds: the toolchain comes from this environment and not from anything the
@@ -771,20 +823,14 @@ setup-xwin: setup-rust xwin-dir
 	$(XWIN) splat --output /opt/xwin; \
 	echo "$$upstream" > $(XWIN_STAMP)
 
-# A host clang below the MSVC STL's floor (see PE_CC_MIN_CLANG at the top)
-# gets Homebrew's LLVM for the PE C/C++; a new enough one needs nothing.
-setup-pe-cc:
-	@if [ "$(HOST_CLANG_OLD)" = "yes" ]; then \
-		echo "==> pe-cc: host clang $(HOST_CLANG_MAJOR) is below $(PE_CC_MIN_CLANG), the PE C/C++ compiles with Homebrew LLVM"; \
-		if [ -x "$(PE_CC_PREFIX)/bin/clang" ]; then \
-			echo "    already present at $(PE_CC_PREFIX)"; \
-		else \
-			brew install llvm; \
-		fi; \
-		"$(PE_CC_PREFIX)/bin/clang" --version | head -1; \
-	else \
-		echo "==> pe-cc: host clang $(HOST_CLANG_MAJOR) compiles the PE C/C++ itself"; \
-	fi
+# The prebuilt nextest, a universal binary, into the cargo bin directory, which
+# is on PATH wherever cargo is and is what a test runner without cargo puts on
+# its PATH itself. The same binary builds the archives and replays them.
+setup-nextest:
+	@echo "==> nextest: $(NEXTEST_VERSION) prebuilt into $${CARGO_HOME:-$$HOME/.cargo}/bin"
+	mkdir -p $${CARGO_HOME:-$$HOME/.cargo}/bin
+	curl -LsSf https://get.nexte.st/$(NEXTEST_VERSION)/mac | tar zxf - -C $${CARGO_HOME:-$$HOME/.cargo}/bin
+	$${CARGO_HOME:-$$HOME/.cargo}/bin/cargo-nextest nextest --version
 
 # The Wine we run is an x86_64 build and every PE it loads is x86 code, so the
 # whole test path goes through Rosetta. A no-op where it is already installed,

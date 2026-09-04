@@ -18,124 +18,106 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Everything a run depends on that is not in the tree is pinned here, so a green
-# main cannot turn red without a commit: both toolchains, and the two cargo tools
-# a leg needs. All three are plain Makefile variables that float for a developer,
-# and every cargo line in the Makefile names its toolchain with rustup's `+`
-# syntax. The MSVC CRT and Windows SDK versions are pinned in the Makefile
-# instead, beside the xwin call that consumes them.
+# main cannot turn red without a commit: both toolchains, the one cargo tool a
+# build needs, and the nextest binary every test machine replays the suites
+# with. All are plain Makefile variables that float for a developer, and every
+# cargo line in the Makefile names its toolchain with rustup's `+` syntax. The
+# MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
+# the xwin call that consumes them.
 env:
   WINE_RELEASE: cx-26.3.0-1
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
-  CARGO_TOOLS: xwin@0.10.0 cargo-nextest@0.9.143
+  CARGO_TOOLS: xwin@0.10.0
+  NEXTEST_VERSION: 0.9.143
   # The paravirtual GPU on a runner does not implement the counters the Metal HUD
   # samples, and says so on every launch. The validation layer keeps the
   # Makefile's default of on: it catches the misuse these legs exist to find.
   MTL_HUD_ENABLED: "0"
 
+# The shape: two machines compile, everything else replays. `build` makes the
+# stage every test leg installs and runs from, so the suites fan out over
+# machines that carry no toolchain, the slow Intel image included, and no
+# compile happens twice. `check` runs every lint, doc and unit leg as steps of
+# one job, then builds the distribution bundle, since each of those is short and
+# a machine per leg cost more in setup than in work.
 jobs:
-  # The linear part: one job per runner architecture downloads and builds the
-  # shared state (toolchains, the ~3 GB MSVC SDK splat, the Wine bundle, the
-  # cargo registry) and saves it to the cache, so the legs below start warm
-  # instead of a dozen runners racing to splat the same SDK. The caches are
-  # keyed by runner architecture, so the arm64 images share one set and the
-  # Intel image primes its own.
-  setup:
-    strategy:
-      matrix:
-        runner: [macos-26, macos-15-intel]
-    runs-on: ${{ matrix.runner }}
+  # Everything a test machine needs, built once on the fast image: both PE
+  # arches, both unix `.so` builds, the e2e suite as nextest archives, and the
+  # conformance runner for both host arches. Primes the caches the check job
+  # restores too.
+  build:
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          # BUILD_ID, which names the build inside every binary, comes from
+          # `git describe --tags`.
+          fetch-tags: true
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
           wine: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
           prime: 'true'
+      - run: make stage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage
+          path: windows/target/mtld3d-stage.tar
+          retention-days: 3
+          if-no-files-found: error
 
-  fmt-check:
-    needs: setup
+  # The gates that need a toolchain but no GPU, one step each so a red step
+  # names itself, and every step runs whatever the ones before it did: a run
+  # is meant to show everything that is wrong at once, not the first thing.
+  # `pe` gates the MSVC SDK and the Wine SDK: clippy and rustdoc run build
+  # scripts, so snmalloc-sys and zstd-sys need the xwin headers and the
+  # archiver, and windows/shim's build script reads Wine's libwinecrt0.a. The
+  # bundle comes last: built the way a release is, at the default PROD=1, so
+  # the production profile's fat LTO is exercised here rather than first
+  # failing when a release is cut.
+  check:
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-      - run: make fmt-check
-
-  audit:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-      - run: make audit
-
-  # clippy for the two PE targets. `pe` gates the MSVC SDK and the Wine SDK:
-  # clippy runs build scripts, so snmalloc-sys and zstd-sys need the xwin headers
-  # and the archiver, and windows/shim's build script reads Wine's libwinecrt0.a,
-  # all before anything is linked.
-  clippy-pe:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [i686, x86_64]
-    steps:
-      - uses: actions/checkout@v5
+        with:
+          fetch-tags: true
       - uses: ./.github/actions/prepare
         with:
           pe: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
-      - run: make clippy-pe-${{ matrix.arch }}
+      - name: fmt-check
+        run: make fmt-check
+      - name: audit
+        if: ${{ !cancelled() }}
+        run: make audit
+      - name: clippy-pe-i686
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-i686
+      - name: clippy-pe-x86_64
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-x86_64
+      - name: clippy-native
+        if: ${{ !cancelled() }}
+        run: make clippy-native
+      - name: doc-windows
+        if: ${{ !cancelled() }}
+        run: make doc-windows
+      - name: doc-unix
+        if: ${{ !cancelled() }}
+        run: make doc-unix
+      - name: test-unit
+        if: ${{ !cancelled() }}
+        run: make test-unit
+      - name: bundle
+        if: ${{ !cancelled() }}
+        run: make bundle
 
-  clippy-native:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-      - run: make clippy-native
-
-  doc-windows:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-        with:
-          pe: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
-      - run: make doc-windows
-
-  doc-unix:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-      - run: make doc-unix
-
-  test-unit:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
-      - run: make test-unit
-
-  # The end-to-end suite: real PE binaries, run by the pinned Wine against a
-  # Metal device, one leg per image, PE arch and variant. Needs everything,
-  # `wine` included, since the leg installs our builtin into the SDK tree and
-  # boots a prefix.
+  # The end-to-end suite: the staged PE binaries, run by the pinned Wine
+  # against a Metal device, one leg per image, PE arch, variant and partition.
   #
   # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
   # on arm64, and the Intel image, whose paravirtual device has no unified
@@ -143,12 +125,14 @@ jobs:
   # so it runs the real Intel/AMD code paths with the strict Managed-memory
   # semantics the forced runs cannot check. The `intel` variant runs the same
   # suite with every `intel.*` config key on and only makes sense on an
-  # Apple-family device, so it runs on the newest arm64 image alone. The two
-  # older images are advisory until their first runs are read.
-  test-e2e:
-    needs: setup
+  # Apple-family device, so it runs on the newest arm64 image alone. Each
+  # suite is split in two hash-sharded partitions, so two machines share it;
+  # the `2` in the make line is the partition count and moves with the list.
+  # The two older images are advisory until their first runs are read.
+  e2e:
+    needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     continue-on-error: ${{ matrix.runner != 'macos-26' }}
     strategy:
       fail-fast: false
@@ -156,50 +140,55 @@ jobs:
         runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
         variant: [native]
+        partition: [1, 2]
         include:
           - runner: macos-26
             arch: i686
             variant: intel
+            partition: 1
+          - runner: macos-26
+            arch: i686
+            variant: intel
+            partition: 2
           - runner: macos-26
             arch: x86_64
             variant: intel
+            partition: 1
+          - runner: macos-26
+            arch: x86_64
+            variant: intel
+            partition: 2
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
+      - uses: ./.github/actions/runner
         with:
-          pe: 'true'
-          wine: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
+          nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml. Scoped to this job because the unix
-      # workspace has no nextest config to carry the same profile.
-      - run: make test-e2e-${{ matrix.arch }} INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
+      # windows/.config/nextest.toml.
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }}/2 INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
         env:
           NEXTEST_PROFILE: ci
 
-  # Wine's own d3d9_test.exe against our builtin, per-site counts diffed against
-  # unix/conformance/baseline.txt. One arch per runner process, and not part of
-  # `make test`: many subtests fail by design, so this gates on a regression
-  # rather than on zero failures. The per-subtest budget is raised from its 180 s
-  # default because the GPU here is paravirtual, and a subtest killed for taking
-  # too long is reported as a crash.
+  # Wine's own d3d9_test.exe against our staged builtin, per-site counts diffed
+  # against unix/conformance/baseline.txt. One arch per runner process, and not
+  # part of `make test`: many subtests fail by design, so this gates on a
+  # regression rather than on zero failures. The per-subtest budget is raised
+  # from its 180 s default because the GPU here is paravirtual, and a subtest
+  # killed for taking too long is reported as a crash.
   # This gates on the same baseline the local runs use, in both directions:
   # a count above its pin is a regression, a count below it is a stale
-  # baseline (also fatal — see CONFORMANCE.md). The paravirtual GPU used to
-  # diverge both ways, but every divergence traced to our own code (the
-  # depth-clamp rule now lives in the FF vertex shader, display geometry and
-  # the registry-mode restore come from the Win32 view, and the pipeline/pass
-  # depth attachments can no longer disagree). The desktop-mode sites that
+  # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum.
-  # The `intel` variant runs the suite under every `intel.*` config key and
-  # gates on its own `<arch>+intel` baseline entries, on the newest arm64
-  # image alone. The two older images run the native suite as advisory legs:
-  # the baseline carries no per-image entries yet, so their counts are read
-  # from the artifact until they are recorded and triaged.
+  # cross-environment maximum. The `intel` variant runs the suite under every
+  # `intel.*` config key and gates on its own `<arch>+intel` baseline entries,
+  # on the newest arm64 image alone. The two older images run the native
+  # suite as advisory legs: the baseline carries no per-image entries yet, so
+  # their counts are read from the artifact until they are recorded and
+  # triaged.
   conformance:
-    needs: setup
+    needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     continue-on-error: ${{ matrix.runner != 'macos-26' }}
@@ -218,12 +207,11 @@ jobs:
             variant: intel
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/prepare
+      - uses: ./.github/actions/runner
         with:
-          pe: 'true'
-          wine: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
-      - run: make conformance-${{ matrix.variant == 'intel' && 'intel-' || '' }}${{ matrix.arch }}
+          nextest-version: ${{ env.NEXTEST_VERSION }}
+      - run: make conformance-${{ matrix.variant == 'intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
@@ -241,28 +229,6 @@ jobs:
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error
-
-  # The distribution bundle, which no other leg covers: it stages both install
-  # routes, marks the builtins, and packs the symbols archive alongside, all from
-  # artifacts for four targets. Built the way a release is, at the default PROD=1,
-  # so the production profile's fat LTO is exercised here rather than first
-  # failing when a release is cut. Costs about 5 minutes, which is less than the
-  # e2e legs take.
-  bundle:
-    needs: setup
-    runs-on: macos-26
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # BUILD_ID, which names the build inside the symbols archive, comes
-          # from `git describe --tags`.
-          fetch-tags: true
-      - uses: ./.github/actions/prepare
-        with:
-          pe: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
-      - run: make bundle
 
   # Manual only: what a hosted macOS runner exposes to Metal, on the Intel
   # image and the arm64 macOS 15 image. The OS, the device, and the capability
@@ -329,6 +295,11 @@ jobs:
           rp.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
           let enc = cb.makeRenderCommandEncoder(descriptor: rp)!
           enc.endEncoding()
+          // A Managed texture on a device without unified memory holds the
+          // GPU's write in VRAM until a synchronize brings it across.
+          let blit = cb.makeBlitCommandEncoder()!
+          blit.synchronize(resource: tex)
+          blit.endEncoding()
           cb.commit()
           cb.waitUntilCompleted()
           print("clear pass status: \(cb.status.rawValue) error: \(String(describing: cb.error))")
