@@ -2505,12 +2505,15 @@ impl Harness {
     /// Whether the device is the paravirtualized one a hosted runner exposes.
     ///
     /// That device claims no GPU family and implements less than the Mac2
-    /// family it stands in for. Measured, not assumed: it hands back a texture
-    /// view with a channel swizzle and then samples the view through the base
-    /// texture's lanes, where every real GPU family applies the swizzle. The
-    /// renderer keys two sampler fallbacks on the same name. A test of a
-    /// feature the device lacks returns early on it, since its assertion
-    /// would measure the device rather than the layer.
+    /// family it stands in for. Measured, not assumed, by the workflow's
+    /// probe job: it hands back a texture view with a channel swizzle and
+    /// then samples the view through the base texture's lanes, where every
+    /// real GPU family applies the swizzle; and a later encoder of the same
+    /// command buffer that loads or samples a multisample depth resolve
+    /// target sees the content an earlier encoder stored there, not the
+    /// resolve. The renderer keys two sampler fallbacks on the same name. A
+    /// test of a feature the device lacks returns early on it, since its
+    /// assertion would measure the device rather than the layer.
     #[must_use]
     pub fn device_is_paravirtual(&self) -> bool {
         let id = self.adapter_identifier();
