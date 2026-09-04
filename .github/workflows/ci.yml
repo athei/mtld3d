@@ -136,11 +136,14 @@ jobs:
   # Managed-memory semantics, and joins once the pinned Wine boots there: for
   # now it cannot boot a prefix (`could not load kernel32.dll, status
   # c0000135`, see the probe job), and a leg that waits out wineboot's timer
-  # to fail is a machine wasted. The forced Intel answers (`make test
-  # INTEL=1`) are a local tool for a machine without Intel hardware and do
-  # not run here. Each suite is split in three hash-sharded partitions, so
-  # three machines share it. The older image is advisory until its first
-  # runs are read.
+  # to fail is a machine wasted. When it joins it runs under `INTEL=1`: the
+  # device already gives three of the four Intel answers, and the fourth,
+  # 32-bit float filtering, is the one a real Intel/AMD Mac's driver denies
+  # and this paravirtual device does not, so the forced key is what makes
+  # the image stand in for the hardware. On an Apple-family image the forced
+  # answers are a local tool (`make test INTEL=1`) and do not run here. Each
+  # suite is split in three hash-sharded partitions, so three machines share
+  # it. The older image is advisory until its first runs are read.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -160,7 +163,7 @@ jobs:
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
       # windows/.config/nextest.toml.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }}
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -178,9 +181,10 @@ jobs:
   # cross-environment maximum. The older image runs the suite as an advisory
   # leg: the baseline carries no per-image entries yet, so its counts are
   # read from the artifact until they are recorded and triaged. The Intel
-  # image waits on the prefix boot, as for the e2e legs above, and the
-  # forced Intel answers (`make conformance-intel`, the `<arch>+intel`
-  # baseline entries) are a local tool that does not run here.
+  # image waits on the prefix boot, as for the e2e legs above; when it joins
+  # it runs the `intel` variant for the reason given there, and records under
+  # the `<arch>+intel` baseline entries. On an Apple-family image that
+  # variant (`make conformance-intel`) is a local tool and does not run here.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -197,7 +201,7 @@ jobs:
         with:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
-      - run: make conformance-${{ matrix.arch }} STAGE="$STAGE"
+      - run: make conformance-${{ matrix.runner == 'macos-15-intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the

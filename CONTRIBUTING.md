@@ -217,9 +217,11 @@ artifacts rather than its status, and run `make conformance` locally when
 your change touches the render or shader-emission path. The Intel image,
 whose device has no unified memory and none of the packed 16-bit formats,
 joins the matrices once the pinned Wine boots a prefix there; the manual
-`probe-metal` job is how an image is checked before it is added. The forced
-Intel answers (`make test INTEL=1`, `make conformance-intel`) are for a
-machine without Intel hardware and do not run in CI.
+`probe-metal` job is how an image is checked before it is added, and it will
+run under the forced Intel answers, because its device filters 32-bit floats
+where a real Intel/AMD Mac's driver does not. On an Apple-family machine the
+forced answers (`make test INTEL=1`, `make conformance-intel`) are the way to
+run the Intel paths without the hardware.
 
 The end-to-end legs run serially in CI on purpose, because parallel device
 creation aborts on a runner. A flake there is not fixed by re-enabling
