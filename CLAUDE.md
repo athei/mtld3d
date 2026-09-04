@@ -6,8 +6,10 @@ a pull request is expected to contain. Read it before changing anything.
 
 It points at the files that own the rules:
 
-- [`README.md`](README.md), the goal, the current feature status, and how to
-  build, install, configure and log.
+- [`README.md`](README.md), the goal, the requirements, and how to build,
+  install, configure and log.
+- [`docs/STATUS.md`](docs/STATUS.md), what is implemented, what is not, and
+  the divergences kept on purpose.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md), the workflow and the lessons that no
   other file owns.
 - [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md), every code rule, with

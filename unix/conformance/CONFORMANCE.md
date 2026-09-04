@@ -100,7 +100,7 @@ site holds its pin, because API misuse is invisible to a pass/fail count. A
 ## Kept divergences
 
 Divergences from D3D9 kept on purpose, because closing them costs frame time,
-memory, or a game that relies on the looser behaviour. The README lists them
+memory, or a game that relies on the looser behaviour. `docs/STATUS.md` lists them
 in one line each; this section is where the reasoning lives. Where Wine's
 suite observes a divergence, the cluster below carries the site-level detail
 and is named here; the rest have no conformance site and this is their only
@@ -441,7 +441,7 @@ working set on each activation change, which costs frame time and risks the
 game's own recreate path, for a device that lost nothing. The
 `D3DERR_DEVICENOTRESET` half is real and implemented: a failed `Reset`
 latches it until one succeeds. Listed under Deliberately not implemented
-in the README.
+in `docs/STATUS.md`.
 
 4551 is `expected`, and follows from the same no-modeset decision as the
 message sites above. It reads a `WINDOWPOS` the test's wndproc only captures
