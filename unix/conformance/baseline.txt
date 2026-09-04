@@ -122,7 +122,6 @@
   visual.c:27902 count=2
 [i686/stateblock] crash=0
 [i686/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [i686+intel/device] crash=0
   device.c:2234 count=1
   device.c:2237 count=1
@@ -236,7 +235,6 @@
   visual.c:28024 count=1
 [i686+intel/stateblock] crash=0
 [i686+intel/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [i686+intel@mac2/device] crash=0
   device.c:3685 count=2
   device.c:3700 count=2
@@ -337,7 +335,6 @@
   visual.c:28024 count=1
 [i686+intel@mac2/stateblock] crash=0
 [i686+intel@mac2/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [i686+scale/device] crash=0
   device.c:3685 count=2
   device.c:3700 count=2
@@ -462,7 +459,6 @@
   visual.c:28137 count=2
 [i686+scale/stateblock] crash=0
 [i686+scale/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [x86_64/device] crash=0
   device.c:2234 count=1
   device.c:2237 count=1
@@ -574,7 +570,6 @@
   visual.c:27902 count=2
 [x86_64/stateblock] crash=0
 [x86_64/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [x86_64+intel/device] crash=0
   device.c:2234 count=1
   device.c:2237 count=1
@@ -686,7 +681,6 @@
   visual.c:28024 count=1
 [x86_64+intel/stateblock] crash=0
 [x86_64+intel/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [x86_64+intel@mac2/device] crash=0
   device.c:3685 count=2
   device.c:3700 count=2
@@ -787,7 +781,6 @@
   visual.c:28024 count=1
 [x86_64+intel@mac2/stateblock] crash=0
 [x86_64+intel@mac2/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
 [x86_64+scale/device] crash=0
   device.c:3685 count=2
   device.c:3700 count=2
@@ -910,4 +903,3 @@
   visual.c:28137 count=2
 [x86_64+scale/stateblock] crash=0
 [x86_64+scale/d3d9ex] crash=0
-  d3d9ex.c:5184 count=1
