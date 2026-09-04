@@ -243,6 +243,9 @@ jobs:
           sysctl -n machdep.cpu.brand_string
           sysctl -n hw.memsize
           xcodebuild -version || true
+          # Whether the runner has a GUI session: the Mac driver needs one.
+          launchctl managername || true
+          id -un; who || true
       - name: Displays and GPUs
         run: system_profiler SPDisplaysDataType || true
       - name: Metal device
@@ -327,16 +330,30 @@ jobs:
           # end of it inline.
           WINEDEBUG=+timestamp,+loaddll,+process,+seh,+winediag "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-trace.log" 2>&1 || echo "reg add exit $?"
           echo "== errors, warnings, exceptions"
-          grep -aE 'err:|warn:|seh:|winediag' "$RUNNER_TEMP/wine-trace.log" | head -60
+          grep -aE 'err:|warn:|seh:dispatch_exception|winediag' "$RUNNER_TEMP/wine-trace.log" | head -40
           echo "== last lines"
-          tail -60 "$RUNNER_TEMP/wine-trace.log"
+          tail -20 "$RUNNER_TEMP/wine-trace.log"
           ls -la "$HOME/.wine" "$HOME/.wine/drive_c" "$HOME/.wine/drive_c/windows" 2>/dev/null || true
           "$HOME/wine-sdk/wine/bin/wineserver" -k || true
+          # The same boot with the Mac driver narrating its own start, since
+          # the abort follows winemac.drv's load by milliseconds, and a boot
+          # without the Mac driver at all, to confirm it is the one aborting.
+          echo "== boot with +macdrv"
+          WINEPREFIX="$RUNNER_TEMP/pfx-macdrv" WINEDEBUG=+timestamp,+macdrv,+seh "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1 || echo "reg add exit $?"
+          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/wine-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -120
+          WINEPREFIX="$RUNNER_TEMP/pfx-macdrv" "$HOME/wine-sdk/wine/bin/wineserver" -k || true
+          echo "== boot without the Mac driver"
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | tail -5 || echo "reg add exit $?"
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" "$W" cmd /c ver 2>&1 | tail -3 || true
+          ls "$RUNNER_TEMP/pfx-nodrv/drive_c/windows" 2>/dev/null | head -5
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" "$HOME/wine-sdk/wine/bin/wineserver" -k || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wine-trace-${{ matrix.runner }}
-          path: ${{ runner.temp }}/wine-trace.log
+          path: |
+            ${{ runner.temp }}/wine-trace.log
+            ${{ runner.temp }}/wine-macdrv.log
           retention-days: 7
           if-no-files-found: ignore
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
