@@ -234,10 +234,7 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    # A prefix boot that fails waits out wineboot's five-minute timer and then
-    # the child's own, so an image where Wine cannot boot costs about eight
-    # minutes per attempt, and the Wine step makes three.
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - name: Host
         run: |
@@ -305,11 +302,14 @@ jobs:
           print("pixel after clear (bgra): \(px)")
           EOF
           swift "$RUNNER_TEMP/probe.swift"
-      # The pinned Wine bundle itself: the loader, a registry write that boots a
-      # fresh prefix, and what the prefix holds afterwards, all unsilenced. The
-      # environment is the Makefile's: without the mscoree/mshtml overrides a
-      # fresh prefix tries to install Wine Mono and Gecko, which on a headless
-      # machine waits out wineboot's five-minute boot timer.
+      # The pinned Wine bundle itself: the loader, then a registry write that
+      # boots a fresh prefix, capped at two minutes each by an alarm rather
+      # than left to wineboot's five-minute timer, since where the boot fails
+      # it fails within seconds. The environment is the Makefile's: without
+      # the mscoree/mshtml overrides a fresh prefix tries to install Wine Mono
+      # and Gecko. A Cocoa exception that aborts a process reports through the
+      # unified log, not stderr, so that is read afterwards; then the same
+      # boot without the Mac driver, to show whether the rest of Wine works.
       - name: Wine
         env:
           WINEDLLOVERRIDES: mscoree,mshtml=
@@ -321,42 +321,28 @@ jobs:
             "https://github.com/athei/wine-build/releases/download/${{ env.WINE_RELEASE }}/wine-${{ env.WINE_RELEASE }}-macos-x86_64.tar.xz"
           tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
           W="$HOME/wine-sdk/wine/bin/wine"
+          WS="$HOME/wine-sdk/wine/bin/wineserver"
+          capped() { perl -e 'alarm shift; exec @ARGV' "$@"; }
           file "$W"
           "$W" --version || echo "wine --version exit $?"
-          # What the bundle was built for and what this machine offers.
-          otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION\|LC_VERSION_MIN' | head -12
-          sysctl -n machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
-          ls "$HOME/wine-sdk/wine/lib/wine" | head
-          ls "$HOME/wine-sdk/wine/lib/wine/x86_64-windows" | head -5
-          # The prefix boot, with every process and module load, every exception
-          # and the time of each, kept whole as an artifact; the errors and the
-          # end of it inline.
-          WINEDEBUG=+timestamp,+loaddll,+process,+seh,+winediag "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-trace.log" 2>&1 || echo "reg add exit $?"
-          echo "== errors, warnings, exceptions"
-          grep -aE 'err:|warn:|seh:dispatch_exception|winediag' "$RUNNER_TEMP/wine-trace.log" | head -40
-          echo "== last lines"
-          tail -20 "$RUNNER_TEMP/wine-trace.log"
-          ls -la "$HOME/.wine" "$HOME/.wine/drive_c" "$HOME/.wine/drive_c/windows" 2>/dev/null || true
-          "$HOME/wine-sdk/wine/bin/wineserver" -k || true
-          # The same boot with the Mac driver narrating its own start, since
-          # the abort follows winemac.drv's load by milliseconds, and a boot
-          # without the Mac driver at all, to confirm it is the one aborting.
-          echo "== boot with +macdrv"
-          WINEPREFIX="$RUNNER_TEMP/pfx-macdrv" WINEDEBUG=+timestamp,+macdrv,+seh "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1 || echo "reg add exit $?"
-          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/wine-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -120
-          WINEPREFIX="$RUNNER_TEMP/pfx-macdrv" "$HOME/wine-sdk/wine/bin/wineserver" -k || true
+          otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
+          echo "== boot, driver traced"
+          since=$(date '+%Y-%m-%d %H:%M:%S')
+          WINEDEBUG=+timestamp,+macdrv,+seh capped 120 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1 || echo "reg add exit $?"
+          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/wine-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -60
+          capped 30 "$WS" -k || true
+          echo "== unified log since the boot"
+          log show --start "$since" --style compact --predicate 'process CONTAINS "explorer" OR process CONTAINS "wine" OR eventMessage CONTAINS[c] "exception" OR eventMessage CONTAINS[c] "assert"' 2>/dev/null | grep -av 'com.apple.securityd\|tccd' | head -80
           echo "== boot without the Mac driver"
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | tail -5 || echo "reg add exit $?"
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" "$W" cmd /c ver 2>&1 | tail -3 || true
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" capped 180 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | tail -5 || echo "reg add exit $?"
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" capped 60 "$W" cmd /c ver 2>&1 | tail -3 || true
           ls "$RUNNER_TEMP/pfx-nodrv/drive_c/windows" 2>/dev/null | head -5
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" "$HOME/wine-sdk/wine/bin/wineserver" -k || true
+          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" capped 30 "$WS" -k || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wine-trace-${{ matrix.runner }}
-          path: |
-            ${{ runner.temp }}/wine-trace.log
-            ${{ runner.temp }}/wine-macdrv.log
+          path: ${{ runner.temp }}/wine-macdrv.log
           retention-days: 7
           if-no-files-found: ignore
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
