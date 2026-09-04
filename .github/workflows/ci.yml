@@ -33,7 +33,12 @@ concurrency:
 # MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
 # the xwin call that consumes them.
 env:
-  WINE_RELEASE: cx-26.3.0-1
+  # cx-26.3.0-2 is the first bundle without MoltenVK. The one before it
+  # shipped the library, and win32u's display-device enumeration created a
+  # Vulkan instance through it at every prefix boot; on the Intel image's
+  # paravirtual device that made Metal abort inside explorer.exe, so no prefix
+  # ever booted there.
+  WINE_RELEASE: cx-26.3.0-2
   RUST_STABLE: 1.97.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0
@@ -129,21 +134,18 @@ jobs:
   # The end-to-end suite: the staged PE binaries, run by the pinned Wine
   # against a Metal device, one leg per image, PE arch and partition.
   #
-  # Two images today: the newest macOS on arm64 and the oldest macOS mtld3d
-  # supports on arm64. The Intel image, whose paravirtual device has no
-  # unified memory, no packed 16-bit formats and a 256-byte linear texture
-  # alignment, runs the real Intel/AMD code paths with the strict
-  # Managed-memory semantics, and joins once the pinned Wine boots there: for
-  # now it cannot boot a prefix (`could not load kernel32.dll, status
-  # c0000135`, see the probe job), and a leg that waits out wineboot's timer
-  # to fail is a machine wasted. When it joins it runs under `INTEL=1`: the
-  # device already gives three of the four Intel answers, and the fourth,
-  # 32-bit float filtering, is the one a real Intel/AMD Mac's driver denies
-  # and this paravirtual device does not, so the forced key is what makes
-  # the image stand in for the hardware. On an Apple-family image the forced
-  # answers are a local tool (`make test INTEL=1`) and do not run here. Each
-  # suite is split in three hash-sharded partitions, so three machines share
-  # it. The older image is advisory until its first runs are read.
+  # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
+  # on arm64, and the Intel image, whose paravirtual device has no unified
+  # memory, no packed 16-bit formats and a 256-byte linear texture alignment,
+  # so it runs the real Intel/AMD code paths with the strict Managed-memory
+  # semantics. That image runs under `INTEL=1`: the device already gives three
+  # of the four Intel answers, and the fourth, 32-bit float filtering, is the
+  # one a real Intel/AMD Mac's driver denies and this paravirtual device does
+  # not, so the forced key is what makes the image stand in for the hardware.
+  # On an Apple-family image the forced answers are a local tool (`make test
+  # INTEL=1`) and do not run here. Each suite is split in three hash-sharded
+  # partitions, so three machines share it. The two older images are advisory
+  # until their first runs are read.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -152,7 +154,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15]
+        runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
         partition: ['1/3', '2/3', '3/3']
     steps:
@@ -178,13 +180,13 @@ jobs:
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum. The older image runs the suite as an advisory
-  # leg: the baseline carries no per-image entries yet, so its counts are
+  # cross-environment maximum. The two older images run the suite as advisory
+  # legs: the baseline carries no per-image entries yet, so their counts are
   # read from the artifact until they are recorded and triaged. The Intel
-  # image waits on the prefix boot, as for the e2e legs above; when it joins
-  # it runs the `intel` variant for the reason given there, and records under
-  # the `<arch>+intel` baseline entries. On an Apple-family image that
-  # variant (`make conformance-intel`) is a local tool and does not run here.
+  # image runs the `intel` variant for the reason given above the e2e legs,
+  # and reads against the `<arch>+intel` baseline entries. On an Apple-family
+  # image that variant (`make conformance-intel`) is a local tool and does not
+  # run here.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -193,7 +195,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15]
+        runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
     steps:
       - uses: actions/checkout@v5
@@ -303,105 +305,37 @@ jobs:
           EOF
           swift "$RUNNER_TEMP/probe.swift"
       # The pinned Wine bundle itself: the loader, then a registry write that
-      # boots a fresh prefix, capped at two minutes each by an alarm rather
-      # than left to wineboot's five-minute timer, since where the boot fails
-      # it fails within seconds. The environment is the Makefile's: without
-      # the mscoree/mshtml overrides a fresh prefix tries to install Wine Mono
-      # and Gecko. A Cocoa exception that aborts a process reports through the
-      # unified log, not stderr, so that is read afterwards; then the same
-      # boot without the Mac driver, to show whether the rest of Wine works.
+      # boots a fresh prefix, capped by an alarm rather than left to wineboot's
+      # five-minute timer, since where a boot fails it fails within seconds,
+      # and the processes a failed boot leaves behind reaped outright, since
+      # one caught in Wine's fault loop survives `wineserver -k`. The
+      # environment is the Makefile's: without the mscoree/mshtml overrides a
+      # fresh prefix tries to install Wine Mono and Gecko.
       - name: Wine
         env:
           WINEDLLOVERRIDES: mscoree,mshtml=
           WINEMSYNC: "1"
           WINEDEBUG: "-all"
         run: |
-          # Every boot below is expected to be able to fail; the verdicts are
-          # the output, so the step must outlive them.
           set +e
           mkdir -p "$HOME/wine-sdk"
           curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
             "https://github.com/athei/wine-build/releases/download/${{ env.WINE_RELEASE }}/wine-${{ env.WINE_RELEASE }}-macos-x86_64.tar.xz"
           tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
           W="$HOME/wine-sdk/wine/bin/wine"
-          WS="$HOME/wine-sdk/wine/bin/wineserver"
           capped() { perl -e 'alarm shift; exec @ARGV' "$@"; }
-          # A process caught in the fault loop survives `wineserver -k`, so
-          # every boot ends with an outright kill of everything from the SDK.
-          reap() { pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true; sleep 2; }
-          boot() { # $1 = prefix name, rest = env assignments; prints the verdict
-            local name="$1"; shift
-            local pfx="$RUNNER_TEMP/pfx-$name"
-            env WINEPREFIX="$pfx" "$@" perl -e 'alarm 240; exec @ARGV' "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/boot-$name.log" 2>&1
-            echo "boot $name: reg add exit $?"
-            if grep -aq EXCEPTION_WINE_ASSERTION "$RUNNER_TEMP/boot-$name.log"; then echo "boot $name: ABORTED (assertion in the trace)"; fi
-            ls "$pfx/drive_c/windows/system32" 2>/dev/null | head -3 | sed "s/^/boot $name: system32 has /"
-            env WINEPREFIX="$pfx" perl -e 'alarm 30; exec @ARGV' "$W" cmd /c ver 2>&1 | grep -a 'Windows' | sed "s/^/boot $name: /" || true
-            reap
-          }
           file "$W"
-          "$W" --version || echo "wine --version exit $?"
+          "$W" --version
           otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
-          # abort() interposed: the process that aborts prints the host
-          # backtrace of the call and exits, instead of Wine turning the
-          # signal into an exception it then loops on. Interposing through
-          # dyld reaches every call bound at load time, which covers Wine's
-          # own images; a call from inside the shared cache would not show.
-          cat > "$RUNNER_TEMP/abort_bt.c" <<'EOF'
-          #include <execinfo.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <dlfcn.h>
-          static void write_str(const char *s) { write(2, s, strlen(s)); }
-          __attribute__((noreturn)) static void my_abort(void) {
-              void *frames[64];
-              int n = backtrace(frames, 64);
-              write_str("== abort() called, host backtrace:\n");
-              backtrace_symbols_fd(frames, n, 2);
-              for (int i = 0; i < n; i++) {
-                  Dl_info info;
-                  if (dladdr(frames[i], &info) && info.dli_fname) {
-                      char line[512];
-                      snprintf(line, sizeof line, "  frame %d: %s + 0x%lx\n", i, info.dli_fname,
-                               (unsigned long)((char *)frames[i] - (char *)info.dli_fbase));
-                      write_str(line);
-                  }
-              }
-              _exit(134);
-          }
-          typedef struct { const void *replacement; const void *replacee; } interpose_t;
-          __attribute__((used)) static const interpose_t interposers[]
-              __attribute__((section("__DATA,__interpose"))) = { { (const void *)my_abort, (const void *)abort } };
-          EOF
-          clang -dynamiclib -arch x86_64 -o "$RUNNER_TEMP/abort_bt.dylib" "$RUNNER_TEMP/abort_bt.c" && echo "interposer built"
-          echo "== boot with abort() interposed"
-          WINEPREFIX="$RUNNER_TEMP/pfx" DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/abort_bt.dylib" WINEDEBUG=+timestamp,+seh,+process capped 90 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1
+          ls "$HOME/wine-sdk/wine/lib/external"
+          echo "== prefix boot"
+          WINEPREFIX="$RUNNER_TEMP/pfx" WINEDEBUG=+seh capped 240 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/boot.log" 2>&1
           echo "boot: reg add exit $?"
-          echo "== the abort"
-          grep -aA30 'abort() called' "$RUNNER_TEMP/wine-macdrv.log" | grep -a 'frame' | head -12 | cut -c1-200
-          reap
-          # The abort sits in Metal under MoltenVK under win32u's display-device
-          # enumeration, which creates a Vulkan instance at prefix boot. Nothing
-          # here needs Vulkan, so the boot is tried again with the bundle's
-          # MoltenVK out of the way, which win32u treats as "no Vulkan".
-          echo "== boot without MoltenVK"
-          ls -la "$HOME/wine-sdk/wine/lib/external/" | grep -i 'vulkan\|molten'
-          mv "$HOME/wine-sdk/wine/lib/external/libMoltenVK.dylib" "$RUNNER_TEMP/libMoltenVK.dylib.away" && echo "MoltenVK moved away"
-          WINEPREFIX="$RUNNER_TEMP/pfx2" WINEDEBUG=-all capped 240 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f
-          echo "boot without MoltenVK: reg add exit $?"
-          WINEPREFIX="$RUNNER_TEMP/pfx2" capped 60 "$W" cmd /c ver 2>&1 | tail -2
-          ls "$RUNNER_TEMP/pfx2/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
-          WINEPREFIX="$RUNNER_TEMP/pfx2" capped 60 "$W" reg query 'HKCU\Software\Wine\Probe' 2>&1 | tail -3
-          reap
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wine-trace-${{ matrix.runner }}
-          path: ${{ runner.temp }}/wine-macdrv.log
-          retention-days: 7
-          if-no-files-found: ignore
+          grep -aq EXCEPTION_WINE_ASSERTION "$RUNNER_TEMP/boot.log" && echo "boot: a process aborted (assertion in the trace)"
+          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/boot.log" | grep -aE 'err:|seh:dispatch_exception' | head -20
+          WINEPREFIX="$RUNNER_TEMP/pfx" capped 60 "$W" cmd /c ver 2>&1 | grep -a Windows
+          ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
+          pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
           cat > "$RUNNER_TEMP/packed.swift" <<'EOF'

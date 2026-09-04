@@ -209,16 +209,17 @@ stage (`make stage`: both PE arches, both unix `.so` builds, the e2e suite as
 nextest archives, the conformance runner for both host arches) and another
 runs every lint, doc and unit leg as steps of one job before building the
 bundle. The test machines carry no toolchain: they install the stage
-(`STAGE=<dir>`) and run the end-to-end and conformance suites on two images,
-the newest macOS on arm64 and the oldest macOS mtld3d supports on arm64. Each
+(`STAGE=<dir>`) and run the end-to-end and conformance suites on three
+images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
+and the Intel image, whose device has no unified memory and none of the
+packed 16-bit formats, so it runs the Intel/AMD code paths for real. Each
 e2e suite is split across three machines (`PARTITION=K/N`). The newest image
-gates; the older one is advisory until its counts are recorded, so read its
-artifacts rather than its status, and run `make conformance` locally when
-your change touches the render or shader-emission path. The Intel image,
-whose device has no unified memory and none of the packed 16-bit formats,
-joins the matrices once the pinned Wine boots a prefix there; the manual
-`probe-metal` job is how an image is checked before it is added, and it will
-run under the forced Intel answers, because its device filters 32-bit floats
+gates; the two older ones are advisory until their counts are recorded, so
+read their artifacts rather than their status, and run `make conformance`
+locally when your change touches the render or shader-emission path. The
+manual
+`probe-metal` job is how an image is checked before it is added, and it runs
+under the forced Intel answers, because its device filters 32-bit floats
 where a real Intel/AMD Mac's driver does not. On an Apple-family machine the
 forced answers (`make test INTEL=1`, `make conformance-intel`) are the way to
 run the Intel paths without the hardware.
