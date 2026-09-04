@@ -56,7 +56,8 @@ pub const ASPECT_TOLERANCE: f64 = 0.15;
 /// served at each of the two adapter formats; the fixed bank this list
 /// replaced came to 16 sizes on that display, 32 entries, and never
 /// overflowed. 15 per format keeps both formats under the 32 with a slot to
-/// spare. The bound is on what a menu shows, not on what a fullscreen
+/// spare, a ceiling the panel-aspect filter of [`served_mode_sizes`] rarely
+/// reaches. The bound is on what a menu shows, not on what a fullscreen
 /// request may set.
 pub const MAX_SERVED_SIZES: usize = 15;
 
@@ -99,32 +100,31 @@ pub fn select_mode_sizes(
     sizes
 }
 
-/// The sizes `EnumAdapterModes` serves: the settable sizes, bounded to `max`.
+/// The sizes `EnumAdapterModes` serves: the settable sizes of the panel's aspect, bounded to `max`.
 ///
-/// A list within `max` is served as is. A longer one keeps the desktop (the
-/// first entry, which doubles as the adapter display mode), then the panel's
-/// own aspect (within [`PANEL_ASPECT_TOLERANCE`] of the desktop's), which
-/// fills the display edge to edge where every other aspect is letterboxed,
-/// then the rest, each group largest first: on a Retina panel the small
-/// synthesised sizes are the least useful, and a game's own config can still
-/// set them since the bound never touches [`select_mode_sizes`]' list. Ties
-/// keep their enumeration order. A `max` of 0 still serves the desktop.
+/// The desktop (the first entry, which doubles as the adapter display mode)
+/// comes first, then the other sizes of the panel's own aspect (within
+/// [`PANEL_ASPECT_TOLERANCE`] of the desktop's), largest first, at most
+/// `max` in all; ties keep their enumeration order. Only that aspect fills
+/// the display: under Wine's `EmulateModeset` any other is letterboxed by
+/// win32u's uniform scale with the desktop showing in the bars, and a menu
+/// is no place to offer that. Every other settable size stays settable for a
+/// game's own config, since this never touches [`select_mode_sizes`]' list.
+/// A `max` of 0 still serves the desktop.
 #[must_use]
 pub fn served_mode_sizes(settable: &[(u32, u32)], max: usize) -> Vec<(u32, u32)> {
     let Some((&desktop, rest)) = settable.split_first() else {
         return Vec::new();
     };
-    if settable.len() <= max {
-        return settable.to_vec();
-    }
     let desktop_aspect = aspect(desktop);
-    let mut ranked = rest.to_vec();
-    ranked.sort_by_key(|&size| {
-        let panel = aspect_off(size, desktop_aspect) <= PANEL_ASPECT_TOLERANCE;
-        (Reverse(panel), Reverse(pixels(size)))
-    });
+    let mut panel: Vec<(u32, u32)> = rest
+        .iter()
+        .copied()
+        .filter(|&size| aspect_off(size, desktop_aspect) <= PANEL_ASPECT_TOLERANCE)
+        .collect();
+    panel.sort_by_key(|&size| Reverse(pixels(size)));
     core::iter::once(desktop)
-        .chain(ranked)
+        .chain(panel)
         .take(max.max(1))
         .collect()
 }

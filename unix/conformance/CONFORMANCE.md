@@ -229,7 +229,8 @@ z-order alone: raising the window to the topmost level deadlocks winemac (see
 test_window_style 5220).
 
 The mode list `EnumAdapterModes` serves is a bounded subset of
-`EnumDisplaySettingsW`'s, so an enumerated mode is one win32u accepts by
+`EnumDisplaySettingsW`'s (the sizes of the display's own aspect, largest
+first), so an enumerated mode is one win32u accepts by
 construction, and a fullscreen request for any mode in the full list is set
 whether or not the bounded list carries it. The test binary, being the
 process's main module, enumerates the same bounded list through its own
@@ -278,9 +279,10 @@ walk further):
   come from `EnumDisplaySettingsW`, the same view win32u validates
   `ChangeDisplaySettingsW` against and derives `GetMonitorInfoW` from,
   instead of `NSScreen`: the current mode for `GetAdapterDisplayMode` (read
-  live, so it follows a mode-set), a bounded subset of the enumerated list
-  for `EnumAdapterModes` (so a mode a game picks is one user32 accepts, and a
-  menu built for a driver's short list does not overflow). On this
+  live, so it follows a mode-set), the display-aspect subset of the
+  enumerated list for `EnumAdapterModes` (so a mode a game picks is one
+  user32 accepts, fills the display, and a menu built for a driver's short
+  list does not overflow). On this
   machine the two views agree under the pinned Retina mode; on the runner's
   virtual display they disagreed by exactly 2x (Win32 2048x1536, `NSScreen`
   1024x768), which split `GetDisplayMode` from the monitor rect

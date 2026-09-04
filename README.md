@@ -230,10 +230,11 @@ memory headroom, or the games that rely on the looser behaviour:
   enlarging). A mode of another aspect than the display's is letterboxed, with
   the desktop showing in the bars and the menu bar staying, since the window no
   longer covers the screen; the game's resolution list carries the display's
-  own modes, which fill it. That list is bounded (15 sizes per colour format,
-  the display's own modes and then the largest), because Wine's mode list is
-  long and era menus were built for a driver's short one: WoW 1.12's
-  resolution dropdown overflows past 32 entries. A game that reads its list
+  own modes, which fill it. That list carries only sizes of the display's own
+  aspect (largest first, at most 15 per colour format): a letterboxed mode is
+  no menu entry, and Wine's mode list is long where era menus were built for
+  a driver's short one, WoW 1.12's resolution dropdown overflowing past 32
+  entries. A game that reads its list
   from user32's `EnumDisplaySettings` instead of `EnumAdapterModes` (WoW 1.12
   does) sees the same bounded list: d3d9 redirects the main module's
   `EnumDisplaySettings` imports at load, leaving user32's own list intact. Any
