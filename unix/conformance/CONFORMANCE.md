@@ -860,7 +860,7 @@ one (`test_mode_change` above); that mechanism is inferred from the
 rejection, not read from a trace. The Apple-family legs pass every site.
 
 ### visual.c/multisampled_depth_buffer_test
-Sites: 17330=expected 17476=expected
+Sites: 17330=flaky 17476=expected
 
 `@mac2` legs only. Both sections resolve a multisampled depth surface
 through `StretchRect` and then depth-test draws against the resolve target.
@@ -870,7 +870,9 @@ workflow's probe job, with and without an encoder in between); Apple GPUs
 see the resolve. The draws are therefore tested against the target's clear
 rather than the resolved scene. A device fault in Metal's ordering guarantee
 that no layer-side change short of a submit per resolve would mask, so
-`expected`; a real Intel/AMD Mac is expected to read zero here.
+`expected`; a real Intel/AMD Mac is expected to read zero here. 17330 reads
+its full count on one run and zero on the next, since the resolve sometimes
+lands before the load after all; `flaky`, pinned at the higher count.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected
