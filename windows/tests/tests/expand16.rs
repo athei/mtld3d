@@ -1,4 +1,4 @@
-//! The packed 16-bit expansion path, forced on via `debug.expandPacked16`.
+//! The packed 16-bit expansion path, forced on via `intel.expandPacked16`.
 //!
 //! On devices without Metal's packed 16-bit pixel formats (Intel/AMD Mac2),
 //! A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 textures are backed by BGRA8 and
@@ -30,7 +30,7 @@ const WHITE: u32 = 0xFFFF_FFFF;
 /// test-local.
 fn force_expand() {
     let merged = format!(
-        "{};debug.expandPacked16=true",
+        "{};intel.expandPacked16=true",
         std::env::var("MTLD3D_CONFIG").unwrap_or_default()
     );
     // SAFETY: single-threaded at this point in the test process (the harness

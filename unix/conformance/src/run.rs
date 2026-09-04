@@ -1,4 +1,4 @@
-//! Spawn Wine's `d3d9_test.exe` for one `(arch, subtest)` and interpret it.
+//! Spawn Wine's `d3d9_test.exe` for one `(leg, subtest)` and interpret it.
 //!
 //! Both paths, the loader and the test binary, come from the caller
 //! (`--wine`/`--exe`). This module resolves nothing itself: it knows no Wine
@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    model::{Arch, Subtest, SubtestResult},
+    model::{Leg, Subtest, SubtestResult},
     scan,
 };
 
@@ -93,8 +93,10 @@ pub fn wine_version(wine: &Path) -> String {
 /// (not inherited) so a validation abort can't mask the failure counts — the
 /// same overrides the shell runner used.
 ///
-/// `arch` does not select anything (the caller already picked the binary); it is
-/// the label the results, raw logs and validation lines are recorded under.
+/// `leg` selects nothing about the binary (the caller already picked it); its
+/// variant adds the config entries the run is measured under, and the whole
+/// leg is the label the results, raw logs and validation lines are recorded
+/// under.
 ///
 /// # Errors
 ///
@@ -102,7 +104,7 @@ pub fn wine_version(wine: &Path) -> String {
 pub fn run_subtest(
     wine: &Path,
     exe: &Path,
-    arch: Arch,
+    leg: Leg,
     subtest: Subtest,
 ) -> Result<SubtestRun, String> {
     if !exe.is_file() {
@@ -147,9 +149,16 @@ pub fn run_subtest(
         // the tone-mapping shader while another machine blits. The baseline has
         // to mean the same thing on every machine that runs it, so pin the SDR
         // path here.
+        //
+        // The leg's variant appends its own entries: the `intel` variant turns
+        // every `intel.*` key on so the whole suite runs under the answers an
+        // Intel/AMD Mac gives.
         .env(
             "MTLD3D_CONFIG",
-            "shaderCache.enable=false;color.hdr.enable=false",
+            format!(
+                "shaderCache.enable=false;color.hdr.enable=false{}",
+                leg.variant.config_entries()
+            ),
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -198,7 +207,7 @@ pub fn run_subtest(
     // normalised, prefixed with the subtest. The count is what gates the leg:
     // the per-site pass/fail counts never capture Metal misuse.
     let validation_errors =
-        report_validation_errors(arch, subtest, &String::from_utf8_lossy(&stderr));
+        report_validation_errors(leg, subtest, &String::from_utf8_lossy(&stderr));
 
     // A timeout is a hang — treat it like a fatal signal so it surfaces as a
     // crash (and a regression vs a clean baseline) rather than a silent count.
@@ -220,7 +229,7 @@ pub fn run_subtest(
     // vs. expected values it carries are what distinguish a real defect from an
     // accepted pixel/caps difference. Off unless `MTLD3D_CONFORMANCE_RAW_DIR` is
     // set; a write failure is reported but never fails the run.
-    save_raw_output(arch, subtest, &combined);
+    save_raw_output(leg, subtest, &combined);
 
     Ok(SubtestRun {
         result: scan::parse_subtest_output(&combined, signaled),
@@ -228,10 +237,10 @@ pub fn run_subtest(
     })
 }
 
-/// Persist a subtest's raw output to `$MTLD3D_CONFORMANCE_RAW_DIR/<arch>-<subtest>.log`.
+/// Persist a subtest's raw output to `$MTLD3D_CONFORMANCE_RAW_DIR/<leg>-<subtest>.log`.
 ///
 /// Only when that variable is set. A no-op (and silent) when it is unset.
-fn save_raw_output(arch: Arch, subtest: Subtest, combined: &str) {
+fn save_raw_output(leg: Leg, subtest: Subtest, combined: &str) {
     let Ok(dir) = std::env::var("MTLD3D_CONFORMANCE_RAW_DIR") else {
         return;
     };
@@ -243,7 +252,7 @@ fn save_raw_output(arch: Arch, subtest: Subtest, combined: &str) {
         );
         return;
     }
-    let path = dir.join(format!("{arch}-{subtest}.log"));
+    let path = dir.join(format!("{leg}-{subtest}.log"));
     if let Err(e) = fs::write(&path, combined) {
         eprintln!(
             "  [conformance] could not write raw log {}: {e}",
@@ -259,12 +268,12 @@ fn save_raw_output(arch: Arch, subtest: Subtest, combined: &str) {
 /// under it: the opening line names the check that fired (`Sampler Descriptor
 /// Validation`) and the detail names what failed it. Returns how many distinct
 /// messages were printed, which is what the leg gates on.
-fn report_validation_errors(arch: Arch, subtest: Subtest, stderr: &str) -> usize {
+fn report_validation_errors(leg: Leg, subtest: Subtest, stderr: &str) -> usize {
     let seen = validation_errors(stderr);
     for msg in &seen {
         let mut lines = msg.lines();
         if let Some(header) = lines.next() {
-            eprintln!("  [{arch}/{subtest}] metal-validation: {header}");
+            eprintln!("  [{leg}/{subtest}] metal-validation: {header}");
         }
         for detail in lines {
             eprintln!("      {detail}");

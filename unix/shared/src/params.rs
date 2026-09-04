@@ -135,13 +135,15 @@ pub struct CreateCommandQueueParams {
     /// False on Intel/AMD non-UMA Macs; the storage-mode policy in
     /// `mtld3d-core::storage_policy` switches CPU-visible buffers to
     /// `Managed` and the encoder enqueues `didModifyRange:` calls when
-    /// this is 0. (Textures are always `Private`.)
+    /// this is 0. (Textures are always `Private`.) The PE side may
+    /// force the non-UMA answer through `intel.managedMemory`.
     pub unified_memory: u32, // out
     /// `device.minimumLinearTextureAlignmentForPixelFormat(BGRA8Unorm)`.
     ///
     /// 16 on Apple Silicon, 256 on AMD/Intel (Mac2). Threaded into
     /// `pad_source_stride` so blit-staging `bytes_per_row` rounds to this
-    /// floor.
+    /// floor. The PE side may raise it to the Mac2 value through
+    /// `intel.linearAlign256`.
     pub min_linear_texture_align: u32, // out
 }
 

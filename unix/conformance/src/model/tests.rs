@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Arch, Baseline, Site, Subtest, SubtestBaseline};
+use super::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, Variant};
 
 fn sample() -> Baseline {
     let mut device = SubtestBaseline {
@@ -41,8 +41,26 @@ fn sample() -> Baseline {
         1,
     );
     let mut entries = BTreeMap::new();
-    entries.insert((Arch::I686, Subtest::Device), device);
-    entries.insert((Arch::X64, Subtest::D3d9Ex), d3d9ex);
+    entries.insert(
+        (
+            Leg {
+                arch: Arch::I686,
+                variant: Variant::Native,
+            },
+            Subtest::Device,
+        ),
+        device,
+    );
+    entries.insert(
+        (
+            Leg {
+                arch: Arch::X64,
+                variant: Variant::Intel,
+            },
+            Subtest::D3d9Ex,
+        ),
+        d3d9ex,
+    );
     Baseline {
         wine_version: "wine-11.0".to_owned(),
         entries,

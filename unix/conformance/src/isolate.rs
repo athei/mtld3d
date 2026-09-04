@@ -14,7 +14,7 @@
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
 use crate::{
-    model::{Arch, Site, Subtest},
+    model::{Leg, Site, Subtest},
     run,
 };
 
@@ -72,7 +72,7 @@ struct Aggregate {
 pub fn run_flap(
     wine: &Path,
     exe: &Path,
-    arch: Arch,
+    leg: Leg,
     subtests: &[Subtest],
     repeat: u32,
 ) -> Result<(), String> {
@@ -81,8 +81,8 @@ pub fn run_flap(
          a site is FLAPS unless it fired in every run at one constant count)\n"
     );
     for &subtest in subtests {
-        let agg = characterize(wine, exe, arch, subtest, repeat)?;
-        print!("{}", render(arch, subtest, &agg));
+        let agg = characterize(wine, exe, leg, subtest, repeat)?;
+        print!("{}", render(leg, subtest, &agg));
     }
     Ok(())
 }
@@ -91,15 +91,15 @@ pub fn run_flap(
 fn characterize(
     wine: &Path,
     exe: &Path,
-    arch: Arch,
+    leg: Leg,
     subtest: Subtest,
     repeat: u32,
 ) -> Result<Aggregate, String> {
     let mut agg = Aggregate::default();
     for i in 1..=repeat {
         // Liveness to stderr — a full subtest can take many seconds.
-        eprintln!("  [{arch}/{subtest}] run {i}/{repeat}…");
-        let result = run::run_subtest(wine, exe, arch, subtest)?.result;
+        eprintln!("  [{leg}/{subtest}] run {i}/{repeat}…");
+        let result = run::run_subtest(wine, exe, leg, subtest)?.result;
         agg.runs += 1;
         if result.crash {
             agg.crash_runs += 1;
@@ -121,12 +121,12 @@ fn characterize(
 /// The header, then flapping sites individually (most-unstable info first),
 /// then a compact summary of the stable sites, then any upstream
 /// `flaky`-marked sites.
-fn render(arch: Arch, subtest: Subtest, agg: &Aggregate) -> String {
+fn render(leg: Leg, subtest: Subtest, agg: &Aggregate) -> String {
     let runs = agg.runs;
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{arch}/{subtest}  N={runs}  crash {}/{runs}",
+        "{leg}/{subtest}  N={runs}  crash {}/{runs}",
         agg.crash_runs
     );
 

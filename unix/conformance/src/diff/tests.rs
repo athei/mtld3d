@@ -11,12 +11,18 @@ use std::collections::BTreeMap;
 use super::diff;
 use crate::{
     classify::Classification,
-    model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult},
+    model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
     triage::DocSite,
 };
 
-fn key() -> (Arch, Subtest) {
-    (Arch::I686, Subtest::Device)
+fn key() -> (Leg, Subtest) {
+    (
+        Leg {
+            arch: Arch::I686,
+            variant: Variant::Native,
+        },
+        Subtest::Device,
+    )
 }
 
 fn site(line: u32) -> Site {
@@ -54,7 +60,7 @@ fn classes_with(entries: &[(u32, Classification)]) -> BTreeMap<Site, DocSite> {
         .collect()
 }
 
-fn current_with(sites: &[(u32, u32)], crash: bool) -> BTreeMap<(Arch, Subtest), SubtestResult> {
+fn current_with(sites: &[(u32, u32)], crash: bool) -> BTreeMap<(Leg, Subtest), SubtestResult> {
     let mut s = BTreeMap::new();
     for &(line, count) in sites {
         s.insert(site(line), count);

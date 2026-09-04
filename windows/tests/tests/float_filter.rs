@@ -1,4 +1,4 @@
-//! The 32-bit float filtering caps split, forced on via `debug.float32Filtering`.
+//! The 32-bit float filtering caps split, forced on via `intel.denyFloat32Filtering`.
 //!
 //! `MTLDevice.supports32BitFloatFiltering` is true on Apple-family GPUs and
 //! commonly false on Intel/AMD Macs, where R32F / G32R32F / A32B32G32R32F are
@@ -35,7 +35,7 @@ const HALF_FLOATS: [(u32, &str); 3] = [
 /// test-local.
 fn force_no_float32_filtering() {
     let merged = format!(
-        "{};debug.float32Filtering=false",
+        "{};intel.denyFloat32Filtering=true",
         std::env::var("MTLD3D_CONFIG").unwrap_or_default()
     );
     // SAFETY: single-threaded at this point in the test process (the harness

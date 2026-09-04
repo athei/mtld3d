@@ -45,18 +45,36 @@ pub struct Mtld3dConfig {
     /// copy, and the 16-bit render target formats stop being
     /// advertised. Exists so the Intel/AMD path can be exercised on
     /// Apple Silicon. Default: `false`. File key:
-    /// `debug.expandPacked16`.
+    /// `intel.expandPacked16`.
     pub expand_packed16: bool,
-    /// Whether single-precision float textures may be advertised as filterable.
+    /// Force the negative 32-bit float filtering answer of GPUs without it.
     ///
-    /// Combined with the device's own
-    /// `MTLDevice.supports32BitFloatFiltering` answer, so `false` forces
-    /// the unfilterable path taken by GPUs without it:
-    /// `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)` reports NOTAVAILABLE
-    /// for R32F / G32R32F / A32B32G32R32F. Exists so that path can be
-    /// exercised on a device that does filter them. Default: `true`.
-    /// File key: `debug.float32Filtering`.
-    pub float32_filtering: bool,
+    /// Combined with the device's own `MTLDevice.supports32BitFloatFiltering`
+    /// answer, so `true` makes `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
+    /// report NOTAVAILABLE for R32F / G32R32F / A32B32G32R32F on any
+    /// device, and `false` leaves the device's answer alone; it never
+    /// claims filtering the device lacks. Exists so the Intel/AMD path
+    /// can be exercised on a device that does filter them. Default:
+    /// `false`. File key: `intel.denyFloat32Filtering`.
+    pub deny_float32_filtering: bool,
+    /// Force the storage policy of a GPU without unified memory.
+    ///
+    /// Clears `GpuCaps::unified_memory` where the snapshot is built, so
+    /// every CPU-visible buffer is created `Managed` and the encoder
+    /// enqueues `didModifyRange:` after each CPU write, as on an
+    /// Intel/AMD Mac. Exists so that path can be exercised on Apple
+    /// Silicon, where a missed notify stays invisible. Default: `false`.
+    /// File key: `intel.managedMemory`.
+    pub managed_memory: bool,
+    /// Force the 256-byte linear texture alignment of a Mac2 GPU.
+    ///
+    /// Raises `GpuCaps::min_linear_texture_align` to 256 where the
+    /// snapshot is built (a larger device value is kept), so blit
+    /// staging pads its rows to that floor and the mips whose pitch falls
+    /// under it take the padded-staging or GPU upload pass paths, as on
+    /// an Intel/AMD Mac. Default: `false`. File key:
+    /// `intel.linearAlign256`.
+    pub linear_align256: bool,
     /// Enable HDR present pipeline on EDR-capable displays.
     ///
     /// The display gates this, not the value: the present pipeline only
@@ -279,7 +297,9 @@ impl Default for Mtld3dConfig {
         Self {
             caps_all: false,
             expand_packed16: false,
-            float32_filtering: true,
+            deny_float32_filtering: false,
+            managed_memory: false,
+            linear_align256: false,
             hdr_enable: true,
             color_space: ColorSpacePolicy::Passthrough,
             cursor_scale: CursorScale::Auto,
@@ -386,11 +406,19 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(target: crate::LOG_TARGET, "config: debug.capsAll = {}", cfg.caps_all);
     info!(
         target: crate::LOG_TARGET,
-        "config: debug.expandPacked16 = {}", cfg.expand_packed16
+        "config: intel.expandPacked16 = {}", cfg.expand_packed16
     );
     info!(
         target: crate::LOG_TARGET,
-        "config: debug.float32Filtering = {}", cfg.float32_filtering
+        "config: intel.denyFloat32Filtering = {}", cfg.deny_float32_filtering
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: intel.managedMemory = {}", cfg.managed_memory
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: intel.linearAlign256 = {}", cfg.linear_align256
     );
     info!(target: crate::LOG_TARGET, "config: color.hdr.enable = {}", cfg.hdr_enable);
     info!(
@@ -493,8 +521,12 @@ const fn cursor_software_label(p: SoftwareCursorPolicy) -> &'static str {
 fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
     match key {
         "debug.capsAll" => assign_bool(source, key, value, &mut cfg.caps_all),
-        "debug.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
-        "debug.float32Filtering" => assign_bool(source, key, value, &mut cfg.float32_filtering),
+        "intel.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
+        "intel.denyFloat32Filtering" => {
+            assign_bool(source, key, value, &mut cfg.deny_float32_filtering);
+        }
+        "intel.managedMemory" => assign_bool(source, key, value, &mut cfg.managed_memory),
+        "intel.linearAlign256" => assign_bool(source, key, value, &mut cfg.linear_align256),
         "color.hdr.enable" => assign_bool(source, key, value, &mut cfg.hdr_enable),
         "color.space" => assign_color_space(source, value, &mut cfg.color_space),
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),

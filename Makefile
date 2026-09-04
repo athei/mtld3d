@@ -412,7 +412,15 @@ bundle: all
 # reported space, so a passing scaled run is the evidence that the logical and
 # render spaces stayed separate. `make test SCALE=0.75` — try 0.5 and a
 # non-dividing 0.67 too, since those catch rounding that a clean fraction hides.
-MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))
+#
+# INTEL=1 reruns the whole e2e suite under every `intel.*` key, i.e. with the
+# device answers an Intel/AMD Mac gives: packed 16-bit formats expanded, 32-bit
+# float filtering denied, Managed buffers with didModifyRange after each write,
+# and the 256-byte linear texture alignment. Every assertion has to hold there
+# too; a test that probes a capability asks the device and asserts the answer
+# it gets, which is also what lets the suite run on real Intel hardware.
+INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
+MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
@@ -466,12 +474,13 @@ test-unit:
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 #
-# A scaled run reports the whole suite instead of stopping at the first
-# failure. The point of `SCALE` is to survey which assertions still hold in
-# the reported space, and one scale-dependent test would otherwise hide every
-# later test's scaled behaviour. The default run keeps fail-fast: there the
-# first failure is a regression to fix, not a survey to read.
-E2E_NEXTEST_FLAGS := $(if $(SCALE),--no-fail-fast)
+# A scaled or Intel-variant run reports the whole suite instead of stopping at
+# the first failure. The point of `SCALE` and `INTEL` is to survey which
+# assertions still hold in the reported space or under the Intel answers, and
+# one dependent test would otherwise hide every later test's behaviour there.
+# The default run keeps fail-fast: there the first failure is a regression to
+# fix, not a survey to read.
+E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast)
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
@@ -491,7 +500,9 @@ test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 # baseline.txt in the crate dir.
 #
 # One arch per runner process, so the two gates are independent jobs. Every leg
-# runs the same four subtests for its arch.
+# runs the same four subtests for its arch. The `-intel` legs run the same
+# binary with `--variant intel`, which turns every `intel.*` config key on, and
+# record under their own `<arch>+intel` baseline entries.
 CONFORMANCE_RUN = cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance -- \
 	--wine $(WINE_SDK)/bin/wine
 
@@ -512,18 +523,35 @@ conformance-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 conformance-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64)
 
-# Re-record the baseline. Both legs write the same baseline.txt (each replacing
-# only its own arch's entries), so they must run in sequence: hence recursive
-# make in the recipe rather than prerequisites, which `-j` could interleave.
+conformance-intel: conformance-intel-i686 conformance-intel-x86_64
+
+conformance-intel-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,i686,--variant intel)
+
+conformance-intel-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,x86_64,--variant intel)
+
+# Re-record the baseline. All four legs write the same baseline.txt (each
+# replacing only its own entries), so they must run in sequence: hence
+# recursive make in the recipe rather than prerequisites, which `-j` could
+# interleave.
 conformance-baseline:
 	$(MAKE) conformance-baseline-i686
 	$(MAKE) conformance-baseline-x86_64
+	$(MAKE) conformance-baseline-intel-i686
+	$(MAKE) conformance-baseline-intel-x86_64
 
 conformance-baseline-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,i686,--update-baseline)
 
 conformance-baseline-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64,--update-baseline)
+
+conformance-baseline-intel-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,i686,--variant intel --update-baseline)
+
+conformance-baseline-intel-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,x86_64,--variant intel --update-baseline)
 
 # Flap characterization: run ONE subtest REPEAT times and print a per-site flap
 # report (which sites fire deterministically vs flutter run-to-run), the

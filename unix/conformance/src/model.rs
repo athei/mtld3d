@@ -22,6 +22,27 @@ pub enum Arch {
     X64,
 }
 
+/// Which device answers the run was measured under, in baseline-output order.
+///
+/// `Native` runs against the device's own capabilities; `Intel` forces every
+/// `intel.*` config key on, so the suite sees the answers an Intel/AMD Mac
+/// gives whatever the machine underneath.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub enum Variant {
+    Native,
+    Intel,
+}
+
+/// One runner process's identity: the architecture it ran and the device answers it ran under.
+///
+/// The baseline is keyed by leg and subtest, so a measurement under the Intel
+/// answers never overwrites the native one for the same architecture.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct Leg {
+    pub arch: Arch,
+    pub variant: Variant,
+}
+
 /// The four `d3d9_test.exe` subtests, in baseline-output order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Subtest {
@@ -42,7 +63,7 @@ pub struct Site {
     pub line: u32,
 }
 
-/// The recorded baseline for one `(arch, subtest)`.
+/// The recorded baseline for one `(leg, subtest)`.
 ///
 /// The crash bit plus every failing site's hit count. Counts only — the
 /// classification for a site lives in CONFORMANCE.md's per-cluster section
@@ -58,14 +79,14 @@ pub struct SubtestBaseline {
 /// The full checked-in baseline.
 ///
 /// The Wine version it was taken against plus one [`SubtestBaseline`] per
-/// `(arch, subtest)`.
+/// `(leg, subtest)`.
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Baseline {
     pub wine_version: String,
-    pub entries: BTreeMap<(Arch, Subtest), SubtestBaseline>,
+    pub entries: BTreeMap<(Leg, Subtest), SubtestBaseline>,
 }
 
-/// A fresh run's result for one `(arch, subtest)`.
+/// A fresh run's result for one `(leg, subtest)`.
 ///
 /// The crash bit plus the per-site hit counts, before any classification is
 /// assigned.
@@ -101,9 +122,44 @@ pub struct SubtestResult {
     pub todo_marked: BTreeMap<Site, u32>,
 }
 
-impl Arch {
-    /// Every architecture, in baseline-output order.
-    pub const ALL: [Self; 2] = [Self::I686, Self::X64];
+impl Variant {
+    /// The `MTLD3D_CONFIG` entries the variant adds to the runner's pinned set.
+    ///
+    /// Empty for `Native`. `Intel` turns on every `intel.*` key, which is
+    /// how a real Intel/AMD Mac answers, so the run measures the whole
+    /// family at once rather than one key at a time.
+    #[must_use]
+    pub const fn config_entries(self) -> &'static str {
+        match self {
+            Self::Native => "",
+            Self::Intel => {
+                ";intel.expandPacked16=true;intel.denyFloat32Filtering=true;\
+                 intel.managedMemory=true;intel.linearAlign256=true"
+            }
+        }
+    }
+}
+
+impl Leg {
+    /// Every leg, in baseline-output order: both variants of each architecture.
+    pub const ALL: [Self; 4] = [
+        Self {
+            arch: Arch::I686,
+            variant: Variant::Native,
+        },
+        Self {
+            arch: Arch::I686,
+            variant: Variant::Intel,
+        },
+        Self {
+            arch: Arch::X64,
+            variant: Variant::Native,
+        },
+        Self {
+            arch: Arch::X64,
+            variant: Variant::Intel,
+        },
+    ];
 }
 
 impl Subtest {
@@ -131,6 +187,28 @@ impl fmt::Display for Arch {
     }
 }
 
+impl fmt::Display for Variant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Native => "native",
+            Self::Intel => "intel",
+        })
+    }
+}
+
+/// `i686` for the native leg, `i686+intel` for the Intel one.
+///
+/// The native form is the bare architecture so a baseline recorded before
+/// variants existed reads unchanged.
+impl fmt::Display for Leg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.variant {
+            Variant::Native => write!(f, "{}", self.arch),
+            Variant::Intel => write!(f, "{}+{}", self.arch, self.variant),
+        }
+    }
+}
+
 impl fmt::Display for Subtest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.arg())
@@ -155,6 +233,30 @@ impl FromStr for Arch {
     }
 }
 
+impl FromStr for Variant {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "native" => Ok(Self::Native),
+            "intel" => Ok(Self::Intel),
+            other => Err(format!("unknown variant {other:?}")),
+        }
+    }
+}
+
+impl FromStr for Leg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (arch, variant) = match s.split_once('+') {
+            Some((arch, variant)) => (arch.parse::<Arch>()?, variant.parse::<Variant>()?),
+            None => (s.parse::<Arch>()?, Variant::Native),
+        };
+        Ok(Self { arch, variant })
+    }
+}
+
 impl FromStr for Subtest {
     type Err = String;
 
@@ -172,7 +274,7 @@ impl FromStr for Subtest {
 impl Baseline {
     /// Serialize to the on-disk text format.
     ///
-    /// Output is deterministic: the `BTreeMap`s iterate in `Arch`/`Subtest`
+    /// Output is deterministic: the `BTreeMap`s iterate in `Leg`/`Subtest`
     /// declaration order and sites sort by `(file, line)`, so re-serializing an
     /// unchanged model is byte-identical.
     #[must_use]
@@ -188,10 +290,11 @@ impl Baseline {
         );
         out.push_str("# keeps the two files covering the same sites.\n");
         out.push_str("# Format: \"[arch/subtest] crash=<0|1>\" header, then indented\n");
-        out.push_str("#         \"  <file>.c:<line> count=<n>\".\n");
+        out.push_str("#         \"  <file>.c:<line> count=<n>\". An arch of the form\n");
+        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys.\n");
         out.push('\n');
-        for (&(arch, subtest), sub) in &self.entries {
-            let _ = writeln!(out, "[{arch}/{subtest}] crash={}", u8::from(sub.crash));
+        for (&(leg, subtest), sub) in &self.entries {
+            let _ = writeln!(out, "[{leg}/{subtest}] crash={}", u8::from(sub.crash));
             for (site, count) in &sub.sites {
                 let _ = writeln!(out, "  {site} count={count}");
             }
@@ -204,11 +307,11 @@ impl Baseline {
     /// # Errors
     ///
     /// Returns a `baseline:<line>: …` message on a malformed header, a site line
-    /// before any header, an unparseable arch/subtest/count, or a line that is
+    /// before any header, an unparseable leg/subtest/count, or a line that is
     /// neither a comment, a header, nor an indented site.
     pub fn from_text(text: &str) -> Result<Self, String> {
         let mut baseline = Self::default();
-        let mut current: Option<(Arch, Subtest)> = None;
+        let mut current: Option<(Leg, Subtest)> = None;
         for (idx, raw) in text.lines().enumerate() {
             let lineno = idx + 1;
             if raw.trim().is_empty() {
@@ -246,15 +349,15 @@ impl Baseline {
     }
 }
 
-fn parse_header(line: &str) -> Result<((Arch, Subtest), SubtestBaseline), String> {
+fn parse_header(line: &str) -> Result<((Leg, Subtest), SubtestBaseline), String> {
     let close = line
         .find(']')
         .ok_or_else(|| format!("malformed header (no ']'): {line:?}"))?;
     let inside = &line[1..close];
-    let (arch_str, subtest_str) = inside
+    let (leg_str, subtest_str) = inside
         .split_once('/')
         .ok_or_else(|| format!("malformed header (no '/'): {line:?}"))?;
-    let arch = arch_str.parse::<Arch>()?;
+    let leg = leg_str.parse::<Leg>()?;
     let subtest = subtest_str.parse::<Subtest>()?;
     let crash_tok = line[close + 1..].trim();
     let crash = match crash_tok.strip_prefix("crash=") {
@@ -263,7 +366,7 @@ fn parse_header(line: &str) -> Result<((Arch, Subtest), SubtestBaseline), String
         _ => return Err(format!("malformed header (expected 'crash=0|1'): {line:?}")),
     };
     Ok((
-        (arch, subtest),
+        (leg, subtest),
         SubtestBaseline {
             crash,
             sites: BTreeMap::new(),

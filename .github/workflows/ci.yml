@@ -128,8 +128,11 @@ jobs:
       - run: make test-unit
 
   # The end-to-end suite: real PE binaries, run by the pinned Wine against a
-  # Metal device, one leg per PE arch. Needs everything, `wine` included, since
-  # the leg installs our builtin into the SDK tree and boots a prefix.
+  # Metal device, one leg per PE arch and per variant. Needs everything, `wine`
+  # included, since the leg installs our builtin into the SDK tree and boots a
+  # prefix. The `intel` variant runs the same suite with every `intel.*` config
+  # key on, i.e. under the device answers an Intel/AMD Mac gives, so those code
+  # paths are exercised on the runner too.
   test-e2e:
     needs: setup
     runs-on: macos-26
@@ -138,6 +141,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [i686, x86_64]
+        variant: [native, intel]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/prepare
@@ -148,7 +152,7 @@ jobs:
       # The ci profile runs the suite serially and to completion; see
       # windows/.config/nextest.toml. Scoped to this job because the unix
       # workspace has no nextest config to carry the same profile.
-      - run: make test-e2e-${{ matrix.arch }}
+      - run: make test-e2e-${{ matrix.arch }} INTEL=${{ matrix.variant == 'intel' && '1' || '' }}
         env:
           NEXTEST_PROFILE: ci
 
@@ -168,6 +172,8 @@ jobs:
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
   # cross-environment maximum.
+  # The `intel` variant runs the suite under every `intel.*` config key and
+  # gates on its own `<arch>+intel` baseline entries.
   conformance:
     needs: setup
     runs-on: macos-26
@@ -176,6 +182,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [i686, x86_64]
+        variant: [native, intel]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/prepare
@@ -183,7 +190,7 @@ jobs:
           pe: 'true'
           wine: 'true'
           wine-release: ${{ env.WINE_RELEASE }}
-      - run: make conformance-${{ matrix.arch }}
+      - run: make conformance-${{ matrix.variant == 'intel' && 'intel-' || '' }}${{ matrix.arch }}
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
@@ -197,7 +204,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: conformance-raw-${{ matrix.arch }}
+          name: conformance-raw-${{ matrix.variant }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error

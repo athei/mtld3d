@@ -1,15 +1,25 @@
-//! Unit tests for the arch-scoped baseline merge.
+//! Unit tests for the leg-scoped baseline merge.
 //!
 //! A re-baseline is a plain re-record of counts, so what matters is the change
 //! report: already-failing sites are carried, fresh ones land in `new_sites`,
-//! and sites that stopped failing land in `dropped_sites`. The arch scope is
-//! pinned too: a run measures one architecture, so the other arch's entries
-//! survive untouched and contribute nothing to the summary.
+//! and sites that stopped failing land in `dropped_sites`. The leg scope is
+//! pinned too: a run measures one architecture under one variant, so every
+//! other leg's entries survive untouched and contribute nothing to the summary.
 
 use std::collections::BTreeMap;
 
 use super::merge;
-use crate::model::{Arch, Baseline, Site, Subtest, SubtestBaseline, SubtestResult};
+use crate::model::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant};
+
+const I686: Leg = Leg {
+    arch: Arch::I686,
+    variant: Variant::Native,
+};
+
+const X64_INTEL: Leg = Leg {
+    arch: Arch::X64,
+    variant: Variant::Intel,
+};
 
 fn site(line: u32) -> Site {
     Site {
@@ -20,7 +30,7 @@ fn site(line: u32) -> Site {
 
 #[test]
 fn records_counts_and_reports_new_and_dropped_sites() {
-    let key = (Arch::I686, Subtest::Device);
+    let key = (I686, Subtest::Device);
 
     let mut prior_sub = SubtestBaseline {
         crash: false,
@@ -48,7 +58,7 @@ fn records_counts_and_reports_new_and_dropped_sites() {
         },
     );
 
-    let (next, summary) = merge(&prior, Arch::I686, &fresh, "new".to_owned());
+    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
     let sub = &next.entries[&key];
     assert!(sub.crash);
     assert_eq!(sub.sites[&site(1)], 7); // refreshed
@@ -61,9 +71,9 @@ fn records_counts_and_reports_new_and_dropped_sites() {
 }
 
 #[test]
-fn a_single_arch_update_keeps_the_other_arch() {
-    let mine = (Arch::I686, Subtest::Device);
-    let theirs = (Arch::X64, Subtest::Visual);
+fn a_single_leg_update_keeps_the_other_legs() {
+    let mine = (I686, Subtest::Device);
+    let theirs = (X64_INTEL, Subtest::Visual);
 
     let mut other_sites = BTreeMap::new();
     other_sites.insert(site(9), 4u32);
@@ -82,12 +92,12 @@ fn a_single_arch_update_keeps_the_other_arch() {
     let mut fresh = BTreeMap::new();
     fresh.insert(mine, SubtestResult::default());
 
-    let (next, summary) = merge(&prior, Arch::I686, &fresh, "new".to_owned());
+    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
     let kept = &next.entries[&theirs];
     assert!(kept.crash);
     assert_eq!(kept.sites[&site(9)], 4);
     assert!(next.entries.contains_key(&mine));
-    // The untouched arch is carried, not re-measured: it reports nothing.
+    // The untouched leg is carried, not re-measured: it reports nothing.
     assert_eq!(summary.carried, 0);
     assert!(summary.new_sites.is_empty());
     assert!(summary.dropped_sites.is_empty());

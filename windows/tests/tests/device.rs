@@ -517,10 +517,23 @@ fn check_format_conversion() {
         D3D_OK,
         "YUY2 -> X8R8G8B8 is decoded by the StretchRect render quad",
     );
+    // A conversion destination has to be renderable, since the quad draws into
+    // it: R5G6B5 is one on a device with the packed 16-bit formats and is not
+    // on one without them, and the conversion answer follows that answer.
+    let r5g6b5_renders = h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) == D3D_OK;
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_UYVY, D3DFMT_R5G6B5),
-        D3D_OK,
-        "UYVY -> R5G6B5 is decoded by the StretchRect render quad",
+        if r5g6b5_renders {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        },
+        "UYVY -> R5G6B5 is decoded by the StretchRect render quad where R5G6B5 renders",
     );
     // Only renderable colour formats are conversion targets: YUV and
     // luminance destinations reject.

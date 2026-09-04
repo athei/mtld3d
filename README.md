@@ -285,6 +285,11 @@ rationale, the ones kept for speed included, in
 and end-to-end suites (`make test`) run the pure-Rust core natively on the host
 and the full stack under Wine.
 
+Both suites also run under the device answers an Intel/AMD Mac gives, forced
+through the `intel.*` keys in `mtld3d.conf`: `make test INTEL=1` and
+`make conformance-intel`. CI runs those variants beside the native ones, so the
+Intel code paths are exercised on every change without Intel hardware.
+
 ## Building from source
 
 mtld3d builds and runs on **Apple Silicon macOS**. `mtld3d.so` ships as both an
