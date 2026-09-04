@@ -76,15 +76,15 @@ pub struct Mtld3dConfig {
     pub color_space: ColorSpacePolicy,
     /// Cursor bitmap enlargement factor, hardware HCURSOR and software sprite alike.
     ///
-    /// Default: [`CursorScale::Auto`] — follow Wine's retina mode (2 when
-    /// the prefix runs in retina mode, else 1). `Fixed(n)` overrides with
+    /// Default: [`CursorScale::Auto`], which follows Wine's retina mode (2
+    /// when the prefix runs in retina mode, else 1). `Fixed(n)` overrides with
     /// the user's chosen multiplier (still clamped to `[1, 8]` at use
     /// site). File key: `cursor.scale` (`auto` | positive integer).
     pub cursor_scale: CursorScale,
     /// Draw the cursor in the unix-side overlay window instead of the hardware HCURSOR.
     ///
-    /// Default: [`SoftwareCursorPolicy::Auto`] — on when the HDR present path
-    /// is active, off otherwise; `On` / `Off` force it. Resolved on the unix
+    /// Default: [`SoftwareCursorPolicy::Auto`], on when the HDR present path
+    /// is active and off otherwise; `On` / `Off` force it. Resolved on the unix
     /// side at device creation. File key: `cursor.software`
     /// (`auto` | `true` | `false`).
     pub cursor_software: SoftwareCursorPolicy,

@@ -10,11 +10,12 @@ A test that needs a non-default option sets it itself: because each test is its
 own process and config resolves lazily on the first `Direct3DCreate9`, the test
 appends its key to `MTLD3D_CONFIG` before constructing the `Harness`. That keeps
 the option-gated behaviour in the ordinary `make test` run rather than behind a
-command a reader has to be told about. Four options are gated this way today:
+command a reader has to be told about. Five options are gated this way today:
 `buffer.ignoreLockBounds` in `buffers.rs`, `depth.aliasSameSize` in
-`render_target.rs`, `debug.expandPacked16` in `expand16.rs`, and `render.scale`
+`render_target.rs`, `debug.expandPacked16` in `expand16.rs`, `render.scale`
 in `render_scale.rs`, for the quantities that convert between the reported and
-rasterized spaces instead of staying in one of them.
+rasterized spaces instead of staying in one of them, and `cursor.software` in
+`device.rs`.
 
 ## Covered behaviour by file
 

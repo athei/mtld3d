@@ -257,7 +257,7 @@ bitflags::bitflags! {
     /// Packed boolean state for `CursorState`.
     ///
     /// Four flags that the cursor module reads and writes together at the
-    /// WM_* edges — packing them into one byte means a `match` against them
+    /// WM_* edges; packing them into one byte means a `match` against them
     /// fits in one comparison and the surrounding struct's tail padding
     /// tightens.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -481,7 +481,9 @@ impl CursorState {
             if self.hash != 0 {
                 send_overlay_state(self.hash, self.overlay_flags(), None);
             }
-        } else {
+        } else if !self.handle.is_null() {
+            // A game that never set a D3D cursor shows none of ours, whatever
+            // WM_SIZE pins: nothing for the pointer watch to look after.
             send_overlay_state(0, self.overlay_flags() | CursorOverlayFlags::HARDWARE, None);
         }
     }
@@ -1094,7 +1096,10 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // screen never calls ShowCursor(TRUE) and relies on exactly that.
             // The unix side asks for the same kick when the pointer comes
             // back from another process, which left its own cursor behind.
-            let was_dirty = cur.dirty() || crate::direct3d9::take_cursor_kick();
+            // Taken unconditionally: a kick left behind an already dirty
+            // pass would fire again on the next, correct pass.
+            let kicked = crate::direct3d9::take_cursor_kick();
+            let was_dirty = cur.dirty() || kicked;
             let started = Instant::now();
             if was_dirty {
                 cur.set_dirty(false);
@@ -1336,15 +1341,25 @@ struct SpriteUpload {
 /// cursor is the hardware cursor's sprite drawn by a different compositor.
 fn upscale_sprite(source: &CursorSource, scale: u32) -> SpriteUpload {
     let scale = scale.clamp(1, 8);
-    let (sw, sh, pixels, path) = scale_cursor_pixels(
+    let src_pixels = u8_to_u32_vec(&source.pixels);
+    // Same rule as the hardware path: a bitmap with no alpha anywhere is an
+    // opaque cursor (there its AND mask keeps every pixel); the overlay
+    // blends premultiplied, so those pixels get an opaque alpha instead.
+    let any_alpha = src_pixels.iter().any(|&px| (px >> 24) != 0);
+    let (sw, sh, mut pixels, path) = scale_cursor_pixels(
         scale as usize,
         source.width as usize,
         source.height as usize,
-        u8_to_u32_vec(&source.pixels),
+        src_pixels,
     );
+    if !any_alpha {
+        for px in &mut pixels {
+            *px |= 0xFF00_0000;
+        }
+    }
     trace!(
         target: LOG_TARGET,
-        "upscale_sprite: {}x{} → {sw}x{sh} path={path}",
+        "upscale_sprite: {}x{} → {sw}x{sh} path={path} any_alpha={any_alpha}",
         source.width, source.height,
     );
     SpriteUpload {
@@ -1411,16 +1426,52 @@ fn send_overlay_state(hash: u64, flags: CursorOverlayFlags, sprite: Option<&Spri
 /// image the pointer shows is the overlay's business.
 fn build_blank_hcursor() -> Option<*mut c_void> {
     const SIDE: usize = 32;
-    let side = i32::try_from(SIDE).expect("32 fits i32");
-    let color = vec![0u8; SIDE * SIDE * 4];
+    let color = vec![0u32; SIDE * SIDE];
     // 1 bpp, rows padded to 32 bits: 32 pixels are 4 bytes per row.
     let mask = [0xFFu8; SIDE * 4];
-    let color_bitmap = create_bitmap_packed(side, side, 1, 32, color.as_ptr().cast::<c_void>());
-    let mask_bitmap = create_bitmap_packed(side, side, 1, 1, mask.as_ptr().cast::<c_void>());
+    let cursor = create_cursor_from_bits(SIDE, SIDE, &color, &mask, (0, 0), "build_blank_hcursor")?;
+    debug!(target: LOG_TARGET, "build_blank_hcursor: ok handle={cursor:p}");
+    Some(cursor)
+}
+
+/// Create an HCURSOR from tight BGRA colour pixels and a 1 bpp AND mask.
+///
+/// The two DDBs are created, handed to `CreateIconIndirect` (which copies
+/// them) and deleted again; every Win32 failure is logged under `what` and
+/// yields `None`.
+///
+/// # Panics
+///
+/// If `width` or `height` does not fit an `i32`; cursor extents never
+/// approach that.
+fn create_cursor_from_bits(
+    width: usize,
+    height: usize,
+    color: &[u32],
+    mask: &[u8],
+    (x_hotspot, y_hotspot): (u32, u32),
+    what: &str,
+) -> Option<*mut c_void> {
+    let bitmap_width = i32::try_from(width).expect("cursor width fits i32");
+    let bitmap_height = i32::try_from(height).expect("cursor height fits i32");
+    let color_bitmap = create_bitmap_packed(
+        bitmap_width,
+        bitmap_height,
+        1,
+        32,
+        color.as_ptr().cast::<c_void>(),
+    );
+    let mask_bitmap = create_bitmap_packed(
+        bitmap_width,
+        bitmap_height,
+        1,
+        1,
+        mask.as_ptr().cast::<c_void>(),
+    );
     if color_bitmap.is_null() || mask_bitmap.is_null() {
         error!(
             target: LOG_TARGET,
-            "build_blank_hcursor: CreateBitmap failed (color={color_bitmap:p} mask={mask_bitmap:p})",
+            "{what}: CreateBitmap failed (color={color_bitmap:p} mask={mask_bitmap:p}) {width}x{height}",
         );
         if !color_bitmap.is_null() {
             delete_object(color_bitmap);
@@ -1431,20 +1482,20 @@ fn build_blank_hcursor() -> Option<*mut c_void> {
         return None;
     }
     let info = ICONINFO {
-        f_icon: 0,
-        x_hotspot: 0,
-        y_hotspot: 0,
+        f_icon: 0, // cursor
+        x_hotspot,
+        y_hotspot,
         hbm_mask: mask_bitmap,
         hbm_color: color_bitmap,
     };
     let cursor = create_icon_indirect(&info);
+    // CreateIconIndirect copies the bitmaps; we own the originals.
     delete_object(color_bitmap);
     delete_object(mask_bitmap);
     if cursor.is_null() {
-        error!(target: LOG_TARGET, "build_blank_hcursor: CreateIconIndirect returned null");
+        error!(target: LOG_TARGET, "{what}: CreateIconIndirect returned null ({width}x{height})");
         None
     } else {
-        debug!(target: LOG_TARGET, "build_blank_hcursor: ok handle={cursor:p}");
         Some(cursor)
     }
 }
@@ -1504,64 +1555,15 @@ fn build_hcursor(
     let (sw, sh, pixels, path) = scale_cursor_pixels(scale, w, h, src_pixels);
     let and_mask = derive_and_mask(&pixels, sw, sh, any_alpha);
 
-    let bitmap_width = i32::try_from(sw).expect("upscaled cursor width fits i32");
-    let bitmap_height = i32::try_from(sh).expect("upscaled cursor height fits i32");
-    let color_bitmap = create_bitmap_packed(
-        bitmap_width,
-        bitmap_height,
-        1,
-        32,
-        pixels.as_ptr().cast::<c_void>(),
-    );
-    let mask_bitmap = create_bitmap_packed(
-        bitmap_width,
-        bitmap_height,
-        1,
-        1,
-        and_mask.as_ptr().cast::<c_void>(),
-    );
-    if color_bitmap.is_null() || mask_bitmap.is_null() {
-        error!(
-            target: LOG_TARGET,
-            "build_hcursor: CreateBitmap failed (color={color_bitmap:p} mask={mask_bitmap:p}) src={width}x{height} → {sw}x{sh} path={path}",
-        );
-        if !color_bitmap.is_null() {
-            delete_object(color_bitmap);
-        }
-        if !mask_bitmap.is_null() {
-            delete_object(mask_bitmap);
-        }
-        return None;
-    }
-
     let scale_u32 = u32::try_from(scale).expect("scale clamped to ≤8 fits u32");
-    let info = ICONINFO {
-        f_icon: 0, // cursor
-        x_hotspot: x_hotspot * scale_u32,
-        y_hotspot: y_hotspot * scale_u32,
-        hbm_mask: mask_bitmap,
-        hbm_color: color_bitmap,
-    };
-    let cursor = create_icon_indirect(&info);
-
-    // CreateIconIndirect copies the bitmaps; we own the originals.
-    delete_object(color_bitmap);
-    delete_object(mask_bitmap);
-
-    if cursor.is_null() {
-        error!(
-            target: LOG_TARGET,
-            "build_hcursor: CreateIconIndirect returned null (src={width}x{height} → {sw}x{sh} path={path} any_alpha={any_alpha})",
-        );
-        None
-    } else {
-        debug!(
-            target: LOG_TARGET,
-            "build_hcursor: ok handle={cursor:p} src={width}x{height} → {sw}x{sh} path={path} any_alpha={any_alpha} hotspot=({},{})→({},{})",
-            x_hotspot, y_hotspot, info.x_hotspot, info.y_hotspot,
-        );
-        Some(cursor)
-    }
+    let hotspot = (x_hotspot * scale_u32, y_hotspot * scale_u32);
+    let cursor = create_cursor_from_bits(sw, sh, &pixels, &and_mask, hotspot, "build_hcursor")?;
+    debug!(
+        target: LOG_TARGET,
+        "build_hcursor: ok handle={cursor:p} src={width}x{height} → {sw}x{sh} path={path} any_alpha={any_alpha} hotspot=({},{})→({},{})",
+        x_hotspot, y_hotspot, hotspot.0, hotspot.1,
+    );
+    Some(cursor)
 }
 
 /// Upscale a tight `w*h` BGRA buffer by `scale`.

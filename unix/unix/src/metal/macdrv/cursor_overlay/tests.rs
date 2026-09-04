@@ -22,6 +22,7 @@ fn geometry() -> SpriteGeometry {
         height: 32.0,
         hotspot_x: 4.0,
         hotspot_y: 6.0,
+        scale: 2.0,
     }
 }
 
@@ -53,13 +54,43 @@ fn sprite_geometry_is_in_points_not_sprite_pixels() {
         pixels: Box::new([]),
     };
     assert_eq!(
-        SpriteGeometry::of(&sprite),
+        SpriteGeometry::of(&sprite, 2),
         SpriteGeometry {
             width: 32.0,
             height: 24.0,
             hotspot_x: 4.0,
             hotspot_y: 6.0,
+            scale: 2.0,
         }
+    );
+}
+
+#[test]
+fn sprite_geometry_divides_by_the_retina_factor_not_the_sprite_scale() {
+    // `cursor.scale = 2` on a non-retina prefix: winemac shows the 64 px
+    // hardware cursor at 64 pt, and so must the overlay.
+    let sprite = Sprite {
+        width: 64,
+        height: 64,
+        x_hotspot: 8,
+        y_hotspot: 8,
+        scale: 2,
+        pixels: Box::new([]),
+    };
+    assert_eq!(
+        SpriteGeometry::of(&sprite, 1),
+        SpriteGeometry {
+            width: 64.0,
+            height: 64.0,
+            hotspot_x: 8.0,
+            hotspot_y: 8.0,
+            scale: 1.0,
+        }
+    );
+    // An unpublished layer scale reads as 1.
+    assert_eq!(
+        SpriteGeometry::of(&sprite, 0),
+        SpriteGeometry::of(&sprite, 1)
     );
 }
 

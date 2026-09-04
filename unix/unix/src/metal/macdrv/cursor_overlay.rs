@@ -38,11 +38,12 @@
 //! crosshair) delivers no mouse events to the application while the pointer
 //! keeps moving; every present notices the pointer moving away from its last
 //! legitimate position with no event since and hides the sprite until events
-//! resume. The check is asked only while the game shows its cursor and winemac
-//! is not clipping it, since in either other state the game owns the pointer
-//! and the events stay away from the application by design (mouselook clips
-//! the cursor for the drag), and a warp the game made through winemac counts
-//! as a legitimate move. And when such a tool ends, the window server shows
+//! resume. The check is asked only while the game shows its cursor, the
+//! application is active and winemac is not clipping the cursor, since in
+//! every other state the events stay away from the application by design
+//! (an inactive application gets none, mouselook clips the cursor for the
+//! drag), and a warp the game made through winemac counts as a legitimate
+//! move. And when such a tool ends, the window server shows
 //! the standard arrow rather than the cursor Wine set, which Wine never
 //! re-applies because its handle did not change; the first event after a
 //! capture asks the PE side for its null-then-set kick, which makes Wine
@@ -80,7 +81,7 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSDictionary, NSNotification, NSNotificationCenter, NSString};
+use objc2_foundation::{NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
     MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
@@ -226,6 +227,13 @@ fn wine_last_warp_uptime() -> f64 {
 /// so a pointer moving with no events reaching us means nothing then.
 static CURSOR_SHOWN: AtomicBool = AtomicBool::new(false);
 
+/// The Wine process is the active application, as its activation observers last saw it.
+///
+/// An inactive application receives no mouse-moved events by design, so a
+/// pointer moving elsewhere on the desktop says nothing about a capture;
+/// the check waits for the activation that brings the events back.
+static APP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// The instant [`LAST_EVENT_NS`] counts from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -256,18 +264,11 @@ fn note_event(position: CGPoint) {
 /// Whether the pointer has moved since the last event with no event for the silence period.
 ///
 /// Callable from any thread: the answer is the whole message, and a stale
-/// read only delays it by one check.
+/// read only delays it by one check. The atomics are consulted before
+/// anything Objective-C, so a present during ordinary mouse traffic costs
+/// three loads.
 fn capture_suspected() -> bool {
-    if !CURSOR_SHOWN.load(Ordering::Relaxed) || wine_clips_cursor() {
-        return false;
-    }
-    let now = NSEvent::mouseLocation();
-    // A warp the game asked for since the last check moved the pointer
-    // legitimately: where it is now is where motion is measured from, and
-    // the silence is measured from now.
-    let warp_bits = wine_last_warp_uptime().to_bits();
-    if warp_bits != 0 && LAST_WARP_SEEN_BITS.swap(warp_bits, Ordering::Relaxed) != warp_bits {
-        note_event(now);
+    if !CURSOR_SHOWN.load(Ordering::Relaxed) || !APP_ACTIVE.load(Ordering::Relaxed) {
         return false;
     }
     let at = LAST_EVENT_NS.load(Ordering::Acquire);
@@ -275,6 +276,24 @@ fn capture_suspected() -> bool {
         return false;
     }
     let silence_ms = EPOCH.elapsed().as_nanos().saturating_sub(u128::from(at)) / 1_000_000;
+    if silence_ms < CAPTURE_SILENCE_MS || wine_clips_cursor() {
+        return false;
+    }
+    // A warp the game asked for since the last check moved the pointer
+    // legitimately: where it is now is where motion is measured from, and
+    // the silence is measured from now. The warp time is read on both sides
+    // of the location so a warp landing between the reads is never paired
+    // with the position from the other side of it; the next check sees it.
+    let warp_before = wine_last_warp_uptime().to_bits();
+    let now = NSEvent::mouseLocation();
+    let warp_after = wine_last_warp_uptime().to_bits();
+    if warp_before != warp_after {
+        return false;
+    }
+    if warp_after != 0 && LAST_WARP_SEEN_BITS.swap(warp_after, Ordering::Relaxed) != warp_after {
+        note_event(now);
+        return false;
+    }
     let (seen_x, seen_y) = unpack_point(LAST_EVENT_POS.load(Ordering::Relaxed));
     let moved = (now.x - seen_x).abs() > 0.5 || (now.y - seen_y).abs() > 0.5;
     pointer_captured(silence_ms, moved)
@@ -374,16 +393,26 @@ struct SpriteGeometry {
     height: f64,
     hotspot_x: f64,
     hotspot_y: f64,
+    /// Sprite pixels per point: the overlay layer's `contentsScale`.
+    scale: f64,
 }
 
 impl SpriteGeometry {
-    fn of(sprite: &Sprite) -> Self {
-        let scale = f64::from(sprite.scale.max(1));
+    /// Size sprite pixels the way winemac sizes a hardware cursor's image.
+    ///
+    /// winemac divides the cursor bitmap's pixel size by the prefix's retina
+    /// factor (2 in retina mode, else 1) to get its point size, whatever the
+    /// bitmap's own scale; `cursor.scale` therefore enlarges both cursors
+    /// alike only when the sprite is divided by the same factor, which is
+    /// the layer scale the attach published, never the sprite's own.
+    fn of(sprite: &Sprite, retina_factor: u32) -> Self {
+        let scale = f64::from(retina_factor.max(1));
         Self {
             width: f64::from(sprite.width) / scale,
             height: f64::from(sprite.height) / scale,
             hotspot_x: f64::from(sprite.x_hotspot) / scale,
             hotspot_y: f64::from(sprite.y_hotspot) / scale,
+            scale,
         }
     }
 }
@@ -399,7 +428,11 @@ bitflags::bitflags! {
         /// macOS gives the pointer to the frontmost application; a sprite
         /// over an inactive game window would sit next to the real arrow.
         const APP_ACTIVE = 1 << 1;
-        /// The pointer is over the game's client area.
+        /// The pointer is over the game's client area, with no other window above it there.
+        ///
+        /// A dialog or another application's panel over the game shows its
+        /// own hardware cursor; a sprite drawn over that would be a second
+        /// pointer.
         const POINTER_INSIDE = 1 << 2;
         /// The game window is fully covered or minimised.
         const OCCLUDED = 1 << 3;
@@ -561,10 +594,9 @@ fn snapshot_wanted() -> WantedSnapshot {
     WantedSnapshot {
         hash: shared.wanted.hash,
         visible: shared.wanted.visible,
-        geometry: shared
-            .sprites
-            .get(&shared.wanted.hash)
-            .map(SpriteGeometry::of),
+        geometry: shared.sprites.get(&shared.wanted.hash).map(|sprite| {
+            SpriteGeometry::of(sprite, super::CURRENT_BACKING_SCALE.load(Ordering::Relaxed))
+        }),
     }
 }
 
@@ -586,6 +618,11 @@ fn apply_on_main_inner(create_if_missing: bool) {
     let wanted = snapshot_wanted();
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "cursor: apply re-entered the overlay on the main thread; \
+                 this state lands with the next event or apply",
+            );
             return;
         };
         if slot.is_none() {
@@ -670,7 +707,10 @@ impl Overlay {
         // the compositor blends the whole window onto the game.
         layer.setOpaque(false);
         layer.setFramebufferOnly(true);
-        layer.setMaximumDrawableCount(2);
+        // Show and hide each present a drawable, and the main thread must
+        // never wait for the compositor to hand one back: three is enough
+        // for two flips within one refresh.
+        layer.setMaximumDrawableCount(3);
         layer.setAllowsNextDrawableTimeout(true);
         layer.setPresentsWithTransaction(false);
         layer.setName(Some(&NSString::from_str("mtld3d-cursor-overlay")));
@@ -710,8 +750,12 @@ impl Overlay {
         window.setIgnoresMouseEvents(true);
         window.setHasShadow(false);
         window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+        // On every Space: the overlay is never ordered in or out, so it must
+        // be wherever the game window is moved to, and a window on no visible
+        // Space would be an uncomposited layer whose presents block.
         window.setCollectionBehavior(
-            NSWindowCollectionBehavior::Transient
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Transient
                 | NSWindowCollectionBehavior::IgnoresCycle
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
@@ -787,7 +831,9 @@ impl Overlay {
             );
             ColorSpacePolicy::Passthrough
         });
-        let screen = self.window.screen().or_else(|| NSScreen::mainScreen(mtm));
+        // The game window's screen, not the overlay's: the overlay follows
+        // the game window one event later.
+        let screen = game_screen(mtm);
         let (native_colorspace, screen_profile_name) =
             screen.as_deref().map_or((None, None), screen_color_profile);
         let screen_name = screen.as_deref().map(|s| s.localizedName().to_string());
@@ -866,18 +912,19 @@ impl Overlay {
                 entry.insert(texture)
             }
         };
-        let scale = f64::from(sprite_scale(hash));
-        self.layer.setBounds(CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize {
-                width: geometry.width,
-                height: geometry.height,
-            },
-        });
-        self.layer.setContentsScale(scale);
-        self.layer.setDrawableSize(CGSize {
-            width: geometry.width * scale,
-            height: geometry.height * scale,
+        without_actions(|| {
+            self.layer.setBounds(CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+            });
+            self.layer.setContentsScale(geometry.scale);
+            self.layer.setDrawableSize(CGSize {
+                width: geometry.width * geometry.scale,
+                height: geometry.height * geometry.scale,
+            });
         });
         let Some(drawable) = self.layer.nextDrawable() else {
             mtld3d_shared::log_once_warn!(
@@ -906,8 +953,8 @@ impl Overlay {
         cmd_buf.commit();
         debug!(
             target: LOG_TARGET,
-            "cursor: sprite {hash:#018x} rendered ({:.0}x{:.0} pt, hotspot ({:.0},{:.0}), {mode:?}, peak {peak:.2}x)",
-            geometry.width, geometry.height, geometry.hotspot_x, geometry.hotspot_y,
+            "cursor: sprite {hash:#018x} rendered ({:.0}x{:.0} pt at {}x, hotspot ({:.0},{:.0}), {mode:?}, peak {peak:.2}x)",
+            geometry.width, geometry.height, geometry.scale, geometry.hotspot_x, geometry.hotspot_y,
         );
         true
     }
@@ -950,7 +997,8 @@ impl Overlay {
         );
         inputs.set(
             VisibilityInputs::POINTER_INSIDE,
-            rect_contains(client, mouse),
+            rect_contains(client, mouse)
+                && window_under_pointer(mouse, mtm) == game_window.windowNumber(),
         );
         inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
@@ -989,11 +1037,36 @@ impl Overlay {
 
     /// Move the sprite layer without an implicit animation.
     fn set_position(&self, position: CGPoint) {
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        self.layer.setPosition(position);
-        CATransaction::commit();
+        without_actions(|| self.layer.setPosition(position));
     }
+}
+
+/// Run layer property writes in a transaction with implicit animations off.
+///
+/// The sprite layer has no delegate, so every animatable property it is
+/// given (position, bounds, contents scale) would otherwise ease over Core
+/// Animation's default quarter second.
+fn without_actions(write: impl FnOnce()) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    write();
+    CATransaction::commit();
+}
+
+/// The number of the window a click at `point` would land on, in any application.
+///
+/// The overlay ignores mouse events, so it is never the answer; the game
+/// window is, unless something sits over it there.
+fn window_under_pointer(point: CGPoint, mtm: MainThreadMarker) -> NSInteger {
+    NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm)
+}
+
+/// The screen the game window is on; the main screen when it is on none or unbound.
+fn game_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+    retain_bound_view()
+        .and_then(|view| view.window())
+        .and_then(|window| window.screen())
+        .or_else(|| NSScreen::mainScreen(mtm))
 }
 
 /// The frame the overlay window covers: the screen the game window is on.
@@ -1001,11 +1074,7 @@ impl Overlay {
 /// The main screen when the game window is not on any (mid-move between
 /// displays) or no game window is bound; the window follows on the next event.
 fn overlay_frame(mtm: MainThreadMarker) -> CGRect {
-    let screen = retain_bound_view()
-        .and_then(|view| view.window())
-        .and_then(|window| window.screen())
-        .or_else(|| NSScreen::mainScreen(mtm));
-    screen.map_or(
+    game_screen(mtm).map_or(
         CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize {
@@ -1015,14 +1084,6 @@ fn overlay_frame(mtm: MainThreadMarker) -> CGRect {
         },
         |screen| screen.frame(),
     )
-}
-
-/// The `scale` the PE side upscaled sprite `hash` by, `1` if it is gone.
-fn sprite_scale(hash: u64) -> u32 {
-    lock_shared()
-        .sprites
-        .get(&hash)
-        .map_or(1, |sprite| sprite.scale.max(1))
 }
 
 /// Copy sprite `hash` out of [`SHARED`] into a shared-storage `MTLTexture`.
@@ -1073,6 +1134,11 @@ fn upload_sprite_texture(
             sprite.pixels.len(),
         );
     }
+    debug!(
+        target: LOG_TARGET,
+        "cursor: sprite {hash:#018x} uploaded ({}x{} px, upscaled {}x)",
+        sprite.width, sprite.height, sprite.scale,
+    );
     drop(shared);
     Some(texture)
 }
@@ -1109,17 +1175,27 @@ pub fn install_pointer_watch() {
     let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &monitor) };
     core::mem::forget(token);
 
+    // SAFETY: the caller runs on the main thread (the attach handler's
+    // main-thread hop), where the application object may be read.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    APP_ACTIVE.store(
+        NSApplication::sharedApplication(mtm).isActive(),
+        Ordering::Relaxed,
+    );
     let center = NSNotificationCenter::defaultCenter();
     // SAFETY: reading AppKit's notification-name constants, immutable statics
     // the framework initialised before `main`.
     let names = unsafe {
         [
-            NSApplicationDidBecomeActiveNotification,
-            NSApplicationDidResignActiveNotification,
+            (NSApplicationDidBecomeActiveNotification, true),
+            (NSApplicationDidResignActiveNotification, false),
         ]
     };
-    for name in names {
-        let block = RcBlock::new(|_: NonNull<NSNotification>| on_pointer_event_main());
+    for (name, active) in names {
+        let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+            APP_ACTIVE.store(active, Ordering::Relaxed);
+            on_pointer_event_main();
+        });
         // SAFETY: objc2 typed binding; the center copies the block, and the
         // token is leaked so the observer lives for the process.
         let token = unsafe {
