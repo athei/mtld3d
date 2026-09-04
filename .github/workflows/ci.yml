@@ -323,21 +323,32 @@ jobs:
           W="$HOME/wine-sdk/wine/bin/wine"
           WS="$HOME/wine-sdk/wine/bin/wineserver"
           capped() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          # A process caught in the fault loop survives `wineserver -k`, so
+          # every boot ends with an outright kill of everything from the SDK.
+          reap() { pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true; sleep 2; }
+          boot() { # $1 = prefix name, rest = env assignments; prints the verdict
+            local name="$1"; shift
+            local pfx="$RUNNER_TEMP/pfx-$name"
+            env WINEPREFIX="$pfx" "$@" perl -e 'alarm 120; exec @ARGV' "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/boot-$name.log" 2>&1
+            echo "boot $name: reg add exit $?"
+            if grep -aq EXCEPTION_WINE_ASSERTION "$RUNNER_TEMP/boot-$name.log"; then echo "boot $name: ABORTED (assertion in the trace)"; fi
+            ls "$pfx/drive_c/windows/system32" 2>/dev/null | head -3 | sed "s/^/boot $name: system32 has /"
+            env WINEPREFIX="$pfx" perl -e 'alarm 30; exec @ARGV' "$W" cmd /c ver 2>&1 | grep -a 'Windows' | sed "s/^/boot $name: /" || true
+            reap
+          }
           file "$W"
           "$W" --version || echo "wine --version exit $?"
           otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
-          echo "== boot, driver traced"
-          since=$(date '+%Y-%m-%d %H:%M:%S')
-          WINEDEBUG=+timestamp,+macdrv,+seh capped 120 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1 || echo "reg add exit $?"
-          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/wine-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -60
-          capped 30 "$WS" -k || true
-          echo "== unified log since the boot"
-          log show --start "$since" --style compact --predicate 'process CONTAINS "explorer" OR process CONTAINS "wine" OR eventMessage CONTAINS[c] "exception" OR eventMessage CONTAINS[c] "assert"' 2>/dev/null | grep -av 'com.apple.securityd\|tccd' | head -80
           echo "== boot without the Mac driver"
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" capped 180 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f 2>&1 | tail -5 || echo "reg add exit $?"
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" capped 60 "$W" cmd /c ver 2>&1 | tail -3 || true
-          ls "$RUNNER_TEMP/pfx-nodrv/drive_c/windows" 2>/dev/null | head -5
-          WINEPREFIX="$RUNNER_TEMP/pfx-nodrv" capped 30 "$WS" -k || true
+          boot nodrv WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" WINEDEBUG=+seh
+          echo "== boot with msync off"
+          boot nomsync WINEMSYNC=0 WINEDEBUG=+seh
+          echo "== boot with the Mac driver traced"
+          boot macdrv WINEDEBUG=+timestamp,+macdrv,+seh
+          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/boot-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -40
+          cp "$RUNNER_TEMP/boot-macdrv.log" "$RUNNER_TEMP/wine-macdrv.log" 2>/dev/null || true
+          echo "== unified log around the abort"
+          capped 120 log show --last 6m --style compact --predicate 'process == "wine" OR process CONTAINS "explorer" OR eventMessage CONTAINS[c] "abort" OR eventMessage CONTAINS[c] "exception"' 2>/dev/null | grep -av 'runningboard\|securityd\|tccd' | head -40
       - uses: actions/upload-artifact@v4
         if: always()
         with:
