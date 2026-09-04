@@ -234,7 +234,10 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    # A prefix boot that fails waits out wineboot's five-minute timer and then
+    # the child's own, so an image where Wine cannot boot costs about eight
+    # minutes per attempt, and the Wine step makes three.
+    timeout-minutes: 45
     steps:
       - name: Host
         run: |
