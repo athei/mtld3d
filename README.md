@@ -122,11 +122,6 @@ conformance` runs Wine's d3d9 test suite against the installed builtin and
 gates on a per-site baseline; every remaining divergence is classified with a
 written rationale in [`CONFORMANCE.md`](unix/conformance/CONFORMANCE.md).
 
-Both suites also run under the device answers an Intel/AMD Mac gives, forced
-through the `intel.*` keys in `mtld3d.conf`: `make test INTEL=1` and
-`make conformance-intel`, so the Intel code paths can be exercised on a machine
-without Intel hardware.
-
 ## Building from source
 
 `WINE_SDK` must point at a Wine build or install providing `wine`,
