@@ -150,12 +150,12 @@ memory headroom, or the games that rely on the looser behaviour:
   staging is released once its upload retires, so serving the lock re-creates
   the buffer, and a *partial* lock taken after such a release leaves the pixels
   outside its rect no longer matching the GPU copy (warned once per texture).
-- **`GetData(D3DGETDATA_FLUSH)` returns `S_OK` immediately** for a pending
-  occlusion query instead of blocking until the GPU has the count. Games use
-  that poll loop as a fence against 2004-era drivers without hazard tracking,
-  which Metal does explicitly, so the wait buys no correctness and stalls the
-  API thread, the frame-time bottleneck. `query.flushImmediate = false`
-  restores the spec-correct wait.
+- **`GetData(D3DGETDATA_FLUSH)` can answer immediately** for a pending
+  occlusion query instead of blocking until the GPU has the count, under
+  `query.flushImmediate = true`. The default is the spec-correct wait; the
+  `wow` profile turns the immediate answer on, because both World of Warcraft
+  clients use the poll loop only as a fence after every loading-screen upload
+  batch and never read the count.
 - **Depth stores are elided** where nothing reads the buffer back, so content
   that relies on depth surviving a pass it never cleared can read stale depth.
   Preserving it unconditionally would cost the optimization on every frame of
@@ -436,7 +436,8 @@ and the environment override it key by key.
 
 | Profile | Application | What it sets and why |
 |---|---|---|
-| `gta-iv` | Grand Theft Auto IV | `adapter.spoof=amd`, because the renderer branches on the reported vendor and stalls in its own identifier parsing on the NVIDIA identity. `caps.dfFormats=false`, because with the DF fourccs advertised it picks a mixed DF24 plus INTZ depth path that no hardware of its era offered. `query.flushImmediate=false`, because its occlusion culling needs real pixel counts rather than an immediate answer. `depth.aliasSameSize=true`, because its late alpha, sky and glow passes z-test one INTZ depth texture against scene depth rendered into a same-size sibling. |
+| `gta-iv` | Grand Theft Auto IV | `adapter.spoof=amd`, because the renderer branches on the reported vendor and stalls in its own identifier parsing on the NVIDIA identity. `caps.dfFormats=false`, because with the DF fourccs advertised it picks a mixed DF24 plus INTZ depth path that no hardware of its era offered. `depth.aliasSameSize=true`, because its late alpha, sky and glow passes z-test one INTZ depth texture against scene depth rendered into a same-size sibling. |
+| `wow` | World of Warcraft (1.12 and 3.3.5 clients) | `query.flushImmediate=true`, because both clients poll `GetData(D3DGETDATA_FLUSH)` as a GPU fence after every loading-screen upload batch and never read the count, so the spec-correct wait would cost seconds per load for nothing. |
 
 Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*`
 and `env_logger` matches by `::`-separated prefix, so `RUST_LOG=mtld3d=warn` is

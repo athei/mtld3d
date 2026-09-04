@@ -142,12 +142,6 @@ pub fn run_subtest(
         // (or a SHADER_CACHE_SCHEMA bump) is always reflected without having to
         // delete a stale cache by hand.
         //
-        // `query.flushImmediate=false`: restore the spec-correct *blocking*
-        // `GetData(D3DGETDATA_FLUSH)` for occlusion queries. The runtime default
-        // (`true`) returns a permissive stub immediately for API-thread
-        // throughput, but conformance wants the real GPU pixel count, so flip it
-        // off here (occlusion-only; EVENT/TIMESTAMP `GetData` are unaffected).
-        //
         // `color.hdr.enable=false`: the shipped default is on, but it resolves
         // off the running machine's panel, so an EDR Mac would present through
         // the tone-mapping shader while another machine blits. The baseline has
@@ -155,7 +149,7 @@ pub fn run_subtest(
         // path here.
         .env(
             "MTLD3D_CONFIG",
-            "shaderCache.enable=false;query.flushImmediate=false;color.hdr.enable=false",
+            "shaderCache.enable=false;color.hdr.enable=false",
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

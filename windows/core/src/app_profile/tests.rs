@@ -53,6 +53,24 @@ fn the_gta_iv_profile_matches_the_real_binarys_resource() {
 }
 
 #[test]
+fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answer() {
+    for version in ["Version 1.12", "Version 3.3"] {
+        let blob = blob(&[
+            ("CompanyName", "Blizzard Entertainment"),
+            ("ProductName", "World of Warcraft"),
+            ("ProductVersion", version),
+        ]);
+        let id = AppIdentity::new("WoW.exe".to_owned(), Some(&blob));
+        let profile = lookup(&id).expect("the wow profile matches");
+        assert_eq!(profile.name(), "wow");
+        assert!(!parse(None, "", None).query_flush_immediate);
+        assert!(parse(Some(profile), "", None).query_flush_immediate);
+    }
+    let nameless = AppIdentity::new("WoW.exe".to_owned(), None);
+    assert!(lookup(&nameless).is_none());
+}
+
+#[test]
 fn a_pinned_field_is_a_substring_test() {
     let suffixed = blob(&[
         ("CompanyName", "Rockstar Games, Inc."),
