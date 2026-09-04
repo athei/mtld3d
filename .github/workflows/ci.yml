@@ -240,7 +240,7 @@ jobs:
           if ! leg; then
             grep -lqE 'TIMED OUT|GPU Hang' "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null || exit 1
             echo "::warning::a subtest hung on this runner's GPU; running the leg once more"
-            rm -rf "$MTLD3D_CONFORMANCE_RAW_DIR"
+            mv "$MTLD3D_CONFORMANCE_RAW_DIR" "$MTLD3D_CONFORMANCE_RAW_DIR-first-attempt"
             leg
           fi
         env:
@@ -257,7 +257,7 @@ jobs:
         if: always()
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/conformance-raw
+          path: ${{ runner.temp }}/conformance-raw*
           retention-days: 14
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
