@@ -77,10 +77,16 @@ static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Name the log location: `<dir>/<stem>-<pid>.log`, created on the first line.
 ///
+/// `pid` is this process's host pid, the one `ps` shows. The PE side's own
+/// pid would not do: it is Wine's process id, and a fresh wineserver hands
+/// its first process the same one every launch, so every run of a game would
+/// append to one file and the retention below would never see a second.
+///
 /// Returns the path the file will have. Nothing is created here; a location
 /// that turns out unusable is reported by the first write, which then falls
 /// back to stderr.
-pub fn open(dir: &str, stem: &str, pid: u32) -> PathBuf {
+pub fn open(dir: &str, stem: &str) -> PathBuf {
+    let pid = std::process::id();
     let dir = PathBuf::from(dir);
     let path = dir.join(mtld3d_shared::log_paths::log_file_name(stem, pid));
     let mut guard = SINK.lock().expect("log file mutex poisoned");

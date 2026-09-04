@@ -1,9 +1,10 @@
-//! Retention of the log directory.
+//! Naming and retention of the log directory.
 //!
-//! `prune` keeps the newest `keep` entries of one extension by modification time and removes
-//! the rest, whether file (a log) or directory (a trace bundle), and leaves the other extension
-//! alone. The modification times are set explicitly so the order does not depend on how fast
-//! the files were created.
+//! `open` names the file after the host pid, the only process id that differs from one launch
+//! to the next. `prune` keeps the newest `keep` entries of one extension by modification time
+//! and removes the rest, whether file (a log) or directory (a trace bundle), and leaves the
+//! other extension alone. The modification times are set explicitly so the order does not
+//! depend on how fast the files were created.
 
 use std::{
     fs::{self, File},
@@ -11,7 +12,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::prune;
+use super::{fall_back_to_stderr, open, prune};
 
 /// A fresh directory under the system temp dir, removed when dropped.
 struct Scratch(PathBuf);
@@ -100,4 +101,18 @@ fn nothing_to_prune_below_the_cap() {
     dir.file("game-1.log", 10);
     prune(&dir.0, "log", 3);
     assert_eq!(dir.names(), ["game-1.log"]);
+}
+
+#[test]
+fn names_the_log_after_the_host_pid() {
+    let dir = Scratch::new("name");
+    let path = open(&dir.0.to_string_lossy(), "game");
+    // Back to stderr before any line creates the file: the sink is process-wide.
+    fall_back_to_stderr();
+    let expected = dir.0.join(format!("game-{}.log", std::process::id()));
+    assert_eq!(path, expected);
+    assert!(
+        dir.names().is_empty(),
+        "naming the location creates nothing"
+    );
 }

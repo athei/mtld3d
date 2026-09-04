@@ -89,7 +89,9 @@ impl Thunk for WriteLogParams {
 /// from `DllMain`, so the location travels separately. `dir` is the unix
 /// path of the log directory, `stem` the executable's file name without its
 /// extension, both UTF-8 without a terminator and kept alive by the PE side
-/// for the call; `pid` names the process. The unix side opens
+/// for the call. The unix side names the process itself, by its host pid:
+/// the Windows pid the PE side sees is Wine's, and Wine hands the first
+/// process of every fresh wineserver the same one. It opens
 /// `<dir>/<stem>-<pid>.log` on the first line it writes and numbers the
 /// traces `<dir>/<stem>-<pid>-<n>.gputrace`.
 #[repr(C, align(8))]
@@ -98,8 +100,6 @@ pub struct OpenLogParams {
     pub stem_ptr: u64, // in: *const u8
     pub dir_len: u32,  // in: byte count
     pub stem_len: u32, // in: byte count
-    pub pid: u32,
-    pub pad0: u32,
 }
 
 impl Thunk for OpenLogParams {
