@@ -350,6 +350,64 @@ jobs:
           WINEPREFIX="$RUNNER_TEMP/pfx" capped 60 "$W" cmd /c ver 2>&1 | grep -a Windows
           ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
           pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true
+      # A view that only reorders channels is how the formats without an
+      # alpha lane read alpha as one; a device that hands one back but samples
+      # through the base texture's lanes is what the swizzle sites in the
+      # conformance baseline look like.
+      - name: Swizzle and sRGB texture views
+        run: |
+          cat > "$RUNNER_TEMP/views.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void probe(texture2d<float> t [[texture(0)]], device float4 *out [[buffer(0)]]) {
+              constexpr sampler s(coord::pixel, filter::nearest);
+              out[0] = t.sample(s, float2(0.5, 0.5));
+          }
+          """
+          let lib = try! d.makeLibrary(source: src, options: nil)
+          let pso = try! d.makeComputePipelineState(function: lib.makeFunction(name: "probe")!)
+          let queue = d.makeCommandQueue()!
+          func sample(_ t: MTLTexture) -> [Float] {
+              let out = d.makeBuffer(length: 16, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let enc = cb.makeComputeCommandEncoder()!
+              enc.setComputePipelineState(pso)
+              enc.setTexture(t, index: 0)
+              enc.setBuffer(out, offset: 0, index: 0)
+              enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+              enc.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              return Array(UnsafeBufferPointer(start: out.contents().assumingMemoryBound(to: Float.self), count: 4))
+          }
+          for usePFV in [false, true] {
+              let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+              desc.usage = usePFV ? [.shaderRead, .pixelFormatView] : [.shaderRead]
+              desc.storageMode = .private
+              let tex = d.makeTexture(descriptor: desc)!
+              let staging = d.makeBuffer(bytes: [UInt8(255), 64, 32, 0], length: 4, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let blit = cb.makeBlitCommandEncoder()!
+              blit.copy(from: staging, sourceOffset: 0, sourceBytesPerRow: 4, sourceBytesPerImage: 4, sourceSize: MTLSize(width: 1, height: 1, depth: 1), to: tex, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+              blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("pixelFormatView usage:", usePFV)
+              print("  base sample:", sample(tex))
+              let sw = MTLTextureSwizzleChannels(red: .red, green: .green, blue: .blue, alpha: .one)
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm, textureType: .type2D, levels: 0..<1, slices: 0..<1, swizzle: sw) {
+                  print("  swizzle view: created, swizzle alpha =", view.swizzle.alpha.rawValue, "sample:", sample(view))
+              } else {
+                  print("  swizzle view: nil")
+              }
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm_srgb) {
+                  print("  srgb view: created, sample:", sample(view))
+              } else {
+                  print("  srgb view: nil")
+              }
+          }
+          EOF
+          swift "$RUNNER_TEMP/views.swift" || echo "views probe failed with exit $?"
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
           cat > "$RUNNER_TEMP/packed.swift" <<'EOF'

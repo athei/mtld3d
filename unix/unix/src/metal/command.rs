@@ -883,7 +883,6 @@ fn sampler_or_default(
 /// out-of-bounds copy. A clamped copy cannot fill a larger drawable, so the
 /// margin is cleared first, because undefined drawable memory reads as
 /// noise, and on an `RGBA16Float` layer that noise is magenta.
-
 fn encode_present_blit(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
