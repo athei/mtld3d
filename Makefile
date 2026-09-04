@@ -114,6 +114,25 @@ XWIN_STAMP := /opt/xwin/.xwin-packages
 # stamps carry the versions.
 XWIN_CRT_VERSION := 14.44.17.14
 XWIN_SDK_VERSION := 10.0.26100
+
+# The C and C++ the PE targets carry (snmalloc, zstd) are compiled by the host
+# `c++` under cc-rs, and the MSVC STL of the CRT above refuses any clang whose
+# major is below 19. Apple's clang reports 21 on macOS 26 but 17 on the Xcode
+# 16 a macOS 15 machine or CI image ships, so on such a host the PE C/C++ goes
+# through Homebrew's LLVM instead: `setup-pe-cc` installs it, and the exports
+# below route cc-rs to it for the two PE targets only. The Rust side, the unix
+# `.so` and the linker are untouched. Nothing changes on a host whose clang is
+# new enough.
+PE_CC_MIN_CLANG  := 19
+HOST_CLANG_MAJOR := $(shell echo __clang_major__ | c++ -E -x c++ - 2>/dev/null | tail -1)
+HOST_CLANG_OLD   := $(shell test "$(HOST_CLANG_MAJOR)" -lt $(PE_CC_MIN_CLANG) 2>/dev/null && echo yes)
+ifeq ($(HOST_CLANG_OLD),yes)
+PE_CC_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
+export CC_i686_pc_windows_msvc    := $(PE_CC_PREFIX)/bin/clang
+export CXX_i686_pc_windows_msvc   := $(PE_CC_PREFIX)/bin/clang++
+export CC_x86_64_pc_windows_msvc  := $(PE_CC_PREFIX)/bin/clang
+export CXX_x86_64_pc_windows_msvc := $(PE_CC_PREFIX)/bin/clang++
+endif
 XWIN := xwin --accept-license --arch x86,x86_64 \
 	--crt-version $(XWIN_CRT_VERSION) --sdk-version $(XWIN_SDK_VERSION) \
 	--cache-dir $(XWIN_CACHE)
@@ -648,7 +667,7 @@ upgrade-incompat:
 # for the same reason the test and lint targets are: a host-only leg needs
 # neither the MSVC SDK nor Rosetta, and a lint leg needs no Wine, so each piece
 # stands alone and this is the everything-at-once aggregate.
-setup: setup-rust setup-dev setup-xwin setup-rosetta
+setup: setup-rust setup-dev setup-xwin setup-pe-cc setup-rosetta
 
 setup-rust:
 	@echo "==> rustup: install $(RUST_STABLE) and $(RUST_NIGHTLY) with the cross-compile targets"
@@ -749,6 +768,21 @@ setup-xwin: setup-rust xwin-dir
 	fi; \
 	$(XWIN) splat --output /opt/xwin; \
 	echo "$$upstream" > $(XWIN_STAMP)
+
+# A host clang below the MSVC STL's floor (see PE_CC_MIN_CLANG at the top)
+# gets Homebrew's LLVM for the PE C/C++; a new enough one needs nothing.
+setup-pe-cc:
+	@if [ "$(HOST_CLANG_OLD)" = "yes" ]; then \
+		echo "==> pe-cc: host clang $(HOST_CLANG_MAJOR) is below $(PE_CC_MIN_CLANG), the PE C/C++ compiles with Homebrew LLVM"; \
+		if [ -x "$(PE_CC_PREFIX)/bin/clang" ]; then \
+			echo "    already present at $(PE_CC_PREFIX)"; \
+		else \
+			brew install llvm; \
+		fi; \
+		"$(PE_CC_PREFIX)/bin/clang" --version | head -1; \
+	else \
+		echo "==> pe-cc: host clang $(HOST_CLANG_MAJOR) compiles the PE C/C++ itself"; \
+	fi
 
 # The Wine we run is an x86_64 build and every PE it loads is x86 code, so the
 # whole test path goes through Rosetta. A no-op where it is already installed,

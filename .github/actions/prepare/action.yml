@@ -109,6 +109,14 @@ runs:
       shell: bash
       run: make setup-xwin
 
+    # The macOS 15 images ship an Xcode whose clang the MSVC STL refuses; the
+    # Makefile routes the PE C/C++ through Homebrew's LLVM there and needs
+    # nothing on macOS 26.
+    - name: PE C/C++ compiler
+      if: inputs.pe == 'true'
+      shell: bash
+      run: make setup-pe-cc
+
     - name: Restore the Wine SDK
       id: wine-cache
       uses: actions/cache/restore@v4
