@@ -342,21 +342,28 @@ jobs:
           file "$W"
           "$W" --version || echo "wine --version exit $?"
           otool -l "$HOME/wine-sdk/wine/lib/wine/x86_64-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
-          echo "== boot without the Mac driver"
-          boot nodrv WINEDLLOVERRIDES="mscoree,mshtml=;winemac.drv=" WINEDEBUG=+seh
-          echo "== boot with msync off"
-          boot nomsync WINEMSYNC=0 WINEDEBUG=+seh
-          echo "== boot with the Mac driver traced"
-          boot macdrv WINEDEBUG=+timestamp,+macdrv,+seh
-          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/boot-macdrv.log" | grep -aE 'macdrv|seh:dispatch_exception|err:|warn:' | head -40
-          cp "$RUNNER_TEMP/boot-macdrv.log" "$RUNNER_TEMP/wine-macdrv.log" 2>/dev/null || true
-          echo "== unified log around the abort"
-          capped 120 log show --last 6m --style compact --predicate 'process == "wine" OR process CONTAINS "explorer" OR eventMessage CONTAINS[c] "abort" OR eventMessage CONTAINS[c] "exception"' 2>/dev/null | grep -av 'runningboard\|securityd\|tccd' | head -40
+          echo "== boot"
+          WINEPREFIX="$RUNNER_TEMP/pfx" WINEDEBUG=+timestamp,+seh,+process capped 90 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/wine-macdrv.log" 2>&1
+          echo "boot: reg add exit $?"
+          grep -a 'NtCreateUserProcess.*pid\|EXCEPTION_WINE_ASSERTION' "$RUNNER_TEMP/wine-macdrv.log" | head -12 | cut -c1-200
+          echo "== the processes left behind"
+          ps -ax -o pid,pcpu,rss,command | grep -a 'wine' | grep -av grep | cut -c1-160
+          # The host stack of every Wine process that survived the boot: the
+          # one caught in the fault loop still has the frames that called
+          # abort() beneath the handler, and `sample` reads them from outside.
+          for pid in $(pgrep -f 'explorer.exe|wineboot|services.exe|rundll32'); do
+            echo "== sample of $pid: $(ps -o command= -p "$pid" | cut -c1-80)"
+            sudo sample "$pid" 2 -mayDie -file "$RUNNER_TEMP/sample-$pid.txt" > /dev/null 2>&1 || echo "sample failed"
+            grep -aE 'Call graph|^ +[0-9]+ Thread|abort|assert|dyld|objc|CoreFoundation|AppKit|Metal|wine|ntdll|win32u|explorer|\.so|\.dylib' "$RUNNER_TEMP/sample-$pid.txt" | head -70 | cut -c1-200
+          done
+          reap
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wine-trace-${{ matrix.runner }}
-          path: ${{ runner.temp }}/wine-macdrv.log
+          path: |
+            ${{ runner.temp }}/wine-macdrv.log
+            ${{ runner.temp }}/sample-*.txt
           retention-days: 7
           if-no-files-found: ignore
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
