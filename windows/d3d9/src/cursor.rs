@@ -1,4 +1,4 @@
-//! Hardware cursor implementation.
+//! The D3D9 cursor: a hardware HCURSOR, or a blank one under the software overlay.
 //!
 //! Implements `D3D9Device::SetCursor*` / `ShowCursor` / `CursorWndProc` so
 //! games that rely on the Win32 cursor (hiding the OS pointer while they

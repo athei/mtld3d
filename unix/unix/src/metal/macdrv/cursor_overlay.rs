@@ -22,7 +22,7 @@
 //! queues one main-thread apply, coalesced through [`APPLY_PENDING`] so a burst
 //! of clicks is one apply of the latest state. Everything that touches
 //! `AppKit`, Core Animation or the overlay's Metal objects runs on the main
-//! thread: the apply, the mouse-move monitor that repositions the window, the
+//! thread: the apply, the mouse-move monitor that repositions the sprite, the
 //! activation observers, and the display reconciliation that re-renders the
 //! sprite when the layer mode or the EDR headroom moved. Those objects live in
 //! a main-thread `thread_local`, which is what makes the split sound without a
@@ -36,17 +36,18 @@
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
-//! keeps moving; every present notices the pointer moving with no events
-//! arriving and hides the sprite until events resume. The check is asked only
-//! while the game shows its cursor and winemac is not clipping it: in either
-//! other state the game owns the pointer and the events stay away from the
-//! application by design (mouselook clips the cursor for the drag). And when such a tool
-//! ends, the window server shows the standard arrow rather than the cursor
-//! Wine set, which Wine never re-applies because its handle did not change;
-//! the first event after a capture asks the PE side for its null-then-set
-//! kick, which makes Wine re-apply through a handle change. That pointer
-//! watch serves the hardware cursor too, so it is installed at attach for
-//! every device, overlay or not.
+//! keeps moving; every present notices the pointer moving away from its last
+//! legitimate position with no event since and hides the sprite until events
+//! resume. The check is asked only while the game shows its cursor and winemac
+//! is not clipping it, since in either other state the game owns the pointer
+//! and the events stay away from the application by design (mouselook clips
+//! the cursor for the drag), and a warp the game made through winemac counts
+//! as a legitimate move. And when such a tool ends, the window server shows
+//! the standard arrow rather than the cursor Wine set, which Wine never
+//! re-applies because its handle did not change; the first event after a
+//! capture asks the PE side for its null-then-set kick, which makes Wine
+//! re-apply through a handle change. That pointer watch serves the hardware
+//! cursor too, so it is installed at attach for every device, overlay or not.
 
 use core::{
     cell::{Cell, RefCell},
