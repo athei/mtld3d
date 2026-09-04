@@ -18,6 +18,12 @@ on:
           upload the file, instead of gating on it.
         type: boolean
         default: false
+      e2e_filter:
+        description: >-
+          Run only the end-to-end tests this nextest filter expression selects
+          (e.g. `test(stencil) | binary(msaa)`), with their log files uploaded.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -168,10 +174,23 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }}
+      # windows/.config/nextest.toml. A dispatch with `e2e_filter` narrows
+      # the run and collects the layer's log files, which are otherwise
+      # written beside each test binary and pruned to the ten newest.
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           NEXTEST_PROFILE: ci
+          E2E_FILTER: ${{ inputs.e2e_filter }}
+          # The layer reads the path on the Windows side, where the unix
+          # root is drive Z.
+          LOG_DIR: ${{ inputs.e2e_filter && format('Z:{0}', runner.temp) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && inputs.e2e_filter }}
+        with:
+          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}-${{ matrix.partition }}
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: ignore
 
   # Wine's own d3d9_test.exe against our staged builtin, per-site counts diffed
   # against unix/conformance/baseline.txt. One arch per runner process, and not
