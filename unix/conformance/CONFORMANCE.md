@@ -348,7 +348,10 @@ test_multisample_get_front_buffer_data 17179 and 17181 by the system-memory
 read-back destinations and resz_test 17724 and 17862 by the RESZ depth
 resolve, and multisampled_depth_buffer_test 17476 went with them once the
 depth-to-depth `StretchRect` resolved a multisampled source, so its cluster
-leaves this document too.) Only two tags change what the gate tolerates:
+leaves this document too. 2026-09-06: a fullscreen `Reset` that names another
+device window hands the session over instead of giving the old window back,
+so test_device_window_reset 5968 passes and that cluster leaves the document
+as well.) Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
@@ -648,16 +651,6 @@ Sites: 14390=expected 14391=expected
 and expects `GetDisplayMode` to answer it; the paravirtual display refuses
 the mode (see `test_mode_change` above) and the answer stays the desktop
 mode. The same scope decision as the desktop-mode cluster.
-
-### device.c/test_device_window_reset
-Sites: 5968=expected
-
-After a Reset that retargets a fullscreen device from the focus window to a
-separate device window, that window must adopt the fullscreen rect. Ours is
-left at its own size (raw output: "Expected (0,0)-(3456,2234), got
-(0,0)-(1728,1117)"); the same count before and after the mode-set landed, so
-the retarget path is what misses. 5951 and 5971, which check that the window
-covers the screen at all, pass.
 
 ### device.c/test_occlusion_query
 Sites: 6780=expected

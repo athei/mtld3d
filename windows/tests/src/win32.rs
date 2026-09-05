@@ -203,6 +203,7 @@ fn register_class() {
 /// # Panics
 ///
 /// Panics if `CreateWindowExA` fails.
+#[must_use]
 pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
     register_class();
     // SAFETY: Win32 thunk; null module name returns the current process handle.
@@ -282,6 +283,7 @@ pub const GWL_EXSTYLE: i32 = -20;
 ///
 /// Panics if the call fails, which for a window this process owns means the
 /// handle is already destroyed.
+#[must_use]
 pub fn window_rect(hwnd: usize) -> Rect {
     let mut rect = Rect {
         left: 0,
@@ -478,6 +480,11 @@ pub fn dc_set_pixel(hdc: usize, x: i32, y: i32, color: u32) -> u32 {
 static DESTROY_WINDOW: Mutex<()> = Mutex::new(());
 
 /// Destroy a window created by [`create_window`].
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process created means
+/// the handle is already destroyed.
 pub fn destroy_window(hwnd: usize) {
     let _one_at_a_time = DESTROY_WINDOW
         .lock()
