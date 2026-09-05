@@ -17,7 +17,9 @@ make conformance-i686           # one arch, one runner process (what CI runs)
 make conformance-x86_64
 make conformance-intel          # both arches under the intel.* config keys
 make conformance-intel-i686     # one arch under the intel.* keys
-make conformance-baseline       # (re)record this machine's four legs of baseline.txt in sequence
+make conformance-scale          # both arches at render.scale = 0.75
+make conformance-scale-i686     # one arch at render.scale = 0.75 (what CI runs, on one image)
+make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
 ```
 
 A leg is one architecture under one variant on one GPU family. The `intel`
@@ -31,9 +33,13 @@ entries, an Intel/AMD Mac records `[<leg>@mac2/<subtest>]` entries, because
 the GPU underneath still decides what the suite sees past the forced answers
 (a tile-based Apple GPU elides depth stores and merges hidden overdraw before
 the visibility counter, encodes special floats its own way, and its validation
-layer applies different texture rules). The sites share the classifications
-below whatever the leg, since a site's nature does not depend on the leg that
-hit it. On the Apple family the two keys that only change a code path and no
+layer applies different texture rules). The `scale` variant (`--variant
+scale`) runs the same binary at `render.scale = 0.75`, so every frame is
+rasterized on a smaller grid and read back through the resolve that brings it
+up to the reported size; its results record under `[<arch>+scale/<subtest>]`
+and CI runs it on one image and one arch, like the scaled end-to-end leg.
+The sites share the classifications below whatever the leg, since a site's
+nature does not depend on the leg that hit it. On the Apple family the two keys that only change a code path and no
 answer, `intel.managedMemory` and `intel.linearAlign256`, must move no count
 at all, and a site that fails only under the variant is expected to trace to
 one of the two caps keys. The `@mac2` entries are recorded by CI, whose
@@ -306,9 +312,12 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **3 `real` · 92 `expected` ·
-4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 16
-Apple-family subtest-legs `crash=0`. (2026-09-05: the `@mac2` legs, recorded
+re-checked before retagging. Headline: **4 `real` · 124 `expected` ·
+4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 24
+Apple-family subtest-legs `crash=0`. (2026-09-05: the `scale` legs added 33
+visual.c sites in twelve clusters, 32 of them `expected` for the one reason
+"The scaled leg" below gives and one `real`, `resz_test` 17946, issue #407;
+they carry no device.c site of their own since #408.) (2026-09-05: the `@mac2` legs, recorded
 on the Intel CI image, added 22 sites, every one `expected` and every one a
 property of that machine, its single-mode display or the GPU family, in the
 `test_mode_change`, `test_get_display_mode`, swizzle-format, `test_fetch4`,
@@ -429,6 +438,27 @@ walk further):
   the mode is set again on `WM_ACTIVATEAPP TRUE` rather than at the app's
   next `Reset`, because the device is never reported lost and so nothing
   would prompt that `Reset` (test_wndproc 4302).
+
+#### The scaled leg
+
+The `scale` legs run every subtest at `render.scale = 0.75`. For the tests'
+640x480 device that rasterizes the back buffer, and every render target or
+depth buffer the test creates at that size, on a 480x360 grid, and every
+pixel the test reads comes back through the readback resolve, a filtered
+copy of the render grid up to the reported size (the display path's
+`MetalFX` scaler is not used for a readback: it writes an opaque alpha and
+takes only a few formats). Every coordinate the suite hands in is converted
+between the two spaces on the way in, so a probe several pixels clear of a
+colour boundary reads exactly what was rasterized at any scale, which is why
+the whole end-to-end suite holds at 0.75. What cannot survive the pair is a
+probe within a pixel of a boundary, a one-pixel feature, or a target too
+small for any pixel of it to be interior: those read the blend the resolve
+leaves, and the tell is a channel at one eighth or seven eighths of the
+neighbour (`0x20`, `0xdf`) or within a step of it (`0x04`, `0xfb`). A site
+of that shape is `expected`: the space separation is the design, and a probe
+on a boundary has no exact answer under a resample. A site whose values do
+not fit that mechanism is `real`, exactly as on any other leg; the one such
+site the legs carry is `resz_test` 17946 (#407).
 
 ### The `real` backlog
 
@@ -1002,6 +1032,98 @@ and on a device without the packed 16-bit formats R5G6B5 is no render target,
 so the answer is NOTAVAILABLE. That is the conformant answer for a device
 without the capability; the same rule is pinned by the e2e
 `check_format_conversion` test, which asks the device first.
+
+### visual.c/get_rt_readback
+Sites: 199=expected
+
+`point_match` walks outward from a point's centre until the colour changes
+and compares that radius with the size the test set; under the scaled leg
+every point's edge reads the resolve's blend one pixel wider than the
+rasterized point, so the radius it finds is off by one at every size ("The
+scaled leg").
+
+### visual.c/texkill_test
+Sites: 5545=expected 5554=expected 5570=expected 5572=expected 5606=expected
+Sites: 5615=expected 5633=expected
+
+Every probe sits one pixel inside a `texkill` boundary (x = 66, 575 or 578
+on row 49) and reads the blend of the killed and the surviving side
+(`0x9f6000`, `0xdf2000`) rather than the pure colour ("The scaled leg").
+
+### visual.c/test_fragment_coords
+Sites: 10769=expected 10771=expected 10773=expected 10775=expected
+
+The four probes straddle the reported centre (319/320, 239/240), where the
+four `vPos` quadrant colours meet, and each reads the blend of its two
+neighbours (`0x00dfdf` for `0x00ffff`). The register itself answers in the
+reported space since #403: before it every probe read the wrong quadrant
+outright. The fraction assertion passes, `frc(vPos)` stays zero under the
+scale ("The scaled leg").
+
+### visual.c/test_pointsize
+Sites: 11502=expected 11504=expected 11506=expected 11508=expected
+Sites: 11556=expected 11567=expected 11571=expected 11574=expected
+Sites: 11579=expected 11582=expected 11585=expected 11588=expected
+
+Point sizes are stated in reported pixels and kept there (the vertex
+epilogue converts them to render pixels, see `points.rs` in the end-to-end
+suite), but the test probes each point's edge to the pixel and a one-pixel
+point outright; every such probe reads the resolve's blend (`0xe3`, `0xfb`,
+`0xdf` channels) ("The scaled leg").
+
+### visual.c/test_viewport
+Sites: 14064=expected 14081=expected
+
+Pixel (1, 119) and (1, 360) lie on the first column and the first and last
+rows of a viewport bound, and read a one-eighth blend (`0x202020`) of the
+colour across it ("The scaled leg").
+
+### visual.c/depth_buffer_test
+Sites: 14557=expected
+
+The test creates targets of 320x240, 480x360 and 640x480 and binds each
+with the device's one depth buffer, expecting depth written through one to
+be read through another at the same pixel. The 640x480 target is the
+back-buffer size and rasterizes at the scale, the depth buffer with it; the
+480x360 target is its own size and does not. Depth written through the
+scaled target lands at three quarters of its reported coordinates, then is
+read through the unscaled target at the unconverted ones, so the two probes
+read the colour of the neighbouring quad. By design: the scale is a property
+of the targets at the back-buffer size (`mtld3d.conf`, `render.scale`), and
+a depth buffer shared between a scaled and an unscaled target of different
+sizes has no single mapping that serves both.
+
+### visual.c/clip_planes
+Sites: 16129=expected 16131=expected
+
+The plane cuts the quad at y = 240.5 in the reported space and the probes
+sit on rows 240 and 241, the two rows either side of it; under the scale
+that edge falls inside one render row and both probes read its blend
+(`0x9ca13c`) ("The scaled leg").
+
+### visual.c/resz_test
+Sites: 17946=real
+
+Every probe of the RESZ-resolved depth reads exactly three quarters of the
+expected value in every channel (`0x18/0x20`, `0x2f/0x40`), the scale
+factor and not a blend, so the depth value itself is scaled somewhere
+between the depth buffer, the RESZ copy and the sample. Issue #407.
+
+### visual.c/test_filling_convention
+Sites: 27409=expected
+
+The test draws into 2x2 to 8x8 render targets and copies each onto the back
+buffer with `StretchRect` before probing it pixel by pixel; a target that
+small resampled onto the scaled back buffer has no pixel that is not a
+boundary, so every probe reads a blend (`0x24db` for `0x00ff`). 221 hits,
+one per pixel per case ("The scaled leg").
+
+### visual.c/test_ffp_w
+Sites: 28113=expected 28137=expected
+
+Both probes sit on the edge of the w-tested quad and read the one-eighth
+blend (`0xdf0020` for `0xff0000`) in both the declaration and the FVF form
+("The scaled leg").
 
 ### stateblock.c clusters
 

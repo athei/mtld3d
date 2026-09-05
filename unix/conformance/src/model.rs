@@ -26,11 +26,14 @@ pub enum Arch {
 ///
 /// `Native` runs against the device's own capabilities; `Intel` forces every
 /// `intel.*` config key on, so the suite sees the answers an Intel/AMD Mac
-/// gives whatever the machine underneath.
+/// gives whatever the machine underneath; `Scale` rasterizes every frame at
+/// 75% of the resolution D3D9 reports and lets `MetalFX` resolve it back up,
+/// so the suite reads the resample a reduced `render.scale` rides.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Variant {
     Native,
     Intel,
+    Scale,
 }
 
 /// The GPU family of the machine a run was measured on, in baseline-output order.
@@ -144,7 +147,9 @@ impl Variant {
     ///
     /// Empty for `Native`. `Intel` turns on every `intel.*` key, which is
     /// how a real Intel/AMD Mac answers, so the run measures the whole
-    /// family at once rather than one key at a time.
+    /// family at once rather than one key at a time. `Scale` sets the one
+    /// `render.scale` the end-to-end suite's scaled leg runs at, so the two
+    /// legs read the same frame shape.
     #[must_use]
     pub const fn config_entries(self) -> &'static str {
         match self {
@@ -153,6 +158,7 @@ impl Variant {
                 ";intel.expandPacked16=true;intel.denyFloat32Filtering=true;\
                  intel.managedMemory=true;intel.linearAlign256=true"
             }
+            Self::Scale => ";render.scale=0.75",
         }
     }
 }
@@ -175,21 +181,21 @@ impl Gpu {
 }
 
 impl Leg {
-    /// Every leg, in baseline-output order: both variants of each architecture on each GPU family.
-    pub const ALL: [Self; 8] = {
+    /// Every leg, in baseline-output order: every variant of each architecture on each GPU family.
+    pub const ALL: [Self; 12] = {
         let mut all = [Self {
             arch: Arch::I686,
             variant: Variant::Native,
             gpu: Gpu::Apple,
-        }; 8];
+        }; 12];
         let archs = [Arch::I686, Arch::X64];
-        let variants = [Variant::Native, Variant::Intel];
+        let variants = [Variant::Native, Variant::Intel, Variant::Scale];
         let gpus = [Gpu::Apple, Gpu::Mac2];
         let mut i = 0;
         while i < all.len() {
             all[i] = Self {
-                arch: archs[i / 4],
-                variant: variants[(i / 2) % 2],
+                arch: archs[i / 6],
+                variant: variants[(i / 2) % 3],
                 gpu: gpus[i % 2],
             };
             i += 1;
@@ -228,6 +234,7 @@ impl fmt::Display for Variant {
         f.write_str(match self {
             Self::Native => "native",
             Self::Intel => "intel",
+            Self::Scale => "scale",
         })
     }
 }
@@ -241,14 +248,14 @@ impl fmt::Display for Gpu {
     }
 }
 
-/// `i686` for the native leg, `i686+intel` for the Intel one, `@mac2` appended off Apple.
+/// `i686` for the native leg, `i686+intel` or `i686+scale` for a variant, `@mac2` off Apple.
 ///
 /// The native form is the bare architecture and the Apple family is implicit,
 /// so a baseline recorded before variants or families existed reads unchanged.
 impl fmt::Display for Leg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.arch)?;
-        if self.variant == Variant::Intel {
+        if self.variant != Variant::Native {
             write!(f, "+{}", self.variant)?;
         }
         if self.gpu == Gpu::Mac2 {
@@ -289,6 +296,7 @@ impl FromStr for Variant {
         match s {
             "native" => Ok(Self::Native),
             "intel" => Ok(Self::Intel),
+            "scale" => Ok(Self::Scale),
             other => Err(format!("unknown variant {other:?}")),
         }
     }
@@ -356,7 +364,8 @@ impl Baseline {
         out.push_str("# keeps the two files covering the same sites.\n");
         out.push_str("# Format: \"[leg/subtest] crash=<0|1>\" header, then indented\n");
         out.push_str("#         \"  <file>.c:<line> count=<n>\". A leg of the form\n");
-        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys, and\n");
+        out.push_str("#         \"<arch>+intel\" is the run under the intel.* config keys,\n");
+        out.push_str("#         \"<arch>+scale\" the run at render.scale = 0.75, and\n");
         out.push_str("#         \"<leg>@mac2\" the run on an Intel/AMD GPU (no suffix: Apple).\n");
         out.push('\n');
         for (&(leg, subtest), sub) in &self.entries {
