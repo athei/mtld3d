@@ -497,8 +497,9 @@ stage: all
 # i.e. rasterizing the back buffer smaller than the resolution D3D9 reports and
 # letting MetalFX resolve it. Every coordinate the suite asserts on is in the
 # reported space, so a passing scaled run is the evidence that the logical and
-# render spaces stayed separate. `make test SCALE=0.75` — try 0.5 and a
-# non-dividing 0.67 too, since those catch rounding that a clean fraction hides.
+# render spaces stayed separate. `make test SCALE=0.75` is what one CI leg
+# runs; try 0.5 and a non-dividing 0.67 too, since those catch rounding that a
+# clean fraction hides.
 #
 # INTEL=1 reruns the whole e2e suite under every `intel.*` key, i.e. with the
 # device answers an Intel/AMD Mac gives: packed 16-bit formats expanded, 32-bit
