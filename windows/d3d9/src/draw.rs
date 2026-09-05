@@ -1301,13 +1301,23 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the unbiased shader with nothing extra bound. A bias on a stage this
     // shader does not sample reaches no sample site, so it neither mints the
     // biased variant nor binds the table.
+    // Under a reduced `render.scale` the sampler picks its mip from the
+    // render grid, coarser than the presented size warrants; `render.lodBias`
+    // adds the compensating `log2(scale)` to every stage the shader samples,
+    // on top of the game's own bias. Zero at the identity and for a target
+    // the scale does not reach, so the default path is untouched.
+    let scale_bias = if enc.config().render_lod_bias {
+        enc.target_scale().lod_bias()
+    } else {
+        0.0
+    };
     let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
     let mut any_lod_bias = false;
     for (stage_u32, b) in stage_bindings.iter() {
         if ps_sampled_mask & (1u16 << stage_u32) == 0 {
             continue;
         }
-        let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state);
+        let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state) + scale_bias;
         if mtld3d_core::sampler_state::lod_bias_active(bias) {
             lod_bias[stage_u32 as usize] = bias;
             any_lod_bias = true;

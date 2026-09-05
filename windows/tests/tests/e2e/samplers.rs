@@ -449,6 +449,52 @@ fn mipmap_lod_bias_shifts_the_sampled_mip() {
 }
 
 #[test]
+fn render_lod_bias_keeps_the_base_level_under_the_scale() {
+    // Under `render.scale` the sampler derives its LOD from the render grid:
+    // at a half scale a quad drawn at one texel per presented pixel covers
+    // half a texel per render pixel, so the implicit LOD is 1 and the sample
+    // lands one level coarser than the presented size warrants. The default
+    // `render.lodBias` adds `log2(scale)` to every sampled stage, so the
+    // unbiased sample reads the base level again and the game's own bias
+    // still lands where it says.
+    //
+    // Pins its own scale (a clean half, so the LOD is exactly 1) rather than
+    // inheriting the run's: at the identity there is nothing to compensate,
+    // and this has to fail in the ordinary `make test` if it regresses.
+    let h = Harness::with_config("render.scale=0.5");
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+
+    let unbiased = sample_at_bias(&h, 0.0);
+    let biased = sample_at_bias(&h, 2.0);
+
+    assert_eq!(
+        unbiased, MIP_TINTS[0],
+        "the compensation cancels the render grid's LOD"
+    );
+    assert_eq!(
+        biased, MIP_TINTS[2],
+        "the game's +2 bias still lands two levels coarser"
+    );
+}
+
+#[test]
+fn render_lod_bias_off_leaves_the_mip_to_the_render_grid() {
+    // With the key off the sampler follows the render grid: at a half scale
+    // the unbiased sample reads level 1, which is what the game would get at
+    // that resolution natively.
+    let h = Harness::with_config("render.scale=0.5;render.lodBias=false");
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+
+    let unbiased = sample_at_bias(&h, 0.0);
+    assert_eq!(
+        unbiased, MIP_TINTS[1],
+        "the render grid's LOD picks level 1"
+    );
+}
+
+#[test]
 fn mipmap_lod_bias_shifts_a_programmable_shader_sample() {
     // Same contract through a `ps_3_0` `texld`: the bias is sampler state, not
     // a fixed-function feature, so it reaches the programmable emitter too.

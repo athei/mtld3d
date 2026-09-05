@@ -305,6 +305,17 @@ fn comments_and_blank_lines_are_skipped() {
 }
 
 #[test]
+fn render_lod_bias_defaults_on_and_parses_off() {
+    assert!(parse(None, "", None).render_lod_bias, "on by default");
+    assert!(!parse(None, "render.lodBias = false\n", None).render_lod_bias);
+    assert!(parse(None, "render.lodBias = true\n", None).render_lod_bias);
+    assert!(
+        parse(None, "render.lodBias = maybe\n", None).render_lod_bias,
+        "an unparsable value keeps the default"
+    );
+}
+
+#[test]
 fn boolean_keys_round_trip_both_values() {
     let cfg = parse(
         None,
