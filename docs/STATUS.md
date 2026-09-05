@@ -75,4 +75,7 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.
+- The window procedure carrying cursor realization and the windowed
+  auto-resize is the device window's, and follows a `Reset` that names another
+  window; D3D9 subclasses the focus window instead. No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
