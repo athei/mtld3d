@@ -264,8 +264,8 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
     }
     if flags & D3DISSUE_END != 0 {
         // Mark "end issued" synchronously so a no-Present `GetData(FLUSH)`
-        // knows the span is closed and safe to flush (an *open* query must
-        // not be flushed — that splits it across submits and zeroes it).
+        // knows the span is closed and there is a result to wait for (an
+        // *open* query has none however far the GPU has got).
         core.mark_end_requested();
         dev.push_op(Box::new(move |enc| enc.end_visibility_query(core)));
     }
@@ -394,13 +394,12 @@ extern "system" fn query_get_data(
                         //
                         // Only do this once END has been issued. A query
                         // still open (begun, not ended) has its counting
-                        // draws recorded *after* this point; flushing now
-                        // would close the recording frame between BEGIN
-                        // and the draws, splitting the span across two
-                        // submits (the count then reads 0). Reporting
-                        // `S_FALSE` for an open query keeps BEGIN + draws
-                        // + END in one frame for the flush that the
-                        // END-side poll triggers.
+                        // draws recorded *after* this point, so there is no
+                        // result to wait for: report `S_FALSE` and let the
+                        // flush the END-side poll triggers do the work. The
+                        // span itself survives the submit either way, since
+                        // a frame boundary cuts an open span into segments
+                        // that add up.
                         if core.end_requested() {
                             // SAFETY: `inner.device_inner` was stamped at
                             // `Self::new` from a live `DeviceInner` and is kept

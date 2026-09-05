@@ -7,6 +7,17 @@
 //! and command-buffer submits, so each BEGIN→END span is summed across
 //! a set of u64 slots at GPU completion.
 //!
+//! A slot array belongs to one submit, so a span that outlives the submit
+//! is cut into segments: the frame boundary closes the open span at the
+//! allocator's high-water mark, queues that segment, and reopens the span
+//! in the continuation frame. Each segment is summed against its own
+//! frame's buffer and folded into a running total the closing segment
+//! publishes. A span that could not be counted at any point (the slot
+//! budget ran out, or the buffer it counted into is gone) answers with the
+//! permissive `u32::MAX` rather than a count that reads as full occlusion,
+//! unless no draw was issued inside it at all: zero is then the exact
+//! answer rather than a guess.
+//!
 //! Split so this module holds only logic that needs no Metal handles:
 //! the slot allocator, the per-query state machine, the sum-across-span
 //! function, and the retired-buffer pool. d3d9.dll owns the COM wrapper
@@ -57,16 +68,19 @@ pub struct VisibilityQueryCore {
     seq_begin: AtomicU64,
     /// Frame submit-seq at `Issue(END)`.
     ///
-    /// Valid once `status` reaches `Pending` following an END — v1
-    /// requires begin and end in the same frame, so this equals
-    /// `seq_begin` after a legal end.
+    /// Valid once `status` reaches `Pending` following an END. It is the
+    /// seq the closing segment retires at, which is the seq `GetData`
+    /// waits on.
     seq_end: AtomicU64,
-    /// First slot index written for this query (Begin-side bump).
-    offset_begin: AtomicU32,
-    /// Slot index written after this query's End-side bump.
+    /// First slot index of the segment currently open.
     ///
-    /// Slots in `[offset_begin, offset_end)` are summed at readback.
-    offset_end: AtomicU32,
+    /// Set at BEGIN and again every time a frame boundary reopens the
+    /// span in the continuation frame.
+    offset_begin: AtomicU32,
+    /// Sample count of every segment of this span already summed.
+    ///
+    /// The closing segment adds its own sum and publishes the total.
+    carried: AtomicU64,
     /// u64 running sum; clamped to `u32::MAX` on `get_u32`.
     accumulated: AtomicU64,
     /// `QueryStatus` encoded as u8.
@@ -88,10 +102,21 @@ pub struct VisibilityQueryCore {
     /// Set the instant `Issue(D3DISSUE_END)` is recorded (API thread).
     ///
     /// Cleared on `Issue(D3DISSUE_BEGIN)`. Lets the blocking
-    /// `GetData(FLUSH)` tell an *ended* query (safe to flush + read)
-    /// from one still *open* (begun, not ended) — flushing the latter
-    /// would split its span across two submits and zero the count.
+    /// `GetData(FLUSH)` tell an *ended* query (whose count the flush can
+    /// make available) from one still *open*, which has no result to
+    /// report however far the GPU has got.
     end_requested: AtomicBool,
+    /// Set when any part of the span could not be counted.
+    ///
+    /// The published result is then the permissive `u32::MAX` ("fully
+    /// visible") rather than a partial sum, so a title reading it draws
+    /// the geometry it would otherwise cull. A span with no draw in it is
+    /// the exception: zero is its exact answer, slots or no slots.
+    uncounted: AtomicBool,
+    /// Draws the encoder had issued when this span opened.
+    draws_at_begin: AtomicU64,
+    /// Draws issued inside the span, filled in at END.
+    draws_in_span: AtomicU64,
 }
 
 impl VisibilityQueryCore {
@@ -101,10 +126,13 @@ impl VisibilityQueryCore {
             seq_begin: AtomicU64::new(0),
             seq_end: AtomicU64::new(0),
             offset_begin: AtomicU32::new(0),
-            offset_end: AtomicU32::new(0),
+            carried: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             status: AtomicU64::new(QueryStatus::NeverIssued as u64),
             end_requested: AtomicBool::new(false),
+            uncounted: AtomicBool::new(false),
+            draws_at_begin: AtomicU64::new(0),
+            draws_in_span: AtomicU64::new(0),
             logical_area: AtomicU64::new(0),
             render_area: AtomicU64::new(0),
         })
@@ -124,26 +152,59 @@ impl VisibilityQueryCore {
     /// Metal encoder will write to. Moves the query from
     /// `NeverIssued`/`Issued` back into `Pending` — a second Issue on the
     /// same wrapper reuses the core.
-    pub fn begin(&self, seq: u64, offset: u32, logical: (u32, u32), render: (u32, u32)) {
+    pub fn begin(
+        &self,
+        seq: u64,
+        offset: u32,
+        logical: (u32, u32),
+        render: (u32, u32),
+        draws_seen: u64,
+    ) {
         self.seq_begin.store(seq, Ordering::Release);
         self.offset_begin.store(offset, Ordering::Release);
         self.logical_area.store(area(logical), Ordering::Release);
         self.render_area.store(area(render), Ordering::Release);
-        // Reset the accumulator in case this core was previously issued
+        self.draws_at_begin.store(draws_seen, Ordering::Release);
+        self.draws_in_span.store(0, Ordering::Release);
+        // Reset the accumulators in case this core was previously issued
         // and the app is re-issuing.
+        self.carried.store(0, Ordering::Release);
+        self.uncounted.store(false, Ordering::Release);
         self.accumulated.store(0, Ordering::Release);
         self.status
             .store(QueryStatus::Pending as u64, Ordering::Release);
     }
 
+    /// Reopen the span in the continuation of a frame that ended mid-span.
+    ///
+    /// The segment the boundary closed keeps its own slots and its own
+    /// frame's buffer; this only points the next segment at the fresh
+    /// frame's allocator. The running total and the areas the count is
+    /// reported in both carry over.
+    pub fn resume(&self, seq: u64, offset: u32) {
+        self.seq_begin.store(seq, Ordering::Release);
+        self.offset_begin.store(offset, Ordering::Release);
+    }
+
     /// Called by the encoder thread on the END closure.
     ///
-    /// Records the frame's submit seq and the slot index just past the
-    /// query's last write, so `sum_slots` knows the half-open range to
-    /// accumulate.
-    pub fn end(&self, seq: u64, offset: u32) {
+    /// Records the submit seq the closing segment retires at, which is what
+    /// `GetData(D3DGETDATA_FLUSH)` waits on, and how many draws the span held.
+    pub fn end(&self, seq: u64, draws_seen: u64) {
         self.seq_end.store(seq, Ordering::Release);
-        self.offset_end.store(offset, Ordering::Release);
+        self.draws_in_span.store(
+            draws_seen.wrapping_sub(self.draws_at_begin.load(Ordering::Acquire)),
+            Ordering::Release,
+        );
+    }
+
+    /// Record that part of this span was never counted.
+    ///
+    /// Called when the frame's slot budget is spent or the buffer a segment
+    /// counted into is gone. The published result is then `u32::MAX` rather
+    /// than the partial sum the slots that did exist add up to.
+    pub fn mark_uncounted(&self) {
+        self.uncounted.store(true, Ordering::Release);
     }
 
     /// `GetData` result: DWORD visible-pixel count clamped at `u32::MAX`.
@@ -197,11 +258,10 @@ impl VisibilityQueryCore {
         self.end_requested.load(Ordering::Acquire)
     }
 
-    /// Slot where Metal started counting for this query.
+    /// Slot where Metal started counting the segment currently open.
     ///
-    /// Encoder reads it in the exhaustion fallback to emit a
-    /// `[begin, begin)` span (summing to 0, then overridden to `u32::MAX`
-    /// at intake).
+    /// Paired with the allocator's next index to make the half-open span
+    /// a segment covers.
     pub fn offset_begin(&self) -> u32 {
         self.offset_begin.load(Ordering::Acquire)
     }
@@ -216,23 +276,38 @@ impl VisibilityQueryCore {
         self.seq_end.load(Ordering::Acquire)
     }
 
-    /// Stores the completed sum and flips status to `Issued`.
+    /// Fold one retired segment's sample count into the span's running total.
     ///
     /// Used only from `VisibilityQueryState::intake_completed` in this
     /// module.
-    fn finalize(&self, summed: u64) {
-        let logical = logical_samples(
-            summed,
-            self.render_area.load(Ordering::Acquire),
-            self.logical_area.load(Ordering::Acquire),
-        );
-        self.accumulated.store(logical, Ordering::Release);
-        self.status
-            .store(QueryStatus::Issued as u64, Ordering::Release);
+    fn accumulate_segment(&self, summed: u64) {
+        let carried = self.carried.load(Ordering::Acquire);
+        self.carried
+            .store(carried.saturating_add(summed), Ordering::Release);
     }
 
-    fn offset_end_internal(&self) -> u32 {
-        self.offset_end.load(Ordering::Acquire)
+    /// Publish the span's total and flip status to `Issued`.
+    ///
+    /// Used only from `VisibilityQueryState::intake_completed` in this
+    /// module.
+    fn publish_span(&self) {
+        // A span with no draw in it counted nothing, whatever became of its
+        // slots, so its sum is exact and the permissive answer would be
+        // invented.
+        let unknown = self.uncounted.load(Ordering::Acquire)
+            && self.draws_in_span.load(Ordering::Acquire) != 0;
+        let result = if unknown {
+            u64::from(u32::MAX)
+        } else {
+            logical_samples(
+                self.carried.load(Ordering::Acquire),
+                self.render_area.load(Ordering::Acquire),
+                self.logical_area.load(Ordering::Acquire),
+            )
+        };
+        self.accumulated.store(result, Ordering::Release);
+        self.status
+            .store(QueryStatus::Issued as u64, Ordering::Release);
     }
 }
 
@@ -467,13 +542,22 @@ impl VisibilityBufferPool {
     }
 }
 
-/// A query whose END has been emitted but whose sum is not yet known.
+/// One segment of a span, awaiting the GPU retiring the frame it counted in.
 ///
-/// Held keyed by the `submit_seq` of the frame that contained END; the
-/// encoder thread finalizes the core once `coherent_seq >= submit_seq`.
-struct PendingQuery {
+/// Held keyed by that frame's `submit_seq`; the encoder thread folds the
+/// segment's slots into the core once `coherent_seq >= submit_seq`. The
+/// half-open slot range travels with the segment rather than being read
+/// off the core, because a span reopened in a continuation frame has
+/// already moved the core's own `offset_begin` on to the next segment.
+struct PendingSegment {
     submit_seq: u64,
     core: Arc<VisibilityQueryCore>,
+    span: (u32, u32),
+    /// Whether this segment carries the query's `Issue(END)`.
+    ///
+    /// The closing segment publishes the total; every earlier one only
+    /// adds to it.
+    closes_span: bool,
 }
 
 /// Composite encoder-side state for visibility queries.
@@ -484,16 +568,18 @@ struct PendingQuery {
 pub struct VisibilityQueryState {
     allocator: VisibilityOffsetAllocator,
     pool: VisibilityBufferPool,
-    /// Queries whose END was emitted on some frame.
+    /// Segments whose slots were emitted on some frame.
     ///
-    /// Finalized once `coherent_seq` catches up to their `submit_seq`.
-    pending: VecDeque<PendingQuery>,
-    /// Set of queries currently between BEGIN and END on the encoder thread.
+    /// Folded in once `coherent_seq` catches up to their `submit_seq`.
+    pending: VecDeque<PendingSegment>,
+    /// Queries currently between BEGIN and END on the encoder thread.
     ///
-    /// Incremented on BEGIN, decremented on END. Used to decide whether a
-    /// pass boundary needs a Counting-mode re-arm and whether END should
-    /// emit Disabled vs a fresh Counting slot.
-    active_count: u32,
+    /// Pushed on BEGIN, removed on END, and carried across frame
+    /// boundaries so a span that outlives its submit is closed and
+    /// reopened rather than lost. Decides whether a freshly opened pass
+    /// needs a Counting-mode arm and whether END emits Disabled or a
+    /// fresh Counting slot.
+    active: Vec<Arc<VisibilityQueryCore>>,
     /// Visibility buffer reserved for the frame currently being encoded.
     ///
     /// `None` until the first BEGIN in a frame allocates. At submit time
@@ -505,6 +591,11 @@ pub struct VisibilityQueryState {
     /// The encoder uses this to short-circuit subsequent commands and to
     /// finalize overflowing queries with the safe `u32::MAX` fallback.
     exhausted_this_frame: bool,
+    /// Draws the encoder has issued, counted from the first frame.
+    ///
+    /// Monotonic across frames on purpose: a span is bracketed by two reads
+    /// of it, and a span cut by a submit boundary spans two frames.
+    draws_seen: u64,
 }
 
 impl VisibilityQueryState {
@@ -524,9 +615,10 @@ impl VisibilityQueryState {
             // wrapper is destroyed before the `PageBox` drops.
             pool: VisibilityBufferPool::new(16),
             pending: VecDeque::new(),
-            active_count: 0,
+            active: Vec::new(),
             current_buffer: None,
             exhausted_this_frame: false,
+            draws_seen: 0,
         }
     }
 
@@ -534,17 +626,31 @@ impl VisibilityQueryState {
     ///
     /// Called on the encoder thread at `begin_frame` *after* the current
     /// frame's buffer (if any) has been moved into retention via
-    /// `retire_current_buffer`. Does not touch the pool or the pending
-    /// list — those drain separately.
+    /// `retire_current_buffer`. Does not touch the pool, the pending list
+    /// or the open spans; those drain separately, and a span open across
+    /// the boundary is reopened by [`Self::resume_open_spans`].
     pub const fn reset_frame(&mut self) {
         self.allocator.reset();
-        self.active_count = 0;
         self.exhausted_this_frame = false;
     }
 
     #[must_use]
-    pub const fn active_count(&self) -> u32 {
-        self.active_count
+    pub const fn active_count(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Count one draw against every span open now and every one opened later.
+    ///
+    /// Called from the encoder's draw-site pass entry. What it buys is the
+    /// distinction between a span that lost its count and one that never had
+    /// anything to count.
+    pub const fn note_draw(&mut self) {
+        self.draws_seen = self.draws_seen.wrapping_add(1);
+    }
+
+    #[must_use]
+    pub const fn draws_seen(&self) -> u64 {
+        self.draws_seen
     }
 
     #[must_use]
@@ -597,8 +703,16 @@ impl VisibilityQueryState {
         self.exhausted_this_frame
     }
 
-    pub const fn mark_exhausted(&mut self) {
+    /// Record that the frame's slot budget is spent.
+    ///
+    /// Every span open at that point loses the rest of its count, so each
+    /// one is marked uncounted: the alternative is publishing a partial
+    /// sum, which reads as occlusion the scene does not have.
+    pub fn mark_exhausted(&mut self) {
         self.exhausted_this_frame = true;
+        for core in &self.active {
+            core.mark_uncounted();
+        }
     }
 
     /// Encoder-side slot allocation.
@@ -609,18 +723,71 @@ impl VisibilityQueryState {
         self.allocator.bump()
     }
 
-    pub const fn inc_active(&mut self) {
-        self.active_count += 1;
+    /// Record a query as open between BEGIN and END.
+    ///
+    /// A second BEGIN on a query that is already open leaves one entry:
+    /// D3D9 restarts the span there, and the core's own `begin` has
+    /// already done that.
+    pub fn push_active(&mut self, core: &Arc<VisibilityQueryCore>) {
+        if self.active.iter().any(|c| Arc::ptr_eq(c, core)) {
+            return;
+        }
+        self.active.push(core.clone());
     }
 
-    pub const fn dec_active(&mut self) {
-        if self.active_count > 0 {
-            self.active_count -= 1;
+    /// Drop a query from the open set at its END.
+    pub fn remove_active(&mut self, core: &Arc<VisibilityQueryCore>) {
+        self.active.retain(|c| !Arc::ptr_eq(c, core));
+    }
+
+    /// Queue one segment of a span for the intake that follows its frame.
+    ///
+    /// `span` is the half-open slot range the segment counted into on the
+    /// frame `submit_seq` names. `closes_span` marks the segment carrying
+    /// `Issue(END)`, the one that publishes the total.
+    pub fn push_pending(
+        &mut self,
+        submit_seq: u64,
+        core: Arc<VisibilityQueryCore>,
+        span: (u32, u32),
+        closes_span: bool,
+    ) {
+        self.pending.push_back(PendingSegment {
+            submit_seq,
+            core,
+            span,
+            closes_span,
+        });
+    }
+
+    /// Cut every open span at a submit boundary.
+    ///
+    /// The frame's slot array retires with the submit, so each open span
+    /// contributes the segment it has counted so far, ending at the
+    /// allocator's high-water mark. Called from the encoder's submit path,
+    /// after the last pass of the frame is closed.
+    pub fn split_open_spans(&mut self, submit_seq: u64) {
+        let end = self.allocator.next;
+        for core in &self.active {
+            self.pending.push_back(PendingSegment {
+                submit_seq,
+                core: core.clone(),
+                span: (core.offset_begin(), end),
+                closes_span: false,
+            });
         }
     }
 
-    pub fn push_pending(&mut self, submit_seq: u64, core: Arc<VisibilityQueryCore>) {
-        self.pending.push_back(PendingQuery { submit_seq, core });
+    /// Reopen every span the previous submit cut, in the frame that continues it.
+    ///
+    /// Called at `begin_frame`, after [`Self::reset_frame`], so the spans
+    /// point at the fresh allocator. The pass the next draw opens arms
+    /// itself from the open set, so no slot is reserved here.
+    pub fn resume_open_spans(&mut self, submit_seq: u64) {
+        let offset = self.allocator.next;
+        for core in &self.active {
+            core.resume(submit_seq, offset);
+        }
     }
 
     /// Drain every owned `RetiredVisibilityBuffer` and clear the pending list.
@@ -637,17 +804,21 @@ impl VisibilityQueryState {
         all.append(&mut self.pool.retired);
         all.append(&mut self.pool.free);
         self.pending.clear();
+        self.active.clear();
         all
     }
 
     /// Drain pending → finalize → release pool entries up to `coherent_seq`.
     ///
-    /// Every pending query whose END frame has retired on the GPU is finalized:
-    /// its slot span is summed from the retired visibility buffer matching its
-    /// `submit_seq`. A buffer that cannot be found — retired and evicted before
-    /// intake ran, which the normal flow never produces — falls back to the
-    /// permissive `u32::MAX`. Retired buffers whose seq has been reached then
-    /// move into the free list so the next frame can reuse them.
+    /// Every queued segment whose frame has retired on the GPU is summed from
+    /// the retired visibility buffer matching its `submit_seq` and folded into
+    /// its query's running total; the segment carrying `Issue(END)` publishes
+    /// that total. An empty span sums to zero without consulting a buffer,
+    /// since a frame that reserved no slot for the query reserved no buffer
+    /// either. A non-empty span whose buffer cannot be found (retired and
+    /// evicted before intake ran, which the normal flow never produces)
+    /// leaves the whole span uncounted. Retired buffers whose seq has been
+    /// reached then move into the free list so the next frame can reuse them.
     ///
     /// Each retired buffer's `PageBox` points at PE-allocated Shared storage
     /// wrapped by Metal. Once `coherent_seq >= release_seq` the GPU is done
@@ -656,12 +827,11 @@ impl VisibilityQueryState {
     ///
     /// # Panics
     ///
-    /// Panics if `pending` and `slot_used` fall out of sync with the slot
-    /// allocator — an invariant maintained by the
-    /// [`VisibilityQueryCore::begin`] / [`VisibilityQueryCore::end`] helpers,
-    /// so unreachable on a well-formed call sequence.
+    /// Panics if a segment is removed from `pending` at an index the loop
+    /// above has already bounds-checked, which the `while i < len` guard
+    /// makes unreachable.
     pub fn intake_completed(&mut self, coherent_seq: u64) {
-        // Finalize first (reads retired buffers by seq), then release
+        // Fold first (reads retired buffers by seq), then release
         // pool entries. Order matters: release_up_to moves retired →
         // free which clears the seq association.
         let mut i = 0;
@@ -671,15 +841,19 @@ impl VisibilityQueryState {
                 continue;
             }
             let entry = self.pending.remove(i).expect("bound-checked");
-            let sum = match self.pool.retired_backing_for(entry.submit_seq) {
-                Some(slots) => sum_slots(
-                    &slots,
-                    entry.core.offset_begin(),
-                    entry.core.offset_end_internal(),
-                ),
-                None => u64::from(u32::MAX),
+            let (begin, end) = entry.span;
+            let sum = if begin >= end {
+                0
+            } else if let Some(slots) = self.pool.retired_backing_for(entry.submit_seq) {
+                sum_slots(&slots, begin, end)
+            } else {
+                entry.core.mark_uncounted();
+                0
             };
-            entry.core.finalize(sum);
+            entry.core.accumulate_segment(sum);
+            if entry.closes_span {
+                entry.core.publish_span();
+            }
         }
         self.pool.release_up_to(coherent_seq);
     }

@@ -3707,7 +3707,12 @@ impl PassState {
         DepthClearOutcome::Folded
     }
 
-    fn current_pass_has_counting_visibility(&self) -> bool {
+    /// Whether the live pass already carries a Counting-mode visibility set.
+    ///
+    /// A closed pass answers `false`: the pass a command opens next starts
+    /// with Metal's own default, which counts nothing.
+    #[must_use]
+    pub fn current_pass_has_counting_visibility(&self) -> bool {
         if self.current_pass_closed {
             return false;
         }
