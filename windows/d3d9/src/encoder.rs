@@ -8188,9 +8188,9 @@ bitflags::bitflags! {
         const GPU_CAPTURE_START = 1 << 2;
         /// Last frame of an F12 run: stop the Metal GPU capture after it.
         ///
-        /// When a mid-frame flush sends the flagged frame out early,
-        /// `stamp_and_swap` moves this bit onto the fresh continuation so the
-        /// capture ends with the piece the closing `Present` submits.
+        /// A frame swap that does not present moves this bit onto the
+        /// continuation, so the capture ends with the piece the closing
+        /// `Present` submits rather than with the process.
         const GPU_CAPTURE_STOP = 1 << 3;
     }
 }
@@ -8497,9 +8497,25 @@ impl FrameData {
             .intersection(FrameDataFlags::GPU_CAPTURE_START.union(FrameDataFlags::GPU_CAPTURE_STOP))
     }
 
-    /// Drop the `GPU_CAPTURE_STOP` mark, for moving it onto a continuation frame.
-    pub const fn clear_gpu_capture_stop(&mut self) {
-        self.flags = self.flags.difference(FrameDataFlags::GPU_CAPTURE_STOP);
+    /// Take the capture marks this frame hands to the frame replacing it.
+    ///
+    /// `submitted` says whether this frame still reaches the encoder. What
+    /// the continuation inherits is cleared here, so exactly one of the two
+    /// frames carries each mark.
+    pub fn take_carried_capture_marks(&mut self, submitted: bool) -> FrameDataFlags {
+        let marks = self.gpu_capture_marks();
+        let (start, stop) = mtld3d_core::present::carried_capture_marks(
+            (
+                marks.contains(FrameDataFlags::GPU_CAPTURE_START),
+                marks.contains(FrameDataFlags::GPU_CAPTURE_STOP),
+            ),
+            submitted,
+        );
+        let mut carried = FrameDataFlags::empty();
+        carried.set(FrameDataFlags::GPU_CAPTURE_START, start);
+        carried.set(FrameDataFlags::GPU_CAPTURE_STOP, stop);
+        self.flags = self.flags.difference(carried);
+        carried
     }
 
     pub const fn set_submit_fence(&mut self, fence: &SubmitFence) {
