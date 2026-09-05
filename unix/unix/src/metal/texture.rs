@@ -740,6 +740,13 @@ pub fn destroy_texture(texture_handle: u64) {
         .expect("live-texture ledger poisoned")
         .remove(&texture_handle);
     if !was_live {
+        // A build with debug assertions stops here: the second destroy is
+        // a PE-side lifetime bug, and a test that provokes one has to fail
+        // rather than pass on a skipped release.
+        debug_assert!(
+            was_live,
+            "destroy_texture: {texture_handle:#x} is not a live texture handle"
+        );
         // Not once: each occurrence names its handle, and the debug lines
         // around it say which destroy asked twice.
         log::warn!(

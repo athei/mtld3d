@@ -297,6 +297,15 @@ bitflags::bitflags! {
         /// later `Reset` succeeds, which is how an app learns it must retry
         /// (after releasing the `D3DPOOL_DEFAULT` resources that blocked it).
         const NOT_RESET = 1 << 2;
+        /// Set once the last `Release` has begun tearing the device down.
+        ///
+        /// The teardown hands a fullscreen window back before the cursor
+        /// subclass comes off, and the restore's `WM_SIZE` reaches the
+        /// subclass with the device no longer fullscreen. Answering it
+        /// would rebuild a back buffer whose handles the teardown has
+        /// already captured and is about to release, so the resize path
+        /// checks this and stands down.
+        const RELEASING = 1 << 3;
     }
 }
 
@@ -2424,6 +2433,14 @@ impl DeviceInner {
         if new_width == 0 || new_height == 0 {
             return;
         }
+        if self.flags.contains(DeviceFlags::RELEASING) {
+            debug!(
+                target: LOG_TARGET,
+                "WM_SIZE ({new_width}x{new_height}) during the device's release ignored; the \
+                 back buffer is being destroyed, not resized",
+            );
+            return;
+        }
         if self.fullscreen.is_some() {
             debug!(
                 target: LOG_TARGET,
@@ -3297,6 +3314,10 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // otherwise race with the encoder's destroy thunks on the same
         // `MTLDevice` during `shutdown_cleanup`.
         device_inner.prewarm.cancel_and_join();
+        // From here on a window message that reaches the cursor subclass
+        // finds a device being torn down, and the resize it may ask for
+        // must not rebuild what the steps below destroy.
+        device_inner.flags.insert(DeviceFlags::RELEASING);
 
         // D3DPOOL_MANAGED textures the game still holds outlive this device.
         // Their `device_inner`/`device_handle` are about to dangle. Zero

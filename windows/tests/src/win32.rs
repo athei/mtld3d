@@ -235,6 +235,7 @@ pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
 /// The call runs straight through the window's (possibly subclassed) wndproc.
 /// Lets tests synthesize the macdrv-posted messages (e.g. `WM_SIZE`)
 /// deterministically.
+#[must_use]
 pub fn send_message(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
     // SAFETY: Win32 thunk; `hwnd` is a window this process created.
     unsafe { SendMessageA(hwnd, msg, wparam, lparam) }
