@@ -670,15 +670,17 @@ pub struct DeviceInner {
     /// create, release and Evict run one at a time, on the API thread or
     /// serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`.
     live_textures: Mutex<Vec<*mut TextureInner>>,
-    /// Uploads the encoder emitted nothing for, waiting to be marked dirty again.
+    /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
     /// rectangle before the job crosses to the encoder thread, and
     /// `UnlockRect` publishes only the rectangle the game locked, so a
     /// decline downstream of the hand-off would otherwise leave the region
     /// unannounced for the rest of the run. The encoder files the
-    /// subresource and its rectangle here; [`Self::apply_upload_redirty`]
-    /// drains the queue once a frame and marks them dirty again.
+    /// subresource and its rectangle here, along with the subresources whose
+    /// upload it did emit and whose staging is waiting on that answer;
+    /// [`Self::apply_upload_answers`] drains the queue once a frame, marks
+    /// the declined ones dirty again and releases the staging of the rest.
     upload_redirty: Arc<RedirtyQueue>,
     /// Per-draw snapshot dirty-bitmask.
     ///
@@ -1820,7 +1822,7 @@ impl DeviceInner {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
-        self.apply_upload_redirty();
+        self.apply_upload_answers();
         let (frame, seq) = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
@@ -2054,37 +2056,50 @@ impl DeviceInner {
         Arc::clone(&self.upload_redirty)
     }
 
-    /// Mark every upload the encoder emitted nothing for dirty again.
+    /// Act on what the encoder made of the uploads of the frame just ended.
     ///
-    /// Runs once per `Present`, before the frame is stamped, so the next
-    /// frame's bind-time flush re-schedules the region. A texture released
-    /// between the decline and this drain has left the registry, and its
-    /// entries are dropped with it.
-    fn apply_upload_redirty(&self) {
+    /// Runs once per `Present`, before the frame is stamped: a declined
+    /// upload is marked dirty again so the next frame's bind-time flush
+    /// re-schedules the region, and a level that was holding its staging for
+    /// the emitted answer releases it. The declines are applied first, so a
+    /// level whose later upload was declined is dirty by the time its earlier
+    /// release is considered and keeps the pages the retry reads. A texture
+    /// released between the answer and this drain has left the registry, and
+    /// its entries are dropped with it.
+    fn apply_upload_answers(&self) {
         if !self.upload_redirty.has_pending() {
             return;
         }
-        let entries = self.upload_redirty.take_pending();
-        if entries.is_empty() {
+        let declined = self.upload_redirty.take_pending();
+        let released = self.upload_redirty.take_released();
+        if declined.is_empty() && released.is_empty() {
             return;
         }
+        let wanted: rustc_hash::FxHashSet<TextureId> = declined
+            .iter()
+            .map(|entry| entry.subresource.texture_id)
+            .chain(released.iter().map(|ack| ack.subresource.texture_id))
+            .collect();
         let live: Vec<*mut TextureInner> = self
             .live_textures
             .lock()
             .expect("live_textures mutex poisoned")
             .clone();
+        // Only the textures an answer names go in the map: a drain runs on
+        // every frame that uploads a static texture, and a game holds far
+        // more textures than one frame uploads.
         let by_id: rustc_hash::FxHashMap<TextureId, *mut TextureInner> = live
             .into_iter()
-            .map(|ptr| {
+            .filter_map(|ptr| {
                 // SAFETY: `ptr` is a snapshot from `live_textures`; entries
                 // are removed before the `TextureInner` Box is freed, and
                 // nothing frees one while the API thread runs this.
                 let id = unsafe { &*ptr }.texture_id();
-                (id, ptr)
+                wanted.contains(&id).then_some((id, ptr))
             })
             .collect();
         let mut restored = 0u32;
-        for entry in &entries {
+        for entry in &declined {
             let Some(&ptr) = by_id.get(&entry.subresource.texture_id) else {
                 continue;
             };
@@ -2098,11 +2113,21 @@ impl DeviceInner {
             );
             restored += 1;
         }
-        mtld3d_shared::log_once_info!(
-            target: TEX_TRACE_TARGET,
-            "upload redirty: {restored} of {} declined uploads marked dirty again",
-            entries.len()
-        );
+        for ack in &released {
+            let Some(&ptr) = by_id.get(&ack.subresource.texture_id) else {
+                continue;
+            };
+            // SAFETY: same contract as the map build above.
+            let ti = unsafe { &mut *ptr };
+            crate::texture::release_emitted_staging(ti, ack.level as usize, ack.generation);
+        }
+        if !declined.is_empty() {
+            mtld3d_shared::log_once_info!(
+                target: TEX_TRACE_TARGET,
+                "upload redirty: {restored} of {} declined uploads marked dirty again",
+                declined.len()
+            );
+        }
     }
 
     /// Finalize the visibility query whose END frame retires at `target_seq`.

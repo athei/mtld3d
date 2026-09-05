@@ -274,6 +274,15 @@ pub struct TextureInner {
     /// staging ([`TextureInner::staging_droppable_class`]), which pays neither
     /// the memory nor the bookkeeping.
     staging_coverage: Vec<StagingCoverage>,
+    /// Per-level count of the uploads scheduled for it (empty when untracked).
+    ///
+    /// A level releases its staging when the encoder answers that an upload of
+    /// it was emitted, and the answer arrives a frame later, by which time the
+    /// level may have scheduled another upload the encoder has not answered
+    /// yet. The count tells the two apart, so the pages a pending upload may
+    /// still have to be retried from stay put. Only the class that can release
+    /// its staging counts, next to its coverage.
+    upload_generation: Vec<u32>,
     /// Levels a device context currently maps (bit N = level N).
     ///
     /// A `GetDC` hands GDI a DIB over the level's staging pages, and
@@ -532,6 +541,23 @@ impl TextureInner {
             && self.dropped_staging & (1u32 << level) == 0
             && !self.locked[level]
             && !self.level_dc_open(level)
+    }
+
+    /// Number this level's next upload and hand the number back.
+    ///
+    /// Zero for a level whose class never releases its staging, which counts
+    /// nothing: the number only serves the release.
+    fn next_upload_generation(&mut self, level: usize) -> u32 {
+        let Some(slot) = self.upload_generation.get_mut(level) else {
+            return 0;
+        };
+        *slot = slot.wrapping_add(1);
+        *slot
+    }
+
+    /// Whether `generation` is the number of the last upload scheduled for `level`.
+    fn is_latest_upload(&self, level: usize, generation: u32) -> bool {
+        self.upload_generation.get(level) == Some(&generation)
     }
 
     /// Whether a device context currently maps `level`.
@@ -2885,6 +2911,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         staging,
         dropped_staging: 0,
         staging_coverage: Vec::new(),
+        upload_generation: Vec::new(),
         dc_open: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
@@ -2914,6 +2941,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         boxed.staging_coverage = core::iter::repeat_with(StagingCoverage::new)
             .take(boxed.staging.len())
             .collect();
+        boxed.upload_generation = vec![0; boxed.staging.len()];
     }
     // A default-pool static texture's staging only carries writes to the
     // GPU, and a streaming engine creates far more textures than it ever
@@ -4048,6 +4076,13 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
     // consulted by the volume blit path.
     let block_rows = ti.mip_height(level_u).div_ceil(ti.block_h.max(1));
     let slice_pitch = ti.mip_bytes_per_row(level_u).saturating_mul(block_rows);
+    // Every byte of a level the game cannot lock again is on the GPU once this
+    // upload is emitted: each write since the staging was allocated was
+    // uploaded by the flush that followed it, this one included, and together
+    // they cover the level. The release waits for the encoder's answer, since
+    // a declined upload is retried from the staging this would have released.
+    let release_staging = ti.staging_droppable(level_u) && ti.staging_fully_written(level_u);
+    let upload_generation = ti.next_upload_generation(level_u);
     let job = TextureUploadJob {
         info: ti.texture_info(),
         arc: ti.staging_arc(level_u),
@@ -4064,6 +4099,8 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
         depth: (ti.depth >> level).max(1),
         slice_pitch,
         redirty: dev.upload_redirty(),
+        release_staging,
+        upload_generation,
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
@@ -4081,13 +4118,6 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
         rect.w,
         rect.h
     );
-    // Every byte of a level the game cannot lock again is now on the GPU: each
-    // write since the staging was allocated was uploaded by the flush that
-    // followed it, this one included, and together they cover the level. The
-    // job holds its own `Arc` of the staging, so the texture's copy can go now.
-    if ti.staging_droppable(level_u) && ti.staging_fully_written(level_u) {
-        ti.drop_staging(level_u);
-    }
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
         enc.run_texture_upload(job);
         if regen_mipmaps {
@@ -4140,6 +4170,10 @@ fn schedule_cube_upload(
         depth: 1,
         slice_pitch,
         redirty: dev.upload_redirty(),
+        // A cube is outside the staging-droppable class: its faces are
+        // written and uploaded by paths that expect the level to be there.
+        release_staging: false,
+        upload_generation: 0,
     };
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
         enc.run_texture_upload(job);
@@ -4162,6 +4196,36 @@ pub fn redirty_declined_upload(ti: &mut TextureInner, face: u32, level: usize, r
     } else {
         ti.mark_written_region(level, rect);
     }
+}
+
+/// Release the staging of a level whose upload the encoder emitted.
+///
+/// The scheduler asked for the release when it built the job and the GPU now
+/// holds every texel of the level, so the pages are redundant: this is the
+/// half of the 32-bit footprint saving that has to wait for an answer, since
+/// a declined upload is retried from exactly these pages. The job carries its
+/// own `Arc` of them, so an upload the encoder still holds for replay keeps
+/// reading what it was built from.
+///
+/// The conditions are re-read here because the level's state moves while the
+/// answer is in flight. A later upload of the level may still be waiting for
+/// an answer of its own, and would be retried from these pages; a write that
+/// landed after the upload was scheduled marks the level dirty and its bytes
+/// have reached no command buffer yet; a lock or a device context maps the
+/// pages; a rename or a release of its own leaves the coverage short of the
+/// whole level. Each of them keeps the staging, and the level is offered
+/// again by the answer or the upload that follows.
+pub fn release_emitted_staging(ti: &mut TextureInner, level: usize, generation: u32) {
+    if level >= (ti.levels as usize).min(32) {
+        return;
+    }
+    if !ti.is_latest_upload(level, generation) || ti.dirty_mask & (1u32 << level) != 0 {
+        return;
+    }
+    if !ti.staging_droppable(level) || !ti.staging_fully_written(level) {
+        return;
+    }
+    ti.drop_staging(level);
 }
 
 /// Mark every previously-uploaded mip dirty for the next bind-time `flush_dirty_mips`.
