@@ -590,13 +590,13 @@ test-unit:
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 #
-# The suite is three test binaries per arch (`windows/tests/tests`: the
-# one-process suite `e2e`, and `unload` and `snmalloc_drift`, which need a
-# process of their own), and the runner in `unix/e2e` runs each once under
+# The suite is four test binaries per arch (`windows/tests/tests`: the
+# one-process suite `e2e`, and `exit_code`, `unload` and `snmalloc_drift`,
+# which need a process of their own), and the runner in `unix/e2e` runs each once under
 # Wine, every test of a binary on `JOBS` threads of that one process, each
 # with its own device. Only a failure, a crash or a hang costs another
 # process: the runner marks the test it attributes the end to and runs the
-# rest again. So a run is six Wine launches, and its report counts every
+# rest again. So a run is eight Wine launches, and its report counts every
 # test rather than stopping at a summary.
 #
 # JOBS=<n> is how many tests run at once, each on its own thread with its

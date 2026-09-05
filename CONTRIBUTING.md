@@ -69,7 +69,7 @@ that touches `docs/CONVENTIONS.md`.
 
 ## Reading a test run
 
-The end-to-end suite is three test binaries per architecture, and the runner
+The end-to-end suite is four test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
 `JOBS` threads of that process (one at a time by default; the Makefile says
 what a higher `JOBS` waits for). It prints one `PASS`/`FAIL`/`SKIP` line per test and a
@@ -85,17 +85,19 @@ summary on both architectures. mtld3d's log of each test process is a file,
 Two things are worth knowing when a test process looks wrong. `d3d9.dll`
 terminates the process from its `DLL_PROCESS_DETACH` once a device exists
 (it cannot survive the allocator's thread-local teardown on Wine's 1 MB
-main-thread stack), and that exit carries code 0 whatever libtest was
-exiting with; the harness's panic hook (`windows/tests/src/win32.rs`)
-terminates the process with libtest's failure code at the first failed
-assertion instead, after the default hook has printed the report that names
-the test. The tests in flight go down with the process: the runner marks the
+main-thread stack), so a test binary's exit status is whatever that
+`TerminateProcess` carries: the status the process asked to exit with, and 0
+for a process that never asked. The harness's panic hook
+(`windows/tests/src/win32.rs`) does not wait for libtest to reach its own
+exit and terminates with libtest's failure code at the first failed
+assertion, after the default hook has printed the report that names the
+test. The tests in flight go down with the process: the runner marks the
 named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: six is a clean
-`make test`.
+`processes` count in the summary says how many the run took: eight is a
+clean `make test`.
 
 ## Which suite is right when they disagree
 

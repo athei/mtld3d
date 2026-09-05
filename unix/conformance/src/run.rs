@@ -360,8 +360,8 @@ fn kill_group(child: &Child) {
 /// ends a process with an unhandled Win32 exception through the exception
 /// code, of which unix keeps the low byte, so an access violation
 /// (`0xC0000005`) reads as `code 5`. A run that reached its summary exits
-/// with `code 0` once a device existed (the layer ends the process from its
-/// detach), else with the framework's failure count capped at 255. A signal
+/// with the framework's failure count capped at 255, which the layer carries
+/// through the `TerminateProcess` its detach ends the process with. A signal
 /// is the number alone (11 `SIGSEGV`, 10 `SIGBUS`, 6 `SIGABRT`, 9 `SIGKILL`):
 /// the scanner's crash markers are signal names, and a name here would turn
 /// a fault the process survived into a crash.

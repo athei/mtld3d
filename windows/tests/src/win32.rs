@@ -80,12 +80,12 @@ const TEST_FAILURE_EXIT_CODE: u32 = 101;
 ///
 /// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
 /// once a device has been created (it cannot survive snmalloc's thread-local
-/// teardown on Wine's 1 MB main-thread stack), and that `TerminateProcess`
-/// exits with code 0 whatever libtest was exiting with, so a failing test
-/// binary read as passing. The hook keeps the default hook's report, which
-/// names the failing test (libtest runs each test on a thread named after
-/// it), and then terminates with libtest's failure code right away, before
-/// the detach path can overwrite it. The tests of the suite share the
+/// teardown on Wine's 1 MB main-thread stack), so a test binary's exit
+/// status is the one that `TerminateProcess` carries. The hook keeps the
+/// default hook's report, which names the failing test (libtest runs each
+/// test on a thread named after it), and then terminates with libtest's
+/// failure code at the first failed assertion, without waiting for libtest
+/// to reach the exit of its own. The tests of the suite share the
 /// process, so the ones in flight go down with it: the e2e runner marks the
 /// named test failed and runs the rest again in a fresh process.
 pub fn install_failure_exit_hook() {
