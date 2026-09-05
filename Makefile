@@ -1,6 +1,27 @@
 ifndef WINE_SDK
 $(error WINE_SDK is not set)
 endif
+
+# ISOLATED=1 runs every install-bearing target against a private clone of the
+# Wine SDK inside this checkout: the SDK the tools come from, the tree the
+# builds install into and the prefix the tests boot all move under
+# `.wine-isolated`, so parallel worktrees, and the game bundle a maintainer is
+# playing from, never see each other's builds. APFS clones both trees for free
+# on the same volume: the SDK from `WINE_SDK`, the prefix from the ambient
+# `WINEPREFIX` (or `~/.wine`) so no prefix boots from scratch; each clone is
+# made once and reused, and `clean-isolated` removes them. Without the knob,
+# `make install` and every test leg keep targeting the shared trees, which is
+# how the game gets a build.
+ISOLATED_ROOT := $(CURDIR)/.wine-isolated
+ifeq ($(ISOLATED),1)
+ISOLATED_PREFIX_SOURCE := $(or $(WINEPREFIX),$(HOME)/.wine)
+$(shell [ -d $(ISOLATED_ROOT)/sdk ] || { mkdir -p $(ISOLATED_ROOT) && { cp -c -R $(WINE_SDK) $(ISOLATED_ROOT)/sdk 2>/dev/null || { rm -rf $(ISOLATED_ROOT)/sdk && cp -R $(WINE_SDK) $(ISOLATED_ROOT)/sdk; }; }; })
+$(shell [ -d $(ISOLATED_ROOT)/prefix ] || [ ! -d $(ISOLATED_PREFIX_SOURCE) ] || { cp -c -R $(ISOLATED_PREFIX_SOURCE) $(ISOLATED_ROOT)/prefix 2>/dev/null || { rm -rf $(ISOLATED_ROOT)/prefix && cp -R $(ISOLATED_PREFIX_SOURCE) $(ISOLATED_ROOT)/prefix; }; })
+WINE_SDK := $(ISOLATED_ROOT)/sdk
+WINE_INSTALL_DIR := $(ISOLATED_ROOT)/sdk
+export WINEPREFIX := $(ISOLATED_ROOT)/prefix
+$(info ==> ISOLATED=1: Wine SDK, install dir and prefix under $(ISOLATED_ROOT))
+endif
 export WINE_SDK
 
 # The Wine tools this Makefile runs, named by absolute path out of the same
@@ -170,7 +191,9 @@ SDK_UNIX_ARCH ?= $(if $(findstring arm64,$(shell file -b $(WINE_SDK)/bin/wine)),
 # plain invocations.
 DENY_WARNINGS := --config 'build.warnings="deny"'
 
-INSTALL_DIRS := $(WINE_SDK) $(WINE_INSTALL_DIR)
+# Sorted for its side effect of dropping a duplicate: under ISOLATED=1 both
+# name the same clone, and the install loops must write it once.
+INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 
 # Both overridable, unlike the rest of these: the HUD and the validation layer
 # are here to catch Metal misuse on a real GPU, and a caller running against a
@@ -225,7 +248,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle stage configure-test-prefix \
+	bundle stage configure-test-prefix clean-isolated clean-isolated-all \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -726,6 +749,30 @@ check:
 clean:
 	cd windows && cargo +$(RUST_STABLE) clean
 	cd unix && cargo +$(RUST_STABLE) clean
+
+# Take down what ISOLATED=1 left in this checkout: the persistent wineserver of
+# the private prefix (and the winedevice residents it keeps), then the clones.
+# Named after the knob rather than folded into `clean`, which is about cargo
+# output and must stay usable while an isolated test is running.
+clean-isolated:
+	if [ -x $(ISOLATED_ROOT)/sdk/bin/wineserver ] && [ -d $(ISOLATED_ROOT)/prefix ]; then \
+		WINEPREFIX=$(ISOLATED_ROOT)/prefix $(ISOLATED_ROOT)/sdk/bin/wineserver -k >/dev/null 2>&1 ; \
+		WINEPREFIX=$(ISOLATED_ROOT)/prefix $(ISOLATED_ROOT)/sdk/bin/wineserver -w >/dev/null 2>&1 ; \
+	fi
+	rm -rf $(ISOLATED_ROOT)
+
+# The same for every worktree of this repository, from any of them: git knows
+# the worktrees, and each one cleans its own environment. A wineserver still
+# running out of a `.wine-isolated/sdk` afterwards belongs to a checkout that
+# was removed with its environment up (`git worktree remove` takes the
+# directory, not the process), so it is ended directly; the path is specific
+# enough that nothing else matches.
+clean-isolated-all:
+	git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r wt; do \
+		[ -d "$$wt/.wine-isolated" ] || continue ; \
+		$(MAKE) -C "$$wt" clean-isolated ; \
+	done
+	pkill -f '/\.wine-isolated/sdk/bin/wineserver' 2>/dev/null || true
 
 upgrade:
 	cd windows && cargo +$(RUST_STABLE) update
