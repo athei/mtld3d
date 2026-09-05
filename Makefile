@@ -596,7 +596,9 @@ test-unit:
 # deadlock stays away and ~130 s when it hits); a CI runner, whose device
 # creation cannot overlap at all, stays at 1 either way. TIMEOUT=<secs> is
 # how long a process may go without reporting a result before the runner
-# kills it and charges the hang to the test that was running (default 60).
+# kills it and charges the hang to the test that was running (default 60);
+# the same bound covers a process that has closed stdout but will not exit,
+# and a process tree that keeps stderr open after the process is gone.
 #
 # A scaled or Intel-variant run reports the whole suite instead of stopping at
 # the first failure, and FAIL_FAST=0 asks for that on any run. The point of
