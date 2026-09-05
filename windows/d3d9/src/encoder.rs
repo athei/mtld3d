@@ -8054,7 +8054,11 @@ impl FrameEncoder {
     /// Returns the held backings (both `PageBox` and `Arc<PageBox>`
     /// variants), then `wait_for_gpu_idle`. The visibility pool is drained
     /// after that wait, and the intake that finalizes the queries counting
-    /// into it runs between the two. Does NOT touch the
+    /// into it runs between the two. A span the application left open is not
+    /// finalized by either: the submit ahead of this cut it at its own
+    /// boundary, and the next `begin_frame` reopens it against the fresh
+    /// buffer, so the drain takes the buffers and leaves the open set. Does
+    /// NOT touch the
     /// `pending_blit_retention` / `current_blit_retention` Arcs (those must
     /// outlive the bulk destroy of the staging `MTLBuffers` that wrap them
     /// via `bytesNoCopy`). Caller drops the returned `HeldBackings` after

@@ -361,6 +361,61 @@ fn state_split_and_resume_close_and_reopen_every_open_span() {
 }
 
 #[test]
+fn state_drain_leaves_an_open_span_to_the_frame_that_continues_it() {
+    use super::{QueryStatus, VisibilityQueryState};
+    // A `Reset` finalizes what it can and then takes every buffer, which is
+    // the same cut a submit makes for a span the application left open. The
+    // segment already counted has been summed by then, and the span itself
+    // continues in the frame that follows, so the two halves still add up.
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    state.bump_slot();
+    core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
+    state.push_active(&core);
+    state.note_draw();
+    let mut first = dummy_buf(1);
+    write_slot(&mut first, 0, 900);
+    state.pool.retire(first);
+
+    // The flush ahead of the drain, then the drain's own finalize.
+    state.split_open_spans(1);
+    state.intake_completed(1);
+    assert_eq!(core.status(), QueryStatus::Pending, "END has not run yet");
+    let drained = state.drain_all_buffers();
+    assert_eq!(drained.len(), 1, "the frame's buffer leaves with the drain");
+    assert_eq!(
+        state.active_count(),
+        1,
+        "the open span survives the drain that takes the buffers"
+    );
+
+    // The frame that continues the span.
+    state.reset_frame();
+    state.resume_open_spans(2);
+    assert_eq!(
+        core.offset_begin(),
+        0,
+        "reopened against the fresh allocator"
+    );
+    state.bump_slot();
+    state.note_draw();
+    let mut second = dummy_buf(2);
+    write_slot(&mut second, 0, 100);
+    state.pool.retire(second);
+    core.end(2, state.draws_seen());
+    state.remove_active(&core);
+    state.push_pending(2, core.clone(), (core.offset_begin(), 1), true);
+
+    state.intake_completed(2);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(
+        core.get_u32(),
+        1_000,
+        "both halves of the span the drain cut"
+    );
+}
+
+#[test]
 fn state_mark_exhausted_makes_every_open_span_uncounted() {
     use super::{QueryStatus, VisibilityQueryState};
     let mut state = VisibilityQueryState::new();

@@ -486,3 +486,54 @@ fn an_ended_span_is_finalized_by_the_reset_that_flushes_its_frame() {
          (~{expected} samples), got {count}"
     );
 }
+
+#[test]
+fn occlusion_count_survives_a_reset_between_begin_and_end() {
+    // A resizing `Reset` waits for the GPU and then takes the visibility pool
+    // down, in the middle of a span the application left open across it. That
+    // is the cut a submit boundary makes, so the span has to continue in the
+    // frame after the `Reset`: a query the `Reset` forgot arms no pass there,
+    // and its `Issue(END)` builds a slot range out of the frame that is gone,
+    // answering with one frame's count or with a zero that reads as full
+    // occlusion. A same-size `Reset` keeps the pool and its span is the
+    // submit-boundary case above.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let (width, height) = h.dims();
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the draw before the Reset");
+    assert_eq!(h.end_scene(), 0);
+    // No Present: the flush the `Reset` performs is what submits the frame
+    // carrying the first half of the span.
+    assert_eq!(
+        h.reset(width / 2, height / 2),
+        0,
+        "resize Reset must succeed"
+    );
+    let (reset_width, reset_height) = h.dims();
+
+    // `Reset` restores the device to its state defaults, the fixed-function
+    // setup the counted draw needs included.
+    arm_for_counting_draws(&h);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    draw_full_frame(&h, "the draw after the Reset");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let expected = width * height + reset_width * reset_height;
+    let count = occlusion_count(&q, "the span the Reset cut");
+    assert!(
+        count.abs_diff(expected) <= expected / 100,
+        "both halves of the span counted, the second against the target the \
+         Reset made (~{expected} samples), got {count}"
+    );
+}
