@@ -127,7 +127,6 @@
   device.c:2238 count=1
   device.c:2250 count=1
   device.c:2251 count=1
-  device.c:3626 count=5
   device.c:3685 count=2
   device.c:3700 count=2
   device.c:4161 count=2
@@ -178,7 +177,6 @@
   device.c:5671 count=1
   device.c:5674 count=1
   device.c:6780 count=1
-  device.c:7927 count=1
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -236,7 +234,6 @@
 [i686+intel/d3d9ex] crash=0
   d3d9ex.c:5184 count=1
 [i686+intel@mac2/device] crash=0
-  device.c:3626 count=5
   device.c:3685 count=2
   device.c:3700 count=2
   device.c:4207 count=2
@@ -277,7 +274,6 @@
   device.c:5676 count=1
   device.c:5900 count=1
   device.c:6780 count=1
-  device.c:7927 count=1
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -576,7 +572,6 @@
   device.c:2238 count=1
   device.c:2250 count=1
   device.c:2251 count=1
-  device.c:3626 count=5
   device.c:3685 count=2
   device.c:3700 count=2
   device.c:4161 count=2
@@ -625,7 +620,6 @@
   device.c:5671 count=1
   device.c:5674 count=1
   device.c:6780 count=1
-  device.c:7927 count=1
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -683,7 +677,6 @@
 [x86_64+intel/d3d9ex] crash=0
   d3d9ex.c:5184 count=1
 [x86_64+intel@mac2/device] crash=0
-  device.c:3626 count=5
   device.c:3685 count=2
   device.c:3700 count=2
   device.c:4207 count=2
@@ -722,7 +715,6 @@
   device.c:5676 count=1
   device.c:5900 count=1
   device.c:6780 count=1
-  device.c:7927 count=1
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30

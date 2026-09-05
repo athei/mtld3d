@@ -560,19 +560,33 @@ fn check_format_conversion() {
 fn windowed_device_type_follows_format_conversion() {
     // The runtime requires windowed CheckDeviceType to equal
     // CheckDeviceFormat(RT, bb) && CheckDeviceFormatConversion(bb, display),
-    // so a 16-bit windowed backbuffer on a 32-bit display is advertised
-    // (CreateDevice substitutes the BGRA8 layer format for it). Fullscreen has
-    // no present conversion and keeps rejecting the pair.
+    // so the answer for a 16-bit backbuffer on a 32-bit display is whatever
+    // this device says about rendering into R5G6B5: yes where the packed
+    // 16-bit Metal formats are native, no where they are expansion-backed
+    // (`expand16` pins that side). Deriving it here rather than pinning one
+    // of the two keeps the identity the assertion, which is the contract.
+    // Fullscreen has no present conversion and rejects the pair either way.
     let h = Harness::factory_only();
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
         D3D_OK,
         "precondition: the conversion is supported",
     );
+    let renderable = h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) == D3D_OK;
+    let expected = if renderable {
+        D3D_OK
+    } else {
+        D3DERR_NOTAVAILABLE
+    };
     assert_eq!(
         h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, true),
-        D3D_OK,
-        "windowed R5G6B5 backbuffer on an X8R8G8B8 display follows the conversion predicate",
+        expected,
+        "windowed R5G6B5 backbuffer on an X8R8G8B8 display follows the render-target answer",
     );
     assert_eq!(
         h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, false),

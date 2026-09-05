@@ -320,6 +320,78 @@ pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<F
     map_d3d_format(d3d_format)
 }
 
+/// Colour formats the Metal backend renders into, as a pure format family.
+///
+/// `A4R4G4B4` and `X1R5G5B5` are excluded on every device: their mapping
+/// carries a sampler swizzle (a channel-order correction and an alpha force
+/// respectively), and a swizzle only affects reads, so render writes would
+/// land in the wrong bits. `R8G8B8` is excluded for the same reason its
+/// texels are widened on upload: it has no Metal counterpart at all.
+/// `A8B8G8R8` and `X8B8G8R8` back `Rgba8Unorm`, colour-renderable on both GPU
+/// families, and a render-target handle is always handed out unswizzled, so
+/// the alpha force `X8B8G8R8` carries on the sampling side does not exclude
+/// it.
+///
+/// The float family is renderable on every device: Metal's pixel-format
+/// capability table lists `R16Float` / `RG16Float` / `RGBA16Float` and
+/// `R32Float` / `RG32Float` / `RGBA32Float` as colour-renderable for both the
+/// Apple and the Mac2 families, so the answer needs no device query. Linear
+/// FILTERING is the half that differs, and it is [`supports_usage_query`],
+/// not this.
+///
+/// `R5G6B5` and `A1R5G5B5` are in the family because they map bit-for-bit to
+/// the native `B5G6R5Unorm` / `BGR5A1Unorm` Metal formats, which a device
+/// without those formats does not have; every advertisement and create gate
+/// that concerns rendering into a surface asks
+/// [`is_render_target_format_device`] instead. This pure form answers the one
+/// question that stays device-independent, the conversion SOURCE side, since
+/// a source is sampled rather than rendered into.
+#[must_use]
+pub const fn is_render_target_format(d3d_format: u32) -> bool {
+    matches!(
+        d3d_format,
+        D3DFMT_A8R8G8B8
+            | D3DFMT_X8R8G8B8
+            | D3DFMT_A8B8G8R8
+            | D3DFMT_X8B8G8R8
+            | D3DFMT_R5G6B5
+            | D3DFMT_A1R5G5B5
+            | D3DFMT_G16R16
+            | D3DFMT_A16B16G16R16
+            | D3DFMT_R16F
+            | D3DFMT_G16R16F
+            | D3DFMT_A16B16G16R16F
+            | D3DFMT_R32F
+            | D3DFMT_G32R32F
+            | D3DFMT_A32B32G32R32F
+    )
+}
+
+/// [`is_render_target_format`], restricted to what this device renders into.
+///
+/// On a device without the native packed 16-bit formats, `R5G6B5` and
+/// `A1R5G5B5` drop out: `map_d3d_format_device` backs them with `Bgra8Unorm`
+/// and they sample fine, but a BGRA8-backed "16-bit render target" would
+/// change `GetRenderTargetData` / `LockRect` readback fidelity and need
+/// pack-down machinery, so the honest answer is to not advertise them.
+///
+/// Three `IDirect3D9` answers derive from this one, and D3D9 requires them to
+/// agree. `CheckDeviceFormat(D3DUSAGE_RENDERTARGET)` is the answer itself.
+/// `CheckDeviceType` is refused for a back buffer the device cannot render
+/// into, whatever the present-time conversion says, so the runtime identity
+/// `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
+/// CheckDeviceFormatConversion(bb, display)` holds. And a
+/// `D3DUSAGE_AUTOGENMIPMAP` query answers the success code `D3DOK_NOAUTOGEN`
+/// rather than `D3D_OK` for a format that is no render target, mip generation
+/// being a render operation: the create still succeeds and simply generates
+/// nothing. An engine that probes then picks `X8R8G8B8`, which is what
+/// hardware of that era without 16-bit render targets forced anyway.
+#[must_use]
+pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bool) -> bool {
+    is_render_target_format(d3d_format)
+        && (native_packed16 || !matches!(d3d_format, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
+}
+
 /// The device-dependent half of a `CheckDeviceFormat` usage query.
 ///
 /// `D3DUSAGE_QUERY_FILTER` asks whether a format samples with linear

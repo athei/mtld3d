@@ -11,10 +11,11 @@ use mtld3d_tests::{Harness, Rgba8, Texture, TexturedVertex, VolumeVertex, assert
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5,
     D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
-    D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+    D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -316,18 +317,58 @@ fn expanded_render_target_caps_are_denied() {
         D3DERR_NOTAVAILABLE,
         "RT usage denied for X1R5G5B5"
     );
-    // Conversion SOURCE side and the backbuffer question are
-    // device-independent: a 16-bit source is sampled (expansion covers it)
-    // and a 16-bit backbuffer substitutes to BGRA8 at CreateDevice.
+    // The conversion SOURCE side is device-independent: a 16-bit source is
+    // sampled, never rendered into, and the expansion covers the sampling.
     assert_eq!(
         h.check_device_format_conversion(D3DFMT_R5G6B5, D3DFMT_X8R8G8B8),
         D3D_OK,
         "R5G6B5 stays a conversion source"
     );
+    // Everything the render-target answer implies follows it. The runtime
+    // reads `CheckDeviceType(windowed)` as `CheckDeviceFormat(RT, bb) &&
+    // CheckDeviceFormatConversion(bb, display)`, so a back buffer this device
+    // cannot render into is refused whatever the conversion says, windowed
+    // and fullscreen alike, and an engine picks X8R8G8B8 instead.
+    for windowed in [true, false] {
+        assert_eq!(
+            h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, windowed),
+            D3DERR_NOTAVAILABLE,
+            "16-bit backbuffer denied, windowed {windowed}"
+        );
+        assert_eq!(
+            h.check_device_type(D3DFMT_R5G6B5, D3DFMT_R5G6B5, windowed),
+            D3DERR_NOTAVAILABLE,
+            "16-bit backbuffer on a 16-bit display denied, windowed {windowed}"
+        );
+        assert_eq!(
+            h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8, windowed),
+            D3D_OK,
+            "the 32-bit pair is unaffected, windowed {windowed}"
+        );
+    }
+    // Mip generation is a render operation, so a format the device does not
+    // render answers the success code D3DOK_NOAUTOGEN rather than D3D_OK.
+    for format in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_AUTOGENMIPMAP,
+                D3DRTYPE_TEXTURE,
+                format
+            ),
+            D3DOK_NOAUTOGEN,
+            "AUTOGENMIPMAP is NOAUTOGEN for the expansion-backed {format:#x}"
+        );
+    }
     assert_eq!(
-        h.check_device_type(D3DFMT_X8R8G8B8, D3DFMT_R5G6B5, true),
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DRTYPE_TEXTURE,
+            D3DFMT_X8R8G8B8
+        ),
         D3D_OK,
-        "16-bit windowed backbuffer stays advertised"
+        "AUTOGENMIPMAP still advertised for a format this device renders"
     );
 }
 
