@@ -43,6 +43,21 @@ Two commands, both green before you commit:
 touched, that churn is its own pull request, not a hand-revert and not a passenger
 in yours.
 
+Every test leg installs the build into the Wine tree `WINE_SDK` names (and into
+`WINE_INSTALL_DIR` when set) before it runs, so two checkouts testing at once
+overwrite each other's `d3d9.dll` and `mtld3d.so`, and a game launched from that
+tree meanwhile runs whichever build landed last. `make test ISOLATED=1` avoids
+both: it clones the SDK and the ambient prefix once into `.wine-isolated/`
+inside the checkout (APFS clones, so neither costs space or a prefix boot) and
+points the tools, the install and the prefix at the clones. Use it whenever
+another worktree may be testing or a game is running; a plain `make install`
+still targets the shared trees on purpose, since that is how the game gets a
+build. The clones and the persistent wineserver of the private prefix stay
+behind for the next run; `make clean-isolated` takes them down, and
+`make clean-isolated-all` does so for every worktree of the repository. A failing run
+whose log shows a `d3d9.dll v` stamp that is not your checkout's is that
+collision, not a regression.
+
 Both agent runners configured in this tree already print the conventions digest
 at session start and run `scripts/audit.sh --file` after every edit, so a
 violation surfaces while you write rather than at commit time. The digest at
