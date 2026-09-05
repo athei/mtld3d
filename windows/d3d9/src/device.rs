@@ -2419,10 +2419,12 @@ impl DeviceInner {
     ///
     /// Drain retention queues + GPU-idle wait so the caller can safely
     /// destroy the implicit backbuffer + depth/stencil `MTLTextures` and
-    /// create their replacements. Returns when the encoder has
-    /// acknowledged.
-    pub fn encoder_reset(&self) {
-        self.encoder.reset();
+    /// create their replacements. `retired_textures` names exactly the
+    /// handles the caller destroys once this returns, so the encoder can
+    /// forget them: they never reach the retention queue that prunes every
+    /// other texture. Returns when the encoder has acknowledged.
+    pub fn encoder_reset(&self, retired_textures: Vec<u64>) {
+        self.encoder.reset(retired_textures);
     }
 
     /// Drop the empty `current_frame` left behind by `flush_current_frame_blocking`.
@@ -2563,8 +2565,6 @@ impl DeviceInner {
         );
 
         self.flush_current_frame_blocking();
-        self.encoder_reset();
-
         let old_handles: [u64; 5] = [
             self.backbuffer_handle.raw(),
             self.backbuffer_srgb_handle.raw(),
@@ -2573,6 +2573,9 @@ impl DeviceInner {
             self.depth_stencil_handle.raw(),
         ];
         let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
+        // The same five leave through the same direct destroy a `Reset` uses,
+        // so the encoder is told about them for the same reason.
+        self.encoder_reset(live.clone());
         if !live.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
@@ -4183,10 +4186,11 @@ fn reset_recreate_resources(
     //    no in-flight command buffer references the old backbuffer or
     //    depth/stencil textures we're about to destroy.
     dev.flush_current_frame_blocking();
-    dev.encoder_reset();
-
     // 2. Destroy the old backbuffer + depth/stencil. Bulk thunk so the
-    //    two handles cross the PE/Unix boundary in one call.
+    //    two handles cross the PE/Unix boundary in one call. The encoder is
+    //    handed the same list: these five leave without passing through the
+    //    retention queue, which is where every other texture's handle-keyed
+    //    records are pruned.
     let old_handles: [u64; 5] = [
         dev.backbuffer_handle.raw(),
         dev.backbuffer_srgb_handle.raw(),
@@ -4194,9 +4198,9 @@ fn reset_recreate_resources(
         dev.backbuffer_msaa_srgb_handle.raw(),
         dev.depth_stencil_handle.raw(),
     ];
-    let live_count = old_handles.iter().filter(|&&h| h != 0).count();
-    if live_count > 0 {
-        let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
+    let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
+    dev.encoder_reset(live.clone());
+    if !live.is_empty() {
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
             pad0: 0,
@@ -4298,9 +4302,18 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
     // The depth texture is about to change — drain so no in-flight command
     // buffer references it (matching reset_recreate_resources steps 1-2).
     dev.flush_current_frame_blocking();
-    dev.encoder_reset();
+    // The old surface leaves without passing through the retention queue, so
+    // the encoder is told about it here for the same reason the resizing path
+    // tells it: nothing else prunes the records keyed on its handle.
+    let old_depth = dev.depth_stencil_handle.raw();
+    let retired: Vec<u64> = if had_depth {
+        vec![old_depth]
+    } else {
+        Vec::new()
+    };
+    dev.encoder_reset(retired);
     if had_depth {
-        let handles = [dev.depth_stencil_handle.raw()];
+        let handles = [old_depth];
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
             pad0: 0,

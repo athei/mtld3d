@@ -1537,9 +1537,14 @@ impl PassState {
         // Re-register the back buffer's sRGB twin every frame. `Reset` and an
         // auto-resize replace the pair together and destroy the old view with
         // the old texture, so a registration naming the retired one must not
-        // survive the swap.
-        if self.backbuffer_texture != backbuffer {
-            let stale = self.twin_of(self.backbuffer_texture);
+        // survive the swap. The test is against the incoming view rather than
+        // the incoming texture: Metal hands a freed address straight back to
+        // the next allocation, so the replacement pair can carry the address
+        // the old back buffer had with a view that is a different object, and
+        // the entry the retired view left behind would then resolve any
+        // texture landing on its address to this back buffer.
+        let stale = self.twin_of(self.backbuffer_texture);
+        if stale != backbuffer_srgb {
             self.drop_srgb_twin(stale);
         }
         self.store_srgb_twin(backbuffer_srgb, backbuffer);
