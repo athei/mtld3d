@@ -1404,6 +1404,80 @@ fn create_fullscreen_honors_the_requested_resolution() {
     );
 }
 
+/// Releasing a fullscreen device gives the window back, and a `WM_SIZE` that
+/// arrives while it does must not resize the back buffer of a device being
+/// torn down.
+///
+/// The mode restore is the first thing the release does to the window, and
+/// where the mode-set is real the window manager answers it with a `WM_SIZE`
+/// for the restored window trimmed to the visible frame, delivered inside
+/// the restore call itself, before the device's own window moves are
+/// guarded. Under the test prefix's emulated mode-set nothing answers, so a
+/// second thread stands in for the window manager: a cross-thread
+/// `SendMessage` waits until the window's thread next pumps, which is that
+/// restore. A release that answered the message would destroy the back
+/// buffer, its sRGB twin and the depth texture a second time and leak their
+/// replacements, which is what ended the process on the Intel CI image. The
+/// unix side refuses a destroy of a handle that is no longer live, and a
+/// build with debug assertions ends the process at that refusal, which is
+/// what makes this test fail without the guard.
+#[test]
+fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
+    const WM_SIZE: u32 = 0x0005;
+    if !display_lists_640x480() {
+        return;
+    }
+    let h = Harness::with_depth();
+    let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+    pp.enable_auto_depth_stencil = 1;
+    pp.auto_depth_stencil_format = D3DFMT_D24S8;
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "Reset to fullscreen 640x480"
+    );
+    {
+        let (bb_hr, bb) = h.back_buffer(0).desc();
+        assert_eq!(bb_hr, D3D_OK, "GetDesc on the fullscreen back buffer");
+        assert_eq!(
+            (bb.width, bb.height),
+            (640, 480),
+            "the mode is the back buffer"
+        );
+    }
+
+    // The stand-in for the window manager: a size the back buffer does not
+    // have, sent from another thread so it queues until the release pumps.
+    let hwnd = h.hwnd();
+    let armed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let sender = {
+        let armed = std::sync::Arc::clone(&armed);
+        std::thread::spawn(move || {
+            armed.wait();
+            mtld3d_tests::send_message(hwnd, WM_SIZE, 0, (456 << 16) | 600);
+        })
+    };
+    armed.wait();
+    // Long enough for the sender to reach its `SendMessage` and block there;
+    // a message that arrives after the release is pumped harmlessly below.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    assert_eq!(
+        h.release_device(),
+        0,
+        "the harness held the only device reference"
+    );
+    assert!(h.pump(), "no WM_QUIT expected");
+    sender
+        .join()
+        .expect("the sender thread ends once its message is answered");
+    let rect = h.window_rect();
+    assert!(
+        rect.right - rect.left > 0 && rect.bottom - rect.top > 0,
+        "the window outlived the device: {rect:?}",
+    );
+}
+
 #[test]
 fn fullscreen_window_reasserts_monitor_rect_after_external_resize() {
     if !display_lists_640x480() {
