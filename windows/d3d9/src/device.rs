@@ -1984,7 +1984,9 @@ impl DeviceInner {
     /// Drop a `TextureInner` from the live-texture registry.
     ///
     /// Called from `texture_release`'s rc→0 path **before** the inner Box is
-    /// freed, so the registry never holds a dangling pointer.
+    /// freed, so the registry never holds a dangling pointer, and from
+    /// `texture::rehydrate_for_device` for the device a texture migrates off,
+    /// which is the only other way an entry stops belonging here.
     pub fn deregister_texture(&self, ti: *mut TextureInner) {
         let mut live = self
             .live_textures
