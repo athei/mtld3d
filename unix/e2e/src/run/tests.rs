@@ -57,6 +57,37 @@ fn a_process_that_closes_stdout_and_never_exits_is_killed_and_reported_hung() {
 }
 
 #[test]
+fn a_killed_process_whose_survivor_holds_stderr_costs_the_grace_not_the_timeout() {
+    // The script goes silent, so the watchdog kills its group; the perl
+    // child moved itself to a group of its own first and keeps stderr open
+    // past the kill, as Wine's debugger does after a crash.
+    let path = script(
+        "escaped",
+        "echo start\necho early >&2\n(perl -e 'setpgrp(0,0); sleep 30' >/dev/null) &\nsleep 30\n",
+    );
+    let timeout = Duration::from_secs(2);
+    let (exit, elapsed, lines) = run_script(&path, timeout);
+    assert_eq!(exit.kind, ExitKind::TimedOut(timeout));
+    assert_eq!(lines, ["start"]);
+    assert!(
+        exit.stderr.starts_with("early\n"),
+        "stderr: {:?}",
+        exit.stderr
+    );
+    assert!(
+        exit.stderr.contains("stderr not collected in full"),
+        "stderr: {:?}",
+        exit.stderr
+    );
+    // One timeout for the silence, the grace for stderr, and slack; the old
+    // shape paid the timeout twice.
+    assert!(
+        elapsed < timeout + Duration::from_secs(2),
+        "took {elapsed:?}"
+    );
+}
+
+#[test]
 fn a_descendant_holding_stderr_does_not_park_the_run() {
     // The script exits at once; its background child keeps stderr open.
     let path = script("holder", "echo done\n(sleep 30 >/dev/null) &\nexit 0\n");
