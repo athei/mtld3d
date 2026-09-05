@@ -280,6 +280,7 @@ extern "system" fn ib_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -300,6 +301,7 @@ extern "system" fn ib_query_interface(
 }
 
 extern "system" fn ib_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: IDirect3DIndexBuffer9 IUnknown AddRef thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -307,6 +309,7 @@ extern "system" fn ib_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn ib_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: IDirect3DIndexBuffer9 IUnknown Release thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -399,6 +402,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DIndexBuffer9 {
 // ── IDirect3DResource9 ──
 
 extern "system" fn ib_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per its ABI, and `device` is
     // the caller's out-param.
@@ -412,6 +416,7 @@ extern "system" fn ib_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -433,6 +438,7 @@ extern "system" fn ib_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -448,6 +454,7 @@ extern "system" fn ib_get_private_data(
 }
 
 extern "system" fn ib_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -461,6 +468,7 @@ extern "system" fn ib_free_private_data(this: *mut c_void, guid: *const Guid) ->
 }
 
 extern "system" fn ib_set_priority(this: *mut c_void, _priority: u32) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
@@ -470,6 +478,7 @@ extern "system" fn ib_set_priority(this: *mut c_void, _priority: u32) -> u32 {
 }
 
 extern "system" fn ib_get_priority(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
@@ -479,6 +488,7 @@ extern "system" fn ib_get_priority(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn ib_pre_load(this: *mut c_void) {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // See IDirect3DTexture9::PreLoad — Metal has no resident-set hint.
     mtld3d_shared::log_once_info!(
@@ -488,6 +498,7 @@ extern "system" fn ib_pre_load(this: *mut c_void) {
 }
 
 extern "system" fn ib_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     D3DRTYPE_INDEXBUFFER
 }
@@ -501,6 +512,7 @@ extern "system" fn ib_lock(
     pp_data: *mut *mut c_void,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     if pp_data.is_null() {
         return D3DERR_INVALIDCALL;
@@ -686,6 +698,7 @@ extern "system" fn ib_lock(
 }
 
 extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DIndexBuffer9>::opt(this) }) else {
@@ -774,6 +787,7 @@ fn release_backing_after_upload(inner: &mut IndexBufferInner) {
 }
 
 extern "system" fn ib_get_desc(this: *mut c_void, desc: *mut D3DINDEXBUFFER_DESC) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
     if desc.is_null() {
         return D3DERR_INVALIDCALL;

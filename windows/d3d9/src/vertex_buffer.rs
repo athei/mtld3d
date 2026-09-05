@@ -362,6 +362,7 @@ extern "system" fn vb_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -382,6 +383,7 @@ extern "system" fn vb_query_interface(
 }
 
 extern "system" fn vb_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: IDirect3DVertexBuffer9 IUnknown AddRef thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -389,6 +391,7 @@ extern "system" fn vb_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn vb_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: IDirect3DVertexBuffer9 IUnknown Release thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -487,6 +490,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DVertexBuffer9 {
 // ── IDirect3DResource9 ──
 
 extern "system" fn vb_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per its ABI, and `device` is
     // the caller's out-param.
@@ -500,6 +504,7 @@ extern "system" fn vb_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -521,6 +526,7 @@ extern "system" fn vb_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -536,6 +542,7 @@ extern "system" fn vb_get_private_data(
 }
 
 extern "system" fn vb_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -553,6 +560,7 @@ extern "system" fn vb_free_private_data(this: *mut c_void, guid: *const Guid) ->
 // Metal has no eviction-order hint, so the value is stored and round-tripped
 // but never acted upon.
 extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVertexBuffer9>::opt(this) }) else {
@@ -566,6 +574,7 @@ extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
 }
 
 extern "system" fn vb_get_priority(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DVertexBuffer9>::opt(this) }) else {
@@ -575,6 +584,7 @@ extern "system" fn vb_get_priority(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn vb_pre_load(this: *mut c_void) {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // See IDirect3DTexture9::PreLoad — Metal has no resident-set hint.
     mtld3d_shared::log_once_info!(
@@ -584,6 +594,7 @@ extern "system" fn vb_pre_load(this: *mut c_void) {
 }
 
 extern "system" fn vb_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     D3DRTYPE_VERTEXBUFFER
 }
@@ -615,6 +626,7 @@ extern "system" fn vb_lock(
     pp_data: *mut *mut c_void,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     if pp_data.is_null() {
         return D3DERR_INVALIDCALL;
@@ -814,6 +826,7 @@ extern "system" fn vb_lock(
 }
 
 extern "system" fn vb_unlock(this: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexBuffer9 per ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVertexBuffer9>::opt(this) }) else {
@@ -906,6 +919,7 @@ fn release_backing_after_upload(inner: &mut VertexBufferInner) {
 }
 
 extern "system" fn vb_get_desc(this: *mut c_void, desc: *mut D3DVERTEXBUFFER_DESC) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
     if desc.is_null() {
         return D3DERR_INVALIDCALL;

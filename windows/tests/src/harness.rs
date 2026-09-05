@@ -117,6 +117,8 @@ pub struct Harness {
     height: Cell<u32>,
     back_buffer_format: u32,
     depth_format: Option<u32>,
+    /// `CreateDevice` behaviour flags the device was created with.
+    behavior_flags: u32,
     present_flags: u32,
     /// `D3DMULTISAMPLE_TYPE` the swap chain was created with, carried into `reset`.
     multi_sample_type: u32,
@@ -188,6 +190,7 @@ impl Harness {
             height: Cell::new(0),
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
+            behavior_flags: 0,
             present_flags: 0,
             multi_sample_type: 0,
         }
@@ -237,6 +240,7 @@ impl Harness {
             height: Cell::new(cfg.height),
             back_buffer_format: cfg.back_buffer_format,
             depth_format: cfg.depth_format,
+            behavior_flags: cfg.behavior_flags,
             present_flags: cfg.present_flags,
             multi_sample_type: cfg.multi_sample_type,
         }
@@ -260,6 +264,12 @@ impl Harness {
     #[must_use]
     pub const fn hwnd(&self) -> usize {
         self.hwnd
+    }
+
+    /// The `CreateDevice` behaviour flags (`D3DCREATE_*`) the device was created with.
+    #[must_use]
+    pub const fn behavior_flags(&self) -> u32 {
+        self.behavior_flags
     }
 
     /// Current backbuffer dimensions (tracks `reset`).

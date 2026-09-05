@@ -25,6 +25,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Multisampling at 2x and 4x, 8x where the device offers it.
 - Windowed and fullscreen swap chains, mode enumeration, hardware and software
   cursors, MetalFX upscaling, HDR output.
+- `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
+  creates, may be called from any thread; each entry point holds a reentrant
+  per-device lock, and a device created without the flag pays nothing.
 
 ## Not implemented yet
 

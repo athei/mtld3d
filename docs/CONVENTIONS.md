@@ -23,6 +23,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `mod.rs` files = 0 | §Module style |
 | Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
 | Every `windows/tests/tests/*.rs` file has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
+| Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -53,6 +54,10 @@ Do not write, in any comment:
 - **A tooling signal or a reference to a private note** (`project_*`, `feedback_*`), or an absolute `/Users/...` path.
 
 **Wine itself is not on this list, and never will be.** mtld3d *is* a d3d9 layer *for* Wine: SEH/NTSTATUS, the unix-call boundary, `macdrv`, `wineserver`, `winebuild`, `server/thread.c`, and Wine's own d3d9 source all document the real host, and they belong in the source. The ban is on the *competing implementation* and on the *test suite cited as provenance* — not on the runtime this thing is built to live inside.
+
+## Every device entry point holds the API lock
+
+A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
 
 ## Factor pure functionality into `mtld3d-core`; `d3d9` is wiring
 

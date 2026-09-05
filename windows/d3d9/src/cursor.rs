@@ -34,7 +34,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL,
-    device::{DeviceInner, Direct3DDevice9, device_timer},
+    device::{DeviceInner, Direct3DDevice9, device_api_lock, device_timer},
     fullscreen::set_window_long_ptr,
     unix_call::unix_call,
 };
@@ -741,6 +741,7 @@ pub extern "system" fn device_set_cursor_properties(
     y_hotspot: u32,
     cursor_bitmap: *mut c_void,
 ) -> i32 {
+    let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     if cursor_bitmap.is_null() {
         warn!(target: LOG_TARGET, "reject SetCursorProperties(null bitmap) → INVALIDCALL");
@@ -923,6 +924,7 @@ pub extern "system" fn device_set_cursor_properties(
 }
 
 pub extern "system" fn device_set_cursor_position(this: *mut c_void, x: i32, y: i32, _flags: u32) {
+    let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     // The pre-check earns its keep: a `SetCursorPos` to the current position
     // still queues a `WM_MOUSEMOVE`, so skipping it keeps the game's message
@@ -961,6 +963,7 @@ pub extern "system" fn device_set_cursor_position(this: *mut c_void, x: i32, y: 
 }
 
 pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
+    let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -1053,6 +1056,18 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
 
 // ── Window-proc subclass ──
 
+/// The subclass window procedure: runs on the window thread, outside the device `ApiLock`.
+///
+/// A thunk holding the lock inside `Reset` or a fullscreen transition sends
+/// this thread synchronous messages (`SetWindowPos`, `ShowWindow`); a window
+/// thread blocked here on the lock would wait on that thunk while the thunk
+/// waits on it. Native D3D9's `D3DCREATE_MULTITHREADED` critical section has
+/// the same hole, and applications keep the window thread out of D3D calls
+/// during `Reset`, so this is parity rather than a gap. What runs unlocked:
+/// the cursor latches on `WM_SETCURSOR` and `WM_ACTIVATE*`, the fullscreen
+/// window lookup, and the auto-resize on `WM_SIZE`, which flushes the current
+/// frame; a user resize on this thread while another thread draws under the
+/// flag is the residual.
 extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
     // Resolve the owning device for *this* window. A window may still be
     // subclassed briefly after its device's entry is removed (or never have

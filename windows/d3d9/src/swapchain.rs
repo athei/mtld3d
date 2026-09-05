@@ -141,6 +141,7 @@ extern "system" fn swapchain_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
@@ -159,6 +160,7 @@ extern "system" fn swapchain_query_interface(
 }
 
 extern "system" fn swapchain_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: IDirect3DSwapChain9 IUnknown AddRef thunk; the D3D9 ABI guarantees
     // `this` is the live wrapper for the call. The engine forwards the device
     // reference for the device-owned implicit swapchain on its 0→1 transition.
@@ -166,6 +168,7 @@ extern "system" fn swapchain_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn swapchain_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: IDirect3DSwapChain9 IUnknown Release thunk; the D3D9 ABI guarantees
     // `this` is the live wrapper for the call. The engine frees an app-owned
     // additional swapchain on its 1→0 transition and forwards the device release
@@ -235,6 +238,7 @@ extern "system" fn swapchain_present(
     _dirty_region: *const c_void,
     _flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -253,7 +257,7 @@ extern "system" fn swapchain_get_front_buffer_data(
     this: *mut c_void,
     _surface: *mut c_void,
 ) -> i32 {
-    let _ = this;
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DSwapChain9::GetFrontBufferData → INVALIDCALL");
     D3DERR_INVALIDCALL
 }
@@ -264,6 +268,7 @@ extern "system" fn swapchain_get_back_buffer(
     _type: u32,
     back_buffer: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     if back_buffer.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -299,8 +304,10 @@ extern "system" fn swapchain_get_back_buffer(
     // stable, so a `Release`-to-0-then-`AddRef` no longer reuses a freed wrapper.
     // There is one Metal drawable, so it aliases the device backbuffer (resolved
     // live, like the device's implicit RT) and `this` is its `GetContainer`.
-    // SAFETY: `obj.inner` is the live `SwapChainInner`; D3D9 is single-threaded,
-    // so the transient exclusive borrow to lazily cache the backbuffer is sound.
+    // SAFETY: `obj.inner` is the live `SwapChainInner`; access is exclusive
+    // (D3D9 objects are single-threaded, or serialised by the device `ApiLock`
+    // under `D3DCREATE_MULTITHREADED`), so the transient exclusive borrow to
+    // lazily cache the backbuffer is sound.
     let inner_mut = unsafe { &mut *obj.inner };
     if inner_mut.backbuffer_surface == 0 {
         let surf = Direct3DSurface9::new_implicit_backbuffer(inner_mut.device_inner, this as u64);
@@ -318,12 +325,13 @@ extern "system" fn swapchain_get_back_buffer(
 }
 
 extern "system" fn swapchain_get_raster_status(this: *mut c_void, _status: *mut c_void) -> i32 {
-    let _ = this;
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DSwapChain9::GetRasterStatus → INVALIDCALL");
     D3DERR_INVALIDCALL
 }
 
 extern "system" fn swapchain_get_display_mode(this: *mut c_void, mode: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     if mode.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -345,6 +353,7 @@ extern "system" fn swapchain_get_display_mode(this: *mut c_void, mode: *mut c_vo
 }
 
 extern "system" fn swapchain_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSwapChain9 per the ABI.
     unsafe { crate::com_ref::com_get_device::<Direct3DSwapChain9>(this, device) }
 }
@@ -353,6 +362,7 @@ extern "system" fn swapchain_get_present_parameters(
     this: *mut c_void,
     parameters: *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
     if parameters.is_null() {
         return D3DERR_INVALIDCALL;
     }
