@@ -2551,13 +2551,14 @@ fn get_dc_on_an_odd_width_16_bit_lockable_render_target_reaches_the_last_row() {
 
 #[test]
 fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
-    // A lockable render target is CPU-addressable at the extent D3D9 reports,
-    // so it declines `render.scale` even at the back buffer's own size, which
-    // is what earns an ordinary render target the scale. Its staging, the
-    // read-back that fills it and the upload that pushes it back all address
-    // that one extent, and so does every path that binds or fills it, so the
-    // probes below sit on the far corner a scaled texture would not reach.
-    // Runs at any `render.scale`: the coordinates are the reported ones.
+    // A lockable render target created at the back buffer's own size takes the
+    // scale like any other, since a depth-stencil of that size does too and the
+    // pair has to rasterize on one grid. What stays at the reported extent is
+    // its CPU staging: the read-back that fills it resolves the texture up and
+    // the upload that pushes it back resamples down, so every path that binds,
+    // fills, reads or writes it addresses the far corner the reported extent
+    // has. Runs at any `render.scale`: the coordinates are the reported ones,
+    // and every probe is on a flat fill a resample reproduces exactly.
     let h = Harness::new();
     let (w, height) = h.dims();
     let bb = h.render_target(0);
@@ -4103,6 +4104,133 @@ fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
         (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
         "the resolved depth (0.25) samples back as dark gray, got {center:?}"
     );
+
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+}
+
+#[test]
+fn resz_resolve_keeps_the_depth_gradient_under_a_render_scale() {
+    // The RESZ round trip out of the pair that has to rasterize on one grid: a
+    // lockable render target created at the reported back-buffer size, with a
+    // depth-stencil surface of that size bound beside it. The scale is pinned
+    // here so the pair runs at it in every test run rather than only in the
+    // scaled sweep.
+    //
+    // A gradient rather than one flat depth, because that is what separates
+    // the two spaces: depth written on one grid and sampled on another comes
+    // back multiplied by the ratio between them, which a constant cannot show.
+    // Depth runs 0 at the left edge to 1 at the right, so the value sampled
+    // back at column x is x / 640 whatever the frame is rasterized at.
+    let h = Harness::create(&HarnessConfig {
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
+
+    let depth_dst = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let lockable_rt = h.create_lockable_render_target(640, 480, D3DFMT_A8R8G8B8);
+    let depth_surface = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+
+    // Pass 1: write the gradient into the depth surface through the FF pipeline.
+    assert_eq!(h.set_render_target(0, &lockable_rt), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth_surface), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let ramp = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: x.mul_add(0.5, 0.5),
+        color: WHITE,
+    };
+    let gradient = [
+        ramp(-1.0, 1.0),
+        ramp(1.0, 1.0),
+        ramp(-1.0, -1.0),
+        ramp(1.0, 1.0),
+        ramp(1.0, -1.0),
+        ramp(-1.0, -1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &gradient),
+        0,
+        "depth gradient draw"
+    );
+
+    // The resolve: destination at stage 0, then the magic POINTSIZE write.
+    assert_eq!(h.set_texture(0, &depth_dst), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0
+    );
+
+    // Pass 2: sample the resolve destination across the whole frame, into the
+    // back buffer, which is what `read_pixel` reads.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the resolved copy"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Columns well inside the frame, so neither the resolve back up to the
+    // reported resolution nor point sampling can move a probe across a
+    // meaningful step of the ramp.
+    for x in [80_u32, 240, 400, 560] {
+        let expected = (x * 255 + 320) / 640;
+        let got = Rgba8::from_pixel(h.read_pixel(x, 240));
+        assert!(
+            got.r.abs_diff(u8::try_from(expected).unwrap_or(255)) <= 4,
+            "the resolved depth at column {x} samples back as {expected}, got {got:?}"
+        );
+    }
 
     assert_eq!(h.clear_pixel_shader(), 0);
     assert_eq!(h.clear_texture(0), 0);

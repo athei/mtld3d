@@ -431,7 +431,6 @@
   visual.c:16129 count=4
   visual.c:16131 count=4
   visual.c:16433 count=2
-  visual.c:17946 count=3
   visual.c:19210 count=1
   visual.c:19217 count=1
   visual.c:19232 count=1
@@ -872,7 +871,6 @@
   visual.c:16129 count=4
   visual.c:16131 count=4
   visual.c:16433 count=2
-  visual.c:17946 count=3
   visual.c:19210 count=1
   visual.c:19217 count=1
   visual.c:19232 count=1

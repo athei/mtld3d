@@ -894,9 +894,10 @@ impl DeviceInner {
     ///
     /// Only render targets and depth-stencils qualify. A surface the game
     /// uploads pixels into has a CPU-side layout that must keep matching what
-    /// D3D9 reports, and a lockable render target is one of those: its CPU
-    /// staging, the read-back that fills it and the upload that pushes it back
-    /// all address the extent D3D9 reports, so its caller passes `false`.
+    /// D3D9 reports, so its caller passes `false`. A lockable render target is
+    /// not one of those: it is still bound and drawn into, so it takes the
+    /// scale and its staging resamples past its texture, the way the lockable
+    /// back buffer's does.
     pub const fn scale_for_created_target(
         &self,
         width: u32,
@@ -5527,15 +5528,13 @@ fn resolve_surface_multi_sample(
 /// `multi_sample` is the already-resolved `(type, quality)` pair: the sample
 /// count plus the D3D9 type the surface reports from `GetDesc`. Above one
 /// sample the create also produces the multisampled companion the passes
-/// attach. `lockable` says the surface is getting a CPU staging buffer, which
-/// fixes its texture at the extent D3D9 reports.
+/// attach.
 struct ColorTargetSpec {
     width: u32,
     height: u32,
     format: u32,
     usage: u32,
     multi_sample: SurfaceMultiSample,
-    lockable: bool,
 }
 
 /// Create a persistent render-target-capable color `MTLTexture` and wrap it as a surface.
@@ -5559,7 +5558,6 @@ fn create_color_target_surface(
         format,
         usage,
         multi_sample,
-        lockable,
     } = spec;
     let mapping = crate::direct3d9::map_for_device(format, expand_packed16)?;
     if mapping.is_compressed() {
@@ -5610,18 +5608,20 @@ fn create_color_target_surface(
     // so `GetDesc` and every coordinate the game supplies stay logical.
     // `D3DUSAGE_RENDERTARGET` gates it: this fn also serves
     // `CreateOffscreenPlainSurface`, whose pixels the game reads and writes at
-    // the size it asked for. `lockable` takes a render target out of the same
-    // rule for the same reason: the game reads and writes it through a CPU
-    // staging laid out at the extent D3D9 reports, so its texture is created at
-    // that extent and every blit between the two addresses one size. The scale
-    // is stored on the surface, so every consumer of it reads the answer back
-    // rather than re-deriving the rule.
+    // the size it asked for. A lockable render target is not an exception: it
+    // is bound and drawn into like any other, and a depth-stencil of the same
+    // size scales whatever it is paired with, so a target that kept its
+    // reported extent would rasterize against an attachment three quarters its
+    // size. Its CPU staging stays at the reported extent instead, and the two
+    // resample past each other the way the lockable back buffer's do. The
+    // scale is stored on the surface, so every consumer of it reads the answer
+    // back rather than re-deriving the rule.
     // SAFETY: `device_inner` is the live owning device, non-null for every
     // caller of this fn (they hold it from the device thunk).
     let scale = unsafe { &*device_inner }.scale_for_created_target(
         width,
         height,
-        usage & D3DUSAGE_RENDERTARGET != 0 && !lockable,
+        usage & D3DUSAGE_RENDERTARGET != 0,
     );
     let mut params = CreateColorTargetParams {
         device_handle,
@@ -5730,14 +5730,10 @@ extern "system" fn device_create_render_target(
     // gets a CPU staging buffer: `LockRect` maps it, `UnlockRect` uploads it to
     // the colour texture. It is sized at the same row pitch every host-visible
     // surface store uses, so `LockRect`, the GPU read-back and the DIB a
-    // `GetDC` wraps around it all step by the same stride. The size is resolved
-    // before the create so the texture and the staging agree on what this
-    // surface is: it is a lockable render target exactly when the staging
-    // exists, and that is what decides whether the texture takes `render.scale`.
-    // A format with no CPU byte size sizes it at zero and is rejected by the
-    // create just below (a lockable render target is an uncompressed colour
-    // format), so every surface that survives the create carries the staging it
-    // asked for.
+    // `GetDC` wraps around it all step by the same stride. A format with no CPU
+    // byte size sizes it at zero and is rejected by the create just below (a
+    // lockable render target is an uncompressed colour format), so every
+    // surface that survives the create carries the staging it asked for.
     let staging_bytes = if lockable == 0 {
         0
     } else {
@@ -5753,7 +5749,6 @@ extern "system" fn device_create_render_target(
             format,
             usage: D3DUSAGE_RENDERTARGET,
             multi_sample,
-            lockable: staging_bytes != 0,
         },
         obj.inner().config().expand_packed16,
     ) else {
