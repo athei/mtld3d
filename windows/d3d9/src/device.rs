@@ -92,8 +92,8 @@ use super::{
         arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
     },
     encoder::{
-        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameDataFlags, FrameEncoder,
-        FrameInit, Op, StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
+        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameEncoder, FrameInit, Op,
+        StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -1451,18 +1451,10 @@ impl DeviceInner {
         // An F12 run ends with the frame the closing `Present` submits. A
         // mid-frame flush sends the marked frame out early, so its stop mark
         // moves onto the continuation; the start mark stays with the first
-        // piece, the encoder keeps capturing until it sees the stop.
-        // `reseed_current_frame` (Reset) replaces the continuation without
-        // passing through here, so a Reset inside a dumped run drops the
-        // migrated stop and the capture ends with the process instead.
-        if no_present
-            && frame
-                .gpu_capture_marks()
-                .contains(FrameDataFlags::GPU_CAPTURE_STOP)
-        {
-            frame.clear_gpu_capture_stop();
-            self.current_frame
-                .mark_gpu_capture(FrameDataFlags::GPU_CAPTURE_STOP);
+        // piece, and the encoder keeps capturing until it sees the stop.
+        if no_present {
+            let carried = frame.take_carried_capture_marks(true);
+            self.current_frame.mark_gpu_capture(carried);
         }
         // Pre-reserve the new frame's ops Vec to the running peak so
         // it never reallocs in steady-state — and so that a post-burst
@@ -2415,7 +2407,14 @@ impl DeviceInner {
     /// flush baked into `current_frame` and the unix-side `submit_frame`
     /// would dereference the freed `MTLTextures`.
     pub fn reseed_current_frame(&mut self) {
+        // The replaced frame is dropped rather than submitted, so an F12 run
+        // in progress hands its marks to the fresh one: without that the
+        // encoder never sees the run's stop and the capture ends only with
+        // the process. Every reseed follows a flush, which already sent the
+        // start out with the piece it submitted, so this is the stop.
+        let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
+        self.current_frame.mark_gpu_capture(carried);
         // Reseeding restores the default RT/depth bindings, so any prior
         // explicit `SetDepthStencilSurface(NULL)` override no longer applies.
         self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
