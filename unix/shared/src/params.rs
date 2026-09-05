@@ -46,6 +46,7 @@ const _: () = {
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
+    assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
@@ -243,6 +244,26 @@ pub struct AttachMetalLayerParams {
 
 impl Thunk for AttachMetalLayerParams {
     const CODE: u32 = Thunks::AttachMetalLayer as u32;
+}
+
+/// Retire one metal view: its attachment record first, then the view itself.
+///
+/// The counterpart of `AttachMetalLayer` for a device that keeps running. A
+/// `Reset` naming another `hDeviceWindow` sends this for the view it is
+/// leaving and attaches a fresh one on the new window, so the device presents
+/// into the window its presentation parameters name. Device teardown does the
+/// same work inside `DestroyCommandQueue`, which owns the queue and the
+/// device as well and has to fence between the two halves.
+///
+/// A view with no attachment record, and the null handle a device that never
+/// attached carries, are both no-ops.
+#[repr(C, align(8))]
+pub struct DetachMetalLayerParams {
+    pub view_handle: MetalHandle<NSViewKind>, // in
+}
+
+impl Thunk for DetachMetalLayerParams {
+    const CODE: u32 = Thunks::DetachMetalLayer as u32;
 }
 
 /// Wanted state of the software cursor overlay: which sprite, and whether it shows.

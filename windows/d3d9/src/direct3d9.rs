@@ -14,7 +14,7 @@ use mtld3d_shared::{
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
     mtl::DeviceCapsFlags,
-    mtl_handle::{MTLTextureKind, NSViewKind},
+    mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
@@ -1399,7 +1399,7 @@ extern "system" fn d3d9_create_device(
     // The words the unix side publishes into for this device, boxed so their
     // addresses hold for the device's lifetime; owned by its cursor state.
     let display_sinks = Box::new(crate::cursor::DisplaySinks::new());
-    let layer_params = attach_metal_layer(hwnd, &cq_params, &pp, cfg, &display_sinks);
+    let layer_params = attach_metal_layer(hwnd, cq_params.device_handle, &pp, cfg, &display_sinks);
 
     // A still-zero dimension here (no usable client rect, or a fullscreen
     // request with zero dims) would abort Metal's texture validation. Reject
@@ -1631,9 +1631,9 @@ extern "system" fn d3d9_create_device(
 /// `CreateDevice` treats as "no presentation surface" rather than an error.
 /// Failures to attach when an HWND is present are also non-fatal: the device
 /// works, but Present is a no-op.
-fn attach_metal_layer(
+pub fn attach_metal_layer(
     hwnd: u64,
-    cq: &CreateCommandQueueParams,
+    device_handle: MetalHandle<MTLDeviceKind>,
     pp: &D3DPRESENT_PARAMETERS,
     cfg: &Mtld3dConfig,
     sinks: &crate::cursor::DisplaySinks,
@@ -1641,7 +1641,7 @@ fn attach_metal_layer(
     let display_sync_enabled = crate::device::resolve_display_sync(pp.presentation_interval);
     let mut layer_params = AttachMetalLayerParams {
         hwnd,
-        device_handle: cq.device_handle,
+        device_handle,
         width: pp.back_buffer_width,
         height: pp.back_buffer_height,
         view_handle: MetalHandle::NULL,

@@ -1212,6 +1212,26 @@ const fn fullscreen_params(hwnd: usize, width: u32, height: u32) -> D3DPRESENT_P
     }
 }
 
+/// The same shape as [`fullscreen_params`], windowed.
+const fn windowed_params(hwnd: usize, width: u32, height: u32) -> D3DPRESENT_PARAMETERS {
+    D3DPRESENT_PARAMETERS {
+        back_buffer_width: width,
+        back_buffer_height: height,
+        back_buffer_format: D3DFMT_X8R8G8B8,
+        back_buffer_count: 1,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        swap_effect: D3DSWAPEFFECT_DISCARD,
+        device_window: hwnd,
+        windowed: 1,
+        enable_auto_depth_stencil: 0,
+        auto_depth_stencil_format: 0,
+        flags: 0,
+        full_screen_refresh_rate_in_hz: 0,
+        presentation_interval: 0,
+    }
+}
+
 #[test]
 fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     if !display_lists_640x480() {
@@ -1481,6 +1501,113 @@ fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
         second_rect,
         "leaving fullscreen gives back the window the device presented into",
     );
+    destroy_window(second);
+}
+
+/// A windowed `Reset` naming another device window moves the device onto it.
+///
+/// The presentation surface and the window subclass are both bound to the
+/// window `CreateDevice` attached, and `Reset` re-specifies the swap chain on
+/// the window its parameters name. The subclass is the observable half: after
+/// the retarget a `WM_SIZE` on the new window resizes the back buffer, and one
+/// on the window the device came from no longer reaches it.
+#[test]
+fn reset_windowed_retarget_moves_the_device_onto_the_new_window() {
+    const WM_SIZE: u32 = 0x0005;
+    // The client size each WM_SIZE announces, as lparam's low and high words.
+    let (new_width, new_height): (isize, isize) = (400, 300);
+    let (old_width, old_height): (isize, isize) = (320, 200);
+    let h = Harness::new();
+    let second = create_window(640, 480, false);
+
+    let mut pp = windowed_params(second, 640, 480);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "windowed Reset onto a second device window",
+    );
+
+    // lparam = client height << 16 | width, the shape macdrv posts.
+    let _ = mtld3d_tests::send_message(second, WM_SIZE, 0, (new_height << 16) | new_width);
+    {
+        let (bb_hr, bb) = h.back_buffer(0).desc();
+        assert_eq!(bb_hr, D3D_OK, "GetDesc after the resize of the new window");
+        assert_eq!(
+            (bb.width, bb.height),
+            (400, 300),
+            "a WM_SIZE on the new device window resizes the back buffer",
+        );
+    }
+
+    let _ = h.send_window_message(WM_SIZE, 0, (old_height << 16) | old_width);
+    {
+        let (bb_hr, bb) = h.back_buffer(0).desc();
+        assert_eq!(bb_hr, D3D_OK, "GetDesc after the resize of the old window");
+        assert_eq!(
+            (bb.width, bb.height),
+            (400, 300),
+            "the window the device left no longer resizes it",
+        );
+    }
+
+    // The frame goes through the layer the retarget attached, so a released or
+    // stale one is a failing Present or a readback of the wrong buffer rather
+    // than a silent no-op.
+    h.render_once(0xFF20_4060, |_| {});
+    assert_pixel_eq(
+        h.read_pixel(8, 8),
+        0xFF20_4060,
+        "the frame presented after the retarget",
+    );
+
+    // The device holds the subclass and the metal view of the second window,
+    // so it goes first.
+    drop(h);
+    destroy_window(second);
+}
+
+/// The cursor subclass follows a windowed `Reset` onto another device window.
+///
+/// `WM_SETCURSOR` on the window the device presents into has to reach the
+/// device's cursor state: the pointer over that window otherwise keeps the
+/// class cursor while the bitmap the application set through
+/// `SetCursorProperties` is realized on a window it stopped drawing in.
+#[test]
+fn reset_windowed_retarget_moves_the_cursor_subclass() {
+    const WM_SETCURSOR: u32 = 0x0020;
+    /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
+    const WM_MOUSEMOVE_LP: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    let h = Harness::new();
+    let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
+
+    {
+        let bitmap = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+    }
+    assert_eq!(h.show_cursor(true), 0, "cursor starts hidden");
+    let ours = h.thread_cursor();
+    assert_ne!(ours, 0, "ShowCursor(TRUE) must realize an HCURSOR");
+
+    let second = create_window(640, 480, false);
+    let mut pp = windowed_params(second, 640, 480);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "windowed Reset onto a second device window",
+    );
+
+    // `Reset` clobbers device state, not the cursor the application set, so
+    // the bitmap and its visibility are still the device's.
+    h.set_thread_cursor(0);
+    let _ = mtld3d_tests::send_message(second, WM_SETCURSOR, second, lp_client_move);
+    assert_eq!(
+        h.thread_cursor(),
+        ours,
+        "WM_SETCURSOR on the new device window must reach the device's cursor",
+    );
+
+    drop(h);
     destroy_window(second);
 }
 

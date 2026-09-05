@@ -76,6 +76,7 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::WriteLog => arp!(handlers::write_log_handler),
         Thunks::OpenLog => arp!(handlers::open_log_handler),
         Thunks::SetCursorOverlay => arp!(handlers::set_cursor_overlay_handler),
+        Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
     }
 }
 

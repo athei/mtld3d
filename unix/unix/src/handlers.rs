@@ -7,11 +7,11 @@ use mtld3d_shared::{
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
     CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
-    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut, MetalHandle, OpenLogParams,
-    SetCursorOverlayParams, SetDisplaySyncEnabledParams, StartGpuCaptureParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
-    WriteLogParams, identity,
+    DestroyResourcesBulkParams, DetachMetalLayerParams, EnsureBlitPipelineParams,
+    EnsureClearQuadPipelineParams, GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut,
+    MetalHandle, OpenLogParams, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
+    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -224,6 +224,27 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         );
         STATUS_UNSUCCESSFUL
     }
+}
+
+/// `DetachMetalLayer`: retire one view's attachment record, then the view.
+///
+/// The order is the one `DestroyCommandQueue` uses: the record goes out of
+/// the registry before the view it names is released, so the process-lifetime
+/// observers never walk a freed view. Sent by a `Reset` that retargets the
+/// device at another window, which attaches a fresh view straight after.
+pub extern "C" fn detach_metal_layer_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const DetachMetalLayerParams.
+    let Some(params) = (unsafe { InPtr::<DetachMetalLayerParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    metal::detach_metal_layer(params.view_handle);
+    metal::release_metal_view(params.view_handle);
+    info!(
+        target: LOG_TARGET,
+        "detached Metal layer (view {:#x})",
+        params.view_handle.raw(),
+    );
+    STATUS_SUCCESS
 }
 
 /// `SetCursorOverlay`: the software cursor's wanted sprite and visibility.

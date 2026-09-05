@@ -198,6 +198,14 @@ record. A knob, where one makes sense, is named with its default.
   itself. An indexed triangle fan on a released index buffer copies it back
   off the GPU once, at one mid-frame GPU wait. Knob: `buffer.ignoreLockBounds`
   keeps the copy, default `false`.
+- **The window procedure mtld3d subclasses is the device window's, and it
+  follows a `Reset` that names another one.** D3D9 subclasses the focus
+  window and leaves that subclass where it is across a retarget. Our hook is
+  what realizes the D3D9 cursor over the client area and what keeps a windowed
+  back buffer matching the client rect, so it belongs on the window the device
+  presents into rather than on the one that holds focus. Sites: `test_wndproc`
+  and `test_wndproc_windowed` for where the hook sits,
+  `test_device_window_reset` for its following a retarget, all below. No knob.
 - **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
@@ -359,7 +367,9 @@ depth-to-depth `StretchRect` resolved a multisampled source, so its cluster
 leaves this document too. 2026-09-06: a fullscreen `Reset` that names another
 device window hands the session over instead of giving the old window back,
 so test_device_window_reset 5968 passes and that cluster leaves the document
-as well.) Only two tags change what the gate tolerates:
+as well; retargeting the Metal layer and the cursor subclass onto that window
+in the same `Reset` then added 5975 and 5978, the same window-procedure
+decision test_wndproc already records, and the cluster comes back for them.) Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
@@ -656,6 +666,21 @@ Sites: 14390=expected 14391=expected
 and expects `GetDisplayMode` to answer it; the paravirtual display refuses
 the mode (see `test_mode_change` above) and the answer stays the desktop
 mode. The same scope decision as the desktop-mode cluster.
+
+### device.c/test_device_window_reset
+Sites: 5975=expected 5978=expected
+
+Both read the window procedures after a `Reset` that retargets a fullscreen
+device from the focus window onto a separate device window: the device
+window's must be the application's own (5975) and the focus window's must
+still be D3D9's (5978). Native subclasses the focus window and leaves it
+there across the retarget. Ours is the cursor subclass, and it follows the
+window the device presents into, because that is the window the D3D9 cursor
+is realized over and the one whose client area the back buffer follows. Both
+halves of that decision are already recorded on test_wndproc 4219/4223/4572
+and test_wndproc_windowed 4701/4778: our hook sits on the device window and
+never on the focus window. These two sites are the same decision seen through
+the retarget, so they move only if the hook moves.
 
 ### device.c/test_occlusion_query
 Sites: 6780=expected
