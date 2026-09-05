@@ -11,7 +11,9 @@ mod device;
 mod direct3d9;
 mod draw;
 mod encoder;
+mod exit_code_hook;
 mod fullscreen;
+mod import_patch;
 mod index_buffer;
 mod log_sink;
 mod mode_list_hook;
@@ -115,23 +117,29 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
         // C++ thread_local teardown walks pools deeply enough to overflow
         // the 1 MB Wine main-thread stack and Wine then aborts exception
         // dispatch, hanging the process. TerminateProcess is the only call
-        // that exits with code 0 while skipping DLL_PROCESS_DETACH and TLS
-        // callbacks; ExitProcess / std::process::exit run them, abort uses
-        // fast-fail. The USED flag discriminates against the loader's early
-        // FreeLibrary probe — Wine's `_reserved` arg is NULL for both
-        // the probe and real exit, so the MSDN contract is unusable here.
+        // that skips DLL_PROCESS_DETACH and TLS callbacks while naming an
+        // exit code; ExitProcess / std::process::exit run them, abort uses
+        // fast-fail. Its code is the one the unix side of Wine exits with,
+        // so it carries the status the process asked to exit with rather
+        // than a zero that would hide a failing run from a unix parent. The
+        // USED flag discriminates against the loader's early FreeLibrary
+        // probe: Wine's `_reserved` arg is NULL for both the probe and real
+        // exit, so the MSDN contract is unusable here.
+        let status = exit_code_hook::status();
         // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for the
         // current process; passing it to TerminateProcess is the documented
         // self-exit form.
         let proc = unsafe { GetCurrentProcess() };
-        // SAFETY: pseudo-handle to current process; exit code 0.
-        unsafe { TerminateProcess(proc, 0) };
+        // SAFETY: pseudo-handle to current process, with the status the
+        // process asked to exit with.
+        unsafe { TerminateProcess(proc, status) };
     }
     if reason == DLL_PROCESS_DETACH {
         // A FreeLibrary the process survives: take the process-wide pointers
         // into this image down with it.
         crash::uninstall();
         mode_list_hook::uninstall();
+        exit_code_hook::uninstall();
     }
     if reason != DLL_PROCESS_ATTACH {
         return 1;
@@ -287,4 +295,5 @@ fn attach_process(instance: *mut c_void) {
     // safe to call from `DLL_PROCESS_ATTACH` with that module handle.
     unsafe { DisableThreadLibraryCalls(instance) };
     mode_list_hook::install();
+    exit_code_hook::install();
 }

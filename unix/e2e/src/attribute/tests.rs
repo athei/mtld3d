@@ -5,8 +5,9 @@
 //! is charged to: a clean run costs one, a panic names its test and the
 //! rest run again, a crash under several threads runs the in-flight set on
 //! one thread to find its test, a hang is the test whose start line has no
-//! outcome, a binary that dies before any test fails whole, and fail-fast
-//! stops after the first failure with the rest reported unrun.
+//! outcome, a binary that dies before any test fails whole, fail-fast stops
+//! after the first failure with the rest reported unrun, and a test that
+//! declares the code it ends its process with passes only on that code.
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -317,4 +318,39 @@ fn an_unclean_exit_after_a_full_tally_costs_no_list_and_no_process() {
     );
     assert_eq!(log.notes.len(), 1);
     assert!(log.notes[0].contains("exit code 3"), "{:?}", log.notes);
+}
+
+#[test]
+fn a_declared_exit_code_the_process_ends_with_passes_its_test() {
+    let mut launcher = Scripted::new(
+        &["a::ends"],
+        vec![Script {
+            stdout: "running 1 test\ntest a::ends ... \n[e2e] test a::ends ends this process with exit code 42\n",
+            stderr: "",
+            kind: ExitKind::Code(42),
+        }],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 1, true, &mut log).unwrap();
+    assert_eq!(run.processes, 1);
+    assert!(!run.failed);
+    assert_eq!(verdicts(&log.results), [("a::ends", "pass")]);
+    assert!(log.notes.is_empty(), "{:?}", log.notes);
+}
+
+#[test]
+fn a_declared_exit_code_the_process_misses_fails_its_test() {
+    let mut launcher = Scripted::new(
+        &["a::ends"],
+        vec![Script {
+            stdout: "running 1 test\ntest a::ends ... [e2e] test a::ends ends this process with exit code 42\n",
+            stderr: "",
+            kind: ExitKind::Code(0),
+        }],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 1, true, &mut log).unwrap();
+    assert_eq!(run.processes, 1);
+    assert!(run.failed);
+    assert_eq!(verdicts(&log.results), [("a::ends", "fail")]);
 }

@@ -9,6 +9,11 @@
 //! set runs once more on one thread, where libtest prints each test's name
 //! before running it. Every round strictly shrinks what is left, so the loop
 //! ends.
+//!
+//! One kind of test ends its process on purpose: it declares its name and
+//! the code it is about to exit with on stdout (see [`declared_exit`]), and
+//! the exit code is then the whole assertion, since libtest never gets to
+//! report a result. A binary that carries such a test carries nothing else.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +22,16 @@ use crate::{
     libtest::{self, Event, Outcome, Summary},
     run::ExitKind,
 };
+
+/// The stdout marker of a test that ends the process it runs in.
+///
+/// What follows it is the test's name, then [`ENDS_PROCESS_CODE`] and the
+/// exit code. libtest leaves its own `test <name> ... ` line open while a
+/// test runs, so the marker can land in the middle of a line and is searched
+/// for rather than matched at the start.
+const ENDS_PROCESS: &str = "[e2e] test ";
+/// What separates the test's name from its exit code in the marker.
+const ENDS_PROCESS_CODE: &str = " ends this process with exit code ";
 
 /// How a process of the binary ended, with everything it printed.
 pub struct ProcessEnd {
@@ -132,6 +147,21 @@ pub fn run_binary(
         })?;
         let ran_something = !round.finished.is_empty();
         let reported = round.finished.len();
+        let declared = declared_exit(&end.stdout);
+        let ends_itself = declared.is_some();
+        if let Some((name, code)) = declared {
+            let verdict = if end.kind == ExitKind::Code(code) {
+                Verdict::Passed
+            } else {
+                run.failed = true;
+                Verdict::Failed(format!(
+                    "the test ends this process with exit code {code}; it ended with {}",
+                    end.kind.describe()
+                ))
+            };
+            done.insert(name.clone());
+            report.result(TestResult { name, verdict });
+        }
         for (name, outcome) in round.finished {
             let verdict = match outcome {
                 Outcome::Ok => Verdict::Passed,
@@ -148,7 +178,7 @@ pub fn run_binary(
             report.result(TestResult { name, verdict });
         }
 
-        let clean = end.kind == ExitKind::Code(0) && round.summary.is_some();
+        let clean = ends_itself || (end.kind == ExitKind::Code(0) && round.summary.is_some());
         let complete = remaining
             .as_ref()
             .is_none_or(|names| names.iter().all(|name| done.contains(name)));
@@ -269,6 +299,22 @@ pub fn run_binary(
         remaining = Some(in_flight);
     }
     Ok(run)
+}
+
+/// The test that ended its own process and the exit code it declared.
+///
+/// A process that ends inside a test reports nothing about it: libtest never
+/// prints its result, and the code the process ended with is all that is
+/// left to judge it by. So the test names itself in the marker, because
+/// nothing else does once the process is gone.
+fn declared_exit(stdout: &str) -> Option<(String, i32)> {
+    stdout.lines().find_map(|line| {
+        let (name, code) = line
+            .split_once(ENDS_PROCESS)?
+            .1
+            .split_once(ENDS_PROCESS_CODE)?;
+        Some((name.to_owned(), code.trim().parse().ok()?))
+    })
 }
 
 #[cfg(test)]
