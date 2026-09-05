@@ -4194,9 +4194,10 @@ fn retarget_device_window(
 ) {
     // Ops already queued name the layer that is about to go, and the encoder
     // waits for GPU idle, so nothing in flight references the view once the
-    // detach releases it.
+    // detach releases it. No texture is destroyed here, so the encoder is
+    // handed no retired handles.
     dev.flush_current_frame_blocking();
-    dev.encoder_reset();
+    dev.encoder_reset(Vec::new());
     if !dev.view_handle.is_null() {
         let mut detach = mtld3d_shared::DetachMetalLayerParams {
             view_handle: dev.view_handle,

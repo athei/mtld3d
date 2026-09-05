@@ -1550,6 +1550,16 @@ fn reset_windowed_retarget_moves_the_device_onto_the_new_window() {
         );
     }
 
+    // The frame goes through the layer the retarget attached, so a released or
+    // stale one is a failing Present or a readback of the wrong buffer rather
+    // than a silent no-op.
+    h.render_once(0xFF20_4060, |_| {});
+    assert_pixel_eq(
+        h.read_pixel(8, 8),
+        0xFF20_4060,
+        "the frame presented after the retarget",
+    );
+
     // The device holds the subclass and the metal view of the second window,
     // so it goes first.
     drop(h);
