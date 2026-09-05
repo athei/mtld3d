@@ -22,7 +22,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
 | Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
-| Every `windows/tests/tests/*.rs` file has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
+| Every end-to-end test file (`windows/tests/tests/*.rs` and `tests/e2e/*.rs`, `main.rs` aside) has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | Release hygiene (see below) | §Release hygiene |
 
@@ -122,7 +122,7 @@ Watch relative paths on the way out: `include_str!` resolves against the contain
 
 ## End-to-end tests are listed in `COVERAGE.md`
 
-`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per file in `windows/tests/tests/`, saying what that file pins. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against the directory in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands with its row in the same change, and a deleted one takes its row with it.
+`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the two files beside it under `windows/tests/tests/` that need a process of their own (`unload.rs`, `snmalloc_drift.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
 
 The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
 

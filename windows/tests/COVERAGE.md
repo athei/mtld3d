@@ -1,18 +1,29 @@
 # mtld3d end-to-end test coverage
 
-Every test is one isolated `#[test]` driving the real `d3d9.dll` through the
-shared [`Harness`](src/harness.rs), verified by pixel readback, `HRESULT`, or a
-getter round-trip — no manual inspection. Run with `make test` (nextest runs
-each test in its own Wine process, in parallel, on both `i686`/`x86_64`
-windows-msvc; the host-native `mtld3d-core`/`mtld3d-shared` unit tests run too).
+Every test is one `#[test]` driving the real `d3d9.dll` through the shared
+[`Harness`](src/harness.rs), verified by pixel readback, `HRESULT`, or a
+getter round-trip — no manual inspection. The files under `tests/e2e/` are
+the modules of one test binary, `tests/e2e/main.rs`, and `make test` runs it
+once per PE arch (`i686`/`x86_64` windows-msvc), its tests on `JOBS` threads
+of that one Wine process, each test with its own device and window;
+`unload.rs` and `snmalloc_drift.rs` beside it are their own binaries because
+each needs a process of its own. The runner is `unix/e2e`, and the
+host-native `mtld3d-core`/`mtld3d-shared` unit tests run too.
 
-A test that needs a non-default option sets it itself: configuration resolves
-at each `Direct3DCreate9` and belongs to the interface it returns, so the test
-appends its key to `MTLD3D_CONFIG` before constructing the `Harness` that needs
-it, and a `Harness` constructed earlier in the same process keeps what it had.
-That keeps the option-gated behaviour in the ordinary `make test` run rather
-than behind a command a reader has to be told about. Eight options are gated
-this way today:
+Two things follow from sharing a process. A test that needs a non-default
+option asks for it on its own harness (`Harness::with_config`,
+`Harness::factory_only_with_config`, or `HarnessConfig::config_entries`):
+configuration resolves at each `Direct3DCreate9` and belongs to the
+interface it returns, and the harness appends the entries to `MTLD3D_CONFIG`
+for that one call under a lock and takes them out again, so no other
+harness, before or after, on any thread, sees them. That keeps the
+option-gated behaviour in the ordinary `make test` run rather than behind a
+command a reader has to be told about. And a fullscreen device holds the
+wineserver session's display mode, which every process in the session sees,
+so a harness that goes fullscreen (created that way or `Reset` into it)
+holds a lock in `harness.rs` until it is windowed again or dropped, and
+fullscreen tests run one at a time while windowed ones run beside them.
+Eight options are gated this way today:
 `buffer.ignoreLockBounds` in `buffers.rs`, `depth.aliasSameSize` in
 `render_target.rs`, `intel.expandPacked16` in `expand16.rs`,
 `intel.denyFloat32Filtering` in `float_filter.rs`, `intel.managedMemory` and

@@ -4,7 +4,7 @@
 //! dependency); only the calls the tests exercise are declared.
 
 use core::ffi::{c_char, c_void};
-use std::sync::Once;
+use std::sync::{Mutex, Once, PoisonError};
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -81,12 +81,13 @@ const TEST_FAILURE_EXIT_CODE: u32 = 101;
 /// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
 /// once a device has been created (it cannot survive snmalloc's thread-local
 /// teardown on Wine's 1 MB main-thread stack), and that `TerminateProcess`
-/// exits with code 0 whatever libtest was exiting with, so nextest saw a
-/// failing test binary as passing. The hook keeps libtest's own report (the
-/// default hook prints the assertion first) and then terminates with
-/// libtest's failure code right away, before the detach path can overwrite
-/// it. One test per process under nextest, so nothing after the failure is
-/// lost.
+/// exits with code 0 whatever libtest was exiting with, so a failing test
+/// binary read as passing. The hook keeps the default hook's report, which
+/// names the failing test (libtest runs each test on a thread named after
+/// it), and then terminates with libtest's failure code right away, before
+/// the detach path can overwrite it. The tests of the suite share the
+/// process, so the ones in flight go down with it: the e2e runner marks the
+/// named test failed and runs the rest again in a fresh process.
 pub fn install_failure_exit_hook() {
     FAILURE_EXIT_HOOK.call_once(|| {
         let default_hook = std::panic::take_hook();
@@ -465,8 +466,21 @@ pub fn dc_set_pixel(hdc: usize, x: i32, y: i32, color: u32) -> u32 {
     unsafe { SetPixel(hdc, x, y, color) }
 }
 
+/// `DestroyWindow`, one call at a time across the process.
+///
+/// Wine's Mac driver tears a window's client surfaces down under two locks
+/// taken in opposite orders on two of its paths: `detach_client_surfaces`
+/// holds the surface list and asks for the window data, `macdrv_DestroyWindow`
+/// holds the window data and releases a surface. Two threads destroying
+/// their windows at once can therefore deadlock inside the driver; one at a
+/// time, they cannot.
+static DESTROY_WINDOW: Mutex<()> = Mutex::new(());
+
 /// Destroy a window created by [`create_window`].
 pub fn destroy_window(hwnd: usize) {
+    let _one_at_a_time = DESTROY_WINDOW
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // SAFETY: Win32 thunk; `hwnd` is a window this process created.
     let ret = unsafe { DestroyWindow(hwnd) };
     assert!(ret != 0, "DestroyWindow failed");

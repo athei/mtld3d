@@ -1772,29 +1772,13 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
     );
 }
 
-/// Append one `key=value` to this process's `MTLD3D_CONFIG`.
+/// A device with the software cursor on.
 ///
-/// Configuration resolves at `Direct3DCreate9`, so the append reaches every
-/// `Harness` constructed after it and none constructed before. nextest runs
-/// each test in its own process, so the append is test-local.
-fn append_config(entry: &str) {
-    let merged = format!(
-        "{};{entry}",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: no thread in the test process reads the environment while this
-    // runs: a device's threads read their configuration through the handle
-    // they were given, and the logging thread never touches the environment.
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-}
-
-/// Turn the software cursor on for this test process.
-///
-/// Must run before the `Harness` whose cursor it configures. The suite pins
-/// `color.hdr.enable=false`, under which the default `auto` resolves to the
-/// hardware cursor; this forces the overlay.
-fn force_software_cursor() {
-    append_config("cursor.software=true");
+/// The suite pins `color.hdr.enable=false`, under which the default `auto`
+/// resolves to the hardware cursor; this harness's interface forces the
+/// overlay, and no other harness in the process sees the key.
+fn software_cursor_harness() -> Harness {
+    Harness::with_config("cursor.software=true")
 }
 
 #[test]
@@ -1803,8 +1787,7 @@ fn each_direct3d9_resolves_its_own_configuration() {
     // the same process resolves `MTLD3D_CONFIG` afresh and neither interface
     // sees the other's answers. `caps.dfFormats` is observable on the factory
     // alone through `CheckDeviceFormat`, so no device is needed.
-    append_config("caps.dfFormats=false");
-    let hidden = Harness::factory_only();
+    let hidden = Harness::factory_only_with_config("caps.dfFormats=false");
     let probe = |h: &Harness| {
         h.check_device_format(
             D3DFMT_X8R8G8B8,
@@ -1819,8 +1802,7 @@ fn each_direct3d9_resolves_its_own_configuration() {
         "the first interface hides DF24"
     );
 
-    append_config("caps.dfFormats=true");
-    let advertised = Harness::factory_only();
+    let advertised = Harness::factory_only_with_config("caps.dfFormats=true");
     assert_eq!(
         probe(&advertised),
         D3D_OK,
@@ -1841,16 +1823,14 @@ fn a_device_keeps_the_configuration_of_the_interface_that_created_it() {
     // The devices are sequential: the second is created after the first is
     // released.
     const MIB: u32 = 1024 * 1024;
-    append_config("memory.vramBudgetMB=64");
-    let first = Harness::new();
+    let first = Harness::with_config("memory.vramBudgetMB=64");
     assert!(
         first.available_texture_mem() <= 64 * MIB,
         "the first device reports at most its interface's 64 MiB budget"
     );
     assert_eq!(first.release_device(), 0, "the first device is released");
 
-    append_config("memory.vramBudgetMB=256");
-    let second = Harness::new();
+    let second = Harness::with_config("memory.vramBudgetMB=256");
     let reported = second.available_texture_mem();
     assert!(
         reported > 64 * MIB && reported <= 256 * MIB,
@@ -1870,8 +1850,7 @@ fn software_cursor_never_pushes_a_null_thread_cursor() {
     /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
     const WM_MOUSEMOVE_LP: isize = 0x0200;
     const HTCLIENT: isize = 1;
-    force_software_cursor();
-    let h = Harness::new();
+    let h = software_cursor_harness();
     let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
 
     let bitmap = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
@@ -1914,8 +1893,7 @@ fn software_cursor_presents_with_the_sprite_shown() {
     // main-thread window creation, a sprite render, and show/hide/show across
     // presents. Nothing of it may disturb the frame, and a cursor change
     // (second bitmap) ships a second sprite.
-    force_software_cursor();
-    let h = Harness::new();
+    let h = software_cursor_harness();
 
     let first = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
     assert_eq!(h.set_cursor_properties_hr(2, 3, &first), D3D_OK);
@@ -1982,4 +1960,33 @@ fn a_second_device_renders_after_the_first_is_destroyed() {
         GREEN,
         "second device after the first was released",
     );
+}
+
+#[test]
+fn a_harness_with_its_own_configuration_leaves_the_environment_alone() {
+    // The entries a harness carries are resolved by its own `Direct3DCreate9`
+    // and never stay in `MTLD3D_CONFIG`, where every later interface in the
+    // process would read them.
+    let before = std::env::var("MTLD3D_CONFIG").ok();
+    let own = Harness::factory_only_with_config("caps.dfFormats=false");
+    assert_eq!(
+        std::env::var("MTLD3D_CONFIG").ok(),
+        before,
+        "the variable is back before the constructor returns"
+    );
+    let plain = Harness::factory_only();
+    let probe = |h: &Harness| {
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DRTYPE_SURFACE,
+            D3DFMT_DF24,
+        )
+    };
+    assert_eq!(
+        probe(&own),
+        D3DERR_NOTAVAILABLE,
+        "the entry reached its own interface"
+    );
+    assert_eq!(probe(&plain), D3D_OK, "and no interface created after it");
 }

@@ -23,19 +23,12 @@ const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
 const WHITE: u32 = 0xFFFF_FFFF;
 
-/// Force the expansion path for this test process.
+/// A device whose interface takes the expansion path.
 ///
-/// Must run before `Harness::new()` (the config is read once at device
-/// bring-up). nextest runs each test in its own process, so the append is
-/// test-local.
-fn force_expand() {
-    let merged = format!(
-        "{};intel.expandPacked16=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed afterwards).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+/// The key is resolved by this harness's `Direct3DCreate9` alone, so the
+/// rest of the suite, sharing the process, keeps the device's own answer.
+fn expanding_harness() -> Harness {
+    Harness::with_config("intel.expandPacked16=true")
 }
 
 /// A full-backbuffer quad (two triangles) with UVs spanning the unit square.
@@ -141,8 +134,7 @@ fn sample_at(h: &Harness, tex: &Texture<'_>, x: u32, y: u32) -> Rgba8 {
 
 #[test]
 fn expanded_color_formats_sample_red() {
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     // 1×1 opaque-red texel encoded for each format (little-endian bytes).
     let cases: [(u32, &[u8]); 4] = [
         (D3DFMT_R5G6B5, &[0x00, 0xF8]),   // R=31
@@ -172,8 +164,7 @@ fn expanded_x1r5g5b5_blends_opaque_with_its_top_bit_clear() {
     const BLUE_CLEAR: u32 = 0xFF00_00FF;
     // X=0 R=31: red with the padding bit clear.
     const RED555: u16 = 0x7C00;
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     let tex = h.create_texture(1, 1, 1, 0, D3DFMT_X1R5G5B5, D3DPOOL_MANAGED);
     tex.lock_rect(0, 0).write(&[RED555]);
     assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
@@ -211,8 +202,7 @@ fn expanded_partial_lock_updates_only_the_dirty_rect() {
     // and the untouched border texels must survive the pass's load action.
     const GREEN16: u16 = 0xF0F0; // A=F R=0 G=F B=0
     const RED16: u16 = 0xFF00; // A=F R=F G=0 B=0
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
     tex.lock_rect(0, 0).write(&[GREEN16; 16]);
     let px = sample_at(&h, &tex, 320, 240);
@@ -254,8 +244,7 @@ fn expanded_mip_chain_samples_every_level() {
     // the 16-byte linear texture alignment a blit source has to meet on
     // Apple Silicon. The upload reads the staging by texel instead, so the
     // pitch is unconstrained and each level lands on its own mip.
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     let tex = h.create_texture(8, 8, 0, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
     assert_eq!(tex.level_count(), 4, "8x8 full mip chain");
     let levels: [(u16, u32); 4] = [
@@ -280,8 +269,7 @@ fn expanded_mip_chain_samples_every_level() {
 
 #[test]
 fn expanded_render_target_caps_are_denied() {
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     for format in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5] {
         assert_eq!(
             h.check_device_format(
@@ -345,8 +333,7 @@ fn expanded_render_target_caps_are_denied() {
 
 #[test]
 fn expanded_cube_face_samples_red() {
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED);
     cube.lock_rect(0, 0, 0).write(&[0xFF00u16; 16]); // +X face opaque red
     assert_eq!(h.set_cube_texture(0, &cube), 0);
@@ -382,8 +369,7 @@ fn expanded_cube_face_samples_red() {
 
 #[test]
 fn expanded_volume_slices_sample_their_colors() {
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     let (hr, tex) = h.try_create_volume_texture([2, 2, 2], 1, 0, D3DFMT_R5G6B5, D3DPOOL_MANAGED);
     assert_eq!(hr, 0, "MANAGED R5G6B5 volume");
     let tex = tex.expect("volume texture");
@@ -433,8 +419,7 @@ fn expanded_volume_slices_sample_their_colors() {
 
 #[test]
 fn expanded_offscreen_plain_is_a_stretch_rect_source() {
-    force_expand();
-    let h = Harness::new();
+    let h = expanding_harness();
     // Clone of render_target.rs's R5G6B5 → X8R8G8B8 conversion test: the
     // DEFAULT offscreen-plain source is BGRA8-backed here, and the scaling
     // render quad samples the expanded texels.

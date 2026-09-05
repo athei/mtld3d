@@ -1,6 +1,6 @@
 //! Spike coverage: the two simplest end-to-end paths, ported to the shared `Harness`.
 //!
-//! Validates the nextest-under-wine runner before the full suite.
+//! Validates the harness under Wine before the rest of the suite.
 
 use mtld3d_tests::{Harness, Rgba8, Vertex, assert_pixel_eq};
 use mtld3d_types::{D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRS_LIGHTING};

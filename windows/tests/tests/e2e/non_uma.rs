@@ -33,19 +33,12 @@ const GREEN: u32 = 0xFF00_FF00;
 const RED: u32 = 0xFFFF_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
 
-/// Force the non-UMA storage policy and the Mac2 alignment floor for this test process.
+/// A device under the non-UMA storage policy and the Mac2 alignment floor.
 ///
-/// Must run before `Harness::new()` (the config is read once at device
-/// bring-up). nextest runs each test in its own process, so the append is
-/// test-local.
-fn force_intel_memory() {
-    let merged = format!(
-        "{};intel.managedMemory=true;intel.linearAlign256=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed afterwards).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+/// Both keys are resolved by this harness's `Direct3DCreate9` alone, so the
+/// rest of the suite, sharing the process, keeps the device's own answers.
+fn non_uma_harness() -> Harness {
+    Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true")
 }
 
 fn stride() -> u32 {
@@ -161,8 +154,7 @@ fn fill_level(tex: &Texture<'_>, level: u32, side: usize, texel: u32) {
 /// A Managed vertex buffer and a Managed index buffer draw what was written into them.
 #[test]
 fn managed_vertex_and_index_buffers_draw() {
-    force_intel_memory();
-    let h = Harness::new();
+    let h = non_uma_harness();
     let verts = [
         Vertex {
             x: -0.5,
@@ -223,8 +215,7 @@ fn managed_vertex_and_index_buffers_draw() {
 /// renames the backing while the first draw still references the old one.
 #[test]
 fn managed_dynamic_discard_refill_renames() {
-    force_intel_memory();
-    let h = Harness::new();
+    let h = non_uma_harness();
     let vb = h.create_vertex_buffer(
         stride() * 3,
         D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
@@ -264,8 +255,7 @@ fn managed_dynamic_discard_refill_renames() {
 /// X8R8G8B8, whose backing is swizzled, takes the padded-staging repack.
 #[test]
 fn mip_chain_under_the_256_byte_floor_samples_every_level() {
-    force_intel_memory();
-    let h = Harness::new();
+    let h = non_uma_harness();
     let colors = [RED, GREEN, BLUE, WHITE, MAGENTA, 0xFFFF_FF00];
     for (format, name) in [(D3DFMT_A8R8G8B8, "A8R8G8B8"), (D3DFMT_X8R8G8B8, "X8R8G8B8")] {
         let tex = h.create_texture(32, 32, 0, 0, format, D3DPOOL_MANAGED);
@@ -293,8 +283,7 @@ fn mip_chain_under_the_256_byte_floor_samples_every_level() {
 /// `GetRenderTargetData` readback proves the texels landed.
 #[test]
 fn lockable_render_target_rows_pad_to_the_floor() {
-    force_intel_memory();
-    let h = Harness::new();
+    let h = non_uma_harness();
     let rt = h.create_lockable_render_target(16, 16, D3DFMT_A8R8G8B8);
     {
         let mut locked = rt.lock_rect(0);

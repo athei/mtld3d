@@ -20,8 +20,9 @@ on:
         default: false
       e2e_filter:
         description: >-
-          Run only the end-to-end tests this nextest filter expression selects
-          (e.g. `test(stencil) | binary(msaa)`), with their log files uploaded.
+          Run only the end-to-end tests whose id contains one of these
+          whitespace-separated patterns (e.g. `stencil msaa::`), with their
+          log files uploaded.
         type: string
         default: ''
 
@@ -39,8 +40,8 @@ concurrency:
 
 # Everything a run depends on that is not in the tree is pinned here, so a green
 # main cannot turn red without a commit: both toolchains, the one cargo tool a
-# build needs, and the nextest binary every test machine replays the suites
-# with. All are plain Makefile variables that float for a developer, and every
+# build needs, and the nextest binary the unit tests run under. All are plain
+# Makefile variables that float for a developer, and every
 # cargo line in the Makefile names its toolchain with rustup's `+` syntax. The
 # MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
 # the xwin call that consumes them.
@@ -68,8 +69,8 @@ env:
 # a machine per leg cost more in setup than in work.
 jobs:
   # Everything a test machine needs, built once on the fast image: both PE
-  # arches, both unix `.so` builds, the e2e suite as nextest archives, and the
-  # conformance runner for both host arches. Primes the caches the check job
+  # arches, both unix `.so` builds, the e2e test binaries, and the e2e and
+  # conformance runners for both host arches. Primes the caches the check job
   # restores too.
   build:
     if: ${{ !inputs.probe_only }}
@@ -143,8 +144,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: make bundle
 
-  # The end-to-end suite: the staged PE binaries, run by the pinned Wine
-  # against a Metal device, one leg per image, PE arch and partition.
+  # The end-to-end suite: the staged test binaries, run by the pinned Wine
+  # against a Metal device, one leg per image and PE arch.
   #
   # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
   # on arm64, and the Intel image, whose paravirtual device has no unified
@@ -155,8 +156,7 @@ jobs:
   # one a real Intel/AMD Mac's driver denies and this paravirtual device does
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
-  # INTEL=1`) and do not run here. Each suite is split in three hash-sharded
-  # partitions, so three machines share it. Every image gates.
+  # INTEL=1`) and do not run here. Every image gates.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -166,20 +166,20 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
-        partition: ['1/3', '2/3', '3/3']
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
-          nextest-version: ${{ env.NEXTEST_VERSION }}
-      # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml. A dispatch with `e2e_filter` narrows
-      # the run and collects the layer's log files, which are otherwise
-      # written beside each test binary and pruned to the ten newest.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
+      # One test at a time (`JOBS=1`): concurrent device creation aborts or
+      # hangs on the paravirtual GPU. The whole suite is reported rather than
+      # the first failure, and a test that is only slow there gets four
+      # minutes before it counts as a hang. A dispatch with `e2e_filter`
+      # narrows the run and collects the layer's log files, which are
+      # otherwise written beside each test binary and pruned to the ten
+      # newest.
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=240 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
-          NEXTEST_PROFILE: ci
           E2E_FILTER: ${{ inputs.e2e_filter }}
           # The layer reads the path on the Windows side, where the unix
           # root is drive Z.
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && inputs.e2e_filter }}
         with:
-          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}-${{ strategy.job-index }}
+          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/*.log
           retention-days: 14
           if-no-files-found: ignore
@@ -223,7 +223,6 @@ jobs:
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
-          nextest-version: ${{ env.NEXTEST_VERSION }}
       # The Intel image reads and, on a `record_intel_baseline` dispatch,
       # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
       # family is a runner, so its counts are recorded here and committed from

@@ -7,8 +7,10 @@
 //! the device so a `Reset` that recreates the backbuffer is reflected without
 //! re-allocating the surface.
 
-use mtld3d_tests::{Harness, SurfaceDc};
-use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, D3DLOCK_READONLY};
+use mtld3d_tests::{Harness, HarnessConfig, SurfaceDc};
+use mtld3d_types::{
+    D3D_OK, D3DERR_INVALIDCALL, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+};
 
 #[test]
 fn implicit_render_target_is_cached_and_aliases_backbuffer() {
@@ -169,14 +171,11 @@ fn release_dc_on_a_lockable_backbuffer_resamples_under_a_render_scale() {
     const GREEN: u32 = 0xFF00_FF00;
     const RED: u32 = 0xFFFF_0000;
     const RED_COLORREF: u32 = 0x0000_00FF;
-    let merged = format!(
-        "{};render.scale=0.75",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness,
-    // and with it the config read, is only constructed afterwards).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-    let h = Harness::with_lockable_back_buffer();
+    let h = Harness::create(&HarnessConfig {
+        present_flags: D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
 
     assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the back buffer green");
     let bb = h.back_buffer(0);
