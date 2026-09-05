@@ -18,7 +18,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLBufferKind};
 
-use crate::{page_box::PageBox, render_scale::RenderScale};
+use crate::page_box::PageBox;
 
 /// 1024 u64 slots = 8 KiB.
 ///
@@ -73,13 +73,18 @@ pub struct VisibilityQueryCore {
     ///
     /// Atomic so `GetData` can observe transitions without locking.
     status: AtomicU64,
-    /// `render.scale` of the target the query began against, in percent.
+    /// Pixel area of the target the query began against, as D3D9 reports it.
     ///
-    /// Latched at BEGIN and applied at finalize: Metal counts the samples the
-    /// rasterizer produced, which under a reduced scale are fewer than the
-    /// pixels D3D9 reports, so the count is scaled back up into the reported
-    /// space before the game reads it.
-    scale_percent: AtomicU32,
+    /// Latched at BEGIN with [`Self::render_area`] and applied at finalize:
+    /// Metal counts the samples the rasterizer produced on the render grid,
+    /// which under a reduced `render.scale` holds fewer pixels than D3D9
+    /// reports, so the count is scaled back up by the ratio of the two areas
+    /// before the game reads it. The areas rather than the nominal scale,
+    /// because a dimension the scale does not divide rounds up on the render
+    /// grid, and only the actual ratio makes a full-frame count exact.
+    logical_area: AtomicU64,
+    /// Pixel area of the same target's render grid.
+    render_area: AtomicU64,
     /// Set the instant `Issue(D3DISSUE_END)` is recorded (API thread).
     ///
     /// Cleared on `Issue(D3DISSUE_BEGIN)`. Lets the blocking
@@ -100,7 +105,8 @@ impl VisibilityQueryCore {
             accumulated: AtomicU64::new(0),
             status: AtomicU64::new(QueryStatus::NeverIssued as u64),
             end_requested: AtomicBool::new(false),
-            scale_percent: AtomicU32::new(RenderScale::IDENTITY.percent()),
+            logical_area: AtomicU64::new(0),
+            render_area: AtomicU64::new(0),
         })
     }
 
@@ -118,10 +124,11 @@ impl VisibilityQueryCore {
     /// Metal encoder will write to. Moves the query from
     /// `NeverIssued`/`Issued` back into `Pending` — a second Issue on the
     /// same wrapper reuses the core.
-    pub fn begin(&self, seq: u64, offset: u32, scale: RenderScale) {
+    pub fn begin(&self, seq: u64, offset: u32, logical: (u32, u32), render: (u32, u32)) {
         self.seq_begin.store(seq, Ordering::Release);
         self.offset_begin.store(offset, Ordering::Release);
-        self.scale_percent.store(scale.percent(), Ordering::Release);
+        self.logical_area.store(area(logical), Ordering::Release);
+        self.render_area.store(area(render), Ordering::Release);
         // Reset the accumulator in case this core was previously issued
         // and the app is re-issuing.
         self.accumulated.store(0, Ordering::Release);
@@ -214,7 +221,11 @@ impl VisibilityQueryCore {
     /// Used only from `VisibilityQueryState::intake_completed` in this
     /// module.
     fn finalize(&self, summed: u64) {
-        let logical = logical_samples(summed, self.scale_percent.load(Ordering::Acquire));
+        let logical = logical_samples(
+            summed,
+            self.render_area.load(Ordering::Acquire),
+            self.logical_area.load(Ordering::Acquire),
+        );
         self.accumulated.store(logical, Ordering::Release);
         self.status
             .store(QueryStatus::Issued as u64, Ordering::Release);
@@ -229,19 +240,27 @@ impl VisibilityQueryCore {
 ///
 /// Encapsulated inside `VisibilityQueryState` — the encoder reaches it
 /// via `VisibilityQueryState::bump_slot`.
-/// Convert a sample count the rasterizer produced at `scale_percent` into reported pixels.
+/// The pixel area of an extent, for the area ratio a count is rescaled by.
+const fn area((width, height): (u32, u32)) -> u64 {
+    (width as u64) * (height as u64)
+}
+
+/// Convert a sample count produced on a `render_area` grid into `logical_area` pixels.
 ///
-/// A target rasterized at `s` percent holds `(s / 100)^2` of the pixels D3D9
-/// reports, so the counter is divided by that, rounded to nearest. The
-/// identity (and a percentage the parser never produces, `0`) passes the
-/// count through; the result saturates at `u64::MAX`.
+/// A target rasterized below the resolution D3D9 reports holds fewer pixels
+/// than the game was told, so the counter is multiplied by the ratio of the
+/// reported area to the render area, rounded to nearest. Equal areas (the
+/// identity, and every target the scale does not reach) and a zero area (a
+/// query begun before any target was bound) pass the count through; the
+/// result saturates at `u64::MAX`.
 #[must_use]
-pub fn logical_samples(render_samples: u64, scale_percent: u32) -> u64 {
-    if scale_percent == 0 || scale_percent == RenderScale::IDENTITY.percent() {
+pub fn logical_samples(render_samples: u64, render_area: u64, logical_area: u64) -> u64 {
+    if render_area == 0 || logical_area == 0 || render_area == logical_area {
         return render_samples;
     }
-    let squared = u128::from(scale_percent) * u128::from(scale_percent);
-    let scaled = (u128::from(render_samples) * 10_000 + squared / 2) / squared;
+    let scaled = (u128::from(render_samples) * u128::from(logical_area)
+        + u128::from(render_area) / 2)
+        / u128::from(render_area);
     u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
