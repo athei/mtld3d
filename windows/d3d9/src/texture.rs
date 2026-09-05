@@ -34,7 +34,7 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE,
-    com_ref::ComUnknown,
+    com_ref::{ComChild, ComUnknown},
     device::DeviceInner,
     encoder::{FrameEncoder, TextureInfo, TextureUploadJob},
     null_out,
@@ -4284,13 +4284,17 @@ pub fn evict_mark_dirty(ti: &mut TextureInner) -> Option<TextureId> {
 ///
 /// Idempotent: returns immediately when `ti.device_inner` already matches
 /// `dev`. Called from every bind site (draw + `StretchRect` + similar).
+///
+/// Takes the wrapper rather than the inner state because the device reference
+/// a non-managed texture holds is counted against the public refcount, which
+/// lives on the wrapper, and has to move with `device_inner`.
 #[inline]
-pub fn rehydrate_for_device(ti: &mut TextureInner, dev: &mut DeviceInner) {
+pub fn rehydrate_for_device(tex: &mut Direct3DTexture9, dev: &mut DeviceInner) {
     let dev_ptr = std::ptr::from_mut::<DeviceInner>(dev) as u64;
-    if ti.device_inner == dev_ptr {
+    if tex.inner().device_inner == dev_ptr {
         return;
     }
-    rehydrate_for_device_slow(ti, dev, dev_ptr);
+    rehydrate_for_device_slow(tex, dev, dev_ptr);
 }
 
 /// Migration tail of [`rehydrate_for_device`], reached only on a device change.
@@ -4299,7 +4303,24 @@ pub fn rehydrate_for_device(ti: &mut TextureInner, dev: &mut DeviceInner) {
 /// same-device pointer compare above.
 #[cold]
 #[inline(never)]
-fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_ptr: u64) {
+fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, dev_ptr: u64) {
+    // A texture with a public reference holds exactly one reference on its
+    // forwarding device, taken at registration or on the public 0->1 edge and
+    // handed back on the 1->0 edge. That device is derived from
+    // `device_inner`, so the reference moves with the texture: left where it
+    // is, the `Release` answers with the adopting device, which never took
+    // one, and the creating device is pinned for good. Both edges of the
+    // `Reset` blocker the engine counts for a `D3DPOOL_DEFAULT` resource move
+    // with it. A texture that forwards nothing (managed, or between devices)
+    // answers null on both sides and moves nothing.
+    let pinned = tex.refcount > 0;
+    let blocks_reset = pinned && tex.blocks_reset_while_referenced();
+    let left_behind = if pinned {
+        tex.device_forward_target()
+    } else {
+        core::ptr::null_mut()
+    };
+    let ti = tex.inner_mut();
     let texture_id = ti.texture_id;
     let mut levels_remarked: u32 = 0;
     if ti.flags.contains(TextureFlags::CUBE) {
@@ -4359,6 +4380,19 @@ fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_p
     if !ti.is_cpu_only() {
         dev.push_texture_warmup(ti.texture_info());
     }
+    let adopted = if pinned {
+        tex.device_forward_target()
+    } else {
+        core::ptr::null_mut()
+    };
+    crate::device::device_wrapper_add_ref(adopted);
+    if blocks_reset {
+        crate::device::device_wrapper_note_reset_blocker(adopted, true);
+        crate::device::device_wrapper_note_reset_blocker(left_behind, false);
+    }
+    // Last, the way the public `Release` forwards it: this can be the
+    // reference the device being left was still standing on.
+    crate::device::device_wrapper_release(left_behind);
     log::info!(
         target: TEX_TRACE_TARGET,
         "tex {texture_id:#x} rehydrated for new device (re-marked {levels_remarked} mips dirty)"

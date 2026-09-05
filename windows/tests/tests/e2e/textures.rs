@@ -2035,6 +2035,114 @@ fn a_texture_migrating_between_live_devices_leaves_the_first_devices_registry() 
     );
 }
 
+/// A `D3DPOOL_DEFAULT` texture that migrates between two live devices takes its pin with it.
+///
+/// Every pool but `D3DPOOL_MANAGED` holds one reference on the device that
+/// created it for the texture's public lifetime, and the runtime derives that
+/// device from the texture's current one. A bind under a second device that is
+/// alive beside the first repoints the texture, so the reference has to move
+/// at the same moment: left where it was, the last `Release` hands a reference
+/// back to the device the texture migrated to, which never took one, and the
+/// creating device stays pinned for the life of the process.
+///
+/// Both devices' counts are read around the migration and around the texture's
+/// `Release`. The `Reset` a referenced `D3DPOOL_DEFAULT` resource blocks reads
+/// the same state from the other side: after the migration it is the adopting
+/// device whose `Reset` the texture has to reject.
+///
+/// `D3DUSAGE_DYNAMIC` keeps the level's staging, so the sample on the second
+/// device reads what the migration re-uploads instead of what a released
+/// staging leaves behind. The reference follows from the pool, so the usage
+/// does not change what is under test.
+#[test]
+fn a_default_texture_migrating_between_live_devices_moves_its_device_pin() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    let first = Harness::new();
+    let second = Harness::new();
+    let first_base = first.device_refcount();
+    let second_base = second.device_refcount();
+
+    let tex = first.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    tex.lock_rect(0, 0).write_u32(&[GREEN; TEXELS]);
+    assert_eq!(
+        first.device_refcount(),
+        first_base + 1,
+        "the texture pins the device that created it"
+    );
+    assert_eq!(
+        second.device_refcount(),
+        second_base,
+        "the other device is untouched by the create"
+    );
+    assert_pixel_eq(
+        sample_center(&first, &tex).to_pixel(),
+        GREEN,
+        "the texture on the device that created it",
+    );
+
+    // The first bind under the second device migrates it, with the first
+    // device still live.
+    assert_pixel_eq(
+        sample_center(&second, &tex).to_pixel(),
+        GREEN,
+        "the texture on the device it migrated to",
+    );
+    // A bound stage holds a reference on the texture, so both devices give
+    // theirs up before the counts are read.
+    assert_eq!(first.clear_texture(0), 0, "unbind on the first device");
+    assert_eq!(second.clear_texture(0), 0, "unbind on the second device");
+    assert_eq!(
+        first.device_refcount(),
+        first_base,
+        "the pin left the device the texture migrated off"
+    );
+    assert_eq!(
+        second.device_refcount(),
+        second_base + 1,
+        "the pin arrived on the device the texture migrated to"
+    );
+
+    // The `Reset` blocker the engine counts for a DEFAULT resource moved with
+    // the reference it rides on.
+    assert_eq!(
+        first.reset(320, 240),
+        0,
+        "the device the texture left has nothing blocking Reset"
+    );
+    assert_eq!(
+        second.reset(320, 240),
+        D3DERR_INVALIDCALL,
+        "the device that adopted the texture is the one it blocks"
+    );
+
+    drop(tex);
+    assert_eq!(
+        first.device_refcount(),
+        first_base,
+        "the freed texture takes nothing from the device it migrated off"
+    );
+    assert_eq!(
+        second.device_refcount(),
+        second_base,
+        "the freed texture gives its reference back to the device it named"
+    );
+    assert_eq!(
+        second.reset(320, 240),
+        0,
+        "Reset succeeds once the texture is freed"
+    );
+}
+
 /// An `UpdateSurface` from system memory reaches the very next draw.
 ///
 /// The staging write only reaches the GPU through the bind-time
