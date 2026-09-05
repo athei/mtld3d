@@ -1093,11 +1093,21 @@ fn update_surface_uploads_the_selected_cube_face() {
     );
 }
 
+/// Run the frame that releases the staging of the levels uploaded so far.
+///
+/// A level of the class that releases its staging after an upload keeps it
+/// until the encoder answers that the upload reached the command stream, and
+/// the answer is acted on at the next `Present`. A test that wants a released
+/// level takes one more frame after the draw that uploaded it.
+fn release_uploaded_staging(h: &Harness) {
+    assert_eq!(h.present(), 0, "the Present that releases uploaded staging");
+}
+
 /// A default-pool texture the game cannot lock takes a second `UpdateTexture`.
 ///
-/// Its staging goes away once the first upload has been submitted (the GPU
-/// holds the only copy, as on real D3D9); the second update re-creates it,
-/// and what samples back is the second fill.
+/// Its staging goes away once the first upload has been emitted (the GPU holds
+/// the only copy, as on real D3D9); the second update re-creates it, and what
+/// samples back is the second fill.
 #[test]
 fn default_pool_texture_takes_a_second_update_after_its_upload() {
     const RED: u32 = 0xFFFF_0000;
@@ -1108,6 +1118,7 @@ fn default_pool_texture_takes_a_second_update_after_its_upload() {
     src.lock_rect(0, 0).write::<u32>(&[RED; 4]);
     assert_eq!(h.update_texture_hr(&src, &dst), 0, "first UpdateTexture");
     assert_pixel_eq(sample_center(&h, &dst).to_pixel(), RED, "first fill");
+    release_uploaded_staging(&h);
 
     src.lock_rect(0, 0).write::<u32>(&[GREEN; 4]);
     assert_eq!(h.update_texture_hr(&src, &dst), 0, "second UpdateTexture");
@@ -1242,6 +1253,8 @@ fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
         assert_pixel_eq(sampled[i], color, name);
     }
 
+    release_uploaded_staging(&h);
+
     // The four writes covered the level, so its staging is gone. A fifth
     // partial update re-creates it and must upload only its own rect: the
     // pixels the GPU already holds are the only copy of the other three.
@@ -1262,7 +1275,7 @@ fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
 /// A sub-rectangle `UpdateSurface` leaves the rest of the destination level alone.
 ///
 /// The destination is a default-pool texture whose staging is released once
-/// its first whole-level upload has been submitted, so the partial update
+/// its first whole-level upload has been emitted, so the partial update
 /// re-creates a staging buffer holding only the copied rectangle. Uploading
 /// the whole mip from it would push uninitialised pages over the GPU content
 /// the copy never touched.
@@ -1281,13 +1294,14 @@ fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
         0,
         "whole-level UpdateSurface"
     );
-    // The sampling draw submits the whole-level upload, which releases the
-    // destination's staging.
+    // The sampling draw submits the whole-level upload; the frame after it
+    // releases the destination's staging.
     assert_pixel_eq(
         sample_center(&h, &dst).to_pixel(),
         GREEN,
         "whole-level fill",
     );
+    release_uploaded_staging(&h);
 
     let patch = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
     patch.lock_rect(0).write_u32(&[RED; 16]);
@@ -1315,7 +1329,8 @@ fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
 /// A plain lock of a released default-pool level hands back the level's texels.
 ///
 /// The whole-level write reaches the GPU at the next draw and the staging goes
-/// with it, so a second lock has nothing left in system memory. D3D9 promises
+/// once that upload is answered, so a second lock has nothing left in system
+/// memory. D3D9 promises
 /// that lock the level's current contents, which leaves reading them back from
 /// the GPU as the only honest answer; the pages alone read as garbage.
 #[test]
@@ -1331,9 +1346,10 @@ fn lock_of_a_released_default_pool_level_reads_the_level_back() {
         assert_eq!(locked.pitch(), 256, "64 texels * 4 bytes/texel row pitch");
         locked.write_u32(&written);
     }
-    // The draw is what uploads the level and releases its staging; which texel
-    // the centre sample lands on is not what this pins.
+    // The draw is what uploads the level; which texel the centre sample lands
+    // on is not what this pins.
     let _sampled = sample_center(&h, &tex);
+    release_uploaded_staging(&h);
 
     let locked = tex.lock_rect(0, 0);
     assert_eq!(
@@ -1345,8 +1361,8 @@ fn lock_of_a_released_default_pool_level_reads_the_level_back() {
 
 /// `GetDC` on a released default-pool level maps the level's own texels.
 ///
-/// The draw uploads the level and the staging goes with the upload, so the
-/// pixels live on the GPU alone and the level's staging slot points at the one
+/// The draw uploads the level and the staging goes once that upload is
+/// answered, so the pixels live on the GPU alone and the slot points at the one
 /// page every released level shares. A DIB over that page reads whatever it
 /// holds and its writes reach every other released level, so the DC reads the
 /// level back first, the way a `LockRect` of it does.
@@ -1363,8 +1379,9 @@ fn get_dc_on_a_released_default_pool_level_reads_the_level_back() {
         let mut locked = tex.lock_rect(0, 0);
         locked.write_u32(&[GREEN; TEXELS]);
     }
-    // The draw is what uploads the level and releases its staging.
+    // The draw is what uploads the level.
     assert_pixel_eq(sample_center(&h, &tex).to_pixel(), GREEN, "upload");
+    release_uploaded_staging(&h);
 
     let surface = tex.surface_level(0);
     let dc = surface.dc();
@@ -1592,6 +1609,7 @@ fn discard_lock_of_a_released_default_pool_level_rewrites_it() {
         locked.write_u32(&[FIRST; TEXELS]);
     }
     assert_pixel_eq(sample_center(&h, &tex).to_pixel(), FIRST, "first fill");
+    release_uploaded_staging(&h);
 
     {
         let mut locked = tex.lock_rect(0, D3DLOCK_DISCARD);
@@ -2666,8 +2684,8 @@ fn get_dc_on_an_odd_width_16_bit_texture_level_round_trips_a_texel() {
 /// nothing but the creation call tells it apart from an ordinary 2D texture,
 /// and the class that releases its staging after an upload must still exclude
 /// it: the volume paths write and upload a level whole and re-create it as a
-/// single 2D slice. The first update is drawn (the point a released level would
-/// go), then a second update has to reach the GPU.
+/// single 2D slice. The first update is drawn and its frame answered (the
+/// point a released level would go), then a second update has to reach the GPU.
 #[test]
 fn single_slice_default_volume_takes_a_second_update_after_its_upload() {
     const RED: u32 = 0xFFFF_0000;
@@ -2696,6 +2714,7 @@ fn single_slice_default_volume_takes_a_second_update_after_its_upload() {
         "SetFVF"
     );
     assert_pixel_eq(sample_volume_depth(&h, 0.5), RED, "first fill");
+    release_uploaded_staging(&h);
 
     src.write_u32(0, &[GREEN; 4]);
     assert_eq!(

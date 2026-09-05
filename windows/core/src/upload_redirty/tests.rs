@@ -1,10 +1,27 @@
-use super::{MAX_REDIRTY_ATTEMPTS, RedirtyEntry, RedirtyQueue, RedirtySubresource};
+use super::{EmittedUpload, MAX_REDIRTY_ATTEMPTS, RedirtyEntry, RedirtyQueue, RedirtySubresource};
 use crate::{dirty_rect::DirtyRect, ids::TextureId};
 
 fn subresource(index: u32) -> RedirtySubresource {
     RedirtySubresource {
         texture_id: TextureId::new_unique(),
         index,
+    }
+}
+
+fn emitted(subresource: RedirtySubresource) -> EmittedUpload {
+    EmittedUpload {
+        subresource,
+        level: subresource.index,
+        generation: 0,
+        releases_staging: false,
+    }
+}
+
+fn releasing(subresource: RedirtySubresource, generation: u32) -> EmittedUpload {
+    EmittedUpload {
+        generation,
+        releases_staging: true,
+        ..emitted(subresource)
     }
 }
 
@@ -22,6 +39,7 @@ fn a_fresh_queue_has_nothing_to_drain() {
     let queue = RedirtyQueue::new();
     assert!(!queue.has_pending());
     assert!(queue.take_pending().is_empty());
+    assert!(queue.take_released().is_empty());
 }
 
 #[test]
@@ -97,7 +115,7 @@ fn an_emitted_upload_gives_the_subresource_its_budget_back() {
     }
     assert!(!queue.decline(entry(sub, rect)));
 
-    queue.note_emitted(sub);
+    queue.note_emitted(emitted(sub));
     assert!(queue.decline(entry(sub, rect)));
 }
 
@@ -105,7 +123,71 @@ fn an_emitted_upload_gives_the_subresource_its_budget_back() {
 fn acknowledging_an_untouched_subresource_changes_nothing() {
     let queue = RedirtyQueue::new();
     let sub = subresource(0);
-    queue.note_emitted(sub);
+    queue.note_emitted(emitted(sub));
     assert!(!queue.has_pending());
     assert!(queue.decline(entry(sub, DirtyRect::full(2, 2))));
+}
+
+#[test]
+fn an_emitted_upload_that_asked_for_it_reports_its_staging_released() {
+    let queue = RedirtyQueue::new();
+    let sub = subresource(3);
+    queue.note_emitted(releasing(sub, 7));
+    assert!(queue.has_pending());
+
+    let released = queue.take_released();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].subresource, sub);
+    assert_eq!(released[0].level, 3);
+    assert_eq!(released[0].generation, 7);
+    assert!(queue.take_pending().is_empty());
+    assert!(!queue.has_pending());
+    assert!(queue.take_released().is_empty());
+}
+
+#[test]
+fn an_emitted_upload_that_keeps_its_staging_releases_nothing() {
+    let queue = RedirtyQueue::new();
+    queue.note_emitted(emitted(subresource(0)));
+    assert!(!queue.has_pending());
+    assert!(queue.take_released().is_empty());
+}
+
+#[test]
+fn a_decline_cancels_a_release_the_same_subresource_is_waiting_for() {
+    let queue = RedirtyQueue::new();
+    let sub = subresource(1);
+    queue.note_emitted(releasing(sub, 1));
+    assert!(queue.decline(entry(sub, DirtyRect::full(8, 8))));
+
+    assert!(queue.take_released().is_empty());
+    assert_eq!(queue.take_pending().len(), 1);
+}
+
+#[test]
+fn a_decline_leaves_another_subresources_release_alone() {
+    let queue = RedirtyQueue::new();
+    let released = subresource(0);
+    let declined = subresource(1);
+    queue.note_emitted(releasing(released, 1));
+    assert!(queue.decline(entry(declined, DirtyRect::full(8, 8))));
+
+    let drained = queue.take_released();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].subresource, released);
+    assert_eq!(queue.take_pending().len(), 1);
+}
+
+#[test]
+fn an_emitted_upload_that_releases_its_staging_also_gives_the_budget_back() {
+    let queue = RedirtyQueue::new();
+    let sub = subresource(0);
+    let rect = DirtyRect::full(16, 16);
+    for _ in 0..MAX_REDIRTY_ATTEMPTS {
+        assert!(queue.decline(entry(sub, rect)));
+    }
+    assert!(!queue.decline(entry(sub, rect)));
+
+    queue.note_emitted(releasing(sub, 1));
+    assert!(queue.decline(entry(sub, rect)));
 }

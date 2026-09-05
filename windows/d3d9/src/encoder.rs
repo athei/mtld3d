@@ -47,7 +47,7 @@ use mtld3d_core::{
     stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
-    upload_redirty::{RedirtyEntry, RedirtyQueue, RedirtySubresource},
+    upload_redirty::{EmittedUpload, RedirtyEntry, RedirtyQueue, RedirtySubresource},
     visibility::{
         MAX_SLOTS, RetiredVisibilityBuffer, SLOT_BYTES, VisibilityQueryCore, VisibilityQueryState,
     },
@@ -354,15 +354,29 @@ pub struct TextureUploadJob {
     /// single-slice `bytes_per_image` from the region's block-row count
     /// instead.
     pub slice_pitch: u32,
-    /// Where a job that emits nothing reports itself.
+    /// Where a job reports what became of it.
     ///
     /// The dirty state this upload was built from is already cleared when
     /// the encoder thread sees the job, so a decline that stayed on this
     /// thread would lose the region: `UnlockRect` publishes only the
     /// rectangle the game locked and nothing re-announces the rest. The
     /// queue carries the subresource and the rectangle back to the API
-    /// thread, which marks them dirty again for the next bind.
+    /// thread, which marks them dirty again for the next bind, and carries
+    /// the emitted answer back for the levels waiting to release their
+    /// staging.
     pub redirty: Arc<RedirtyQueue>,
+    /// Whether the level releases its staging once this upload is emitted.
+    ///
+    /// Set for a level of the staging-droppable class whose every texel this
+    /// upload puts on the GPU. The release waits for the emitted answer: a
+    /// level released at schedule time has no bytes left to retry from when
+    /// the upload is declined downstream of the hand-off.
+    pub release_staging: bool,
+    /// Which of the level's scheduled uploads this one is.
+    ///
+    /// Travels back with the emitted answer so the release can tell whether a
+    /// later upload of the level is still waiting for an answer of its own.
+    pub upload_generation: u32,
 }
 
 impl TextureUploadJob {
@@ -371,6 +385,16 @@ impl TextureUploadJob {
         RedirtySubresource {
             texture_id: self.info.texture_id,
             index: u32::try_from(self.staging_index).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The answer this job reports once its upload reaches the command stream.
+    fn emitted_answer(&self) -> EmittedUpload {
+        EmittedUpload {
+            subresource: self.redirty_subresource(),
+            level: self.level,
+            generation: self.upload_generation,
+            releases_staging: self.release_staging,
         }
     }
 
@@ -6740,8 +6764,9 @@ impl FrameEncoder {
         if emitted {
             // The subresource reached the command stream, so its decline
             // record (if it had one) has served its purpose and its retry
-            // budget goes back.
-            job.redirty.note_emitted(job.redirty_subresource());
+            // budget goes back, and a level that was holding its staging for
+            // this answer may let it go.
+            job.redirty.note_emitted(job.emitted_answer());
             // Keep the job so an aborted upload command buffer can replay
             // it. It only holds a clone of the texture's own persistent
             // staging Arc, so the memory cost is the clone.
