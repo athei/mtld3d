@@ -312,17 +312,20 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **2 `real` · 124 `expected` ·
+re-checked before retagging. Headline: **0 `real` · 124 `expected` ·
 4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 24
 Apple-family subtest-legs `crash=0`. (2026-09-05: the two answers a device
 without the packed 16-bit formats derives from its render-target answer,
 `CheckDeviceType` for a 16-bit back buffer and the `AUTOGENMIPMAP` probe, were
 made to follow it, so device.c:3626 and device.c:7927 dropped off the Intel
-legs and their clusters left the audit.)
-(2026-09-05: the `scale` legs added 33
-visual.c sites in twelve clusters, 32 of them `expected` for the one reason
-"The scaled leg" below gives and one `real`, `resz_test` 17946, issue #407;
-they carry no device.c site of their own since #408.) (2026-09-05: the `@mac2` legs, recorded
+legs and their clusters left the audit; `ValidateDevice` learnt the sampler
+filter rules the same day and device.c:8181 went with them.)
+(2026-09-05: the `scale` legs added 32
+visual.c sites in eleven clusters, every one `expected` for the one reason
+"The scaled leg" below gives; they carry no device.c site of their own since
+#408. The `resz_test` site they also carried, 17946, was `real` and is fixed:
+a lockable render target created at the reported back-buffer size declined the
+scale while the depth-stencil bound with it took it, issue #407.) (2026-09-05: the `@mac2` legs, recorded
 on the Intel CI image, added 22 sites, every one `expected` and every one a
 property of that machine, its single-mode display or the GPU family, in the
 `test_mode_change`, `test_get_display_mode`, swizzle-format, `test_fetch4`,
@@ -465,8 +468,8 @@ leaves, and the tell is a channel at one eighth or seven eighths of the
 neighbour (`0x20`, `0xdf`) or within a step of it (`0x04`, `0xfb`). A site
 of that shape is `expected`: the space separation is the design, and a probe
 on a boundary has no exact answer under a resample. A site whose values do
-not fit that mechanism is `real`, exactly as on any other leg; the one such
-site the legs carry is `resz_test` 17946 (#407).
+not fit that mechanism is `real`, exactly as on any other leg; the legs carry
+none today.
 
 ### The `real` backlog
 
@@ -1061,14 +1064,6 @@ The plane cuts the quad at y = 240.5 in the reported space and the probes
 sit on rows 240 and 241, the two rows either side of it; under the scale
 that edge falls inside one render row and both probes read its blend
 (`0x9ca13c`) ("The scaled leg").
-
-### visual.c/resz_test
-Sites: 17946=real
-
-Every probe of the RESZ-resolved depth reads exactly three quarters of the
-expected value in every channel (`0x18/0x20`, `0x2f/0x40`), the scale
-factor and not a blend, so the depth value itself is scaled somewhere
-between the depth buffer, the RESZ copy and the sample. Issue #407.
 
 ### visual.c/test_filling_convention
 Sites: 27409=expected

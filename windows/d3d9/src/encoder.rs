@@ -264,12 +264,14 @@ pub struct BlitSide {
     pub sample_count: u8,
 }
 
-/// One back-buffer `ReleaseDC` write-back that has to change size on the way in.
+/// One staging write-back into a colour texture that has to change size on the way in.
 ///
-/// `GetDC` hands the DIB out at the extent D3D9 reports, so under a
-/// `render.scale` below 100% the page GDI drew into is larger than the texture
-/// it belongs in. Built by `surface.rs` on the API thread, which is where the
-/// device's scale and the back buffer's extent are both reachable.
+/// `GetDC` and `LockRect` hand their bytes out at the extent D3D9 reports, so
+/// under a `render.scale` below 100% the page the caller wrote is larger than
+/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and a
+/// lockable render target's `UnlockRect`. Built by `surface.rs` on the API
+/// thread, which is where the device's scale and the surface's extent are both
+/// reachable.
 pub struct ResampledUpload {
     /// Destination colour `MTLTexture`.
     pub color_handle: u64,
@@ -279,8 +281,8 @@ pub struct ResampledUpload {
     pub logical: (u32, u32),
     /// Extent of the destination texture, at or below `logical`.
     pub texture: (u32, u32),
-    /// Bytes per pixel of `format`.
-    pub bytes_per_pixel: u32,
+    /// Row stride of the source rows, which need not be the tight one.
+    pub bytes_per_row: u32,
     /// Multisampled companion of the destination, null when single-sampled.
     pub msaa: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of `msaa`, null whenever `msaa` is.
@@ -7583,11 +7585,12 @@ impl FrameEncoder {
             });
     }
 
-    /// Upload `tight` at its own extent, then resample it into a smaller colour texture.
+    /// Upload `rows` at their own extent, then resample them into a smaller colour texture.
     ///
     /// The resizing counterpart of [`Self::upload_bytes_to_color_handle`], for
-    /// the back buffer's `ReleaseDC` write-back under a `render.scale` below
-    /// 100%. The rows land in a scratch texture at the extent they describe,
+    /// the back buffer's `ReleaseDC` write-back and a lockable render target's
+    /// `UnlockRect` under a `render.scale` below 100%. The rows land in a
+    /// scratch texture at the extent they describe,
     /// which the blit-quad pipeline then samples across the destination with a
     /// linear filter, the same resample a scaling `StretchRect` runs. The
     /// upload rides the frame's leading blit pass and the quad is a render pass
@@ -7596,7 +7599,7 @@ impl FrameEncoder {
     /// Declines, once, when the scratch cannot be created: the destination
     /// keeps the pixels the GPU already holds, which is what an unresampled
     /// direct copy could not have given it either.
-    pub fn upload_bytes_resampled(&mut self, target: &ResampledUpload, tight: &[u8]) {
+    pub fn upload_bytes_resampled(&mut self, target: &ResampledUpload, rows: &[u8]) {
         let (src_w, src_h) = target.logical;
         let (dst_w, dst_h) = target.texture;
         if target.color_handle == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
@@ -7611,14 +7614,7 @@ impl FrameEncoder {
             );
             return;
         }
-        // `tight` is packed at exactly `src_w` pixels per row.
-        self.upload_bytes_to_color_handle(
-            scratch,
-            tight,
-            src_w,
-            src_h,
-            src_w * target.bytes_per_pixel,
-        );
+        self.upload_bytes_to_color_handle(scratch, rows, src_w, src_h, target.bytes_per_row);
         let src = BlitSide {
             handle: scratch,
             rect: StretchRegion {
@@ -7661,9 +7657,10 @@ impl FrameEncoder {
     /// Get, or build, the scratch texture [`Self::upload_bytes_resampled`] stages through.
     ///
     /// Returns 0 when Metal declines the texture. One slot rather than a map:
-    /// the only extent asked for is the back buffer's reported one, which
-    /// changes at `Reset` and never per frame, so a replacement retires the
-    /// previous texture on the seq-gated queue instead of accumulating entries.
+    /// only a surface at the reported back-buffer size takes the scale at all,
+    /// so the extent asked for changes at `Reset` and never per frame, and a
+    /// replacement retires the previous texture on the seq-gated queue instead
+    /// of accumulating entries.
     fn ensure_dc_write_back_scratch(
         &mut self,
         width: u32,

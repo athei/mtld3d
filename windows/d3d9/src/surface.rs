@@ -2599,7 +2599,7 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
         format,
         logical: (width, height),
         texture: (scale.dimension(width), scale.dimension(height)),
-        bytes_per_pixel: bpp,
+        bytes_per_row: src_stride,
         msaa: inner.live_msaa_handle(),
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
@@ -2850,10 +2850,10 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         height,
         bytes_per_row,
         slice: 0,
-        // Whole-surface read. A lockable render target's texture is created at
-        // the extent D3D9 reports (it declines `render.scale`, so its staging
-        // and its texture are one size), so the region already equals the
-        // texture and the unix side skips the resolve.
+        // Whole-surface read, in the extent D3D9 reports. A lockable render
+        // target at the back-buffer size is rasterized at `render.scale`, so
+        // the unix side resolves the level up to this extent before the copy;
+        // at any other size the two already agree and the resolve is skipped.
         source_width: width,
         source_height: height,
         // A lockable render target has a non-zero `bpp`, so its format is
@@ -2876,9 +2876,10 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
 /// closure owns, at the staging's own row pitch) so the surface's `PageBox` is
 /// never aliased across the API/encoder boundary.
 ///
-/// The copy region is the surface's reported extent, which is also the
-/// texture's: a lockable render target declines `render.scale` so the two
-/// never disagree.
+/// The staging is laid out at the extent D3D9 reports and the colour texture
+/// at `render.scale` of it, so a scaled surface takes the resampling upload
+/// (the same one the back buffer's `ReleaseDC` write-back takes) and every
+/// other one the direct copy.
 fn lockable_rt_upload(inner: &mut SurfaceInner) {
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -2921,12 +2922,30 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         );
         return;
     }
+    let scale = inner.live_render_scale();
     // SAFETY: `inner.device_inner` was stamped at `Self::new` from a live
     // `DeviceInner`; non-null here, and the device outlives all its child
-    // resources per D3D9 lifetime rules.
+    // resources per D3D9 lifetime rules. It is a different allocation from the
+    // surface, so the borrows below never overlap.
     let device_inner = unsafe { &mut *inner.device_inner };
+    if scale.is_identity() {
+        device_inner.push_op(Box::new(move |enc| {
+            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, pitch);
+        }));
+        return;
+    }
+    let target = ResampledUpload {
+        color_handle,
+        format: fmt.metal_pixel_format(),
+        logical: (width, height),
+        texture: (scale.dimension(width), scale.dimension(height)),
+        bytes_per_row: pitch,
+        msaa: inner.live_msaa_handle(),
+        msaa_srgb: inner.live_msaa_srgb_handle(),
+        sample_count: inner.live_multi_sample().sample_count,
+    };
     device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, pitch);
+        enc.upload_bytes_resampled(&target, &bytes);
     }));
 }
 
