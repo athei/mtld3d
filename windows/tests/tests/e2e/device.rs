@@ -1404,22 +1404,20 @@ fn create_fullscreen_honors_the_requested_resolution() {
     );
 }
 
-/// Releasing a fullscreen device gives the window back, and a `WM_SIZE` that
-/// arrives while it does must not resize the back buffer of a device being
-/// torn down.
+/// A `WM_SIZE` that arrives during a fullscreen device's release resizes nothing.
 ///
-/// The mode restore is the first thing the release does to the window, and
-/// where the mode-set is real the window manager answers it with a `WM_SIZE`
-/// for the restored window trimmed to the visible frame, delivered inside
-/// the restore call itself, before the device's own window moves are
-/// guarded. Under the test prefix's emulated mode-set nothing answers, so a
-/// second thread stands in for the window manager: a cross-thread
-/// `SendMessage` waits until the window's thread next pumps, which is that
-/// restore. A release that answered the message would destroy the back
-/// buffer, its sRGB twin and the depth texture a second time and leak their
-/// replacements, which is what ended the process on the Intel CI image. The
-/// unix side refuses a destroy of a handle that is no longer live, and a
-/// build with debug assertions ends the process at that refusal, which is
+/// Releasing a fullscreen device gives the window back. The mode restore is the
+/// first thing the release does to the window, and where the mode-set is real
+/// the window manager answers it with a `WM_SIZE` for the restored window
+/// trimmed to the visible frame, delivered inside the restore call itself,
+/// before the device's own window moves are guarded. Under the test prefix's
+/// emulated mode-set nothing answers, so a second thread stands in for the
+/// window manager: a cross-thread `SendMessage` waits until the window's thread
+/// next pumps, which is that restore. A release that answered the message would
+/// destroy the back buffer, its sRGB twin and the depth texture a second time
+/// and leak their replacements, which is what ended the process on the Intel CI
+/// image. The unix side refuses a destroy of a handle that is no longer live,
+/// and a build with debug assertions ends the process at that refusal, which is
 /// what makes this test fail without the guard.
 #[test]
 fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
@@ -1454,7 +1452,7 @@ fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
         let armed = std::sync::Arc::clone(&armed);
         std::thread::spawn(move || {
             armed.wait();
-            mtld3d_tests::send_message(hwnd, WM_SIZE, 0, (456 << 16) | 600);
+            let _ = mtld3d_tests::send_message(hwnd, WM_SIZE, 0, (0x1C8 << 16) | 0x258);
         })
     };
     armed.wait();
