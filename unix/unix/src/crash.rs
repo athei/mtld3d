@@ -428,6 +428,13 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
     push_hex(&mut b, &mut p, thread_id());
     push(&mut b, &mut p, b" pc=");
     push_hex(&mut b, &mut p, pc);
+    // The native first argument: for a fault in `objc_release` or
+    // `objc_msgSend` it is the object that was gone.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        push(&mut b, &mut p, b" arg0=");
+        push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
+    }
     push(&mut b, &mut p, b" image=");
     // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
     unsafe {
@@ -472,28 +479,20 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
         let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
     }
 
-    // The faulting stack, bounded by the thread's own stack top: the fault
-    // may be one Wine recovers, and a read past the top would re-fault into
-    // the re-entrancy guard and end a process that would have lived.
+    // The faulting stack. The fault may be one Wine recovers, so the scan
+    // must not fault itself: it probes each page before reading it rather
+    // than trusting a stack bound, since a Wine thread runs its unix calls
+    // on a stack Wine allocated, not the one its pthread record names.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
-        let words = stack_words_above(sp);
-        if words > 0 {
-            let mut b = [0u8; 192];
-            let mut p = 0;
-            push(
-                &mut b,
-                &mut p,
-                b"[mtld3d::unix] mtld3d.so return addrs on stack (",
-            );
-            push_decimal(&mut b, &mut p, u32::try_from(words).unwrap_or(u32::MAX));
-            push(&mut b, &mut p, b" words scanned):\n");
+        if sp != 0 {
+            const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
             // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
             unsafe {
-                let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+                let _ = libc::write(fd, HDR.as_ptr().cast::<c_void>(), HDR.len());
             }
-            our_frames_on_stack(sp, words);
+            our_frames_on_stack(sp, STACK_SCAN_WORDS);
         }
     }
 }
@@ -507,22 +506,6 @@ fn thread_id() -> u64 {
         libc::pthread_threadid_np(0, &raw mut id);
     }
     id
-}
-
-/// How many 4-byte words lie between `sp` and the calling thread's stack top.
-///
-/// Capped at [`STACK_SCAN_WORDS`]. Zero when the top is unknown or below
-/// `sp`, which skips the scan rather than guessing.
-fn stack_words_above(sp: u64) -> usize {
-    // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
-    let me = unsafe { libc::pthread_self() };
-    // SAFETY: `pthread_get_stackaddr_np` on the calling thread reads its
-    // pthread record; it is the documented way to the stack's high end.
-    let top = unsafe { libc::pthread_get_stackaddr_np(me) } as usize as u64;
-    if top <= sp {
-        return 0;
-    }
-    usize::try_from((top - sp) / 4).map_or(STACK_SCAN_WORDS, |w| w.min(STACK_SCAN_WORDS))
 }
 
 /// Append the calling thread's name.
@@ -619,10 +602,20 @@ fn our_frames_on_stack(sp: u64, words: usize) {
     let base = sp as *const u8;
     let mut printed = 0u32;
     let mut slot = 0usize;
+    let mut probed_page = 0u64;
     while slot < words && printed < OURS_CAP {
-        // SAFETY: an offset into stack memory near `sp`; an unmapped read below
-        // re-faults into the re-entrancy guard (terminating), which bounds the
-        // walk.
+        // The word plus the seven bytes after it; a read that would cross
+        // into a page nobody mapped ends the walk instead of faulting.
+        let end = sp.wrapping_add((slot * 4) as u64 + 7);
+        let page = page_of(end);
+        if page != probed_page {
+            if !page_is_mapped(page) {
+                break;
+            }
+            probed_page = page;
+        }
+        // SAFETY: an offset into stack memory near `sp`, on a page the probe
+        // above found mapped.
         let word = unsafe { base.add(slot * 4) };
         // SAFETY: as above; `read_unaligned` tolerates a 4-byte-aligned 32-bit
         // stack.
@@ -636,6 +629,26 @@ fn our_frames_on_stack(sp: u64, words: usize) {
         }
         slot += 1;
     }
+}
+
+/// The page `addr` lies on.
+fn page_of(addr: u64) -> u64 {
+    // SAFETY: `sysconf` reads a constant.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .unwrap_or(4096)
+        .max(1);
+    addr & !(page - 1)
+}
+
+/// Whether the page at `page` is mapped, asked of the kernel rather than found out by a fault.
+///
+/// `mincore` answers `ENOMEM` for an address no mapping covers and is a
+/// plain system call, which is what a signal handler can afford.
+fn page_is_mapped(page: u64) -> bool {
+    let mut vec = [0i8; 1];
+    // SAFETY: `mincore` reads no user memory but the one-byte out vector.
+    let rc = unsafe { libc::mincore(page as *const c_void, 1, vec.as_mut_ptr()) };
+    rc == 0
 }
 
 /// What dyld knows about `addr`: its image, and the nearest symbol below it.
@@ -717,6 +730,15 @@ const SP_OFFSET: usize = 264;
 const ARG0_OFFSET: usize = 32;
 #[cfg(target_arch = "aarch64")]
 const ARG0_OFFSET: usize = 16;
+
+/// Byte offset of the register carrying a native call's first argument.
+///
+/// `x86_64` `__rdi`, the System V first argument, which is what a framework
+/// or the Objective-C runtime was handed; `arm64` `__x0`, the same role.
+#[cfg(target_arch = "x86_64")]
+const NATIVE_ARG0_OFFSET: usize = 48;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_ARG0_OFFSET: usize = 16;
 
 /// Byte offset of `__rax`, which holds the vtable pointer a `CALL` loaded.
 #[cfg(target_arch = "x86_64")]

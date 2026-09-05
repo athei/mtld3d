@@ -405,8 +405,14 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     // lines already cover the boot-time milestone.
     debug!(
         target: LOG_TARGET,
-        "created backbuffer {}x{} samples={}",
-        params.width, params.height, params.sample_count
+        "created backbuffer {}x{} samples={}: texture {:#x} srgb {:#x} msaa {:#x} msaa_srgb {:#x}",
+        params.width,
+        params.height,
+        params.sample_count,
+        params.texture_handle.raw(),
+        params.srgb_texture_handle.raw(),
+        params.msaa_texture_handle.raw(),
+        params.msaa_srgb_texture_handle.raw(),
     );
     STATUS_SUCCESS
 }
@@ -604,6 +610,14 @@ pub extern "C" fn create_depth_texture_handler(args: *mut c_void) -> i32 {
         params.sample_count,
     ) {
         params.texture_handle = handle;
+        debug!(
+            target: LOG_TARGET,
+            "created depth texture {}x{} samples={}: {:#x}",
+            params.width,
+            params.height,
+            params.sample_count,
+            handle.raw(),
+        );
         STATUS_SUCCESS
     } else {
         error!(target: LOG_TARGET, "failed to create depth texture");
@@ -819,6 +833,14 @@ pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
     let slice = unsafe {
         core::slice::from_raw_parts(params.handles_ptr as *const u64, params.count as usize)
     };
+    // The handles by value, so a later fault or ledger warning on one of
+    // them can be matched to the destroy that carried it.
+    debug!(
+        target: LOG_TARGET,
+        "DestroyResourcesBulk {:?} x{}: {slice:#x?}",
+        params.kind,
+        params.count,
+    );
     match params.kind {
         DestroyKind::Buffer => {
             for &h in slice {

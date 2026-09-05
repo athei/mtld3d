@@ -154,6 +154,8 @@ fn foreign_fault_is_named_then_forwarded() {
         .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
     assert!(line.contains("signo=11"), "{line}");
     assert!(line.contains(" tid=0x"), "{line}");
+    // The released or messaged object, for a fault inside the runtime.
+    assert!(line.contains(" arg0=0x"), "{line}");
     // The image as path plus offset: the load address alone names nothing
     // once the process is gone.
     assert!(line.contains("image=/"), "{line}");
@@ -162,7 +164,7 @@ fn foreign_fault_is_named_then_forwarded() {
     // The faulting stack was scanned for our frames: this test binary is
     // one of ours by path, so the caller of `strlen` is on the list.
     assert!(
-        report.contains("mtld3d.so return addrs on stack ("),
+        report.contains("mtld3d.so return addrs on stack:"),
         "{report}"
     );
 }

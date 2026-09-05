@@ -18,6 +18,31 @@ use objc2_metal::{
 
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
 
+/// The texture handles this side has minted and not yet destroyed.
+///
+/// A handle enters at [`mint`] and leaves at [`destroy_texture`], so a
+/// destroy of a handle that is not here is a second destroy of one that was,
+/// or a value that never was one: the release it asks for would hand the
+/// Objective-C runtime an object that is gone, which ends the process where
+/// the memory has been reused and corrupts a live object where it has not.
+/// The check costs one hash per create and per destroy, both rare next to
+/// what they do.
+static LIVE_TEXTURES: std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashSet<u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashSet::default()));
+
+/// Hand a texture's retain to a raw handle, recording it as live.
+///
+/// Every texture handle that reaches the PE side is minted here, so the
+/// ledger and [`destroy_texture`]'s check agree on what is live.
+fn mint<T: objc2::Message>(texture: Retained<T>) -> u64 {
+    let raw = Retained::into_raw(texture).cast::<core::ffi::c_void>() as usize as u64;
+    LIVE_TEXTURES
+        .lock()
+        .expect("live-texture ledger poisoned")
+        .insert(raw);
+    raw
+}
+
 /// Creates a persistent `BGRA8Unorm` render target texture for use as a backbuffer.
 ///
 /// The new texture is cleared to opaque black before it is returned. A
@@ -64,7 +89,7 @@ pub fn create_backbuffer(
     // SAFETY: `Retained::into_raw` transfers the retain into a raw
     // pointer; `MetalHandle::new` adopts it as the canonical retain.
     Some((
-        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
         srgb_handle,
     ))
 }
@@ -135,7 +160,7 @@ fn srgb_twin_view(
     view.map_or(0, |view| {
         let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
         view.setLabel(Some(&srgb_label));
-        Retained::into_raw(view) as u64
+        mint(view)
     })
 }
 
@@ -227,7 +252,7 @@ pub fn create_depth_texture(
     texture.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
     // adopts it as canonical.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
 }
 
 /// Creates a standalone color render-target texture.
@@ -263,7 +288,7 @@ pub fn create_color_target(
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
     // adopts it as canonical.
     Some((
-        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
         srgb_handle,
     ))
 }
@@ -293,7 +318,7 @@ pub fn create_upscale_target(
     )?;
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
     // adopts it as canonical.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) })
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
 }
 
 /// Shared body of the colour-texture creators.
@@ -385,7 +410,7 @@ pub fn create_msaa_companion(
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
     // adopts it as canonical.
     Some((
-        unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(texture) as u64) },
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
         srgb_handle,
     ))
 }
@@ -658,13 +683,13 @@ pub fn create_texture(
         };
         if let Some(view) = view {
             view.setLabel(Some(&label));
-            return Some((Retained::into_raw(view) as u64, srgb_handle));
+            return Some((mint(view), srgb_handle));
         }
     }
 
     texture.setLabel(Some(&label));
 
-    Some((Retained::into_raw(texture) as u64, srgb_handle))
+    Some((mint(texture), srgb_handle))
 }
 
 /// Create a single-slice, 2D view of one array slice of a texture.
@@ -702,11 +727,28 @@ pub fn create_texture_slice_view(
     view.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` hands over the view's only retain, which
     // the typed handle carries to the PE side.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(Retained::into_raw(view) as u64) })
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(view)) })
 }
 
 /// Release a Metal texture handle.
 pub fn destroy_texture(texture_handle: u64) {
+    if texture_handle == 0 {
+        return;
+    }
+    let was_live = LIVE_TEXTURES
+        .lock()
+        .expect("live-texture ledger poisoned")
+        .remove(&texture_handle);
+    if !was_live {
+        // Not once: each occurrence names its handle, and the debug lines
+        // around it say which destroy asked twice.
+        log::warn!(
+            target: crate::LOG_TARGET,
+            "destroy_texture: {texture_handle:#x} is not a live texture handle; a second \
+             destroy of a texture already released, or a value that never was one; skipped",
+        );
+        return;
+    }
     // SAFETY: bulk-destroy thunk; PE side has dropped its only copy of `texture_handle`.
     let handle = unsafe { MetalHandle::<MTLTextureKind>::new(texture_handle) };
     // SAFETY: just wrapped the unique canonical retain.
