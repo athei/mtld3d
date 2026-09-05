@@ -1747,6 +1747,42 @@ const fn positive_x_face_quad() -> [CubeVertex; 6] {
     ]
 }
 
+/// Bind `cube` for point-sampled `+X` face draws and hand back the quad.
+///
+/// The cube form of [`bind_for_quadrant_draws`], for the tests that draw more
+/// than once in a scene.
+fn bind_cube_for_face_draws(h: &Harness, cube: &mtld3d_tests::CubeTexture<'_>) -> [CubeVertex; 6] {
+    assert_eq!(h.set_cube_texture(0, cube), 0, "SetTexture cube");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+        0,
+        "SetFVF cube"
+    );
+    positive_x_face_quad()
+}
+
+/// Bind `cube`, sample its `+X` face across the back buffer, read the quadrant centres.
+///
+/// Clockwise from the top left, the order [`QUADRANTS`] lists them in. The
+/// cube is unbound again, so the caller can release the device it was sampled
+/// on without the stage holding the texture.
+fn sample_cube_face_quadrants(h: &Harness, cube: &mtld3d_tests::CubeTexture<'_>) -> [u32; 4] {
+    let quad = bind_cube_for_face_draws(h, cube);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "cube sample draw"
+        );
+    });
+    let sampled = read_quadrants(h);
+    assert_eq!(h.clear_texture(0), 0, "unbind the cube");
+    sampled
+}
+
 /// A partial lock's `UnlockRect` publishes the rect it named, on every upload path.
 ///
 /// Each quadrant is locked while the previous draw's upload is in flight and
@@ -1829,16 +1865,7 @@ fn partial_locks_publish_their_own_rect_on_every_upload_path() {
 
     let cube = h.create_cube_texture_owned(SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
     cube.lock_rect(0, 0, 0).write_u32(&[BLACK; TEXELS]);
-    assert_eq!(h.set_cube_texture(0, &cube), 0, "SetTexture cube");
-    h.select_texture_stage(0);
-    point_clamp(&h);
-    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
-    assert_eq!(
-        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
-        0,
-        "SetFVF cube"
-    );
-    let quad = positive_x_face_quad();
+    let quad = bind_cube_for_face_draws(&h, &cube);
     h.render_once(BLACK, |d| {
         for (color, rect, name) in QUADRANTS {
             assert_eq!(
@@ -1860,6 +1887,48 @@ fn partial_locks_publish_their_own_rect_on_every_upload_path() {
         assert_pixel_eq(sampled[i], color, &format!("cube +X {name}"));
     }
     assert_eq!(h.clear_texture(0), 0, "unbind the cube");
+}
+
+/// A cube face uploads whole onto the device it migrates to.
+///
+/// A `D3DPOOL_MANAGED` cube outlives the device that created it: the
+/// application keeps the texture, releases the device, creates another and
+/// binds the texture there. That device's Metal texture is empty, so every
+/// level the application has written is uploaded again whole. A partial lock
+/// the old device never flushed leaves an upload rect behind, and honouring it
+/// on the new device would upload that rect alone and leave the rest of the
+/// face at the empty texture's zeros.
+#[test]
+fn a_cube_face_uploads_whole_onto_the_device_it_migrates_to() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const BASE: u32 = 0xFF00_FF00;
+    const PATCH: u32 = 0xFFFF_0000;
+    let first = Harness::new();
+    let cube = first.create_cube_texture_owned(SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    cube.lock_rect(0, 0, 0).write_u32(&[BASE; TEXELS]);
+    let sampled = sample_cube_face_quadrants(&first, &cube);
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate() {
+        assert_pixel_eq(sampled[i], BASE, name);
+    }
+
+    // No draw follows this lock, so the top-left quadrant is still the face's
+    // pending upload rect when the device goes away under it.
+    let (_, rect, _) = QUADRANTS[0];
+    cube.lock_rect_partial(0, 0, &rect, 0)
+        .write_u32_rect(32, 32, &[PATCH; 32 * 32]);
+    assert_eq!(
+        first.release_device(),
+        0,
+        "a managed cube holds no reference on the device"
+    );
+
+    let second = Harness::new();
+    let migrated = sample_cube_face_quadrants(&second, &cube);
+    assert_pixel_eq(migrated[0], PATCH, "the quadrant the partial lock wrote");
+    for (i, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(migrated[i], BASE, name);
+    }
 }
 
 /// An `UpdateSurface` from system memory reaches the very next draw.
