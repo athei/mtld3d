@@ -423,6 +423,11 @@ pub fn is_dropped_staging_page(bits: *const u8) -> bool {
 }
 
 impl TextureInner {
+    /// Process-unique id of the texture this inner belongs to.
+    pub const fn texture_id(&self) -> TextureId {
+        self.texture_id
+    }
+
     /// D3DPOOL_* the texture was created in.
     pub const fn d3d_pool(&self) -> u32 {
         self.d3d_pool
@@ -4058,6 +4063,7 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: (ti.depth >> level).max(1),
         slice_pitch,
+        redirty: dev.upload_redirty(),
     };
     let texture_id = ti.texture_id;
     let regen_mipmaps = ti.autogen_mipmap() && level == 0;
@@ -4133,10 +4139,29 @@ fn schedule_cube_upload(
         bytes_per_pixel: ti.bytes_per_pixel,
         depth: 1,
         slice_pitch,
+        redirty: dev.upload_redirty(),
     };
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
         enc.run_texture_upload(job);
     }));
+}
+
+/// Re-mark a subresource whose upload the encoder emitted nothing for.
+///
+/// The bind-time flush takes a level's dirty bit and its pending rectangle
+/// before the job crosses to the encoder thread, so an upload that reaches no
+/// command buffer leaves the region unannounced: `UnlockRect` publishes only
+/// the rectangle the game locked, and the level is not re-announced until the
+/// game writes those texels again. Restoring the dirty state here makes the
+/// next bind retry the upload. The rectangle unions with anything the game
+/// has written since, and a write that already covers the level keeps it
+/// whole, so the retry never narrows what was going to be uploaded anyway.
+pub fn redirty_declined_upload(ti: &mut TextureInner, face: u32, level: usize, rect: DirtyRect) {
+    if ti.flags.contains(TextureFlags::CUBE) {
+        ti.mark_cube_written_region(face, level, rect);
+    } else {
+        ti.mark_written_region(level, rect);
+    }
 }
 
 /// Mark every previously-uploaded mip dirty for the next bind-time `flush_dirty_mips`.

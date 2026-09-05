@@ -1356,6 +1356,17 @@ impl CopyRejectReason {
         self as u64
     }
 
+    /// Per-destination key so the warn fires once per reason and destination.
+    ///
+    /// A texture upload that this rejects is one texture's pixels, and a
+    /// single key for the whole process names the first texture to hit the
+    /// reason and hides every other one. Metal object addresses are at least
+    /// 8-byte aligned and the discriminant is under 8, so the low bits carry
+    /// it without ever colliding with another destination.
+    const fn key_at(self, destination: u64) -> u64 {
+        destination ^ (self as u64)
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::FormatMismatch => "source and destination pixel formats are incompatible",
@@ -1782,7 +1793,7 @@ fn encode_leading_blits(
                     let dst_handle = cmd.dst_handle;
                     mtld3d_shared::log_once_warn_by!(
                         target: crate::LOG_TARGET,
-                        key: reason.key(),
+                        key: reason.key_at(dst_handle),
                         "encode_leading_blits: {reason_text}, upload skipped. \
                          src handle={src_handle:#x} {source}, \
                          dst handle={dst_handle:#x} {destination}, \
