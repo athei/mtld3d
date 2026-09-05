@@ -14,6 +14,12 @@
 //! checked on both of its bounds: the region against the addressed mip level, rounded up
 //! to the block grid so a compressed level below one block still takes a whole block, and
 //! the buffer against the rows and slices the strides walk.
+//!
+//! `first_pending` is the lookup behind a GPU-retire wait: it is checked to answer with the
+//! smallest registered seq at or past the target on the waiting device, and never with
+//! another device's entry, however the seqs of the two interleave.
+
+use std::collections::BTreeMap;
 
 use mtld3d_shared::mtl::{BlockLayout, PixelFormat};
 use objc2_metal::MTLPixelFormat;
@@ -21,8 +27,43 @@ use objc2_metal::MTLPixelFormat;
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PresentGeometry, PresentRoute,
     SETTLED_PRESENTS, copy_buffer_to_texture_reject, copy_texture_reject,
-    copy_texture_to_buffer_reject, geometry_settled, present_route,
+    copy_texture_to_buffer_reject, first_pending, geometry_settled, present_route,
 };
+
+/// Two device identities that sort either side of each other's seqs.
+const DEVICE_A: u64 = 0x1000;
+const DEVICE_B: u64 = 0x2000;
+
+/// A wait answers with its own device's smallest seq at or past the target.
+///
+/// Device B holds the seq A's wait would find first in a registry keyed by
+/// seq alone.
+#[test]
+fn a_wait_answers_with_its_own_devices_next_seq() {
+    let map: BTreeMap<(u64, u64), u32> = [
+        ((DEVICE_A, 5), 15),
+        ((DEVICE_B, 5), 25),
+        ((DEVICE_B, 6), 26),
+        ((DEVICE_A, 7), 17),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(first_pending(&map, DEVICE_A, 5), Some(&15));
+    assert_eq!(first_pending(&map, DEVICE_A, 6), Some(&17));
+    assert_eq!(first_pending(&map, DEVICE_A, 7), Some(&17));
+    assert_eq!(first_pending(&map, DEVICE_A, 8), None);
+    assert_eq!(first_pending(&map, DEVICE_B, 6), Some(&26));
+}
+
+/// Another device's entries never answer a wait, whatever seqs it holds.
+#[test]
+fn another_devices_entries_never_answer_a_wait() {
+    let map: BTreeMap<(u64, u64), u32> = (1..=10).map(|seq| ((DEVICE_B, seq), 20)).collect();
+    assert_eq!(first_pending(&map, DEVICE_A, 1), None);
+    assert_eq!(first_pending(&map, DEVICE_A, 0), None);
+    assert_eq!(first_pending(&map, DEVICE_B, 3), Some(&20));
+    assert_eq!(first_pending(&map, DEVICE_B, 11), None);
+}
 
 /// Matching extents take the blit whether or not `MetalFX` exists.
 #[test]

@@ -64,17 +64,35 @@ unsafe impl Send for PendingCmdBuf {}
 // SAFETY: as above.
 unsafe impl Sync for PendingCmdBuf {}
 
-/// Registry of in-flight `MTLCommandBuffer`s keyed by `submit_seq`.
+/// Registry of in-flight `MTLCommandBuffer`s keyed by `(device, submit_seq)`.
+///
+/// The device half of the key is the frame's `coherent_seq_ptr`, the
+/// PE-side counter the buffer's completion advances: one per device, and
+/// the same value on every submit and every wait of that device. Every
+/// device mints its own `submit_seq` from one, so without it two live
+/// devices would share a key space, replace each other's entries and wait
+/// on each other's buffers; and the in-order argument behind
+/// `wait_for_gpu_retire` holds only within one queue, which is one device.
 ///
 /// `submit_frame` inserts before `commit()`; the
 /// `addCompletedHandler` block removes after the GPU retires;
-/// `wait_for_gpu_retire` looks up by range to do a kernel-blocked
-/// wait. The retain held here is what keeps the cmdbuf addressable
-/// after `commit()` returns ownership to Metal — Metal's queue keeps
-/// its own refcount, but we need a stable pointer to call
+/// `wait_for_gpu_retire` looks up by range within its device to do a
+/// kernel-blocked wait. The retain held here is what keeps the cmdbuf
+/// addressable after `commit()` returns ownership to Metal — Metal's queue
+/// keeps its own refcount, but we need a stable pointer to call
 /// `waitUntilCompleted` on. The completion handler always removes,
 /// so the map size is bounded by in-flight frames.
-static PENDING_CMDBUFS: Mutex<BTreeMap<u64, PendingCmdBuf>> = Mutex::new(BTreeMap::new());
+static PENDING_CMDBUFS: Mutex<BTreeMap<(u64, u64), PendingCmdBuf>> = Mutex::new(BTreeMap::new());
+
+/// The entry for the smallest seq at or past `target` on one device.
+///
+/// Entries of other devices never answer: the range stays inside `device`'s
+/// half of the key space.
+fn first_pending<V>(map: &BTreeMap<(u64, u64), V>, device: u64, target: u64) -> Option<&V> {
+    map.range((device, target)..=(device, u64::MAX))
+        .next()
+        .map(|(_, value)| value)
+}
 
 /// Log sub-target of the presented-cadence probe.
 ///
@@ -175,8 +193,9 @@ fn register_presented_probe(
 /// Block until `coherent_seq >= target_seq` by calling `waitUntilCompleted`.
 ///
 /// The wait targets the registered cmdbuf for the smallest in-flight seq
-/// ≥ target. Metal's queue is in-order, so waiting on that one implicitly
-/// waits on every earlier one too. After the wait we `fetch_max` the
+/// ≥ target on the device `coherent_seq_ptr` belongs to. Metal's queue is
+/// in-order, so waiting on that one implicitly waits on every earlier one
+/// of the same device too. After the wait we `fetch_max` the
 /// atomic ourselves: the completion handler may not have fired yet (it
 /// runs on Metal's own dispatch queue), and our caller needs to observe
 /// `coherent_seq >= target_seq` on return.
@@ -202,7 +221,7 @@ pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64, failed_submit
         // handler removes from the same map and would deadlock if we
         // held the lock across the kernel sleep.
         let map = PENDING_CMDBUFS.lock().unwrap();
-        map.range(target_seq..).next().map(|(_, cb)| cb.0.clone())
+        first_pending(&map, coherent_seq_ptr, target_seq).map(|cb| cb.0.clone())
     };
     let Some(cmdbuf) = cmdbuf else {
         // Either the handler raced ahead of us (already removed) or
@@ -608,9 +627,12 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
     // read the atomic directly to drain retention queues. The same
     // handler also removes our `PENDING_CMDBUFS` entry — the registry
     // keeps the cmdbuf reachable for `wait_for_gpu_retire`'s
-    // `waitUntilCompleted` call until Metal signals completion.
+    // `waitUntilCompleted` call until Metal signals completion. The entry
+    // is keyed by this device (its `coherent_seq_ptr`) as well as the seq,
+    // so another device's frame at the same seq is a different entry.
     if params.coherent_seq_ptr != 0 && params.submit_seq > 0 {
-        let atomic_ptr = usize::try_from(params.coherent_seq_ptr)
+        let device = params.coherent_seq_ptr;
+        let atomic_ptr = usize::try_from(device)
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = params.submit_seq;
         let failed_seq_ptr = params.failed_submit_seq_ptr;
@@ -649,7 +671,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
                 atomic.fetch_max(seq, Ordering::Release);
                 mtld3d_shared::crumb!("submit:retire", seq);
-                let _ = PENDING_CMDBUFS.lock().unwrap().remove(&seq);
+                let _ = PENDING_CMDBUFS.lock().unwrap().remove(&(device, seq));
             },
         );
         // SAFETY: objc2 typed binding; `handler` is kept alive on the stack
@@ -661,7 +683,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
         PENDING_CMDBUFS
             .lock()
             .unwrap()
-            .insert(seq, PendingCmdBuf(cmd_buf.clone()));
+            .insert((device, seq), PendingCmdBuf(cmd_buf.clone()));
     }
 
     mtld3d_shared::crumb!("submit:commit");
