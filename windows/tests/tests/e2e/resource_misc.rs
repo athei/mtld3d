@@ -8,11 +8,13 @@ use core::ffi::c_void;
 use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
-    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D16,
-    D3DFMT_D24S8, D3DFMT_INDEX16, D3DFMT_R5G6B5, D3DFVF_XYZ, D3DMULTISAMPLE_4_SAMPLES,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSBT_ALL, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY,
-    D3DVERTEXELEMENT9, E_NOINTERFACE, Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DERR_UNSUPPORTEDTEXTUREFILTER,
+    D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_INDEX16, D3DFMT_R5G6B5, D3DFVF_XYZ,
+    D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DSBT_ALL, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
+    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -786,6 +788,82 @@ fn validate_device_succeeds_and_clip_plane_round_trips() {
         h.get_clip_plane(3),
         (D3D_OK, plane),
         "GetClipPlane(3) returns the set coefficients"
+    );
+}
+
+/// The sentinel a failing `ValidateDevice` must leave in the pass count.
+const PASSES_SENTINEL: u32 = 0xdead_beef;
+
+#[test]
+fn validate_device_rejects_a_stage_that_disables_a_filter() {
+    let h = Harness::new();
+    let texture = h.create_texture(32, 32, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    // A stage may not disable magnification or minification. The rule holds
+    // whether or not the stage has a texture bound, and the failing call
+    // leaves the pass count untouched.
+    for bound in [false, true] {
+        let hr = if bound {
+            h.set_texture(0, &texture)
+        } else {
+            h.clear_texture(0)
+        };
+        assert_eq!(hr, D3D_OK, "SetTexture(0) bound={bound}");
+        for (mag, min) in [
+            (D3DTEXF_NONE, D3DTEXF_NONE),
+            (D3DTEXF_POINT, D3DTEXF_NONE),
+            (D3DTEXF_NONE, D3DTEXF_POINT),
+        ] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MAGFILTER, mag), D3D_OK);
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MINFILTER, min), D3D_OK);
+            assert_eq!(
+                h.validate_device(PASSES_SENTINEL),
+                (D3DERR_UNSUPPORTEDTEXTUREFILTER, PASSES_SENTINEL),
+                "mag {mag} min {min} bound={bound}"
+            );
+        }
+        // The D3D9 default filters validate and report their pass.
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            D3D_OK
+        );
+        assert_eq!(
+            h.validate_device(PASSES_SENTINEL),
+            (D3D_OK, 1),
+            "point mag and min bound={bound}"
+        );
+    }
+    // Linear filtering a format the device filters stays valid, mip filter
+    // included: only D3DTEXF_NONE on mag or min is the disabled-stage rule.
+    for state in [D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER] {
+        assert_eq!(h.set_sampler_state(0, state, D3DTEXF_LINEAR), D3D_OK);
+    }
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3D_OK, 1),
+        "trilinear on a filterable format"
+    );
+    // Any stage answers, not just the one a texture is bound to.
+    assert_eq!(
+        h.set_sampler_state(7, D3DSAMP_MINFILTER, D3DTEXF_NONE),
+        D3D_OK
+    );
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3DERR_UNSUPPORTEDTEXTUREFILTER, PASSES_SENTINEL),
+        "a disabled filter on an unbound stage"
+    );
+    assert_eq!(
+        h.set_sampler_state(7, D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        D3D_OK
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        D3D_OK,
+        "unbind before the texture drops"
     );
 }
 

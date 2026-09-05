@@ -10,8 +10,9 @@ use mtld3d_tests::Harness;
 use mtld3d_types::{
     D3D_OK, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
     D3DFMT_A32B32G32R32F, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_RENDERTARGET,
+    D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, E_FAIL,
 };
 
 /// The formats `supports32BitFloatFiltering` covers.
@@ -129,4 +130,93 @@ fn single_precision_floats_stay_creatable_and_renderable() {
             "{name} CreateRenderTarget",
         );
     }
+}
+
+/// The sentinel a failing `ValidateDevice` must leave in the pass count.
+const PASSES_SENTINEL: u32 = 0xdead_beef;
+
+/// Set the three filters of sampler 0, asserting each write succeeds.
+fn set_filters(h: &Harness, mag: u32, min: u32, mip: u32) {
+    for (state, value) in [
+        (D3DSAMP_MAGFILTER, mag),
+        (D3DSAMP_MINFILTER, min),
+        (D3DSAMP_MIPFILTER, mip),
+    ] {
+        assert_eq!(
+            h.set_sampler_state(0, state, value),
+            D3D_OK,
+            "sampler state"
+        );
+    }
+}
+
+#[test]
+fn validate_device_rejects_filtering_an_unfilterable_texture() {
+    let h = Harness::with_config(DENY_FLOAT32_FILTERING);
+    let float32 = h.create_texture(32, 32, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.set_texture(0, &float32),
+        D3D_OK,
+        "SetTexture(A32B32G32R32F)"
+    );
+    // Point sampling is what the device offers for this format, so it validates.
+    for mip in [D3DTEXF_NONE, D3DTEXF_POINT] {
+        set_filters(&h, D3DTEXF_POINT, D3DTEXF_POINT, mip);
+        assert_eq!(
+            h.validate_device(PASSES_SENTINEL),
+            (D3D_OK, 1),
+            "point sampling with mip {mip}"
+        );
+    }
+    // Asking any of the three for a filtered fetch is the E_FAIL an engine
+    // reads as "take the fallback"; the pass count stays untouched.
+    for (mag, min, mip) in [
+        (D3DTEXF_LINEAR, D3DTEXF_POINT, D3DTEXF_NONE),
+        (D3DTEXF_POINT, D3DTEXF_LINEAR, D3DTEXF_NONE),
+        (D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_LINEAR),
+    ] {
+        set_filters(&h, mag, min, mip);
+        assert_eq!(
+            h.validate_device(PASSES_SENTINEL),
+            (E_FAIL, PASSES_SENTINEL),
+            "mag {mag} min {min} mip {mip} on a point-sampled format"
+        );
+    }
+    // The rule is the bound format's, not the filters': the same trilinear
+    // setup on a format the device filters validates.
+    let filterable = h.create_texture(32, 32, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.set_texture(0, &filterable),
+        D3D_OK,
+        "SetTexture(A8R8G8B8)"
+    );
+    set_filters(&h, D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_LINEAR);
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3D_OK, 1),
+        "trilinear on a filterable format"
+    );
+    // Unbinding drops the rule with the texture: the same trilinear stage
+    // with nothing bound has no format to answer for.
+    assert_eq!(h.clear_texture(0), D3D_OK, "SetTexture(0, null)");
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3D_OK, 1),
+        "trilinear with no texture bound"
+    );
+    assert_eq!(
+        h.set_texture(0, &float32),
+        D3D_OK,
+        "SetTexture(A32B32G32R32F)"
+    );
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (E_FAIL, PASSES_SENTINEL),
+        "rebinding the point-sampled format brings the rule back"
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        D3D_OK,
+        "unbind before the textures drop"
+    );
 }

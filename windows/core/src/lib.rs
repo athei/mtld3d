@@ -58,5 +58,6 @@ pub mod texture_staging;
 pub mod upload_pass;
 pub mod upload_recovery;
 pub mod upload_redirty;
+pub mod validate_device;
 pub mod visibility;
 pub mod vs_draw;

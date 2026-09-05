@@ -324,8 +324,8 @@ property of that machine, its single-mode display or the GPU family, in the
 `fp_special_test`, `test_multisample_get_front_buffer_data` and
 `multisampled_depth_buffer_test` clusters; the eight `@mac2` subtest-legs are
 `crash=0` too.) (2026-09-04: the Intel legs, which run every subtest
-under the `intel.*` config keys, added device.c:3626, 7927 and 8181 as `real`
-(issues #362, #363) and visual.c:28024 as `caps`; no site moved under the two
+under the `intel.*` config keys, added device.c:3626 and 7927 as `real`
+(issue #362) and visual.c:28024 as `caps`; no site moved under the two
 keys that change only a code path, `intel.managedMemory` and
 `intel.linearAlign256`. On the Apple family the `ceiling` and `flaky` pins of
 the native device legs are carried on the Intel legs at the same counts, since
@@ -462,13 +462,10 @@ site the legs carry is `resz_test` 17946 (#407).
 
 ### The `real` backlog
 
-Three sites, all on the Intel legs only, none reachable on Apple Silicon:
-
-- device.c:3626 and device.c:7927, issue #362: `CheckDeviceType` and the
-  `AUTOGENMIPMAP` probe keep advertising 16-bit formats on a device that
-  cannot render them, while `CheckDeviceFormat(RENDERTARGET)` denies them.
-- device.c:8181, issue #363: `ValidateDevice` answers S_OK whatever the
-  sampler filters and the bound texture's filter capability are.
+Two sites, device.c:3626 and device.c:7927, both on the Intel legs only and
+neither reachable on Apple Silicon: `CheckDeviceType` and the `AUTOGENMIPMAP`
+probe keep advertising 16-bit formats on a device that cannot render them,
+while `CheckDeviceFormat(RENDERTARGET)` denies them (issue #362).
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin that reads zero on other hardware
@@ -747,17 +744,6 @@ Intel legs only. For a texture format the device does not render, the
 A1R5G5B5 while denying it as a render target, because mip generation works on
 the BGRA8 backing the expansion path gives it. Same inconsistency as
 test_check_device_type, same issue (#362).
-
-### device.c/test_filter
-Sites: 8181=real
-
-Intel legs only. `ValidateDevice` is expected to answer
-`D3DERR_UNSUPPORTEDTEXTUREFILTER` for a stage whose mag or min filter is
-`D3DTEXF_NONE`, texture or not, and `E_FAIL` for a linear filter on a bound
-texture whose format the device does not filter. Ours answers S_OK with one
-pass unconditionally (issue #363). The test skips where A32B32G32R32F
-filters, which is every Apple GPU, and runs where the 32-bit float filter
-probe is negative, which the Intel legs force.
 
 ### device.c/test_miptree_layout
 Sites: 12784=expected 12823=expected

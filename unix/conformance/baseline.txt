@@ -181,7 +181,6 @@
   device.c:5968 count=1
   device.c:6780 count=1
   device.c:7927 count=1
-  device.c:8181 count=10
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -282,7 +281,6 @@
   device.c:5968 count=1
   device.c:6780 count=1
   device.c:7927 count=1
-  device.c:8181 count=10
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -634,7 +632,6 @@
   device.c:5968 count=1
   device.c:6780 count=1
   device.c:7927 count=1
-  device.c:8181 count=10
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30
@@ -733,7 +730,6 @@
   device.c:5968 count=1
   device.c:6780 count=1
   device.c:7927 count=1
-  device.c:8181 count=10
   device.c:8664 count=60
   device.c:8682 count=30
   device.c:8701 count=30

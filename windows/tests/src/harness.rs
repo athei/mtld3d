@@ -551,9 +551,18 @@ impl Harness {
 
     /// `ValidateDevice`. Returns the hr (the pass count is discarded).
     pub fn validate_device_hr(&self) -> i32 {
-        let mut passes = 0u32;
+        self.validate_device(0).0
+    }
+
+    /// `ValidateDevice` with the pass count seeded to `seed`. Returns `(hr, passes)`.
+    ///
+    /// A failing call leaves the out-param alone, so a caller that seeds a
+    /// sentinel can tell an untouched count from a written one.
+    pub fn validate_device(&self, seed: u32) -> (i32, u32) {
+        let mut passes = seed;
         // SAFETY: vtable thunk; `&mut passes` is writable.
-        unsafe { (self.dev_vtbl().validate_device)(self.device, &raw mut passes) }
+        let hr = unsafe { (self.dev_vtbl().validate_device)(self.device, &raw mut passes) };
+        (hr, passes)
     }
 
     /// `SetClipPlane(index, plane)`. Returns the hr.

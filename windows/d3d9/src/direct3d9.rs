@@ -764,7 +764,7 @@ pub fn native_packed16_supported(expand_packed16: bool) -> bool {
 /// are unaffected. `intel.denyFloat32Filtering = true` (`deny`, the
 /// interface's setting) forces the negative answer on any device so the path
 /// can be exercised on Apple Silicon.
-fn float32_filtering_supported(deny: bool) -> bool {
+pub fn float32_filtering_supported(deny: bool) -> bool {
     let supported = device_info()
         .caps
         .contains(DeviceCapsFlags::FLOAT32_FILTERING)
