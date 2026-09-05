@@ -8,8 +8,8 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5,
-    D3DFMT_A4R4G4B4, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1, D3DFMT_DXT5,
-    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
+    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1,
+    D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
     D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
     D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY,
     D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
@@ -842,19 +842,23 @@ fn system_memory_surfaces_are_rejected_as_render_targets() {
 /// A format that is not colour-renderable cannot be created as a render target.
 ///
 /// `CheckDeviceFormat` answers `NOTAVAILABLE` for every one of these next to
-/// `D3DUSAGE_RENDERTARGET`, so the create has to refuse the caller that skipped
-/// the probe rather than hand back a texture nothing can draw into. The cost of
-/// leniency is not a wrong pixel: Metal's render-pipeline validation refuses a
-/// non-renderable colour attachment with an abort, so the first draw into such a
-/// texture takes the process down.
+/// `D3DUSAGE_RENDERTARGET`, so both creates that can carry the usage have to
+/// refuse the caller that skipped the probe rather than hand back a surface
+/// nothing can draw into. The cost of leniency is not a wrong pixel: Metal
+/// refuses a colour attachment it cannot render into with an abort, so a
+/// block-compressed render target takes the process down at the first draw, and
+/// `A8`, whose Metal twin is sampleable only, takes it down inside texture
+/// creation before any draw is reached.
 #[test]
-fn create_texture_rejects_a_render_target_in_a_non_renderable_format() {
+fn creates_reject_a_render_target_in_a_non_renderable_format() {
     let h = Harness::new();
     for format in [
         D3DFMT_DXT1,
         D3DFMT_DXT5,
         D3DFMT_ATI1,
+        D3DFMT_A8,
         D3DFMT_L8,
+        D3DFMT_V8U8,
         D3DFMT_A4R4G4B4,
     ] {
         let (hr, ptr) =
@@ -864,6 +868,11 @@ fn create_texture_rejects_a_render_target_in_a_non_renderable_format() {
             "CreateTexture(format={format:#x}, RENDERTARGET)"
         );
         assert!(ptr.is_null(), "format {format:#x} returned a texture");
+        assert_eq!(
+            h.create_render_target_hr(64, 64, format),
+            D3DERR_INVALIDCALL,
+            "CreateRenderTarget(format={format:#x})"
+        );
     }
 }
 

@@ -5438,11 +5438,13 @@ struct ColorTargetSpec {
 
 /// Create a persistent render-target-capable color `MTLTexture` and wrap it as a surface.
 ///
-/// The wrapper is a standalone `Direct3DSurface9`, mirroring the depth path. Shared by
-/// `CreateRenderTarget` (usage = `D3DUSAGE_RENDERTARGET`) and
-/// `CreateOffscreenPlainSurface(D3DPOOL_DEFAULT)` (usage = 0). Returns the boxed
-/// wrapper pointer, or `None` (caller maps to `INVALIDCALL`) for an unmappable or
-/// compressed color format, or if the Metal allocation fails.
+/// The wrapper is a standalone `Direct3DSurface9`, mirroring the depth path.
+/// `CreateRenderTarget` (usage = `D3DUSAGE_RENDERTARGET`) is its only caller
+/// today; the usage-0 shape a `D3DPOOL_DEFAULT` offscreen plain would take is
+/// answered too, because the two differ only in which format question they ask.
+/// Returns the boxed wrapper pointer, or `None` (caller maps to `INVALIDCALL`)
+/// for an unmappable or compressed color format, for a format whose usage the
+/// device cannot honour, or if the Metal allocation fails.
 fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
@@ -5461,17 +5463,44 @@ fn create_color_target_surface(
     if mapping.is_compressed() {
         return None;
     }
-    // A format whose texels are widened on the way into a BGRA8 backing is
-    // sampling-only: a standalone surface in one of them would pair a
-    // narrower CPU staging with a 32-bit texture through the lockable-RT
-    // upload/readback blits, so reject the create outright. That is the
-    // packed 16-bit family on a device without the native formats, and
-    // R8G8B8 on every device. `CheckDeviceFormat(RENDERTARGET)` already
-    // answers NOTAVAILABLE for them; where the backing is native the lenient
-    // accept stands.
-    if mtld3d_core::upload_pass::is_expanded_upload(format, mapping.metal_pixel_format()) {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateRenderTarget(format={format}) → INVALIDCALL (a format widened on upload is sampling-only)");
+    // A create's usage has to agree with the answer `CheckDeviceFormat` gives
+    // for the same format, and the two usages this fn serves ask different
+    // questions of it.
+    //
+    // With `D3DUSAGE_RENDERTARGET` the question is the device predicate every
+    // other render-target create gate uses. Two groups fail it: the
+    // sampling-only formats, block-compressed ones included, which no D3D9
+    // device rendered into, and the packed 16-bit members on a device that
+    // expansion-backs them, where rendering into the BGRA8 backing would break
+    // Lock/readback fidelity. Neither can be passed through, because Metal
+    // refuses a colour attachment it cannot render into with an abort rather
+    // than a returned error, and this create is the last point that can answer
+    // the application with a D3D9 error instead. Nothing between here and the
+    // draw catches it: `A8` (Metal's `A8Unorm`, which the format tables list as
+    // sampleable only) and `L8` both built a render-target surface fine before
+    // this gate.
+    //
+    // Without the usage the surface is only locked, sampled and blitted, so the
+    // narrower question stands: a format whose texels are widened on the way
+    // into a BGRA8 backing would pair a narrower CPU staging with a 32-bit
+    // texture through the upload and readback blits. That is the packed 16-bit
+    // family on a device without the native formats, and R8G8B8 on every
+    // device.
+    if usage & D3DUSAGE_RENDERTARGET != 0 {
+        if !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16) {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: u64::from(format),
+                "reject CreateRenderTarget(format={format}) → INVALIDCALL (format is not colour-renderable on this device)"
+            );
+            return None;
+        }
+    } else if mtld3d_core::upload_pass::is_expanded_upload(format, mapping.metal_pixel_format()) {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: u64::from(format),
+            "reject standalone surface(format={format}) → INVALIDCALL (a format widened on upload is sampling-only)"
+        );
         return None;
     }
     // A render target created at the reported back-buffer size is the game's
