@@ -88,7 +88,7 @@ jobs:
   build:
     if: ${{ !inputs.probe_only }}
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -121,7 +121,7 @@ jobs:
   check:
     if: ${{ !inputs.probe_only }}
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -186,11 +186,17 @@ jobs:
   # all fit an existing combination is folded into it instead, and that
   # would turn the macos-26/i686 identity leg into the scaled one. The job
   # name is spelled out so the empty value does not show in it.
+  # A green leg takes two to four minutes, four Wine processes included. The
+  # budget is a multiple of that, not of the worst case the runner's watchdog
+  # can produce: a process that faults and leaves Wine's debugger holding the
+  # pipes costs the watchdog period twice over, and a leg where every process
+  # does so would run the whole hour under the old budget while saying nothing
+  # a shorter one does not.
   e2e:
     name: e2e (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.scale && format(', scale {0}', matrix.scale) || '' }})
     needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -213,7 +219,7 @@ jobs:
       # narrows the run and collects the layer's log files, which are
       # otherwise written beside each test binary and pruned to the ten
       # newest.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=240 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           E2E_FILTER: ${{ inputs.e2e_filter }}
           # The layer reads the path on the Windows side, where the unix
@@ -252,11 +258,15 @@ jobs:
   # `include` entry becomes its own combination rather than being folded into
   # the macos-26/i686 native leg; the job name is spelled out so the empty
   # value does not show in it.
+  # A green leg takes four to six minutes; the longest single subtest on the
+  # Intel image stays under four, which is what the per-subtest budget below
+  # is sized against. A `conformance_repeat` dispatch runs one subtest twenty
+  # times and legitimately needs the old hour.
   conformance:
     name: conformance (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.variant && format(', {0}', matrix.variant) || '' }})
     needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.conformance_repeat && 60 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -344,7 +354,7 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Host
         run: |
