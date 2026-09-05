@@ -810,6 +810,66 @@ pub const fn mtl_pixel_format(wire: PixelFormat) -> MTLPixelFormat {
     }
 }
 
+/// The wire format a Metal pixel format came from, `None` for one mtld3d never sends.
+///
+/// The inverse of [`mtl_pixel_format`], for a path that starts from a live
+/// texture rather than from a wire message: the readback resolve creates its
+/// scratch in the source texture's own format.
+pub const fn wire_pixel_format(mtl: MTLPixelFormat) -> Option<PixelFormat> {
+    Some(match mtl {
+        MTLPixelFormat::A8Unorm => PixelFormat::A8Unorm,
+        MTLPixelFormat::R8Unorm => PixelFormat::R8Unorm,
+        MTLPixelFormat::R16Unorm => PixelFormat::R16Unorm,
+        MTLPixelFormat::R16Float => PixelFormat::R16Float,
+        MTLPixelFormat::R32Float => PixelFormat::R32Float,
+        MTLPixelFormat::BC4_RUnorm => PixelFormat::Bc4RUnorm,
+        MTLPixelFormat::RG8Unorm => PixelFormat::Rg8Unorm,
+        MTLPixelFormat::RG8Snorm => PixelFormat::Rg8Snorm,
+        MTLPixelFormat::RG16Unorm => PixelFormat::Rg16Unorm,
+        MTLPixelFormat::RG16Float => PixelFormat::Rg16Float,
+        MTLPixelFormat::RG32Float => PixelFormat::Rg32Float,
+        MTLPixelFormat::B5G6R5Unorm => PixelFormat::B5G6R5Unorm,
+        MTLPixelFormat::ABGR4Unorm => PixelFormat::Abgr4Unorm,
+        MTLPixelFormat::BGR5A1Unorm => PixelFormat::Bgr5A1Unorm,
+        MTLPixelFormat::RGBA8Unorm => PixelFormat::Rgba8Unorm,
+        MTLPixelFormat::RGBA8Unorm_sRGB => PixelFormat::Rgba8UnormSrgb,
+        MTLPixelFormat::BGRA8Unorm => PixelFormat::Bgra8Unorm,
+        MTLPixelFormat::BGRA8Unorm_sRGB => PixelFormat::Bgra8UnormSrgb,
+        MTLPixelFormat::RGBA16Unorm => PixelFormat::Rgba16Unorm,
+        MTLPixelFormat::RGBA16Float => PixelFormat::Rgba16Float,
+        MTLPixelFormat::RGBA32Float => PixelFormat::Rgba32Float,
+        MTLPixelFormat::BC1_RGBA => PixelFormat::Bc1Rgba,
+        MTLPixelFormat::BC1_RGBA_sRGB => PixelFormat::Bc1RgbaSrgb,
+        MTLPixelFormat::BC2_RGBA => PixelFormat::Bc2Rgba,
+        MTLPixelFormat::BC2_RGBA_sRGB => PixelFormat::Bc2RgbaSrgb,
+        MTLPixelFormat::BC3_RGBA => PixelFormat::Bc3Rgba,
+        MTLPixelFormat::BC3_RGBA_sRGB => PixelFormat::Bc3RgbaSrgb,
+        MTLPixelFormat::Depth32Float => PixelFormat::Depth32Float,
+        MTLPixelFormat::Depth32Float_Stencil8 => PixelFormat::Depth32FloatStencil8,
+        _ => return None,
+    })
+}
+
+/// True for a colour format a render pass can write and a sampler can read.
+///
+/// The readback resolve renders the scaled source into a scratch of the same
+/// format, which rules out the block-compressed formats (never render
+/// targets) and the depth formats (read back through their own path).
+pub const fn is_resolvable_color_format(fmt: PixelFormat) -> bool {
+    !matches!(
+        fmt,
+        PixelFormat::Bc1Rgba
+            | PixelFormat::Bc1RgbaSrgb
+            | PixelFormat::Bc2Rgba
+            | PixelFormat::Bc2RgbaSrgb
+            | PixelFormat::Bc3Rgba
+            | PixelFormat::Bc3RgbaSrgb
+            | PixelFormat::Bc4RUnorm
+            | PixelFormat::Depth32Float
+            | PixelFormat::Depth32FloatStencil8
+    )
+}
+
 /// True for depth/stencil pixel formats.
 ///
 /// Used by `create_texture` to route shadow-map textures into the depth
@@ -840,3 +900,6 @@ const fn mtl_storage_mode(wire: StorageMode) -> MTLStorageMode {
         StorageMode::Memoryless => MTLStorageMode::Memoryless,
     }
 }
+
+#[cfg(test)]
+mod tests;

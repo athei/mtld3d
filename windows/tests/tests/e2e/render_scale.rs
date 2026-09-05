@@ -23,13 +23,14 @@
 
 use mtld3d_tests::{Harness, PosColorVertex, RhwVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8,
-    D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
-    D3DPOOL_DEFAULT, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
-    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
-    D3DVIEWPORT9,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8B8G8R8,
+    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_X8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
+    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -836,6 +837,77 @@ fn a_ps_3_0_vpos_reads_reported_pixel_coordinates_under_the_scale() {
     );
     assert_eq!(rgb(480, 360), 0, "and so in the far quadrant");
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn a_scaled_target_reads_back_at_the_reported_extent_in_every_colour_format() {
+    // `GetRenderTargetData` owes the game the target at the extent D3D9
+    // reports. A `CreateRenderTarget` surface at the back-buffer size is
+    // rasterized at `render.scale`, so the readback resolves it up first, and
+    // that resolve has to work in the target's own format: a game reads its
+    // HDR pass back in a float format, its UI in an 8-bit one. Each format is
+    // cleared to opaque red through the target and read back through a
+    // SYSTEMMEM plain of the same format at the first, the middle and the
+    // last pixel; the last one is outside the scaled texture altogether.
+    //
+    // Pins its own scale (a clean half, so both extents are exact) rather
+    // than inheriting the run's: at the identity there is no resolve, and
+    // this has to fail in the ordinary `make test` if it regresses.
+    const RED: u32 = 0xFFFF_0000;
+    // Each format's own encoding of opaque red, as the u32 words of one pixel.
+    const FORMATS: [(u32, &str, &[u32]); 4] = [
+        (D3DFMT_X8R8G8B8, "X8R8G8B8", &[0x00FF_0000]),
+        (D3DFMT_A8B8G8R8, "A8B8G8R8", &[0xFF00_00FF]),
+        (
+            D3DFMT_A16B16G16R16F,
+            "A16B16G16R16F",
+            &[0x0000_3C00, 0x3C00_0000],
+        ),
+        (
+            D3DFMT_A32B32G32R32F,
+            "A32B32G32R32F",
+            &[0x3F80_0000, 0, 0, 0x3F80_0000],
+        ),
+    ];
+    let h = Harness::with_config("render.scale=0.5");
+    let (width, height) = h.dims();
+    let backbuffer = h.render_target(0);
+    for (format, name, red) in FORMATS {
+        let rt = h.create_render_target(width, height, format);
+        assert_eq!(h.set_render_target(0, &rt), 0, "{name}: bind the target");
+        assert_eq!(h.clear_target(RED), 0, "{name}: clear it red");
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            0,
+            "{name}: restore the back buffer"
+        );
+
+        let dst = h.create_offscreen_plain_surface(width, height, format, D3DPOOL_SYSTEMMEM);
+        assert_eq!(
+            h.get_render_target_data_hr(&rt, &dst),
+            D3D_OK,
+            "{name}: GetRenderTargetData at the reported extent"
+        );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let words_per_pixel = red.len();
+        let pitch_words = locked.pitch().cast_unsigned() as usize / 4;
+        let words = locked.as_u32(pitch_words * height as usize);
+        let pixel =
+            |x: usize, y: usize| &words[y * pitch_words + x * words_per_pixel..][..words_per_pixel];
+        for (x, y, where_) in [
+            (0, 0, "the first pixel"),
+            (width as usize / 2, height as usize / 2, "the middle"),
+            (width as usize - 1, height as usize - 1, "the last pixel"),
+        ] {
+            let got = pixel(x, y);
+            let got = match format {
+                // The X channel of X8R8G8B8 carries no defined value.
+                D3DFMT_X8R8G8B8 => vec![got[0] & 0x00FF_FFFF],
+                _ => got.to_vec(),
+            };
+            assert_eq!(got, red, "{name}: {where_} reads the clear colour");
+        }
+    }
 }
 
 /// A depth texture at the back-buffer size is charged the chain it occupies.
