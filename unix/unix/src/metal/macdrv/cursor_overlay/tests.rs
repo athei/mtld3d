@@ -7,13 +7,14 @@
 //! is the pointer-inside-the-client-area test, with its half-open edges, and
 //! `peak_changed` decides which headroom moves re-render the sprite: the 5%
 //! rule the log uses, plus the `1.0` boundary where the frame switches
-//! pipelines.
+//! pipelines. `warp_since` is the run-loop observer's test for a pointer warp
+//! the sprite has not followed yet.
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use super::{
     CAPTURE_SILENCE_MS, Sprite, SpriteGeometry, VisibilityInputs, overlay_visible, peak_changed,
-    pointer_captured, rect_contains, sprite_origin,
+    pointer_captured, rect_contains, sprite_origin, warp_since,
 };
 
 fn geometry() -> SpriteGeometry {
@@ -161,4 +162,17 @@ fn crossing_the_passthrough_boundary_always_re_renders() {
     assert!(peak_changed(1.0, 1.02));
     assert!(peak_changed(1.02, 1.0));
     assert!(!peak_changed(1.01, 1.02));
+}
+
+#[test]
+fn a_warp_is_followed_once_and_a_cleared_warp_time_is_not_a_warp() {
+    // A fresh warp time is a move nothing else reported.
+    assert!(warp_since(0.0, 12.5));
+    assert!(warp_since(12.5, 13.0));
+    // The same warp seen again is not followed twice.
+    assert!(!warp_since(12.5, 12.5));
+    // winemac clears the time once an event newer than the warp arrived; the
+    // pointer watch handled that event, so there is nothing to follow.
+    assert!(!warp_since(12.5, 0.0));
+    assert!(!warp_since(0.0, 0.0));
 }
