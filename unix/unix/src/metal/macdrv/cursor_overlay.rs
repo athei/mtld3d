@@ -38,6 +38,17 @@
 //! are per-device calls, so the device that last spoke is the device the
 //! game means.
 //!
+//! The sprite's position and its pixels reach the compositor together. The
+//! layer presents with the Core Animation transaction, so a hide and the move
+//! made with it land in one frame and the old sprite is never seen at a new
+//! place. That matters because the apply and the game's own pointer warps
+//! reach the main thread through different queues (ours the dispatch main
+//! queue, winemac's its request source) and a game warps right after showing
+//! or hiding its cursor: the two have no order. A warp delivers no event
+//! either, so a run-loop observer ahead of Core Animation's commit reads
+//! winemac's last warp time and repositions the sprite in the same iteration,
+//! whichever of the warp and the apply ran first.
+//!
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
 //! crosshair) delivers no mouse events to the application while the pointer
@@ -85,13 +96,18 @@ use objc2_app_kit::{
     NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSString};
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
-    MTLResource, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+use objc2_core_foundation::{
+    CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CGPoint, CGRect, CGSize, kCFRunLoopCommonModes,
 };
-use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
+use objc2_foundation::{
+    NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSNull, NSString,
+};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLDrawable, MTLOrigin, MTLPixelFormat,
+    MTLRegion, MTLResource, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
+};
+use objc2_quartz_core::{CAAction, CALayer, CAMetalDrawable, CAMetalLayer};
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -650,6 +666,8 @@ fn snapshot_wanted() -> WantedSnapshot {
 thread_local! {
     /// Whether the pointer watch has been installed.
     static POINTER_WATCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// The winemac warp time the run-loop observer last repositioned the sprite for.
+    static WARP_FOLLOWED: Cell<f64> = const { Cell::new(0.0) };
     /// The overlay's `AppKit` and Metal objects; main thread only, by construction.
     ///
     /// Every access is from a block dispatched to the main queue or from an
@@ -761,7 +779,14 @@ impl Overlay {
         // for two flips within one refresh.
         layer.setMaximumDrawableCount(3);
         layer.setAllowsNextDrawableTimeout(true);
-        layer.setPresentsWithTransaction(false);
+        // The pixels ride the Core Animation transaction that carries the
+        // layer's position, so a hide and the move that goes with it reach
+        // the compositor in one frame; see `Overlay::sync_position`.
+        layer.setPresentsWithTransaction(true);
+        // No implicit animation on anything written here: without this, the
+        // layer having no delegate, every position or bounds write would ease
+        // over Core Animation's default quarter second.
+        layer.setActions(Some(&no_actions()));
         layer.setName(Some(&NSString::from_str("mtld3d-cursor-overlay")));
         // Positioned by its bottom-left corner, like the window it lives in.
         layer.setAnchorPoint(CGPoint { x: 0.0, y: 0.0 });
@@ -912,16 +937,18 @@ impl Overlay {
     /// Present the pixels `content` names, if the drawable does not show them already.
     ///
     /// The layer's surface stays in the window's scene either way: hidden is a
-    /// transparent clear, never a removed layer.
-    fn ensure_content(&mut self, content: Content) {
+    /// transparent clear, never a removed layer. Whether the drawable shows
+    /// `content` on return; `false` when the present could not be made and
+    /// the next event or apply retries.
+    fn ensure_content(&mut self, content: Content) -> bool {
         if self.content == content {
-            return;
+            return true;
         }
         let presented = match content {
             Content::Transparent => self.present_transparent(),
             Content::Sprite { hash, mode, peak } => {
                 let Some((_, geometry)) = self.wanted.filter(|(wanted, _)| *wanted == hash) else {
-                    return;
+                    return false;
                 };
                 self.render(hash, geometry, mode, peak)
             }
@@ -930,6 +957,7 @@ impl Overlay {
             self.content = content;
             debug!(target: LOG_TARGET, "cursor: overlay shows {content:?}");
         }
+        presented
     }
 
     /// Present a transparent drawable: the hidden state.
@@ -942,8 +970,7 @@ impl Overlay {
         };
         cmd_buf.setLabel(Some(&NSString::from_str("mtld3d-cursor-clear")));
         command::clear_cursor_drawable(&cmd_buf, &drawable.texture());
-        cmd_buf.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        cmd_buf.commit();
+        present_with_transaction(&cmd_buf, &drawable);
         true
     }
 
@@ -963,19 +990,17 @@ impl Overlay {
                 entry.insert(texture)
             }
         };
-        without_actions(|| {
-            self.layer.setBounds(CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize {
-                    width: geometry.width,
-                    height: geometry.height,
-                },
-            });
-            self.layer.setContentsScale(geometry.scale);
-            self.layer.setDrawableSize(CGSize {
-                width: geometry.width * geometry.scale,
-                height: geometry.height * geometry.scale,
-            });
+        self.layer.setBounds(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: geometry.width,
+                height: geometry.height,
+            },
+        });
+        self.layer.setContentsScale(geometry.scale);
+        self.layer.setDrawableSize(CGSize {
+            width: geometry.width * geometry.scale,
+            height: geometry.height * geometry.scale,
         });
         let Some(drawable) = self.layer.nextDrawable() else {
             mtld3d_shared::log_once_warn!(
@@ -1000,8 +1025,7 @@ impl Overlay {
         {
             return false;
         }
-        cmd_buf.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        cmd_buf.commit();
+        present_with_transaction(&cmd_buf, &drawable);
         debug!(
             target: LOG_TARGET,
             "cursor: sprite {hash:#018x} rendered ({:.0}x{:.0} pt at {}x, hotspot ({:.0},{:.0}), {mode:?}, peak {peak:.2}x)",
@@ -1064,15 +1088,7 @@ impl Overlay {
             self.ensure_content(Content::Transparent);
             return;
         };
-        // Follow the pointer whenever it is over the game, shown or not: the
-        // position write is free and keeps a hidden sprite where it will
-        // reappear.
-        if inputs.contains(VisibilityInputs::POINTER_INSIDE) {
-            let local = self.window.convertPointFromScreen(mouse);
-            let (x, y) = sprite_origin((local.x, local.y), geometry);
-            self.set_position(CGPoint { x, y });
-        }
-        if shown {
+        let content = if shown {
             let mode = self.mode.unwrap_or(LayerMode::Sdr);
             let peak = att.headroom();
             // Re-render on a sprite or layer-mode change, and on a headroom
@@ -1085,28 +1101,92 @@ impl Overlay {
                 } if h == hash && m == mode && !peak_changed(p, peak) => p,
                 _ => peak,
             };
-            self.ensure_content(Content::Sprite { hash, mode, peak });
+            Content::Sprite { hash, mode, peak }
         } else {
-            self.ensure_content(Content::Transparent);
+            Content::Transparent
+        };
+        // Pixels first, the position second, and the position only once the
+        // drawable shows the wanted pixels. Both are part of the run loop
+        // iteration's one transaction (the layer presents with it), so the
+        // compositor sees a hide and the move that comes with it in the same
+        // frame, never the old sprite at the new place; and a hide whose
+        // present found no drawable keeps the old sprite where it is until
+        // the retry, rather than moving it. The pointer is followed whenever
+        // it is over the game, shown or not: the write costs nothing and
+        // keeps a hidden sprite where it will reappear.
+        if self.ensure_content(content) && inputs.contains(VisibilityInputs::POINTER_INSIDE) {
+            let local = self.window.convertPointFromScreen(mouse);
+            let (x, y) = sprite_origin((local.x, local.y), geometry);
+            self.layer.setPosition(CGPoint { x, y });
         }
-    }
-
-    /// Move the sprite layer without an implicit animation.
-    fn set_position(&self, position: CGPoint) {
-        without_actions(|| self.layer.setPosition(position));
     }
 }
 
-/// Run layer property writes in a transaction with implicit animations off.
+/// Commit `cmd_buf` and present `drawable` as part of the current Core Animation transaction.
 ///
-/// The sprite layer has no delegate, so every animatable property it is
-/// given (position, bounds, contents scale) would otherwise ease over Core
-/// Animation's default quarter second.
-fn without_actions(write: impl FnOnce()) {
-    CATransaction::begin();
-    CATransaction::setDisableActions(true);
-    write();
-    CATransaction::commit();
+/// The sequence `presentsWithTransaction` asks for: the command buffer must
+/// be scheduled before the drawable is handed to the transaction, and the
+/// transaction is the run loop iteration's implicit one, committed once the
+/// iteration ends with every layer write made meanwhile. The wait is for
+/// scheduling only, on the main thread, for a pass that draws one sprite.
+fn present_with_transaction(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+) {
+    cmd_buf.commit();
+    cmd_buf.waitUntilScheduled();
+    drawable.present();
+}
+
+/// An actions table that switches implicit animations off for everything the overlay writes.
+fn no_actions() -> Retained<NSDictionary<NSString, ProtocolObject<dyn CAAction>>> {
+    let null = NSNull::null();
+    let none: &ProtocolObject<dyn CAAction> = ProtocolObject::from_ref(&*null);
+    let keys = [
+        NSString::from_str("position"),
+        NSString::from_str("bounds"),
+        NSString::from_str("contentsScale"),
+        NSString::from_str("contents"),
+    ];
+    NSDictionary::from_slices(
+        &[&*keys[0], &*keys[1], &*keys[2], &*keys[3]],
+        &[none, none, none, none],
+    )
+}
+
+/// Whether winemac warped the pointer since the last warp the observer acted on.
+///
+/// winemac reports `0` once an event newer than its warp arrived, which the
+/// pointer watch handled as that event; only a fresh warp time is a move
+/// nothing else told us about. Compared bit for bit: `followed` is a copy of
+/// an earlier `now`, never a computed value.
+const fn warp_since(followed: f64, now: f64) -> bool {
+    now != 0.0 && now.to_bits() != followed.to_bits()
+}
+
+/// Run-loop observer: reposition the sprite after a warp the game made through winemac.
+///
+/// **Main thread only**, at the end of every main run-loop iteration, ahead
+/// of Core Animation's commit. A `SetCursorPos` warp delivers no event, and a
+/// game warps right after showing or hiding its cursor; whichever of the warp
+/// and the apply ran first in this iteration, the sprite is where the pointer
+/// is by the time the iteration's transaction commits.
+extern "C-unwind" fn follow_warp(
+    _observer: *mut CFRunLoopObserver,
+    _activity: CFRunLoopActivity,
+    _info: *mut core::ffi::c_void,
+) {
+    let now = wine_last_warp_uptime();
+    let warped = WARP_FOLLOWED.with(|followed| {
+        let seen = warp_since(followed.get(), now);
+        if seen {
+            followed.set(now);
+        }
+        seen
+    });
+    if warped {
+        sync_overlay_on_main();
+    }
 }
 
 /// The number of the window a click at `point` would land on, in any application.
@@ -1232,6 +1312,36 @@ pub fn install_pointer_watch() {
     // token is leaked below so the monitor is never removed.
     let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &monitor) };
     core::mem::forget(token);
+
+    // The warp watch: order 0 runs before Core Animation's commit observer
+    // (order 2 000 000) at the same before-waiting and exit points, in the
+    // common modes Wine runs its requests in.
+    let activities = CFRunLoopActivity::BeforeWaiting | CFRunLoopActivity::Exit;
+    // SAFETY: the callback reads main-thread state only and takes no
+    // context (null is allowed); the observer is leaked below.
+    let observer = unsafe {
+        CFRunLoopObserver::new(
+            None,
+            activities.0,
+            true,
+            0,
+            Some(follow_warp),
+            core::ptr::null_mut(),
+        )
+    };
+    // SAFETY: reading a CoreFoundation constant, an immutable static the
+    // framework initialised before `main`.
+    let common_modes = unsafe { kCFRunLoopCommonModes };
+    if let (Some(observer), Some(main_loop)) = (observer, CFRunLoop::main()) {
+        main_loop.add_observer(Some(&observer), common_modes);
+        core::mem::forget(observer);
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "cursor: no run-loop observer for pointer warps; \
+             the sprite follows a warp on the next mouse event instead",
+        );
+    }
 
     // SAFETY: the caller runs on the main thread (the attach handler's
     // main-thread hop), where the application object may be read.
