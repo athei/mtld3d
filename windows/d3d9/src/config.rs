@@ -1,4 +1,4 @@
-//! Process-wide [`Mtld3dConfig`] resolved once on first access via [`LazyLock`].
+//! The [`Mtld3dConfig`] an `IDirect3D9` resolves at `Direct3DCreate9`.
 //!
 //! Three lookups feed it. The built-in [`AppProfile`] for this application, if
 //! it has one, comes from the executable's name plus the version resource of the
@@ -8,10 +8,12 @@
 //! `mtld3d.conf` at the repo root for the user-facing sample with documented
 //! keys and defaults.
 //!
-//! Touched once at the top of `Direct3DCreate9` so option resolution
-//! and the per-key info log fire early in the process lifecycle.
+//! Resolved at the top of `Direct3DCreate9`, once per interface, so option
+//! resolution and the per-key info log fire before the interface answers
+//! anything; the interface owns the result and hands it to each device it
+//! creates.
 
-use std::{ffi::c_void, path::PathBuf, ptr, sync::LazyLock};
+use std::{ffi::c_void, path::PathBuf, ptr};
 
 use log::info;
 use mtld3d_core::{
@@ -26,13 +28,12 @@ unsafe extern "system" {
     fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
 }
 
-/// Resolved config.
+/// Resolve the configuration for a new `IDirect3D9`.
 ///
-/// Read with `&*CONFIG` — `LazyLock` is preferred over `OnceLock` when
-/// the initializer takes no captured args.
-pub static CONFIG: LazyLock<Mtld3dConfig> = LazyLock::new(load);
-
-fn load() -> Mtld3dConfig {
+/// Reads the profile, the file and the environment afresh each time, so a
+/// process that creates several interfaces gives each the options in force
+/// when it was created.
+pub fn load() -> Mtld3dConfig {
     let env_override = std::env::var("MTLD3D_CONFIG")
         .ok()
         .filter(|s| !s.trim().is_empty());

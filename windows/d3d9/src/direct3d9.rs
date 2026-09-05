@@ -2,18 +2,19 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicU32, Ordering},
 };
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use log::{error, info, trace, warn};
 use mtld3d_core::{
     caps,
+    config::{CursorScale, Mtld3dConfig},
     display_mode::{MAX_SERVED_SIZES, ModeRequest, select_mode_sizes, served_mode_sizes},
     format_probe::FormatProbeKey,
     multisample,
 };
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
-    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtrMut,
+    CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
     mtl::DeviceCapsFlags,
     mtl_handle::{MTLTextureKind, NSViewKind},
@@ -270,14 +271,30 @@ static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
 pub struct Direct3D9 {
     vtbl: *const IDirect3D9Vtbl,
     refcount: u32,
+    inner: Box<Direct3D9Inner>,
+}
+
+/// What an `IDirect3D9` owns: the configuration it resolved at `Direct3DCreate9`.
+///
+/// Shared with every device the interface creates and with the threads a
+/// device spawns, so it is reference counted rather than borrowed from the
+/// interface, whose `Release` can come before those threads exit.
+pub struct Direct3D9Inner {
+    config: Arc<Mtld3dConfig>,
 }
 
 impl Direct3D9 {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<Mtld3dConfig>) -> Self {
         Self {
             vtbl: &raw const DIRECT3D9_VTBL,
             refcount: 1,
+            inner: Box::new(Direct3D9Inner { config }),
         }
+    }
+
+    /// The configuration this interface resolved at `Direct3DCreate9`.
+    pub const fn config(&self) -> &Arc<Mtld3dConfig> {
+        &self.inner.config
     }
 }
 
@@ -324,11 +341,11 @@ const fn is_conversion_source(fmt: u32) -> bool {
 /// Windowed `CheckDeviceType` shares this predicate on purpose: the runtime
 /// asserts `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
 /// CheckDeviceFormatConversion(bb, display)`, so the two must never drift.
-fn is_format_conversion_supported(src: u32, dst: u32) -> bool {
+fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> bool {
     if src == dst {
         return true;
     }
-    is_conversion_source(src) && is_render_target_format_on_device(dst)
+    is_conversion_source(src) && is_render_target_format_on_device(dst, expand_packed16)
 }
 
 // Formats the texture pool can sample or receive uploads in.
@@ -436,9 +453,10 @@ pub const fn is_render_target_format(fmt: u32) -> bool {
 /// `CheckDeviceFormat(RENDERTARGET)` and fall back to X8R8G8B8). Every
 /// advertisement arm and create gate that concerns actually rendering into a
 /// surface uses this form.
-pub fn is_render_target_format_on_device(fmt: u32) -> bool {
+pub fn is_render_target_format_on_device(fmt: u32, expand_packed16: bool) -> bool {
     is_render_target_format(fmt)
-        && (native_packed16_supported() || !matches!(fmt, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
+        && (native_packed16_supported(expand_packed16)
+            || !matches!(fmt, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
 }
 
 /// `map_d3d_format_device` with this device's packed 16-bit answer applied.
@@ -446,8 +464,12 @@ pub fn is_render_target_format_on_device(fmt: u32) -> bool {
 /// The form every create path that freezes a Metal format into a texture
 /// must use; layout-only callers (Lock pitch, staging sizing) may keep the
 /// plain `map_d3d_format`, whose source-layout fields are identical.
-pub fn map_for_device(format: u32) -> Option<mtld3d_core::format::FormatMapping> {
-    mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported())
+/// `expand_packed16` is the interface's `intel.expandPacked16`.
+pub fn map_for_device(
+    format: u32,
+    expand_packed16: bool,
+) -> Option<mtld3d_core::format::FormatMapping> {
+    mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
 }
 
 /// Depth-stencil formats.
@@ -587,7 +609,7 @@ const extern "system" fn d3d9_get_adapter_count(_this: *mut c_void) -> u32 {
 }
 
 extern "system" fn d3d9_get_adapter_identifier(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     _flags: u32,
     id: *mut D3DADAPTER_IDENTIFIER9,
@@ -596,6 +618,10 @@ extern "system" fn d3d9_get_adapter_identifier(
     if adapter != 0 {
         return D3DERR_INVALIDCALL;
     }
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: vtable out-param; `id` is *mut D3DADAPTER_IDENTIFIER9 per IDirect3D9 ABI.
     let Some(mut id) = (unsafe { InPtrMut::<D3DADAPTER_IDENTIFIER9>::opt(id.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -622,7 +648,7 @@ extern "system" fn d3d9_get_adapter_identifier(
     // this era key whole render paths (depth copies, shadow filtering) off the
     // vendor id, sniff the description string for a marketing name, and gate
     // on a minimum driver version, so all of these move together.
-    let spoof = match crate::config::CONFIG.adapter_spoof {
+    let spoof = match d3d.config().adapter_spoof {
         mtld3d_core::config::AdapterSpoof::None => None,
         mtld3d_core::config::AdapterSpoof::Nvidia => Some(SpoofIdentity {
             vendor: 0x10DE,
@@ -724,22 +750,22 @@ pub fn device_caps_flags() -> DeviceCapsFlags {
 ///
 /// True on Apple-family GPUs; false on Intel/AMD (Mac2), where the D3D
 /// formats A4R4G4B4 / R5G6B5 / A1R5G5B5 / X1R5G5B5 are backed by
-/// `Bgra8Unorm` instead and widened by the GPU upload pass. `intel.expandPacked16` forces the
-/// expansion path on any device so it can be exercised on Apple Silicon; it
-/// folds in here so every consumer (format mapping, `CheckDeviceFormat`,
-/// create gates) flips together.
-pub fn native_packed16_supported() -> bool {
+/// `Bgra8Unorm` instead and widened by the GPU upload pass. `intel.expandPacked16`
+/// (`expand_packed16`, the interface's setting) forces the expansion path on
+/// any device so it can be exercised on Apple Silicon; it folds in here so
+/// every consumer (format mapping, `CheckDeviceFormat`, create gates) flips
+/// together.
+pub fn native_packed16_supported(expand_packed16: bool) -> bool {
     let native = device_info()
         .caps
         .contains(DeviceCapsFlags::NATIVE_PACKED16)
-        && !crate::config::CONFIG.expand_packed16;
+        && !expand_packed16;
     if !native {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "packed 16-bit formats unavailable natively (forced={}): \
+            "packed 16-bit formats unavailable natively (forced={expand_packed16}): \
              A4R4G4B4/R5G6B5/A1R5G5B5/X1R5G5B5 \
-             widen to BGRA8 in the GPU upload pass, 16-bit render targets are not advertised",
-            crate::config::CONFIG.expand_packed16
+             widen to BGRA8 in the GPU upload pass, 16-bit render targets are not advertised"
         );
     }
     native
@@ -752,19 +778,19 @@ pub fn native_packed16_supported() -> bool {
 /// those three with it, so an engine that probes before picking a scene
 /// format takes its own fallback instead of sampling a format the device
 /// point-samples. The half-float members are filterable on every family and
-/// are unaffected. `intel.denyFloat32Filtering = true` forces the negative
-/// answer on any device so the path can be exercised on Apple Silicon.
-fn float32_filtering_supported() -> bool {
+/// are unaffected. `intel.denyFloat32Filtering = true` (`deny`, the
+/// interface's setting) forces the negative answer on any device so the path
+/// can be exercised on Apple Silicon.
+fn float32_filtering_supported(deny: bool) -> bool {
     let supported = device_info()
         .caps
         .contains(DeviceCapsFlags::FLOAT32_FILTERING)
-        && !crate::config::CONFIG.deny_float32_filtering;
+        && !deny;
     if !supported {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "32-bit float filtering unavailable (forced={}): R32F/G32R32F/A32B32G32R32F \
-             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER",
-            crate::config::CONFIG.deny_float32_filtering
+            "32-bit float filtering unavailable (forced={deny}): R32F/G32R32F/A32B32G32R32F \
+             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER"
         );
     }
     supported
@@ -858,13 +884,17 @@ extern "system" fn d3d9_get_adapter_display_mode(
 }
 
 extern "system" fn d3d9_check_device_type(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     dev_type: u32,
     adapter_format: u32,
     bb_format: u32,
     windowed: i32,
 ) -> i32 {
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     if adapter != 0 || dev_type != D3DDEVTYPE_HAL || !is_display_format(adapter_format) {
         warn!(
             target: LOG_TARGET,
@@ -887,7 +917,11 @@ extern "system" fn d3d9_check_device_type(
     // for it (`warn_unsupported_backbuffer_format`).
     let presentable = is_render_target_format(effective_bb)
         && if windowed != 0 {
-            is_format_conversion_supported(effective_bb, adapter_format)
+            is_format_conversion_supported(
+                effective_bb,
+                adapter_format,
+                d3d.config().expand_packed16,
+            )
         } else {
             is_present_compatible(effective_bb, adapter_format)
         };
@@ -907,7 +941,7 @@ extern "system" fn d3d9_check_device_type(
 }
 
 extern "system" fn d3d9_check_device_format(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     dev_type: u32,
     adapter_format: u32,
@@ -922,6 +956,11 @@ extern "system" fn d3d9_check_device_format(
         key: FormatProbeKey::from_probe(usage, rtype, check_format).raw(),
         "CheckDeviceFormat probe: usage={usage:#x} rtype={rtype} fmt={check_format:#x}"
     );
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let cfg = d3d.config();
     // A D3DFMT_UNKNOWN (0) adapter format is never a valid query — the runtime
     // rejects it with INVALIDCALL ahead of any availability check, for every
     // device type.
@@ -942,7 +981,7 @@ extern "system" fn d3d9_check_device_format(
     }
     // `caps.dfFormats = false` hides the DF fourccs (INTZ stays): an engine
     // finding both DF and INTZ can pick a mixed depth path no real GPU had.
-    if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
+    if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !cfg.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
     // The RESZ pseudo-format: probing it asks "is the RESZ depth resolve
@@ -987,7 +1026,7 @@ extern "system" fn d3d9_check_device_format(
     // answer is the render-target question itself, whether or not the caller
     // also passed D3DUSAGE_RENDERTARGET.
     if usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING != 0
-        && !is_render_target_format_on_device(check_format)
+        && !is_render_target_format_on_device(check_format, cfg.expand_packed16)
     {
         return D3DERR_NOTAVAILABLE;
     }
@@ -999,7 +1038,7 @@ extern "system" fn d3d9_check_device_format(
     if !mtld3d_core::format::supports_usage_query(
         check_format,
         usage,
-        float32_filtering_supported(),
+        float32_filtering_supported(cfg.deny_float32_filtering),
     ) {
         return D3DERR_NOTAVAILABLE;
     }
@@ -1007,7 +1046,7 @@ extern "system" fn d3d9_check_device_format(
         if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
             false
         } else if usage & D3DUSAGE_RENDERTARGET != 0 {
-            is_render_target_format_on_device(check_format)
+            is_render_target_format_on_device(check_format, cfg.expand_packed16)
                 && (usage & D3DUSAGE_QUERY_SRGBWRITE == 0 || has_srgb_twin(check_format))
         } else if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
@@ -1024,7 +1063,7 @@ extern "system" fn d3d9_check_device_format(
         if usage & D3DUSAGE_QUERY_SRGBWRITE != 0 && !has_srgb_twin(check_format) {
             false
         } else {
-            is_render_target_format_on_device(check_format)
+            is_render_target_format_on_device(check_format, cfg.expand_packed16)
         }
     } else if rtype == D3DRTYPE_SURFACE || rtype == D3DRTYPE_TEXTURE {
         // SRGBREAD: per-format gate for whether `D3DSAMP_SRGBTEXTURE=1`
@@ -1065,7 +1104,7 @@ extern "system" fn d3d9_check_device_format(
 }
 
 extern "system" fn d3d9_check_device_multi_sample_type(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     _dev_type: u32,
     surface_format: u32,
@@ -1075,6 +1114,10 @@ extern "system" fn d3d9_check_device_multi_sample_type(
 ) -> i32 {
     // SAFETY: vtable out-param; `quality_levels` is *mut u32 per IDirect3D9 ABI.
     unsafe { OutPtr::write_opt(quality_levels, 1) };
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     if adapter != 0 {
         warn!(
             target: LOG_TARGET,
@@ -1085,8 +1128,9 @@ extern "system" fn d3d9_check_device_multi_sample_type(
     let caps = device_caps_flags();
     // A format the device cannot render into at all cannot be multisampled
     // either, whatever count is asked for.
-    let renderable = is_render_target_format_on_device(surface_format)
-        || is_depth_stencil_format(surface_format);
+    let renderable =
+        is_render_target_format_on_device(surface_format, d3d.config().expand_packed16)
+            || is_depth_stencil_format(surface_format);
     // `D3DMULTISAMPLE_NONMASKABLE` reports how many rungs its quality ladder
     // has; every maskable level has exactly one quality level. Games poll the
     // whole enum at start-up, so neither the yes nor the no is logged.
@@ -1107,17 +1151,22 @@ extern "system" fn d3d9_check_device_multi_sample_type(
 }
 
 extern "system" fn d3d9_check_depth_stencil_match(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     dev_type: u32,
     adapter_format: u32,
     rt_format: u32,
     ds_format: u32,
 ) -> i32 {
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let cfg = d3d.config();
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
         || !is_display_format(adapter_format)
-        || !is_render_target_format_on_device(rt_format)
+        || !is_render_target_format_on_device(rt_format, cfg.expand_packed16)
         || !is_depth_stencil_format(ds_format)
     {
         warn!(
@@ -1127,22 +1176,30 @@ extern "system" fn d3d9_check_depth_stencil_match(
         return D3DERR_NOTAVAILABLE;
     }
     // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here.
-    if matches!(ds_format, D3DFMT_DF24 | D3DFMT_DF16) && !crate::config::CONFIG.df_formats {
+    if matches!(ds_format, D3DFMT_DF24 | D3DFMT_DF16) && !cfg.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
     D3D_OK
 }
 
 extern "system" fn d3d9_check_device_format_conversion(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     dev_type: u32,
     source_format: u32,
     target_format: u32,
 ) -> i32 {
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     if adapter != 0
         || dev_type != D3DDEVTYPE_HAL
-        || !is_format_conversion_supported(source_format, target_format)
+        || !is_format_conversion_supported(
+            source_format,
+            target_format,
+            d3d.config().expand_packed16,
+        )
     {
         trace!(
             target: LOG_TARGET,
@@ -1154,7 +1211,7 @@ extern "system" fn d3d9_check_device_format_conversion(
 }
 
 extern "system" fn d3d9_get_device_caps(
-    _this: *mut c_void,
+    this: *mut c_void,
     adapter: u32,
     _device_type: u32,
     caps: *mut D3DCAPS9,
@@ -1163,15 +1220,15 @@ extern "system" fn d3d9_get_device_caps(
     if adapter != 0 {
         return D3DERR_INVALIDCALL;
     }
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: vtable out-param; `caps` is *mut D3DCAPS9 per IDirect3D9 ABI.
     let Some(mut caps) = (unsafe { InPtrMut::<D3DCAPS9>::opt(caps.cast()) }) else {
         return D3DERR_INVALIDCALL;
     };
-    caps::fill(
-        &mut caps,
-        crate::config::CONFIG.caps_all,
-        sampler_border_supported(),
-    );
+    caps::fill(&mut caps, d3d.config().caps_all, sampler_border_supported());
     0 // S_OK
 }
 
@@ -1321,6 +1378,11 @@ extern "system" fn d3d9_create_device(
     if adapter != 0 || device.is_null() {
         return D3DERR_INVALIDCALL;
     }
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per IDirect3D9 ABI.
+    let Some(d3d) = (unsafe { InPtr::<Direct3D9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let cfg = d3d.config();
     // SAFETY: vtable in/out-param; per the D3D9 ABI `present_params` points to a
     // readable+writable `D3DPRESENT_PARAMETERS` — CreateDevice resolves and
     // reports the effective geometry back through it.
@@ -1408,7 +1470,7 @@ extern "system" fn d3d9_create_device(
     warn_unsupported_backbuffer_format(pp.back_buffer_format);
     crate::device::warn_present_params_fields_once(&pp);
 
-    let layer_params = attach_metal_layer(hwnd, &cq_params, &pp);
+    let layer_params = attach_metal_layer(hwnd, &cq_params, &pp, cfg);
 
     // A still-zero dimension here (no usable client rect, or a fullscreen
     // request with zero dims) would abort Metal's texture validation. Reject
@@ -1428,13 +1490,14 @@ extern "system" fn d3d9_create_device(
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
-    let (cursor_scale, scale_origin) = resolve_cursor_scale(layer_params.backing_scale);
+    let (cursor_scale, scale_origin) =
+        resolve_cursor_scale(layer_params.backing_scale, cfg.cursor_scale);
     let software_cursor = layer_params.software_cursor_active != 0;
     info!(
         target: LOG_TARGET,
         "cursor: {} at {cursor_scale}x ({scale_origin}; cursor.software = {:?})",
         if software_cursor { "software overlay" } else { "hardware HCURSOR" },
-        crate::config::CONFIG.cursor_software,
+        cfg.cursor_software,
     );
 
     // `render.scale` splits the back buffer in two from here on: `pp` keeps
@@ -1442,7 +1505,10 @@ extern "system" fn d3d9_create_device(
     // `render_scale` of it and MetalFX resamples on present. Without MetalFX
     // there is nothing that could resample, so the scale is forced to
     // identity rather than silently presenting a mis-sized frame.
-    let render_scale = resolve_render_scale(layer_params.metalfx_available != 0);
+    let render_scale = resolve_render_scale(
+        layer_params.metalfx_available != 0,
+        cfg.render_scale_percent,
+    );
     let render_width = render_scale.dimension(pp.back_buffer_width);
     let render_height = render_scale.dimension(pp.back_buffer_height);
 
@@ -1522,7 +1588,7 @@ extern "system" fn d3d9_create_device(
 
     addref_parent_direct3d9(this);
     spawn_tsc_warmup();
-    let (encoder, prewarm) = spawn_encoder_and_prewarm(&cq_params);
+    let (encoder, prewarm) = spawn_encoder_and_prewarm(&cq_params, cfg);
 
     let dev = Direct3DDevice9::new(crate::device::DeviceCreateInfo {
         device_handle: cq_params.device_handle,
@@ -1590,6 +1656,7 @@ extern "system" fn d3d9_create_device(
         cursor_scale,
         software_cursor,
         fullscreen,
+        config: Arc::clone(cfg),
     });
 
     // Install the cursor wndproc subclass. Must happen after `DeviceInner` is
@@ -1632,6 +1699,7 @@ fn attach_metal_layer(
     hwnd: u64,
     cq: &CreateCommandQueueParams,
     pp: &D3DPRESENT_PARAMETERS,
+    cfg: &Mtld3dConfig,
 ) -> AttachMetalLayerParams {
     let display_sync_enabled = crate::device::resolve_display_sync(pp.presentation_interval);
     let mut layer_params = AttachMetalLayerParams {
@@ -1643,12 +1711,12 @@ fn attach_metal_layer(
         layer_handle: MetalHandle::NULL,
         backing_scale: 1,
         display_sync_enabled: u32::from(display_sync_enabled),
-        hdr_enable: u32::from(crate::config::CONFIG.hdr_enable),
-        color_space: crate::config::CONFIG.color_space,
-        max_fps: crate::config::CONFIG.present_max_fps,
+        hdr_enable: u32::from(cfg.hdr_enable),
+        color_space: cfg.color_space,
+        max_fps: cfg.present_max_fps,
         metalfx_available: 0,
         backing_scale_ptr: (&raw const DISPLAY_BACKING_SCALE) as u64,
-        software_cursor: crate::config::CONFIG.cursor_software,
+        software_cursor: cfg.cursor_software,
         software_cursor_active: 0,
         cursor_kick_ptr: (&raw const CURSOR_KICK) as u64,
     };
@@ -1702,17 +1770,21 @@ fn spawn_tsc_warmup() {
 /// to flip `cache_ready`.
 fn spawn_encoder_and_prewarm(
     cq: &CreateCommandQueueParams,
+    cfg: &Arc<Mtld3dConfig>,
 ) -> (EncoderThread, crate::shader_prewarm::PrewarmHandle) {
     // The only place the snapshot is built: the `intel.*` overrides fold in
     // here so the encoder and `DeviceInner::gpu_caps()` see one answer.
-    let cfg = &*crate::config::CONFIG;
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
         unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
-    let encoder = EncoderThread::spawn(gpu_caps);
-    let prewarm = crate::shader_prewarm::spawn(cq.device_handle, encoder.prewarm_sender());
+    let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg));
+    let prewarm = crate::shader_prewarm::spawn(
+        cq.device_handle,
+        encoder.prewarm_sender(),
+        cfg.shader_cache_enable,
+    );
     (encoder, prewarm)
 }
 
@@ -1762,27 +1834,34 @@ pub fn display_backing_scale() -> Option<u32> {
 /// out at half a point, so the bitmap is doubled; in non-retina mode macOS
 /// already doubles everything the game draws and the bitmap stays. The same
 /// factor feeds the hardware HCURSOR and the software sprite. `cursor.scale`
-/// in `mtld3d.conf` overrides: `auto` (the default) follows the retina mode; a
-/// positive integer forces a fixed multiplier. Both paths clamp to `[1, 8]`,
-/// the range the downstream HCURSOR builder asserts.
-pub fn resolve_cursor_scale(backing_scale: u32) -> (u32, &'static str) {
-    let scale = crate::config::CONFIG.cursor_scale.resolve(backing_scale);
-    let origin = match crate::config::CONFIG.cursor_scale {
-        mtld3d_core::config::CursorScale::Auto => "auto from the Wine retina mode",
-        mtld3d_core::config::CursorScale::Fixed(_) => "cursor.scale override",
+/// in `mtld3d.conf` (`cursor_scale`, the interface's setting) overrides:
+/// `auto` (the default) follows the retina mode; a positive integer forces a
+/// fixed multiplier. Both paths clamp to `[1, 8]`, the range the downstream
+/// HCURSOR builder asserts.
+pub const fn resolve_cursor_scale(
+    backing_scale: u32,
+    cursor_scale: CursorScale,
+) -> (u32, &'static str) {
+    let scale = cursor_scale.resolve(backing_scale);
+    let origin = match cursor_scale {
+        CursorScale::Auto => "auto from the Wine retina mode",
+        CursorScale::Fixed(_) => "cursor.scale override",
     };
     (scale, origin)
 }
 
-/// Resolve `render.scale` against what the GPU can actually do.
+/// Resolve `render.scale` (`render_scale_percent`) against what the GPU can actually do.
 ///
 /// `MetalFX` is the only thing that can resample a frame at present time, so a
 /// GPU without it has to render at exactly the presented size. Say so once
 /// rather than quietly ignoring the user's setting.
-fn resolve_render_scale(metalfx_available: bool) -> mtld3d_core::render_scale::RenderScale {
+fn resolve_render_scale(
+    metalfx_available: bool,
+    render_scale_percent: u32,
+) -> mtld3d_core::render_scale::RenderScale {
     use mtld3d_core::render_scale::RenderScale;
 
-    let requested = RenderScale::from_percent(crate::config::CONFIG.render_scale_percent);
+    let requested = RenderScale::from_percent(render_scale_percent);
     if requested.is_identity() {
         return RenderScale::IDENTITY;
     }

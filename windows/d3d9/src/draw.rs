@@ -1217,18 +1217,6 @@ pub const fn build_alpha_ref_bytes(variant: VariantKey, alpha_ref: f32) -> ([u8;
     (alpha_ref.to_le_bytes(), 4)
 }
 
-/// `debug.skipShaders = hex,hex,…` shader-identity bisection probe.
-///
-/// Each value is a `pair_id().hash` u64 in hex (exactly the value the
-/// per-pass debug log prints as `VS ff 0xN` / `VS prog 0xN` / `PS ff
-/// 0xN` / `PS prog 0xN`). A draw is skipped when *either* its VS
-/// `pair_id` hash or its PS `pair_id` hash matches any value in the
-/// set. Stable across frames, unlike index-based skip — the right tool
-/// when draw counts vary frame-to-frame.
-fn skip_shader_hashes() -> &'static [u64] {
-    &crate::config::CONFIG.skip_shaders
-}
-
 /// Close the `draw N` debug group `emit_draw` opened for a dumped draw.
 fn close_dump_group(enc: &mut FrameEncoder, dump_draw: Option<u32>) {
     if dump_draw.is_some() {
@@ -1540,10 +1528,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    CreateShader); `resolve_*_library` handles cache hit/miss + emit
     //    + compile behind the scenes.
     // `debug.skipShaders` bisection: drop this draw if either stage's content
-    // hash is in the skip set. The hash (`disk_key`) is computed only when the
-    // set is armed — empty in normal play — so the hot path pays nothing.
+    // hash is in the skip set. Each value is a `pair_id().hash` u64 (the value
+    // the per-pass debug log prints as `VS ff 0xN` / `VS prog 0xN` / `PS ff
+    // 0xN` / `PS prog 0xN`), stable across frames unlike an index-based skip.
+    // The hash (`disk_key`) is computed only when the set is armed — empty in
+    // normal play — so the hot path pays nothing.
     let t_keys = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RKeys));
-    let skip_set = skip_shader_hashes();
+    let skip_set = enc.config().skip_shaders.as_slice();
     if !skip_set.is_empty() {
         let (vs_h, ps_h) = (vs.disk_key(), ps.disk_key(ps_variant));
         // Also match the raw content-hash program ids: they are what the

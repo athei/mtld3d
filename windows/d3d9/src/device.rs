@@ -10,6 +10,7 @@ mod frame_dump;
 mod mem_watch;
 use mtld3d_core::{
     caps,
+    config::Mtld3dConfig,
     convert::{
         self, FfVsLayout, InputSemantic, d3d_to_metal_primitive, fvf_to_elements,
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
@@ -521,6 +522,11 @@ pub struct DeviceInner {
     /// GPU-waits) before allocating, bounding peak PE-heap retention. This is
     /// the only bound on retained bytes; `0` removes it entirely.
     retention_cap_bytes: u64,
+    /// The configuration of the `IDirect3D9` that created this device.
+    ///
+    /// Shared with the encoder thread; the device reads it wherever an option
+    /// decides a per-call answer.
+    config: Arc<Mtld3dConfig>,
     render_states: [u32; RENDER_STATE_COUNT],
     /// Per-slot "have we warned about this unsupported RS write yet?" latch.
     ///
@@ -1360,6 +1366,11 @@ impl DeviceInner {
     /// Device capabilities, as the encoder sees them.
     pub const fn gpu_caps(&self) -> mtld3d_core::gpu_caps::GpuCaps {
         self.encoder.gpu_caps()
+    }
+
+    /// The configuration of the `IDirect3D9` that created this device.
+    pub fn config(&self) -> &Mtld3dConfig {
+        &self.config
     }
 
     pub const fn upload_coherent_seq_arc(&self) -> &Arc<AtomicU64> {
@@ -2585,6 +2596,8 @@ pub struct DeviceCreateInfo {
     /// stays fullscreen and hands it back to `fullscreen::leave` on the way
     /// out (a windowed `Reset`, or device destruction).
     pub fullscreen: Option<crate::fullscreen::SavedWindow>,
+    /// The configuration of the creating `IDirect3D9`.
+    pub config: Arc<Mtld3dConfig>,
 }
 
 #[repr(C)]
@@ -2655,7 +2668,8 @@ impl Direct3DDevice9 {
             perf: ApiPerfState::new(),
             vbib_retention_pending: Vec::new(),
             pending_retention_bytes: 0,
-            retention_cap_bytes: crate::config::CONFIG.vbib_retention_cap_bytes,
+            retention_cap_bytes: info.config.vbib_retention_cap_bytes,
+            config: info.config,
             render_states: info.render_states,
             rs_warn_fired: [0; RENDER_STATE_COUNT.div_ceil(64)],
             ff_state: FfState::new(),
@@ -3479,14 +3493,17 @@ extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
     // could handle but a Metal command buffer, out of memory, whose rendering
     // is discarded.
     const VRAM_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
-    let budget = match crate::config::CONFIG.vram_budget_cap_bytes {
+    let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return 0;
+    };
+    let dev = obj.inner();
+    let budget = match dev.config().vram_budget_cap_bytes {
         0 => VRAM_BUDGET,
         cap => VRAM_BUDGET.min(cap),
     };
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let used = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
-        .map_or(0, |obj| obj.inner().vram_bytes_used.load(Ordering::Acquire));
+    let used = dev.vram_bytes_used.load(Ordering::Acquire);
     let available =
         u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
     // Games size their texture budgets from this call or from DXGI; the
@@ -3553,11 +3570,15 @@ extern "system" fn device_get_device_caps(this: *mut c_void, caps: *mut D3DCAPS9
     if caps.is_null() {
         return D3DERR_INVALIDCALL;
     }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     // SAFETY: `caps` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `D3DCAPS9` slot owned by the caller.
     caps::fill(
         unsafe { &mut *caps },
-        crate::config::CONFIG.caps_all,
+        obj.inner().config().caps_all,
         crate::direct3d9::sampler_border_supported(),
     );
     0 // S_OK
@@ -4146,7 +4167,8 @@ extern "system" fn device_present(
     // displays. One relaxed load and a compare on an unchanged value, which
     // is every frame that stays put.
     if let Some(backing_scale) = crate::direct3d9::display_backing_scale() {
-        let (scale, _origin) = crate::direct3d9::resolve_cursor_scale(backing_scale);
+        let (scale, _origin) =
+            crate::direct3d9::resolve_cursor_scale(backing_scale, dev.config().cursor_scale);
         dev.cursor_mut().follow_scale(scale);
     }
     dev.cursor_mut().note_present();
@@ -4403,7 +4425,13 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         });
     }
 
-    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    };
+    let expand_packed16 = obj.inner().config().expand_packed16;
+    let Some(fmt) = crate::direct3d9::map_for_device(format, expand_packed16) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -4418,7 +4446,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // formats outside that list keep today's lenient create on every device.
     if usage_rt
         && crate::direct3d9::is_render_target_format(format)
-        && !crate::direct3d9::is_render_target_format_on_device(format)
+        && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16)
     {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateTexture(format={format}, RENDERTARGET) → INVALIDCALL (packed 16-bit formats are sampling-only on this device)");
@@ -4510,11 +4538,6 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         mip_heights.push(mh);
         mip_bytes_per_row.push(bpr);
     }
-
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
-        return D3DERR_INVALIDCALL;
-    };
 
     let mut flags = TextureFlags::empty();
     flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
@@ -4847,7 +4870,13 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return E_NOTIMPL;
     }
-    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    };
+    let Some(fmt) = crate::direct3d9::map_for_device(format, obj.inner().config().expand_packed16)
+    else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateVolumeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -5019,7 +5048,13 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    let Some(fmt) = crate::direct3d9::map_for_device(format) else {
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    };
+    let expand_packed16 = obj.inner().config().expand_packed16;
+    let Some(fmt) = crate::direct3d9::map_for_device(format, expand_packed16) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "reject CreateCubeTexture(format={format}) → INVALIDCALL (no format mapping)");
         null_out(texture);
@@ -5037,7 +5072,8 @@ extern "system" fn device_create_cube_texture(
     // out where they are expansion-backed).
     if (matches!(format, D3DFMT_ATI1 | D3DFMT_YUY2 | D3DFMT_UYVY) && pool != D3DPOOL_SCRATCH)
         || is_depth_fmt
-        || (usage_rt && !crate::direct3d9::is_render_target_format_on_device(format))
+        || (usage_rt
+            && !crate::direct3d9::is_render_target_format_on_device(format, expand_packed16))
     {
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -5333,6 +5369,7 @@ fn create_color_target_surface(
     device_handle: MetalHandle<MTLDeviceKind>,
     device_inner: *mut DeviceInner,
     spec: &ColorTargetSpec,
+    expand_packed16: bool,
 ) -> Option<*mut Direct3DSurface9> {
     let &ColorTargetSpec {
         width,
@@ -5342,7 +5379,7 @@ fn create_color_target_surface(
         multi_sample,
         lockable,
     } = spec;
-    let mapping = crate::direct3d9::map_for_device(format)?;
+    let mapping = crate::direct3d9::map_for_device(format, expand_packed16)?;
     if mapping.is_compressed() {
         return None;
     }
@@ -5508,6 +5545,7 @@ extern "system" fn device_create_render_target(
             multi_sample,
             lockable: staging_bytes != 0,
         },
+        obj.inner().config().expand_packed16,
     ) else {
         warn!(
             target: LOG_TARGET,
@@ -6650,7 +6688,8 @@ extern "system" fn device_stretch_rect(
         return D3DERR_INVALIDCALL;
     }
 
-    if let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info) {
+    let expand_packed16 = dev.config().expand_packed16;
+    if let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info, expand_packed16) {
         return hr;
     }
     let Some((src_region, dst_region)) =
@@ -6692,9 +6731,10 @@ extern "system" fn device_stretch_rect(
     // Device-aware mapping: it must agree with the Metal formats the textures
     // were actually created with (e.g. a packed 16-bit pair that is
     // BGRA8-backed on this device is NOT cross-format).
-    let cross_format = crate::direct3d9::map_for_device(src_info.format)
+    let cross_format = crate::direct3d9::map_for_device(src_info.format, expand_packed16)
         .map(|m| m.metal_pixel_format())
-        != crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format());
+        != crate::direct3d9::map_for_device(dst_info.format, expand_packed16)
+            .map(|m| m.metal_pixel_format());
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
@@ -6913,11 +6953,14 @@ fn flush_dirty_mips_for_stretch(
 fn check_stretch_rect_formats(
     src: &StretchSurfaceInfo,
     dst: &StretchSurfaceInfo,
+    expand_packed16: bool,
 ) -> Result<(), i32> {
     // Device-aware mapping, so the comparison sees the Metal formats the
     // textures were actually created with on this device.
-    let src_mtl = crate::direct3d9::map_for_device(src.format).map(|m| m.metal_pixel_format());
-    let dst_mtl = crate::direct3d9::map_for_device(dst.format).map(|m| m.metal_pixel_format());
+    let src_mtl = crate::direct3d9::map_for_device(src.format, expand_packed16)
+        .map(|m| m.metal_pixel_format());
+    let dst_mtl = crate::direct3d9::map_for_device(dst.format, expand_packed16)
+        .map(|m| m.metal_pixel_format());
     // A same-Metal-format pair takes the 1:1 copy path. A cross-Metal-format
     // pair converts either via the render-quad path (sample src → write the dst
     // render target — needs a render-target destination) or, into an
@@ -7166,7 +7209,8 @@ fn emit_stretch_rect_blit(
         // Device-aware: the pipeline's colour format must match the attachment
         // texture as created on this device (BGRA8 for an expanded 16-bit dst).
         let Some(dst_format) =
-            crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format())
+            crate::direct3d9::map_for_device(dst_info.format, enc.config().expand_packed16)
+                .map(|m| m.metal_pixel_format())
         else {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
@@ -7320,7 +7364,8 @@ fn emit_same_texture_stretch(
     // texture was actually created with, and the render quad keys its pipeline
     // and colour attachment off the same value.
     let Some(format) =
-        crate::direct3d9::map_for_device(dst_info.format).map(|m| m.metal_pixel_format())
+        crate::direct3d9::map_for_device(dst_info.format, enc.config().expand_packed16)
+            .map(|m| m.metal_pixel_format())
     else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
@@ -7666,8 +7711,8 @@ fn color_fill_render_target(
 ) -> i32 {
     // Device-aware: the clear-quad pipeline's colour format must match the
     // attachment as it was created here (BGRA8 for an expanded 16-bit target).
-    let Some(format) =
-        crate::direct3d9::map_for_device(info.format).map(|m| m.metal_pixel_format())
+    let Some(format) = crate::direct3d9::map_for_device(info.format, dev.config().expand_packed16)
+        .map(|m| m.metal_pixel_format())
     else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "ColorFill: render-target format {} unmapped → INVALIDCALL", info.format);
@@ -8334,7 +8379,7 @@ extern "system" fn device_set_depth_stencil_surface(
         // same dimensions inherits the previous one's contents, matching
         // the shared physical depth allocation of D3D9-era drivers that
         // engines of that era rely on (bind one handle, sample the other).
-        if crate::config::CONFIG.depth_alias_same_size {
+        if dev.config().depth_alias_same_size {
             let mip_w = (w >> mip).max(1);
             let mip_h = (h >> mip).max(1);
             if let Some((prev_id, pw, ph)) = dev.last_sized_depth
@@ -9463,13 +9508,17 @@ extern "system" fn device_set_palette_entries(
     if entries.is_null() {
         return D3DERR_INVALIDCALL;
     }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
     // D3D9's palette API is non-functional on modern hardware: the setter
     // succeeds and the palette is simply ignored. One validation remains:
     // without D3DPTEXTURECAPS_ALPHAPALETTE — advertised only under
     // debug.capsAll — every PALETTEENTRY's peFlags must be 0xFF (fully
     // opaque); an alpha-bearing entry
     // is INVALIDCALL. The getters stay INVALIDCALL.
-    if !crate::config::CONFIG.caps_all {
+    if !obj.inner().config().caps_all {
         // PALETTEENTRY is { peRed, peGreen, peBlue, peFlags } (4 bytes, peFlags
         // last); the array holds 256 entries per the D3D9 ABI = 1024 bytes.
         // SAFETY: `entries` is non-null (checked) and per the D3D9 ABI points to
@@ -11652,8 +11701,7 @@ fn read_shader_bytecode(ptr: *const u32) -> Option<Vec<u32>> {
 /// calls with the same id are no-ops. Failures log once and don't
 /// abort the caller — this is a forensic shader-capture probe, not a
 /// correctness path.
-fn maybe_dump_bytecode(prefix: &str, shader_id: ProgramId, bytecode: &[u32]) {
-    let dir = &crate::config::CONFIG.bytecode_dump_dir;
+fn maybe_dump_bytecode(dir: &str, prefix: &str, shader_id: ProgramId, bytecode: &[u32]) {
     if dir.is_empty() {
         return;
     }
@@ -11702,7 +11750,16 @@ extern "system" fn device_create_vertex_shader(
     // offline analysis. `ProgramId::from_tokens` is content-derived, so
     // the id is stable without a successful parse.
     let shader_id = ProgramId::from_tokens(&bytecode);
-    maybe_dump_bytecode("vs", shader_id, &bytecode);
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    maybe_dump_bytecode(
+        &obj.inner().config().bytecode_dump_dir,
+        "vs",
+        shader_id,
+        &bytecode,
+    );
     let program = match mtld3d_core::dxso::parse(&bytecode) {
         Ok(p) => p,
         Err(e) => {
@@ -11741,10 +11798,6 @@ extern "system" fn device_create_vertex_shader(
     // The parsed program moves into an op bound for the encoder's program
     // cache; the token stream itself moves into the wrapper, which answers
     // `GetFunction` from it.
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
-        return D3DERR_INVALIDCALL;
-    };
     obj.inner().push_op(Box::new(move |enc| {
         enc.register_program(shader_id, program);
     }));
@@ -12275,7 +12328,16 @@ extern "system" fn device_create_pixel_shader(
     // See `device_create_vertex_shader` — dump before parse so failed
     // attempts still get captured.
     let shader_id = ProgramId::from_tokens(&bytecode);
-    maybe_dump_bytecode("ps", shader_id, &bytecode);
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    maybe_dump_bytecode(
+        &obj.inner().config().bytecode_dump_dir,
+        "ps",
+        shader_id,
+        &bytecode,
+    );
     let program = match mtld3d_core::dxso::parse(&bytecode) {
         Ok(p) => p,
         Err(e) => {
@@ -12317,10 +12379,6 @@ extern "system" fn device_create_pixel_shader(
         program.uses_dynamic_bool_constants(),
     );
     let color_out_mask = program.color_out_mask();
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
-        return D3DERR_INVALIDCALL;
-    };
     obj.inner().push_op(Box::new(move |enc| {
         enc.register_program(shader_id, program);
     }));

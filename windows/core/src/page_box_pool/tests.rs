@@ -4,7 +4,9 @@
 //! pages and is retargeted to the new logical length), LIFO order within a class, the largest
 //! accepted class, and the three refusal paths (disabled pool, oversize class, byte cap) handing
 //! the box back for a plain drop. The exact round trip and the mixed-class case also walk
-//! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set.
+//! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set. The cap
+//! moves after construction: a pool built disabled parks once it is given a budget, and stops
+//! again when the budget is taken away.
 
 use super::{MAX_POOL_CLASSES, PageBoxPool};
 use crate::page_box::{PAGE_SIZE, PageBox};
@@ -17,6 +19,23 @@ fn disabled_pool_never_stores() {
     assert!(pool.recycle(pb).is_some(), "disabled pool must reject");
     assert!(pool.acquire(PAGE_SIZE).is_none());
     assert_eq!(pool.pooled_bytes(), 0);
+}
+
+#[test]
+fn cap_moves_after_construction() {
+    let pool = PageBoxPool::new(0);
+    pool.set_cap(1024 * 1024);
+    assert!(pool.enabled());
+    assert_eq!(pool.cap_bytes(), 1024 * 1024);
+    let pb = PageBox::new_uninit(PAGE_SIZE);
+    assert!(pool.recycle(pb).is_none(), "an enabled pool parks");
+    assert!(pool.acquire(PAGE_SIZE).is_some(), "and hands the box back");
+
+    pool.set_cap(0);
+    assert!(!pool.enabled());
+    let pb = PageBox::new_uninit(PAGE_SIZE);
+    assert!(pool.recycle(pb).is_some(), "a disabled pool rejects again");
+    assert!(pool.acquire(PAGE_SIZE).is_none());
 }
 
 #[test]

@@ -14,15 +14,22 @@ use mtld3d_shared::{
 
 use crate::app_profile::AppProfile;
 
+/// Byte cap of the `PageBox` recycle pool when `memory.pageboxPoolCapMB` is not set.
+///
+/// The pool is constructed before any configuration is resolved and sized
+/// from this, so the number lives here and nowhere else.
+pub const DEFAULT_PAGEBOX_POOL_CAP_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Resolved runtime configuration.
 ///
-/// One instance built at startup from the user's `mtld3d.conf` (or
-/// all-defaults if the file is absent).
+/// One instance per `IDirect3D9`, built at `Direct3DCreate9` from the user's
+/// `mtld3d.conf` (or all-defaults if the file is absent) and shared with every
+/// device that interface creates.
 ///
 /// Field shape stays flat — the dotted file keys (`debug.capsAll`,
 /// `color.hdr.enable`, …) are a file-namespace choice for the user,
 /// not a nesting choice for the struct. A flat layout keeps call sites
-/// a single field access (`CONFIG.caps_all` vs. `CONFIG.debug.caps_all`)
+/// a single field access (`cfg.caps_all` vs. `cfg.debug.caps_all`)
 /// and avoids a pointless sub-struct.
 #[derive(Debug, PartialEq, Eq)]
 // File-shape: each key maps to one independent toggle; nesting them
@@ -113,8 +120,9 @@ pub struct Mtld3dConfig {
     /// Directory the process's log file and GPU traces go into.
     ///
     /// Resolved against the executable's directory; an absolute path stands
-    /// as is. Empty string = `mtld3d-logs` beside the executable. Default:
-    /// `""`. File key: `log.dir`.
+    /// as is. Empty string = `mtld3d-logs` beside the executable. The log
+    /// file is one per process, so the first `Direct3DCreate9` names its
+    /// location and later ones leave it. Default: `""`. File key: `log.dir`.
     pub log_dir: String,
     /// Directory to dump raw DXSO bytecode into on first sight of each shader id.
     ///
@@ -206,8 +214,9 @@ pub struct Mtld3dConfig {
     /// parked bytes peaked at 53 MiB in a quiet scene, so the default
     /// leaves ~2x headroom for busy scenes. The cap bounds the
     /// committed bytes the pool may park; over-cap boxes drop to the
-    /// allocator as before. Default: 128 MiB. File key:
-    /// `memory.pageboxPoolCapMB` (value in MiB).
+    /// allocator as before. The pool is one per process, so the value the
+    /// most recent `Direct3DCreate9` resolved is the one in force. Default:
+    /// 128 MiB. File key: `memory.pageboxPoolCapMB` (value in MiB).
     pub pagebox_pool_cap_bytes: u64,
     /// Frame-rate ceiling applied via the present-throttle duration.
     ///
@@ -320,7 +329,7 @@ impl Default for Mtld3dConfig {
             } else {
                 0
             },
-            pagebox_pool_cap_bytes: 128 * 1024 * 1024,
+            pagebox_pool_cap_bytes: DEFAULT_PAGEBOX_POOL_CAP_BYTES,
             present_max_fps: 0,
             render_scale_percent: 100,
             adapter_spoof: AdapterSpoof::None,
