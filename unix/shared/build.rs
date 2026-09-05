@@ -35,6 +35,7 @@ fn build_id() -> String {
     // without touching a single source file or moving HEAD, and a release
     // artifact stamped with the previous version is the one mistake this line
     // exists to prevent.
+    //
     // `HEAD` is per-worktree, and names the ref rather than the commit, so it
     // is the one file read from the worktree's own gitdir: it moves on a branch
     // switch and stays put on a commit. Everything a ref names lives in the
