@@ -13,6 +13,11 @@
 //! fail by design given our documented stub/limitation list. It is a
 //! tracked-score tool that exits non-zero only on a *regression* vs the
 //! baseline.
+//!
+//! Exit codes: 0 for a leg that holds its baseline, 1 for a regression, a
+//! stale baseline or a Metal-validation error, 2 for a usage or spawn error,
+//! and [`run::GPU_HANG_EXIT`] for a leg cut short by a GPU hang, which has no
+//! verdict at all.
 
 mod classify;
 mod cli;
@@ -61,14 +66,17 @@ fn real_main() -> Result<ExitCode, String> {
     // `--repeat N>1` is characterization, not a gate: run each selected subtest N
     // times and print a flap report, then exit 0 regardless of what fluttered.
     if config.repeat > 1 {
-        isolate::run_flap(&config.wine, &config.exe, leg, &subtests, config.repeat)?;
-        return Ok(ExitCode::SUCCESS);
+        let hung = isolate::run_flap(&config.wine, &config.exe, leg, &subtests, config.repeat)?;
+        return Ok(hung.map_or(ExitCode::SUCCESS, |subtest| gpu_hang_verdict(leg, subtest)));
     }
 
     let mut current: BTreeMap<(Leg, Subtest), SubtestResult> = BTreeMap::new();
     let mut validation_errors = 0;
     for &subtest in &subtests {
         let run = run::run_subtest(&config.wine, &config.exe, leg, subtest)?;
+        if run.gpu_hang {
+            return Ok(gpu_hang_verdict(leg, subtest));
+        }
         validation_errors += run.validation_errors;
         current.insert((leg, subtest), run.result);
     }
@@ -131,6 +139,17 @@ fn real_main() -> Result<ExitCode, String> {
     let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
     Ok(verdict(&report, validation_errors))
+}
+
+/// The exit for a leg a GPU hang cut short: no diff, no baseline write.
+///
+/// A `--update-baseline` run must never record what a hung GPU read, and a
+/// diff of a truncated leg would report every later site as gone. The leg
+/// has to run again on a GPU that works; on a hosted runner that is a fresh
+/// machine, since the hang outlives the process there.
+fn gpu_hang_verdict(leg: Leg, subtest: Subtest) -> ExitCode {
+    println!("conformance: GPU HANG in {leg}/{subtest}; the leg was cut short and has no verdict");
+    ExitCode::from(run::GPU_HANG_EXIT)
 }
 
 /// Turn a run's diff report and its Metal-validation error count into an exit code.

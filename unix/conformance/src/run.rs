@@ -7,11 +7,16 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
-    io::Read,
-    os::unix::process::ExitStatusExt,
+    io::{BufRead, BufReader, Read},
+    os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -30,6 +35,25 @@ use crate::{
 /// finish in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
+
+/// The driver's codes for a hung GPU, as Metal prints them to stderr.
+///
+/// The first names the command buffer that hung the GPU, the second every
+/// one the driver ignores afterwards for the process's earlier errors. Both
+/// mean the same for the counts: every read after the line comes off a GPU
+/// that runs nothing, so the subtest is stopped the moment either arrives
+/// and the leg ends there (see [`GPU_HANG_EXIT`]).
+const GPU_HANG_MARKERS: [&str; 2] = [
+    "kIOAccelCommandBufferCallbackErrorHang",
+    "kIOAccelCommandBufferCallbackErrorSubmissionsIgnored",
+];
+
+/// The runner's exit code for a leg a GPU hang cut short.
+///
+/// Distinct from a regression (1) and a usage or spawn error (2): the leg
+/// has no verdict. On a hosted runner the GPU stays hung for the rest of the
+/// machine's life, so the answer is a fresh machine, not another attempt.
+pub const GPU_HANG_EXIT: u8 = 3;
 
 /// How many Metal API-validation error messages a leg may log and still pass.
 ///
@@ -56,6 +80,12 @@ pub struct SubtestRun {
     pub result: SubtestResult,
     /// Distinct Metal API-validation error messages the subtest logged.
     pub validation_errors: usize,
+    /// The GPU hung under the subtest, which was stopped on the driver's line.
+    ///
+    /// Every later subtest would run on a GPU that ignores its command
+    /// buffers, so the leg's counts past this point mean nothing: the caller
+    /// stops the leg and exits with [`GPU_HANG_EXIT`].
+    pub gpu_hang: bool,
 }
 
 /// Whether the Metal-validation error messages a run logged fail its leg.
@@ -97,6 +127,17 @@ pub fn wine_version(wine: &Path) -> String {
 /// variant adds the config entries the run is measured under, and the whole
 /// leg is the label the results, raw logs and validation lines are recorded
 /// under.
+///
+/// stderr is read as it arrives, and the driver's GPU-hang line kills the
+/// process at once rather than after its budget: what the subtest reads from
+/// then on is zeros off a GPU that runs nothing, and the wait would only make
+/// the same verdict cost minutes.
+///
+/// The child runs in a process group of its own, and a kill, for the hang or
+/// for the budget, takes the whole group: the pipes end with the last process
+/// holding them, so a descendant cannot park the run past the kill. The
+/// wineserver the caller booted for the whole run is in the caller's group
+/// and is never touched.
 ///
 /// # Errors
 ///
@@ -162,23 +203,24 @@ pub fn run_subtest(
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", wine.display()))?;
 
     // Drain stdout/stderr on their own threads so a full pipe buffer can't
     // wedge the child while we poll for the timeout.
     let mut child_stdout = child.stdout.take().expect("stdout piped");
-    let mut child_stderr = child.stderr.take().expect("stderr piped");
+    let child_stderr = child.stderr.take().expect("stderr piped");
     let out_reader = thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = child_stdout.read_to_end(&mut buf);
         buf
     });
-    let err_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_stderr.read_to_end(&mut buf);
-        buf
-    });
+    let hung = Arc::new(AtomicBool::new(false));
+    let err_reader = {
+        let hung = Arc::clone(&hung);
+        thread::spawn(move || drain_stderr(child_stderr, &hung))
+    };
 
     let timeout = subtest_timeout();
     let start = Instant::now();
@@ -190,8 +232,14 @@ pub fn run_subtest(
         {
             break status;
         }
+        if hung.load(Ordering::Relaxed) {
+            kill_group(&child);
+            break child
+                .wait()
+                .map_err(|e| format!("reap of hung {} failed: {e}", wine.display()))?;
+        }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_group(&child);
             timed_out = true;
             break child
                 .wait()
@@ -201,6 +249,9 @@ pub fn run_subtest(
     };
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
+    // Read after the join, so a line the process printed just before ending
+    // on its own counts too: its later reads were zeros all the same.
+    let gpu_hang = hung.load(Ordering::Relaxed);
 
     // Surface Metal API-validation failures (the layer runs in `nslog` mode, so
     // these are logged rather than aborting). Deduplicated, address/number
@@ -211,15 +262,27 @@ pub fn run_subtest(
 
     // A timeout is a hang — treat it like a fatal signal so it surfaces as a
     // crash (and a regression vs a clean baseline) rather than a silent count.
-    let signaled = timed_out || status.signal().is_some();
+    // A GPU hang is one too: the counts stop meaning anything at its line.
+    let signaled = timed_out || gpu_hang || status.signal().is_some();
     let mut combined = String::from_utf8_lossy(&stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&stderr));
     if timed_out {
-        use std::fmt::Write as _;
         let _ = write!(
             combined,
             "\n[conformance] subtest TIMED OUT after {}s and was killed\n",
             timeout.as_secs()
+        );
+    }
+    if gpu_hang {
+        let after = start.elapsed().as_secs();
+        eprintln!(
+            "  [{leg}/{subtest}] GPU hang: the driver reported it after {after}s; the subtest \
+             was stopped and the leg ends here"
+        );
+        let _ = write!(
+            combined,
+            "\n[conformance] GPU HANG reported by the driver after {after}s; the subtest was \
+             stopped and the leg ends here\n"
         );
     }
 
@@ -234,7 +297,49 @@ pub fn run_subtest(
     Ok(SubtestRun {
         result: scan::parse_subtest_output(&combined, signaled),
         validation_errors,
+        gpu_hang,
     })
+}
+
+/// Drain stderr into a buffer, raising `hung` on the driver's GPU-hang line.
+///
+/// Line by line, so the line is seen while the process still runs and the
+/// poll loop can kill it on the flag instead of waiting out the budget. The
+/// buffer keeps every byte, invalid UTF-8 included: the check reads a lossy
+/// copy of each line and the drain never stops on one.
+fn drain_stderr(stderr: impl Read, hung: &AtomicBool) -> Vec<u8> {
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+    let mut line = Vec::new();
+    while let Ok(1..) = reader.read_until(b'\n', &mut line) {
+        if is_gpu_hang_line(&String::from_utf8_lossy(&line)) {
+            hung.store(true, Ordering::Relaxed);
+        }
+        buf.append(&mut line);
+    }
+    buf
+}
+
+/// Whether a stderr line is the driver reporting a hung GPU.
+fn is_gpu_hang_line(line: &str) -> bool {
+    GPU_HANG_MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// SIGKILL the child's process group: the child and everything it forked.
+///
+/// The child is its own group leader (`process_group(0)` at spawn), so the
+/// group id is its pid. A group that is already gone is not an error. The
+/// e2e runner keeps the same function for the same reason; the two runners
+/// are separate binaries with no crate between them for a process helper.
+fn kill_group(child: &Child) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: kill(2) with a negative pid signals the group; it touches no
+    // memory of ours and a stale id is reported as ESRCH, not acted on.
+    unsafe {
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
 }
 
 /// Persist a subtest's raw output to `$MTLD3D_CONFORMANCE_RAW_DIR/<leg>-<subtest>.log`.

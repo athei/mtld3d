@@ -9,7 +9,9 @@
 //! fired in every run at the same count is deterministic; one that fired in only
 //! some runs, or at a varying count, is flaky. The output is the evidence for
 //! tagging a site `flaky` in `CONFORMANCE.md` (see [`crate::triage`]). This is
-//! measurement, not a gate — it never sets a non-zero exit code.
+//! measurement, not a gate — it never sets a non-zero exit code, with one
+//! exception: a GPU hang ends the measurement, since every run after it would
+//! read off a GPU that runs nothing, and the caller exits for it.
 
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
@@ -55,6 +57,10 @@ struct Aggregate {
     runs: u32,
     /// Runs that crashed/aborted/timed out (the per-subtest crash bit).
     crash_runs: u32,
+    /// The run the GPU hung under, which ended the measurement.
+    ///
+    /// Counted in `crash_runs` too; the runs after it never happened.
+    hung_run: Option<u32>,
     /// Failing (gating) sites and their flap stats.
     sites: BTreeMap<Site, SiteFlap>,
     /// Total occurrences of Wine's own `flaky`-macro-marked failures (non-gating) across all runs.
@@ -64,6 +70,8 @@ struct Aggregate {
 }
 
 /// Run every selected subtest of one test binary `repeat` times and print a flap report.
+///
+/// Returns the subtest a GPU hang stopped the measurement under, if one did.
 ///
 /// # Errors
 ///
@@ -75,7 +83,7 @@ pub fn run_flap(
     leg: Leg,
     subtests: &[Subtest],
     repeat: u32,
-) -> Result<(), String> {
+) -> Result<Option<Subtest>, String> {
     println!(
         "flap characterization: {repeat} run(s) per combo (counts shown as value×runs; \
          a site is FLAPS unless it fired in every run at one constant count)\n"
@@ -83,11 +91,16 @@ pub fn run_flap(
     for &subtest in subtests {
         let agg = characterize(wine, exe, leg, subtest, repeat)?;
         print!("{}", render(leg, subtest, &agg));
+        if agg.hung_run.is_some() {
+            return Ok(Some(subtest));
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Run one subtest `repeat` times, folding each run into an [`Aggregate`].
+///
+/// Stops at the run the GPU hangs under.
 fn characterize(
     wine: &Path,
     exe: &Path,
@@ -99,10 +112,15 @@ fn characterize(
     for i in 1..=repeat {
         // Liveness to stderr — a full subtest can take many seconds.
         eprintln!("  [{leg}/{subtest}] run {i}/{repeat}…");
-        let result = run::run_subtest(wine, exe, leg, subtest)?.result;
+        let run = run::run_subtest(wine, exe, leg, subtest)?;
+        let result = run.result;
         agg.runs += 1;
         if result.crash {
             agg.crash_runs += 1;
+        }
+        if run.gpu_hang {
+            agg.hung_run = Some(i);
+            break;
         }
         for (site, &count) in &result.sites {
             let flap = agg.sites.entry(site.clone()).or_default();
@@ -129,6 +147,12 @@ fn render(leg: Leg, subtest: Subtest, agg: &Aggregate) -> String {
         "{leg}/{subtest}  N={runs}  crash {}/{runs}",
         agg.crash_runs
     );
+    if let Some(run) = agg.hung_run {
+        let _ = writeln!(
+            out,
+            "  GPU hang in run {run}; the measurement ends here and the runs after it never ran"
+        );
+    }
 
     let mut stable: Vec<&Site> = Vec::new();
     for (site, flap) in &agg.sites {
