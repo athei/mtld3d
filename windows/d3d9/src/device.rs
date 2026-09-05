@@ -7188,7 +7188,7 @@ fn flush_dirty_mips_for_stretch(
         // live `Direct3DTexture9` whose refcount keeps it alive while
         // the surface is alive.
         let tex = unsafe { &mut *parent };
-        crate::texture::rehydrate_for_device(tex.inner_mut(), obj.inner());
+        crate::texture::rehydrate_for_device(tex, obj.inner());
         crate::texture::flush_dirty_mips(tex.inner_mut(), obj.inner());
     }
 }
@@ -11486,7 +11486,7 @@ fn snapshot_stage_bindings(
         // Cross-device migration handler — must run before flush_dirty_mips
         // so the re-marked dirty bits drive an upload against the new
         // device's encoder + handles.
-        crate::texture::rehydrate_for_device(tex.inner_mut(), dev);
+        crate::texture::rehydrate_for_device(tex, dev);
         crate::texture::flush_dirty_mips(tex.inner_mut(), dev);
         // A texture's SetLOD raises the effective most-detailed mip. LOD == 0
         // (the common case) is a no-op in both branches.
