@@ -174,18 +174,8 @@ fn dynamic_vertex_buffer_discard_refill() {
 /// which both triangles share.
 #[test]
 fn staged_vertex_buffer_upload_ignores_the_announced_lock_range() {
-    // `buffer.ignoreLockBounds` is off by default, so this test asks for
-    // it. The harness process owns its environment and no other thread
-    // runs yet; extend the suite-wide config with the option under test.
-    let merged = format!(
-        "{};buffer.ignoreLockBounds=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the
-    // harness and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::new();
+    // `buffer.ignoreLockBounds` is off by default, so this test asks for it.
+    let h = Harness::with_config("buffer.ignoreLockBounds=true");
     let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
     arm_diffuse(&h);
     assert_eq!(
@@ -233,18 +223,8 @@ fn staged_vertex_buffer_upload_ignores_the_announced_lock_range() {
 /// selected.
 #[test]
 fn staged_index_buffer_upload_ignores_the_announced_lock_range() {
-    // `buffer.ignoreLockBounds` is off by default, so this test asks for
-    // it. The harness process owns its environment and no other thread
-    // runs yet; extend the suite-wide config with the option under test.
-    let merged = format!(
-        "{};buffer.ignoreLockBounds=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the
-    // harness and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::new();
+    // `buffer.ignoreLockBounds` is off by default, so this test asks for it.
+    let h = Harness::with_config("buffer.ignoreLockBounds=true");
     // Two disjoint triangles sharing vertex 0 (top centre): 0-1-2 fills the
     // left of the screen, 0-3-2 the right, with the shared v0-v2 edge as the
     // boundary. Culling off so neither winding matters.

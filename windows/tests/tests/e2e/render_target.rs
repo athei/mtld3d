@@ -3,7 +3,8 @@
 //! The round-trip renders to a texture, then samples it.
 
 use mtld3d_tests::{
-    CubeTexture, Harness, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex, VolumeVertex,
+    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex,
+    VolumeVertex,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
@@ -4620,17 +4621,11 @@ fn intz_carries_a_working_stencil_plane() {
 /// after rendering into texture B must make A's z-test see B's contents.
 #[test]
 fn same_size_depth_bind_inherits_contents_when_aliased() {
-    // The harness process owns its environment and no other thread runs
-    // yet; extend the suite-wide config with the option under test.
-    let merged = format!(
-        "{};depth.aliasSameSize=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the
-    // harness and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::with_depth();
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "depth.aliasSameSize=true",
+        ..HarnessConfig::default()
+    });
     let a = h.create_texture(
         640,
         480,

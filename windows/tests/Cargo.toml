@@ -7,7 +7,15 @@ license.workspace = true
 description.workspace = true
 authors.workspace = true
 
+# The harness library carries no unit tests of its own (the environment lock
+# is pinned from `tests/e2e/device.rs`), so cargo builds no test binary for
+# it: every binary under `tests/` is one Wine launch of the suite.
+[lib]
+test = false
+doctest = false
+
 [dependencies]
+bitflags = { workspace = true }
 mtld3d-types = { workspace = true }
 
 # `tests/snmalloc_drift.rs` only. It is the one test target that runs on a PE

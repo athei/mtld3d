@@ -110,8 +110,9 @@ runs:
       shell: bash
       run: make setup-xwin
 
-    # The prebuilt nextest, pinned by ci.yml; lands in the cargo bin directory
-    # and so travels in the tools cache with the toolchains.
+    # The prebuilt nextest the unit tests run under, pinned by ci.yml; lands
+    # in the cargo bin directory and so travels in the tools cache with the
+    # toolchains.
     - name: nextest
       shell: bash
       run: make setup-nextest NEXTEST_VERSION="$NEXTEST_VERSION"

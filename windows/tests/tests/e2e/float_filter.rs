@@ -28,25 +28,15 @@ const HALF_FLOATS: [(u32, &str); 3] = [
     (D3DFMT_A16B16G16R16F, "A16B16G16R16F"),
 ];
 
-/// Force the no-32-bit-float-filtering answer for this test process.
+/// The key that forces the no-32-bit-float-filtering answer.
 ///
-/// Must run before the first `Harness` (the config is read once at factory
-/// bring-up). nextest runs each test in its own process, so the append is
-/// test-local.
-fn force_no_float32_filtering() {
-    let merged = format!(
-        "{};intel.denyFloat32Filtering=true",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed afterwards).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-}
+/// Resolved by each harness's own `Direct3DCreate9`, so the rest of the
+/// suite, sharing the process, keeps the device's own answer.
+const DENY_FLOAT32_FILTERING: &str = "intel.denyFloat32Filtering=true";
 
 #[test]
 fn filter_query_is_denied_for_the_single_precision_floats() {
-    force_no_float32_filtering();
-    let h = Harness::factory_only();
+    let h = Harness::factory_only_with_config(DENY_FLOAT32_FILTERING);
     for (fmt, name) in SINGLE_FLOATS {
         assert_eq!(
             h.check_device_format(
@@ -73,8 +63,7 @@ fn filter_query_is_denied_for_the_single_precision_floats() {
 
 #[test]
 fn only_filtering_drops_out_for_the_single_precision_floats() {
-    force_no_float32_filtering();
-    let h = Harness::factory_only();
+    let h = Harness::factory_only_with_config(DENY_FLOAT32_FILTERING);
     for (fmt, name) in SINGLE_FLOATS {
         assert_eq!(
             h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, fmt),
@@ -96,8 +85,7 @@ fn only_filtering_drops_out_for_the_single_precision_floats() {
 
 #[test]
 fn the_rest_of_the_advertised_set_still_filters() {
-    force_no_float32_filtering();
-    let h = Harness::factory_only();
+    let h = Harness::factory_only_with_config(DENY_FLOAT32_FILTERING);
     for (fmt, name) in HALF_FLOATS {
         assert_eq!(
             h.check_device_format(
@@ -130,8 +118,7 @@ fn the_rest_of_the_advertised_set_still_filters() {
 
 #[test]
 fn single_precision_floats_stay_creatable_and_renderable() {
-    force_no_float32_filtering();
-    let h = Harness::new();
+    let h = Harness::with_config(DENY_FLOAT32_FILTERING);
     for (fmt, name) in SINGLE_FLOATS {
         // Unfilterable is not unusable: the create paths are unchanged, so a
         // title that samples one point-filtered still gets its texture.

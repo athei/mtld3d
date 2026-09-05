@@ -3,15 +3,12 @@ description: Bring up a test machine that replays a staged build, with no toolch
 
 # A test leg builds nothing: it takes the stage the build job packed and runs
 # the suites against the pinned Wine. So this holds the Wine SDK, Rosetta where
-# the machine is arm64, the nextest binary that replays the archives, and the
-# unpacked stage, and nothing else. The Makefile does the rest through
-# `STAGE=`.
+# the machine is arm64, and the unpacked stage, which carries the test
+# binaries and both runners, and nothing else. The Makefile does the rest
+# through `STAGE=`.
 inputs:
   wine-release:
     description: wine-build release tag to download on a cache miss.
-    required: true
-  nextest-version:
-    description: nextest version to install from its prebuilt binaries.
     required: true
 
 runs:
@@ -51,10 +48,6 @@ runs:
     - name: Rosetta
       shell: bash
       run: make setup-rosetta
-
-    - name: nextest
-      shell: bash
-      run: make setup-nextest NEXTEST_VERSION=${{ inputs.nextest-version }}
 
     - name: Download the staged build
       uses: actions/download-artifact@v4

@@ -328,6 +328,7 @@ dependencies = [
 name = "mtld3d-tests"
 version = "0.8.0"
 dependencies = [
+ "bitflags 2.13.1",
  "mtld3d-core",
  "mtld3d-types",
  "snmalloc-rs",

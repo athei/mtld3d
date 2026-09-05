@@ -239,6 +239,10 @@ name = "mtld3d-conformance"
 version = "0.8.0"
 
 [[package]]
+name = "mtld3d-e2e"
+version = "0.8.0"
+
+[[package]]
 name = "mtld3d-shared"
 version = "0.8.0"
 dependencies = [

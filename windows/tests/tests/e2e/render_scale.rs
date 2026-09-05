@@ -522,18 +522,9 @@ fn reset_resize_keeps_reported_coordinates() {
 /// this must fail in the ordinary `make test` if it regresses.
 #[test]
 fn a_point_keeps_its_reported_diameter_under_the_scale() {
-    // The harness process owns its environment and no other thread runs yet;
-    // extend the suite-wide config with the scale under test. The parser keeps
-    // the last segment, so this wins over a `make test SCALE=<n>` run too.
-    let merged = format!(
-        "{};render.scale=0.5",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::new();
+    // The scale under test, resolved by this harness alone. The parser keeps
+    // the last entry, so this wins over a `make test SCALE=<n>` run too.
+    let h = Harness::with_config("render.scale=0.5");
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
     h.select_diffuse_stage(0);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
@@ -720,18 +711,9 @@ fn a_depth_texture_at_the_backbuffer_size_is_charged_its_scaled_chain() {
     // A size that is not the back buffer's, for the texture that keeps its own.
     const OWN_SIZE: u32 = 256;
 
-    // The harness process owns its environment and no other thread runs yet;
-    // extend the suite-wide config with the scale under test. The parser keeps
-    // the last segment, so this wins over a `make test SCALE=<n>` run too.
-    let merged = format!(
-        "{};render.scale=0.5",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::new();
+    // The scale under test, resolved by this harness alone. The parser keeps
+    // the last entry, so this wins over a `make test SCALE=<n>` run too.
+    let h = Harness::with_config("render.scale=0.5");
     let (width, height) = h.dims();
     // One level of a four-byte depth format, at half of each reported edge.
     let scaled_bytes = (width / 2) * 4 * (height / 2);
@@ -804,18 +786,9 @@ fn a_standalone_surface_at_the_backbuffer_size_is_charged_its_scaled_extent() {
     // A size that is not the back buffer's, for the surface that keeps its own.
     const OWN_SIZE: u32 = 256;
 
-    // The harness process owns its environment and no other thread runs yet;
-    // extend the suite-wide config with the scale under test. The parser keeps
-    // the last segment, so this wins over a `make test SCALE=<n>` run too.
-    let merged = format!(
-        "{};render.scale=0.5",
-        std::env::var("MTLD3D_CONFIG").unwrap_or_default()
-    );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed below).
-    unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
-
-    let h = Harness::new();
+    // The scale under test, resolved by this harness alone. The parser keeps
+    // the last entry, so this wins over a `make test SCALE=<n>` run too.
+    let h = Harness::with_config("render.scale=0.5");
     let (width, height) = h.dims();
     // Both formats are four bytes a texel, at half of each reported edge.
     let scaled_bytes = (width / 2) * 4 * (height / 2);

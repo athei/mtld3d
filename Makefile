@@ -98,10 +98,10 @@ RUST_NIGHTLY ?= nightly
 # happened to hold that day. Developer-only tooling is deliberately not in here,
 # see `setup-dev`.
 CARGO_TOOLS ?= xwin
-# nextest runs every test leg and comes as a prebuilt universal binary
-# (`setup-nextest`) rather than through `cargo install`: a test runner that only
-# replays a staged build has no cargo at all, and a build machine saves the
-# compile. `latest` floats for a developer; ci.yml pins a version.
+# nextest runs the host-native unit tests and comes as a prebuilt universal
+# binary (`setup-nextest`) rather than through `cargo install`, which saves a
+# build machine the compile. `latest` floats for a developer; ci.yml pins a
+# version. The end-to-end suite does not use it: its runner is `unix/e2e`.
 NEXTEST_VERSION ?= latest
 
 PE_i386     := i686-pc-windows-msvc
@@ -131,12 +131,12 @@ OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
 OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
 # `make stage` packs everything a test machine needs out of one build:
-# both PE arches, both unix `.so` builds, the nextest archives of the e2e suite
-# per PE arch, and the conformance runner for both host arches. `STAGE=<dir>`
+# both PE arches, both unix `.so` builds, the e2e test binaries per PE arch,
+# and the e2e and conformance runners for both host arches. `STAGE=<dir>`
 # then points the install, e2e and conformance targets at an unpacked stage
 # instead of a build: the OUT_* dirs become the staged ones, the build
-# prerequisites drop, nextest replays the archive through its standalone
-# binary, and the conformance runner is the staged binary for this machine.
+# prerequisites drop, and both runners are the staged binaries for this
+# machine, run against the staged test binaries.
 # That is how CI builds once on a fast machine and fans the suites out over
 # runners that carry no toolchain, and how a slow or old machine can run the
 # suites against a build made elsewhere.
@@ -452,14 +452,16 @@ bundle: all
 		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
 
 # The test hand-off (see STAGE above): the install inputs laid out exactly as
-# the OUT_* dirs hold them, the e2e suite as nextest archives, and the
-# conformance runner for either host arch. A plain tar, since the artifact
+# the OUT_* dirs hold them, the e2e test binaries per PE arch, and the e2e and
+# conformance runners for either host arch. A plain tar, since the artifact
 # store drops execute bits and the `.dSYM` directories otherwise.
 stage: all
 	rm -rf $(STAGE_DIR) $(STAGE_OUT)
 	mkdir -p $(STAGE_DIR)/i386-windows $(STAGE_DIR)/x86_64-windows
 	mkdir -p $(STAGE_DIR)/$(UNIX_WINEDIR_x64) $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)
-	mkdir -p $(STAGE_DIR)/tests $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
+	mkdir -p $(STAGE_DIR)/tests/i686 $(STAGE_DIR)/tests/x86_64
+	mkdir -p $(STAGE_DIR)/e2e/x86_64 $(STAGE_DIR)/e2e/arm64
+	mkdir -p $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
 	cp $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
 		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
 	cp $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
@@ -468,10 +470,12 @@ stage: all
 	cp -R $(OUT_unix_x64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
 	cp $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
 	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
-	cd windows && cargo +$(RUST_STABLE) nextest archive -p mtld3d-tests --target $(PE_i386) \
-		--archive-file $(STAGE_DIR)/tests/e2e-i686.tar.zst
-	cd windows && cargo +$(RUST_STABLE) nextest archive -p mtld3d-tests --target $(PE_x64) \
-		--archive-file $(STAGE_DIR)/tests/e2e-x86_64.tar.zst
+	cp $(call E2E_EXES,$(PE_i386)) $(STAGE_DIR)/tests/i686/
+	cp $(call E2E_EXES,$(PE_x64)) $(STAGE_DIR)/tests/x86_64/
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_x64)
+	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_arm64)
+	cp unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/x86_64/
+	cp unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/arm64/
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_arm64)
 	cp unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/x86_64/
@@ -479,7 +483,8 @@ stage: all
 	tar -cf $(STAGE_OUT) -C $(STAGE_DIR) .
 
 # E2E test environment overrides (the global exports above target the game):
-#   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
+#   - shaderCache.enable=false  — the on-disk cache would serve stale MSL across
+#     runs, and the suite's processes must not race it.
 #   - color.hdr.enable=false    the shipped default is on, and it resolves off
 #     the running machine's panel, so leaving it would make the suite take the
 #     HDR present route on an EDR Mac and the SDR one elsewhere. Pin it so the
@@ -506,7 +511,7 @@ stage: all
 # one directory instead of beside each test binary, so a machine that is only
 # reachable through its artifacts (a CI runner) can hand the logs back. The
 # path is read on the PE side: an absolute Windows path (`Z:\...` for a unix
-# path under Wine). Ten files are kept per directory, so pair it with FILTER.
+# path under Wine). Ten files are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
 MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
@@ -569,38 +574,71 @@ test-unit:
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 #
+# The suite is three test binaries per arch (`windows/tests/tests`: the
+# one-process suite `e2e`, and `unload` and `snmalloc_drift`, which need a
+# process of their own), and the runner in `unix/e2e` runs each once under
+# Wine, every test of a binary on `JOBS` threads of that one process, each
+# with its own device. Only a failure, a crash or a hang costs another
+# process: the runner marks the test it attributes the end to and runs the
+# rest again. So a run is six Wine launches, and its report counts every
+# test rather than stopping at a summary.
+#
+# JOBS=<n> is how many tests run at once, each on its own thread with its
+# own device. The default is 1 until the Wine SDK carries the Mac driver fix
+# for a lock-order inversion its D3DMetal client-surface hack has:
+# `macdrv_DestroyWindow` releases those surfaces while it holds the window
+# data, taking win32u's surface lock, and every other window update
+# (`update_client_surfaces`, `detach_client_surfaces`) takes the two the
+# other way round, so a window torn down on one thread while another thread
+# creates, moves or destroys its own deadlocks the process. The runner's
+# watchdog then charges the hang and runs the rest one at a time, so a
+# `JOBS=4` run is correct today but slow (the suite is ~10 s when the
+# deadlock stays away and ~130 s when it hits); a CI runner, whose device
+# creation cannot overlap at all, stays at 1 either way. TIMEOUT=<secs> is
+# how long a process may go without reporting a result before the runner
+# kills it and charges the hang to the test that was running (default 60).
+#
 # A scaled or Intel-variant run reports the whole suite instead of stopping at
-# the first failure. The point of `SCALE` and `INTEL` is to survey which
-# assertions still hold in the reported space or under the Intel answers, and
-# one dependent test would otherwise hide every later test's behaviour there.
-# The default run keeps fail-fast: there the first failure is a regression to
-# fix, not a survey to read.
+# the first failure, and FAIL_FAST=0 asks for that on any run. The point of
+# `SCALE` and `INTEL` is to survey which assertions still hold in the reported
+# space or under the Intel answers, and one dependent test would otherwise
+# hide every later test's behaviour there. The default run keeps fail-fast:
+# there the first failure is a regression to fix, not a survey to read.
 #
-# PARTITION=K/N runs the K-th of N hash-sharded slices of the suite, so several
-# machines can split one arch's suite between them; the shard a test lands in
-# depends on its name alone, so the slices agree across machines and builds.
-#
-# FILTER=<expr> narrows the run to the tests a nextest filter expression
-# selects (`test(name)`, `binary(stem)`, `|`, `&`), for a machine where the
-# whole suite is not the question. A slice the filter leaves empty passes.
-E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast) $(if $(PARTITION),--partition hash:$(PARTITION)) $(if $(FILTER),--no-tests=pass -E '$(FILTER)')
+# FILTER='<patterns>' narrows the run to the tests whose id (`<binary>::<test
+# path>`, e.g. `e2e::msaa::resolve_counts_edge_pixels`) contains any of the
+# whitespace-separated patterns: `msaa::` is one file, `stencil` every test
+# with the word. A filter that selects nothing passes.
+JOBS ?= 1
+TIMEOUT ?= 60
+E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE)$(INTEL),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)')
 
-# From a build here, nextest builds and runs the package through cargo; from a
-# stage it replays the archive through its own binary, which needs no cargo,
-# and is told where this checkout's workspace is so its config resolves.
-NEXTEST       := $(if $(STAGE),cargo-nextest nextest,cargo +$(RUST_STABLE) nextest)
-E2E_SUITE_i686   := $(if $(STAGE),--archive-file $(STAGE)/tests/e2e-i686.tar.zst --workspace-remap $(CURDIR)/windows,-p mtld3d-tests --target $(PE_i386))
-E2E_SUITE_x86_64 := $(if $(STAGE),--archive-file $(STAGE)/tests/e2e-x86_64.tar.zst --workspace-remap $(CURDIR)/windows,-p mtld3d-tests --target $(PE_x64))
+# The test binaries of one PE arch, from cargo's own account of what it built:
+# `cargo test --no-run` prints one JSON message per artifact, and the test
+# targets are the only ones with an executable. A glob over `deps/` would also
+# pick up the stale hashes of earlier builds. Expanded inside a recipe, where
+# the `$$(...)` is the shell's. From a stage the binaries are the staged ones.
+define E2E_EXES
+$$(cd windows && cargo +$(RUST_STABLE) test --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics | sed -n 's/^.*"executable":"\([^"]*\.exe\)".*/\1/p')
+endef
+E2E_EXES_i686   = $(if $(STAGE),$(STAGE)/tests/i686/*.exe,$(call E2E_EXES,$(PE_i386)))
+E2E_EXES_x86_64 = $(if $(STAGE),$(STAGE)/tests/x86_64/*.exe,$(call E2E_EXES,$(PE_x64)))
+
+# From a build here the runner is built and run through cargo, from its own
+# workspace so its `.cargo/config.toml` applies; from a stage it is the staged
+# binary for this machine's arch (compare `CONFORMANCE_BIN`).
+E2E_RUNNER_DIR := $(if $(STAGE),.,unix)
+E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/$(HOST_ARCH)/mtld3d-e2e,cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-e2e --)
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		$(NEXTEST) run $(E2E_SUITE_i686) $(E2E_NEXTEST_FLAGS)
+	exes="$(E2E_EXES_i686)"; cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
+		$(E2E_RUNNER) --wine $(WINE) $(E2E_FLAGS) -- $$exes
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	cd windows && $(MTLD3D_TEST_ENV) CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$(WINE) \
-		$(NEXTEST) run $(E2E_SUITE_x86_64) $(E2E_NEXTEST_FLAGS)
+	exes="$(E2E_EXES_x86_64)"; cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
+		$(E2E_RUNNER) --wine $(WINE) $(E2E_FLAGS) -- $$exes
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts
@@ -888,8 +926,7 @@ setup-xwin: setup-rust xwin-dir
 	echo "$$upstream" > $(XWIN_STAMP)
 
 # The prebuilt nextest, a universal binary, into the cargo bin directory, which
-# is on PATH wherever cargo is and is what a test runner without cargo puts on
-# its PATH itself. The same binary builds the archives and replays them.
+# is on PATH wherever cargo is. Only the host-native unit tests use it.
 setup-nextest:
 	@echo "==> nextest: $(NEXTEST_VERSION) prebuilt into $${CARGO_HOME:-$$HOME/.cargo}/bin"
 	mkdir -p $${CARGO_HOME:-$$HOME/.cargo}/bin

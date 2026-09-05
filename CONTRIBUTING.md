@@ -66,30 +66,33 @@ that touches `docs/CONVENTIONS.md`.
 
 ## Reading a test run
 
-The suite is honest, the summary is not. Two ways a run reads green while it
-failed:
+The end-to-end suite is three test binaries per architecture, and the runner
+in `unix/e2e` runs each one once under Wine with every test of the binary on
+`JOBS` threads of that process (one at a time by default; the Makefile says
+what a higher `JOBS` waits for). It prints one `PASS`/`FAIL`/`SKIP` line per test and a
+summary that counts every test, so the summary is the thing to read; a
+failure is fatal to the default run (`FAIL_FAST=0` reports the whole suite).
+One trap remains: a pipeline reports the last stage's status, so
+`make test | tee log` returns the exit code of `tee`. Capture with a plain
+redirect, `make test > out.log 2>&1`, and judge the run by the runner's
+summary on both architectures. mtld3d's log of each test process is a file,
+`<binary>-<pid>.log` under `mtld3d-logs` next to the test executable in
+`windows/target`, one per process, so one file carries the whole suite's log.
 
-- The test runner is fail-fast. On a failure it prints a summary like
-  `42/88 tests run`, which undercounts and reads as mostly passing.
-- A pipeline reports the last stage's status, so `make test | tee log` returns
-  the exit code of `tee`.
-
-A third one is closed by the harness itself, and worth knowing about when a
-test process looks wrong: `d3d9.dll` terminates the process from its
-`DLL_PROCESS_DETACH` once a device exists (it cannot survive the allocator's
-thread-local teardown on Wine's 1 MB main-thread stack), and that exit carries
-code 0 whatever libtest was exiting with. Until the harness installed a panic
-hook that terminates the process with libtest's failure code at the first
-failed assertion (`windows/tests/src/win32.rs`), every e2e failure after
-`CreateDevice` reported as `PASS`. A test that prints `test result: FAILED`
-and still shows as passing means that hook is not in place.
-
-So capture with a plain redirect, in this order, `make test > out.log 2>&1`, and
-judge the run by grepping per-test results on both architectures rather than by
-the summary or by `$?`. Every test name appears once per architecture, and the
-occasional `LEAK` line is benign. The runner's output carries the harness's own
-lines only; mtld3d's log of each test process is a file, `<test>-<pid>.log` under
-`mtld3d-logs` next to the test executable in `windows/target`.
+Two things are worth knowing when a test process looks wrong. `d3d9.dll`
+terminates the process from its `DLL_PROCESS_DETACH` once a device exists
+(it cannot survive the allocator's thread-local teardown on Wine's 1 MB
+main-thread stack), and that exit carries code 0 whatever libtest was
+exiting with; the harness's panic hook (`windows/tests/src/win32.rs`)
+terminates the process with libtest's failure code at the first failed
+assertion instead, after the default hook has printed the report that names
+the test. The tests in flight go down with the process: the runner marks the
+named test failed and runs the rest again in a fresh process, and a crash or
+a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
+one-thread re-run of the tests that were in flight when nothing names the
+culprit. So a failure costs one result and one extra process, and the
+`processes` count in the summary says how many the run took: six is a clean
+`make test`.
 
 ## Which suite is right when they disagree
 
@@ -223,16 +226,15 @@ The description is what survives, and for anything non-trivial it carries:
 5. Verification: the commands you ran and what a reviewer should look for.
 
 CI compiles on two machines and replays everywhere else. One job builds the
-stage (`make stage`: both PE arches, both unix `.so` builds, the e2e suite as
-nextest archives, the conformance runner for both host arches) and another
+stage (`make stage`: both PE arches, both unix `.so` builds, the e2e test
+binaries, the e2e and conformance runners for both host arches) and another
 runs every lint, doc and unit leg as steps of one job before building the
 bundle. The test machines carry no toolchain: they install the stage
 (`STAGE=<dir>`) and run the end-to-end and conformance suites on three
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
-packed 16-bit formats, so it runs the Intel/AMD code paths for real. Each
-e2e suite is split across three machines (`PARTITION=K/N`). Every image
-gates. The Intel image reads the conformance baseline's `@mac2` entries,
+packed 16-bit formats, so it runs the Intel/AMD code paths for real. Every
+image gates. The Intel image reads the conformance baseline's `@mac2` entries,
 which only it can record: dispatch the workflow with `record_intel_baseline`
 and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
 (`unix/conformance/CONFORMANCE.md` has the procedure). Run `make conformance`
@@ -244,9 +246,9 @@ where a real Intel/AMD Mac's driver does not. On an Apple-family machine the
 forced answers (`make test INTEL=1`, `make conformance-intel`) are the way to
 run the Intel paths without the hardware.
 
-The end-to-end legs run serially in CI on purpose, because parallel device
-creation aborts on a runner. A flake there is not fixed by re-enabling
-parallelism.
+The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`),
+because parallel device creation aborts on a runner. A flake there is not
+fixed by re-enabling parallelism.
 
 ## What sends a pull request back
 

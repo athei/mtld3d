@@ -5,6 +5,7 @@
 //! call only safe methods and assert on the returned `HRESULT`s / pixels.
 
 use core::{cell::Cell, ffi::c_void};
+use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
@@ -24,6 +25,64 @@ use crate::{
     win32,
 };
 
+/// The process environment, which every `Direct3DCreate9` reads.
+///
+/// Configuration resolves from `MTLD3D_CONFIG` inside that call and belongs
+/// to the interface it returns, and the tests of the suite run on several
+/// threads of one process. So a test that needs an option of its own never
+/// leaves it in the environment: its creation holds this lock exclusively
+/// while it appends the entries, creates the interface and puts the
+/// variable back, and every other creation, and every read of the
+/// suite-wide value, holds it shared.
+static ENVIRONMENT: RwLock<()> = RwLock::new(());
+
+/// The environment variable the layer reads its configuration overrides from.
+const CONFIG_VAR: &str = "MTLD3D_CONFIG";
+
+/// The display mode of the wineserver session, held by one fullscreen device at a time.
+///
+/// A fullscreen device sets a mode the whole session sees, so two of them
+/// live at once would each read the other's. A harness takes the mode when
+/// it goes fullscreen (created that way, or `Reset` into it), keeps it
+/// across further fullscreen resets, and gives it back when it comes back
+/// windowed or is torn down. Windowed devices never wait for it, which is
+/// the exclusion the suite always had. One fullscreen harness per test at a
+/// time: a second one on the same thread would wait for the first forever.
+///
+/// A flag under a mutex plus a condvar rather than a held `MutexGuard`,
+/// because the holder is a harness field and a guard there would put a
+/// significant drop into every test's `Harness`.
+static MODESET_HELD: Mutex<bool> = Mutex::new(false);
+static MODESET_RELEASED: Condvar = Condvar::new();
+
+/// Take the session's display mode, waiting for the harness that holds it.
+fn hold_display_mode() {
+    let mut held = MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    while *held {
+        held = MODESET_RELEASED
+            .wait(held)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+    *held = true;
+}
+
+/// Give the session's display mode back and wake one harness waiting for it.
+fn release_display_mode() {
+    *MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    MODESET_RELEASED.notify_one();
+}
+
+bitflags::bitflags! {
+    /// What a [`Harness`] has given up or holds beyond its own objects.
+    #[derive(Clone, Copy)]
+    struct HarnessState: u8 {
+        /// [`Harness::release_device`] has released the device reference.
+        const DEVICE_RELEASED = 1 << 0;
+        /// The device is fullscreen and the harness holds the session's display mode.
+        const HOLDS_DISPLAY_MODE = 1 << 1;
+    }
+}
+
 /// How a [`Harness`] device is created.
 pub struct HarnessConfig {
     pub width: u32,
@@ -33,6 +92,15 @@ pub struct HarnessConfig {
     pub depth_format: Option<u32>,
     /// `WS_VISIBLE`. Hidden (default) keeps parallel runs off-screen.
     pub visible: bool,
+    /// Configuration entries for this harness's interface alone.
+    ///
+    /// `key=value` entries, `;`-separated, appended to the suite-wide
+    /// `MTLD3D_CONFIG` for the one `Direct3DCreate9` this harness makes and
+    /// taken out of the environment again before the call returns. The
+    /// parser keeps the last entry for a key, so these win over a
+    /// `make test SCALE=<n>` or `INTEL=1` run. Empty (the default) means
+    /// the suite-wide configuration.
+    pub config_entries: &'static str,
     /// `D3DPRESENT_PARAMETERS.Windowed`, in its wire encoding (1 = windowed).
     pub windowed: u32,
     /// `CreateDevice` behaviour flags (`D3DCREATE_*`).
@@ -53,6 +121,7 @@ impl Default for HarnessConfig {
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
             visible: false,
+            config_entries: "",
             windowed: 1,
             behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
             present_flags: 0,
@@ -85,10 +154,16 @@ pub struct DrawIndexedUpParams {
 /// of a boundary holds at any scale and must not consult it.
 ///
 /// Reads the environment the device reads, and takes the last `render.scale`
-/// segment because that is the one the config parser keeps.
+/// segment because that is the one the config parser keeps. This is the
+/// suite-wide value: a harness that pins its own scale through
+/// [`HarnessConfig::config_entries`] knows what it asked for.
 #[must_use]
 pub fn render_scale_is_identity() -> bool {
-    let Ok(config) = std::env::var("MTLD3D_CONFIG") else {
+    let config = {
+        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+        std::env::var(CONFIG_VAR)
+    };
+    let Ok(config) = config else {
         return true;
     };
     let Some(value) = config
@@ -111,7 +186,7 @@ pub fn render_scale_is_identity() -> bool {
 pub struct Harness {
     d3d9: *mut c_void,
     device: *mut c_void,
-    device_released: Cell<bool>,
+    state: Cell<HarnessState>,
     hwnd: usize,
     width: Cell<u32>,
     height: Cell<u32>,
@@ -122,6 +197,43 @@ pub struct Harness {
     present_flags: u32,
     /// `D3DMULTISAMPLE_TYPE` the swap chain was created with, carried into `reset`.
     multi_sample_type: u32,
+}
+
+/// `Direct3DCreate9` under the environment lock.
+///
+/// Shared for the suite-wide configuration; exclusive, with `entries`
+/// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
+/// put back afterwards, for a harness that carries entries of its own.
+///
+/// # Panics
+/// Panics if the factory cannot be created.
+fn create_factory(entries: &str) -> *mut c_void {
+    let d3d9 = if entries.is_empty() {
+        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: Win32-style factory entrypoint with no preconditions.
+        unsafe { Direct3DCreate9(D3DSDK_VERSION) }
+    } else {
+        let exclusive = ENVIRONMENT.write().unwrap_or_else(PoisonError::into_inner);
+        let previous = std::env::var(CONFIG_VAR).ok();
+        let merged = format!("{};{entries}", previous.as_deref().unwrap_or_default());
+        // SAFETY: the exclusive lock above keeps every reader of the variable
+        // in this process out until it is put back: interfaces read it only
+        // inside `Direct3DCreate9`, always under the shared lock, and nothing
+        // else in the process reads the environment.
+        unsafe { std::env::set_var(CONFIG_VAR, merged) };
+        // SAFETY: Win32-style factory entrypoint with no preconditions.
+        let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+        match previous {
+            // SAFETY: as above, still under the exclusive lock.
+            Some(value) => unsafe { std::env::set_var(CONFIG_VAR, value) },
+            // SAFETY: as above, still under the exclusive lock.
+            None => unsafe { std::env::remove_var(CONFIG_VAR) },
+        }
+        drop(exclusive);
+        d3d9
+    };
+    assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
+    d3d9
 }
 
 impl Harness {
@@ -178,13 +290,23 @@ impl Harness {
     /// Panics if the factory cannot be created.
     #[must_use]
     pub fn factory_only() -> Self {
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
-        assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
+        Self::factory_only_with_config("")
+    }
+
+    /// A factory only, created under `config_entries` of its own.
+    ///
+    /// [`Self::factory_only`] with [`HarnessConfig::config_entries`]: the
+    /// interface resolves the suite-wide configuration plus `entries`.
+    ///
+    /// # Panics
+    /// Panics if the factory cannot be created.
+    #[must_use]
+    pub fn factory_only_with_config(entries: &str) -> Self {
+        let d3d9 = create_factory(entries);
         Self {
             d3d9,
             device: core::ptr::null_mut(),
-            device_released: Cell::new(false),
+            state: Cell::new(HarnessState::empty()),
             hwnd: 0,
             width: Cell::new(0),
             height: Cell::new(0),
@@ -196,6 +318,21 @@ impl Harness {
         }
     }
 
+    /// A 640×480 device whose interface resolves `entries` on top of the suite-wide configuration.
+    ///
+    /// [`Self::new`] with [`HarnessConfig::config_entries`] set; the
+    /// entries apply to this harness alone.
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn with_config(entries: &'static str) -> Self {
+        Self::create(&HarnessConfig {
+            config_entries: entries,
+            ..HarnessConfig::default()
+        })
+    }
+
     /// Create a device from an explicit [`HarnessConfig`].
     ///
     /// # Panics
@@ -203,9 +340,12 @@ impl Harness {
     #[must_use]
     pub fn create(cfg: &HarnessConfig) -> Self {
         win32::install_failure_exit_hook();
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
-        assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
+        let d3d9 = create_factory(cfg.config_entries);
+        let mut state = HarnessState::empty();
+        if cfg.windowed == 0 {
+            hold_display_mode();
+            state |= HarnessState::HOLDS_DISPLAY_MODE;
+        }
 
         let width = i32::try_from(cfg.width).expect("width fits i32");
         let height = i32::try_from(cfg.height).expect("height fits i32");
@@ -234,7 +374,7 @@ impl Harness {
         Self {
             d3d9,
             device,
-            device_released: Cell::new(false),
+            state: Cell::new(state),
             hwnd,
             width: Cell::new(cfg.width),
             height: Cell::new(cfg.height),
@@ -323,9 +463,10 @@ impl Harness {
     /// Panics if the harness's device reference has already been released.
     pub fn release_device(&self) -> u32 {
         assert!(
-            !self.device_released.replace(true),
+            !self.has(HarnessState::DEVICE_RELEASED),
             "the device reference is released once"
         );
+        self.set(HarnessState::DEVICE_RELEASED, true);
         // SAFETY: vtable thunk; this releases the reference `CreateDevice`
         // handed the harness, which `Drop` now skips.
         unsafe { (self.dev_vtbl().release)(self.device) }
@@ -2430,8 +2571,7 @@ impl Harness {
             ..HarnessConfig::default()
         };
         let mut pp = present_params(&cfg, self.hwnd);
-        // SAFETY: vtable thunk; `&mut pp` is writable.
-        let hr = unsafe { (self.dev_vtbl().reset)(self.device, (&raw mut pp).cast::<c_void>()) };
+        let hr = self.reset_params(&mut pp);
         if hr == 0 {
             self.width.set(width);
             self.height.set(height);
@@ -2441,10 +2581,33 @@ impl Harness {
 
     /// `Reset` with caller-built parameters (for malformed-input tests).
     ///
-    /// Returns the hr; does not touch [`Self::dims`].
+    /// Returns the hr; does not touch [`Self::dims`]. A fullscreen request
+    /// takes the session's display mode before the call; a windowed one
+    /// that succeeds gives it back.
     pub fn reset_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        if pp.windowed == 0 && !self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            hold_display_mode();
+            self.set(HarnessState::HOLDS_DISPLAY_MODE, true);
+        }
         // SAFETY: vtable thunk; `pp` is writable for the call.
-        unsafe { (self.dev_vtbl().reset)(self.device, core::ptr::from_mut(pp).cast::<c_void>()) }
+        let hr = unsafe {
+            (self.dev_vtbl().reset)(self.device, core::ptr::from_mut(pp).cast::<c_void>())
+        };
+        if hr == 0 && pp.windowed != 0 && self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            self.set(HarnessState::HOLDS_DISPLAY_MODE, false);
+            release_display_mode();
+        }
+        hr
+    }
+
+    const fn has(&self, flag: HarnessState) -> bool {
+        self.state.get().contains(flag)
+    }
+
+    fn set(&self, flag: HarnessState, on: bool) {
+        let mut state = self.state.get();
+        state.set(flag, on);
+        self.state.set(state);
     }
 
     // ── Factory (IDirect3D9) queries ──
@@ -2632,7 +2795,7 @@ impl Default for Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        if !self.device.is_null() && !self.device_released.get() {
+        if !self.device.is_null() && !self.has(HarnessState::DEVICE_RELEASED) {
             // SAFETY: vtable thunk; `self.device` is live and released exactly once.
             unsafe { (self.dev_vtbl().release)(self.device) };
         }
@@ -2640,6 +2803,11 @@ impl Drop for Harness {
         unsafe { (self.factory_vtbl().release)(self.d3d9) };
         if self.hwnd != 0 {
             win32::destroy_window(self.hwnd);
+        }
+        // The device release above put the mode back; only now may another
+        // fullscreen harness take it.
+        if self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            release_display_mode();
         }
     }
 }

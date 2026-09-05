@@ -132,17 +132,21 @@ inline_tests() {
 # exists: a file with no row is coverage nobody can find from the index, and a
 # row with no file claims coverage that no longer runs.
 #
-# The first cell of a table row is the file the row documents, so the row set is
-# the backticked `*.rs` name that opens a `|`-delimited line.
+# The files are the modules of the one-process suite under `tests/e2e/` and
+# the two binaries beside it; `tests/e2e/main.rs` only declares the modules
+# and pins nothing, so it has no row. The first cell of a table row is the
+# file the row documents, so the row set is the backticked `*.rs` name that
+# opens a `|`-delimited line.
 coverage_matrix() {
     rows=$(sed -n 's/^| *`\([^`]*\.rs\)` *|.*/\1/p' "$COVERAGE")
-    for file in $(git ls-files "$COVERAGE_TESTS/*.rs"); do
+    for file in $(git ls-files "$COVERAGE_TESTS/*.rs" "$COVERAGE_TESTS/e2e/*.rs"); do
         stem=${file##*/}
+        [ "$file" = "$COVERAGE_TESTS/e2e/main.rs" ] && continue
         printf '%s\n' "$rows" | grep -qxF "$stem" ||
             printf '%s: no row in %s\n' "$file" "$COVERAGE"
     done
     for row in $rows; do
-        [ -f "$COVERAGE_TESTS/$row" ] ||
+        [ -f "$COVERAGE_TESTS/$row" ] || [ -f "$COVERAGE_TESTS/e2e/$row" ] ||
             printf '%s: row names `%s`, which is not a file in %s/\n' \
                 "$COVERAGE" "$row" "$COVERAGE_TESTS"
     done
