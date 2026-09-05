@@ -141,6 +141,7 @@ instead of quietly simplifying.
 make conformance                       # both architectures, diffed against the baseline
 make conformance-i686                  # one architecture, one runner process
 make conformance-isolate ONLY=visual ARCH=x86_64 REPEAT=1
+make conformance-isolate ONLY=device ARCH=i686 REPEAT=20 VARIANT=intel LOG=debug
 make conformance-baseline-i686         # re-record this architecture's entries
 ```
 
@@ -241,7 +242,11 @@ asks `render_scale_is_identity()` and pins its exact shape at the identity
 rather than failing that leg. Every image gates. The Intel image reads the conformance baseline's `@mac2` entries,
 which only it can record: dispatch the workflow with `record_intel_baseline`
 and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
-(`unix/conformance/CONFORMANCE.md` has the procedure). Run `make conformance`
+(`unix/conformance/CONFORMANCE.md` has the procedure). A conformance subtest
+that dies on one image now and then is caught by dispatching with
+`conformance_repeat=<n>`, which runs it that many times on every image and
+uploads each run's raw output, ending in how the process ended, with the
+layer's debug log beside it. Run `make conformance`
 locally when your change touches the render or shader-emission path. The
 manual
 `probe-metal` job is how an image is checked before it is added, and it runs

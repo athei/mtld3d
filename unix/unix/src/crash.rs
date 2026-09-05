@@ -1,7 +1,7 @@
 //! Always-on unix-side crash handler.
 //!
 //! Installed once from `init_logger_handler`. Catches SIGSEGV, SIGBUS,
-//! SIGABRT. The handler is async-signal-safe — it only calls
+//! SIGILL, SIGABRT. The handler is async-signal-safe — it only calls
 //! `libc::write` on the log file's descriptor and `mtld3d_shared::crumb::dump_recent` (which is
 //! itself async-signal-safe). On a fatal signal in OUR code the handler:
 //!
@@ -26,6 +26,19 @@
 //! at startup on `CrossOver`'s arm64 Wine, and on any host it would have eaten
 //! the guest's own exception handling.
 //!
+//! One line is still written before such a fault is forwarded when its PC
+//! lies in a native image (a framework, libobjc, libsystem, Wine's own
+//! `.so`): `fault outside mtld3d.so:` with the signal number, the thread id
+//! and name, the PC as image plus offset and nearest symbol, then the return
+//! addresses into our own dylib found on the faulting stack. A fault there on
+//! a thread Wine does not own (ours, or a Metal completion thread) ends the
+//! process inside Wine's handler with nothing else said, and the game's log
+//! then has to name the image, the thread and our frames under it at least.
+//! Guest code and translated code resolve to no image and stay silent: those
+//! faults are Wine's ordinary work. The report is capped at a few per process
+//! and carries no signal name, since a fault Wine recovers
+//! must not read as a crash to anything that scans the log for one.
+//!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
 //! to the SIGABRT branch.
@@ -34,7 +47,7 @@ use core::{
     ffi::{c_int, c_void},
     mem, ptr,
 };
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use mtld3d_shared::crumb;
 
@@ -65,7 +78,8 @@ impl PrevDisposition {
 }
 
 /// Previous dispositions of the signals we install, indexed by [`signal_slot`].
-static PREV: [PrevDisposition; 3] = [
+static PREV: [PrevDisposition; 4] = [
+    PrevDisposition::new(),
     PrevDisposition::new(),
     PrevDisposition::new(),
     PrevDisposition::new(),
@@ -77,6 +91,7 @@ const fn signal_slot(signo: c_int) -> Option<usize> {
         libc::SIGSEGV => Some(0),
         libc::SIGBUS => Some(1),
         libc::SIGABRT => Some(2),
+        libc::SIGILL => Some(3),
         _ => None,
     }
 }
@@ -105,6 +120,9 @@ pub fn install() {
     if std::env::var_os("MTLD3D_NO_CRASH_HANDLER").is_none() {
         install_signal_handler(libc::SIGSEGV);
         install_signal_handler(libc::SIGBUS);
+        // A trap instruction: a framework's own assertion (`__builtin_trap`)
+        // ends a process this way, and so does a jump into non-code.
+        install_signal_handler(libc::SIGILL);
     }
     install_signal_handler(libc::SIGABRT);
 }
@@ -190,6 +208,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // SIGABRT is not shared this way: an abort is always terminal, and its PC
     // is inside libsystem rather than our code, so it stays ours to report.
     if signo != libc::SIGABRT && !fault_is_ours(ctx) {
+        report_foreign_fault(signo, ctx);
         forward_to_previous(signo, info, ctx);
         return;
     }
@@ -235,25 +254,11 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 
     // Faulting thread name. For a teardown race the *which thread* (API vs
     // `mtld3d-encoder` / `mtld3d-submit` / `mtld3d-prewarm`) is the first clue.
-    // `pthread_getname_np` only reads thread-local storage — signal-safe enough
-    // for a terminating handler.
     {
-        let mut name = [0u8; 64];
-        // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
-        let tid = unsafe { libc::pthread_self() };
-        // SAFETY: writes a NUL-terminated name (≤ len) into the buffer.
-        unsafe {
-            pthread_getname_np(
-                tid,
-                name.as_mut_ptr().cast::<core::ffi::c_char>(),
-                name.len(),
-            );
-        }
-        let nlen = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         let mut b = [0u8; 192];
         let mut p = 0;
         push(&mut b, &mut p, b"[mtld3d::unix] thread=");
-        push(&mut b, &mut p, &name[..nlen.min(96)]);
+        push_thread_name(&mut b, &mut p);
         push(&mut b, &mut p, b"\n");
         // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
@@ -387,6 +392,142 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     unsafe { libc::_exit(1) };
 }
 
+/// Name a fault in someone else's native code before it is handed back.
+///
+/// Only when the PC resolves to an image: guest and translated code do not,
+/// and a fault there is Wine's ordinary work. The line carries the thread id,
+/// the PC as image plus offset (a load address on its own names nothing once
+/// the process is gone) and the nearest symbol dyld knows, and is followed by
+/// the return addresses into our dylib on the faulting stack, which is what
+/// ties a fault in a framework to the call of ours that provoked it. Written
+/// in pieces rather than one buffer, because an image path can be longer than
+/// the line buffer. Stops after [`FOREIGN_REPORT_LIMIT`] reports, since a game
+/// may probe with faults of its own and every one would cost the lookups.
+fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
+    /// How many faults outside our image get a report.
+    const FOREIGN_REPORT_LIMIT: u32 = 4;
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+
+    let pc = fault_pc(ctx);
+    let Some(info) = dladdr_info(pc) else {
+        return;
+    };
+    if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
+        return;
+    }
+    let fd = crate::log_file::raw_fd();
+    let mut b = [0u8; 192];
+    let mut p = 0;
+    push(
+        &mut b,
+        &mut p,
+        b"[mtld3d::unix] fault outside mtld3d.so: signo=",
+    );
+    push_decimal(&mut b, &mut p, signo.cast_unsigned());
+    push(&mut b, &mut p, b" tid=");
+    push_hex(&mut b, &mut p, thread_id());
+    push(&mut b, &mut p, b" pc=");
+    push_hex(&mut b, &mut p, pc);
+    // The native first argument: for a fault in `objc_release` or
+    // `objc_msgSend` it is the object that was gone.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        push(&mut b, &mut p, b" arg0=");
+        push_hex(&mut b, &mut p, mcontext_u64(ctx, NATIVE_ARG0_OFFSET));
+    }
+    push(&mut b, &mut p, b" image=");
+    // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
+    unsafe {
+        let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+    }
+    // SAFETY: `dli_fname` is the NUL-terminated path dyld owns for a loaded
+    // image; `strlen` is async-signal-safe.
+    let image_len = unsafe { libc::strlen(info.dli_fname) };
+    // SAFETY: write(2) is async-signal-safe; `image_len` bytes at `dli_fname`
+    // are the path just measured.
+    unsafe {
+        let _ = libc::write(fd, info.dli_fname.cast::<c_void>(), image_len);
+    }
+    let mut b = [0u8; 192];
+    let mut p = 0;
+    push(&mut b, &mut p, b"+");
+    push_hex(
+        &mut b,
+        &mut p,
+        pc.wrapping_sub(info.dli_fbase as usize as u64),
+    );
+    if !info.dli_sname.is_null() {
+        push(&mut b, &mut p, b" sym=");
+        // SAFETY: `dli_sname` is the NUL-terminated symbol name dyld owns;
+        // `strlen` is async-signal-safe.
+        let name_len = unsafe { libc::strlen(info.dli_sname) };
+        // SAFETY: `name_len` bytes at `dli_sname` are the name just measured.
+        let name = unsafe { core::slice::from_raw_parts(info.dli_sname.cast::<u8>(), name_len) };
+        push(&mut b, &mut p, &name[..name_len.min(96)]);
+        push(&mut b, &mut p, b"+");
+        push_hex(
+            &mut b,
+            &mut p,
+            pc.wrapping_sub(info.dli_saddr as usize as u64),
+        );
+    }
+    push(&mut b, &mut p, b" thread=");
+    push_thread_name(&mut b, &mut p);
+    push(&mut b, &mut p, b"\n");
+    // SAFETY: as above.
+    unsafe {
+        let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+    }
+
+    // The faulting stack. The fault may be one Wine recovers, so the scan
+    // must not fault itself: it probes each page before reading it rather
+    // than trusting a stack bound, since a Wine thread runs its unix calls
+    // on a stack Wine allocated, not the one its pthread record names.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let sp = mcontext_u64(ctx, SP_OFFSET);
+        if sp != 0 {
+            const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
+            // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
+            unsafe {
+                let _ = libc::write(fd, HDR.as_ptr().cast::<c_void>(), HDR.len());
+            }
+            our_frames_on_stack(sp, STACK_SCAN_WORDS);
+        }
+    }
+}
+
+/// The calling thread's system-wide id, the one `ps -M` and a sample show.
+fn thread_id() -> u64 {
+    let mut id = 0u64;
+    // SAFETY: `pthread_threadid_np` with a null thread reads the calling
+    // thread's own id into `id`; it touches thread-local state only.
+    unsafe {
+        libc::pthread_threadid_np(0, &raw mut id);
+    }
+    id
+}
+
+/// Append the calling thread's name.
+///
+/// `pthread_getname_np` only reads thread-local storage, which is
+/// signal-safe enough for a terminating handler.
+fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
+    let mut name = [0u8; 64];
+    // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
+    let tid = unsafe { libc::pthread_self() };
+    // SAFETY: writes a NUL-terminated name (≤ len) into the buffer.
+    unsafe {
+        pthread_getname_np(
+            tid,
+            name.as_mut_ptr().cast::<core::ffi::c_char>(),
+            name.len(),
+        );
+    }
+    let nlen = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    push(buf, pos, &name[..nlen.min(96)]);
+}
+
 /// Scan the raw stack for return addresses into our own dylib and print them.
 ///
 /// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
@@ -398,31 +539,11 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 fn scan_stack_for_our_frames(sp: u64) {
     /// Header for the guest-stack pass below.
     const GUEST_HDR: &[u8] = b"[mtld3d::unix] guest (PE) stack words:\n";
-    /// Stack words to inspect, and the print caps for each pass.
-    const WORDS: usize = 4096;
-    const OURS_CAP: u32 = 48;
+    /// Print cap for the guest pass.
     const GUEST_CAP: u32 = 64;
 
+    our_frames_on_stack(sp, STACK_SCAN_WORDS);
     let base = sp as *const u8;
-    let mut printed = 0u32;
-    let mut slot = 0usize;
-    while slot < WORDS && printed < OURS_CAP {
-        // SAFETY: an offset into stack memory near `sp`; an unmapped read below
-        // re-faults into the re-entrancy guard (terminating), which bounds the
-        // walk.
-        let word = unsafe { base.add(slot * 4) };
-        // SAFETY: as above; `read_unaligned` tolerates a 4-byte-aligned 32-bit
-        // stack.
-        let addr = unsafe { word.cast::<u64>().read_unaligned() };
-        if addr >= 0x1000 && dladdr_is_ours(addr) {
-            let mut frame = [addr as *mut c_void; 1];
-            // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd`
-            // resolves via `dladdr` and writes to fd 2.
-            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
-            printed += 1;
-        }
-        slot += 1;
-    }
     // Second pass: the 32-bit guest stack. `dladdr` can't see Wine's PE
     // builtins (not dyld images), so collect raw 4-byte words that land in the
     // PE-builtin zone [0x7A00_0000, 0x7C00_0000) (ntdll/user32/win32u/d3d9/…)
@@ -441,7 +562,7 @@ fn scan_stack_for_our_frames(sp: u64) {
     }
     let mut guest_printed = 0u32;
     let mut slot = 0usize;
-    while slot < WORDS && guest_printed < GUEST_CAP {
+    while slot < STACK_SCAN_WORDS && guest_printed < GUEST_CAP {
         // SAFETY: as the loop above, an offset into stack memory near `sp`.
         let word = unsafe { base.add(slot * 4) };
         // SAFETY: as above; an unmapped read re-faults into the re-entrancy
@@ -465,6 +586,92 @@ fn scan_stack_for_our_frames(sp: u64) {
     }
 }
 
+/// Stack words a scan inspects from the faulting stack pointer upward.
+const STACK_SCAN_WORDS: usize = 4096;
+
+/// Print the return addresses into our own dylib among `words` stack words above `sp`.
+///
+/// `backtrace_symbols_fd`-prints each value that `dladdr` resolves into a
+/// module whose path contains `mtld3d`, capped so a deep stack can't flood.
+/// The 4-byte step tolerates a 32-bit guest stack's alignment; a spilled
+/// return address is a stack word on both arches.
+fn our_frames_on_stack(sp: u64, words: usize) {
+    /// Print cap for the pass.
+    const OURS_CAP: u32 = 48;
+
+    let base = sp as *const u8;
+    let mut printed = 0u32;
+    let mut slot = 0usize;
+    let mut probed_page = 0u64;
+    while slot < words && printed < OURS_CAP {
+        // The word plus the seven bytes after it; a read that would cross
+        // into a page nobody mapped ends the walk instead of faulting.
+        let end = sp.wrapping_add((slot * 4) as u64 + 7);
+        let page = page_of(end);
+        if page != probed_page {
+            if !page_is_mapped(page) {
+                break;
+            }
+            probed_page = page;
+        }
+        // SAFETY: an offset into stack memory near `sp`, on a page the probe
+        // above found mapped.
+        let word = unsafe { base.add(slot * 4) };
+        // SAFETY: as above; `read_unaligned` tolerates a 4-byte-aligned 32-bit
+        // stack.
+        let addr = unsafe { word.cast::<u64>().read_unaligned() };
+        if addr >= 0x1000 && dladdr_is_ours(addr) {
+            let mut frame = [addr as *mut c_void; 1];
+            // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd`
+            // resolves via `dladdr` and writes to fd 2.
+            unsafe { backtrace_symbols_fd(frame.as_mut_ptr(), 1, crate::log_file::raw_fd()) };
+            printed += 1;
+        }
+        slot += 1;
+    }
+}
+
+/// The page `addr` lies on.
+fn page_of(addr: u64) -> u64 {
+    // SAFETY: `sysconf` reads a constant.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .unwrap_or(4096)
+        .max(1);
+    addr & !(page - 1)
+}
+
+/// Whether the page at `page` is mapped, asked of the kernel rather than found out by a fault.
+///
+/// `mincore` answers `ENOMEM` for an address no mapping covers and is a
+/// plain system call, which is what a signal handler can afford.
+fn page_is_mapped(page: u64) -> bool {
+    let mut vec = [0i8; 1];
+    // SAFETY: `mincore` reads no user memory but the one-byte out vector.
+    let rc = unsafe { libc::mincore(page as *const c_void, 1, vec.as_mut_ptr()) };
+    rc == 0
+}
+
+/// What dyld knows about `addr`: its image, and the nearest symbol below it.
+///
+/// `None` outside every image: guest (PE) pages and translated code are not
+/// images dyld knows. `dladdr` allocates nothing, which is what lets a signal
+/// handler ask.
+fn dladdr_info(addr: u64) -> Option<libc::Dl_info> {
+    // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
+    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
+    // SAFETY: `dladdr` reads `addr` only as an opaque value and fills `info`.
+    let ok = unsafe { libc::dladdr(addr as *const c_void, &raw mut info) };
+    if ok == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    Some(info)
+}
+
+/// The path of the loaded image `addr` lies in, or `None` outside every image.
+fn dladdr_image(addr: u64) -> Option<*const core::ffi::c_char> {
+    dladdr_info(addr).map(|info| info.dli_fname)
+}
+
 /// True when `addr` resolves (via `dladdr`) into our own `.so`.
 ///
 /// The match is on a loaded image whose filename contains the bytes `mtld3d`.
@@ -476,14 +683,10 @@ fn dladdr_is_ours(addr: u64) -> bool {
     /// Bound on the path scan, so a corrupt `dli_fname` can't spin.
     const PATH_MAX_SCAN: usize = 4096;
 
-    // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
-    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
-    // SAFETY: `dladdr` reads `addr` only as an opaque value and fills `info`.
-    let ok = unsafe { libc::dladdr(addr as *const c_void, &raw mut info) };
-    if ok == 0 || info.dli_fname.is_null() {
+    let Some(path) = dladdr_image(addr) else {
         return false;
-    }
-    let path = info.dli_fname.cast::<u8>();
+    };
+    let path = path.cast::<u8>();
     let mut idx = 0usize;
     let mut matched = 0usize;
     while idx < PATH_MAX_SCAN {
@@ -527,6 +730,15 @@ const SP_OFFSET: usize = 264;
 const ARG0_OFFSET: usize = 32;
 #[cfg(target_arch = "aarch64")]
 const ARG0_OFFSET: usize = 16;
+
+/// Byte offset of the register carrying a native call's first argument.
+///
+/// `x86_64` `__rdi`, the System V first argument, which is what a framework
+/// or the Objective-C runtime was handed; `arm64` `__x0`, the same role.
+#[cfg(target_arch = "x86_64")]
+const NATIVE_ARG0_OFFSET: usize = 48;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_ARG0_OFFSET: usize = 16;
 
 /// Byte offset of `__rax`, which holds the vtable pointer a `CALL` loaded.
 #[cfg(target_arch = "x86_64")]
@@ -661,6 +873,7 @@ const fn signal_name(signo: libc::c_int) -> &'static [u8] {
         libc::SIGSEGV => b"SIGSEGV",
         libc::SIGBUS => b"SIGBUS",
         libc::SIGABRT => b"SIGABRT",
+        libc::SIGILL => b"SIGILL",
         _ => b"SIG?",
     }
 }
@@ -670,6 +883,22 @@ fn push(buf: &mut [u8; 192], pos: &mut usize, bytes: &[u8]) {
     let take = bytes.len().min(avail);
     buf[*pos..*pos + take].copy_from_slice(&bytes[..take]);
     *pos += take;
+}
+
+/// Append `v` in decimal, the form a signal number is read in.
+fn push_decimal(buf: &mut [u8; 192], pos: &mut usize, v: u32) {
+    let mut digits = [0u8; 10];
+    let mut n = digits.len();
+    let mut v = v;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + u8::try_from(v % 10).expect("a digit fits u8");
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    push(buf, pos, &digits[n..]);
 }
 
 fn push_hex(buf: &mut [u8; 192], pos: &mut usize, v: u64) {

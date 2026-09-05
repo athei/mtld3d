@@ -220,9 +220,8 @@ pub fn destroy_command_queue(
     // `release_retain` calls below.)
     unsafe { pipeline_handle.release_retain() };
     // SAFETY: as above.
-    unsafe { depth_texture_handle.release_retain() };
-    // SAFETY: as above.
-    unsafe { backbuffer_handle.release_retain() };
+    crate::metal::destroy_texture(depth_texture_handle.raw());
+    crate::metal::destroy_texture(backbuffer_handle.raw());
     // SAFETY: as above.
     unsafe { queue_handle.release_retain() };
     // SAFETY: as above.

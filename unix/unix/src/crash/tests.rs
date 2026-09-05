@@ -6,12 +6,26 @@
 //! only be exercised by taking the signal, so the test re-executes the binary,
 //! faults on a known address, and asserts the child died through the handler's
 //! own exit path with a decodable banner, PC, stack pointer and argument labels.
+//!
+//! The second test faults inside libsystem instead: a fault the handler does
+//! not own is handed back to the signal's default action, and the report it
+//! writes first has to name the image with an offset, the thread, and our
+//! frames on the faulting stack. The third traps in our own code, which is
+//! fatal like a fault.
+
+use std::os::unix::process::ExitStatusExt as _;
 
 /// Set in the re-executed child so it faults instead of asserting.
 ///
 /// A signal handler can only be exercised by actually taking the signal,
 /// which terminates the process, so the test spawns itself.
 const SELFTEST_ENV: &str = "MTLD3D_CRASH_SELFTEST";
+
+/// Set in the re-executed child so it faults in someone else's code.
+const FOREIGN_SELFTEST_ENV: &str = "MTLD3D_CRASH_FOREIGN_SELFTEST";
+
+/// Set in the re-executed child so it executes a trap instruction.
+const ILL_SELFTEST_ENV: &str = "MTLD3D_CRASH_ILL_SELFTEST";
 
 /// The bad pointer the child dereferences.
 ///
@@ -102,4 +116,93 @@ fn fault_report_decodes_registers() {
         );
         assert_ne!(value_after(caller_label), zero, "{report}");
     }
+}
+
+/// A fault outside our image is named, then handed back.
+///
+/// `strlen` on the bad address faults inside libsystem, which the handler
+/// does not own: the child dies by the signal's default action rather than
+/// the handler's `_exit(1)`, and the report before that names the image and
+/// the calling thread.
+#[test]
+fn foreign_fault_is_named_then_forwarded() {
+    if std::env::var_os(FOREIGN_SELFTEST_ENV).is_some() {
+        super::install();
+        // SAFETY: deliberately unsound; this is the fault under test, taken
+        // in a child process that dies on it.
+        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
+        unreachable!("the strlen above must fault, not return {len}");
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "crash::tests::foreign_fault_is_named_then_forwarded",
+            "--nocapture",
+        ])
+        .env(FOREIGN_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
+    assert!(!report.contains("FATAL"), "{report}");
+    let line = report
+        .lines()
+        .find(|l| l.contains("fault outside mtld3d.so"))
+        .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
+    assert!(line.contains("signo=11"), "{line}");
+    assert!(line.contains(" tid=0x"), "{line}");
+    // The released or messaged object, for a fault inside the runtime.
+    assert!(line.contains(" arg0=0x"), "{line}");
+    // The image as path plus offset: the load address alone names nothing
+    // once the process is gone.
+    assert!(line.contains("image=/"), "{line}");
+    assert!(line.contains(".dylib+0x"), "{line}");
+    assert!(line.contains("thread="), "{line}");
+    // The faulting stack was scanned for our frames: this test binary is
+    // one of ours by path, so the caller of `strlen` is on the list.
+    assert!(
+        report.contains("mtld3d.so return addrs on stack:"),
+        "{report}"
+    );
+}
+
+/// A trap instruction in our own code is fatal and named like a fault.
+///
+/// A framework's assertion ends a process with the same signal, so the
+/// handler has to own it: the child dies through the handler's `_exit(1)`
+/// with the banner, not by the signal's default action.
+#[test]
+fn illegal_instruction_in_our_code_is_fatal() {
+    if std::env::var_os(ILL_SELFTEST_ENV).is_some() {
+        super::install();
+        // SAFETY: deliberately traps; this is the signal under test, taken
+        // in a child process that never returns from the handler.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!("ud2");
+        }
+        // SAFETY: as above, the permanently undefined encoding.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("udf #0");
+        }
+        unreachable!("the trap above must not return");
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "crash::tests::illegal_instruction_in_our_code_is_fatal",
+            "--nocapture",
+        ])
+        .env(ILL_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert!(report.contains("FATAL: SIGILL"), "{report}");
 }
