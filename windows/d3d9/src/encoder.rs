@@ -53,12 +53,12 @@ use mtld3d_core::{
     },
 };
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType,
-    CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
-    CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
-    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams,
-    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CompileShaderLibraryParams,
+    CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
+    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
+    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, WaitForGpuRetireParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
         PixelFormat, PrimitiveType, QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle,
@@ -2353,6 +2353,9 @@ impl FrameEncoder {
         self.intake_visibility();
         mtld3d_shared::crumb!("phase:BfVisRst");
         self.visibility.reset_frame();
+        // A span the previous submit cut continues here, against this
+        // frame's own slot allocator and buffer.
+        self.visibility.resume_open_spans(self.current_submit_seq);
         mtld3d_shared::crumb!("phase:BfPassRst");
         // Keep the seen-rt sets when the previous submit was a mid-frame flush
         // (the D3D9 frame did not end there); `finalize_submit` consumes the
@@ -2587,29 +2590,52 @@ impl FrameEncoder {
     }
 
     pub fn emit_command(&mut self, cmd: Command) {
-        // Pass-boundary re-arm for active occlusion queries: if a new
-        // pass is about to open while at least one query is active,
-        // bump to a fresh slot and emit a Counting-mode set *before*
-        // the user command, so Metal continues accumulating into a
-        // new slot on the new pass. Skip when `cmd` is itself a
-        // SetVisibilityResultMode (that's the Begin/End path
-        // allocating their own slot).
-        if self.pass_state.current_pass_closed()
-            && self.visibility.active_count() > 0
-            && cmd.cmd != CommandType::SetVisibilityResultMode as u32
-            && !self.visibility.exhausted_this_frame()
-        {
-            if let Some(slot) = self.visibility.bump_slot() {
-                let re_arm = Command::set_visibility_result_mode(
-                    VisibilityResultMode::Counting,
-                    slot * SLOT_BYTES,
-                );
-                self.pass_state.emit_command(re_arm);
-            } else {
-                self.mark_visibility_exhausted();
-            }
-        }
         self.pass_state.emit_command(cmd);
+    }
+
+    /// Reserve the frame's next visibility slot.
+    ///
+    /// `None` once the frame's slot budget is spent or its buffer could not
+    /// be created; both mark the frame exhausted, so every span open at that
+    /// point publishes the permissive answer instead of a partial count.
+    fn allocate_visibility_slot(&mut self) -> Option<u32> {
+        if self.visibility.exhausted_this_frame() {
+            return None;
+        }
+        if !self.ensure_visibility_buffer() {
+            self.mark_visibility_exhausted();
+            return None;
+        }
+        let Some(slot) = self.visibility.bump_slot() else {
+            self.mark_visibility_exhausted();
+            return None;
+        };
+        Some(slot)
+    }
+
+    /// Arm the current pass for the occlusion queries counting across it.
+    ///
+    /// A Metal render encoder starts with visibility counting off, so a pass
+    /// opened between `Issue(BEGIN)` and `Issue(END)` counts nothing until a
+    /// Counting-mode set lands on it, and every pass split in between (an
+    /// `D3DRS_SRGBWRITEENABLE` toggle, a render-target change, a `Clear`
+    /// under a counting pass) opens one. This is the draw-site arm, so the
+    /// synthetic quad a `Clear` emits into a fresh pass stays outside the
+    /// count while every game draw after it is inside it.
+    fn arm_visibility_on_current_pass(&mut self) {
+        if self.visibility.active_count() == 0
+            || self.pass_state.current_pass_has_counting_visibility()
+        {
+            return;
+        }
+        let Some(slot) = self.allocate_visibility_slot() else {
+            return;
+        };
+        self.pass_state
+            .emit_command(Command::set_visibility_result_mode(
+                VisibilityResultMode::Counting,
+                slot * SLOT_BYTES,
+            ));
     }
 
     /// Arm a visibility query.
@@ -2619,45 +2645,21 @@ impl FrameEncoder {
     /// visibility buffer exists, allocating or pulling from the pool on
     /// first call in the frame.
     pub fn begin_visibility_query(&mut self, core: &Arc<VisibilityQueryCore>) {
-        if self.visibility.exhausted_this_frame() {
-            core.begin(
-                self.current_submit_seq,
-                0,
-                self.pass_state.current_color_logical_size(),
-                self.pass_state.current_color_size(),
-            );
-            self.visibility.inc_active();
-            return;
-        }
-        if !self.ensure_visibility_buffer() {
-            self.mark_visibility_exhausted();
-            core.begin(
-                self.current_submit_seq,
-                0,
-                self.pass_state.current_color_logical_size(),
-                self.pass_state.current_color_size(),
-            );
-            self.visibility.inc_active();
-            return;
-        }
-        let Some(slot) = self.visibility.bump_slot() else {
-            self.mark_visibility_exhausted();
-            core.begin(
-                self.current_submit_seq,
-                0,
-                self.pass_state.current_color_logical_size(),
-                self.pass_state.current_color_size(),
-            );
-            self.visibility.inc_active();
-            return;
-        };
+        let slot = self.allocate_visibility_slot();
         core.begin(
             self.current_submit_seq,
-            slot,
+            slot.unwrap_or(0),
             self.pass_state.current_color_logical_size(),
             self.pass_state.current_color_size(),
+            self.visibility.draws_seen(),
         );
-        self.visibility.inc_active();
+        self.visibility.push_active(core);
+        let Some(slot) = slot else {
+            // Nothing to count into. `begin` above cleared the flag for the
+            // fresh span, so mark it after rather than before.
+            core.mark_uncounted();
+            return;
+        };
         let cmd =
             Command::set_visibility_result_mode(VisibilityResultMode::Counting, slot * SLOT_BYTES);
         // `emit_command` opens a fresh Metal pass when the prior one was
@@ -2677,42 +2679,37 @@ impl FrameEncoder {
     ///
     /// Bumps to a fresh slot so summation sees a half-open `[begin, end)`
     /// range, transitions the Metal encoder to Disabled (or re-arms to
-    /// Counting if other queries are still active), and queues the core
-    /// onto the pending list to be finalized once the GPU has retired
-    /// this frame.
+    /// Counting if other queries are still active), and queues the closing
+    /// segment so the total is published once the GPU has retired this
+    /// frame. With no slot left the span closes empty and answers from the
+    /// uncounted flag instead of the sum.
     pub fn end_visibility_query(&mut self, core: Arc<VisibilityQueryCore>) {
         let submit_seq = self.current_submit_seq;
-        if self.visibility.exhausted_this_frame() {
-            // Match the safe-fallback span: end == begin, sum = 0 (but
-            // the fallback path below will finalize to u32::MAX at
-            // intake, not sum the buffer).
-            core.end(submit_seq, core.offset_begin());
-            self.visibility.dec_active();
-            self.visibility.push_pending(submit_seq, core);
-            return;
-        }
-        let Some(slot) = self.visibility.bump_slot() else {
-            self.mark_visibility_exhausted();
-            core.end(submit_seq, core.offset_begin());
-            self.visibility.dec_active();
-            self.visibility.push_pending(submit_seq, core);
-            return;
-        };
-        core.end(submit_seq, slot);
-        self.visibility.dec_active();
-        let mode = if self.visibility.active_count() == 0 {
-            VisibilityResultMode::Disabled
+        let begin = core.offset_begin();
+        let slot = self.allocate_visibility_slot();
+        core.end(submit_seq, self.visibility.draws_seen());
+        self.visibility.remove_active(&core);
+        if let Some(slot) = slot {
+            let mode = if self.visibility.active_count() == 0 {
+                VisibilityResultMode::Disabled
+            } else {
+                VisibilityResultMode::Counting
+            };
+            let cmd = Command::set_visibility_result_mode(mode, slot * SLOT_BYTES);
+            // Symmetric with `begin_visibility_query`: if this mode-set opens a
+            // fresh pass, reset `last_bound` so any later draw in the frame
+            // re-emits its bindings across the encoder boundary.
+            let passes_before = self.pass_state.passes().len();
+            self.pass_state.emit_command(cmd);
+            self.reset_last_bound_if_pass_opened(passes_before);
         } else {
-            VisibilityResultMode::Counting
-        };
-        let cmd = Command::set_visibility_result_mode(mode, slot * SLOT_BYTES);
-        // Symmetric with `begin_visibility_query`: if this mode-set opens a
-        // fresh pass, reset `last_bound` so any later draw in the frame re-emits
-        // its bindings across the encoder boundary.
-        let passes_before = self.pass_state.passes().len();
-        self.pass_state.emit_command(cmd);
-        self.reset_last_bound_if_pass_opened(passes_before);
-        self.visibility.push_pending(submit_seq, core);
+            core.mark_uncounted();
+        }
+        // An unallocated end closes an empty span, which sums to zero
+        // without reading a buffer; the flag above is what decides whether
+        // that zero or the permissive answer is published.
+        self.visibility
+            .push_pending(submit_seq, core, (begin, slot.unwrap_or(begin)), true);
     }
 
     /// Reserve a visibility buffer for the current frame.
@@ -2826,8 +2823,8 @@ impl FrameEncoder {
         self.visibility.mark_exhausted();
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "visibility-query slot budget exhausted for this frame \
-             — overflowing queries finalize to u32::MAX"
+            "visibility-query slot budget exhausted for this frame: \
+             overflowing queries that drew report u32::MAX"
         );
     }
 
@@ -4989,6 +4986,11 @@ impl FrameEncoder {
         let passes_before = self.pass_state.passes().len();
         self.pass_state.ensure_pass_open();
         self.reset_last_bound_if_pass_opened(passes_before);
+        // The draw-site entry, so this is where a draw is counted against
+        // the open occlusion spans: a span holding no draw answers zero
+        // exactly, even where its slots went missing.
+        self.visibility.note_draw();
+        self.arm_visibility_on_current_pass();
     }
 
     /// Record that the draw being emitted read `[offset, offset + size)` from VB/IB `id`.
@@ -9279,6 +9281,11 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // whatever is open.
     enc.pass_state.flush_pending_clears();
     enc.end_current_pass("submit");
+    // The frame's slot array retires with this submit, so a span still open
+    // (a readback flush between BEGIN and END, or a query held across
+    // Present) contributes what it has counted so far and is reopened
+    // against the continuation frame's allocator at the next `begin_frame`.
+    enc.visibility.split_open_spans(frame.submit_seq);
 
     // A readback flush is not a frame end: the frame continues and any colour
     // or depth target may still be read back or drawn into, so the last-use

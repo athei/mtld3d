@@ -1,10 +1,13 @@
 //! Unit tests for the occlusion-query logic behind `IDirect3DQuery9`.
 //!
 //! Covers slot allocation (bump, reset, exhaustion), `sum_slots` over half-open and
-//! out-of-range spans, and the BEGIN/END/finalize state machine with its `u32` clamp. The
-//! pool and state cases pin the lifetime rules: intake finalizes only queries whose END frame
+//! out-of-range spans, and the BEGIN/END/publish state machine with its `u32` clamp. The
+//! pool and state cases pin the lifetime rules: intake publishes only queries whose END frame
 //! has retired, reuse waits for `coherent_seq` to reach a buffer's `release_seq`, and an
-//! over-cap retire hands the evicted entry back.
+//! over-cap retire hands the evicted entry back. The segment cases pin what a span that
+//! outlives its submit does: it is cut at the boundary, reopened in the continuation, and
+//! the two sums add up, while a span that lost its slots reads `u32::MAX` unless it held
+//! no draw, where zero is exact.
 
 use mtld3d_shared::MetalHandle;
 
@@ -18,6 +21,12 @@ fn dummy_buf(seq: u64) -> RetiredVisibilityBuffer {
     // SAFETY: tests; opaque value never dereferenced.
     let handle = unsafe { MetalHandle::new(0xDEAD_BEEF) };
     RetiredVisibilityBuffer::new(PageBox::new_zeroed(8192), handle, seq)
+}
+
+/// Write a sample count into one slot of a test buffer, as the GPU would.
+fn write_slot(buf: &mut RetiredVisibilityBuffer, slot: usize, value: u64) {
+    let bytes = value.to_le_bytes();
+    buf.backing_mut().as_mut_slice()[slot * 8..slot * 8 + 8].copy_from_slice(&bytes);
 }
 
 #[test]
@@ -91,42 +100,99 @@ fn query_core_status_transitions() {
     let core = VisibilityQueryCore::new();
     assert_eq!(core.status(), QueryStatus::NeverIssued);
     assert_eq!(core.seq_end_loaded(), 0);
-    core.begin(10, 3, (640, 480), (640, 480));
+    core.begin(10, 3, (640, 480), (640, 480), 0);
     assert_eq!(core.status(), QueryStatus::Pending);
     assert_eq!(core.offset_begin(), 3);
     // BEGIN does not record seq_end — END drives the GetData(FLUSH)
     // gate.
     assert_eq!(core.seq_end_loaded(), 0);
-    core.end(10, 7);
+    core.end(10, 1);
     assert_eq!(core.status(), QueryStatus::Pending);
-    assert_eq!(core.offset_end_internal(), 7);
     assert_eq!(core.seq_end_loaded(), 10);
-    core.finalize(42);
+    core.accumulate_segment(42);
+    core.publish_span();
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 42);
 }
 
 #[test]
+fn query_core_adds_up_the_segments_of_a_split_span() {
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    // The submit boundary folds the first segment in and reopens the span
+    // against the continuation frame's allocator.
+    core.accumulate_segment(1_000);
+    core.resume(2, 0);
+    assert_eq!(core.offset_begin(), 0);
+    assert_eq!(
+        core.status(),
+        QueryStatus::Pending,
+        "a resumed span is not done"
+    );
+    core.end(2, 1);
+    core.accumulate_segment(234);
+    core.publish_span();
+    assert_eq!(core.get_u32(), 1_234);
+    assert_eq!(core.seq_end_loaded(), 2);
+}
+
+#[test]
+fn query_core_uncounted_span_publishes_fully_visible() {
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 4);
+    core.accumulate_segment(1_000);
+    core.mark_uncounted();
+    core.end(1, 5);
+    core.publish_span();
+    assert_eq!(
+        core.get_u32(),
+        u32::MAX,
+        "a span that lost part of its count reads fully visible, never a partial sum"
+    );
+    // A re-issue clears the flag, so the next span reports its real count.
+    core.begin(2, 0, (640, 480), (640, 480), 5);
+    core.end(2, 6);
+    core.accumulate_segment(7);
+    core.publish_span();
+    assert_eq!(core.get_u32(), 7);
+}
+
+#[test]
+fn query_core_uncounted_span_with_no_draw_publishes_zero() {
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 9);
+    core.mark_uncounted();
+    // The same draw total at END: nothing was issued inside the span, so
+    // zero is the exact answer and the permissive one would be invented.
+    core.end(1, 9);
+    core.publish_span();
+    assert_eq!(core.get_u32(), 0);
+}
+
+#[test]
 fn query_core_reissue_resets_accumulator() {
     let core = VisibilityQueryCore::new();
-    core.begin(1, 0, (640, 480), (640, 480));
+    core.begin(1, 0, (640, 480), (640, 480), 0);
     core.end(1, 1);
-    core.finalize(100);
+    core.accumulate_segment(100);
+    core.publish_span();
     assert_eq!(core.get_u32(), 100);
     // Re-issue with a different span: accumulator must zero out.
-    core.begin(2, 2, (640, 480), (640, 480));
+    core.begin(2, 2, (640, 480), (640, 480), 0);
     assert_eq!(core.status(), QueryStatus::Pending);
-    core.end(2, 3);
-    core.finalize(7);
+    core.end(2, 1);
+    core.accumulate_segment(7);
+    core.publish_span();
     assert_eq!(core.get_u32(), 7);
 }
 
 #[test]
 fn query_core_u32_clamp() {
     let core = VisibilityQueryCore::new();
-    core.begin(0, 0, (640, 480), (640, 480));
+    core.begin(0, 0, (640, 480), (640, 480), 0);
     core.end(0, 1);
-    core.finalize(u64::MAX);
+    core.accumulate_segment(u64::MAX);
+    core.publish_span();
     assert_eq!(core.get_u32(), u32::MAX);
 }
 
@@ -171,27 +237,170 @@ fn state_intake_completed_respects_seq() {
     let mut state = VisibilityQueryState::new();
     let c1 = VisibilityQueryCore::new();
     let c2 = VisibilityQueryCore::new();
-    c1.begin(5, 0, (640, 480), (640, 480));
+    c1.begin(5, 0, (640, 480), (640, 480), 0);
     c1.end(5, 1);
-    c2.begin(10, 2, (640, 480), (640, 480));
-    c2.end(10, 3);
-    state.push_pending(5, c1.clone());
-    state.push_pending(10, c2.clone());
+    c2.begin(10, 2, (640, 480), (640, 480), 0);
+    c2.end(10, 1);
+    state.push_pending(5, c1.clone(), (0, 1), true);
+    state.push_pending(10, c2.clone(), (2, 3), true);
     // Retire one buffer at each seq. No GPU counters in the test
-    // buffers → sum is 0, so `intake_completed` finalizes with 0.
+    // buffers → sum is 0, so `intake_completed` publishes 0.
     state.pool.retire(dummy_buf(5));
     state.pool.retire(dummy_buf(10));
 
-    // coherent_seq = 7: only c1 (seq 5) should finalize.
+    // coherent_seq = 7: only c1 (seq 5) should publish.
     state.intake_completed(7);
     assert_eq!(c1.status(), QueryStatus::Issued);
     assert_eq!(c2.status(), QueryStatus::Pending);
     assert_eq!(state.pending.len(), 1);
 
-    // coherent_seq = 10: c2 finalizes.
+    // coherent_seq = 10: c2 publishes.
     state.intake_completed(10);
     assert_eq!(c2.status(), QueryStatus::Issued);
     assert_eq!(state.pending.len(), 0);
+}
+
+#[test]
+fn state_intake_adds_a_split_span_up_across_its_two_frames() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    // Frame 1 counted slot 0, frame 2 slot 0 of its own buffer.
+    let mut first = dummy_buf(1);
+    write_slot(&mut first, 0, 900);
+    let mut second = dummy_buf(2);
+    write_slot(&mut second, 0, 100);
+    state.pool.retire(first);
+    state.pool.retire(second);
+    state.push_pending(1, core.clone(), (0, 1), false);
+    core.resume(2, 0);
+    core.end(2, 1);
+    state.push_pending(2, core.clone(), (0, 1), true);
+
+    state.intake_completed(1);
+    assert_eq!(
+        core.status(),
+        QueryStatus::Pending,
+        "a span is not done while a later segment is outstanding"
+    );
+    state.intake_completed(2);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(core.get_u32(), 1_000);
+}
+
+#[test]
+fn state_intake_reads_an_empty_segment_without_a_buffer() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    // A continuation frame that drew nothing reserved no slot and so no
+    // buffer either; its empty segment must not make the span permissive.
+    state.push_pending(1, core.clone(), (0, 0), false);
+    let mut second = dummy_buf(2);
+    write_slot(&mut second, 0, 55);
+    state.pool.retire(second);
+    core.resume(2, 0);
+    core.end(2, 1);
+    state.push_pending(2, core.clone(), (0, 1), true);
+
+    state.intake_completed(2);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(core.get_u32(), 55);
+}
+
+#[test]
+fn state_intake_answers_permissively_when_a_counted_segments_buffer_is_gone() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    core.end(1, 1);
+    // Nothing retired at seq 1: the slots the span counted into cannot be
+    // read back.
+    state.push_pending(1, core.clone(), (0, 2), true);
+    state.intake_completed(1);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(core.get_u32(), u32::MAX);
+}
+
+#[test]
+fn state_split_and_resume_close_and_reopen_every_open_span() {
+    use super::VisibilityQueryState;
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    state.push_active(&core);
+    // A second BEGIN on the same query leaves one entry.
+    state.push_active(&core);
+    assert_eq!(state.active_count(), 1);
+    state.bump_slot();
+    state.bump_slot();
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+
+    state.split_open_spans(1);
+    assert_eq!(state.pending.len(), 1);
+    assert_eq!(state.pending[0].span, (0, 2), "cut at the high-water mark");
+    assert!(!state.pending[0].closes_span);
+
+    state.reset_frame();
+    assert_eq!(
+        state.active_count(),
+        1,
+        "reset_frame leaves the open span for the continuation"
+    );
+    state.resume_open_spans(2);
+    assert_eq!(
+        core.offset_begin(),
+        0,
+        "reopened against the fresh allocator"
+    );
+
+    state.remove_active(&core);
+    assert_eq!(state.active_count(), 0);
+}
+
+#[test]
+fn state_mark_exhausted_makes_every_open_span_uncounted() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
+    state.push_active(&core);
+    state.note_draw();
+    state.mark_exhausted();
+    assert!(state.exhausted_this_frame());
+    core.end(1, state.draws_seen());
+    state.push_pending(1, core.clone(), (0, 0), true);
+    state.intake_completed(1);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(
+        core.get_u32(),
+        u32::MAX,
+        "an exhausted frame reports fully visible, not the zero an empty span sums to"
+    );
+}
+
+#[test]
+fn state_draw_counter_carries_across_a_frame_boundary() {
+    use super::VisibilityQueryState;
+    let mut state = VisibilityQueryState::new();
+    state.note_draw();
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, (640, 480), (640, 480), state.draws_seen());
+    state.push_active(&core);
+    state.note_draw();
+    // The submit boundary resets the slot allocator, never the draw count.
+    state.reset_frame();
+    state.note_draw();
+    state.mark_exhausted();
+    core.end(2, state.draws_seen());
+    core.publish_span();
+    assert_eq!(
+        core.get_u32(),
+        u32::MAX,
+        "two draws inside the span, and the count of them was lost"
+    );
 }
 
 #[test]
@@ -199,10 +408,8 @@ fn state_reset_frame_clears_per_frame_fields() {
     use super::VisibilityQueryState;
     let mut state = VisibilityQueryState::new();
     state.bump_slot();
-    state.inc_active();
     state.install_current_buffer(dummy_buf(0));
     state.mark_exhausted();
-    assert_eq!(state.active_count(), 1);
     assert_eq!(state.current_buffer_handle().raw(), 0xDEAD_BEEF);
     assert!(state.exhausted_this_frame());
     assert_eq!(state.allocator.next, 1);
@@ -211,7 +418,6 @@ fn state_reset_frame_clears_per_frame_fields() {
     // not touch the current buffer slot.
     state.retire_current_buffer(42);
     state.reset_frame();
-    assert_eq!(state.active_count(), 0);
     assert!(state.current_buffer_handle().is_null());
     assert!(!state.exhausted_this_frame());
     assert_eq!(state.allocator.next, 0);
@@ -315,9 +521,10 @@ fn logical_samples_saturates_instead_of_wrapping() {
 #[test]
 fn finalize_reports_the_count_in_reported_pixels_of_the_target_begun_against() {
     let core = VisibilityQueryCore::new();
-    core.begin(1, 0, (640, 480), (320, 240));
+    core.begin(1, 0, (640, 480), (320, 240), 0);
     core.end(1, 1);
-    core.finalize(76_800);
+    core.accumulate_segment(76_800);
+    core.publish_span();
     assert_eq!(core.get_u32(), 307_200);
     assert_eq!(core.get_u64(), 307_200);
     assert_eq!(core.status(), QueryStatus::Issued);
