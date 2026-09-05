@@ -197,7 +197,8 @@ jobs:
   # part of `make test`: many subtests fail by design, so this gates on a
   # regression rather than on zero failures. The per-subtest budget is raised
   # from its 180 s default because the GPU here is paravirtual, and a subtest
-  # killed for taking too long is reported as a crash.
+  # killed for taking too long is reported as a crash; a subtest the GPU
+  # hangs under never reaches it (see the step below).
   # This gates on the same baseline the local runs use, in both directions:
   # a count above its pin is a regression, a count below it is a stale
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
@@ -228,19 +229,23 @@ jobs:
       # family is a runner, so its counts are recorded here and committed from
       # the artifact below (each arch's file carries its own leg; the merge is
       # leg-scoped, so the two sections are copied in side by side).
-      # The paravirtual GPU hangs now and then under a long subtest (the
-      # driver reports kIOAccelCommandBufferCallbackErrorHang and every later
-      # command buffer is ignored, or the subtest never returns and the
-      # runner kills it at its budget). A regression never looks like that,
-      # so a leg whose raw output carries the signature gets one more
-      # attempt; a second hang, or any other failure, gates.
+      # The paravirtual GPU hangs now and then under a long subtest: the
+      # driver reports kIOAccelCommandBufferCallbackErrorHang on the test
+      # process's stderr, every later command buffer is ignored, and the GPU
+      # stays that way for the rest of the machine's life (a second attempt
+      # on the same runner hung again, in the next subtest's fresh process).
+      # The runner reads that line as it arrives, stops the subtest and ends
+      # the leg, so the hang costs seconds rather than the subtest's budget;
+      # what is left for this step is to say what the failure means. A
+      # regression never looks like that, and the machine will not recover,
+      # so the answer is a re-run of the failed jobs, which lands on a fresh
+      # runner, not another attempt here.
       - run: |
-          leg() { make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"; }
-          if ! leg; then
-            grep -lqE 'TIMED OUT|GPU Hang' "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null || exit 1
-            echo "::warning::a subtest hung on this runner's GPU; running the leg once more"
-            mv "$MTLD3D_CONFORMANCE_RAW_DIR" "$MTLD3D_CONFORMANCE_RAW_DIR-first-attempt"
-            leg
+          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"; then
+            if grep -lq kIOAccelCommandBufferCallbackErrorHang "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null; then
+              echo "::error::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short; not a regression when the other conformance jobs are green. Re-run the failed jobs to get a fresh machine: gh run rerun ${{ github.run_id }} --failed"
+            fi
+            exit 1
           fi
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
@@ -256,7 +261,7 @@ jobs:
         if: always()
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/conformance-raw*
+          path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error
       - uses: actions/upload-artifact@v4

@@ -50,6 +50,18 @@ the Metal-validation lines), which is what the per-cluster audit below was built
 from — the *actual-vs-expected* values distinguish a real defect from an
 acceptable `caps` difference. Off unless the variable is set.
 
+The runner reads the test process's stderr as it arrives, and the driver's
+GPU-hang line (`kIOAccelCommandBufferCallbackErrorHang`, or the
+`...SubmissionsIgnored` line the driver prints for every command buffer it
+drops afterwards) stops the subtest at once and ends the leg: exit code 3, no
+verdict, no baseline write. Every count after that line is a read off a GPU
+that runs nothing, and waiting out the subtest's budget would only make the
+same non-verdict cost minutes. On the Intel CI image the paravirtual GPU stays
+hung for the rest of the machine's life, so the later subtests would hang too
+and the job names the re-run of the failed jobs, which lands on a fresh runner.
+A hang on a real GPU is worth a look on its own (a shader that hangs the GPU is
+a bug), but the leg has to run again for its counts either way.
+
 There is no conformance-specific input to set. The test binaries ship inside the
 Wine SDK bundle (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
 published by the [wine-build](https://github.com/athei/wine-build) bundle step),
