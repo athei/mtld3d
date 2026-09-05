@@ -241,6 +241,9 @@ version = "0.8.0"
 [[package]]
 name = "mtld3d-e2e"
 version = "0.8.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "mtld3d-shared"
