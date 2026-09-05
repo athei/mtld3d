@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Arch, Baseline, Leg, Site, Subtest, SubtestBaseline, Variant};
+use super::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, Variant};
 
 fn sample() -> Baseline {
     let mut device = SubtestBaseline {
@@ -46,6 +46,7 @@ fn sample() -> Baseline {
             Leg {
                 arch: Arch::I686,
                 variant: Variant::Native,
+                gpu: Gpu::Apple,
             },
             Subtest::Device,
         ),
@@ -56,6 +57,7 @@ fn sample() -> Baseline {
             Leg {
                 arch: Arch::X64,
                 variant: Variant::Intel,
+                gpu: Gpu::Mac2,
             },
             Subtest::D3d9Ex,
         ),
@@ -99,4 +101,31 @@ fn parse_rejects_legacy_class_token() {
 fn parse_rejects_bad_crash_token() {
     let err = Baseline::from_text("[i686/device] crash=maybe\n").unwrap_err();
     assert!(err.contains("crash=0|1"), "{err}");
+}
+
+#[test]
+fn leg_names_round_trip_with_implicit_native_and_apple() {
+    for (text, arch, variant, gpu) in [
+        ("i686", Arch::I686, Variant::Native, Gpu::Apple),
+        ("x86_64+intel", Arch::X64, Variant::Intel, Gpu::Apple),
+        ("i686@mac2", Arch::I686, Variant::Native, Gpu::Mac2),
+        ("x86_64+intel@mac2", Arch::X64, Variant::Intel, Gpu::Mac2),
+    ] {
+        let leg = Leg { arch, variant, gpu };
+        assert_eq!(leg.to_string(), text);
+        assert_eq!(text.parse::<Leg>().unwrap(), leg);
+    }
+    assert!("i686@apple2".parse::<Leg>().is_err());
+    assert!("i686@mac2+intel".parse::<Leg>().is_err());
+}
+
+#[test]
+fn every_leg_is_listed_once_in_output_order() {
+    let mut seen = Leg::ALL.to_vec();
+    seen.dedup();
+    assert_eq!(seen.len(), Leg::ALL.len());
+    assert!(Leg::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(Leg::ALL[0].to_string(), "i686");
+    assert_eq!(Leg::ALL[3].to_string(), "i686+intel@mac2");
+    assert_eq!(Leg::ALL[7].to_string(), "x86_64+intel@mac2");
 }

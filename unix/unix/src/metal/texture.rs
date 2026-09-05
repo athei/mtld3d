@@ -45,22 +45,13 @@ pub fn create_backbuffer(
         return None;
     }
     let device = device_handle.into_retained()?;
-
-    // SAFETY: objc2 typed binding; class-method constructor on
-    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
-    let desc = unsafe {
-        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            MTLPixelFormat::BGRA8Unorm,
-            width as usize,
-            height as usize,
-            false,
-        )
-    };
-    desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-
-    let texture = device.newTextureWithDescriptor(&desc)?;
-    let label = objc2_foundation::NSString::from_str("mtld3d-backbuffer");
-    texture.setLabel(Some(&label));
+    let texture = create_color_texture(
+        &device,
+        width,
+        height,
+        MTLPixelFormat::BGRA8Unorm,
+        "mtld3d-backbuffer",
+    )?;
     clear_texture_black(queue_handle, &texture);
     let srgb_handle = srgb_twin_view(
         &texture,
@@ -86,16 +77,39 @@ const IDENTITY_SWIZZLE: MTLTextureSwizzleChannels = MTLTextureSwizzleChannels {
     alpha: objc2_metal::MTLTextureSwizzle::Alpha,
 };
 
+/// Usage bits for a texture, by what it serves.
+///
+/// `ShaderRead` always, `RenderTarget` for an attachment. `PixelFormatView` is
+/// what a view of another pixel format needs on its base texture, and a colour
+/// texture takes such views: the sRGB twin, and the channel swizzle a format
+/// without an alpha lane samples through. An Apple-family GPU exempts a view
+/// that changes only transfer function or swizzle from the usage, and the bit
+/// would cost it lossless compression on every colour texture, so it stays
+/// off there; every other family refuses the view without it. Depth textures
+/// take no view and never carry the bit.
+fn texture_usage(
+    device: &ProtocolObject<dyn MTLDevice>,
+    render_target: bool,
+    takes_views: bool,
+) -> MTLTextureUsage {
+    let mut usage = MTLTextureUsage::ShaderRead;
+    if render_target {
+        usage |= MTLTextureUsage::RenderTarget;
+    }
+    if takes_views && !super::device::is_apple_family(device) {
+        usage |= MTLTextureUsage::PixelFormatView;
+    }
+    usage
+}
+
 /// The sRGB twin view of a colour texture, or 0 when the format has no twin.
 ///
-/// Metal exempts a view that differs from its base only in transfer function
-/// from the `PixelFormatView` usage requirement, so the twin costs neither an
-/// extra usage flag nor the texture's lossless compression, and it inherits
-/// the base's usage, which keeps a render target's twin render-targetable.
-/// `swizzle` mirrors whichever channel order the base handle is handed out
-/// with, so the two views differ only in transfer function; a render target
-/// is always handed out unswizzled, since Metal forbids rendering through a
-/// channel swizzle.
+/// The base texture's usage allows the view (see [`texture_usage`]), and the
+/// view inherits that usage, which keeps a render target's twin
+/// render-targetable. `swizzle` mirrors whichever channel order the base
+/// handle is handed out with, so the two views differ only in transfer
+/// function; a render target is always handed out unswizzled, since Metal
+/// forbids rendering through a channel swizzle.
 fn srgb_twin_view(
     texture: &ProtocolObject<dyn MTLTexture>,
     format: PixelFormat,
@@ -236,7 +250,6 @@ pub fn create_color_target(
         width,
         height,
         mtl_pixel_format(pixel_format),
-        None,
         "mtld3d-color-target",
     )?;
     let srgb_handle = srgb_twin_view(
@@ -255,14 +268,12 @@ pub fn create_color_target(
     ))
 }
 
-/// Creates the `Private` colour texture a `MetalFX` upscale reads or writes.
+/// Creates the colour texture a `MetalFX` upscale reads or writes.
 ///
-/// Same shape as [`create_color_target`] but with the storage mode pinned:
-/// `MTLFXSpatialScaler` rejects an output texture that is not `Private`
-/// (`outputTexture must have private storage mode`), and the descriptor's
-/// default is not. Nothing CPU-visible is needed by either consumer — the
-/// readback resolve is copied out by a blit, and the HDR tone-map scratch is
-/// only ever read by the scaler.
+/// Same shape as [`create_color_target`] without the sRGB twin: nothing
+/// samples the scratch through a transfer function. `MTLFXSpatialScaler`
+/// rejects an output texture that is not `Private`, which every colour
+/// texture here is.
 ///
 /// Takes the device by reference rather than by handle because `submit_frame`
 /// reaches this through `cmd_buf.device()` and carries no device handle of its
@@ -278,7 +289,6 @@ pub fn create_upscale_target(
         width,
         height,
         mtl_pixel_format(pixel_format),
-        Some(MTLStorageMode::Private),
         "mtld3d-upscale-scratch",
     )?;
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
@@ -288,16 +298,17 @@ pub fn create_upscale_target(
 
 /// Shared body of the colour-texture creators.
 ///
-/// `storage_mode` of `None` leaves the descriptor's default, which is what the
-/// D3D9-facing render targets have always used. Hands back the retained
-/// texture rather than a handle, so the caller can take an sRGB view of it
-/// before transferring the retain into the handle it returns.
+/// `Private` storage: nothing on the CPU touches a colour texture (every
+/// upload is a blit from a staging buffer and every readback a blit into one),
+/// and the descriptor's default, `Managed`, would keep a CPU mirror the GPU
+/// has to synchronise. Hands back the retained texture rather than a handle,
+/// so the caller can take an sRGB view of it before transferring the retain
+/// into the handle it returns.
 fn create_color_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
     height: u32,
     mtl_format: objc2_metal::MTLPixelFormat,
-    storage_mode: Option<MTLStorageMode>,
     label: &str,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     // SAFETY: objc2 typed binding; class-method constructor on
@@ -310,10 +321,8 @@ fn create_color_texture(
             false,
         )
     };
-    desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    if let Some(mode) = storage_mode {
-        desc.setStorageMode(mode);
-    }
+    desc.setUsage(texture_usage(device, true, true));
+    desc.setStorageMode(MTLStorageMode::Private);
 
     let texture = device.newTextureWithDescriptor(&desc)?;
     let label = objc2_foundation::NSString::from_str(label);
@@ -366,7 +375,7 @@ pub fn create_msaa_companion(
     // SAFETY: objc2 typed binding; the count was validated against
     // `supportsTextureSampleCount:` before it crossed the boundary.
     unsafe { desc.setSampleCount(sample_count as usize) };
-    desc.setUsage(MTLTextureUsage::RenderTarget);
+    desc.setUsage(texture_usage(&device, true, true));
     desc.setStorageMode(MTLStorageMode::Private);
 
     let texture = device.newTextureWithDescriptor(&desc)?;
@@ -544,20 +553,11 @@ pub fn create_texture(
     // Honor RT bits: RENDER_TARGET textures also keep ShaderRead so the
     // subsequent pass can sample them (water reflection, portrait models).
     // Depth textures with DEPTH_STENCIL flag are sampleable shadow maps:
-    // they need both the depth-attachment binding AND ShaderRead. We
-    // deliberately don't add `PixelFormatView`: it blocks Metal's
-    // lossless framebuffer compression on every BGRA8 / BC1-3 colour
-    // texture, and nothing here needs it — the sRGB twin view below is
-    // exempt (linear↔sRGB views of the same base format are allowed
-    // without it), and no other reinterpreting view exists.
+    // they need both the depth-attachment binding AND ShaderRead.
     let is_render_target = desc
         .usage_flags
         .intersects(TextureUsage::RENDER_TARGET | TextureUsage::DEPTH_STENCIL);
-    let mut usage = MTLTextureUsage::ShaderRead;
-    if is_render_target {
-        usage |= MTLTextureUsage::RenderTarget;
-    }
-    tex_desc.setUsage(usage);
+    tex_desc.setUsage(texture_usage(device, is_render_target, !is_depth));
 
     // Depth textures must live in private storage on Apple Silicon, regardless
     // of what the PE side requested (CPU upload of a depth texture is meaningless).
@@ -582,9 +582,7 @@ pub fn create_texture(
 
     // sRGB twin view, created eagerly for every colour format that has one so
     // the draw-time bind can honour `D3DSAMP_SRGBTEXTURE=1` without a
-    // mid-frame crossing. Metal exempts linear↔sRGB views of the same base
-    // format from the `PixelFormatView` usage requirement, so the twin costs
-    // neither an extra usage flag nor the texture's lossless compression.
+    // mid-frame crossing.
     // The twin mirrors the base handle's swizzle (when the base is handed out
     // as a swizzle view below) so the two views only ever differ in transfer
     // function. A render target never takes the swizzle branch, so the twin
@@ -675,8 +673,8 @@ pub fn create_texture(
 /// `texture2d<float>`. A cube-map source therefore has to reach it as a 2D view
 /// of the face the D3D9 call named: the cube texture binds as a `texturecube`
 /// and the sample lands on face 0 whichever face the blit addressed. The view
-/// keeps the base format and spans every mip level, so it needs no
-/// `PixelFormatView` usage on the base texture and the explicit `level()` the
+/// keeps the base format and spans every mip level, so no GPU family asks for
+/// `PixelFormatView` usage on the base texture, and the explicit `level()` the
 /// fragment function passes still selects the source mip.
 ///
 /// The returned view is a fresh object whose retain the caller owns; the PE

@@ -41,7 +41,7 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache::{self, CachedKind},
     shader_compile_stats::{self, BurstTracker, CompileBucket},
-    storage_policy::buffer_storage_mode,
+    storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
@@ -2642,7 +2642,7 @@ impl FrameEncoder {
             backing_ptr,
             length,
             id: 0,
-            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            storage_mode: gpu_written_buffer_storage_mode(),
             kind: BufferKind::Visibility,
         };
         let mut handle = MetalHandle::<MTLBufferKind>::NULL;

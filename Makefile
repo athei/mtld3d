@@ -478,8 +478,14 @@ stage: all
 # and the 256-byte linear texture alignment. Every assertion has to hold there
 # too; a test that probes a capability asks the device and asserts the answer
 # it gets, which is also what lets the suite run on real Intel hardware.
+#
+# LOG_DIR=<path> puts every test process's log file (and its GPU traces) in
+# one directory instead of beside each test binary, so a machine that is only
+# reachable through its artifacts (a CI runner) can hand the logs back. The
+# path is read on the PE side: an absolute Windows path (`Z:\...` for a unix
+# path under Wine). Ten files are kept per directory, so pair it with FILTER.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
-MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))
+MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
@@ -550,7 +556,11 @@ test-unit:
 # PARTITION=K/N runs the K-th of N hash-sharded slices of the suite, so several
 # machines can split one arch's suite between them; the shard a test lands in
 # depends on its name alone, so the slices agree across machines and builds.
-E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast) $(if $(PARTITION),--partition hash:$(PARTITION))
+#
+# FILTER=<expr> narrows the run to the tests a nextest filter expression
+# selects (`test(name)`, `binary(stem)`, `|`, `&`), for a machine where the
+# whole suite is not the question. A slice the filter leaves empty passes.
+E2E_NEXTEST_FLAGS := $(if $(SCALE)$(INTEL),--no-fail-fast) $(if $(PARTITION),--partition hash:$(PARTITION)) $(if $(FILTER),--no-tests=pass -E '$(FILTER)')
 
 # From a build here, nextest builds and runs the package through cargo; from a
 # stage it replays the archive through its own binary, which needs no cargo,

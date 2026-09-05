@@ -182,6 +182,7 @@ fn untextured_xyz_point_under_an_ortho_projection_covers_its_pixels() {
         z: 0.1,
     }];
     h.render_once(BLUE, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
         assert_eq!(d.draw_primitive_up(D3DPT_POINTLIST, 1, &point), 0);
     });
     // The probes sit one pixel either side of the square's edge, which is

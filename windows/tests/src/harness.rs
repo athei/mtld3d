@@ -2502,6 +2502,31 @@ impl Harness {
         unsafe { (self.factory_vtbl().get_adapter_count)(self.d3d9) }
     }
 
+    /// Whether the device is the paravirtualized one a hosted runner exposes.
+    ///
+    /// That device claims no GPU family and implements less than the Mac2
+    /// family it stands in for. Measured, not assumed, by the workflow's
+    /// probe job: it hands back a texture view with a channel swizzle and
+    /// then samples the view through the base texture's lanes, where every
+    /// real GPU family applies the swizzle; and a later encoder of the same
+    /// command buffer that loads or samples a multisample depth resolve
+    /// target sees the content an earlier encoder stored there, not the
+    /// resolve. The renderer keys two sampler fallbacks on the same name. A
+    /// test of a feature the device lacks returns early on it, since its
+    /// assertion would measure the device rather than the layer.
+    #[must_use]
+    pub fn device_is_paravirtual(&self) -> bool {
+        let id = self.adapter_identifier();
+        let len = id
+            .description
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(id.description.len());
+        id.description[..len]
+            .windows(b"Paravirtual".len())
+            .any(|w| w == b"Paravirtual")
+    }
+
     /// `IDirect3D9::GetAdapterIdentifier`, asserting success.
     #[must_use]
     pub fn adapter_identifier(&self) -> D3DADAPTER_IDENTIFIER9 {

@@ -1,5 +1,6 @@
 unix/conformance/src/classify.rs Classification Clone,Copy,PartialEq,Eq,Debug
 unix/conformance/src/model.rs Arch Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
+unix/conformance/src/model.rs Gpu Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
 unix/conformance/src/model.rs Leg Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
 unix/conformance/src/model.rs Site Clone,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
 unix/conformance/src/model.rs Subtest Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash

@@ -216,9 +216,11 @@ bundle. The test machines carry no toolchain: they install the stage
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
 packed 16-bit formats, so it runs the Intel/AMD code paths for real. Each
-e2e suite is split across three machines (`PARTITION=K/N`). The newest image
-gates; the two older ones are advisory until their counts are recorded, so
-read their artifacts rather than their status, and run `make conformance`
+e2e suite is split across three machines (`PARTITION=K/N`). Every image
+gates. The Intel image reads the conformance baseline's `@mac2` entries,
+which only it can record: dispatch the workflow with `record_intel_baseline`
+and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
+(`unix/conformance/CONFORMANCE.md` has the procedure). Run `make conformance`
 locally when your change touches the render or shader-emission path. The
 manual
 `probe-metal` job is how an image is checked before it is added, and it runs

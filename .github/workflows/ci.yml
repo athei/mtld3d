@@ -12,6 +12,18 @@ on:
         description: Run only the probe-metal job.
         type: boolean
         default: false
+      record_intel_baseline:
+        description: >-
+          Re-record the Intel image's conformance legs into baseline.txt and
+          upload the file, instead of gating on it.
+        type: boolean
+        default: false
+      e2e_filter:
+        description: >-
+          Run only the end-to-end tests this nextest filter expression selects
+          (e.g. `test(stencil) | binary(msaa)`), with their log files uploaded.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -144,10 +156,7 @@ jobs:
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
   # INTEL=1`) and do not run here. Each suite is split in three hash-sharded
-  # partitions, so three machines share it. The two older images are advisory:
-  # the arm64 one until its counts are recorded, the Intel one until what its
-  # first run found is fixed (#364, #365, #366: a texture usage bit its views
-  # need, a Shared texture it rejects, a sampler it never binds).
+  # partitions, so three machines share it. Every image gates.
   e2e:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -165,13 +174,23 @@ jobs:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
       # The ci profile runs the suite serially and to completion; see
-      # windows/.config/nextest.toml. The advisory images tolerate a failing
-      # suite at this step, so the job and its check stay green and the
-      # failure is read from the step's own log.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }}
-        continue-on-error: ${{ matrix.runner != 'macos-26' }}
+      # windows/.config/nextest.toml. A dispatch with `e2e_filter` narrows
+      # the run and collects the layer's log files, which are otherwise
+      # written beside each test binary and pruned to the ten newest.
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" PARTITION=${{ matrix.partition }} INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           NEXTEST_PROFILE: ci
+          E2E_FILTER: ${{ inputs.e2e_filter }}
+          # The layer reads the path on the Windows side, where the unix
+          # root is drive Z.
+          LOG_DIR: ${{ inputs.e2e_filter && format('Z:{0}', runner.temp) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && inputs.e2e_filter }}
+        with:
+          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: ignore
 
   # Wine's own d3d9_test.exe against our staged builtin, per-site counts diffed
   # against unix/conformance/baseline.txt. One arch per runner process, and not
@@ -184,13 +203,12 @@ jobs:
   # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
   # fail on a real Mac because macdrv rejects the tests' mode changes read
   # zero on this display; those carry the `ceiling` class, whose pin is a
-  # cross-environment maximum. The two older images run the suite as advisory
-  # legs: the baseline carries no per-image entries yet, so their counts are
-  # read from the artifact until they are recorded and triaged. The Intel
-  # image runs the `intel` variant for the reason given above the e2e legs,
-  # and reads against the `<arch>+intel` baseline entries. On an Apple-family
-  # image that variant (`make conformance-intel`) is a local tool and does not
-  # run here.
+  # cross-environment maximum. The two arm64 images read the same entries.
+  # The Intel image runs the `intel` variant for the reason given above the
+  # e2e legs, and its GPU family gives it its own entries, `<arch>+intel@mac2`,
+  # which only it can record (the step below does, on request). On an
+  # Apple-family image that variant (`make conformance-intel`) is a local tool
+  # and does not run here.
   conformance:
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -206,9 +224,25 @@ jobs:
         with:
           wine-release: ${{ env.WINE_RELEASE }}
           nextest-version: ${{ env.NEXTEST_VERSION }}
-      - run: make conformance-${{ matrix.runner == 'macos-15-intel' && 'intel-' || '' }}${{ matrix.arch }} STAGE="$STAGE"
-        # As for the e2e legs: advisory images tolerate a failing run here.
-        continue-on-error: ${{ matrix.runner != 'macos-26' }}
+      # The Intel image reads and, on a `record_intel_baseline` dispatch,
+      # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
+      # family is a runner, so its counts are recorded here and committed from
+      # the artifact below (each arch's file carries its own leg; the merge is
+      # leg-scoped, so the two sections are copied in side by side).
+      # The paravirtual GPU hangs now and then under a long subtest (the
+      # driver reports kIOAccelCommandBufferCallbackErrorHang and every later
+      # command buffer is ignored, or the subtest never returns and the
+      # runner kills it at its budget). A regression never looks like that,
+      # so a leg whose raw output carries the signature gets one more
+      # attempt; a second hang, or any other failure, gates.
+      - run: |
+          leg() { make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"; }
+          if ! leg; then
+            grep -lqE 'TIMED OUT|GPU Hang' "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null || exit 1
+            echo "::warning::a subtest hung on this runner's GPU; running the leg once more"
+            mv "$MTLD3D_CONFORMANCE_RAW_DIR" "$MTLD3D_CONFORMANCE_RAW_DIR-first-attempt"
+            leg
+          fi
         env:
           MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
           # Every subtest's full output, which is what carries the
@@ -223,7 +257,14 @@ jobs:
         if: always()
         with:
           name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/conformance-raw
+          path: ${{ runner.temp }}/conformance-raw*
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.record_intel_baseline && matrix.runner == 'macos-15-intel' }}
+        with:
+          name: baseline-mac2-${{ matrix.arch }}
+          path: unix/conformance/baseline.txt
           retention-days: 14
           if-no-files-found: error
 
@@ -341,6 +382,336 @@ jobs:
           WINEPREFIX="$RUNNER_TEMP/pfx" capped 60 "$W" cmd /c ver 2>&1 | grep -a Windows
           ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
           pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true
+      # A view that only reorders channels is how the formats without an
+      # alpha lane read alpha as one; a device that hands one back but samples
+      # through the base texture's lanes is what the swizzle sites in the
+      # conformance baseline look like.
+      - name: Swizzle and sRGB texture views
+        run: |
+          cat > "$RUNNER_TEMP/views.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void probe(texture2d<float> t [[texture(0)]], device float4 *out [[buffer(0)]]) {
+              constexpr sampler s(coord::pixel, filter::nearest);
+              out[0] = t.sample(s, float2(0.5, 0.5));
+          }
+          """
+          let lib = try! d.makeLibrary(source: src, options: nil)
+          let pso = try! d.makeComputePipelineState(function: lib.makeFunction(name: "probe")!)
+          let queue = d.makeCommandQueue()!
+          func sample(_ t: MTLTexture) -> [Float] {
+              let out = d.makeBuffer(length: 16, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let enc = cb.makeComputeCommandEncoder()!
+              enc.setComputePipelineState(pso)
+              enc.setTexture(t, index: 0)
+              enc.setBuffer(out, offset: 0, index: 0)
+              enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+              enc.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              return Array(UnsafeBufferPointer(start: out.contents().assumingMemoryBound(to: Float.self), count: 4))
+          }
+          for usePFV in [false, true] {
+              let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+              desc.usage = usePFV ? [.shaderRead, .pixelFormatView] : [.shaderRead]
+              desc.storageMode = .private
+              let tex = d.makeTexture(descriptor: desc)!
+              let staging = d.makeBuffer(bytes: [UInt8(255), 64, 32, 0], length: 4, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let blit = cb.makeBlitCommandEncoder()!
+              blit.copy(from: staging, sourceOffset: 0, sourceBytesPerRow: 4, sourceBytesPerImage: 4, sourceSize: MTLSize(width: 1, height: 1, depth: 1), to: tex, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+              blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("pixelFormatView usage:", usePFV)
+              print("  base sample:", sample(tex))
+              let sw = MTLTextureSwizzleChannels(red: .red, green: .green, blue: .blue, alpha: .one)
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm, textureType: .type2D, levels: 0..<1, slices: 0..<1, swizzle: sw) {
+                  print("  swizzle view: created, swizzle alpha =", view.swizzle.alpha.rawValue, "sample:", sample(view))
+              } else {
+                  print("  swizzle view: nil")
+              }
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm_srgb) {
+                  print("  srgb view: created, sample:", sample(view))
+              } else {
+                  print("  srgb view: nil")
+              }
+          }
+          EOF
+          swift "$RUNNER_TEMP/views.swift" || echo "views probe failed with exit $?"
+      # The depth-side features the e2e suite leans on, each measured on its
+      # own: a 16-bit depth attachment, a fragment-less depth write under a
+      # scissor with the colour write mask off, a multisample depth resolve,
+      # and a point wider than one pixel.
+      - name: Depth, scissor, resolve and point probes
+        run: |
+          cat > "$RUNNER_TEMP/depth.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          struct V { float4 pos [[position]]; float psize [[point_size]]; };
+          vertex V tri(uint vid [[vertex_id]], constant float &z [[buffer(0)]]) {
+              float2 p = float2(float((vid << 1u) & 2u) * 2.0 - 1.0, float(vid & 2u) * 2.0 - 1.0);
+              V v; v.pos = float4(p, z, 1.0); v.psize = 1.0; return v;
+          }
+          vertex V pt(uint vid [[vertex_id]]) { V v; v.pos = float4(0, 0, 0.5, 1); v.psize = 15.0; return v; }
+          fragment float4 solid(constant float4 &c [[buffer(0)]]) { return c; }
+          """
+          let lib = try! d.makeLibrary(source: src, options: nil)
+          let queue = d.makeCommandQueue()!
+          func tex(_ f: MTLPixelFormat, _ w: Int, _ h: Int, samples: Int = 1) -> MTLTexture {
+              let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false)
+              desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .private
+              if samples > 1 { desc.textureType = .type2DMultisample; desc.sampleCount = samples }
+              return d.makeTexture(descriptor: desc)!
+          }
+          func pso(_ vs: String, fs: String?, color: MTLPixelFormat, depth: MTLPixelFormat, writeColor: Bool, samples: Int = 1) -> MTLRenderPipelineState {
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: vs)
+              p.fragmentFunction = fs.map { lib.makeFunction(name: $0)! }
+              p.colorAttachments[0].pixelFormat = color
+              if !writeColor { p.colorAttachments[0].writeMask = [] }
+              p.depthAttachmentPixelFormat = depth
+              p.rasterSampleCount = samples
+              return try! d.makeRenderPipelineState(descriptor: p)
+          }
+          func dss(write: Bool) -> MTLDepthStencilState {
+              let s = MTLDepthStencilDescriptor(); s.depthCompareFunction = .lessEqual; s.isDepthWriteEnabled = write
+              return d.makeDepthStencilState(descriptor: s)!
+          }
+          func readback(_ t: MTLTexture, bpp: Int) -> [UInt8] {
+              let buf = d.makeBuffer(length: t.width * t.height * bpp, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!; let b = cb.makeBlitCommandEncoder()!
+              b.copy(from: t, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: t.width, height: t.height, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: t.width * bpp, destinationBytesPerImage: t.width * t.height * bpp)
+              b.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              return Array(UnsafeBufferPointer(start: buf.contents().assumingMemoryBound(to: UInt8.self), count: t.width * t.height * bpp))
+          }
+          func px(_ bytes: [UInt8], _ w: Int, _ x: Int, _ y: Int) -> [UInt8] { Array(bytes[(y * w + x) * 4 ..< (y * w + x) * 4 + 4]) }
+          let W = 16, H = 16
+          // 1. Depth16Unorm vs Depth32Float: clear 1.0, draw a triangle at z=0.5 (lessEqual) in red over a blue clear.
+          for df in [MTLPixelFormat.depth16Unorm, .depth32Float] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(df, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: df, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("depth \(df.rawValue == 250 ? "16" : "32") draw at 0.5 over clear 1.0, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(want red)")
+          }
+          // 2. Fragment-less depth write under a scissor, colour write mask off: left half to z=0, then a red triangle at 0.5.
+          do {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: nil, color: .rgba8Unorm, depth: .depth32Float, writeColor: false)); e.setDepthStencilState(dss(write: true))
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W / 2, height: H))
+              var zv: Float = 0.0; e.setVertexBytes(&zv, length: 4, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W, height: H))
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: .depth32Float, writeColor: true)); e.setDepthStencilState(dss(write: false))
+              zv = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("fragment-less scissored depth write: left pixel", px(b, W, 2, 8), "(want green: depth 0 rejects the red), right pixel", px(b, W, 13, 8), "(want red: depth 1 accepts)")
+          }
+          // 3. Multisample depth resolve: 4x depth cleared to 0.25, resolve with sample0, read the resolved depth.
+          do {
+              let ms = tex(.depth32Float, W, H, samples: 4); let rs = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.depthAttachment.texture = ms; rp.depthAttachment.resolveTexture = rs; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 0.25; rp.depthAttachment.storeAction = .multisampleResolve; rp.depthAttachment.depthResolveFilter = .sample0
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!; e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let b = readback(rs, bpp: 4)
+              let v = b.withUnsafeBytes { $0.load(fromByteOffset: (8 * W + 8) * 4, as: Float.self) }
+              print("multisample depth resolve, resolved centre depth:", v, "(want 0.25)")
+          }
+          // 5. A depth plane nothing cleared: loaded DontCare on its first use, then a draw at 0.5 under lessEqual.
+          for df in [MTLPixelFormat.depth32Float_stencil8, .depth32Float] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(df, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .dontCare; rp.depthAttachment.storeAction = .store
+              if df == .depth32Float_stencil8 { rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store }
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: df, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("uncleared depth (\(df == .depth32Float ? "D32F" : "D32F_S8"), DontCare load), draw at 0.5 lessEqual, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(red = the plane read as far, blue = as near)")
+          }
+          // 6. The clear-quad shape on a combined depth-stencil attachment: viewport set, scissor to the
+          //    left half, a fragment-less pipeline that declares the stencil format, depth always/write,
+          //    then a red triangle at 0.5 under lessEqual over the full attachment. Once without and once
+          //    with an empty fragment function.
+          let src2 = """
+          #include <metal_stdlib>
+          using namespace metal;
+          fragment void nothing() {}
+          """
+          let lib2 = try! d.makeLibrary(source: src2, options: nil)
+          for withFragment in [false, true] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri")
+              p.fragmentFunction = withFragment ? lib2.makeFunction(name: "nothing") : nil
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm; p.colorAttachments[0].writeMask = []
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let quad = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let pc = MTLRenderPipelineDescriptor()
+              pc.vertexFunction = lib.makeFunction(name: "tri"); pc.fragmentFunction = lib.makeFunction(name: "solid")
+              pc.colorAttachments[0].pixelFormat = .rgba8Unorm
+              pc.depthAttachmentPixelFormat = .depth32Float_stencil8; pc.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let cover = try! d.makeRenderPipelineState(descriptor: pc)
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(W), height: Double(H), znear: 0, zfar: 1))
+              e.setRenderPipelineState(quad); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W / 2, height: H))
+              var zv: Float = 0.0; e.setVertexBytes(&zv, length: 4, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W, height: H))
+              e.setRenderPipelineState(cover); e.setDepthStencilState(dss(write: false))
+              zv = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("clear-quad shape on D32F_S8 (\(withFragment ? "empty fragment function" : "no fragment function")): left", px(b, W, 2, 8), "(want green) right", px(b, W, 13, 8), "(want red)")
+          }
+          // 7. A drawn multisample depth, resolved: 4x colour+depth pass cleared to 1.0, a triangle at 0.5
+          //    under always/write, store multisampleResolve on depth (sample0), then read the resolved depth.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let rsc = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = msc; rp.colorAttachments[0].resolveTexture = rsc; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].storeAction = .multisampleResolve
+              rp.depthAttachment.texture = ms; rp.depthAttachment.resolveTexture = rs; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .multisampleResolve; rp.depthAttachment.depthResolveFilter = .sample0
+              rp.stencilAttachment.texture = ms; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .dontCare
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the drawn depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("drawn multisample depth resolve (D32F_S8), resolved centre depth:", v, "(want 0.5)")
+          }
+          // 8. A multisample depth stored by one pass and resolved by the next: pass A draws at 0.5 and
+          //    stores; pass B loads it with no colour attachment and no draw, store storeAndMultisampleResolve.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              let e2 = cb.makeRenderCommandEncoder(descriptor: b2)!; e2.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the cross-pass depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("cross-pass multisample depth resolve (stored, then loaded and resolved), centre:", v, "(want 0.5)")
+          }
+          // 9. A resolve target loaded as an attachment by the next encoder of the same command buffer:
+          //    pass P stores the destination at 1.0, pass A draws a multisample depth at 0.5, pass B resolves
+          //    it into the destination, pass C loads the destination and draws red at 0.75 under less.
+          //    Red means the load saw 1.0 (the resolve was not seen), blue means it saw 0.5.
+          for withBlit in [false, true] {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let c = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let cb = queue.makeCommandBuffer()!
+              let pp = MTLRenderPassDescriptor()
+              pp.depthAttachment.texture = rs; pp.depthAttachment.loadAction = .clear; pp.depthAttachment.clearDepth = 1.0; pp.depthAttachment.storeAction = .store
+              pp.stencilAttachment.texture = rs; pp.stencilAttachment.loadAction = .clear; pp.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: pp)!.endEncoding()
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: b2)!.endEncoding()
+              if withBlit { let bl = cb.makeBlitCommandEncoder()!; bl.endEncoding() }
+              let cc = MTLRenderPassDescriptor()
+              cc.colorAttachments[0].texture = c; cc.colorAttachments[0].loadAction = .clear; cc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); cc.colorAttachments[0].storeAction = .store
+              cc.depthAttachment.texture = rs; cc.depthAttachment.loadAction = .load; cc.depthAttachment.storeAction = .store
+              cc.stencilAttachment.texture = rs; cc.stencilAttachment.loadAction = .load; cc.stencilAttachment.storeAction = .store
+              let p1 = MTLRenderPipelineDescriptor()
+              p1.vertexFunction = lib.makeFunction(name: "tri"); p1.fragmentFunction = lib.makeFunction(name: "solid")
+              p1.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p1.depthAttachmentPixelFormat = .depth32Float_stencil8; p1.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let pso1 = try! d.makeRenderPipelineState(descriptor: p1)
+              let less = MTLDepthStencilDescriptor(); less.depthCompareFunction = .less; less.isDepthWriteEnabled = false
+              let e3 = cb.makeRenderCommandEncoder(descriptor: cc)!
+              e3.setRenderPipelineState(pso1); e3.setDepthStencilState(d.makeDepthStencilState(descriptor: less)!)
+              zv = 0.75; e3.setVertexBytes(&zv, length: 4, index: 0); e3.setFragmentBytes(&col, length: 16, index: 0)
+              e3.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e3.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("resolve target loaded by the next encoder (\(withBlit ? "blit encoder between" : "no encoder between")):", px(readback(c, bpp: 4), W, 8, 8), "(blue = resolve seen, red = stale 1.0)")
+          }
+          // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
+          do {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("pt", fs: "solid", color: .rgba8Unorm, depth: .depth32Float, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var col: [Float] = [1, 1, 1, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("15 px point: centre", px(b, W, 8, 8), "5 px right", px(b, W, 13, 8), "(want white, white)")
+          }
+          EOF
+          swift "$RUNNER_TEMP/depth.swift" || echo "depth probe failed with exit $?"
       - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
         run: |
           cat > "$RUNNER_TEMP/packed.swift" <<'EOF'

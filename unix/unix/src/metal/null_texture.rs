@@ -11,14 +11,17 @@
 
 use std::sync::OnceLock;
 
-use mtld3d_shared::NullTextureKind;
+use mtld3d_shared::{MetalHandle, NullTextureKind, mtl_handle::MTLSamplerStateKind};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSamplerDescriptor, MTLSize,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSamplerDescriptor,
+    MTLSamplerState, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 
-use crate::LOG_TARGET;
+use crate::{
+    LOG_TARGET,
+    metal::{device::cpu_written_texture_storage, handle::IntoRetained},
+};
 
 /// Handles to the three opaque-black textures and their default sampler.
 ///
@@ -52,6 +55,21 @@ impl NullTextures {
 }
 
 static NULL_TEXTURES: OnceLock<NullTextures> = OnceLock::new();
+
+/// The shared default sampler, retained for the caller.
+///
+/// What a slot gets when the draw names no usable sampler of its own: the
+/// sampler a null-texture bind installs, and the substitute for a sampler
+/// state the device declined to create. `None` only when the default sampler
+/// itself cannot be created.
+pub fn default_sampler(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLSamplerState>>> {
+    let null = ensure(device)?;
+    // SAFETY: the handle came from `create`'s `Retained::into_raw`, alive for
+    // the process lifetime.
+    unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) }.into_retained()
+}
 
 /// Lazily create and cache the opaque-black textures + default sampler.
 ///
@@ -91,8 +109,9 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
 
 /// A 1×1 (per slice) `RGBA8Unorm` texture filled with opaque black.
 ///
-/// `slices` is 6 for a cube (one per face), 1 otherwise. Shared storage so the
-/// pixel can be written from the CPU; the four bytes are `(R, G, B, A) =
+/// `slices` is 6 for a cube (one per face), 1 otherwise. CPU-writable storage
+/// for the device (see [`cpu_written_texture_storage`]) so the pixel can be
+/// written with `replaceRegion:`; the four bytes are `(R, G, B, A) =
 /// (0, 0, 0, 255)`, which samples as `(0, 0, 0, 1)`.
 fn make_black_texture(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -109,7 +128,7 @@ fn make_black_texture(
     // SAFETY: plain property setter on a fresh descriptor.
     unsafe { desc.setDepth(1) };
     desc.setUsage(MTLTextureUsage::ShaderRead);
-    desc.setStorageMode(MTLStorageMode::Shared);
+    desc.setStorageMode(cpu_written_texture_storage(device));
 
     let texture = device.newTextureWithDescriptor(&desc)?;
     let label = objc2_foundation::NSString::from_str("mtld3d-null-black");

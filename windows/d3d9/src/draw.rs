@@ -19,7 +19,10 @@ use mtld3d_core::{
         FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
     },
     ids::{BufferId, ProgramId},
-    passes::{NULL_TEXTURE_SAMPLER_SENTINEL, VertexBufferBind, null_texture_tex_sentinel},
+    passes::{
+        NULL_TEXTURE_SAMPLER_SENTINEL, VertexBufferBind, null_texture_tex_sentinel,
+        sampler_cache_key,
+    },
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
     pipeline_state::{PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
@@ -1948,9 +1951,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         if enc.last_bound().fragment_texture_changed(stage_u32, handle) {
             enc.emit_command(Command::set_fragment_texture(handle, stage_u32));
         }
+        // A sampler state the device declined to create is handle 0, which the
+        // unix side replaces with the default sampler; the cache records the
+        // default's sentinel so the slot is neither left unbound against a
+        // fresh cache nor deduped against a later real sampler.
         if enc
             .last_bound()
-            .fragment_sampler_changed(stage_u32, sampler)
+            .fragment_sampler_changed(stage_u32, sampler_cache_key(sampler))
         {
             enc.emit_command(Command::set_fragment_sampler_state(sampler, stage_u32));
         }
@@ -2033,7 +2040,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 if enc.last_bound().vertex_texture_changed(slot, handle) {
                     enc.emit_command(Command::set_vertex_texture(handle, slot));
                 }
-                if sampler != 0 && enc.last_bound().vertex_sampler_changed(slot, sampler) {
+                if enc
+                    .last_bound()
+                    .vertex_sampler_changed(slot, sampler_cache_key(sampler))
+                {
                     enc.emit_command(Command::set_vertex_sampler_state(sampler, slot));
                 }
             }

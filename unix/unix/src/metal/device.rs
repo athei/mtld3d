@@ -8,7 +8,7 @@ use mtld3d_shared::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLPixelFormat,
+    MTLPixelFormat, MTLStorageMode,
 };
 
 use super::{
@@ -83,6 +83,17 @@ fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.name().to_string().contains("Paravirtual")
 }
 
+/// True when the device belongs to Metal's Apple GPU family.
+///
+/// The Apple family is what an Apple Silicon Mac's GPU claims; an Intel or
+/// AMD GPU claims Mac2 only, and the paravirtualized device a CI runner
+/// exposes claims nothing. Two texture rules branch on it: which pixel
+/// formats exist natively, and whether a view that changes only transfer
+/// function or swizzle needs the `PixelFormatView` usage on its base texture.
+pub fn is_apple_family(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    device.supportsFamily(MTLGPUFamily::Apple2)
+}
+
 /// True when the packed 16-bit pixel formats exist natively on this device.
 ///
 /// `B5G6R5Unorm` / `Bgr5A1Unorm` / `Abgr4Unorm` are listed Apple-family-only
@@ -91,7 +102,21 @@ fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
 /// When false, the PE side backs the corresponding D3D formats with
 /// `Bgra8Unorm` and widens their texels in the GPU upload pass.
 pub fn supports_native_packed16(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    device.supportsFamily(MTLGPUFamily::Apple2)
+    is_apple_family(device)
+}
+
+/// Storage mode for a texture the CPU writes with `replaceRegion:`.
+///
+/// `Shared` where the CPU and GPU share memory; a device without unified
+/// memory rejects `Shared` textures outright, and `Managed` is the mode that
+/// keeps a CPU-writable copy there. `replaceRegion:` carries the write across
+/// on its own for a `Managed` texture, so the caller needs nothing further.
+pub fn cpu_written_texture_storage(device: &ProtocolObject<dyn MTLDevice>) -> MTLStorageMode {
+    if device.hasUnifiedMemory() {
+        MTLStorageMode::Shared
+    } else {
+        MTLStorageMode::Managed
+    }
 }
 
 /// True when single-precision float textures sample with linear filtering.

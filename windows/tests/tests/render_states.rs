@@ -335,7 +335,13 @@ fn stencil_test_gates_rendering() {
     let h = Harness::with_depth();
     arm_diffuse(&h);
     h.render_once(BLACK, |d| {
-        assert_eq!(d.clear(D3DCLEAR_STENCIL, 0, 1.0, 0), 0, "stencil clear");
+        // The depth plane starts undefined and the depth test is on, so it is
+        // cleared along with the stencil the test is about.
+        assert_eq!(
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+            0,
+            "depth and stencil clear"
+        );
         assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
         assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), 0);
         assert_eq!(
@@ -369,6 +375,7 @@ fn stencil_clear_leaves_depth_intact() {
     let h = Harness::with_depth();
     arm_diffuse(&h);
     h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
         let near = quad_at_depth(GREEN, 0.25);
         assert_eq!(
             d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &near),
@@ -445,9 +452,9 @@ fn stencil_reference_is_compared_through_the_mask() {
     arm_diffuse(&h);
     h.render_once(BLACK, |d| {
         assert_eq!(
-            d.clear(D3DCLEAR_STENCIL, 0, 1.0, STORED),
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, STORED),
             0,
-            "stencil clear"
+            "depth and stencil clear"
         );
         assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
         assert_eq!(d.set_render_state(D3DRS_STENCILMASK, 0xFF), 0);
@@ -481,6 +488,7 @@ fn stencil_enable_without_a_stencil_attachment_is_dropped() {
     });
     arm_diffuse(&h);
     h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
         assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
         assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
         assert_eq!(d.set_render_state(D3DRS_STENCILREF, 0x7F), 0);

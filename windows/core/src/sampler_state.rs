@@ -24,9 +24,12 @@ use mtld3d_types::{
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT,
 };
 
-use crate::convert::{
-    border_color_preset, d3d_border_color_to_metal, d3d_to_metal_address_mode,
-    d3d_to_metal_min_mag_filter, d3d_to_metal_mip_filter,
+use crate::{
+    caps::MAX_ANISOTROPY,
+    convert::{
+        border_color_preset, d3d_border_color_to_metal, d3d_to_metal_address_mode,
+        d3d_to_metal_min_mag_filter, d3d_to_metal_mip_filter,
+    },
 };
 
 /// Upper LOD clamp passed to every `MTLSamplerDescriptor`.
@@ -277,7 +280,7 @@ pub fn params_from_snapshot(
         address_u: d3d_to_metal_address_mode(s.address_u),
         address_v: d3d_to_metal_address_mode(s.address_v),
         address_w: d3d_to_metal_address_mode(s.address_w),
-        max_anisotropy: s.max_anisotropy.max(1),
+        max_anisotropy: s.max_anisotropy.clamp(1, MAX_ANISOTROPY),
         lod_min_clamp: f32::from(max_mip_u16).to_bits(),
         lod_max_clamp: LOD_MAX_CLAMP.to_bits(),
         is_compare: u32::from(s.flags.contains(SamplerFlags::IS_COMPARE)),
