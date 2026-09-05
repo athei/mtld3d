@@ -4219,13 +4219,18 @@ fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_p
                 let index = ti
                     .cube_subresource_index(face, level)
                     .expect("validated cube subresource");
-                let cube = ti.cube.as_deref_mut().expect("cube storage");
-                if cube.was_uploaded[index] {
-                    cube.dirty_masks[face as usize] |= 1 << level;
-                    ti.dirty_mask |= 1 << level;
+                let uploaded = {
+                    let cube = ti.cube.as_deref_mut().expect("cube storage");
+                    cube.last_submit_seq[index] = 0;
+                    cube.was_uploaded[index]
+                };
+                if uploaded {
+                    // Whole-level: the mark drops any pending partial rect an
+                    // unflushed lock left behind, which would otherwise narrow
+                    // this upload into the new device's empty face.
+                    ti.mark_cube_dirty(face, level);
                     levels_remarked += 1;
                 }
-                cube.last_submit_seq[index] = 0;
             }
         }
     } else {
