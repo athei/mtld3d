@@ -610,6 +610,15 @@ pub const PS_BOOL_CONST_SLOT: u32 = 10;
 /// site; bound only for a draw whose bound stages carry a non-zero bias.
 pub const PS_LOD_BIAS_SLOT: u32 = 9;
 
+/// Fragment-stage buffer slot of the per-draw `PsDraw` uniform.
+///
+/// One `float4`: `.xy` are the logical pixels per render pixel of the bound
+/// colour target, which a `ps_3_0` `vPos` read applies to the rasterized
+/// position so the register stays in the space D3D9 reports under
+/// `render.scale`. Bound only for a draw whose pixel shader declares `vPos`
+/// into a target rasterized below the reported resolution.
+pub const PS_DRAW_SLOT: u32 = 8;
+
 // The uniform slots must clear every stream slot and stay inside Metal's
 // 31-entry vertex buffer table.
 const _: () = {

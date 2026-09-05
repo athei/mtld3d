@@ -467,6 +467,19 @@ impl DxsoProgram {
     /// declaration of the `vs_i` / `ps_i` argument on it. Subroutine bodies
     /// count: a `call` inline-expands them into the entry point, so a `rep
     /// iN` reached only through a `call` still reads the argument.
+    /// True when a `ps_3_0` program declares the `vPos` register.
+    ///
+    /// `vPos` is `MiscType` register 0, identified by index rather than by the
+    /// `dcl` token's usage. The emitter gates the fragment argument on it and
+    /// the draw path gates the render-scale variant and its uniform on it.
+    #[must_use]
+    pub fn reads_vpos(&self) -> bool {
+        self.declarations.iter().any(|decl| {
+            matches!(decl, Declaration::Semantic { reg, .. }
+                if reg.kind == RegKind::MiscType && reg.index == 0)
+        })
+    }
+
     #[must_use]
     pub fn uses_dynamic_int_constants(&self) -> bool {
         let defined: std::collections::BTreeSet<u16> =

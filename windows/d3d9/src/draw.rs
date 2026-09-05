@@ -36,8 +36,8 @@ use mtld3d_core::{
 use mtld3d_shared::{
     Command, NullTextureKind, VertexAttrDesc,
     mtl::{
-        IndexType, PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, PrimitiveType,
-        VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
+        IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
+        PrimitiveType, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
         VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
@@ -1358,6 +1358,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     }
     // Both emitters honour the bias, so the flag rides on the shared PS key.
     ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_bias);
+    // `vPos` is the rasterized pixel coordinate. Into a target rasterized
+    // below the resolution D3D9 reports, a shader that declares the register
+    // reads it through the `PsDraw` uniform so it stays in the reported space;
+    // only such a shader pays for the variant and the bind.
+    let vpos_scaled = !enc.target_scale().is_identity()
+        && matches!(ps, PsSource::Programmable { ps_id, .. } if enc.ps_reads_vpos(*ps_id));
+    ps_variant.flags.set(VariantFlags::VPOS_SCALE, vpos_scaled);
     // `D3DRS_MULTISAMPLEMASK`: Metal has no pipeline-state sample mask, so a
     // narrowed mask becomes a `[[sample_mask]]` output in a pixel-shader
     // variant. The API thread already resolved the state against the bound
@@ -2147,6 +2154,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)
                     .expect("LOD bias uniform is 256 bytes"),
                 PS_LOD_BIAS_SLOT,
+            ));
+        }
+    }
+    // The render scale behind a scaled `vPos` read. Bound only for a draw
+    // whose shader took the variant; the encoder dedups it, and the scale
+    // changes only with the bound target.
+    if vpos_scaled {
+        let draw_bytes = mtld3d_core::ps_draw::build_ps_draw_bytes(enc.target_scale());
+        if enc.last_bound().ps_draw_changed(&draw_bytes) {
+            let ptr = enc.alloc_scratch(&draw_bytes);
+            enc.emit_command(Command::set_fragment_bytes_at(
+                ptr,
+                u32::try_from(mtld3d_core::ps_draw::PS_DRAW_BYTES).expect("16 fits u32"),
+                PS_DRAW_SLOT,
             ));
         }
     }

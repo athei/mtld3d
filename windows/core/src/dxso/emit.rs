@@ -25,8 +25,8 @@ use std::{
 };
 
 use mtld3d_shared::mtl::{
-    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT,
-    VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_BOOL_CONST_SLOT,
+    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
@@ -96,6 +96,16 @@ bitflags::bitflags! {
         /// shader and binds nothing, so the common case costs nothing.
         /// Folded into the PS cache key.
         const LOD_BIAS = 1 << 5;
+        /// The bound colour target is rasterized below the resolution D3D9 reports.
+        ///
+        /// Set only for a `ps_3_0` shader that declares `vPos`: the function
+        /// then takes the `PsDraw` uniform and reads the register as the
+        /// rasterized position scaled into the reported space, so a shader
+        /// comparing `vPos` against the back-buffer size it was told, or
+        /// dividing by it for a screen-space UV, sees the same values it
+        /// would at the identity. A shader without `vPos` never carries the
+        /// bit, so its MSL and its key are unchanged.
+        const VPOS_SCALE = 1 << 7;
         /// `D3DRS_MULTISAMPLEMASK` selects fewer than all samples.
         ///
         /// When set, the fragment function returns a struct carrying a
@@ -399,6 +409,9 @@ pub fn emit_ps_programmable_named(
     emit_const_rel_helper(&mut out, ps);
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         emit_srgb_write_helper(&mut out);
+    }
+    if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
+        w(&mut out, crate::ps_draw::PS_DRAW_MSL);
     }
     emit_ps_function(&mut out, ps, variant, entry)?;
     Ok(out)
@@ -1044,14 +1057,14 @@ fn emit_ps_function(
     // register index, not the dcl usage — the D3D9 spec allows the
     // dcl token's usage to be Position/Face but the index is the
     // canonical disambiguator.
-    let mut has_vpos = false;
+    let has_vpos = ps.reads_vpos();
     let mut has_vface = false;
     for decl in &ps.declarations {
         if let Declaration::Semantic { reg, .. } = decl
             && reg.kind == RegKind::MiscType
         {
             match reg.index {
-                0 => has_vpos = true,
+                0 => {}
                 1 => has_vface = true,
                 other => {
                     mtld3d_shared::log_once_warn_by!(
@@ -1063,6 +1076,7 @@ fn emit_ps_function(
             }
         }
     }
+    let vpos_scaled = has_vpos && variant.flags.contains(VariantFlags::VPOS_SCALE);
     // SM2/SM3 oDepth: the PS function must return a struct binding
     // both `oC0 [[color(0)]]` and `oDepth [[depth(any)]]` instead of
     // a bare float4. Pre-scan so we only pay the struct cost when the
@@ -1149,6 +1163,14 @@ fn emit_ps_function(
         let _ = write!(
             out,
             ",\n    constant float4 *lod_bias [[buffer({PS_LOD_BIAS_SLOT})]]"
+        );
+    }
+    // The render-scale uniform behind a scaled `vPos` read; only a shader
+    // that declares the register into a scaled target takes it.
+    if vpos_scaled {
+        let _ = write!(
+            out,
+            ",\n    constant PsDraw &ps_draw [[buffer({PS_DRAW_SLOT})]]"
         );
     }
     // Dynamic integer / boolean constants (a non-`defi` `iN` / non-`defb`
@@ -1279,6 +1301,7 @@ fn emit_ps_function(
     let subs = (!ps.subroutines.is_empty()).then_some(&ps.subroutines);
     let mut ps_context_flags = EmitContextFlags::empty();
     ps_context_flags.set(EmitContextFlags::PS_HAS_VPOS, has_vpos);
+    ps_context_flags.set(EmitContextFlags::PS_VPOS_SCALE, vpos_scaled);
     ps_context_flags.set(EmitContextFlags::PS_HAS_VFACE, has_vface);
     ps_context_flags.set(EmitContextFlags::PS_HAS_DEPTH_OUT, has_depth_out);
     ps_context_flags.set(
@@ -1484,6 +1507,11 @@ bitflags::bitflags! {
         /// Clear → the sample sites are emitted without either, and no
         /// `lod_bias` argument exists to read.
         const PS_LOD_BIAS = 1 << 4;
+        /// PS only: `vPos` reads apply the `PsDraw` scale.
+        ///
+        /// Set → the register is `floor(position.xy * vpos_scale.xy)` and the
+        /// `ps_draw` argument exists to read. Clear → the identity form.
+        const PS_VPOS_SCALE = 1 << 5;
     }
 }
 
@@ -1691,6 +1719,11 @@ impl<'a> EmitContext<'a> {
     #[inline]
     const fn ps_has_vpos(&self) -> bool {
         self.flags.contains(EmitContextFlags::PS_HAS_VPOS)
+    }
+
+    #[inline]
+    const fn ps_vpos_scaled(&self) -> bool {
+        self.flags.contains(EmitContextFlags::PS_VPOS_SCALE)
     }
 
     #[inline]
@@ -2710,7 +2743,13 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
             // vPos = the `[[position]]` from the `Varyings` (`in.position`).
             // D3D9 vPos is the INTEGER pixel coord (so `frc(vPos)` is 0 at a
             // pixel), but Metal `[[position]]` is the pixel CENTRE (x+0.5) —
-            // subtract 0.5 to match D3D9.
+            // subtract 0.5 to match D3D9. Into a target rasterized below the
+            // reported resolution the centre is first scaled into the
+            // reported space and floored, which keeps the integer contract
+            // and lands on the reported pixel the render pixel's centre is in.
+            0 if ctx.ps_vpos_scaled() => {
+                "float4(floor(in.position.xy * ps_draw.vpos_scale.xy), in.position.zw)".to_string()
+            }
             0 if ctx.ps_has_vpos() => "(in.position - 0.5)".to_string(),
             1 if ctx.ps_has_vface() => "float4(v_face)".to_string(),
             other => {

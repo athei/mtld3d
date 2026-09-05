@@ -1047,6 +1047,11 @@ pub struct FrameEncoder {
     /// declared sampler the game left unbound. Only PS programs get an entry;
     /// VS programs (no samplers) fall through to the empty default.
     prog_sampler_decls: FxHashMap<ProgramId, PsSamplerDecls>,
+    /// The pixel shaders that declare `vPos`.
+    ///
+    /// Read on every programmable draw into a scaled target: only such a
+    /// shader takes the render-scale variant and its `PsDraw` uniform.
+    prog_reads_vpos: FxHashSet<ProgramId>,
     /// Compiled `MTLLibrary` handles keyed by content hash (`disk_key`).
     ///
     /// One entry per unique shader source; a single shader compiled
@@ -1517,6 +1522,7 @@ impl FrameEncoder {
             last_pipeline_memo: None,
             program_cache: FxHashMap::default(),
             prog_sampler_decls: FxHashMap::default(),
+            prog_reads_vpos: FxHashSet::default(),
             lib_cache: FxHashMap::default(),
             ff_vs_libs: FxHashMap::default(),
             prog_vs_libs: FxHashMap::default(),
@@ -5000,9 +5006,19 @@ impl FrameEncoder {
         self.prog_sampler_decls
             .entry(shader_id)
             .or_insert_with(|| PsSamplerDecls::from_program(&program));
+        if program.reads_vpos() {
+            self.prog_reads_vpos.insert(shader_id);
+        }
         self.program_cache
             .entry(shader_id)
             .or_insert_with(|| Box::new(program));
+    }
+
+    /// True when the pixel shader `ps_id` declares `vPos`.
+    ///
+    /// False for an unregistered id.
+    pub fn ps_reads_vpos(&self, ps_id: ProgramId) -> bool {
+        self.prog_reads_vpos.contains(&ps_id)
     }
 
     /// The declared sampler slots + types for a programmable pixel shader.
