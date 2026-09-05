@@ -6,7 +6,8 @@
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, assert_pixel_eq, enumerate_display_sizes,
+    WS_VISIBLE, assert_pixel_eq, create_window, destroy_window, enumerate_display_sizes,
+    window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -1417,6 +1418,56 @@ fn reset_fullscreen_non_mode_request_follows_the_window() {
         (screen_w, screen_h),
         "a non-mode request follows the monitor-covering window",
     );
+}
+
+/// A fullscreen `Reset` naming another device window hands the session over.
+///
+/// The window the device came from keeps the borderless style and the monitor
+/// rect it was put in: the session moves across rather than being given back,
+/// so an app that retargets its device sees no screen uncovered behind it. The
+/// window that is handed back on the way out is the one the device presents
+/// into, the retarget target.
+#[test]
+fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
+    let h = Harness::new();
+    // The current resolution is a settable mode on any display, so this runs
+    // wherever the suite does, unlike the tests that request 640x480.
+    let (screen_w, screen_h) = Harness::screen_size();
+    let second = create_window(320, 240, false);
+    let second_rect = window_rect(second);
+
+    let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset on the device's own window",
+    );
+    let covered = h.window_rect();
+
+    let mut pp = fullscreen_params(second, screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset onto a second device window",
+    );
+    assert_eq!(
+        window_rect(second),
+        covered,
+        "the new device window must cover the monitor",
+    );
+    assert_eq!(
+        h.window_rect(),
+        covered,
+        "the window the device came from keeps the fullscreen rect",
+    );
+
+    assert_eq!(h.reset(screen_w, screen_h), D3D_OK, "windowed Reset");
+    assert_eq!(
+        window_rect(second),
+        second_rect,
+        "leaving fullscreen gives back the window the device presented into",
+    );
+    destroy_window(second);
 }
 
 #[test]

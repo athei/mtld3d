@@ -586,7 +586,7 @@ impl Drop for DrivingGuard {
 /// Held by the device for the lifetime of the fullscreen mode so [`leave`]
 /// can put the window back exactly as the game left it. The `HWND` travels
 /// with it: a `Reset` may hand the device a different window, and the one to
-/// restore is always the one we took over.
+/// restore is the one the session is on, the window the device presents into.
 pub struct SavedWindow {
     hwnd: *mut c_void,
     style: u32,

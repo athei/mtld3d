@@ -2433,7 +2433,9 @@ impl DeviceInner {
     /// back buffer in one space; present scales the back buffer to the
     /// display. A device created with `D3DCREATE_NOWINDOWCHANGES` leaves the
     /// window untouched, which is what the flag asks for, and still sets the
-    /// mode.
+    /// mode. Called on a device that is already fullscreen it moves the
+    /// session onto `hwnd`, leaving the window it was on covering the
+    /// monitor.
     pub fn enter_fullscreen(
         &mut self,
         hwnd: *mut c_void,
@@ -4116,8 +4118,6 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
         dev.leave_fullscreen();
         return;
     }
-    // A Reset may retarget the device at another window. The one we took over
-    // is the one we give back, so a retarget is a leave followed by an enter.
     let target = if pp.device_window == 0 {
         dev.window()
     } else {
@@ -4128,7 +4128,13 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
         dev.update_fullscreen(mode);
         return;
     }
-    dev.leave_fullscreen();
+    // A Reset may retarget the device at another window. The session is
+    // handed over rather than given back: the window left behind keeps the
+    // borderless style and the monitor rect it was put in, since the app that
+    // retargeted its device did not ask for a screen to be uncovered behind
+    // it, and the new window is taken over exactly as a fullscreen create
+    // takes one over, so the eventual leave gives back the window the device
+    // presents into.
     dev.enter_fullscreen(target, mode);
 }
 
