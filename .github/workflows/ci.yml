@@ -244,8 +244,16 @@ jobs:
   # e2e legs, and its GPU family gives it its own entries, `<arch>+intel@mac2`,
   # which only it can record (the step below does, on request). On an
   # Apple-family image that variant (`make conformance-intel`) is a local tool
-  # and does not run here.
+  # and does not run here. One more leg runs the `scale` variant, the suite
+  # at `render.scale = 0.75`, against its own `<arch>+scale` entries: the
+  # counterpart of the scaled e2e leg, on the same image and arch, and one
+  # leg for the same reason.
+  # The `variant` axis carries one empty value (the native run) so the
+  # `include` entry becomes its own combination rather than being folded into
+  # the macos-26/i686 native leg; the job name is spelled out so the empty
+  # value does not show in it.
   conformance:
+    name: conformance (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.variant && format(', {0}', matrix.variant) || '' }})
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -254,6 +262,11 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
+        variant: [""]
+        include:
+          - runner: macos-26
+            arch: i686
+            variant: scale
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -281,10 +294,10 @@ jobs:
       # the layer's debug log sits beside it.
       - run: |
           if [ -n "$CONFORMANCE_REPEAT" ]; then
-            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH=${{ matrix.arch }} REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || 'native' }} LOG=debug STAGE="$STAGE"
+            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH=${{ matrix.arch }} REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || matrix.variant || 'native' }} LOG=debug STAGE="$STAGE"
             exit
           fi
-          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"; then
+          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}${{ matrix.arch }} STAGE="$STAGE"; then
             if grep -lq kIOAccelCommandBufferCallbackErrorHang "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null; then
               echo "::error::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short; not a regression when the other conformance jobs are green. Re-run the failed jobs to get a fresh machine: gh run rerun ${{ github.run_id }} --failed"
             fi
@@ -305,7 +318,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}
+          name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/conformance-raw
           retention-days: 14
           if-no-files-found: error

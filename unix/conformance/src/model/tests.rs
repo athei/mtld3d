@@ -127,5 +127,7 @@ fn every_leg_is_listed_once_in_output_order() {
     assert!(Leg::ALL.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(Leg::ALL[0].to_string(), "i686");
     assert_eq!(Leg::ALL[3].to_string(), "i686+intel@mac2");
-    assert_eq!(Leg::ALL[7].to_string(), "x86_64+intel@mac2");
+    assert_eq!(Leg::ALL[5].to_string(), "i686+scale@mac2");
+    assert_eq!(Leg::ALL[6].to_string(), "x86_64");
+    assert_eq!(Leg::ALL[11].to_string(), "x86_64+scale@mac2");
 }

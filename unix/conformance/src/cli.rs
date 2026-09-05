@@ -43,7 +43,7 @@ pub struct Config {
 /// Parse CLI args (excluding `argv[0]`).
 ///
 /// Recognised flags: `--update-baseline`, `--wine <path>`, `--exe <path>`,
-/// `--arch <arch>`, `--variant <native|intel>`, `--assets <dir>`,
+/// `--arch <arch>`, `--variant <native|intel|scale>`, `--assets <dir>`,
 /// `--only <subtest>`, `--repeat <N>`, `--log <filter>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
@@ -90,7 +90,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
             "--variant" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "--variant needs native|intel".to_owned())?;
+                    .ok_or_else(|| "--variant needs native|intel|scale".to_owned())?;
                 variant = value.parse::<Variant>()?;
             }
             "--assets" => {

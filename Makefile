@@ -253,6 +253,8 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
+	conformance-scale conformance-scale-i686 conformance-scale-x86_64 \
+	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
 	clippy-native audit doc doc-windows doc-unix check clean upgrade \
@@ -691,7 +693,17 @@ conformance-intel-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 conformance-intel-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64,--variant intel)
 
-# Re-record the baseline. All four legs write the same baseline.txt (each
+# The same binary at `render.scale = 0.75`, the scaled leg CI runs for one
+# arch; both arches exist as local tools and both record in the baseline.
+conformance-scale: conformance-scale-i686 conformance-scale-x86_64
+
+conformance-scale-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,i686,--variant scale)
+
+conformance-scale-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,x86_64,--variant scale)
+
+# Re-record the baseline. All six legs write the same baseline.txt (each
 # replacing only its own entries), so they must run in sequence: hence
 # recursive make in the recipe rather than prerequisites, which `-j` could
 # interleave.
@@ -700,6 +712,8 @@ conformance-baseline:
 	$(MAKE) conformance-baseline-x86_64
 	$(MAKE) conformance-baseline-intel-i686
 	$(MAKE) conformance-baseline-intel-x86_64
+	$(MAKE) conformance-baseline-scale-i686
+	$(MAKE) conformance-baseline-scale-x86_64
 
 conformance-baseline-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,i686,--update-baseline)
@@ -712,6 +726,12 @@ conformance-baseline-intel-i686: install-windows-i686 install-unix-$(SDK_UNIX_AR
 
 conformance-baseline-intel-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64,--variant intel --update-baseline)
+
+conformance-baseline-scale-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,i686,--variant scale --update-baseline)
+
+conformance-baseline-scale-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
+	$(call conformance_leg,x86_64,--variant scale --update-baseline)
 
 # Flap characterization: run ONE subtest REPEAT times and print a per-site flap
 # report (which sites fire deterministically vs flutter run-to-run), the

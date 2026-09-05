@@ -235,11 +235,13 @@ bundle. The test machines carry no toolchain: they install the stage
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
 packed 16-bit formats, so it runs the Intel/AMD code paths for real. One
-more end-to-end leg runs the suite at `render.scale = 0.75`, the evidence
-that the coordinates the tests assert on stay in the space D3D9 reports when
-the frame is rasterized smaller; a test that needs single-pixel resolution
-asks `render_scale_is_identity()` and pins its exact shape at the identity
-rather than failing that leg. Every image gates. The Intel image reads the conformance baseline's `@mac2` entries,
+more end-to-end leg, and one more conformance leg, run their suite at
+`render.scale = 0.75`, the evidence that the coordinates the tests assert on
+stay in the space D3D9 reports when the frame is rasterized smaller; a test
+that needs single-pixel resolution asks `render_scale_is_identity()` and pins
+its exact shape at the identity rather than failing that leg, and the
+conformance sites that cannot (a probe on a colour boundary) are classified
+under "The scaled leg" in `unix/conformance/CONFORMANCE.md`. Every image gates. The Intel image reads the conformance baseline's `@mac2` entries,
 which only it can record: dispatch the workflow with `record_intel_baseline`
 and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
 (`unix/conformance/CONFORMANCE.md` has the procedure). A conformance subtest
