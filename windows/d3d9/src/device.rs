@@ -4054,6 +4054,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     } else {
         0
     };
+    // A `Reset` may name another `hDeviceWindow`. The presentation surface
+    // and the window subclass both live on the window the device attached, so
+    // they move across before anything is recreated against the new one.
+    if target_window != dev.window() {
+        retarget_device_window(dev, &pp, target_window);
+    }
+
     // debug, not info — fires per-frame during a window drag.
     if resized {
         debug!(
@@ -4166,6 +4173,64 @@ fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_
     // takes one over, so the eventual leave gives back the window the device
     // presents into.
     dev.enter_fullscreen(target, mode);
+}
+
+/// Move the presentation surface and the cursor subclass to a new device window.
+///
+/// A `Reset` may retarget the device at another window, and D3D9 answers it by
+/// re-specifying the swap chain on that window. Here the swap chain is the
+/// `CAMetalLayer` attached to the window `CreateDevice` was given, plus the
+/// subclass the cursor latches and the auto-resize ride. The old metal view
+/// and its attachment record are retired first, so the record the new attach
+/// registers is the only one this device owns.
+///
+/// An attach that fails leaves the device with no presentation surface, the
+/// same answer `CreateDevice` gives that failure: the device keeps working and
+/// `Present` becomes a no-op.
+fn retarget_device_window(
+    dev: &mut DeviceInner,
+    pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
+    hwnd: usize,
+) {
+    // Ops already queued name the layer that is about to go, and the encoder
+    // waits for GPU idle, so nothing in flight references the view once the
+    // detach releases it.
+    dev.flush_current_frame_blocking();
+    dev.encoder_reset();
+    if !dev.view_handle.is_null() {
+        let mut detach = mtld3d_shared::DetachMetalLayerParams {
+            view_handle: dev.view_handle,
+        };
+        unix_call(&mut detach);
+    }
+    let config = Arc::clone(&dev.config);
+    let layer_params = crate::direct3d9::attach_metal_layer(
+        hwnd as u64,
+        dev.device_handle,
+        pp,
+        &config,
+        dev.cursor.sinks(),
+    );
+    if layer_params.view_handle.is_null() {
+        warn!(
+            target: LOG_TARGET,
+            "Reset: no Metal layer on the new device window 0x{hwnd:x}; the device presents              nowhere until a later Reset attaches one",
+        );
+    }
+    dev.view_handle = layer_params.view_handle;
+    dev.layer_handle = layer_params.layer_handle;
+    let (cursor_scale, _origin) =
+        crate::direct3d9::resolve_cursor_scale(layer_params.backing_scale, config.cursor_scale);
+    let dev_ptr = std::ptr::from_mut::<DeviceInner>(dev);
+    dev.cursor
+        .retarget(hwnd as *mut c_void, layer_params.view_handle, dev_ptr);
+    dev.cursor.follow_scale(cursor_scale);
+    info!(
+        target: LOG_TARGET,
+        "Reset: device window retargeted to 0x{hwnd:x} (view {:#x}, layer {:#x})",
+        layer_params.view_handle.raw(),
+        layer_params.layer_handle.raw(),
+    );
 }
 
 /// Steps 1-6 of the Reset protocol.

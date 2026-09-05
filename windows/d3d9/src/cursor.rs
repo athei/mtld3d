@@ -845,6 +845,45 @@ impl CursorState {
             .expect("device-instances mutex poisoned")
             .remove(&(self.hwnd as usize));
     }
+
+    /// Move the subclass and the overlay's view onto another device window.
+    ///
+    /// A `Reset` naming a different `hDeviceWindow` moves the presentation
+    /// surface onto that window, and the messages the cursor rides move with
+    /// it. The old window's procedure and back-pointer go back before the new
+    /// window's are taken, so a message arriving between the two finds no
+    /// device rather than the wrong one. The realized `HCURSOR`, both sprite
+    /// caches and the visibility latches carry over: `Reset` re-specifies the
+    /// swap chain, not the cursor the application set.
+    ///
+    /// `view_handle` names the view the new window's attach produced, null
+    /// when it produced none. The overlay state is re-sent against it because
+    /// the record the previous state named is gone; the sprites themselves are
+    /// content-addressed on the unix side and outlive the detach, so the
+    /// uploaded set stays valid.
+    pub fn retarget(
+        &mut self,
+        hwnd: *mut c_void,
+        view_handle: MetalHandle<NSViewKind>,
+        dev_ptr: *mut DeviceInner,
+    ) {
+        self.uninstall_subclass();
+        self.hwnd = hwnd;
+        self.original_wndproc = null_mut();
+        self.view_handle = view_handle;
+        self.install_subclass(dev_ptr);
+        self.push_overlay_state();
+    }
+
+    /// The words the unix side publishes into for this device.
+    ///
+    /// The attach that a device-window retarget issues hands their addresses
+    /// over again, and they are the same box: the device owns it for its
+    /// lifetime, so the address the new attachment record holds is the one
+    /// the cursor still reads.
+    pub const fn sinks(&self) -> &DisplaySinks {
+        &self.sinks
+    }
 }
 
 // ── Vtable entry points ──
