@@ -557,7 +557,7 @@ extern "system" fn ib_lock(
                 inner.usage,
                 inner.pool,
                 size_to_lock,
-                crate::config::CONFIG.buffer_ignore_lock_bounds,
+                ignore_lock_bounds(inner),
             );
             let discard = flags & D3DLOCK_DISCARD != 0;
             let widen = !trusted && (inner.backing.may_widen_upload() || discard);
@@ -731,6 +731,23 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
     D3D_OK
 }
 
+/// `buffer.ignoreLockBounds` of the device that owns this buffer.
+///
+/// A buffer with no device behind it (the pointer is stamped at creation and
+/// is null only for a buffer that outlived a teardown) answers the default.
+fn ignore_lock_bounds(inner: &IndexBufferInner) -> bool {
+    if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ib: no device behind the buffer; buffer.ignoreLockBounds reads as false");
+        return false;
+    }
+    // SAFETY: `inner.device_inner` was stamped at `Self::new` from a live
+    // `DeviceInner`; the device outlives all its child resources per D3D9
+    // lifetime rules.
+    let dev = unsafe { &*inner.device_inner };
+    dev.config().buffer_ignore_lock_bounds
+}
+
 /// Release the CPU backing of an index buffer whose upload just carried every byte.
 ///
 /// Same class and same guards as the vertex-buffer release: the transient
@@ -744,7 +761,7 @@ extern "system" fn ib_unlock(this: *mut c_void) -> i32 {
 fn release_backing_after_upload(inner: &mut IndexBufferInner) {
     if inner.locked
         || inner.backing.is_pinned()
-        || crate::config::CONFIG.buffer_ignore_lock_bounds
+        || ignore_lock_bounds(inner)
         || !may_release_backing(inner.usage, inner.pool)
         || !inner.backing.may_widen_upload()
     {

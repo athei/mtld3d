@@ -44,8 +44,9 @@ section that starts with the two log lines confirming mtld3d loaded.
 
 ## Configuration
 
-Runtime options live in `mtld3d.conf` next to the game's `.exe`, read once at
-`Direct3DCreate9`. The [sample](mtld3d.conf) documents every key with its
+Runtime options live in `mtld3d.conf` next to the game's `.exe`, read at
+`Direct3DCreate9` and kept by the interface it returns and the devices that
+interface creates. The [sample](mtld3d.conf) documents every key with its
 default and the reason it exists; a missing file means defaults. Every key
 can also be set at launch through the `MTLD3D_CONFIG` environment variable,
 which wins over the file. Keys worth knowing by name: `render.scale` renders

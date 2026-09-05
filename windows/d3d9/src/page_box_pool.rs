@@ -9,15 +9,14 @@
 
 use std::sync::LazyLock;
 
-use mtld3d_core::page_box_pool::PageBoxPool;
+use mtld3d_core::{config::DEFAULT_PAGEBOX_POOL_CAP_BYTES, page_box_pool::PageBoxPool};
 
-/// The pool, sized from `memory.pageboxPoolCapMB` on first use.
+/// The pool, at the default cap until a `Direct3DCreate9` applies `memory.pageboxPoolCapMB`.
 ///
 /// A cap of 0 disables the pool: `acquire` never hits and `recycle`
 /// hands every box back for a plain drop, restoring the
 /// everything-through-the-allocator behaviour (the measured baseline
 /// arm of the warm-page A/B).
 pub static PAGEBOX_POOL: LazyLock<PageBoxPool> = LazyLock::new(|| {
-    let cap = usize::try_from(crate::config::CONFIG.pagebox_pool_cap_bytes).unwrap_or(usize::MAX);
-    PageBoxPool::new(cap)
+    PageBoxPool::new(usize::try_from(DEFAULT_PAGEBOX_POOL_CAP_BYTES).unwrap_or(usize::MAX))
 });

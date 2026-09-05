@@ -36,6 +36,7 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, Ordering},
 };
+use std::sync::Arc;
 
 use mtld3d_shared::{InitLoggerParams, identity};
 // HRESULT codes live in `mtld3d_types` (shared with the integration-test
@@ -143,16 +144,20 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
 #[unsafe(export_name = "Direct3DCreate9")]
 #[must_use]
 pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
-    // First touch resolves `mtld3d.conf` and logs the option set; later
-    // call sites read `&*config::CONFIG` cheaply. The log location it names
-    // reaches the unix side before the logging thread starts, so every line
-    // queued since `DllMain` lands in the file.
-    let cfg = &*config::CONFIG;
-    log_sink::open(cfg);
+    // Resolves `mtld3d.conf` for this interface and logs the option set. The
+    // log location it names reaches the unix side before the logging thread
+    // starts, so every line queued since `DllMain` lands in the file; a later
+    // interface names it again and the unix side keeps the file it has.
+    let cfg = config::load();
+    log_sink::open(&cfg);
     // The first entry point outside `DllMain`: the logging thread can start
     // here (DllMain runs under the loader lock and must not spawn threads).
     log_sink::start();
-    Box::into_raw(Box::new(Direct3D9::new())).cast::<c_void>()
+    // The page-box pool is one per process; the interface resolved most
+    // recently sizes it.
+    page_box_pool::PAGEBOX_POOL
+        .set_cap(usize::try_from(cfg.pagebox_pool_cap_bytes).unwrap_or(usize::MAX));
+    Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg)))).cast::<c_void>()
 }
 
 #[unsafe(export_name = "Direct3DShaderValidatorCreate9")]

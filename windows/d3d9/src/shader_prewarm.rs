@@ -29,10 +29,7 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
     LOG_TARGET,
-    encoder::{
-        PrewarmSender, StageLibHandles, compile_stage_library, shader_cache_enabled,
-        shader_cache_path,
-    },
+    encoder::{PrewarmSender, StageLibHandles, compile_stage_library, shader_cache_path},
 };
 
 /// Lifetime handle for the prewarm thread.
@@ -80,18 +77,28 @@ impl PrewarmHandle {
 /// `PrewarmSender`. `MTLLibrary` handles compiled for one `MTLDevice` would
 /// not be valid on another, so per-device runs are also correct (no shared
 /// cross-device state).
-pub fn spawn(device_handle: MetalHandle<MTLDeviceKind>, sender: PrewarmSender) -> PrewarmHandle {
+pub fn spawn(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    sender: PrewarmSender,
+    shader_cache: bool,
+) -> PrewarmHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let join = thread::Builder::new()
         .name("mtld3d-shader-prewarm".into())
-        .spawn(move || run(device_handle, sender, &stop_for_thread))
+        .spawn(move || run(device_handle, sender, &stop_for_thread, shader_cache))
         .ok();
     PrewarmHandle { stop, join }
 }
 
-fn run(device_handle: MetalHandle<MTLDeviceKind>, sender: PrewarmSender, stop: &AtomicBool) {
-    if !shader_cache_enabled() {
+/// The pre-warm body; `shader_cache` is the interface's `shaderCache.enable`.
+fn run(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    sender: PrewarmSender,
+    stop: &AtomicBool,
+    shader_cache: bool,
+) {
+    if !shader_cache {
         info!(
             target: LOG_TARGET,
             "shader_cache: shaderCache.enable = false, skipping pre-warm"

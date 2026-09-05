@@ -15,6 +15,7 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
     buffer_rename::BufferMapMode,
+    config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{
@@ -958,6 +959,8 @@ pub struct FrameEncoder {
     /// Drives storage-mode policy (`Shared` vs `Managed`), texture-buffer
     /// alignment, and the `didModifyRange:` enqueue gate.
     gpu_caps: GpuCaps,
+    /// The configuration of the `IDirect3D9` behind this encoder's device.
+    config: Arc<Mtld3dConfig>,
 
     // Persistent caches (survive across frames)
     device_handle: MetalHandle<MTLDeviceKind>,
@@ -1446,7 +1449,7 @@ pub struct RetiredColorTarget {
 }
 
 impl FrameEncoder {
-    fn new(gpu_caps: GpuCaps) -> Self {
+    fn new(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>) -> Self {
         // Spawn the dedicated submit thread. It issues the `SubmitFrame`
         // thunk for `Async` frames so the unix command-walk + present
         // overlaps the encoder's next build. The work channel is cap-1 so
@@ -1468,11 +1471,12 @@ impl FrameEncoder {
             last_bound: LastBoundCache::new(),
             scratch: ScratchArena::new(),
             frame_blit_commands: Vec::new(),
-            flags: if shader_cache_enabled() {
+            flags: if config.shader_cache_enable {
                 FrameEncoderFlags::empty()
             } else {
                 FrameEncoderFlags::CACHE_DISABLED
             },
+            config,
             payload_pool: Vec::new(),
             submit_work_tx,
             submit_return_rx,
@@ -1538,6 +1542,12 @@ impl FrameEncoder {
             ff_vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ff_vs_const_scratch_cache: None,
         }
+    }
+
+    /// The configuration of the `IDirect3D9` behind this encoder's device.
+    #[must_use]
+    pub fn config(&self) -> &Mtld3dConfig {
+        &self.config
     }
 
     /// Pointer accessor for the encoder's current snapshot.
@@ -8517,12 +8527,12 @@ impl PrewarmSender {
 }
 
 impl EncoderThread {
-    pub fn spawn(gpu_caps: GpuCaps) -> Self {
+    pub fn spawn(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(1);
         let (prewarm_tx, prewarm_rx) = mpsc::sync_channel::<PrewarmPayload>(1);
         let handle = thread::Builder::new()
             .name("mtld3d-encoder".into())
-            .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps))
+            .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps, config))
             .expect("mtld3d: failed to spawn encoder thread");
         Self {
             sender,
@@ -8770,12 +8780,13 @@ fn encoder_thread_main(
     receiver: &mpsc::Receiver<EncoderMessage>,
     prewarm_rx: &mpsc::Receiver<PrewarmPayload>,
     gpu_caps: GpuCaps,
+    config: Arc<Mtld3dConfig>,
 ) {
     let apple = GpuCaps::apple_silicon_default();
     if !gpu_caps.unified_memory
         || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
     {
-        let cfg = &*crate::config::CONFIG;
+        let cfg = &config;
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "Intel-family GPU paths active: unified_memory={} (forced={}), \
@@ -8788,7 +8799,7 @@ fn encoder_thread_main(
             cfg.linear_align256,
         );
     }
-    let mut enc = FrameEncoder::new(gpu_caps);
+    let mut enc = FrameEncoder::new(gpu_caps, config);
     let mut frame_counter: u64 = 0;
     // Idempotent — also called from `lib.rs::init_logger` during
     // DllMain so the file is already mapped by the time we get here.
@@ -8949,7 +8960,7 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
         let mut params = SetDisplaySyncEnabledParams {
             layer_handle: frame.layer_handle,
             display_sync_enabled: u32::from(enabled),
-            max_fps: crate::config::CONFIG.present_max_fps,
+            max_fps: enc.config().present_max_fps,
         };
         unix_call(&mut params);
     }
@@ -9660,15 +9671,6 @@ pub fn shader_cache_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let parent = exe.parent()?;
     Some(parent.join("mtld3d_shaders.bin"))
-}
-
-/// Mirror of the `shaderCache.enable` config key.
-///
-/// Read once at `FrameEncoder::new` and once at pre-warm spawn; users set
-/// `shaderCache.enable = false` in `mtld3d.conf` to bypass disk caching
-/// for both. Default: `true`.
-pub fn shader_cache_enabled() -> bool {
-    crate::config::CONFIG.shader_cache_enable
 }
 
 /// Open the cache file in append mode, creating it (and writing the 16-byte header) if absent.

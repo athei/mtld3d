@@ -177,7 +177,7 @@ pub struct AttachMetalLayerParams {
     ///
     /// Non-zero = allow the HDR present pipeline when the display also has
     /// EDR headroom, zero = force the SDR path. Resolved PE-side from
-    /// `CONFIG.hdr_enable`; unix side feeds it to `resolve_hdr_active`.
+    /// the interface's `hdr_enable`; unix side feeds it to `resolve_hdr_active`.
     pub hdr_enable: u32, // in
     /// `color.space` from `mtld3d.conf`.
     ///
@@ -186,13 +186,13 @@ pub struct AttachMetalLayerParams {
     /// the panel's native primaries. `Accurate` overrides that with the
     /// sRGB family for both SDR and HDR paths so guest art reads with its
     /// designer-intended hues. PE side reads this from
-    /// `CONFIG.color_space`.
+    /// the interface's `color_space`.
     pub color_space: ColorSpacePolicy, // in
     /// `present.maxFps` from `mtld3d.conf`: frame-rate ceiling in Hz, `0` = uncapped.
     ///
     /// Combined with the vsync request into the present-throttle
     /// duration — the lower rate wins. PE side reads this from
-    /// `CONFIG.present_max_fps`.
+    /// the interface's `present_max_fps`.
     pub max_fps: u32, // in
     /// Whether this GPU can run a `MetalFX` spatial upscale.
     ///
@@ -216,7 +216,7 @@ pub struct AttachMetalLayerParams {
     ///
     /// Resolved on the unix side against the layer mode attach picked, since
     /// `Auto` means "on when the present path is HDR" and only the unix side
-    /// knows that. PE side reads this from `CONFIG.cursor_software`.
+    /// knows that. PE side reads this from the interface's `cursor_software`.
     pub software_cursor: SoftwareCursorPolicy, // in
     /// Whether this device draws its cursor through the overlay window.
     ///

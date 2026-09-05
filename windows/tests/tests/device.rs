@@ -12,17 +12,17 @@ use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
     D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
     D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DXT1,
-    D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
-    D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSWAPEFFECT_DISCARD,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    DevCaps, TextureCaps,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DF24,
+    D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5,
+    D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_FILLMODE,
+    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
 #[test]
@@ -1772,20 +1772,90 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
     );
 }
 
-/// Turn the software cursor on for this test process.
+/// Append one `key=value` to this process's `MTLD3D_CONFIG`.
 ///
-/// Must run before the first `Harness` (the config is read once at factory
-/// bring-up). nextest runs each test in its own process, so the append is
-/// test-local. The suite pins `color.hdr.enable=false`, under which the
-/// default `auto` resolves to the hardware cursor; this forces the overlay.
-fn force_software_cursor() {
+/// Configuration resolves at `Direct3DCreate9`, so the append reaches every
+/// `Harness` constructed after it and none constructed before. nextest runs
+/// each test in its own process, so the append is test-local.
+fn append_config(entry: &str) {
     let merged = format!(
-        "{};cursor.software=true",
+        "{};{entry}",
         std::env::var("MTLD3D_CONFIG").unwrap_or_default()
     );
-    // SAFETY: single-threaded at this point in the test process (the harness
-    // and with it the config read are only constructed afterwards).
+    // SAFETY: no thread in the test process reads the environment while this
+    // runs: a device's threads read their configuration through the handle
+    // they were given, and the logging thread never touches the environment.
     unsafe { std::env::set_var("MTLD3D_CONFIG", merged) };
+}
+
+/// Turn the software cursor on for this test process.
+///
+/// Must run before the `Harness` whose cursor it configures. The suite pins
+/// `color.hdr.enable=false`, under which the default `auto` resolves to the
+/// hardware cursor; this forces the overlay.
+fn force_software_cursor() {
+    append_config("cursor.software=true");
+}
+
+#[test]
+fn each_direct3d9_resolves_its_own_configuration() {
+    // Configuration belongs to the interface: a second `Direct3DCreate9` in
+    // the same process resolves `MTLD3D_CONFIG` afresh and neither interface
+    // sees the other's answers. `caps.dfFormats` is observable on the factory
+    // alone through `CheckDeviceFormat`, so no device is needed.
+    append_config("caps.dfFormats=false");
+    let hidden = Harness::factory_only();
+    let probe = |h: &Harness| {
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DRTYPE_SURFACE,
+            D3DFMT_DF24,
+        )
+    };
+    assert_eq!(
+        probe(&hidden),
+        D3DERR_NOTAVAILABLE,
+        "the first interface hides DF24"
+    );
+
+    append_config("caps.dfFormats=true");
+    let advertised = Harness::factory_only();
+    assert_eq!(
+        probe(&advertised),
+        D3D_OK,
+        "the second interface resolved its own configuration"
+    );
+    assert_eq!(
+        probe(&hidden),
+        D3DERR_NOTAVAILABLE,
+        "the first interface kept its configuration"
+    );
+}
+
+#[test]
+fn a_device_keeps_the_configuration_of_the_interface_that_created_it() {
+    // The device takes its configuration from the interface that created it.
+    // `memory.vramBudgetMB` caps what `GetAvailableTextureMem` reports, so a
+    // device from each of two interfaces reports each interface's own cap.
+    // The devices are sequential: the second is created after the first is
+    // released.
+    const MIB: u32 = 1024 * 1024;
+    append_config("memory.vramBudgetMB=64");
+    let first = Harness::new();
+    assert!(
+        first.available_texture_mem() <= 64 * MIB,
+        "the first device reports at most its interface's 64 MiB budget"
+    );
+    assert_eq!(first.release_device(), 0, "the first device is released");
+
+    append_config("memory.vramBudgetMB=256");
+    let second = Harness::new();
+    let reported = second.available_texture_mem();
+    assert!(
+        reported > 64 * MIB && reported <= 256 * MIB,
+        "the second device reports its own interface's 256 MiB budget, got {reported}"
+    );
 }
 
 #[test]

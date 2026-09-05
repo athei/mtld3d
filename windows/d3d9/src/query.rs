@@ -342,7 +342,11 @@ extern "system" fn query_get_data(
                 }
                 QueryStatus::Pending => {
                     if flags & D3DGETDATA_FLUSH != 0 {
-                        if crate::config::CONFIG.query_flush_immediate {
+                        // SAFETY: `inner.device_inner` was stamped at
+                        // `Self::new` from a live `DeviceInner` and is kept
+                        // alive by the device.
+                        let dev = unsafe { &*device_inner_ptr };
+                        if dev.config().query_flush_immediate {
                             // D3D9-era games use FLUSH-poll as a
                             // poor-man's GPU fence to compensate for
                             // 2004-era drivers that lacked resource

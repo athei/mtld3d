@@ -50,42 +50,55 @@ struct PoolInner {
 
 /// Bounded recycle pool for retired [`PageBox`]es.
 ///
-/// Constructed once with a byte cap (`0` = disabled: `acquire` never
-/// hits, `recycle` returns every box to the caller for a plain drop).
-/// Boxes are matched by exact padded size; there is no splitting or
-/// coalescing, because the rename workload re-requests the same handful
-/// of buffer sizes within a frame or two.
+/// Constructed with a byte cap (`0` = disabled: `acquire` never hits,
+/// `recycle` returns every box to the caller for a plain drop) that
+/// [`Self::set_cap`] can move later, since the pool outlives the
+/// configuration that sizes it. Boxes are matched by exact padded size;
+/// there is no splitting or coalescing, because the rename workload
+/// re-requests the same handful of buffer sizes within a frame or two.
 pub struct PageBoxPool {
     inner: Mutex<PoolInner>,
     /// Mirror of `PoolInner::bytes` for lock-free gauge reads.
     pooled_bytes: AtomicUsize,
     /// Byte cap; `0` disables the pool.
-    cap_bytes: usize,
+    ///
+    /// Read without the lock on the fast path and written by
+    /// [`Self::set_cap`]; a box parked under an earlier, larger cap stays
+    /// parked, so parked bytes can exceed a lowered cap until they are
+    /// acquired.
+    cap_bytes: AtomicUsize,
 }
 
 impl PageBoxPool {
     /// Pool with `cap_bytes` of parking budget (`0` = disabled).
     #[must_use]
     pub fn new(cap_bytes: usize) -> Self {
-        let classes = if cap_bytes == 0 {
-            Vec::new()
-        } else {
-            (0..MAX_POOL_CLASSES).map(|_| Vec::new()).collect()
-        };
+        let classes = (0..MAX_POOL_CLASSES).map(|_| Vec::new()).collect();
         Self {
             inner: Mutex::new(PoolInner { classes, bytes: 0 }),
             pooled_bytes: AtomicUsize::new(0),
-            cap_bytes,
+            cap_bytes: AtomicUsize::new(cap_bytes),
         }
     }
 
-    /// True when a non-zero cap was configured.
+    /// Move the parking budget to `cap_bytes` (`0` = disabled).
+    pub fn set_cap(&self, cap_bytes: usize) {
+        self.cap_bytes.store(cap_bytes, Ordering::Relaxed);
+    }
+
+    /// The parking budget in bytes; `0` while the pool is disabled.
+    #[must_use]
+    pub fn cap_bytes(&self) -> usize {
+        self.cap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// True when a non-zero cap is configured.
     ///
     /// Callers use this to keep hit/miss counters silent while the pool
     /// is off, so the A/B baseline arm reads 0/0 instead of all-miss.
     #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.cap_bytes != 0
+    pub fn enabled(&self) -> bool {
+        self.cap_bytes() != 0
     }
 
     /// Pop a parked box whose padded size matches `logical_len`'s class.
@@ -101,7 +114,7 @@ impl PageBoxPool {
     /// panicked mid-operation; nothing recoverable remains then.
     #[must_use]
     pub fn acquire(&self, logical_len: usize) -> Option<PageBox> {
-        if self.cap_bytes == 0 {
+        if !self.enabled() {
             return None;
         }
         let class = PageBox::padded_len(logical_len) / PAGE_SIZE - 1;
@@ -130,7 +143,8 @@ impl PageBoxPool {
     /// Panics if the pool mutex was poisoned, same as [`Self::acquire`].
     #[must_use]
     pub fn recycle(&self, pb: PageBox) -> Option<PageBox> {
-        if self.cap_bytes == 0 {
+        let cap_bytes = self.cap_bytes();
+        if cap_bytes == 0 {
             return Some(pb);
         }
         let class = pb.len() / PAGE_SIZE - 1;
@@ -138,7 +152,7 @@ impl PageBoxPool {
             return Some(pb);
         }
         let mut inner = self.inner.lock().expect("PageBoxPool mutex poisoned");
-        if inner.bytes + pb.len() > self.cap_bytes {
+        if inner.bytes + pb.len() > cap_bytes {
             return Some(pb);
         }
         inner.bytes += pb.len();
