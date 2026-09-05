@@ -11,6 +11,10 @@ endif
 # with EXDEV and one on a volume that is not APFS cannot clone at all, which is
 # what the two `cp` fallbacks are for, the second of them copying the bytes.
 # Prints nothing on stdout, so `$(shell ...)` can call it.
+#
+# Copying a single file takes `cp -c` instead: one clonefile(2) for the one
+# file, and cp itself falls back to a byte copy when the destination is on
+# another volume or on a volume that cannot clone.
 define clone_tree
 { mkdir -p $$(dirname $(2)) && { python3 -c 'import ctypes, sys; lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib"); lib.clonefile.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32); sys.exit(0 if lib.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) == 0 else 1)' $(1) $(2) 2>/dev/null || { rm -rf $(2); cp -c -R $(1) $(2) 2>/dev/null; } || { rm -rf $(2); cp -R $(1) $(2); }; }; }
 endef
@@ -316,13 +320,13 @@ windows-x86_64:
 # by that name — renaming the bundle afterwards produces one lldb won't find.
 unix-x64:
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_x64) $(FRAME_POINTERS)
-	cp $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
+	cp -c $(OUT_unix_x64)/libmtld3d_unix.dylib $(OUT_unix_x64)/mtld3d.so
 	rm -rf $(OUT_unix_x64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_x64)/mtld3d.so
 
 unix-arm64:
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(UNIX_TARGET_arm64) $(FRAME_POINTERS)
-	cp $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
+	cp -c $(OUT_unix_arm64)/libmtld3d_unix.dylib $(OUT_unix_arm64)/mtld3d.so
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
 
@@ -354,8 +358,8 @@ install-windows-i686: $(if $(STAGE),,windows-i686)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/i386-windows ; \
-		cp $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$tree/i386-windows/ ; \
-		cp $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$tree/i386-windows/ ; \
+		cp -c $(OUT_i386)/mtld3d.dll  $(OUT_i386)/mtld3d.pdb  $$tree/i386-windows/ ; \
+		cp -c $(OUT_i386)/d3d9.dll    $(OUT_i386)/d3d9.pdb    $$tree/i386-windows/ ; \
 		$(WINEBUILD) --builtin $$tree/i386-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -f $$dir/lib/wine/i386-windows/d3d9.pdb $$dir/lib/wine/i386-windows/mtld3d.pdb ; \
@@ -368,8 +372,8 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/x86_64-windows ; \
-		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$tree/x86_64-windows/ ; \
-		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$tree/x86_64-windows/ ; \
+		cp -c $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$tree/x86_64-windows/ ; \
+		cp -c $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$tree/x86_64-windows/ ; \
 		$(WINEBUILD) --builtin $$tree/x86_64-windows/d3d9.dll ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -f $$dir/lib/wine/x86_64-windows/d3d9.pdb $$dir/lib/wine/x86_64-windows/mtld3d.pdb ; \
@@ -387,9 +391,9 @@ install-unix-x64: $(if $(STAGE),,unix-x64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_x64) ; \
-		cp $(OUT_unix_x64)/mtld3d.so        $$tree/$(UNIX_WINEDIR_x64)/ ; \
+		cp -c $(OUT_unix_x64)/mtld3d.so        $$tree/$(UNIX_WINEDIR_x64)/ ; \
 		rm -rf $$tree/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $$tree/$(UNIX_WINEDIR_x64)/ ; \
+		$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$$tree/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM) ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so $$dir/lib/wine/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM ; \
 		fi ; \
@@ -399,9 +403,9 @@ install-unix-arm64: $(if $(STAGE),,unix-arm64)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_arm64) ; \
-		cp $(OUT_unix_arm64)/mtld3d.so      $$tree/$(UNIX_WINEDIR_arm64)/ ; \
+		cp -c $(OUT_unix_arm64)/mtld3d.so      $$tree/$(UNIX_WINEDIR_arm64)/ ; \
 		rm -rf $$tree/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $$tree/$(UNIX_WINEDIR_arm64)/ ; \
+		$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$$tree/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM) ; \
 		if [ $$tree != $$dir/lib/wine ]; then \
 			rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
 		fi ; \
@@ -428,26 +432,26 @@ bundle: all
 	mkdir -p $(BUNDLE_STAGE)/native/x86_64-windows
 	mkdir -p $(BUNDLE_STAGE)/prefix-markers/syswow64
 	mkdir -p $(BUNDLE_STAGE)/prefix-markers/system32
-	cp $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
-	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/wine/i386-windows/
-	cp $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
-	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
+	cp -c $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
+	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/wine/i386-windows/
+	cp -c $(OUT_x64)/mtld3d.dll            $(BUNDLE_STAGE)/wine/x86_64-windows/
+	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	# Markers live outside wine/, and already carry the name they need in the
 	# prefix, so both routes are a plain copy into the matching system dir with
 	# no rename. Keeping them out of wine/ is what stops `cp -R wine/*` from
 	# dragging them onto the builtin search path, where wineboot would stamp a
 	# second, useless marker under the name "mtld3d.fake.dll".
-	cp $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/prefix-markers/syswow64/mtld3d.dll
-	cp $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
+	cp -c $(OUT_i386)/mtld3d.fake.dll      $(BUNDLE_STAGE)/prefix-markers/syswow64/mtld3d.dll
+	cp -c $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
-	cp $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
-	cp $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
-	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
-	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
-	cp $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
-	cp $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
-	cp $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
+	cp -c $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
+	cp -c $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
+	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
+	cp -c $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
+	cp -c $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
+	cp -c $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
+	cp -c $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
 	tar -cJf $(BUNDLE_OUT) -C $(BUNDLE_STAGE) wine native prefix-markers mtld3d.conf INSTALL.md LICENSE
 	# The symbols for exactly these binaries, as a second archive. Laid out by
 	# arch alone, with no wine/native split: debug info has no install route, and
@@ -457,12 +461,12 @@ bundle: all
 	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)
 	mkdir -p $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)
 	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
-	cp $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
-	cp $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
-	cp $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
-	cp $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
-	cp -R $(OUT_unix_x64)/mtld3d.so.dSYM   $(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/
-	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/
+	cp -c $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
+	cp -c $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
+	cp -c $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
+	cp -c $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
+	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
+	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
 	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows \
 		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
 
@@ -477,24 +481,24 @@ stage: all
 	mkdir -p $(STAGE_DIR)/tests/i686 $(STAGE_DIR)/tests/x86_64
 	mkdir -p $(STAGE_DIR)/e2e/x86_64 $(STAGE_DIR)/e2e/arm64
 	mkdir -p $(STAGE_DIR)/conformance/x86_64 $(STAGE_DIR)/conformance/arm64
-	cp $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
+	cp -c $(OUT_i386)/mtld3d.dll $(OUT_i386)/mtld3d.pdb $(OUT_i386)/mtld3d.fake.dll \
 		$(OUT_i386)/d3d9.dll $(OUT_i386)/d3d9.pdb $(STAGE_DIR)/i386-windows/
-	cp $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
+	cp -c $(OUT_x64)/mtld3d.dll $(OUT_x64)/mtld3d.pdb $(OUT_x64)/mtld3d.fake.dll \
 		$(OUT_x64)/d3d9.dll $(OUT_x64)/d3d9.pdb $(STAGE_DIR)/x86_64-windows/
-	cp $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
-	cp -R $(OUT_unix_x64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
-	cp $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
-	cp -R $(OUT_unix_arm64)/mtld3d.so.dSYM $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
-	cp $(call E2E_EXES,$(PE_i386)) $(STAGE_DIR)/tests/i686/
-	cp $(call E2E_EXES,$(PE_x64)) $(STAGE_DIR)/tests/x86_64/
+	cp -c $(OUT_unix_x64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_x64)/
+	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
+	cp -c $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
+	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
+	cp -c $(call E2E_EXES,$(PE_i386)) $(STAGE_DIR)/tests/i686/
+	cp -c $(call E2E_EXES,$(PE_x64)) $(STAGE_DIR)/tests/x86_64/
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_arm64)
-	cp unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/x86_64/
-	cp unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/arm64/
+	cp -c unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/x86_64/
+	cp -c unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/arm64/
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-conformance --target $(UNIX_TARGET_arm64)
-	cp unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/x86_64/
-	cp unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/arm64/
+	cp -c unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/x86_64/
+	cp -c unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)/mtld3d-conformance $(STAGE_DIR)/conformance/arm64/
 	tar -cf $(STAGE_OUT) -C $(STAGE_DIR) .
 
 # E2E test environment overrides (the global exports above target the game):
