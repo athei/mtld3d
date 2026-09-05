@@ -989,6 +989,60 @@ fn reset_same_size_keeps_uploads_queued_before_it() {
     );
 }
 
+/// The state defaults a same-size `Reset` applies reach the encoder.
+///
+/// `Reset` restores the full-target viewport, and the encoder's viewport is
+/// sticky across frames: nothing else re-asserts it, so the ops the
+/// state-default restore queues have to land in a frame that is submitted. A
+/// pre-`Reset` viewport that survives clips the following frame's `Clear` and
+/// draw to the corner it covered.
+#[test]
+fn reset_same_size_restores_the_rasterized_viewport() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    const BLACK: u32 = 0xFF00_0000;
+    const CORNER: u32 = 64;
+
+    let h = Harness::new();
+    // Paint the whole target first, so the centre carries a known colour that
+    // a viewport-clipped clear and draw would leave untouched.
+    h.render_once(BLUE, |_| {});
+    assert_pixel_eq(h.read_pixel(320, 240), BLUE, "full-target clear");
+
+    let corner = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: CORNER,
+        height: CORNER,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&corner), 0, "SetViewport before Reset");
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset must succeed");
+
+    // No `SetViewport` after the Reset: the default the Reset applies is the
+    // only thing that can widen the frame back to the full target.
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING off");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF for the post-Reset draw"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(RED)),
+            0,
+            "post-Reset draw"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        RED,
+        "the Reset's default viewport must reach the encoder",
+    );
+}
+
 #[test]
 fn reset_clears_the_stage_cube_binding_mask() {
     const RED: u32 = 0xFFFF_0000;
