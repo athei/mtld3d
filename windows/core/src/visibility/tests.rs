@@ -10,9 +10,9 @@ use mtld3d_shared::MetalHandle;
 
 use super::{
     MAX_SLOTS, QueryStatus, RetiredVisibilityBuffer, VisibilityBufferPool,
-    VisibilityOffsetAllocator, VisibilityQueryCore, sum_slots,
+    VisibilityOffsetAllocator, VisibilityQueryCore, logical_samples, sum_slots,
 };
-use crate::page_box::PageBox;
+use crate::{page_box::PageBox, render_scale::RenderScale};
 
 fn dummy_buf(seq: u64) -> RetiredVisibilityBuffer {
     // SAFETY: tests; opaque value never dereferenced.
@@ -91,7 +91,7 @@ fn query_core_status_transitions() {
     let core = VisibilityQueryCore::new();
     assert_eq!(core.status(), QueryStatus::NeverIssued);
     assert_eq!(core.seq_end_loaded(), 0);
-    core.begin(10, 3);
+    core.begin(10, 3, RenderScale::IDENTITY);
     assert_eq!(core.status(), QueryStatus::Pending);
     assert_eq!(core.offset_begin(), 3);
     // BEGIN does not record seq_end — END drives the GetData(FLUSH)
@@ -109,12 +109,12 @@ fn query_core_status_transitions() {
 #[test]
 fn query_core_reissue_resets_accumulator() {
     let core = VisibilityQueryCore::new();
-    core.begin(1, 0);
+    core.begin(1, 0, RenderScale::IDENTITY);
     core.end(1, 1);
     core.finalize(100);
     assert_eq!(core.get_u32(), 100);
     // Re-issue with a different span: accumulator must zero out.
-    core.begin(2, 2);
+    core.begin(2, 2, RenderScale::IDENTITY);
     assert_eq!(core.status(), QueryStatus::Pending);
     core.end(2, 3);
     core.finalize(7);
@@ -124,7 +124,7 @@ fn query_core_reissue_resets_accumulator() {
 #[test]
 fn query_core_u32_clamp() {
     let core = VisibilityQueryCore::new();
-    core.begin(0, 0);
+    core.begin(0, 0, RenderScale::IDENTITY);
     core.end(0, 1);
     core.finalize(u64::MAX);
     assert_eq!(core.get_u32(), u32::MAX);
@@ -171,9 +171,9 @@ fn state_intake_completed_respects_seq() {
     let mut state = VisibilityQueryState::new();
     let c1 = VisibilityQueryCore::new();
     let c2 = VisibilityQueryCore::new();
-    c1.begin(5, 0);
+    c1.begin(5, 0, RenderScale::IDENTITY);
     c1.end(5, 1);
-    c2.begin(10, 2);
+    c2.begin(10, 2, RenderScale::IDENTITY);
     c2.end(10, 3);
     state.push_pending(5, c1.clone());
     state.push_pending(10, c2.clone());
@@ -268,4 +268,45 @@ fn scaling_smoke_hundred_queries() {
         u32::try_from(sum).expect("700 * 10 = 7000 fits u32"),
         TOTAL * 10,
     );
+}
+
+#[test]
+fn logical_samples_passes_the_identity_through() {
+    assert_eq!(logical_samples(0, 100), 0);
+    assert_eq!(logical_samples(307_200, 100), 307_200);
+    assert_eq!(logical_samples(u64::MAX, 100), u64::MAX);
+    assert_eq!(
+        logical_samples(42, 0),
+        42,
+        "an unparsed percentage is the identity"
+    );
+}
+
+#[test]
+fn logical_samples_divides_by_the_squared_scale_rounding_to_nearest() {
+    // A 640x480 frame at 50% rasterizes 320x240 samples.
+    assert_eq!(logical_samples(76_800, 50), 307_200);
+    // At 75% a 480x360 frame; 172_800 * 16 / 9.
+    assert_eq!(logical_samples(172_800, 75), 307_200);
+    // One sample at 75% is 1.78 reported pixels, rounded to 2; at 50% it is 4.
+    assert_eq!(logical_samples(1, 75), 2);
+    assert_eq!(logical_samples(1, 50), 4);
+    // 5 samples at 75% are 8.89, rounded to 9.
+    assert_eq!(logical_samples(5, 75), 9);
+}
+
+#[test]
+fn logical_samples_saturates_instead_of_wrapping() {
+    assert_eq!(logical_samples(u64::MAX, 50), u64::MAX);
+}
+
+#[test]
+fn finalize_reports_the_count_in_reported_pixels_of_the_scale_begun_at() {
+    let core = VisibilityQueryCore::new();
+    core.begin(1, 0, RenderScale::from_percent(50));
+    core.end(1, 1);
+    core.finalize(76_800);
+    assert_eq!(core.get_u32(), 307_200);
+    assert_eq!(core.get_u64(), 307_200);
+    assert_eq!(core.status(), QueryStatus::Issued);
 }

@@ -74,6 +74,63 @@ fn occlusion_query_counts_visible_pixels() {
 }
 
 #[test]
+fn occlusion_query_counts_in_reported_pixels_under_the_scale() {
+    // A game reads an occlusion count against the pixels it was told the
+    // back buffer has: a lens flare fades by a disc's area in those pixels, a
+    // threshold is stated in them. Under `render.scale` the rasterizer
+    // produces fewer samples, so the count is scaled back up into the
+    // reported space before the game reads it. A quad covering the whole
+    // frame counts exactly the reported pixel count.
+    //
+    // Pins its own scale (a clean half, so the render extent is exact) rather
+    // than inheriting the run's: at the identity there is nothing to convert,
+    // and this has to fail in the ordinary `make test` if it regresses.
+    let h = Harness::with_config("render.scale=0.5");
+    let (width, height) = h.dims();
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFF00_FF00,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "fullscreen draw"
+    );
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let (hr, count) = q.data_u32(D3DGETDATA_FLUSH);
+    assert_eq!(hr, 0, "GetData(FLUSH)");
+    assert_eq!(
+        count,
+        width * height,
+        "a fullscreen quad counts the reported pixels, not the rasterized samples"
+    );
+}
+
+#[test]
 fn timestamp_query_contract() {
     let h = Harness::new();
     // TIMESTAMP is not backed by a Metal counter here; pin whatever the device

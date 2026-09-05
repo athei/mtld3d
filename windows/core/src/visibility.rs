@@ -18,7 +18,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLBufferKind};
 
-use crate::page_box::PageBox;
+use crate::{page_box::PageBox, render_scale::RenderScale};
 
 /// 1024 u64 slots = 8 KiB.
 ///
@@ -73,6 +73,13 @@ pub struct VisibilityQueryCore {
     ///
     /// Atomic so `GetData` can observe transitions without locking.
     status: AtomicU64,
+    /// `render.scale` of the target the query began against, in percent.
+    ///
+    /// Latched at BEGIN and applied at finalize: Metal counts the samples the
+    /// rasterizer produced, which under a reduced scale are fewer than the
+    /// pixels D3D9 reports, so the count is scaled back up into the reported
+    /// space before the game reads it.
+    scale_percent: AtomicU32,
     /// Set the instant `Issue(D3DISSUE_END)` is recorded (API thread).
     ///
     /// Cleared on `Issue(D3DISSUE_BEGIN)`. Lets the blocking
@@ -93,6 +100,7 @@ impl VisibilityQueryCore {
             accumulated: AtomicU64::new(0),
             status: AtomicU64::new(QueryStatus::NeverIssued as u64),
             end_requested: AtomicBool::new(false),
+            scale_percent: AtomicU32::new(RenderScale::IDENTITY.percent()),
         })
     }
 
@@ -110,9 +118,10 @@ impl VisibilityQueryCore {
     /// Metal encoder will write to. Moves the query from
     /// `NeverIssued`/`Issued` back into `Pending` — a second Issue on the
     /// same wrapper reuses the core.
-    pub fn begin(&self, seq: u64, offset: u32) {
+    pub fn begin(&self, seq: u64, offset: u32, scale: RenderScale) {
         self.seq_begin.store(seq, Ordering::Release);
         self.offset_begin.store(offset, Ordering::Release);
+        self.scale_percent.store(scale.percent(), Ordering::Release);
         // Reset the accumulator in case this core was previously issued
         // and the app is re-issuing.
         self.accumulated.store(0, Ordering::Release);
@@ -205,7 +214,8 @@ impl VisibilityQueryCore {
     /// Used only from `VisibilityQueryState::intake_completed` in this
     /// module.
     fn finalize(&self, summed: u64) {
-        self.accumulated.store(summed, Ordering::Release);
+        let logical = logical_samples(summed, self.scale_percent.load(Ordering::Acquire));
+        self.accumulated.store(logical, Ordering::Release);
         self.status
             .store(QueryStatus::Issued as u64, Ordering::Release);
     }
@@ -219,6 +229,22 @@ impl VisibilityQueryCore {
 ///
 /// Encapsulated inside `VisibilityQueryState` — the encoder reaches it
 /// via `VisibilityQueryState::bump_slot`.
+/// Convert a sample count the rasterizer produced at `scale_percent` into reported pixels.
+///
+/// A target rasterized at `s` percent holds `(s / 100)^2` of the pixels D3D9
+/// reports, so the counter is divided by that, rounded to nearest. The
+/// identity (and a percentage the parser never produces, `0`) passes the
+/// count through; the result saturates at `u64::MAX`.
+#[must_use]
+pub fn logical_samples(render_samples: u64, scale_percent: u32) -> u64 {
+    if scale_percent == 0 || scale_percent == RenderScale::IDENTITY.percent() {
+        return render_samples;
+    }
+    let squared = u128::from(scale_percent) * u128::from(scale_percent);
+    let scaled = (u128::from(render_samples) * 10_000 + squared / 2) / squared;
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
 struct VisibilityOffsetAllocator {
     next: u32,
     exhausted: bool,
