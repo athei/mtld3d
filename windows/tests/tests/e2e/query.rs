@@ -1,26 +1,33 @@
 //! Query objects: the EVENT fence path (issue → get-data signalled).
 
-use mtld3d_tests::{Harness, PosColorVertex, Query};
+use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Query};
 use mtld3d_types::{
-    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPT_TRIANGLELIST,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPT_TRIANGLELIST,
     D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION, D3DQUERYTYPE_TIMESTAMP, D3DRS_LIGHTING,
+    D3DRS_ZENABLE, D3DRS_ZFUNC,
 };
 
-/// A full-frame quad in clip space, one solid colour.
-const FULL_FRAME_QUAD: [PosColorVertex; 6] = [
-    quad_vertex(-1.0, 1.0),
-    quad_vertex(1.0, 1.0),
-    quad_vertex(-1.0, -1.0),
-    quad_vertex(1.0, 1.0),
-    quad_vertex(1.0, -1.0),
-    quad_vertex(-1.0, -1.0),
-];
+/// A full-frame quad in clip space at depth `z`, one solid colour.
+const fn full_frame_quad(z: f32) -> [PosColorVertex; 6] {
+    [
+        quad_vertex(-1.0, 1.0, z),
+        quad_vertex(1.0, 1.0, z),
+        quad_vertex(-1.0, -1.0, z),
+        quad_vertex(1.0, 1.0, z),
+        quad_vertex(1.0, -1.0, z),
+        quad_vertex(-1.0, -1.0, z),
+    ]
+}
 
-const fn quad_vertex(x: f32, y: f32) -> PosColorVertex {
+/// The quad every counting draw that has no depth buffer under it uses.
+const FULL_FRAME_QUAD: [PosColorVertex; 6] = full_frame_quad(0.5);
+
+const fn quad_vertex(x: f32, y: f32, z: f32) -> PosColorVertex {
     PosColorVertex {
         x,
         y,
-        z: 0.5,
+        z,
         color: 0xFF00_FF00,
     }
 }
@@ -41,6 +48,15 @@ fn draw_full_frame(h: &Harness, what: &str) {
     );
 }
 
+/// Draw the full-frame quad at depth `z`, asserting the call succeeded.
+fn draw_full_frame_at(h: &Harness, z: f32, what: &str) {
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full_frame_quad(z)),
+        0,
+        "{what}"
+    );
+}
+
 /// Read a finished occlusion count, asserting `GetData` reported a result.
 fn occlusion_count(q: &Query<'_>, what: &str) -> u32 {
     let (hr, count) = q.data_u32(D3DGETDATA_FLUSH);
@@ -48,12 +64,12 @@ fn occlusion_count(q: &Query<'_>, what: &str) -> u32 {
     count
 }
 
-/// Assert a count is two full frames' worth, within the rounding a scale costs.
-fn assert_two_full_frames(count: u32, dims: (u32, u32), what: &str) {
-    let expected = 2 * dims.0 * dims.1;
+/// Assert a count is `frames` full frames' worth, within the rounding a scale costs.
+fn assert_full_frames(count: u32, frames: u32, dims: (u32, u32), what: &str) {
+    let expected = frames * dims.0 * dims.1;
     assert!(
         count.abs_diff(expected) <= expected / 100,
-        "{what}: expected both draws counted (~{expected} samples), got {count}"
+        "{what}: expected {frames} full frame(s) counted (~{expected} samples), got {count}"
     );
 }
 
@@ -80,48 +96,122 @@ fn event_query_signals() {
 
 #[test]
 fn occlusion_query_counts_visible_pixels() {
-    let h = Harness::new();
+    // The result is the samples the draws inside the span produced, so a quad
+    // covering the frame counts the frame's pixels. `query.flushImmediate` is
+    // pinned false rather than inherited: the immediate answer is a stub that
+    // reports every span fully visible, and a run that turned it on would
+    // satisfy a loose assertion without a single slot being summed.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
     let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
         panic!("OCCLUSION query should be supported");
     };
-
-    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
-    h.select_diffuse_stage(0);
-    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
-    let v = |x: f32, y: f32| PosColorVertex {
-        x,
-        y,
-        z: 0.5,
-        color: 0xFF00_FF00,
-    };
-    let quad = [
-        v(-1.0, 1.0),
-        v(1.0, 1.0),
-        v(-1.0, -1.0),
-        v(1.0, 1.0),
-        v(1.0, -1.0),
-        v(-1.0, -1.0),
-    ];
+    arm_for_counting_draws(&h);
 
     assert!(h.pump(), "WM_QUIT");
     assert_eq!(h.begin_scene(), 0);
     assert_eq!(h.clear_target(0xFF00_0000), 0);
     assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
-    assert_eq!(
-        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
-        0,
-        "visible draw"
-    );
+    draw_full_frame(&h, "visible draw");
     assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);
 
-    let (hr, count) = q.data_u32(D3DGETDATA_FLUSH);
-    assert_eq!(hr, 0, "GetData(FLUSH)");
-    assert!(
-        count > 1000,
-        "fullscreen quad covers many samples, got {count}"
+    assert_full_frames(
+        occlusion_count(&q, "the visible span"),
+        1,
+        dims,
+        "a quad covering the frame",
     );
+}
+
+#[test]
+fn occlusion_query_counts_nothing_for_a_depth_occluded_draw() {
+    // What a title acts on is the *visible* sample count: a draw whose every
+    // sample fails the depth test contributes nothing, which is the whole
+    // reason to issue the query. Two spans in one frame, the near one counting
+    // a full frame, so the far one's zero is the depth test's answer rather
+    // than a counter that never ran or a slot that was never summed.
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "query.flushImmediate=false",
+        ..HarnessConfig::default()
+    });
+    let dims = h.dims();
+    let Some(near) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    let Some(far) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "ZENABLE");
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0, "ZFUNC");
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF00_0000, 1.0, 0),
+        0,
+        "clear colour and depth"
+    );
+    assert_eq!(
+        near.issue(D3DISSUE_BEGIN),
+        0,
+        "Issue(BEGIN) for the near span"
+    );
+    draw_full_frame_at(&h, 0.5, "the near draw");
+    assert_eq!(near.issue(D3DISSUE_END), 0, "Issue(END) for the near span");
+    assert_eq!(
+        far.issue(D3DISSUE_BEGIN),
+        0,
+        "Issue(BEGIN) for the far span"
+    );
+    draw_full_frame_at(&h, 0.9, "the far draw");
+    assert_eq!(far.issue(D3DISSUE_END), 0, "Issue(END) for the far span");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_full_frames(
+        occlusion_count(&near, "the near span"),
+        1,
+        dims,
+        "a draw in front of the cleared depth",
+    );
+    assert_eq!(
+        occlusion_count(&far, "the far span"),
+        0,
+        "a draw every sample of which fails the depth test counts no samples"
+    );
+}
+
+#[test]
+fn occlusion_query_flush_poll_stubs_the_count_under_flush_immediate() {
+    // `query.flushImmediate=true` gives up the count to save the API-thread
+    // time the spec-correct wait costs, and answers a `D3DGETDATA_FLUSH` poll
+    // of a pending query with the permissive `u32::MAX` instead. The poll sits
+    // inside the recording frame, before anything is submitted, so the query
+    // is pending for certain and the stub is the only answer the arm can give.
+    let h = Harness::with_config("query.flushImmediate=true");
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the draw the poll gives up counting");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+
+    assert_eq!(
+        occlusion_count(&q, "the stubbed poll"),
+        u32::MAX,
+        "the immediate answer reports fully visible instead of the count"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
 }
 
 #[test]
@@ -136,46 +226,24 @@ fn occlusion_query_counts_in_reported_pixels_under_the_scale() {
     // Pins its own scale (a clean half, so the render extent is exact) rather
     // than inheriting the run's: at the identity there is nothing to convert,
     // and this has to fail in the ordinary `make test` if it regresses.
-    let h = Harness::with_config("render.scale=0.5");
+    let h = Harness::with_config("render.scale=0.5;query.flushImmediate=false");
     let (width, height) = h.dims();
     let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
         panic!("OCCLUSION query should be supported");
     };
-    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
-    h.select_diffuse_stage(0);
-    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
-    let v = |x: f32, y: f32| PosColorVertex {
-        x,
-        y,
-        z: 0.5,
-        color: 0xFF00_FF00,
-    };
-    let quad = [
-        v(-1.0, 1.0),
-        v(1.0, 1.0),
-        v(-1.0, -1.0),
-        v(1.0, 1.0),
-        v(1.0, -1.0),
-        v(-1.0, -1.0),
-    ];
+    arm_for_counting_draws(&h);
 
     assert!(h.pump(), "WM_QUIT");
     assert_eq!(h.begin_scene(), 0);
     assert_eq!(h.clear_target(0xFF00_0000), 0);
     assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
-    assert_eq!(
-        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
-        0,
-        "fullscreen draw"
-    );
+    draw_full_frame(&h, "fullscreen draw");
     assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);
 
-    let (hr, count) = q.data_u32(D3DGETDATA_FLUSH);
-    assert_eq!(hr, 0, "GetData(FLUSH)");
     assert_eq!(
-        count,
+        occlusion_count(&q, "the scaled span"),
         width * height,
         "a fullscreen quad counts the reported pixels, not the rasterized samples"
     );
@@ -220,10 +288,60 @@ fn occlusion_count_survives_a_pass_split_between_begin_and_end() {
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);
 
-    assert_two_full_frames(
+    assert_full_frames(
         occlusion_count(&q, "the split span"),
+        2,
         dims,
         "a pass split inside the span",
+    );
+}
+
+#[test]
+fn occlusion_count_survives_a_render_target_round_trip_between_begin_and_end() {
+    // A `Clear` is one way into a fresh pass inside a span; a render-target
+    // change is the other, and the one a title takes when it renders a shadow
+    // map or a reflection in the middle of the span it is measuring. Binding
+    // another target ends the pass, and binding the first one back leaves the
+    // next draw to open a pass of its own, which starts with visibility
+    // counting off and has to be armed again.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
+    // At the back buffer's own size, so the round trip changes the attachment
+    // and nothing else: `SetRenderTarget` snaps the viewport to the target it
+    // binds, and a target of another size would put a viewport restore in the
+    // way of what this test is about.
+    let offscreen = h.create_render_target(dims.0, dims.1, D3DFMT_X8R8G8B8);
+    let back = h.back_buffer(0);
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "draw before the round trip");
+    assert_eq!(
+        h.set_render_target(0, &offscreen),
+        0,
+        "bind the offscreen target"
+    );
+    assert_eq!(
+        h.set_render_target(0, &back),
+        0,
+        "bind the back buffer back"
+    );
+    draw_full_frame(&h, "draw after the round trip");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_full_frames(
+        occlusion_count(&q, "the round-trip span"),
+        2,
+        dims,
+        "a render-target round trip inside the span",
     );
 }
 
@@ -262,8 +380,9 @@ fn occlusion_count_survives_a_flush_between_begin_and_end() {
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);
 
-    assert_two_full_frames(
+    assert_full_frames(
         occlusion_count(&open, "the flushed span"),
+        2,
         dims,
         "a submit inside the span",
     );
