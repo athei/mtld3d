@@ -27,11 +27,13 @@
 
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
+use mtld3d_core::api_lock::ApiGuard;
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, Guid};
 
 use crate::device::{
-    device_wrapper_add_ref, device_wrapper_note_reset_blocker, device_wrapper_release,
+    device_api_lock, device_wrapper_add_ref, device_wrapper_note_reset_blocker,
+    device_wrapper_release,
 };
 
 /// COM types whose vtable starts with the `IUnknown` head.
@@ -329,6 +331,22 @@ pub unsafe fn com_get_device<T: ComChild>(this: *mut c_void, device: *mut *mut c
     // SAFETY: non-null (checked) and writable per the ABI.
     unsafe { *device = wrapper };
     D3D_OK
+}
+
+/// Hold the owning device's API lock for a child thunk; see [`device_api_lock`].
+///
+/// Every entry point of every child object binds this as its first
+/// statement, the child-local getters and setters included, so two threads
+/// on one object are serialised the way the device's own entry points are.
+/// A null `this`, or a child with no device (a managed texture between
+/// devices), gets the no-op guard.
+#[inline]
+pub fn com_api_lock<T: ComChild>(this: *mut c_void) -> ApiGuard {
+    // SAFETY: vtable thunk; `this` is `*mut T` per the object's ABI.
+    let Some(obj) = (unsafe { InPtr::<T>::opt(this) }) else {
+        return ApiGuard::NOOP;
+    };
+    device_api_lock(obj.owning_device())
 }
 
 // ── Shader bytecode read-back ──

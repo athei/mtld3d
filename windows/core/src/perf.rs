@@ -372,10 +372,11 @@ impl ApiTimer {
         if !enabled {
             return 0;
         }
-        // SAFETY: the API thread is single-threaded; this transient
-        // `&mut` never overlaps another live borrow — parent timers
-        // touch the perf state only inside their own `start`/`Drop`,
-        // which are strictly nested around this call.
+        // SAFETY: access is exclusive (D3D9 objects are single-threaded, or
+        // serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`);
+        // this transient `&mut` never overlaps another live borrow, since
+        // parent timers touch the perf state only inside their own
+        // `start`/`Drop`, which are strictly nested around this call.
         let perf = unsafe { &mut *perf_ptr };
         let saved = perf.active_child_cycles;
         perf.active_child_cycles = 0;

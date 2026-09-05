@@ -145,6 +145,7 @@ extern "system" fn ps_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DPixelShader9>(this);
     let _timer = ps_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -164,6 +165,7 @@ extern "system" fn ps_query_interface(
 }
 
 extern "system" fn ps_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DPixelShader9>(this);
     let _timer = ps_timer(this);
     // SAFETY: IDirect3DPixelShader9 IUnknown AddRef thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -171,6 +173,7 @@ extern "system" fn ps_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn ps_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DPixelShader9>(this);
     let _timer = ps_timer(this);
     // SAFETY: IDirect3DPixelShader9 IUnknown Release thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -243,6 +246,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DPixelShader9 {
 }
 
 extern "system" fn ps_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DPixelShader9>(this);
     let _timer = ps_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DPixelShader9 per its ABI, and `device` is
     // the caller's out-param.
@@ -254,6 +258,7 @@ extern "system" fn ps_get_function(
     data: *mut c_void,
     size_of_data: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DPixelShader9>(this);
     let _timer = ps_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DPixelShader9 per IDirect3DPixelShader9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DPixelShader9>::opt(this) }) else {

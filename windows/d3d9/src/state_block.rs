@@ -803,6 +803,7 @@ extern "system" fn sb_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -822,6 +823,7 @@ extern "system" fn sb_query_interface(
 }
 
 extern "system" fn sb_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: IDirect3DStateBlock9 IUnknown AddRef thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -829,6 +831,7 @@ extern "system" fn sb_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn sb_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: IDirect3DStateBlock9 IUnknown Release thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -872,6 +875,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DStateBlock9 {
 }
 
 extern "system" fn sb_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DStateBlock9 per its ABI, and `device` is
     // the caller's out-param.
@@ -879,6 +883,7 @@ extern "system" fn sb_get_device(this: *mut c_void, device: *mut *mut c_void) ->
 }
 
 extern "system" fn sb_capture(this: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: IDirect3DStateBlock9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut.
     let mut wrap = unsafe { VtableThis::<Direct3DStateBlock9>::new(this) };
@@ -922,6 +927,7 @@ extern "system" fn sb_capture(this: *mut c_void) -> i32 {
 }
 
 extern "system" fn sb_apply(this: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DStateBlock9>(this);
     let _timer = sb_timer(this);
     // SAFETY: IDirect3DStateBlock9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut.
     let mut wrap = unsafe { VtableThis::<Direct3DStateBlock9>::new(this) };

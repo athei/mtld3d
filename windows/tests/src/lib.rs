@@ -11,6 +11,7 @@ mod ffi;
 mod harness;
 mod pixel;
 mod resource;
+mod shared;
 mod vertex;
 mod vtbl;
 mod win32;
@@ -21,6 +22,7 @@ pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
     SurfaceDc, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
 };
+pub use shared::{SharedDevice, SharedQuery, SharedVertexBuffer};
 pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
     VolumeVertex,

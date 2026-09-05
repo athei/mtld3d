@@ -618,7 +618,9 @@ impl Direct3DSurface9 {
     /// same layout every other host-visible surface store carries.
     pub fn set_lockable_staging(&mut self, backing: PageBox) {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper,
-        // freshly created by `new_color_target` (refcount 1, single-threaded).
+        // freshly created by `new_color_target` (refcount 1); access is
+        // exclusive: D3D9 objects are single-threaded, or serialised by the
+        // device `ApiLock` under `D3DCREATE_MULTITHREADED`.
         unsafe { &mut *self.inner }.system_memory = Some(backing);
     }
 
@@ -710,8 +712,10 @@ impl Direct3DSurface9 {
     /// texture level or a cube face the state is the whole texture's, matching
     /// the way `GetDC` itself gates every sub-resource together.
     pub fn has_open_dc(&self) -> bool {
-        // SAFETY: `self.inner` is this wrapper's live `SurfaceInner`; D3D9
-        // objects are single-threaded, so the exclusive reborrow is sound.
+        // SAFETY: `self.inner` is this wrapper's live `SurfaceInner`; access is
+        // exclusive (D3D9 objects are single-threaded, or serialised by the
+        // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+        // reborrow is sound.
         let state = unsafe { (*self.inner).dc_lock_ptr() };
         // SAFETY: `dc_lock_ptr` returns the live resource-wide state, read-only here.
         unsafe { &*state }.dc_in_use
@@ -928,8 +932,9 @@ impl Direct3DSurface9 {
     /// it does for a level of a `D3DPOOL_DEFAULT` or `D3DPOOL_MANAGED` texture.
     pub fn system_memory_blit_dst(&self) -> Option<SystemMemoryDst> {
         // SAFETY: `self.inner` is the live `SurfaceInner` for this wrapper;
-        // surfaces are single-threaded D3D9 objects, so the transient
-        // exclusive borrow taken to read the buffer pointer is sound.
+        // access is exclusive (D3D9 objects are single-threaded, or serialised
+        // by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
+        // transient exclusive borrow taken to read the buffer pointer is sound.
         let inner = unsafe { &mut *self.inner };
         if !inner.metal_color_handle.is_null() {
             return None;
@@ -1224,8 +1229,10 @@ impl SurfaceInner {
         }
         // SAFETY: `state_owner_texture` is the owning `Direct3DTexture9`, which
         // outlives every shell it hands out (a shell is freed only from inside
-        // the texture's own teardown); D3D9 objects are single-threaded so the
-        // exclusive borrow of its inner state is sound for this call.
+        // the texture's own teardown); access is exclusive (D3D9 objects are
+        // single-threaded, or serialised by the device `ApiLock` under
+        // `D3DCREATE_MULTITHREADED`), so the exclusive borrow of its inner
+        // state is sound for this call.
         let tex = unsafe { &*self.state_owner_texture };
         tex.dc_lock_state_ptr()
     }
@@ -1245,7 +1252,9 @@ impl SurfaceInner {
         // map count untouched.
         if self.cube_face != u32::MAX && !self.state_owner_texture.is_null() {
             // SAFETY: `state_owner_texture` is the owning cube texture, set at
-            // construction and outliving the face; single-threaded access is sound.
+            // construction and outliving the face; access is exclusive: D3D9
+            // objects are single-threaded, or serialised by the device
+            // `ApiLock` under `D3DCREATE_MULTITHREADED`.
             let cube = unsafe { &*self.state_owner_texture };
             if cube
                 .inner()
@@ -1256,7 +1265,9 @@ impl SurfaceInner {
         }
         let shared = self.dc_lock_ptr();
         // SAFETY: `shared` is the live resource-wide state (own field or the
-        // owning cube texture's); single-threaded access makes the deref sound.
+        // owning cube texture's); access is exclusive (D3D9 objects are
+        // single-threaded, or serialised by the device `ApiLock` under
+        // `D3DCREATE_MULTITHREADED`), so the deref is sound.
         let shared = unsafe { &mut *shared };
         if shared.dc_in_use || self.flags.contains(SurfaceFlags::MAPPED) {
             return Err(D3DERR_INVALIDCALL);
@@ -1444,6 +1455,7 @@ extern "system" fn surface_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -1480,6 +1492,7 @@ unsafe fn container_forward_texture(this: *mut c_void) -> *mut Direct3DTexture9 
 }
 
 extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: IDirect3DSurface9 AddRef thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
@@ -1503,6 +1516,7 @@ extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn surface_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: IDirect3DSurface9 Release thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
@@ -1683,8 +1697,10 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
     let inner_ptr = unsafe { (*surf).inner };
     // SAFETY: `inner_ptr` is its valid `SurfaceInner` for the duration of teardown.
     unsafe { (*inner_ptr).implicit_kind = ImplicitKind::None };
-    // SAFETY: the caller guarantees `ptr` is a live device-owned implicit surface
-    // wrapper; D3D9 is single-threaded so nothing else references it at teardown.
+    // SAFETY: the caller guarantees `ptr` is a live device-owned implicit
+    // surface wrapper; access is exclusive (D3D9 objects are single-threaded,
+    // or serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`),
+    // so nothing else references it at teardown.
     unsafe { finalize_surface(surf) };
 }
 
@@ -1712,8 +1728,9 @@ pub unsafe fn finalize_cached_surface(ptr: u64) {
     // SAFETY: `inner_ptr` is its valid `SurfaceInner` for the duration of teardown.
     unsafe { (*inner_ptr).flags.remove(SurfaceFlags::CONTAINER_CACHED) };
     // SAFETY: the caller guarantees `ptr` is a live cached sub-resource wrapper
-    // whose container is finalizing; D3D9 is single-threaded so nothing else
-    // references it.
+    // whose container is finalizing; access is exclusive (D3D9 objects are
+    // single-threaded, or serialised by the device `ApiLock` under
+    // `D3DCREATE_MULTITHREADED`), so nothing else references it.
     unsafe { finalize_surface(surf) };
 }
 
@@ -1736,7 +1753,9 @@ pub unsafe fn set_cached_surface_device(ptr: u64, device_inner: *mut DeviceInner
     }
     // SAFETY: `ptr` is a live cached sub-resource surface wrapper per the contract.
     let inner_ptr = unsafe { (*(ptr as *mut Direct3DSurface9)).inner };
-    // SAFETY: `inner_ptr` is its valid `SurfaceInner`; D3D9 is single-threaded.
+    // SAFETY: `inner_ptr` is its valid `SurfaceInner`; access is exclusive:
+    // D3D9 objects are single-threaded, or serialised by the device `ApiLock`
+    // under `D3DCREATE_MULTITHREADED`.
     unsafe { (*inner_ptr).device_inner = device_inner };
 }
 
@@ -1758,8 +1777,10 @@ impl ComUnknown for Direct3DSurface9 {
         let tex = self.forward_texture();
         if !tex.is_null() {
             // SAFETY: `tex` is the live container texture, kept alive by the
-            // reference this surface already holds on it; D3D9 objects are
-            // single-threaded, so the exclusive borrow is sound for this call.
+            // reference this surface already holds on it; access is exclusive
+            // (D3D9 objects are single-threaded, or serialised by the device
+            // `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+            // borrow is sound for this call.
             unsafe { &mut *tex }.private_refcount_inc();
         }
     }
@@ -1872,6 +1893,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
 // ── IDirect3DResource9 stubs ──
 
 extern "system" fn surface_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetDevice()");
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
@@ -1885,6 +1907,7 @@ extern "system" fn surface_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -1909,6 +1932,7 @@ extern "system" fn surface_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -1924,6 +1948,7 @@ extern "system" fn surface_get_private_data(
 }
 
 extern "system" fn surface_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -1940,6 +1965,7 @@ extern "system" fn surface_free_private_data(this: *mut c_void, guid: *const Gui
 }
 
 extern "system" fn surface_set_priority(this: *mut c_void, _priority: u32) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
@@ -1949,6 +1975,7 @@ extern "system" fn surface_set_priority(this: *mut c_void, _priority: u32) -> u3
 }
 
 extern "system" fn surface_get_priority(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     mtld3d_shared::log_once_info!(
         target: crate::LOG_TARGET,
@@ -1958,6 +1985,7 @@ extern "system" fn surface_get_priority(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn surface_pre_load(this: *mut c_void) {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // See IDirect3DTexture9::PreLoad — Metal has no resident-set hint.
     mtld3d_shared::log_once_info!(
@@ -1967,6 +1995,7 @@ extern "system" fn surface_pre_load(this: *mut c_void) {
 }
 
 extern "system" fn surface_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     trace!(target: LOG_TARGET, "IDirect3DSurface9::GetType()");
     D3DRTYPE_SURFACE
@@ -1996,6 +2025,7 @@ extern "system" fn surface_get_container(
     riid: *const Guid,
     container: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     if container.is_null() {
         return D3DERR_INVALIDCALL;
@@ -2067,6 +2097,7 @@ extern "system" fn surface_get_container(
 }
 
 extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DESC) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::Misc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }) else {
@@ -2123,6 +2154,7 @@ extern "system" fn surface_lock_rect(
     rect: *const c_void,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::LockRect);
     if locked_rect.is_null() {
         return D3DERR_INVALIDCALL;
@@ -2135,8 +2167,9 @@ extern "system" fn surface_lock_rect(
     // `LockRect` while a `GetDC` is held anywhere on the resource (for a
     // texture, on any level or face). The systemmem path additionally tracks the
     // per-sub-resource map flag in `systemmem_lock_rect` via `try_begin_lock`.
-    // SAFETY: `obj.inner` is the live `SurfaceInner`; surfaces are
-    // single-threaded so the transient exclusive borrow is sound.
+    // SAFETY: `obj.inner` is the live `SurfaceInner`; access is exclusive (D3D9
+    // objects are single-threaded, or serialised by the device `ApiLock` under
+    // `D3DCREATE_MULTITHREADED`), so the transient exclusive borrow is sound.
     let inner_mut = unsafe { &mut *obj.inner };
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state.
     if (unsafe { &*inner_mut.dc_lock_ptr() }).dc_in_use {
@@ -2240,6 +2273,7 @@ extern "system" fn surface_lock_rect(
 }
 
 extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::UnlockRect);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }) else {
@@ -2347,8 +2381,9 @@ fn backbuffer_lock_readback(
 ) -> i32 {
     let inner_ptr = obj.inner;
     // SAFETY: `inner_ptr` is the live `SurfaceInner` allocation for this
-    // wrapper; surfaces are single-threaded objects in D3D9 so the
-    // exclusive borrow is sound for the duration of this fn.
+    // wrapper; access is exclusive (D3D9 objects are single-threaded, or
+    // serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so
+    // the exclusive borrow is sound for the duration of this fn.
     let inner = unsafe { &mut *inner_ptr };
 
     // A backbuffer created with D3DPRESENTFLAG_LOCKABLE_BACKBUFFER accepts a
@@ -2585,8 +2620,10 @@ fn systemmem_lock_rect(
     rect: *const c_void,
 ) -> i32 {
     let inner_ptr = obj.inner;
-    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; D3D9
-    // surfaces are single-threaded, so the exclusive borrow is sound.
+    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; access
+    // is exclusive (D3D9 objects are single-threaded, or serialised by the
+    // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+    // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
     if inner.system_memory.is_none() {
         return D3DERR_INVALIDCALL;
@@ -2671,8 +2708,10 @@ fn lockable_rt_lock_rect(
     flags: u32,
 ) -> i32 {
     let inner_ptr = obj.inner;
-    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; D3D9
-    // surfaces are single-threaded, so the exclusive borrow is sound.
+    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; access
+    // is exclusive (D3D9 objects are single-threaded, or serialised by the
+    // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+    // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
     if inner.system_memory.is_none() {
         return D3DERR_INVALIDCALL;
@@ -3055,7 +3094,9 @@ impl SurfaceInner {
             let src_pitch = mtld3d_core::format::linear_row_pitch(width, bpp) as usize;
             // SAFETY: `system_memory` is `Some` (checked above); the `PageBox`
             // pointer stays valid for the surface's lifetime and is only read
-            // through this borrow on the single-threaded API thread.
+            // through this borrow, and access is exclusive: D3D9 objects are
+            // single-threaded, or serialised by the device `ApiLock` under
+            // `D3DCREATE_MULTITHREADED`.
             let bits = self
                 .system_memory
                 .as_ref()
@@ -3181,6 +3222,7 @@ fn pin_dc_texture_level(inner: &SurfaceInner, open: bool) {
 }
 
 extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::GetDc);
     if hdc.is_null() {
         return D3DERR_INVALIDCALL;
@@ -3200,8 +3242,10 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
         return D3DERR_INVALIDCALL;
     }
     let inner_ptr = obj.inner;
-    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; D3D9
-    // surfaces are single-threaded, so the exclusive borrow is sound.
+    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; access
+    // is exclusive (D3D9 objects are single-threaded, or serialised by the
+    // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+    // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
 
     // A failed `GetDC` must leave the caller's out-`HDC` slot untouched, so
@@ -3324,14 +3368,17 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
 }
 
 extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DSurface9>(this);
     let _timer = surf_timer(this, SurfaceSubCategory::ReleaseDc);
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DSurface9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let inner_ptr = obj.inner;
-    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; D3D9
-    // surfaces are single-threaded, so the exclusive borrow is sound.
+    // SAFETY: `inner_ptr` is the live `SurfaceInner` for this wrapper; access
+    // is exclusive (D3D9 objects are single-threaded, or serialised by the
+    // device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the exclusive
+    // borrow is sound.
     let inner = unsafe { &mut *inner_ptr };
 
     // A `ReleaseDC` is valid only while a `GetDC` is outstanding, and only for

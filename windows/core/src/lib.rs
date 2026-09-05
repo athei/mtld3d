@@ -11,6 +11,7 @@
 /// logs to `"mtld3d::perf"`.
 const LOG_TARGET: &str = "mtld3d::d3d9";
 
+pub mod api_lock;
 pub mod app_profile;
 pub mod buffer_backing;
 pub mod buffer_rename;

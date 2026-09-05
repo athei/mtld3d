@@ -110,6 +110,7 @@ extern "system" fn query_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -129,6 +130,7 @@ extern "system" fn query_query_interface(
 }
 
 extern "system" fn query_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: IDirect3DQuery9 IUnknown AddRef thunk; the D3D9 ABI guarantees
     // `this` is the live wrapper for the call.
@@ -136,6 +138,7 @@ extern "system" fn query_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn query_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: IDirect3DQuery9 IUnknown Release thunk; the D3D9 ABI guarantees
     // `this` is the live wrapper for the call.
@@ -176,6 +179,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DQuery9 {
 }
 
 extern "system" fn query_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DQuery9 per its ABI, and `device` is
     // the caller's out-param.
@@ -183,6 +187,7 @@ extern "system" fn query_get_device(this: *mut c_void, device: *mut *mut c_void)
 }
 
 extern "system" fn query_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DQuery9 per IDirect3DQuery9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DQuery9>::opt(this) }) else {
@@ -192,6 +197,7 @@ extern "system" fn query_get_type(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn query_get_data_size(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DQuery9 per IDirect3DQuery9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DQuery9>::opt(this) }) else {
@@ -201,6 +207,7 @@ extern "system" fn query_get_data_size(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     let unknown = flags & !(D3DISSUE_BEGIN | D3DISSUE_END);
     if unknown != 0 {
@@ -284,6 +291,7 @@ extern "system" fn query_get_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DQuery9>(this);
     let _timer = query_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DQuery9 per IDirect3DQuery9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DQuery9>::opt(this) }) else {

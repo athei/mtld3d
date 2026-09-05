@@ -124,6 +124,7 @@ extern "system" fn vd_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexDeclaration9>(this);
     let _timer = vdecl_timer(this);
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
@@ -143,6 +144,7 @@ extern "system" fn vd_query_interface(
 }
 
 extern "system" fn vd_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexDeclaration9>(this);
     let _timer = vdecl_timer(this);
     // SAFETY: IDirect3DVertexDeclaration9 IUnknown AddRef thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -150,6 +152,7 @@ extern "system" fn vd_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn vd_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexDeclaration9>(this);
     let _timer = vdecl_timer(this);
     // SAFETY: IDirect3DVertexDeclaration9 IUnknown Release thunk; the D3D9 ABI
     // guarantees `this` is the live wrapper for the call.
@@ -221,6 +224,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DVertexDeclaration9 {
 }
 
 extern "system" fn vd_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexDeclaration9>(this);
     let _timer = vdecl_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexDeclaration9 per its
     // ABI, and `device` is the caller's out-param.
@@ -232,6 +236,7 @@ extern "system" fn vd_get_declaration(
     out_elements: *mut D3DVERTEXELEMENT9,
     num_elements: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DVertexDeclaration9>(this);
     let _timer = vdecl_timer(this);
     if num_elements.is_null() {
         return D3DERR_INVALIDCALL;

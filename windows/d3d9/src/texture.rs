@@ -1397,8 +1397,9 @@ impl TextureInner {
         let src_bytes =
             unsafe { std::slice::from_raw_parts(src_box.as_ptr(), src_box.logical_len()) };
         // SAFETY: `dst_box` is this level's whole staging allocation, disjoint
-        // from the source's as above; D3D9 objects are single-threaded, so this
-        // call has exclusive access to it.
+        // from the source's as above, and access is exclusive: D3D9 objects are
+        // single-threaded, or serialised by the device `ApiLock` under
+        // `D3DCREATE_MULTITHREADED`.
         let dst_bytes = unsafe {
             std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
         };
@@ -1495,8 +1496,9 @@ impl TextureInner {
         let src_bytes =
             unsafe { std::slice::from_raw_parts(src_box.as_ptr(), src_box.logical_len()) };
         // SAFETY: `dst_box` is this face's whole staging allocation, disjoint
-        // from the source's as above; D3D9 objects are single-threaded, so this
-        // call has exclusive access to it.
+        // from the source's as above, and access is exclusive: D3D9 objects are
+        // single-threaded, or serialised by the device `ApiLock` under
+        // `D3DCREATE_MULTITHREADED`.
         let dst_bytes = unsafe {
             std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
         };
@@ -1777,8 +1779,9 @@ impl TextureInner {
             depth: 1,
         };
         // SAFETY: `dst_box` is this level's whole staging allocation, distinct
-        // from the caller-owned source bytes; D3D9 objects are single-threaded,
-        // so this call has exclusive access to it.
+        // from the caller-owned source bytes, and access is exclusive: D3D9
+        // objects are single-threaded, or serialised by the device `ApiLock`
+        // under `D3DCREATE_MULTITHREADED`.
         let dst_bytes = unsafe {
             std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
         };
@@ -1833,8 +1836,9 @@ impl TextureInner {
             depth: 1,
         };
         // SAFETY: `dst_box` is this face's whole staging allocation, distinct
-        // from the caller-owned source bytes; D3D9 objects are single-threaded,
-        // so this call has exclusive access to it.
+        // from the caller-owned source bytes, and access is exclusive: D3D9
+        // objects are single-threaded, or serialised by the device `ApiLock`
+        // under `D3DCREATE_MULTITHREADED`.
         let dst_bytes = unsafe {
             std::slice::from_raw_parts_mut(dst_box.as_ptr().cast_mut(), dst_box.logical_len())
         };
@@ -1885,9 +1889,10 @@ impl TextureInner {
             // SAFETY: `row_off + run <= logical` (checked), so `row_off` is
             // within the allocation.
             let row_ptr = unsafe { base.add(row_off) };
-            // SAFETY: `row_ptr..row_ptr+run` is in-bounds (above); D3D9 objects
-            // are single-threaded, so the write has exclusive access and no
-            // other slice aliases this run.
+            // SAFETY: `row_ptr..row_ptr+run` is in-bounds (above), no other
+            // slice aliases this run, and access is exclusive: D3D9 objects are
+            // single-threaded, or serialised by the device `ApiLock` under
+            // `D3DCREATE_MULTITHREADED`.
             let dst = unsafe { core::slice::from_raw_parts_mut(row_ptr, run) };
             mtld3d_core::convert::splat_pixel_pattern(dst, pixel);
         }
@@ -2952,13 +2957,16 @@ impl Direct3DTexture9 {
     /// Raw pointer to the per-resource `LockRect`/`GetDC` state its sub-surfaces share.
     ///
     /// Called through a raw `*mut Direct3DTexture9` from a level or face
-    /// surface, so it takes `&self` and points into the inner allocation: D3D9
-    /// objects are single-threaded, so no two sub-resources touch it
-    /// concurrently. A raw pointer (not `&mut`) so the caller can hold it
-    /// alongside an unrelated borrow of the sub-surface.
+    /// surface, so it takes `&self` and points into the inner allocation;
+    /// access is exclusive (D3D9 objects are single-threaded, or serialised by
+    /// the device `ApiLock` under `D3DCREATE_MULTITHREADED`), so no two
+    /// sub-resources touch it concurrently. A raw pointer (not `&mut`) so the
+    /// caller can hold it alongside an unrelated borrow of the sub-surface.
     pub fn dc_lock_state_ptr(&self) -> *mut DcLockState {
         // SAFETY: `self.inner` is the live `Box::into_raw(TextureInner)` from
-        // `Self::new`; single-threaded access makes the exclusive reborrow sound.
+        // `Self::new`; access is exclusive (D3D9 objects are single-threaded,
+        // or serialised by the device `ApiLock` under
+        // `D3DCREATE_MULTITHREADED`), so the exclusive reborrow is sound.
         let inner = unsafe { &mut *self.inner };
         &raw mut inner.dc_lock
     }
@@ -3045,6 +3053,7 @@ extern "system" fn texture_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // The leaf interface follows the wrapper's kind; the 2D, cube and volume
     // textures share this vtable slot.
@@ -3079,6 +3088,7 @@ extern "system" fn texture_query_interface(
 // `{ vtbl, refcount, private_refcount, inner: *mut TextureInner }` layout, so
 // the engine treats either as `Direct3DTexture9` for refcount purposes.
 extern "system" fn texture_add_ref(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: IDirect3DTexture9/IDirect3DVolumeTexture9 IUnknown AddRef thunk;
     // the D3D9 ABI guarantees `this` is the live wrapper for the call.
@@ -3086,6 +3096,7 @@ extern "system" fn texture_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn texture_release(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: IDirect3DTexture9/IDirect3DVolumeTexture9 IUnknown Release thunk;
     // the D3D9 ABI guarantees `this` is the live wrapper for the call.
@@ -3238,6 +3249,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
 // ── IDirect3DResource9 ──
 
 extern "system" fn texture_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: IDirect3DTexture9 / IDirect3DVolumeTexture9 / IDirect3DCubeTexture9
     // GetDevice thunk: all three vtables share it, and their wrappers share a
@@ -3253,6 +3265,7 @@ extern "system" fn texture_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -3274,6 +3287,7 @@ extern "system" fn texture_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -3288,6 +3302,7 @@ extern "system" fn texture_get_private_data(
 }
 
 extern "system" fn texture_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per IDirect3DResource9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
@@ -3305,6 +3320,7 @@ extern "system" fn texture_free_private_data(this: *mut c_void, guid: *const Gui
 // Metal has no eviction-order hint, so the value is stored and round-tripped
 // but never acted upon.
 extern "system" fn texture_set_priority(this: *mut c_void, priority: u32) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
@@ -3318,6 +3334,7 @@ extern "system" fn texture_set_priority(this: *mut c_void, priority: u32) -> u32
 }
 
 extern "system" fn texture_get_priority(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
@@ -3327,6 +3344,7 @@ extern "system" fn texture_get_priority(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn texture_pre_load(this: *mut c_void) {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // PreLoad is a hint to bring a managed texture into VRAM. Metal
     // has no equivalent (textures live in unified memory, the driver
@@ -3340,6 +3358,7 @@ extern "system" fn texture_pre_load(this: *mut c_void) {
 }
 
 extern "system" fn texture_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     D3DRTYPE_TEXTURE
 }
@@ -3347,6 +3366,7 @@ extern "system" fn texture_get_type(this: *mut c_void) -> u32 {
 // ── IDirect3DBaseTexture9 ──
 
 extern "system" fn texture_set_lod(this: *mut c_void, lod: u32) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per the ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
@@ -3365,6 +3385,7 @@ extern "system" fn texture_set_lod(this: *mut c_void, lod: u32) -> u32 {
 }
 
 extern "system" fn texture_get_lod(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per the ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
@@ -3374,6 +3395,7 @@ extern "system" fn texture_get_lod(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn texture_get_level_count(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
@@ -3388,6 +3410,7 @@ extern "system" fn texture_get_level_count(this: *mut c_void) -> u32 {
 // log once-by-value when Set asks for something other than LINEAR so
 // "this game wanted point-filtered mipgen" is visible without spam.
 extern "system" fn texture_set_auto_gen_filter_type(this: *mut c_void, filter_type: u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // D3DTEXF_NONE is not a valid autogen filter (the chain must be generated
     // with *some* filter). Metal's generateMipmaps is fixed-linear, so any
@@ -3409,6 +3432,7 @@ extern "system" fn texture_set_auto_gen_filter_type(this: *mut c_void, filter_ty
 }
 
 extern "system" fn texture_get_auto_gen_filter_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
@@ -3422,6 +3446,7 @@ extern "system" fn texture_get_auto_gen_filter_type(this: *mut c_void) -> u32 {
 // For a non-AUTOGENMIPMAP texture the D3D9 spec leaves it undefined —
 // log once and do nothing.
 extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
@@ -3454,6 +3479,7 @@ extern "system" fn texture_get_level_desc(
     level: u32,
     desc: *mut D3DSURFACE_DESC,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }) else {
@@ -3485,6 +3511,7 @@ extern "system" fn texture_get_surface_level(
     level: u32,
     surface: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
@@ -3646,6 +3673,7 @@ extern "system" fn texture_lock_rect(
     rect: *const c_void,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     // SAFETY: vtable `this` is the live cube wrapper for this call.
@@ -3757,6 +3785,7 @@ extern "system" fn texture_lock_rect(
 }
 
 extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     let level_u8 = u8::try_from(level).expect("D3D9 mip level ≤ 14");
     mtld3d_shared::crumb!("api:tex_ulock", u64::from(level_u8));
@@ -3836,6 +3865,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
 }
 
 extern "system" fn texture_add_dirty_rect(this: *mut c_void, rect: *const c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per the ABI. InPtrMut
     // so we can union the rect into the source dirty region.
@@ -4249,10 +4279,11 @@ pub fn promote_to_gpu(ti: &mut TextureInner) -> bool {
 ///
 /// Called at bind time from `device.rs::snapshot_stage_bindings` (every Draw)
 /// and `device.rs::device_stretch_rect` (`StretchRect` texture-source).
-/// D3D9 is single-threaded per device, so the `&mut TextureInner` and
-/// `&mut DeviceInner` here are sound — we hold them only for the
-/// duration of this call. The `dev` parameter avoids lifting a second
-/// `&mut DeviceInner` from `ti.device_inner` (which would alias the
+/// Access is exclusive (D3D9 objects are single-threaded, or serialised by the
+/// device `ApiLock` under `D3DCREATE_MULTITHREADED`), so the
+/// `&mut TextureInner` and `&mut DeviceInner` here are sound: both are held
+/// only for the duration of this call. The `dev` parameter avoids lifting a
+/// second `&mut DeviceInner` from `ti.device_inner` (which would alias the
 /// caller's already-held `dev` borrow).
 #[inline]
 pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
@@ -4404,11 +4435,13 @@ impl Direct3DVolumeTexture9 {
     }
 }
 
-const extern "system" fn volume_get_type(_this: *mut c_void) -> u32 {
+extern "system" fn volume_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     D3DRTYPE_VOLUMETEXTURE
 }
 
 extern "system" fn volume_get_level_desc(this: *mut c_void, level: u32, desc: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -4441,6 +4474,7 @@ extern "system" fn volume_get_volume_level(
     level: u32,
     volume: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if volume.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -4483,6 +4517,7 @@ extern "system" fn volume_lock_box(
     box_ptr: *const c_void,
     _flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if locked_box.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -4589,6 +4624,7 @@ extern "system" fn volume_lock_box(
 }
 
 extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -4635,6 +4671,7 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
 }
 
 extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     // SAFETY: vtable thunk; volume layout matches `Direct3DTexture9`.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -4731,11 +4768,23 @@ impl Direct3DVolume9 {
     }
 }
 
+/// Hold the API lock of the device that owns a volume shell's parent texture.
+///
+/// The shell has no device of its own; its parent volume texture does, and a
+/// sub-resource and its container cannot come from different devices.
+fn volume9_api_lock(this: *mut c_void) -> mtld3d_core::api_lock::ApiGuard {
+    // SAFETY: vtable thunk; `this` is *mut Direct3DVolume9 per IDirect3DVolume9 ABI.
+    let parent = (unsafe { InPtr::<Direct3DVolume9>::opt(this) })
+        .map_or(core::ptr::null_mut(), |v| v.parent_texture);
+    crate::com_ref::com_api_lock::<Direct3DTexture9>(parent)
+}
+
 extern "system" fn volume9_query_interface(
     this: *mut c_void,
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    let _api = volume9_api_lock(this);
     // A volume is an `IUnknown` and an `IDirect3DVolume9`, nothing else: it is
     // not a resource (the parent texture is).
     // SAFETY: `riid` is the caller's read-only GUID pointer.
@@ -4752,6 +4801,7 @@ extern "system" fn volume9_query_interface(
 }
 
 extern "system" fn volume9_add_ref(this: *mut c_void) -> u32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: IDirect3DVolume9 AddRef thunk; `this` is the live wrapper.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
         return 0;
@@ -4762,6 +4812,7 @@ extern "system" fn volume9_add_ref(this: *mut c_void) -> u32 {
 }
 
 extern "system" fn volume9_release(this: *mut c_void) -> u32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: IDirect3DVolume9 Release thunk; `this` is the live wrapper.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DVolume9>::opt(this) }) else {
         return 0;
@@ -4803,6 +4854,7 @@ unsafe fn finalize_cached_volume(ptr: u64) {
 }
 
 extern "system" fn volume9_get_device(this: *mut c_void, device: *mut *mut c_void) -> i32 {
+    let _api = volume9_api_lock(this);
     // The shell holds no device of its own, but it does hold the volume
     // texture that owns it, and that is the same device: a sub-resource and
     // its container cannot come from different ones.
@@ -4842,6 +4894,7 @@ extern "system" fn volume9_set_private_data(
     size: u32,
     flags: u32,
 ) -> i32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -4860,6 +4913,7 @@ extern "system" fn volume9_get_private_data(
     data: *mut c_void,
     size: *mut u32,
 ) -> i32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -4873,6 +4927,7 @@ extern "system" fn volume9_get_private_data(
 }
 
 extern "system" fn volume9_free_private_data(this: *mut c_void, guid: *const Guid) -> i32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: vtable in-param; `guid` is *const Guid per the D3D9 ABI.
     let Some(guid) = (unsafe { InPtr::<Guid>::opt(guid.cast()) }) else {
         return D3DERR_INVALIDCALL;
@@ -4889,6 +4944,7 @@ extern "system" fn volume9_get_container(
     riid: *const Guid,
     container: *mut *mut c_void,
 ) -> i32 {
+    let _api = volume9_api_lock(this);
     if container.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -4923,6 +4979,7 @@ extern "system" fn volume9_get_container(
 }
 
 extern "system" fn volume9_get_desc(this: *mut c_void, desc: *mut D3DVOLUME_DESC) -> i32 {
+    let _api = volume9_api_lock(this);
     if desc.is_null() {
         return D3DERR_INVALIDCALL;
     }
@@ -4953,6 +5010,7 @@ extern "system" fn volume9_lock_box(
     box_ptr: *const c_void,
     flags: u32,
 ) -> i32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: IDirect3DVolume9 LockBox thunk; `this` is the live wrapper.
     let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -4964,6 +5022,7 @@ extern "system" fn volume9_lock_box(
 }
 
 extern "system" fn volume9_unlock_box(this: *mut c_void) -> i32 {
+    let _api = volume9_api_lock(this);
     // SAFETY: IDirect3DVolume9 UnlockBox thunk; `this` is the live wrapper.
     let Some(obj) = (unsafe { InPtr::<Direct3DVolume9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -5024,7 +5083,8 @@ impl Direct3DCubeTexture9 {
     }
 }
 
-const extern "system" fn cube_get_type(_this: *mut c_void) -> u32 {
+extern "system" fn cube_get_type(this: *mut c_void) -> u32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     D3DRTYPE_CUBETEXTURE
 }
 
@@ -5032,6 +5092,7 @@ const extern "system" fn cube_get_type(_this: *mut c_void) -> u32 {
 // cube sidecar. The wrapper is layout-identical to `Direct3DTexture9`, so the
 // delegated texture thunks and their casts are sound.
 extern "system" fn cube_get_level_desc(this: *mut c_void, level: u32, desc: *mut c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     // A cube level is a surface, so the delegated `D3DSURFACE_DESC.Type` of
     // `D3DRTYPE_SURFACE` is already correct — no per-level override.
     texture_get_level_desc(this, level, desc.cast::<D3DSURFACE_DESC>())
@@ -5043,6 +5104,7 @@ extern "system" fn cube_get_cube_map_surface(
     level: u32,
     surface: *mut *mut c_void,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     if face >= CUBE_FACE_COUNT || surface.is_null() {
         null_out(surface);
@@ -5100,6 +5162,7 @@ pub extern "system" fn cube_lock_rect(
     rect: *const c_void,
     flags: u32,
 ) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
     if face >= CUBE_FACE_COUNT || locked_rect.is_null() {
         return D3DERR_INVALIDCALL;
@@ -5163,6 +5226,7 @@ pub extern "system" fn cube_lock_rect(
 
 /// Unlock one cube face subresource.
 pub extern "system" fn cube_unlock_rect(this: *mut c_void, face: u32, level: u32) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if face >= CUBE_FACE_COUNT {
         return D3DERR_INVALIDCALL;
     }
@@ -5201,6 +5265,7 @@ pub extern "system" fn cube_unlock_rect(this: *mut c_void, face: u32, level: u32
 }
 
 extern "system" fn cube_add_dirty_rect(this: *mut c_void, face: u32, rect: *const c_void) -> i32 {
+    let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if face >= CUBE_FACE_COUNT {
         return D3DERR_INVALIDCALL;
     }

@@ -1443,6 +1443,12 @@ impl Query<'_> {
         (hr, out)
     }
 
+    /// The raw `IDirect3DQuery9*`.
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
     fn vtbl(&self) -> &'static IDirect3DQuery9Vtbl {
         // SAFETY: `self.ptr` is a live query for the wrapper's lifetime.
         unsafe { deref_vtbl::<IDirect3DQuery9Vtbl>(self.ptr) }

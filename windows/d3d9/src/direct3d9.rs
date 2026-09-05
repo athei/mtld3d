@@ -1684,6 +1684,12 @@ extern "system" fn d3d9_create_device(
     pp_in.back_buffer_format = pp.back_buffer_format;
     // SAFETY: vtable out-param; `device` is *mut *mut c_void per IDirect3D9 ABI.
     unsafe { OutPtr::write_opt(device, dev_ptr.cast::<c_void>()) };
+    if behavior_flags & mtld3d_types::D3DCREATE_MULTITHREADED != 0 {
+        info!(
+            target: LOG_TARGET,
+            "CreateDevice: D3DCREATE_MULTITHREADED, device entry points serialised"
+        );
+    }
     info!(target: LOG_TARGET, "CreateDevice succeeded");
     D3D_OK
 }

@@ -36,6 +36,24 @@ unix/unix/src/metal/upscale.rs'
 
 INLINE_ALWAYS_SITES='unix/shared/src/crumb.rs'
 
+# The COM entry points that hold the device's API lock: every
+# `extern "system" fn` defined in these files opens with `let _api =`. The
+# cursor window procedure is the one exception, by name: it runs on the window
+# thread, which a thunk holding the lock sends synchronous messages to.
+API_LOCK_FILES='windows/d3d9/src/device.rs
+windows/d3d9/src/cursor.rs
+windows/d3d9/src/texture.rs
+windows/d3d9/src/surface.rs
+windows/d3d9/src/vertex_buffer.rs
+windows/d3d9/src/index_buffer.rs
+windows/d3d9/src/swapchain.rs
+windows/d3d9/src/query.rs
+windows/d3d9/src/state_block.rs
+windows/d3d9/src/vertex_decl.rs
+windows/d3d9/src/vertex_shader.rs
+windows/d3d9/src/pixel_shader.rs'
+API_LOCK_EXEMPT='cursor_wnd_proc'
+
 status=0
 
 # Report a finding and name the section of docs/CONVENTIONS.md it comes from,
@@ -128,6 +146,34 @@ coverage_matrix() {
             printf '%s: row names `%s`, which is not a file in %s/\n' \
                 "$COVERAGE" "$row" "$COVERAGE_TESTS"
     done
+}
+
+# The first statement of every `extern "system" fn` in the device and child
+# files is `let _api = ...;`, the guard on the device's API lock. Items (`use`,
+# `const`) and comments may come first, a statement may not, so a thunk added
+# later cannot run outside the lock without failing here. `pub` and `const`
+# headers count; a header may span several lines and ends at its `{`.
+api_lock_first() {
+    awk -v exempt="$API_LOCK_EXEMPT" '
+        FNR == 1 { state = 0 }
+        state == 0 && /^(pub )?(const )?extern "system" fn / {
+            name = $0
+            sub(/^.*extern "system" fn /, "", name)
+            sub(/\(.*/, "", name)
+            hdr = FNR
+            state = (name == exempt) ? 0 : 1
+        }
+        state == 1 {
+            if ($0 ~ /\{[ \t]*$/) state = 2
+            next
+        }
+        state == 2 {
+            if ($0 ~ /^[ \t]*$/ || $0 ~ /^[ \t]*\/\// || $0 ~ /^[ \t]*(use|const) /) next
+            if ($0 !~ /^    let _api = /)
+                printf "%s:%d: %s does not open with `let _api = ...;`\n", FILENAME, hdr, name
+            state = 0
+        }
+    ' "$@"
 }
 
 # Every type deriving Clone and/or Copy, as `path Type Derives`. The committed
@@ -229,6 +275,12 @@ case "${1:-}" in
         "inline test module: declare it as 'mod tests;' and move the body to $(dirname "$file")/$(basename "$file" .rs)/tests.rs" \
         "$findings"
 
+    if printf '%s\n' "$API_LOCK_FILES" | grep -qxF "$file"; then
+        findings=$(api_lock_first "$file")
+        [ -z "$findings" ] || report 'Every device entry point holds the API lock' \
+            'entry point outside the device API lock' "$findings"
+    fi
+
     banned 'pub\(crate\)' 'No pub(crate) — use module hierarchy' \
         'pub(crate) visibility' "$file"
     banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
@@ -269,6 +321,14 @@ findings=$(inline_tests "$@")
 if [ -n "$findings" ]; then
     report 'Unit tests live in <stem>/tests.rs' \
         "inline test module: declare it as 'mod tests;' and move the body to <stem>/tests.rs" \
+        "$findings"
+fi
+
+# shellcheck disable=SC2086
+findings=$(api_lock_first $API_LOCK_FILES)
+if [ -n "$findings" ]; then
+    report 'Every device entry point holds the API lock' \
+        'entry point outside the device API lock: `let _api = ...;` must be its first statement' \
         "$findings"
 fi
 
