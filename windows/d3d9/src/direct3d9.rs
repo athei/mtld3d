@@ -258,6 +258,14 @@ pub struct Direct3D9Inner {
     config: Arc<Mtld3dConfig>,
 }
 
+impl Drop for Direct3D9Inner {
+    fn drop(&mut self) {
+        // The last interface retires the logging thread and waits for it, so
+        // a `FreeLibrary` that follows this `Release` finds no thread of ours.
+        crate::log_sink::release();
+    }
+}
+
 impl Direct3D9 {
     pub fn new(config: Arc<Mtld3dConfig>) -> Self {
         Self {

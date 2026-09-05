@@ -152,7 +152,8 @@ pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
     log_sink::open(&cfg);
     // The first entry point outside `DllMain`: the logging thread can start
     // here (DllMain runs under the loader lock and must not spawn threads).
-    log_sink::start();
+    // It runs until the last interface is released, holding this image.
+    log_sink::acquire();
     // The page-box pool is one per process; the interface resolved most
     // recently sizes it.
     page_box_pool::PAGEBOX_POOL

@@ -52,7 +52,7 @@ const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xC000_0409;
 const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
