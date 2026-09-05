@@ -49,6 +49,7 @@ const _: () = {
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
+    assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
     assert!(core::mem::size_of::<PassDescriptor>() == 216);
 };
 
@@ -207,11 +208,13 @@ pub struct AttachMetalLayerParams {
     /// `backing_scale` above answers for the layer as attach found it. The
     /// unix side stores a new value here whenever its display-follow
     /// reconciliation derives one, so the PE-side cursor upscale picks it up
-    /// without a second thunk. Backed by a static in the PE image rather than
-    /// a device-owned allocation: the reconciliation runs on the `AppKit`
-    /// main thread, outside any thunk, so it cannot be ordered against a
-    /// device teardown. `0` disables the republish.
-    pub backing_scale_ptr: u64, // in: *const AtomicU32 (PE static, process lifetime)
+    /// without a second thunk. The word lives in a heap box the device owns
+    /// and keeps at one address for its lifetime; the unix side records the
+    /// address on the attachment record it creates for this view and writes
+    /// through it only while that record is registered, and
+    /// `DestroyCommandQueue` unregisters the record before the box is
+    /// dropped. `0` disables the republish.
+    pub backing_scale_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
     /// `cursor.software` from `mtld3d.conf`.
     ///
     /// Resolved on the unix side against the layer mode attach picked, since
@@ -232,8 +235,10 @@ pub struct AttachMetalLayerParams {
     /// process's cursor on screen. Wine re-applies its cursor only on a handle
     /// change, so the PE side answers a set flag with its null-then-set kick
     /// at the next `WM_SETCURSOR` or `ShowCursor(TRUE)`, taking the flag back
-    /// to zero. Same backing contract as `backing_scale_ptr`. `0` disables it.
-    pub cursor_kick_ptr: u64, // in: *const AtomicU32 (PE static, process lifetime)
+    /// to zero. Every live device's word is set, since the kick is idempotent
+    /// and the pointer's return concerns each of them. Same backing contract
+    /// as `backing_scale_ptr`. `0` disables it.
+    pub cursor_kick_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
 }
 
 impl Thunk for AttachMetalLayerParams {
@@ -264,20 +269,34 @@ pub struct SetCursorOverlayParams {
     pub scale: u32,                // in: sprite pixels per point, 1..=8
     pub flags: CursorOverlayFlags, // in
     pub pad0: u32,
+    /// The metal view of the device that speaks: its `AttachMetalLayer` `view_handle`.
+    ///
+    /// Names the attachment record whose window the overlay is drawn over
+    /// and whose layer mode, colorspace, headroom and backing scale the
+    /// sprite is rendered for. The overlay follows the device whose call
+    /// arrived most recently, since `SetCursorProperties` and `ShowCursor`
+    /// are per-device calls. A view no attachment record names is rejected.
+    pub view_handle: MetalHandle<NSViewKind>, // in
 }
 
 impl Thunk for SetCursorOverlayParams {
     const CODE: u32 = Thunks::SetCursorOverlay as u32;
 }
 
-/// Update `CAMetalLayer.displaySyncEnabled` on an already-attached layer.
+/// Re-derive the present throttle of an already-attached layer.
 ///
 /// Used by the D3D9 Reset path to honour a runtime change of
-/// `D3DPRESENT_PARAMETERS::PresentationInterval`.
+/// `D3DPRESENT_PARAMETERS::PresentationInterval`. The layer's own
+/// `displaySyncEnabled` stays off; what moves is the minimum present
+/// duration on the layer's attachment record.
 #[repr(C, align(8))]
 pub struct SetDisplaySyncEnabledParams {
+    /// The layer whose attachment record takes the new pacing.
+    ///
+    /// Looked up by layer address, so a device that never attached one is
+    /// answered with a warning and no change.
     pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
-    pub display_sync_enabled: u32,                   // in: 0 = off, !=0 = on
+    pub display_sync_enabled: u32, // in: 0 = off, !=0 = on
     /// `present.maxFps` from `mtld3d.conf`: frame-rate ceiling in Hz, `0` = uncapped.
     ///
     /// Re-sent on every Reset so the throttle recomputation keeps
@@ -888,14 +907,13 @@ pub struct SubmitFrameParams {
     /// arrival. Measured by `perf::NanosSetTimer`; the PE side converts it into
     /// its own cycles with `tsc::ns_to_cycles` before folding it into perf.
     pub drawable_wait_ns: u64, // out
-    /// `NSView*` the layer was attached to.
+    /// `NSView*` the layer was attached to: the key of the attachment record.
     ///
-    /// `submit_frame` walks `view → window → screen` each present to read
-    /// the screen's *dynamic*
-    /// `maximumExtendedDynamicRangeColorComponentValue` (the BT.2446 target
-    /// peak each frame). NULL if no layer was attached (no present this
-    /// frame). Used only on the HDR branch, gated unix-side by
-    /// `HDR_BOOTSTRAP_PEAK_BITS > 1.0`.
+    /// `submit_frame` looks the record up by it each present and reads the
+    /// display state the record holds for this device's window (occlusion,
+    /// the live EDR headroom, the present throttle, the present-geometry
+    /// streak). NULL when no layer was attached, which is also when
+    /// `present_layer` is NULL and nothing is presented.
     pub present_view: MetalHandle<NSViewKind>, // in
 }
 

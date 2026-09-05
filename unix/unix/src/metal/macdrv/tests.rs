@@ -22,23 +22,14 @@
 //! marked installed, which is what keeps a process whose first `CreateDevice`
 //! beats Wine's application delegate from running unfiltered for its lifetime.
 //!
-//! `detach_metal_layer` is the other half of that path: the reconciliation
-//! runs from process-lifetime observers, so what stops it walking a released
-//! view, or re-deriving against a display nothing is bound to, is that
-//! teardown leaves nothing bound. One test covers it, because the record and
-//! the derived state it clears are process-wide.
-
-use core::sync::atomic::Ordering;
-
-use mtld3d_shared::{MetalHandle, mtl_handle::NSViewKind};
+//! The other half of that path, what a device's teardown retires and what
+//! it leaves alone for the devices still attached, is the attachment
+//! registry's, and lives in `attachment/tests.rs`.
 
 use super::{
-    BACKING_SCALE_SINK_PTR, CURRENT_BACKING_SCALE, CURRENT_HEADROOM_BITS, HDR_ACTIVE,
-    LAST_LOGGED_HEADROOM_BITS, LayerMode, PRESENT_PACING_BITS, PresentPacing,
-    ScreenParamsFilterStep, WINDOW_OCCLUDED, backing_scale_change, backing_scale_from,
-    detach_metal_layer, display_state_is_latched, is_bound_window, layer_mode_change,
-    layer_mode_for, min_present_duration, min_present_duration_change, pack_pacing,
-    screen_params_filter_step, unpack_pacing, with_bound_display,
+    LayerMode, PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
+    layer_mode_change, layer_mode_for, min_present_duration, min_present_duration_change,
+    pack_pacing, screen_params_filter_step, unpack_pacing,
 };
 
 #[test]
@@ -154,110 +145,6 @@ fn a_brightness_change_alone_does_not_reconfigure() {
     // therefore keep the HDR layer.
     assert_eq!(layer_mode_change(LayerMode::Hdr, 16.0, true), None);
     assert_eq!(layer_mode_change(LayerMode::Hdr, 16.0, true), None);
-}
-
-#[test]
-fn teardown_unbinds_the_display_and_resets_what_it_derived() {
-    const VIEW: usize = 0x1000;
-    const LAYER: usize = 0x2000;
-    const WINDOW: usize = 0x3000;
-
-    with_bound_display(|bound| {
-        bound.view = VIEW;
-        bound.layer = LAYER;
-        bound.window = WINDOW;
-    });
-    HDR_ACTIVE.store(true, Ordering::Relaxed);
-    CURRENT_HEADROOM_BITS.store(4.0_f32.to_bits(), Ordering::Relaxed);
-    LAST_LOGGED_HEADROOM_BITS.store(4.0_f32.to_bits(), Ordering::Relaxed);
-    WINDOW_OCCLUDED.store(true, Ordering::Relaxed);
-    PRESENT_PACING_BITS.store(
-        pack_pacing(&PresentPacing {
-            vsync_requested: true,
-            max_fps: 60,
-        }),
-        Ordering::Relaxed,
-    );
-    CURRENT_BACKING_SCALE.store(2, Ordering::Relaxed);
-    BACKING_SCALE_SINK_PTR.store(0x4000, Ordering::Relaxed);
-    assert!(
-        display_state_is_latched(),
-        "the reconciliation has a display to re-derive against"
-    );
-    assert!(
-        is_bound_window(WINDOW),
-        "the bound window matches while attached"
-    );
-    assert!(!is_bound_window(WINDOW + 8), "another window never matches");
-
-    // SAFETY: `MetalHandle::new` asks for a retained object's address or `0`;
-    // these addresses are only ever compared here, never dereferenced.
-    let other_view = unsafe { MetalHandle::<NSViewKind>::new(VIEW as u64 + 8) };
-    detach_metal_layer(other_view);
-    with_bound_display(|bound| {
-        assert_eq!(
-            bound.view, VIEW,
-            "another device's teardown leaves the bound view alone"
-        );
-    });
-
-    // SAFETY: as above.
-    let view = unsafe { MetalHandle::<NSViewKind>::new(VIEW as u64) };
-    detach_metal_layer(view);
-
-    with_bound_display(|bound| {
-        assert_eq!(bound.view, 0, "the view the headroom refresh walks");
-        assert_eq!(
-            bound.layer, 0,
-            "the layer the display-follow path reconfigures"
-        );
-        assert_eq!(
-            bound.window, 0,
-            "the window the occlusion observer filters by"
-        );
-    });
-    assert!(
-        !is_bound_window(WINDOW),
-        "the released window no longer matches"
-    );
-    assert!(!is_bound_window(0), "nothing bound matches nothing");
-    assert!(
-        !HDR_ACTIVE.load(Ordering::Relaxed),
-        "no layer carries an HDR configuration"
-    );
-    assert_eq!(
-        CURRENT_HEADROOM_BITS.load(Ordering::Relaxed),
-        1.0_f32.to_bits(),
-        "the headroom the present pass treats as the identity curve",
-    );
-    assert_eq!(
-        LAST_LOGGED_HEADROOM_BITS.load(Ordering::Relaxed),
-        0,
-        "the next session logs its own headroom baseline",
-    );
-    assert!(
-        !WINDOW_OCCLUDED.load(Ordering::Relaxed),
-        "no window suppresses a present"
-    );
-    assert_eq!(
-        PRESENT_PACING_BITS.load(Ordering::Relaxed),
-        0,
-        "the next attach latches the pacing its own guest asked for",
-    );
-    assert_eq!(
-        CURRENT_BACKING_SCALE.load(Ordering::Relaxed),
-        0,
-        "no display's backing scale is published",
-    );
-    assert_eq!(
-        BACKING_SCALE_SINK_PTR.load(Ordering::Relaxed),
-        0,
-        "nothing is written into a guest that may have unloaded d3d9.dll",
-    );
-    assert!(
-        !display_state_is_latched(),
-        "the reconciliation has nothing to re-derive against"
-    );
 }
 
 #[test]

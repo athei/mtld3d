@@ -43,9 +43,13 @@ fn attach_metal_layer_layout() {
 #[test]
 fn set_cursor_overlay_layout() {
     use super::SetCursorOverlayParams;
-    // 2*u64 + 7*u32 + 1*CursorOverlayFlags = 16 + 28 + 4 = 48
+    // 2*u64 + 7*u32 + 1*CursorOverlayFlags + 1*MetalHandle = 16 + 28 + 4 + 8 = 56
     assert_eq!(core::mem::align_of::<SetCursorOverlayParams>(), 8);
-    assert_eq!(core::mem::size_of::<SetCursorOverlayParams>(), 48);
+    assert_eq!(core::mem::size_of::<SetCursorOverlayParams>(), 56);
+    assert_eq!(
+        core::mem::offset_of!(SetCursorOverlayParams, view_handle),
+        48
+    );
 }
 
 #[test]

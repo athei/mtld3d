@@ -1,8 +1,8 @@
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
@@ -19,222 +19,40 @@ use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
+pub mod attachment;
 mod cursor_overlay;
 
+use attachment::{AttachFlags, AttachLatches, Attachment};
 pub use cursor_overlay::{poll_capture_from_present, set_cursor_overlay};
 
-/// Whether the bound `CAMetalLayer` currently carries the EDR configuration.
-///
-/// Written on the API thread during attach and again on the main thread
-/// whenever the bound window's screen changes its EDR capability, so it always
-/// names the configuration the layer actually has. The present route is taken
-/// from the drawable's own pixel format rather than from here, so a
-/// reconfiguration landing between two presents cannot mismatch the pass.
-///
-/// All HDR state lives unix-side: PE has no knowledge of HDR, no wire
-/// fields beyond `SubmitFrameParams.present_view` (PE already has the
-/// `NSView*` from `AttachMetalLayer`; sending it is independent of HDR).
-static HDR_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// The `color.hdr.enable` setting the most recent attach carried.
-///
-/// Deciding the layer configuration for a screen first seen mid-session needs
-/// the user's gate, and that gate only ever arrives on the attach wire.
-static HDR_ENABLE_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// The `color.space` policy of the most recent attach, as `ColorSpacePolicy as u32`.
-///
-/// Latched for the same reason as [`HDR_ENABLE_REQUESTED`]: reconfiguring the
-/// layer for a new screen has to pick the colorspace family attach would have
-/// picked for it.
-static COLOR_SPACE_POLICY: AtomicU32 = AtomicU32::new(ColorSpacePolicy::Passthrough as u32);
-
-/// Whether the bound window is currently fully occluded (covered or minimised).
-///
-/// I.e. its `NSWindow` occlusion state lacks the `Visible` bit. Seeded at
-/// `AttachMetalLayer` and updated by an `NSWindowDidChangeOcclusionState`
-/// observer (both on the main thread); read by `submit_frame` per present
-/// to skip the `nextDrawable` acquire while nothing reaches the screen.
-/// Relaxed is enough — a one-frame lag at the transition is harmless and
-/// bounded by the retained `allowsNextDrawableTimeout` safety valve.
-static WINDOW_OCCLUDED: AtomicBool = AtomicBool::new(false);
-
-/// Last per-frame headroom we emitted an `info!` for, encoded as `f32::to_bits`.
-///
-/// `0` = never logged; the first refresh always logs to establish a baseline
-/// distinct from the attach-time line. Subsequent refreshes fire only when the
-/// dynamic headroom drifts more than 5% relative to the last-logged value,
-/// diagnostic for steady-state brightness/thermal changes without per-frame
-/// spam. Written only on the main thread, inside [`refresh_headroom_on_main`].
-static LAST_LOGGED_HEADROOM_BITS: AtomicU32 = AtomicU32::new(0);
-
-/// Live EDR headroom as `f32::to_bits`, published by the main thread.
-///
-/// `submit_frame` needs this every present to drive the HDR tone-map shader,
-/// but deriving it means walking `NSView.window → NSWindow.screen`, and those
-/// two are main-thread-only however read-only the `NSScreen` property at the
-/// end of the walk is. Doing that walk on the submit thread crashed inside
-/// `AppKit` roughly three seconds after a zone transition, which is exactly when
-/// the main thread is rebuilding window and screen state. So the walk moved to
-/// the main thread and the presenting thread reads this instead.
-///
-/// Seeded to `1.0`, which the HDR shader treats as the identity curve, so the
-/// presents before the first refresh lands are correct rather than merely safe.
-static CURRENT_HEADROOM_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
-
-/// Raw addresses of the `AppKit` objects the most recent attach latched.
-///
-/// `0` in a field means nothing of that kind is bound. All three belong to the
-/// metal view the attaching device owns, so they are valid only while that
-/// device holds it alive.
-struct BoundDisplay {
-    /// Raw `NSView*` the headroom refresh walks.
-    ///
-    /// Latched at attach so the main thread never has to be handed a view
-    /// pointer by the presenting thread.
-    view: usize,
-    /// Raw `CAMetalLayer*` the display-follow path reconfigures.
-    ///
-    /// Reconfigured from the main thread for the same reason: the presenting
-    /// thread never hands a Core Animation pointer across a thread boundary.
-    layer: usize,
-    /// Raw `NSWindow*` the occlusion observer filters notifications by.
-    ///
-    /// Compared against the notification's own live object, never
-    /// dereferenced.
-    window: usize,
-}
-
-impl BoundDisplay {
-    /// The record of a session with no metal view attached.
-    const UNBOUND: Self = Self {
-        view: 0,
-        layer: 0,
-        window: 0,
-    };
-}
-
-/// The `AppKit` objects a display reconciliation may resurrect, guarded as one.
-///
-/// [`detach_metal_layer`] clears the record under this lock before the
-/// teardown path releases the metal view, and every resurrection retains its
-/// object while holding the lock, so a reconciliation either owns a retain of
-/// a live object or finds nothing bound. Re-attach re-points the record, which
-/// is what keeps the process-lifetime observers correct across device and
-/// window churn.
-static BOUND_DISPLAY: Mutex<BoundDisplay> = Mutex::new(BoundDisplay::UNBOUND);
-
-/// Run `f` against the bound-display record.
-fn with_bound_display<R>(f: impl FnOnce(&mut BoundDisplay) -> R) -> R {
-    let mut bound = BOUND_DISPLAY.lock().expect("bound-display mutex poisoned");
-    f(&mut bound)
-}
-
-/// Retain the bound `NSView`, or `None` while no metal view is attached.
-///
-/// **Main thread only**, because the caller goes on to walk the view.
-fn retain_bound_view() -> Option<Retained<objc2_app_kit::NSView>> {
-    with_bound_display(|bound| {
-        if bound.view == 0 {
-            return None;
-        }
-        // SAFETY: teardown clears this field under the same lock before it
-        // releases the metal view, so a non-zero address names a live `NSView`
-        // here, and the retain this takes keeps it alive for the walk.
-        unsafe { Retained::retain(bound.view as *mut objc2_app_kit::NSView) }
-    })
-}
-
-/// Retain the bound `CAMetalLayer`, or `None` while no metal view is attached.
-///
-/// **Main thread only**, for the same reason [`retain_bound_view`] is.
-fn retain_bound_layer() -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
-    with_bound_display(|bound| {
-        if bound.layer == 0 {
-            return None;
-        }
-        // SAFETY: wine retains the layer for the metal view's lifetime, and
-        // teardown clears this field under the same lock before releasing that
-        // view, so the address names a live layer here.
-        unsafe { Retained::retain(bound.layer as *mut objc2_quartz_core::CAMetalLayer) }
-    })
-}
-
-/// Whether `window` is the `NSWindow` the most recent attach bound.
-///
-/// `0` and any other window answer `false`, so the occlusion observer ignores
-/// notifications for windows that are not ours and every notification once the
-/// device is gone.
-fn is_bound_window(window: usize) -> bool {
-    window != 0 && with_bound_display(|bound| bound.window == window)
-}
-
-/// Release the latches `view_handle` left behind. **Device teardown only.**
+/// Retire the attachment record `view_handle` names. **Device teardown only.**
 ///
 /// The teardown path releases that metal view, so the view, its layer and its
-/// window stop being valid the moment it runs. Clearing the record before the
-/// release is what keeps the process-lifetime screen-parameter and occlusion
-/// observers from walking a freed view: they take the same lock, so each one
-/// either retained its object before the clear or finds nothing bound. The
-/// derived state then goes back to what a session with no layer reports: no
-/// HDR configuration applied, the identity headroom the present pass treats
-/// as a no-op, and a window that never suppresses a present.
+/// window stop being valid the moment it runs. Unregistering the record
+/// before the release is what keeps the process-lifetime screen-parameter,
+/// occlusion and pointer observers from walking a freed view: every
+/// dereference they make goes through the registry, which either retains the
+/// object while the record is live or finds it gone. Everything the display
+/// decided for that window goes with the record, and the PE-side sinks it
+/// published into are never written again, since the device is about to drop
+/// them.
 ///
-/// What attach latched *about* the display goes with it. A reconciliation
-/// that survived the clear must not re-derive a present throttle from the
-/// pacing of a guest that is gone, and must not publish a backing scale into
-/// a `d3d9.dll` static the guest may since have unloaded. This is the only
-/// entry point that drops any of it; the next attach latches its own.
-///
-/// Only the bound view's own teardown clears, so a device that never attached
-/// and one whose view a later attach has already replaced leave the record
-/// naming the view that is still live.
+/// Only the record of this view is retired. A device that never attached
+/// finds no record, and another device's record is untouched.
 pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
-    let detached = with_bound_display(|bound| {
-        let bound_view = view_addr != 0 && bound.view == view_addr;
-        if bound_view {
-            *bound = BoundDisplay::UNBOUND;
-        }
-        bound_view
-    });
-    if !detached {
+    let Some(att) = attachment::unregister(view_addr) else {
         return;
-    }
-    HDR_ACTIVE.store(false, Ordering::Relaxed);
-    CURRENT_HEADROOM_BITS.store(1.0_f32.to_bits(), Ordering::Relaxed);
-    LAST_LOGGED_HEADROOM_BITS.store(0, Ordering::Relaxed);
-    WINDOW_OCCLUDED.store(false, Ordering::Relaxed);
-    PRESENT_PACING_BITS.store(0, Ordering::Relaxed);
-    CURRENT_BACKING_SCALE.store(0, Ordering::Relaxed);
-    BACKING_SCALE_SINK_PTR.store(0, Ordering::Relaxed);
-    CURSOR_KICK_SINK_PTR.store(0, Ordering::Relaxed);
-    cursor_overlay::detach();
+    };
+    cursor_overlay::detach(view_addr);
+    debug!(
+        target: LOG_TARGET,
+        "present: detached view {:#x} (layer {:#x}); its display state is retired",
+        att.view(),
+        att.layer(),
+    );
 }
-
-/// Whether a headroom refresh is already queued on the main thread.
-///
-/// Bounds the main queue to one outstanding refresh no matter how far ahead the
-/// presenting thread runs, so a busy main thread cannot accumulate a backlog of
-/// them.
-static HEADROOM_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Presents since the last headroom refresh was queued.
-///
-/// Refreshing every present would put a main-queue block in every frame for a
-/// value that tracks display brightness, so it is sampled every
-/// [`HEADROOM_REFRESH_PRESENTS`] instead. A present counter rather than a clock
-/// because the call site is per-present and this needs no new time source; the
-/// cost is that the interval is measured in frames, which at 30 to 300 fps puts
-/// the refresh somewhere between one second and a tenth of one.
-///
-/// Starts already due so the first present after attach queues a refresh
-/// rather than waiting out a full interval on the seeded `1.0`.
-static PRESENTS_SINCE_HEADROOM_REFRESH: AtomicU64 = AtomicU64::new(HEADROOM_REFRESH_PRESENTS);
-
-/// How many presents may pass between headroom refreshes.
-const HEADROOM_REFRESH_PRESENTS: u64 = 32;
 
 /// Tell macOS this process is doing continuous, latency-critical, user-interactive work.
 ///
@@ -273,54 +91,38 @@ pub fn declare_latency_critical_activity() {
     });
 }
 
-/// Whether the bound window is fully occluded — see [`WINDOW_OCCLUDED`].
-///
-/// `submit_frame` consults this each present and skips the drawable
-/// acquire+present (the command buffer still commits) when `true`, so a
-/// covered window never blocks on `nextDrawable`'s timeout.
-#[must_use]
-pub fn window_occluded() -> bool {
-    WINDOW_OCCLUDED.load(Ordering::Relaxed)
-}
-
-/// Begin tracking the bound window's occlusion so presents can skip `nextDrawable`.
+/// Begin tracking the record's window occlusion so presents can skip `nextDrawable`.
 ///
 /// `submit_frame` skips the present while the window is fully
 /// covered/minimised. When a window is occluded the compositor stops
 /// recycling its drawables, so `nextDrawable` would block its full
 /// `allowsNextDrawableTimeout` for nothing on screen and back-pressure the
-/// whole pipeline up to the guest's render loop. Records the window
-/// pointer + seeds [`WINDOW_OCCLUDED`] from the current state, then installs
+/// whole pipeline up to the guest's render loop. Records the window pointer
+/// on `att` and seeds its occlusion from the current state, then installs
 /// the (process-lifetime) observer once. Runs the `AppKit` work on the main
-/// thread — `NSView`/`NSWindow` access and the notification center are
-/// main-thread affairs, mirroring [`configure_metal_layer`]'s posture.
-fn install_occlusion_tracking(view: *mut c_void) {
-    use objc2_app_kit::{NSView, NSWindowOcclusionState};
+/// thread: `NSView`/`NSWindow` access and the notification center are
+/// main-thread affairs, mirroring [`configure_metal_layer`]'s posture. The
+/// record is registered before this runs, so the observer can already find
+/// it.
+fn install_occlusion_tracking(att: &Arc<Attachment>) {
+    use objc2_app_kit::NSWindowOcclusionState;
 
-    let view_addr = view as usize;
-    // The headroom refresh walks this same view, and stores it here rather
-    // than taking it per present so the presenting thread never hands an
-    // AppKit pointer across a thread boundary. Re-attach re-points it.
-    with_bound_display(|bound| bound.view = view_addr);
+    let att = Arc::clone(att);
     run_on_main_thread_sync(move || {
-        // SAFETY: `view_addr` is the metal `NSView*` macdrv just created and
-        // returned to attach; we are on the main thread (dispatch to the main
-        // queue), where AppKit object access is valid, and the view outlives
-        // this synchronous call.
-        let view = unsafe { &*(view_addr as *const NSView) };
-        let Some(window) = view.window() else {
-            // No host window yet — assume visible so we never wrongly suppress
-            // presents; the observer corrects it on the first state change.
-            with_bound_display(|bound| bound.window = 0);
-            WINDOW_OCCLUDED.store(false, Ordering::Relaxed);
+        let window = attachment::retain_view(&att).and_then(|view| view.window());
+        let Some(window) = window else {
+            // No host window yet: assume visible so a present is never
+            // wrongly suppressed; the observer corrects it on the first
+            // state change.
+            att.set_window(0);
+            att.set_window_occluded(false);
             return;
         };
-        let window_addr = Retained::as_ptr(&window) as usize;
-        with_bound_display(|bound| bound.window = window_addr);
+        att.set_window(Retained::as_ptr(&window) as usize);
         let occluded = !window
             .occlusionState()
             .contains(NSWindowOcclusionState::Visible);
-        WINDOW_OCCLUDED.store(occluded, Ordering::Relaxed);
+        att.set_window_occluded(occluded);
         install_occlusion_observer_once();
         // SAFETY: inside the main-thread dispatch above.
         let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
@@ -462,8 +264,8 @@ const fn screen_params_filter_step(installed: bool, has_delegate: bool) -> Scree
 /// process lifetime like the occlusion observer, and it has to outlive any one
 /// device: taking the notification over unregisters Wine's delegate for this
 /// name, so removing our observer at teardown would leave nobody forwarding
-/// it at all. What teardown clears instead is [`BOUND_DISPLAY`], which is
-/// what the handler walks.
+/// it at all. What teardown retires instead is the attachment record, and
+/// the handler walks only the records that are still live.
 fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     use core::ptr::NonNull;
 
@@ -541,9 +343,9 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
             return;
         }
         // A real topology or mode change is the moment a display was
-        // attached, removed or reconfigured, so reconcile the layer now
+        // attached, removed or reconfigured, so reconcile every layer now
         // rather than waiting out the present-counted poll interval.
-        refresh_headroom_on_main();
+        refresh_all_on_main();
         let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
         if delegate_ptr == 0 {
             return;
@@ -573,11 +375,12 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
 
 /// Install the `NSWindowDidChangeOcclusionState` observer exactly once.
 ///
-/// Scoped to all windows (`object: None`) and filtered in the block by
-/// [`is_bound_window`], so a single leaked observer survives device/window
-/// churn — a re-attach just re-points [`BOUND_DISPLAY`]. The token is
-/// intentionally leaked for the process lifetime, the same posture as the
-/// `NSProcessInfo` activity in [`declare_latency_critical_activity`].
+/// Scoped to all windows (`object: None`) and matched in the block against
+/// the window of every live attachment record, so a single leaked observer
+/// survives device and window churn, and two views on one `NSWindow` both
+/// follow it. The token is intentionally leaked for the process lifetime,
+/// the same posture as the `NSProcessInfo` activity in
+/// [`declare_latency_critical_activity`].
 fn install_occlusion_observer_once() {
     use core::ptr::NonNull;
     use std::sync::Once;
@@ -601,17 +404,23 @@ fn install_occlusion_observer_once() {
                 return;
             };
             let object_ptr = Retained::as_ptr(&object) as usize;
-            if !is_bound_window(object_ptr) {
+            let ours: Vec<Arc<Attachment>> = attachment::live()
+                .into_iter()
+                .filter(|att| object_ptr != 0 && att.window() == object_ptr)
+                .collect();
+            if ours.is_empty() {
                 return;
             }
             // SAFETY: `object` is the live window that posted the notification;
-            // its pointer matches the window bound at attach, so it is our
-            // `NSWindow`, and it stays retained for this call. Occlusion
+            // its pointer matches a window an attach found, so it is one of
+            // our `NSWindow`s, and it stays retained for this call. Occlusion
             // notifications are delivered on the main thread, where the
             // `occlusionState` read is valid.
             let window = unsafe { &*(object_ptr as *const NSWindow) };
             let occluded = !window.occlusionState().contains(NSWindowOcclusionState::Visible);
-            WINDOW_OCCLUDED.store(occluded, Ordering::Relaxed);
+            for att in &ours {
+                att.set_window_occluded(occluded);
+            }
         });
 
         let center = NSNotificationCenter::defaultCenter();
@@ -632,53 +441,6 @@ fn install_occlusion_observer_once() {
     });
 }
 
-/// Minimum seconds between presents passed to `presentDrawable:afterMinimumDuration:`.
-///
-/// Encoded as `f64::to_bits`. `0.0` means "no throttle" — `submit_frame`
-/// calls plain `presentDrawable:` (equivalent to
-/// `D3DPRESENT_INTERVAL_IMMEDIATE`). Non-zero is the longer of the
-/// vsync-equivalent cap (`1 / panel_max_hz`) and the user's `present.maxFps`
-/// cap; on `ProMotion` the panel adapts to whatever cadence the API thread
-/// sustains under the cap (the system's transparent VRR). Set at
-/// `configure_metal_layer` time; the D3D9 Reset path
-/// (`set_display_sync_enabled`) re-queries the panel and overwrites.
-static MIN_PRESENT_DURATION_BITS: AtomicU64 = AtomicU64::new(0);
-
-/// Present pacing latched from the PE side, encoded by [`pack_pacing`].
-///
-/// Attach and the D3D9 Reset path both write it, and the display-follow
-/// reconciliation reads it back so a re-derivation on another panel still
-/// honours the guest's vsync request and the user's `present.maxFps`
-/// ceiling. One packed word rather than two atomics, so a Reset landing
-/// between two reads cannot hand the reconciliation half of each.
-static PRESENT_PACING_BITS: AtomicU64 = AtomicU64::new(0);
-
-/// Backing scale of the display the bound layer is on.
-///
-/// Seeded at attach from the same reading [`DisplayCaps`] carries to the PE
-/// side, and re-derived by the display-follow reconciliation. Compared
-/// against before publishing, so the PE side only hears about real changes.
-/// `0` before the first attach and again once [`detach_metal_layer`] runs,
-/// which is what [`display_state_is_latched`] reads.
-static CURRENT_BACKING_SCALE: AtomicU32 = AtomicU32::new(0);
-
-/// Address of the PE-side `AtomicU32` a changed backing scale is published into.
-///
-/// Latched at attach from `AttachMetalLayerParams::backing_scale_ptr`. The
-/// PE side backs it with a static in its own image rather than a
-/// device-owned allocation, because the reconciliation runs on the main
-/// thread outside any thunk and so cannot be ordered against a device
-/// teardown. [`detach_metal_layer`] clears it all the same, because a
-/// `d3d9.dll` the guest unloads takes the static with it. `0` before the
-/// first attach.
-static BACKING_SCALE_SINK_PTR: AtomicUsize = AtomicUsize::new(0);
-
-/// Address of the PE-side `AtomicU32` that asks for a cursor re-apply.
-///
-/// Latched at attach from `AttachMetalLayerParams::cursor_kick_ptr`, the same
-/// contract as [`BACKING_SCALE_SINK_PTR`]. `0` before the first attach.
-static CURSOR_KICK_SINK_PTR: AtomicUsize = AtomicUsize::new(0);
-
 /// Present-throttle request resolved PE-side.
 ///
 /// The guest's vsync ask (`D3DPRESENT_PARAMETERS::PresentationInterval`
@@ -694,15 +456,6 @@ pub struct PresentPacing {
     ///
     /// When both this and vsync are active the lower rate wins.
     pub max_fps: u32,
-}
-
-/// Read the present-throttle duration — see [`MIN_PRESENT_DURATION_BITS`].
-///
-/// `submit_frame` consults this per present and dispatches to the
-/// `afterMinimumDuration:` overload when non-zero.
-#[must_use]
-pub fn min_present_duration_sec() -> f64 {
-    f64::from_bits(MIN_PRESENT_DURATION_BITS.load(Ordering::Relaxed))
 }
 
 /// Derive the present-throttle duration from the panel ceiling and the PE-side pacing request.
@@ -729,15 +482,7 @@ fn min_present_duration(panel_max_hz: f64, pacing: &PresentPacing) -> f64 {
     vsync_duration.max(cap_duration)
 }
 
-/// Store [`min_present_duration`]'s result into [`MIN_PRESENT_DURATION_BITS`].
-///
-/// The present site consumes it from there.
-fn store_min_present_duration(panel_max_hz: f64, pacing: &PresentPacing) {
-    let seconds = min_present_duration(panel_max_hz, pacing);
-    MIN_PRESENT_DURATION_BITS.store(seconds.to_bits(), Ordering::Relaxed);
-}
-
-/// Fold a [`PresentPacing`] into the one word [`PRESENT_PACING_BITS`] holds.
+/// Fold a [`PresentPacing`] into the one word an attachment record holds for it.
 ///
 /// The vsync request is the low bit and the frame cap rides above it, so the
 /// pair is written and read as a unit.
@@ -813,40 +558,6 @@ fn screen_max_hz(screen: &objc2_app_kit::NSScreen) -> f64 {
     f64::from(as_u32)
 }
 
-/// Ask the PE side to re-apply the game's cursor through Wine.
-///
-/// Called when the pointer comes back after another process held it. The
-/// store is `Release` against the PE side's `AcqRel` swap; the flag is the
-/// whole message.
-fn request_cursor_kick() {
-    let sink = CURSOR_KICK_SINK_PTR.load(Ordering::Relaxed);
-    if sink == 0 {
-        return;
-    }
-    // SAFETY: the PE side backs this address with a static `AtomicU32` in its
-    // own image, readable for every write from here; see
-    // [`BACKING_SCALE_SINK_PTR`] for the lifetime argument.
-    let sink = unsafe { &*(sink as *const AtomicU32) };
-    sink.store(1, Ordering::Release);
-}
-
-/// Publish a backing scale into the PE-side sink, when one has been handed over.
-///
-/// The store is `Relaxed`: the value stands alone, the PE side reads it once
-/// per present, and there is nothing for it to order against.
-fn publish_backing_scale(scale: u32) {
-    let sink = BACKING_SCALE_SINK_PTR.load(Ordering::Relaxed);
-    if sink == 0 {
-        return;
-    }
-    // SAFETY: the PE side backs this address with a static `AtomicU32` in its
-    // own image, so it stays readable for every write from here, including
-    // ones landing after the device it was attached for is gone. `AtomicU32`
-    // has the same size and alignment in both images.
-    let sink = unsafe { &*(sink as *const AtomicU32) };
-    sink.store(scale, Ordering::Relaxed);
-}
-
 /// Everything the PE side's `AttachMetalLayer` request carries in.
 ///
 /// Bundled so the entry point stays inside clippy's `too_many_arguments`
@@ -866,9 +577,10 @@ pub struct LayerAttachRequest {
     pub color_space: ColorSpacePolicy,
     /// Address of the PE-side `AtomicU32` that receives a changed backing scale.
     ///
-    /// See [`BACKING_SCALE_SINK_PTR`]. `0` leaves the display-follow path
-    /// with nothing to publish into, which is what a headless smoke test
-    /// that never built one looks like.
+    /// Recorded on the attachment record and written only while that record
+    /// is live. `0` leaves the display-follow path with nothing to publish
+    /// into, which is what a headless smoke test that never built one looks
+    /// like.
     pub backing_scale_sink_ptr: u64,
     /// Where a cursor re-apply request is written on the PE side, `0` = nowhere.
     pub cursor_kick_sink_ptr: u64,
@@ -1088,12 +800,12 @@ fn run_on_main_thread_async<F: FnOnce() + Send + 'static>(f: F) {
 /// - `backing_scale` is the Wine metal layer's `contentsScale` rounded +
 ///   clamped to `[1, 8]`: 2 when the prefix runs in retina mode, else 1.
 ///
-/// Side effect: latches the unix-side `HDR_ACTIVE` global to `true`
-/// when the display has EDR potential and `hdr_enable` is set (resolved
-/// PE-side from `color.hdr.enable` in `mtld3d.conf`), and records the layer,
-/// the pacing, the backing scale and both user settings so the per-present
-/// poll can follow the window onto another display and re-derive everything
-/// that display decides.
+/// Side effect: registers an attachment record for the view, keyed by the
+/// view address the PE side gets back, holding the layer, the pacing, the
+/// backing scale, both user settings and whether the layer was configured
+/// for HDR (the display has EDR potential and `hdr_enable` is set), so the
+/// per-present poll can follow this window onto another display and
+/// re-derive everything that display decides, for this device alone.
 pub fn attach_metal_layer(
     device_handle: MetalHandle<MTLDeviceKind>,
     request: LayerAttachRequest,
@@ -1148,39 +860,15 @@ pub fn attach_metal_layer(
             error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
             None
         } else {
-            // Latch the layer and the two user settings the display-follow
-            // path needs: it reconfigures this layer for a screen that was
-            // not attached yet, and has to apply the same gate and the same
-            // colorspace policy attach would have applied.
-            with_bound_display(|bound| bound.layer = layer as usize);
-            HDR_ENABLE_REQUESTED.store(hdr_enable, Ordering::Relaxed);
-            COLOR_SPACE_POLICY.store(color_space as u32, Ordering::Relaxed);
-            // Same for the pacing and the backing scale: the display-follow
-            // path re-derives the present throttle and the scale for a screen
-            // that was not attached yet, and needs the guest's vsync ask, the
-            // user's frame cap and the value the PE side is already using.
-            PRESENT_PACING_BITS.store(pack_pacing(&pacing), Ordering::Relaxed);
             // The cursor scale follows Wine's retina mode, which the layer
             // carries as its contents scale, not the display's own factor: in
             // non-retina mode macOS already doubles everything the game draws,
             // its cursor included.
             let backing_scale = backing_scale_from(layer_contents_scale(layer));
-            CURRENT_BACKING_SCALE.store(backing_scale, Ordering::Relaxed);
-            BACKING_SCALE_SINK_PTR.store(
-                usize::try_from(backing_scale_sink_ptr)
-                    .expect("PE wire pointer fits host address space (unix is 64-bit)"),
-                Ordering::Relaxed,
-            );
-            publish_backing_scale(backing_scale);
-            CURSOR_KICK_SINK_PTR.store(
-                usize::try_from(cursor_kick_sink_ptr)
-                    .expect("PE wire pointer fits host address space (unix is 64-bit)"),
-                Ordering::Relaxed,
-            );
             // Decide HDR vs SDR layer configuration from the panel's
-            // static potential + the user's `color.hdr.enable` setting. Latch
-            // the result as the configuration the layer now carries — the
-            // user gate stays unix-side from here on.
+            // static potential + the user's `color.hdr.enable` setting. The
+            // result is the configuration the layer now carries; the user
+            // gate stays unix-side from here on.
             let mode = resolve_layer_mode(
                 hint.edr_potential,
                 hint.screen_name.as_deref(),
@@ -1189,7 +877,29 @@ pub fn attach_metal_layer(
                     .contains(ColorspaceFlags::IS_WIDE_GAMUT),
                 hdr_enable,
             );
-            HDR_ACTIVE.store(mode == LayerMode::Hdr, Ordering::Relaxed);
+            // The record holds the layer and everything the display-follow
+            // path needs to reconfigure it for a screen that was not attached
+            // yet: the same gate and colorspace policy attach applied, the
+            // guest's vsync ask, the user's frame cap and the scale the PE
+            // side is already using.
+            let mut flags = AttachFlags::empty();
+            flags.set(AttachFlags::HDR_ENABLE_REQUESTED, hdr_enable);
+            flags.set(AttachFlags::HDR_ACTIVE, mode == LayerMode::Hdr);
+            let att = attachment::register(
+                view as usize,
+                layer as usize,
+                &AttachLatches {
+                    flags,
+                    color_space,
+                    pacing_bits: pack_pacing(&pacing),
+                    backing_scale,
+                    backing_scale_sink: usize::try_from(backing_scale_sink_ptr)
+                        .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+                    cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
+                        .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+                },
+            );
+            attachment::publish_backing_scale(&att, backing_scale);
             // The software cursor rides the same decision: the overlay window
             // is a compositing cost an EDR layer already pays.
             let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
@@ -1198,12 +908,12 @@ pub fn attach_metal_layer(
                 "cursor: software overlay {} (cursor.software = {software_cursor:?}, layer {mode:?})",
                 if software_cursor_active { "on" } else { "off" },
             );
-            configure_metal_layer(
+            let min_present_duration = configure_metal_layer(
                 layer,
                 device_handle.raw(),
                 width,
                 height,
-                pacing,
+                &pacing,
                 hint.panel_max_hz,
                 LayerColorConfig {
                     mode,
@@ -1213,9 +923,10 @@ pub fn attach_metal_layer(
                     screen_profile_name: hint.screen_profile_name,
                 },
             );
+            att.set_min_present_duration(min_present_duration);
             // Start occlusion tracking for this window so presents skip the
             // `nextDrawable` timeout while it is fully covered/minimised.
-            install_occlusion_tracking(view);
+            install_occlusion_tracking(&att);
             // SAFETY: macdrv just handed us the view + layer pointers
             // with implicit retain ownership (Cocoa autorelease pool
             // raised before this call). The PE side keeps these
@@ -1243,22 +954,35 @@ pub fn attach_metal_layer(
 /// The D3D9 Reset path honouring a
 /// `D3DPRESENT_PARAMETERS::PresentationInterval` flip. The layer's
 /// `displaySyncEnabled` stays `false` from attach time onward; what actually
-/// changes is the present-throttle duration consulted at the present site,
-/// recomputed from `NSScreen.mainScreen` here (the PE side re-sends the
-/// `present.maxFps` cap so it survives Resets). `layer_handle` is unused
-/// (kept for wire-format stability). The mainScreen lookup may pick the
-/// wrong panel in a multi-monitor setup; the display-follow reconciliation
-/// walks to the window's own screen and corrects it within one poll
-/// interval, which is why this path stays a one-line read.
+/// changes is the present-throttle duration on the layer's attachment
+/// record, consulted at the present site and recomputed from
+/// `NSScreen.mainScreen` here (the PE side re-sends the `present.maxFps` cap
+/// so it survives Resets). The mainScreen lookup may pick the wrong panel in
+/// a multi-monitor setup; the display-follow reconciliation walks to the
+/// window's own screen and corrects it within one poll interval, which is
+/// why this path stays a one-line read. A device's Reset re-paces that
+/// device alone.
 ///
-/// The new pacing is latched for that reconciliation too, so a throttle it
-/// re-derives on another panel keeps the interval the guest just asked for.
+/// The new pacing is latched on the record for that reconciliation too, so
+/// a throttle it re-derives on another panel keeps the interval the guest
+/// just asked for.
 pub fn set_display_sync_enabled(
-    _layer_handle: MetalHandle<CAMetalLayerKind>,
+    layer_handle: MetalHandle<CAMetalLayerKind>,
     pacing: &PresentPacing,
 ) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
+
+    let layer_addr =
+        usize::try_from(layer_handle.raw()).expect("a 64-bit host addresses every layer pointer");
+    let Some(att) = attachment::find_by_layer(layer_addr) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: SetDisplaySyncEnabled for layer {layer_addr:#x} with no attachment record; \
+             the present throttle is unchanged",
+        );
+        return;
+    };
     // SAFETY: NSScreen is MainThreadOnly per objc2-app-kit's class
     // annotation, but mtld3d reads only display-metadata properties
     // (`maximumFramesPerSecond`, `frame`, `convertRectToBacking`), which
@@ -1266,9 +990,9 @@ pub fn set_display_sync_enabled(
     // can be retrieved from any thread"). This is the canonical statement
     // of that posture; the other NSScreen readers in this file cite it.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    PRESENT_PACING_BITS.store(pack_pacing(pacing), Ordering::Relaxed);
+    att.set_pacing_bits(pack_pacing(pacing));
     let panel_max_hz = NSScreen::mainScreen(mtm).map_or(0.0_f64, |s| screen_max_hz(&s));
-    store_min_present_duration(panel_max_hz, pacing);
+    att.set_min_present_duration(min_present_duration(panel_max_hz, pacing));
 }
 
 /// Host-time seconds (`CFTimeInterval`) to nanoseconds, saturating.
@@ -1620,90 +1344,49 @@ fn resolve_layer_mode(
     mode
 }
 
-/// The *dynamic* `maximumExtendedDynamicRangeColorComponentValue` of the bound view's screen.
+/// Reconcile every live attachment against its display. **Main thread only.**
 ///
-/// Distinct from the `…Potential…` value `view_display_caps` reads once at
-/// attach: this one tracks the panel's currently-available headroom, which
-/// on a Mac is `panel_peak_nits / current_paper_white_nits`. It drops as the
-/// user raises display brightness, and under thermal load. `submit_frame`
-/// clamps the BT.2446-A target peak to it because macOS *global-scales*
-/// over-headroom EDR (crushes midtones), rather than soft-knee compressing
-/// the top.
-///
-/// Reads the value the main thread last published and queues a refresh when
-/// one is due. Never touches `AppKit`, so it is safe to call from the
-/// presenting thread; see [`CURRENT_HEADROOM_BITS`] for why that matters.
-///
-/// Called every present whatever the layer is configured for, because the
-/// refresh it queues is also what notices the window moving onto a display of
-/// the other class: an SDR session that never polled would never see a panel
-/// with headroom appear under it.
-///
-/// Returns `1.0` on any lookup failure or while macOS hasn't yet
-/// transitioned the screen into EDR mode (the first presents after
-/// `AttachMetalLayer` land here). `1.0` is still correct for the HDR
-/// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve,
-/// producing valid linear-DisplayP3 output.
-pub fn current_headroom() -> f32 {
-    let due = PRESENTS_SINCE_HEADROOM_REFRESH.fetch_add(1, Ordering::Relaxed)
-        >= HEADROOM_REFRESH_PRESENTS;
-    if due
-        && HEADROOM_REFRESH_PENDING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        PRESENTS_SINCE_HEADROOM_REFRESH.store(0, Ordering::Relaxed);
-        queue_headroom_refresh();
-    }
-    f32::from_bits(CURRENT_HEADROOM_BITS.load(Ordering::Relaxed))
-}
-
-/// Ask the main thread for a fresh headroom reading, without waiting for it.
-///
-/// The work function takes no context: everything it needs is in statics, so
-/// there is nothing to keep alive across the async hand-off and nothing to
-/// allocate or free.
-fn queue_headroom_refresh() {
-    extern "C" fn thunk(_ctx: *mut c_void) {
-        refresh_headroom_on_main();
-    }
-    // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton, a valid
-    // `dispatch_queue_t` for the process lifetime; the null context is never
-    // dereferenced because `thunk` ignores it.
-    unsafe {
-        let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
-        dispatch_async_f(main_q, core::ptr::null_mut(), thunk);
+/// The screen-parameter filter calls this on a real topology or mode change,
+/// when every window may have landed on another panel.
+fn refresh_all_on_main() {
+    for att in attachment::live() {
+        refresh_attachment_on_main(&att);
     }
 }
 
-/// Read the live EDR headroom and publish it. **Main thread only.**
+/// Read the live EDR headroom of the record's window and publish it. **Main thread only.**
 ///
 /// Walks `NSView.window → NSWindow.screen` and reads the screen's dynamic
-/// headroom, which is the walk that must not happen anywhere else: the first
-/// two are main-thread-only objects that the main thread rebuilds across a
-/// window or display change. Logs the drift line here too, for the same
-/// reason, since naming the screen means walking to it again.
+/// `maximumExtendedDynamicRangeColorComponentValue`, which is the walk that
+/// must not happen anywhere else: the first two are main-thread-only
+/// objects that the main thread rebuilds across a window or display change.
+/// The value is the panel's currently-available headroom, which on a Mac is
+/// `panel_peak_nits / current_paper_white_nits`; it drops as the user raises
+/// display brightness, and under thermal load, and `submit_frame` clamps
+/// the BT.2446-A target peak to it because macOS global-scales
+/// over-headroom EDR (crushes midtones) rather than soft-knee compressing
+/// the top. Logs the drift line here too, for the same reason, since naming
+/// the screen means walking to it again.
 ///
 /// The walk ends on whichever screen the window is on *now*, so it is also
-/// where everything the display decides is reconciled against that screen:
-/// the layer's own configuration ([`follow_screen_layer_mode`]), the present
-/// throttle ([`follow_screen_present_throttle`]) and the backing scale the PE
-/// side consumes ([`follow_screen_backing_scale`]).
-fn refresh_headroom_on_main() {
+/// where everything the display decides is reconciled against that screen
+/// for this record: the layer's own configuration
+/// ([`follow_screen_layer_mode`]), the present throttle
+/// ([`follow_screen_present_throttle`]) and the backing scale the PE side
+/// consumes ([`follow_layer_backing_scale`]). A record that was retired
+/// between the queueing and the run finds no view and does nothing.
+fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
 
-    HEADROOM_REFRESH_PENDING.store(false, Ordering::Release);
-    // Nothing bound: either no device has attached a layer yet, or the one
-    // that had is gone and its view with it. Either way there is no window to
-    // walk, and the notification that got us here still reaches Wine.
-    let Some(view_obj) = retain_bound_view() else {
+    att.end_headroom_refresh();
+    let Some(view_obj) = attachment::retain_view(att) else {
         return;
     };
     // SAFETY: we are on the main thread (dispatched to the main queue), where
     // NSScreen's main-thread-only class annotation is satisfied for real.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    // The attach that bound this view may have run before Wine had an
+    // The attach that registered this record may have run before Wine had an
     // application delegate, which leaves the notification unfiltered. This is
     // the recurring main-thread pass, so it is where the install is retried;
     // once it has landed the retry is one relaxed load.
@@ -1724,16 +1407,16 @@ fn refresh_headroom_on_main() {
     } else {
         1.0
     };
-    CURRENT_HEADROOM_BITS.store(headroom.to_bits(), Ordering::Relaxed);
+    att.set_headroom(headroom);
     // Only reconcile against a screen we actually reached. A window mid-move
     // between displays reports none, and the layer is better left as it is
     // than reconfigured twice against a screen the window is leaving.
     if let Some(screen) = screen.as_deref() {
-        follow_screen_layer_mode(screen);
-        follow_screen_present_throttle(screen);
-        follow_layer_backing_scale();
+        follow_screen_layer_mode(att, screen);
+        follow_screen_present_throttle(att, screen);
+        follow_layer_backing_scale(att);
     }
-    log_headroom_change_if_any(headroom, &view_obj);
+    log_headroom_change_if_any(att, headroom, &view_obj);
     cursor_overlay::reconcile_on_main();
 }
 
@@ -1741,22 +1424,26 @@ fn refresh_headroom_on_main() {
 ///
 /// **Main thread only**, because naming the screen walks the same
 /// main-thread-only `NSView.window → NSWindow.screen` chain the reading
-/// itself does. Called from [`refresh_headroom_on_main`].
+/// itself does. Called from [`refresh_attachment_on_main`].
 ///
-/// First call (`last == 0`) always logs so the refresh baseline is distinct
+/// A record's first call always logs so the refresh baseline is distinct
 /// from the attach line. Subsequent within-±5% calls are silent, which gives
 /// the user a way to verify the per-frame clamp is doing what it claims
 /// without flooding the console during sub-percent oscillation. Names the
-/// screen the view is currently bound to so a stuck-at-1.0 run tells us
-/// *which* display is reporting no headroom.
-fn log_headroom_change_if_any(current_headroom: f32, view: &objc2_app_kit::NSView) {
-    let last_bits = LAST_LOGGED_HEADROOM_BITS.load(Ordering::Relaxed);
-    let last = f32::from_bits(last_bits);
-    let should_log = last_bits == 0 || ((current_headroom - last).abs() / last) > 0.05;
+/// screen the view is currently on so a stuck-at-1.0 run tells us *which*
+/// display is reporting no headroom.
+fn log_headroom_change_if_any(
+    att: &Arc<Attachment>,
+    current_headroom: f32,
+    view: &objc2_app_kit::NSView,
+) {
+    let last = att.last_logged_headroom();
+    let should_log = last.is_none_or(|last| ((current_headroom - last).abs() / last) > 0.05);
     if !should_log {
         return;
     }
-    LAST_LOGGED_HEADROOM_BITS.store(current_headroom.to_bits(), Ordering::Relaxed);
+    let last = last.unwrap_or(0.0);
+    att.set_last_logged_headroom(current_headroom);
     let screen = view_screen_name(view);
     let screen_ref = screen.as_deref().unwrap_or("(unknown screen)");
     info!(
@@ -1767,7 +1454,7 @@ fn log_headroom_change_if_any(current_headroom: f32, view: &objc2_app_kit::NSVie
 
 /// Look up `NSScreen.localizedName` for the screen the view's window is currently on.
 ///
-/// Mirrors the screen-lookup walk in [`refresh_headroom_on_main`] so the
+/// Mirrors the screen-lookup walk in [`refresh_attachment_on_main`] so the
 /// logged screen identity matches the screen whose headroom we just read.
 /// **Main thread only**, for the same reason that one is. Returns `None`
 /// if the view has no window or no screen association yet.
@@ -1786,15 +1473,20 @@ fn view_screen_name(view: &objc2_app_kit::NSView) -> Option<String> {
     Some(screen.localizedName().to_string())
 }
 
+/// Configure a freshly attached layer on the main thread; returns the present throttle.
+///
+/// The throttle is [`min_present_duration`] of the panel under the window
+/// and the guest's pacing, in seconds; the caller stores it on the
+/// attachment record for the present site to consult.
 fn configure_metal_layer(
     layer: *mut c_void,
     device_handle: u64,
     width: u32,
     height: u32,
-    pacing: PresentPacing,
+    pacing: &PresentPacing,
     panel_max_hz: f64,
     color: LayerColorConfig,
-) {
+) -> f64 {
     // Hop to AppKit's main thread for the entire CALayer configuration
     // block. `wantsExtendedDynamicRangeContent`, `colorspace`, and
     // `pixelFormat` must land in a CATransaction commit observable by
@@ -1825,8 +1517,6 @@ fn configure_metal_layer(
             device_handle,
             width,
             height,
-            &pacing,
-            panel_max_hz,
             LayerColorRefs {
                 mode: color.mode,
                 color_space: color.color_space,
@@ -1836,6 +1526,7 @@ fn configure_metal_layer(
             },
         );
     });
+    min_present_duration(panel_max_hz, pacing)
 }
 
 fn configure_metal_layer_inner(
@@ -1843,8 +1534,6 @@ fn configure_metal_layer_inner(
     device_handle: u64,
     width: u32,
     height: u32,
-    pacing: &PresentPacing,
-    panel_max_hz: f64,
     color: LayerColorRefs<'_>,
 ) {
     use objc2_quartz_core::{CAMetalLayer, kCAGravityResizeAspect};
@@ -1902,9 +1591,9 @@ fn configure_metal_layer_inner(
     // fall through to vsync-requested with a one-shot warn at the call
     // site. The user's `present.maxFps` ceiling rides the same
     // throttle: the lower rate wins, and it also bounds the
-    // IMMEDIATE free-run.
+    // IMMEDIATE free-run. The duration itself is derived by the caller and
+    // kept on the attachment record.
     layer.setDisplaySyncEnabled(false);
-    store_min_present_duration(panel_max_hz, pacing);
     // 3 explicit drawables; 2 starves at 120 Hz under jitter.
     layer.setMaximumDrawableCount(3);
     // Default true; surface stalls surface as errors, not hangs.
@@ -2112,7 +1801,7 @@ fn screen_color_profile(
     (cg_cs, profile_name)
 }
 
-/// Follow the bound window's screen when its EDR capability changes. **Main thread only.**
+/// Follow the record's window onto a screen of the other EDR class. **Main thread only.**
 ///
 /// A session can move between displays: the window is dragged to another
 /// screen, an external monitor is attached or unplugged, or the machine is
@@ -2126,33 +1815,24 @@ fn screen_color_profile(
 /// re-formatting the layer on a brightness step would drop the drawable pool
 /// for a value the present shader already tracks per frame. Reconfiguring is
 /// therefore rare, and each one gets a log line.
-fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
-    let applied = if HDR_ACTIVE.load(Ordering::Relaxed) {
+fn follow_screen_layer_mode(att: &Arc<Attachment>, screen: &objc2_app_kit::NSScreen) {
+    let applied = if att.hdr_active() {
         LayerMode::Hdr
     } else {
         LayerMode::Sdr
     };
     let potential = screen.maximumPotentialExtendedDynamicRangeColorComponentValue();
-    let hdr_enable = HDR_ENABLE_REQUESTED.load(Ordering::Relaxed);
     // The layer already matches this screen, which is every poll of a session
     // that stays on one display.
-    let Some(mode) = layer_mode_change(applied, potential, hdr_enable) else {
+    let Some(mode) = layer_mode_change(applied, potential, att.hdr_enable_requested()) else {
         return;
     };
-    // No layer bound: attach configures the first one itself, and a torn-down
-    // device leaves none to reconcile.
-    let Some(layer) = retain_bound_layer() else {
+    // A record retired since the refresh was queued leaves no layer to
+    // reconcile.
+    let Some(layer) = attachment::retain_layer(att) else {
         return;
     };
-    let raw_policy = COLOR_SPACE_POLICY.load(Ordering::Relaxed);
-    let color_space = ColorSpacePolicy::from_repr(raw_policy).unwrap_or_else(|| {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "present: attach latched an unknown color.space policy {raw_policy}; \
-             reconfiguring the layer as passthrough",
-        );
-        ColorSpacePolicy::Passthrough
-    });
+    let color_space = att.color_space();
     let (native_colorspace, screen_profile_name) = screen_color_profile(screen);
     let screen_name = screen.localizedName().to_string();
     let cs_label = apply_layer_color(
@@ -2165,7 +1845,7 @@ fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
             screen_profile_name: screen_profile_name.as_deref(),
         },
     );
-    HDR_ACTIVE.store(mode == LayerMode::Hdr, Ordering::Relaxed);
+    att.set_hdr_active(mode == LayerMode::Hdr);
     let pf = layer.pixelFormat();
     let wants = layer.wantsExtendedDynamicRangeContent();
     info!(
@@ -2173,19 +1853,6 @@ fn follow_screen_layer_mode(screen: &objc2_app_kit::NSScreen) {
         "hdr: window moved onto '{screen_name}' (potential={potential:.2}×), layer reconfigured: \
          pixelFormat={pf:?} wantsEDR={wants} colorspace={cs_label}",
     );
-}
-
-/// Whether a bound display's own state is latched for the follow path to use.
-///
-/// Attach seeds [`CURRENT_BACKING_SCALE`] with a factor of at least 1 and
-/// [`detach_metal_layer`] clears it back to `0`, so it doubles as the flag
-/// for "there is a display whose state these two can re-derive". The retained
-/// view the reconciliation walks answers whether an `AppKit` object is safe
-/// to touch; this answers whether the values to compare against are still
-/// this session's, which a teardown landing between the two would otherwise
-/// leave stale.
-fn display_state_is_latched() -> bool {
-    CURRENT_BACKING_SCALE.load(Ordering::Relaxed) != 0
 }
 
 /// Re-derive the present throttle for the screen the window is on. **Main thread only.**
@@ -2199,17 +1866,14 @@ fn display_state_is_latched() -> bool {
 ///
 /// A session that stays on one display derives the duration it already has,
 /// and nothing is stored or logged.
-fn follow_screen_present_throttle(screen: &objc2_app_kit::NSScreen) {
-    if !display_state_is_latched() {
-        return;
-    }
-    let pacing = unpack_pacing(PRESENT_PACING_BITS.load(Ordering::Relaxed));
+fn follow_screen_present_throttle(att: &Arc<Attachment>, screen: &objc2_app_kit::NSScreen) {
+    let pacing = unpack_pacing(att.pacing_bits());
     let panel_max_hz = screen_max_hz(screen);
-    let applied = min_present_duration_sec();
+    let applied = att.min_present_duration_sec();
     let Some(seconds) = min_present_duration_change(applied, panel_max_hz, &pacing) else {
         return;
     };
-    MIN_PRESENT_DURATION_BITS.store(seconds.to_bits(), Ordering::Relaxed);
+    att.set_min_present_duration(seconds);
     info!(
         target: LOG_TARGET,
         "present: '{}' tops out at {panel_max_hz:.0} Hz, minimum present duration \
@@ -2229,19 +1893,16 @@ fn follow_screen_present_throttle(screen: &objc2_app_kit::NSScreen) {
 ///
 /// A session whose mode stays put reads back the scale it already published,
 /// and nothing is stored or logged.
-fn follow_layer_backing_scale() {
-    if !display_state_is_latched() {
-        return;
-    }
-    let Some(layer) = retain_bound_layer() else {
+fn follow_layer_backing_scale(att: &Arc<Attachment>) {
+    let Some(layer) = attachment::retain_layer(att) else {
         return;
     };
-    let applied = CURRENT_BACKING_SCALE.load(Ordering::Relaxed);
+    let applied = att.backing_scale();
     let Some(scale) = backing_scale_change(applied, layer.contentsScale()) else {
         return;
     };
-    CURRENT_BACKING_SCALE.store(scale, Ordering::Relaxed);
-    publish_backing_scale(scale);
+    att.set_backing_scale(scale);
+    attachment::publish_backing_scale(att, scale);
     info!(
         target: LOG_TARGET,
         "present: the Wine layer's contents scale is {scale}x (was {applied}x), cursor scale republished to the guest",

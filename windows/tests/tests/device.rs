@@ -1948,14 +1948,14 @@ fn software_cursor_presents_with_the_sprite_shown() {
 
 #[test]
 fn a_second_device_renders_after_the_first_is_destroyed() {
-    // The unix side latches the metal view, its layer and its window at
-    // CreateDevice and reconciles them against the display from the main
-    // thread. Releasing a device releases that view, so the latches go with
-    // it and the next device's own attach has to re-establish them. Both
-    // devices present past the interval at which the presenting thread asks
-    // the main thread for a reconciliation, so that walk runs on the first
-    // device's view while it is still attached and on the second device's
-    // once it replaces it.
+    // The unix side keeps an attachment record per device, holding the metal
+    // view, its layer and its window from CreateDevice on, and reconciles it
+    // against the display from the main thread. Releasing a device retires
+    // its record before the view is released, and the next device's own
+    // attach registers a record of its own. Both devices present past the
+    // interval at which the presenting thread asks the main thread for a
+    // reconciliation, so that walk runs on the first device's record while it
+    // is live and on the second device's once it has replaced it.
     const PRESENTS: u32 = 40;
     const RED: u32 = 0xFFFF_0000;
     const GREEN: u32 = 0xFF00_FF00;

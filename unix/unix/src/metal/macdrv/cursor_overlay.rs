@@ -29,9 +29,14 @@
 //! lock around `Retained` handles.
 //!
 //! Nothing about the game window is latched: the game `NSWindow`, its level,
-//! its client rectangle and its screen are read from the bound view at every
-//! event, so in-game resolution changes, windowed/fullscreen switches and
-//! display moves need no signal from the PE side.
+//! its client rectangle and its screen are read at every event from the view
+//! of the attachment record the overlay follows, so in-game resolution
+//! changes, windowed/fullscreen switches and display moves need no signal
+//! from the PE side. There is one system cursor and one overlay window for
+//! the process, and they follow the device whose `SetCursorOverlay` arrived
+//! most recently ([`ACTIVE_VIEW`]): `SetCursorProperties` and `ShowCursor`
+//! are per-device calls, so the device that last spoke is the device the
+//! game means.
 //!
 //! Two things the pointer can do without telling this process, both handled
 //! here. A system tool that takes the pointer (the interactive screenshot
@@ -57,8 +62,8 @@ use core::{
 use std::{
     collections::hash_map::Entry,
     sync::{
-        LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -90,9 +95,9 @@ use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
 use rustc_hash::FxHashMap;
 
 use super::{
-    COLOR_SPACE_POLICY, CURRENT_HEADROOM_BITS, HDR_ACTIVE, LayerColorRefs, LayerMode,
-    apply_layer_color, request_cursor_kick, retain_bound_layer, retain_bound_view,
-    run_on_main_thread_async, screen_color_profile, window_occluded,
+    LayerColorRefs, LayerMode, apply_layer_color,
+    attachment::{self, Attachment},
+    run_on_main_thread_async, screen_color_profile,
 };
 use crate::metal::{command, device::cpu_written_texture_storage, present};
 
@@ -235,6 +240,24 @@ static APP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// The instant [`LAST_EVENT_NS`] counts from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// The view of the attachment record the overlay follows, `0` = none.
+///
+/// The raw `NSView*` address the most recent `SetCursorOverlay` named,
+/// written on the API thread once the handler has confirmed a record exists
+/// for it, and cleared by that record's detach. Read through
+/// [`active_attachment`], which resolves it against the registry, so a view
+/// retired since the last call resolves to nothing rather than to a freed
+/// object.
+static ACTIVE_VIEW: AtomicUsize = AtomicUsize::new(0);
+
+/// The record the overlay follows, while it is live.
+fn active_attachment() -> Option<Arc<Attachment>> {
+    match ACTIVE_VIEW.load(Ordering::Relaxed) {
+        0 => None,
+        view => attachment::find(view),
+    }
+}
 
 fn pack_point(point: CGPoint) -> u64 {
     // Screen coordinates fit `f32` with room to spare; the lost fraction is
@@ -487,8 +510,21 @@ fn peak_changed(applied: f32, current: f32) -> bool {
 ///
 /// `pixels` is `Some` when this hash is new to the unix side; the bytes are
 /// copied here, so the PE buffer only has to live for the call. Never blocks
-/// on the main thread.
-pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>) {
+/// on the main thread. `false` when `params.view_handle` names no attachment
+/// record, in which case nothing is recorded: the overlay has no window to
+/// draw over for a device that never attached, and a retired view must not
+/// become the one it follows.
+pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>) -> bool {
+    let view = usize::try_from(params.view_handle.raw())
+        .expect("a 64-bit host addresses every view pointer");
+    if attachment::find(view).is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "SetCursorOverlay: view {view:#x} has no attachment record → ignored",
+        );
+        return false;
+    }
+    ACTIVE_VIEW.store(view, Ordering::Relaxed);
     let visible = params.flags.contains(CursorOverlayFlags::VISIBLE);
     CURSOR_SHOWN.store(visible, Ordering::Relaxed);
     if !visible {
@@ -498,7 +534,7 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
     }
     if params.flags.contains(CursorOverlayFlags::HARDWARE) {
         // Visibility only: the hardware cursor path has no sprite.
-        return;
+        return true;
     }
     {
         let mut shared = lock_shared();
@@ -521,19 +557,29 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
         };
     }
     queue_apply();
+    true
 }
 
-/// The bound device is going away: hide the sprite and forget every sprite it uploaded.
+/// The device that attached `view` is going away: stop following it.
 ///
-/// The window and its observers stay for the process lifetime like the other
-/// `AppKit` observers; the next device's PE side has an empty uploaded set of
-/// its own and re-sends what it shows.
-pub fn detach() {
+/// Only the device the overlay follows changes anything on screen: its sprite
+/// is hidden and the cursor is no longer shown, so the capture checks stop.
+/// Another device's teardown leaves the overlay where it is. The uploaded
+/// sprites stay: they are content-addressed, so a second device's uploaded
+/// set may name an entry the first one sent, and its next call would name a
+/// sprite the unix side no longer held. The window and its observers stay
+/// for the process lifetime like the other `AppKit` observers.
+pub fn detach(view: usize) {
+    if ACTIVE_VIEW
+        .compare_exchange(view, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     CURSOR_SHOWN.store(false, Ordering::Relaxed);
     CAPTURED.store(false, Ordering::Relaxed);
     {
         let mut shared = lock_shared();
-        shared.sprites.clear();
         shared.wanted = Wanted {
             hash: 0,
             visible: false,
@@ -589,13 +635,15 @@ struct WantedSnapshot {
 }
 
 fn snapshot_wanted() -> WantedSnapshot {
+    let retina_factor = active_attachment().map_or(1, |att| att.backing_scale());
     let shared = lock_shared();
     WantedSnapshot {
         hash: shared.wanted.hash,
         visible: shared.wanted.visible,
-        geometry: shared.sprites.get(&shared.wanted.hash).map(|sprite| {
-            SpriteGeometry::of(sprite, super::CURRENT_BACKING_SCALE.load(Ordering::Relaxed))
-        }),
+        geometry: shared
+            .sprites
+            .get(&shared.wanted.hash)
+            .map(|sprite| SpriteGeometry::of(sprite, retina_factor)),
     }
 }
 
@@ -644,8 +692,10 @@ fn on_pointer_event_main() {
     note_event(NSEvent::mouseLocation());
     if CAPTURED.swap(false, Ordering::AcqRel) {
         // The other process's cursor is still on screen; Wine only replaces
-        // it on a handle change, which the PE side's kick provides.
-        request_cursor_kick();
+        // it on a handle change, which the PE side's kick provides. Every
+        // live device gets it: the kick is idempotent, and which device the
+        // pointer's return concerns is not a question worth guessing at.
+        attachment::request_cursor_kick_all();
         debug!(
             target: LOG_TARGET,
             "cursor: mouse events resumed, pointer released, cursor re-apply requested",
@@ -692,10 +742,10 @@ struct Overlay {
 impl Overlay {
     /// Create the window, its layer and the input hooks. **Main thread only.**
     ///
-    /// `None` when there is no bound layer to borrow a device from or Metal
-    /// refuses a command queue; the next apply tries again.
+    /// `None` when there is no attachment to borrow a layer's device from or
+    /// Metal refuses a command queue; the next apply tries again.
     fn create(mtm: MainThreadMarker) -> Option<Self> {
-        let game_layer = retain_bound_layer()?;
+        let game_layer = attachment::retain_layer(&active_attachment()?)?;
         let device = game_layer.device()?;
         let queue = device.newCommandQueue()?;
         queue.setLabel(Some(&NSString::from_str("mtld3d-cursor-queue")));
@@ -793,14 +843,20 @@ impl Overlay {
     }
 
     /// Bring the window in line with the wanted state, the layer mode and the headroom.
+    ///
+    /// The layer mode and colorspace are the followed attachment's; with none
+    /// to follow the layer keeps its configuration and the sprite is hidden
+    /// by `sync_position`.
     fn apply(&mut self, mtm: MainThreadMarker, wanted: WantedSnapshot) {
-        let mode = if HDR_ACTIVE.load(Ordering::Relaxed) {
-            LayerMode::Hdr
-        } else {
-            LayerMode::Sdr
-        };
-        if self.mode != Some(mode) {
-            self.reconfigure_layer(mtm, mode);
+        if let Some(att) = active_attachment() {
+            let mode = if att.hdr_active() {
+                LayerMode::Hdr
+            } else {
+                LayerMode::Sdr
+            };
+            if self.mode != Some(mode) {
+                self.reconfigure_layer(mtm, mode, att.color_space());
+            }
         }
         self.wanted_visible = wanted.visible;
         if wanted.hash == 0 {
@@ -820,16 +876,12 @@ impl Overlay {
     }
 
     /// Give the overlay layer the game layer's format, colorspace and EDR opt-in.
-    fn reconfigure_layer(&mut self, mtm: MainThreadMarker, mode: LayerMode) {
-        let raw_policy = COLOR_SPACE_POLICY.load(Ordering::Relaxed);
-        let color_space = ColorSpacePolicy::from_repr(raw_policy).unwrap_or_else(|| {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "cursor: attach latched an unknown color.space policy {raw_policy}; \
-                 configuring the overlay as passthrough",
-            );
-            ColorSpacePolicy::Passthrough
-        });
+    fn reconfigure_layer(
+        &mut self,
+        mtm: MainThreadMarker,
+        mode: LayerMode,
+        color_space: ColorSpacePolicy,
+    ) {
         // The game window's screen, not the overlay's: the overlay follows
         // the game window one event later.
         let screen = game_screen(mtm);
@@ -960,7 +1012,12 @@ impl Overlay {
 
     /// Level, position and content against the pointer and the game window as they are now.
     fn sync_position(&mut self, mtm: MainThreadMarker) {
-        let game = retain_bound_view().and_then(|view| view.window().map(|window| (view, window)));
+        let Some(att) = active_attachment() else {
+            self.ensure_content(Content::Transparent);
+            return;
+        };
+        let game = attachment::retain_view(&att)
+            .and_then(|view| view.window().map(|window| (view, window)));
         let Some((view, game_window)) = game else {
             self.ensure_content(Content::Transparent);
             return;
@@ -999,7 +1056,7 @@ impl Overlay {
             rect_contains(client, mouse)
                 && window_under_pointer(mouse, mtm) == game_window.windowNumber(),
         );
-        inputs.set(VisibilityInputs::OCCLUDED, window_occluded());
+        inputs.set(VisibilityInputs::OCCLUDED, att.window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
         inputs.set(VisibilityInputs::CAPTURED, CAPTURED.load(Ordering::Relaxed));
         let shown = overlay_visible(inputs);
@@ -1017,7 +1074,7 @@ impl Overlay {
         }
         if shown {
             let mode = self.mode.unwrap_or(LayerMode::Sdr);
-            let peak = f32::from_bits(CURRENT_HEADROOM_BITS.load(Ordering::Relaxed));
+            let peak = att.headroom();
             // Re-render on a sprite or layer-mode change, and on a headroom
             // move worth it; otherwise the drawable already shows this sprite.
             let peak = match self.content {
@@ -1060,9 +1117,10 @@ fn window_under_pointer(point: CGPoint, mtm: MainThreadMarker) -> NSInteger {
     NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm)
 }
 
-/// The screen the game window is on; the main screen when it is on none or unbound.
+/// The screen the game window is on; the main screen when it is on none or none is followed.
 fn game_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
-    retain_bound_view()
+    active_attachment()
+        .and_then(|att| attachment::retain_view(&att))
         .and_then(|view| view.window())
         .and_then(|window| window.screen())
         .or_else(|| NSScreen::mainScreen(mtm))
@@ -1071,7 +1129,7 @@ fn game_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
 /// The frame the overlay window covers: the screen the game window is on.
 ///
 /// The main screen when the game window is not on any (mid-move between
-/// displays) or no game window is bound; the window follows on the next event.
+/// displays) or no attachment is followed; the window follows on the next event.
 fn overlay_frame(mtm: MainThreadMarker) -> CGRect {
     game_screen(mtm).map_or(
         CGRect {
