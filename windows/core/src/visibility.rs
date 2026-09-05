@@ -790,12 +790,22 @@ impl VisibilityQueryState {
         }
     }
 
-    /// Drain every owned `RetiredVisibilityBuffer` and clear the pending list.
+    /// Drain every owned `RetiredVisibilityBuffer`, leaving the queries alone.
     ///
     /// Covers the current-frame slot plus the pool's retired and free lists.
     /// Caller takes ownership of the returned vec; each entry's `into_parts`
     /// yields the (`PageBox`, `metal_handle`, `release_seq`) triple the encoder
-    /// feeds through its destroy-then-drop ordering at shutdown.
+    /// feeds through its destroy-then-drop ordering.
+    ///
+    /// The caller finalizes first, so every segment whose frame the GPU has
+    /// retired is summed while the buffer it counted into is still here and
+    /// the pending list is empty by the time this runs. A span still open is
+    /// not finished at all: the submit that precedes the drain cut it at its
+    /// own boundary, and the frame that continues it reopens it through
+    /// [`Self::resume_open_spans`], so the open set survives. A segment that
+    /// somehow outlives the finalize keeps its place too and answers
+    /// permissively at the next intake, which cannot find the buffer it names:
+    /// dropping it would leave its query `Pending` for the rest of the process.
     pub fn drain_all_buffers(&mut self) -> Vec<RetiredVisibilityBuffer> {
         let mut all = Vec::new();
         if let Some(cur) = self.current_buffer.take() {
@@ -803,8 +813,6 @@ impl VisibilityQueryState {
         }
         all.append(&mut self.pool.retired);
         all.append(&mut self.pool.free);
-        self.pending.clear();
-        self.active.clear();
         all
     }
 
