@@ -2552,23 +2552,23 @@ impl FrameEncoder {
     /// first call in the frame.
     pub fn begin_visibility_query(&mut self, core: &Arc<VisibilityQueryCore>) {
         if self.visibility.exhausted_this_frame() {
-            core.begin(self.current_submit_seq, 0);
+            core.begin(self.current_submit_seq, 0, self.target_scale());
             self.visibility.inc_active();
             return;
         }
         if !self.ensure_visibility_buffer() {
             self.mark_visibility_exhausted();
-            core.begin(self.current_submit_seq, 0);
+            core.begin(self.current_submit_seq, 0, self.target_scale());
             self.visibility.inc_active();
             return;
         }
         let Some(slot) = self.visibility.bump_slot() else {
             self.mark_visibility_exhausted();
-            core.begin(self.current_submit_seq, 0);
+            core.begin(self.current_submit_seq, 0, self.target_scale());
             self.visibility.inc_active();
             return;
         };
-        core.begin(self.current_submit_seq, slot);
+        core.begin(self.current_submit_seq, slot, self.target_scale());
         self.visibility.inc_active();
         let cmd =
             Command::set_visibility_result_mode(VisibilityResultMode::Counting, slot * SLOT_BYTES);
