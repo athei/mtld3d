@@ -75,8 +75,10 @@ pub struct BinaryRun {
 pub trait Report {
     /// One test's verdict.
     fn result(&mut self, result: TestResult);
-    /// Something about a process worth a line in the run's output: how it
-    /// ended when that was not clean, and what the runner did about it.
+    /// Something about a process worth a line in the run's output.
+    ///
+    /// How a process ended when that was not clean, and what the runner did
+    /// about it.
     fn note(&mut self, note: &str);
 }
 

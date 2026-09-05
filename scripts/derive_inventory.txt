@@ -5,6 +5,7 @@ unix/conformance/src/model.rs Leg Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,H
 unix/conformance/src/model.rs Site Clone,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
 unix/conformance/src/model.rs Subtest Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
 unix/conformance/src/model.rs Variant Clone,Copy,PartialEq,Eq,PartialOrd,Ord,Debug,Hash
+unix/e2e/src/run.rs ExitKind Debug,Clone,Copy,PartialEq,Eq
 unix/shared/src/commands.rs BlitCommand Clone,Copy
 unix/shared/src/commands.rs BlitCommandType Clone,Copy,Debug,PartialEq,Eq,FromRepr
 unix/shared/src/commands.rs Command Clone,Copy
