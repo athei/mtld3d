@@ -7,7 +7,7 @@
 //! the device so a `Reset` that recreates the backbuffer is reflected without
 //! re-allocating the surface.
 
-use mtld3d_tests::{Harness, HarnessConfig, SurfaceDc};
+use mtld3d_tests::{Harness, HarnessConfig};
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
 };
@@ -103,23 +103,6 @@ fn get_dc_on_non_lockable_backbuffer_rejects_and_preserves_out() {
     );
 }
 
-/// Paint a `side` x `side` block of `color` into `dc`, origin at the top left.
-///
-/// A block rather than a lone pixel: under a `render.scale` the write-back is
-/// a downscale and the read-back an upscale, and only an interior pixel comes
-/// through a resample pair unchanged.
-fn fill_block(dc: &SurfaceDc<'_>, side: i32, color: u32) {
-    for y in 0..side {
-        for x in 0..side {
-            assert_eq!(
-                dc.set_pixel(x, y, color),
-                color,
-                "SetPixel into the DC stores the colour it was handed",
-            );
-        }
-    }
-}
-
 #[test]
 fn release_dc_on_a_lockable_backbuffer_reaches_the_back_buffer() {
     // The DC over a lockable back buffer wraps a read-back snapshot rather than
@@ -142,7 +125,7 @@ fn release_dc_on_a_lockable_backbuffer_reaches_the_back_buffer() {
         GREEN_COLORREF,
         "the DC reads the colour the Clear painted",
     );
-    fill_block(&dc, 64, RED_COLORREF);
+    dc.fill_block(64, RED_COLORREF);
     assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
 
     // Alpha is masked off: GDI leaves the fourth byte at zero, but a
@@ -180,7 +163,7 @@ fn release_dc_on_a_lockable_backbuffer_resamples_under_a_render_scale() {
     assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the back buffer green");
     let bb = h.back_buffer(0);
     let dc = bb.dc();
-    fill_block(&dc, 64, RED_COLORREF);
+    dc.fill_block(64, RED_COLORREF);
     assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
 
     // Deep inside the block on both sides of the round trip, so the linear

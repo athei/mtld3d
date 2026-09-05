@@ -157,7 +157,24 @@ jobs:
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
   # INTEL=1`) and do not run here. Every image gates.
+  #
+  # One more leg runs the whole suite at `render.scale = 0.75`: the back
+  # buffer rasterized smaller than the resolution D3D9 reports and resolved
+  # back up by MetalFX. Every coordinate the suite asserts on is in the
+  # reported space, so that leg is the evidence that the logical and render
+  # spaces stay separate; a test that needs single-pixel resolution asks
+  # `render_scale_is_identity()` and pins its exact shape at the identity
+  # alone. One leg, not a dimension: the code that keeps the two spaces apart
+  # is arch- and OS-independent, so a second scaled leg would cost a whole
+  # suite run for nothing. 0.75 is the documented sweep value; 0.5 and the
+  # non-dividing 0.67 stay local tools (`make test SCALE=<n>`). The `scale`
+  # axis carries one empty value (the identity run) so the `include` entry,
+  # whose scale differs, becomes its own combination: an include whose keys
+  # all fit an existing combination is folded into it instead, and that
+  # would turn the macos-26/i686 identity leg into the scaled one. The job
+  # name is spelled out so the empty value does not show in it.
   e2e:
+    name: e2e (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.scale && format(', scale {0}', matrix.scale) || '' }})
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -166,6 +183,11 @@ jobs:
       matrix:
         runner: [macos-26, macos-15, macos-15-intel]
         arch: [i686, x86_64]
+        scale: [""]
+        include:
+          - runner: macos-26
+            arch: i686
+            scale: "0.75"
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -178,7 +200,7 @@ jobs:
       # narrows the run and collects the layer's log files, which are
       # otherwise written beside each test binary and pruned to the ten
       # newest.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=240 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
+      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=240 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           E2E_FILTER: ${{ inputs.e2e_filter }}
           # The layer reads the path on the Windows side, where the unix
@@ -187,7 +209,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && inputs.e2e_filter }}
         with:
-          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}
+          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
           path: ${{ runner.temp }}/*.log
           retention-days: 14
           if-no-files-found: ignore

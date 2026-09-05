@@ -955,6 +955,26 @@ impl SurfaceDc<'_> {
         crate::win32::dc_set_pixel(self.hdc.addr(), x, y, color)
     }
 
+    /// Paint a `side` x `side` block of `color` (a `COLORREF`), origin at the top left.
+    ///
+    /// A block rather than a lone pixel: under a `render.scale` the write-back
+    /// is a downscale and the read-back an upscale, and only an interior pixel
+    /// comes through a resample pair unchanged.
+    ///
+    /// # Panics
+    /// Panics if GDI stores any pixel as a colour other than `color`.
+    pub fn fill_block(&self, side: i32, color: u32) {
+        for y in 0..side {
+            for x in 0..side {
+                assert_eq!(
+                    self.set_pixel(x, y, color),
+                    color,
+                    "SetPixel into the DC stores the colour it was handed",
+                );
+            }
+        }
+    }
+
     /// `ReleaseDC`, returning the hr.
     #[must_use]
     pub fn release(self) -> i32 {

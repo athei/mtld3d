@@ -1806,7 +1806,14 @@ fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
     // GDI drew through the DC survives ReleaseDC in both directions the
     // surface can be read: a LockRect of the same staging, and a StretchRect
     // into the back buffer, which reads the level's Metal texture instead.
+    //
+    // GDI paints a block and every probe stays well inside its colour: under
+    // a `render.scale` the "1:1" StretchRect lands in a back buffer rasterized
+    // smaller and the read-back resolves it up again, and a lone pixel does
+    // not survive that pair (it comes back as a blend of itself and its
+    // neighbours). An interior pixel of a block does, at any scale.
     const SIZE: u32 = 64;
+    const BLOCK: i32 = 32;
     const GREEN_COLORREF: u32 = 0x0000_FF00;
     const RED_COLORREF: u32 = 0x0000_00FF;
     // GDI knows no alpha: SetPixel stores the three colour bytes and leaves
@@ -1826,11 +1833,7 @@ fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
         GREEN_COLORREF,
         "the DC reads the fill the plain holds",
     );
-    assert_eq!(
-        dc.set_pixel(10, 10, RED_COLORREF),
-        RED_COLORREF,
-        "SetPixel into the DC stores the colour it was handed",
-    );
+    dc.fill_block(BLOCK, RED_COLORREF);
     assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
 
     {
@@ -1843,7 +1846,7 @@ fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
             "LockRect reads what GDI drew through the DC",
         );
         assert_eq!(
-            px[(32 * pitch_px + 32) as usize],
+            px[(48 * pitch_px + 48) as usize],
             GREEN,
             "and the fill everywhere GDI left alone",
         );
@@ -1862,10 +1865,10 @@ fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
         h.read_pixel(10, 10),
         GDI_RED,
         0,
-        "GDI's pixel reaches the back buffer",
+        "GDI's block reaches the back buffer",
     );
     assert_rgb_close(
-        h.read_pixel(32, 32),
+        h.read_pixel(48, 48),
         GREEN,
         0,
         "and so does the fill around it",
