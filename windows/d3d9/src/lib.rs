@@ -160,6 +160,33 @@ pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
     Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg)))).cast::<c_void>()
 }
 
+/// `Direct3DCreate9Ex`: exported, and answers `D3DERR_NOTAVAILABLE`.
+///
+/// `D3D9Ex` is not implemented, so this never hands back an `IDirect3D9Ex`. The
+/// export exists because a title can fail on the symbol's absence alone: a
+/// compatibility checker resolves the name to decide whether the installed
+/// runtime is the Vista-era one and refuses to start the game when the lookup
+/// comes back null, without ever calling what it found. A resolvable entry
+/// point that reports the feature as unavailable answers that question
+/// truthfully, where a missing one reads as a broken `d3d9.dll`.
+///
+/// A caller that does invoke it gets the documented failure for a runtime
+/// without `D3D9Ex`, and `ppD3D` is cleared so no caller reads an uninitialised
+/// pointer after a failed create.
+#[unsafe(export_name = "Direct3DCreate9Ex")]
+pub extern "system" fn direct3d_create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
+    log_sink::start();
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "Direct3DCreate9Ex → NOTAVAILABLE (D3D9Ex is not implemented)"
+    );
+    if out.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    null_out(out);
+    D3DERR_NOTAVAILABLE
+}
+
 #[unsafe(export_name = "Direct3DShaderValidatorCreate9")]
 #[must_use]
 pub extern "system" fn direct3d_shader_validator_create9() -> *mut c_void {
