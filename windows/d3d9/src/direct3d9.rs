@@ -17,11 +17,9 @@ use mtld3d_shared::{
     mtl_handle::{MTLTextureKind, NSViewKind},
 };
 use mtld3d_types::{
-    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A1R5G5B5,
-    D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32,
-    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16,
+    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
     D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE,
     D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
     D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
@@ -311,7 +309,7 @@ const fn is_present_compatible(src: u32, dst: u32) -> bool {
 /// decodes the two packed 4:2:2 YUV formats (`YUY2` / `UYVY`) in its fragment
 /// function; the offscreen-plain CPU converter covers the same set.
 const fn is_conversion_source(fmt: u32) -> bool {
-    is_render_target_format(fmt) || matches!(fmt, D3DFMT_YUY2 | D3DFMT_UYVY)
+    mtld3d_core::format::is_render_target_format(fmt) || matches!(fmt, D3DFMT_YUY2 | D3DFMT_UYVY)
 }
 
 /// `CheckDeviceFormatConversion`: whether `StretchRect` converts `src` into `dst`.
@@ -366,80 +364,18 @@ const fn is_cube_texture_format(fmt: u32) -> bool {
         && !is_depth_stencil_format(fmt)
 }
 
-// Formats the Metal backend can render into, as a pure format-family predicate.
-//
-// `R5G6B5` and `A1R5G5B5` map bit-for-bit to the native `B5G6R5Unorm` /
-// `BGR5A1Unorm` Metal formats, which are colour-renderable on Apple GPUs, so
-// they are valid render targets there — but only there: on a device without
-// the packed 16-bit formats they are sampling-only (expanded to BGRA8 at
-// upload), and every advertisement or create gate must use
-// `is_render_target_format_on_device` instead of this predicate. This pure
-// form remains for the sites where the answer is device-independent: the
-// backbuffer question (`CheckDeviceType` — the CAMetalLayer is hardcoded
-// BGRA8 and `d3d9_create_device` substitutes it for a 16-bit request, so a
-// 16-bit backbuffer works on every device) and the conversion SOURCE side (a
-// conversion source is sampled, never rendered into). `A4R4G4B4` is excluded
-// even on Apple GPUs: its native Metal format (`ABGR4Unorm`) has a different
-// channel order that is corrected with a sampler swizzle, and a swizzle only
-// affects reads — render writes would land in the wrong bits — so `A4R4G4B4`
-// is a sampling-only format everywhere.
-//
-// `A8B8G8R8` and `X8B8G8R8` are the reversed-channel twins of the 32-bit
-// family and back Metal's `RGBA8Unorm`, colour-renderable on both GPU
-// families, so they are render targets everywhere. `X8B8G8R8` carries the
-// same alpha-forcing swizzle `X8R8G8B8` does, which is a sampling-only view:
-// a render-target handle is always handed out unswizzled, and the X byte is
-// "don't care" on the write side anyway. Neither is a DISPLAY format, so
-// `is_present_compatible` keeps them out of the fullscreen backbuffer answer.
-// `R8G8B8` is deliberately absent: it has no Metal counterpart at all and is
-// widened to BGRA8 by the upload pass, so rendering into it would break the
-// same Lock/readback fidelity the expanded 16-bit formats are held out for.
-//
-// The float family is renderable on every device: Metal's pixel-format
-// capability table lists R16Float / RG16Float / RGBA16Float and R32Float /
-// RG32Float / RGBA32Float as colour-renderable for both the Apple and the
-// Mac2 GPU families, so the answer needs no device query. Linear FILTERING is
-// the half that differs, and it is not this predicate: the half-float members
-// filter everywhere, while the single-precision three depend on
-// `MTLDevice.supports32BitFloatFiltering`, which `CheckDeviceFormat` answers
-// from the device for `D3DUSAGE_QUERY_FILTER`
-// (`format::supports_usage_query`). Engines that render HDR internally (an
-// off-screen float scene target, their own tone-map into the 8-bit
-// backbuffer) probe exactly this before choosing their scene format.
-pub const fn is_render_target_format(fmt: u32) -> bool {
-    matches!(
-        fmt,
-        D3DFMT_A8R8G8B8
-            | D3DFMT_X8R8G8B8
-            | D3DFMT_A8B8G8R8
-            | D3DFMT_X8B8G8R8
-            | D3DFMT_R5G6B5
-            | D3DFMT_A1R5G5B5
-            | D3DFMT_G16R16
-            | D3DFMT_A16B16G16R16
-            | D3DFMT_R16F
-            | D3DFMT_G16R16F
-            | D3DFMT_A16B16G16R16F
-            | D3DFMT_R32F
-            | D3DFMT_G32R32F
-            | D3DFMT_A32B32G32R32F
-    )
-}
-
-/// [`is_render_target_format`], restricted to what this device renders into.
+/// `mtld3d_core::format::is_render_target_format_device`, keyed on the config.
 ///
-/// On a device without the native packed 16-bit formats, `R5G6B5` and
-/// `A1R5G5B5` drop out: they are backed by BGRA8 and sampled fine, but a
-/// BGRA8-backed "16-bit render target" would change `GetRenderTargetData` /
-/// `LockRect` readback fidelity and need pack-down machinery, so the honest
-/// answer is to not advertise them (engines probe
-/// `CheckDeviceFormat(RENDERTARGET)` and fall back to X8R8G8B8). Every
-/// advertisement arm and create gate that concerns actually rendering into a
-/// surface uses this form.
+/// The form every advertisement arm and create gate that concerns actually
+/// rendering into a surface uses. `expand_packed16` is the interface's
+/// `intel.expandPacked16`; the pure format family is the core predicate, and
+/// callers that need the device-independent answer (the conversion SOURCE
+/// side) reach for that one directly.
 pub fn is_render_target_format_on_device(fmt: u32, expand_packed16: bool) -> bool {
-    is_render_target_format(fmt)
-        && (native_packed16_supported(expand_packed16)
-            || !matches!(fmt, D3DFMT_R5G6B5 | D3DFMT_A1R5G5B5))
+    mtld3d_core::format::is_render_target_format_device(
+        fmt,
+        native_packed16_supported(expand_packed16),
+    )
 }
 
 /// `map_d3d_format_device` with this device's packed 16-bit answer applied.
@@ -891,20 +827,22 @@ extern "system" fn d3d9_check_device_type(
     } else {
         bb_format
     };
-    // The backbuffer must be a renderable colour surface, and presentable to
-    // the display format: in windowed mode via a supported format conversion
-    // (the same predicate `CheckDeviceFormatConversion` answers with, so the
-    // two agree for every pair); in fullscreen it must match the display
-    // format's colour family directly. A 16-bit windowed backbuffer is
-    // therefore advertised; `CreateDevice` substitutes the BGRA8 layer format
-    // for it (`warn_unsupported_backbuffer_format`).
-    let presentable = is_render_target_format(effective_bb)
+    // The backbuffer must be a colour surface THIS device renders into, and
+    // presentable to the display format: in windowed mode via a supported
+    // format conversion (the same predicate `CheckDeviceFormatConversion`
+    // answers with, so the two agree for every pair); in fullscreen it must
+    // match the display format's colour family directly. The runtime asserts
+    // `CheckDeviceType(windowed) == CheckDeviceFormat(RT, bb) &&
+    // CheckDeviceFormatConversion(bb, display)`, so the renderable half is
+    // the device-restricted answer: where the packed 16-bit formats are
+    // expansion-backed, a 16-bit back buffer is refused here as well, and an
+    // engine picks X8R8G8B8 the way hardware without 16-bit render targets
+    // made it. `CreateDevice` stays lenient and substitutes the BGRA8 layer
+    // format for a 16-bit request (`warn_unsupported_backbuffer_format`).
+    let expand_packed16 = d3d.config().expand_packed16;
+    let presentable = is_render_target_format_on_device(effective_bb, expand_packed16)
         && if windowed != 0 {
-            is_format_conversion_supported(
-                effective_bb,
-                adapter_format,
-                d3d.config().expand_packed16,
-            )
+            is_format_conversion_supported(effective_bb, adapter_format, expand_packed16)
         } else {
             is_present_compatible(effective_bb, adapter_format)
         };
@@ -1069,13 +1007,18 @@ extern "system" fn d3d9_check_device_format(
         return D3DERR_NOTAVAILABLE;
     }
     // D3DUSAGE_AUTOGENMIPMAP needs render-target capability even when the
-    // query does not include D3DUSAGE_RENDERTARGET. Metal mip generation is
-    // available for renderable 2D and cube color formats. Deliberately the
-    // pure predicate: on a device that expands the packed 16-bit formats the
-    // backing is BGRA8 (renderable everywhere), so `generateMipmaps` still
-    // works for R5G6B5/A1R5G5B5 and the NOAUTOGEN answer stays identical
-    // across device kinds.
-    if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && !is_render_target_format(check_format) {
+    // query does not include D3DUSAGE_RENDERTARGET, so the answer is the
+    // device's render-target answer for the format: a caller derives the one
+    // from the other and the two must agree. On a device that expands the
+    // packed 16-bit formats `generateMipmaps` would still work on the BGRA8
+    // backing, but advertising mip generation for a format the same interface
+    // refuses as a render target is the contradiction, so R5G6B5/A1R5G5B5
+    // answer NOAUTOGEN there. The create is unaffected: `D3DOK_NOAUTOGEN` is
+    // a success code, and a texture created with the usage anyway keeps its
+    // generated chain.
+    if usage & D3DUSAGE_AUTOGENMIPMAP != 0
+        && !is_render_target_format_on_device(check_format, cfg.expand_packed16)
+    {
         return D3DOK_NOAUTOGEN;
     }
     mtld3d_shared::log_once_debug_by!(

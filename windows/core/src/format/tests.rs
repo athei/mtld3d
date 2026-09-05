@@ -8,7 +8,10 @@
 //! wide-channel family (16-bit unorm and the floats): Metal format, pitch,
 //! and the missing-channel swizzle, plus `is_mapped_color_format` tracking
 //! the lookup table. `format_name` is pinned on both sides: a mapped name,
-//! and the fixed unknown fallback that callers log the raw code beside.
+//! and the fixed unknown fallback that callers log the raw code beside. The
+//! render-target family is pinned in both its forms: the pure one, and the
+//! device one where the two packed 16-bit members whose Metal counterpart is
+//! missing drop out while nothing else moves.
 
 use mtld3d_types::{D3DUSAGE_NONSECURE, D3DUSAGE_WRITEONLY};
 
@@ -316,6 +319,120 @@ fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support()
     let bgra = map_d3d_format_device(D3DFMT_A8R8G8B8, false).expect("mapped");
     assert_eq!(bgra.metal_pixel_format(), PixelFormat::Bgra8Unorm);
     assert_eq!(bgra.bytes_per_pixel(), 4);
+}
+
+#[test]
+fn the_render_target_family_holds_the_formats_a_colour_attachment_accepts() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_L8, D3DFMT_X1R5G5B5};
+
+    use super::is_render_target_format;
+
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_X8B8G8R8,
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_G16R16,
+        D3DFMT_A16B16G16R16,
+        D3DFMT_R16F,
+        D3DFMT_G16R16F,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_R32F,
+        D3DFMT_G32R32F,
+        D3DFMT_A32B32G32R32F,
+    ] {
+        assert!(is_render_target_format(fmt), "format {fmt} renders");
+    }
+    // The swizzled pair reads through a channel correction a render write
+    // cannot undo, R8G8B8 has no Metal counterpart and is widened on upload,
+    // and the compressed and single-channel formats no D3D9 device rendered
+    // into stay out.
+    for fmt in [
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_R8G8B8,
+        D3DFMT_DXT1,
+        D3DFMT_A8,
+        D3DFMT_L8,
+        D3DFMT_D24S8,
+    ] {
+        assert!(
+            !is_render_target_format(fmt),
+            "format {fmt} does not render"
+        );
+    }
+}
+
+#[test]
+fn only_the_native_packed_16_bit_pair_drops_out_of_the_device_answer() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_X1R5G5B5};
+
+    use super::{is_render_target_format, is_render_target_format_device};
+
+    // With the native formats the device answer is the pure family exactly.
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_DXT1,
+    ] {
+        assert_eq!(
+            is_render_target_format_device(fmt, true),
+            is_render_target_format(fmt),
+            "format {fmt} under native packed 16-bit support"
+        );
+    }
+    // Without them the two members whose Metal counterpart is missing drop
+    // out; `map_d3d_format_device` backs them with Bgra8Unorm, which samples
+    // but would not read back at the source layout a Lock reports.
+    for fmt in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5] {
+        assert!(
+            is_render_target_format(fmt),
+            "format {fmt} renders natively"
+        );
+        assert!(
+            !is_render_target_format_device(fmt, false),
+            "format {fmt} is expansion-backed and does not render"
+        );
+        assert_eq!(
+            super::map_d3d_format_device(fmt, false)
+                .expect("mapped")
+                .metal_pixel_format(),
+            PixelFormat::Bgra8Unorm,
+            "format {fmt} is the expanded backing the answer is denied for"
+        );
+    }
+    // Nothing else moves with the flag.
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_X8B8G8R8,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_G16R16,
+        D3DFMT_A16B16G16R16,
+        D3DFMT_R16F,
+        D3DFMT_G16R16F,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_R32F,
+        D3DFMT_G32R32F,
+        D3DFMT_A32B32G32R32F,
+        D3DFMT_R8G8B8,
+        D3DFMT_DXT1,
+    ] {
+        assert_eq!(
+            is_render_target_format_device(fmt, false),
+            is_render_target_format_device(fmt, true),
+            "format {fmt} does not depend on the packed 16-bit answer"
+        );
+    }
 }
 
 #[test]

@@ -312,9 +312,14 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **4 `real` · 124 `expected` ·
+re-checked before retagging. Headline: **2 `real` · 124 `expected` ·
 4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 24
-Apple-family subtest-legs `crash=0`. (2026-09-05: the `scale` legs added 33
+Apple-family subtest-legs `crash=0`. (2026-09-05: the two answers a device
+without the packed 16-bit formats derives from its render-target answer,
+`CheckDeviceType` for a 16-bit back buffer and the `AUTOGENMIPMAP` probe, were
+made to follow it, so device.c:3626 and device.c:7927 dropped off the Intel
+legs and their clusters left the audit.)
+(2026-09-05: the `scale` legs added 33
 visual.c sites in twelve clusters, 32 of them `expected` for the one reason
 "The scaled leg" below gives and one `real`, `resz_test` 17946, issue #407;
 they carry no device.c site of their own since #408.) (2026-09-05: the `@mac2` legs, recorded
@@ -324,14 +329,14 @@ property of that machine, its single-mode display or the GPU family, in the
 `fp_special_test`, `test_multisample_get_front_buffer_data` and
 `multisampled_depth_buffer_test` clusters; the eight `@mac2` subtest-legs are
 `crash=0` too.) (2026-09-04: the Intel legs, which run every subtest
-under the `intel.*` config keys, added device.c:3626 and 7927 as `real`
-(issue #362) and visual.c:28024 as `caps`; no site moved under the two
-keys that change only a code path, `intel.managedMemory` and
-`intel.linearAlign256`. On the Apple family the `ceiling` and `flaky` pins of
-the native device legs are carried on the Intel legs at the same counts, since
-the environment they depend on is the same; the `@mac2` legs, recorded on the
-Intel CI image, carry their own counts, see the family paragraph under
-"Running".) (2026-08-27: device.c:15088 moved from `expected`
+under the `intel.*` config keys, added device.c:3626, 7927 and 8181 as `real`
+(issues #362, #363; all three are fixed and gone) and visual.c:28024 as
+`caps`; no site moved under the two keys that change only a code path,
+`intel.managedMemory` and `intel.linearAlign256`. On the Apple family the
+`ceiling` and `flaky` pins of the native device legs are carried on the Intel
+legs at the same counts, since the environment they depend on is the same; the
+`@mac2` legs, recorded on the Intel CI image, carry their own counts, see the
+family paragraph under "Running".) (2026-08-27: device.c:15088 moved from `expected`
 to `ceiling`, it fires only where the Wine build ships a loadable d3d12.dll;
 the SRGBTEXTURE decode landing the same day changed no site counts — the
 newly-running `srgbtexture_test` passes. 2026-08-28: honouring
@@ -465,10 +470,7 @@ site the legs carry is `resz_test` 17946 (#407).
 
 ### The `real` backlog
 
-Two sites, device.c:3626 and device.c:7927, both on the Intel legs only and
-neither reachable on Apple Silicon: `CheckDeviceType` and the `AUTOGENMIPMAP`
-probe keep advertising 16-bit formats on a device that cannot render them,
-while `CheckDeviceFormat(RENDERTARGET)` denies them (issue #362).
+Empty. No failing site is classified `real` on any leg.
 
 Every other failing site is a recorded decision (`expected`), a capability we
 do not advertise (`caps`), a pin that reads zero on other hardware
@@ -717,26 +719,6 @@ render-target row of that check, so it fires on the native legs only: on the
 Intel legs R5G6B5 is no render target and the answer is the NOTAVAILABLE the
 test expects.
 
-### device.c/test_check_device_type
-Sites: 3626=real
-
-Intel legs only. The test derives the expected `CheckDeviceType` answer from
-`CheckDeviceFormat(RENDERTARGET, back buffer)`: where the back-buffer format
-is no render target, the device type must be refused. On a device without
-the packed 16-bit formats we deny R5G6B5 / A1R5G5B5 as render targets and
-still accept them as back buffers, windowed and fullscreen, because
-`CreateDevice` serves any 16-bit back buffer through the BGRA8 layer format.
-The two answers contradict each other on that device (issue #362); on Apple
-Silicon both are yes and the site never fires.
-
-### device.c/test_mipmap_gen
-Sites: 7927=real
-
-Intel legs only. For a texture format the device does not render, the
-`AUTOGENMIPMAP` probe must answer `D3DOK_NOAUTOGEN`; we answer D3D_OK for
-A1R5G5B5 while denying it as a render target, because mip generation works on
-the BGRA8 backing the expansion path gives it. Same inconsistency as
-test_check_device_type, same issue (#362).
 
 ### device.c/test_miptree_layout
 Sites: 12784=expected 12823=expected
