@@ -8023,7 +8023,7 @@ impl FrameEncoder {
     /// per-frame retention queues need draining: their `MTLBuffers` were
     /// already slated for release once the GPU finished, and Reset's GPU
     /// idle wait is exactly that signal.
-    fn reset_cleanup(&mut self) {
+    fn reset_cleanup(&mut self, retired_textures: &[u64]) {
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
         let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
@@ -8032,13 +8032,29 @@ impl FrameEncoder {
         drop(held);
         self.pending_blit_retention.clear();
         self.current_blit_retention.clear();
+        // The implicit surfaces the caller is about to destroy never pass
+        // through the retention queue, so this is their only chance to leave
+        // the handle-keyed records. The wait above has retired every
+        // submission that named them, and Metal hands a freed address to the
+        // next allocation, so a record left behind would answer for whatever
+        // lands there.
+        for &handle in retired_textures {
+            // SAFETY: `device_reset` fills the list from the device's
+            // `MetalHandle<MTLTextureKind>` slots, so each value is an
+            // `MTLTexture` handle; both calls only hash it.
+            let texture = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
+            self.pass_state.unregister_srgb_twin(texture);
+            self.retire_texture_handle(handle);
+        }
     }
 
     /// Drain resource + visibility retention into the caller's `buffers` / `textures` Vecs.
     ///
     /// They merge with the live-cache handles the caller already collected.
     /// Returns the held backings (both `PageBox` and `Arc<PageBox>`
-    /// variants), then `wait_for_gpu_idle`. Does NOT touch the
+    /// variants), then `wait_for_gpu_idle`. The visibility pool is drained
+    /// after that wait, and the intake that finalizes the queries counting
+    /// into it runs between the two. Does NOT touch the
     /// `pending_blit_retention` / `current_blit_retention` Arcs (those must
     /// outlive the bulk destroy of the staging `MTLBuffers` that wrap them
     /// via `bytesNoCopy`). Caller drops the returned `HeldBackings` after
@@ -8092,13 +8108,6 @@ impl FrameEncoder {
                 held.staging_arcs.push(arc);
             }
         }
-        for vis_buf in self.visibility.drain_all_buffers() {
-            let (page_box, handle, _seq) = vis_buf.into_parts();
-            if !handle.is_null() {
-                buffers.push(handle.raw());
-            }
-            held.pageboxes.push(page_box);
-        }
         let fan = core::mem::replace(&mut self.fan_index_buffer, FanIndexBuffer::EMPTY);
         if !fan.handle.is_null() {
             buffers.push(fan.handle.raw());
@@ -8107,6 +8116,18 @@ impl FrameEncoder {
             held.pageboxes.push(page_box);
         }
         self.wait_for_gpu_idle();
+        // Finalize before the pool goes: the wait has retired the frame that
+        // carried the last `Issue(END)`, and the drain below takes the slot
+        // arrays its counts are summed from. A query left `Pending` here is
+        // one the application still holds and can only ever read as `S_FALSE`.
+        self.intake_visibility();
+        for vis_buf in self.visibility.drain_all_buffers() {
+            let (page_box, handle, _seq) = vis_buf.into_parts();
+            if !handle.is_null() {
+                buffers.push(handle.raw());
+            }
+            held.pageboxes.push(page_box);
+        }
         held
     }
 
@@ -8820,9 +8841,12 @@ impl EncoderThread {
     /// and creating their replacements: the cleanup waits for GPU idle so
     /// no in-flight command buffer references the textures we're about to
     /// destroy.
-    pub fn reset(&self) {
+    pub fn reset(&self, retired_textures: Vec<u64>) {
         let (ack_tx, ack_rx) = mpsc::sync_channel(0);
-        let _ = self.sender.send(EncoderMessage::Reset { ack: ack_tx });
+        let _ = self.sender.send(EncoderMessage::Reset {
+            retired_textures,
+            ack: ack_tx,
+        });
         let _ = ack_rx.recv();
     }
 }
@@ -8880,6 +8904,13 @@ enum EncoderMessage {
     /// encoder keeps running afterward with the new handles arriving via
     /// the next `FrameData`.
     Reset {
+        /// `MTLTexture` handles the caller destroys the moment this is acknowledged.
+        ///
+        /// The implicit surfaces (back buffer, its sRGB view, the
+        /// multisampled pair, the depth surface) leave through a direct
+        /// bulk destroy rather than through the retention queue, so the
+        /// pass state is told about them here instead of at a drain.
+        retired_textures: Vec<u64>,
         ack: mpsc::SyncSender<()>,
     },
     Shutdown,
@@ -9058,12 +9089,15 @@ fn encoder_thread_main(
                 enc.intake_visibility();
                 let _ = done.send(());
             }
-            Ok(EncoderMessage::Reset { ack }) => {
+            Ok(EncoderMessage::Reset {
+                retired_textures,
+                ack,
+            }) => {
                 mtld3d_shared::crumb!("phase:RecvReset");
                 // Commit every in-flight async frame before the reset tears
                 // down / recreates the backbuffer + depth they reference.
                 enc.drain_submit_thread();
-                enc.reset_cleanup();
+                enc.reset_cleanup(&retired_textures);
                 let _ = ack.send(());
             }
             Ok(EncoderMessage::Shutdown) | Err(_) => {

@@ -445,3 +445,44 @@ fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
         "a query the frame had no slot left for, with a draw in it, reads fully visible"
     );
 }
+
+#[test]
+fn an_ended_span_is_finalized_by_the_reset_that_flushes_its_frame() {
+    // A resizing `Reset` flushes the frame the application is recording,
+    // which is the frame carrying the last `Issue(END)` before it, waits for
+    // the GPU, and then takes the visibility pool down. The count has to be
+    // summed out of that pool while it is still there: a query left `Pending`
+    // is one the application still holds, and every later `GetData` for it
+    // answers `S_FALSE`. Under `query.flushImmediate=false` that makes the
+    // blocking arm a poll loop with no end, which is why the key is pinned
+    // here rather than left at the permissive stub the default gives.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let (width, height) = h.dims();
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the counted draw");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    // No Present: the Reset's own flush is what submits the counting frame,
+    // so the span is queued after that frame's intake has already run.
+    assert_eq!(
+        h.reset(width / 2, height / 2),
+        0,
+        "resize Reset must succeed"
+    );
+
+    let count = occlusion_count(&q, "the span the Reset flushed");
+    let expected = width * height;
+    assert!(
+        count.abs_diff(expected) <= expected / 100,
+        "the span counted its draw against the pre-Reset target \
+         (~{expected} samples), got {count}"
+    );
+}

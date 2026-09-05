@@ -3103,6 +3103,48 @@ fn unregister_texture_re_arms_the_frame_scoped_sets() {
     );
 }
 
+/// A replaced back-buffer view retires the registration the old one held.
+///
+/// `Reset` destroys the back buffer together with its sRGB view and creates
+/// both again, and Metal hands the freed address back for the replacement
+/// readily enough that the texture can come back at the address it had while
+/// the view behind it is a different object. The retired view's entry would
+/// otherwise resolve every texture allocated at its address to this back
+/// buffer, which is a colour target a pass is free to be held ahead of.
+#[test]
+fn a_replaced_backbuffer_view_retires_the_old_registration() {
+    let mut s = fresh();
+    let replacement = tex(0x1002);
+    assert_eq!(
+        s.twin_of(backbuffer()),
+        backbuffer_srgb(),
+        "the frame registers the pair it was handed",
+    );
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: replacement,
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    assert_eq!(
+        s.twin_of(backbuffer()),
+        replacement,
+        "the fresh view takes the slot",
+    );
+    assert!(
+        !s.srgb_twin_to_base.contains_key(&backbuffer_srgb()),
+        "the retired view no longer names a base",
+    );
+}
+
 /// A retired depth handle stops being sampleable, so its address can be reused.
 ///
 /// Metal is free to hand the address of a destroyed `MTLTexture` back for the
