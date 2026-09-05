@@ -18,6 +18,7 @@ use mtld3d_core::{
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
+    dirty_rect::DirtyRect,
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
         declared_ps_samplers, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
@@ -46,6 +47,7 @@ use mtld3d_core::{
     stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
+    upload_redirty::{RedirtyEntry, RedirtyQueue, RedirtySubresource},
     visibility::{
         MAX_SLOTS, RetiredVisibilityBuffer, SLOT_BYTES, VisibilityQueryCore, VisibilityQueryState,
     },
@@ -350,6 +352,66 @@ pub struct TextureUploadJob {
     /// single-slice `bytes_per_image` from the region's block-row count
     /// instead.
     pub slice_pitch: u32,
+    /// Where a job that emits nothing reports itself.
+    ///
+    /// The dirty state this upload was built from is already cleared when
+    /// the encoder thread sees the job, so a decline that stayed on this
+    /// thread would lose the region: `UnlockRect` publishes only the
+    /// rectangle the game locked and nothing re-announces the rest. The
+    /// queue carries the subresource and the rectangle back to the API
+    /// thread, which marks them dirty again for the next bind.
+    pub redirty: Arc<RedirtyQueue>,
+}
+
+impl TextureUploadJob {
+    /// The subresource key this job's decline record is filed under.
+    fn redirty_subresource(&self) -> RedirtySubresource {
+        RedirtySubresource {
+            texture_id: self.info.texture_id,
+            index: u32::try_from(self.staging_index).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The region this job was carrying, as a dirty rectangle.
+    const fn redirty_rect(&self) -> DirtyRect {
+        DirtyRect {
+            x: self.origin_x,
+            y: self.origin_y,
+            w: self.region_w,
+            h: self.region_h,
+        }
+    }
+}
+
+/// Hand an upload the encoder emitted nothing for back to the API thread.
+///
+/// The scheduler cleared the subresource's dirty bit and took its pending
+/// rectangle before the job crossed to this thread, so without this the
+/// region is lost: `UnlockRect` publishes only the rectangle the game
+/// locked, and nothing re-announces the rest until the game writes those
+/// texels again. The queue carries the rectangle back and the next bind
+/// retries. `reason` names the emit path that produced nothing, so a
+/// subresource that spends its retry budget says which one on the way out.
+fn decline_texture_upload(job: &TextureUploadJob, reason: &str) {
+    let subresource = job.redirty_subresource();
+    let entry = RedirtyEntry {
+        subresource,
+        face: job.destination_slice,
+        level: job.level,
+        rect: job.redirty_rect(),
+    };
+    if job.redirty.decline(entry) {
+        return;
+    }
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: subresource.texture_id.raw(),
+        "run_texture_upload: texture {:#x} subresource {} has declined its upload \
+         {} times ({reason}); the region keeps whatever the texture holds",
+        subresource.texture_id.raw(),
+        subresource.index,
+        mtld3d_core::upload_redirty::MAX_REDIRTY_ATTEMPTS,
+    );
 }
 
 /// Per-mip `MTLBuffer` wrapper for texture staging.
@@ -6315,10 +6377,20 @@ impl FrameEncoder {
                         entry.attempts(),
                     );
                 }
-                // Acknowledged, or the game released the texture so the
-                // replay had no destination: dropping the job releases the
-                // staging Arc clone, which is all the entry owns.
-                UploadFate::Released | UploadFate::Reissue => {}
+                // The replay emitted nothing: the game released the
+                // texture, or the blit path declined it. Report it so the
+                // API thread restores the mip's dirty state and the next
+                // bind schedules the upload again; an entry naming a
+                // texture that is gone is dropped at the drain.
+                UploadFate::Reissue => {
+                    decline_texture_upload(
+                        entry.payload(),
+                        "the aborted-submit replay emitted nothing",
+                    );
+                }
+                // Acknowledged: dropping the job releases the staging Arc
+                // clone, which is all the entry owns.
+                UploadFate::Released => {}
             }
         }
     }
@@ -6604,7 +6676,13 @@ impl FrameEncoder {
     pub fn run_texture_upload(&mut self, job: TextureUploadJob) {
         let mut handle = self.get_or_create_texture(&job.info);
         if handle == 0 {
-            error!(target: LOG_TARGET, "run_texture_upload: texture handle creation failed");
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: job.info.texture_id.raw(),
+                "run_texture_upload: texture {:#x} handle creation failed",
+                job.info.texture_id.raw(),
+            );
+            decline_texture_upload(&job, "no destination texture");
             return;
         }
         // Per-draw texture versioning: this blit lands in the frame-head
@@ -6643,6 +6721,7 @@ impl FrameEncoder {
             } else {
                 handle = self.rename_sampled_texture(&job, handle);
                 if handle == 0 {
+                    decline_texture_upload(&job, "the sampled-texture rename found no destination");
                     return;
                 }
             }
@@ -6655,6 +6734,10 @@ impl FrameEncoder {
             self.run_texture_upload_blit(&job, handle)
         };
         if emitted {
+            // The subresource reached the command stream, so its decline
+            // record (if it had one) has served its purpose and its retry
+            // budget goes back.
+            job.redirty.note_emitted(job.redirty_subresource());
             // Keep the job so an aborted upload command buffer can replay
             // it. It only holds a clone of the texture's own persistent
             // staging Arc, so the memory cost is the clone.
@@ -6663,6 +6746,8 @@ impl FrameEncoder {
                 self.current_submit_seq,
                 job,
             );
+        } else {
+            decline_texture_upload(&job, "the blit path emitted nothing");
         }
     }
 
@@ -7097,10 +7182,13 @@ impl FrameEncoder {
             return Some(true);
         }
         if mtld3d_core::upload_pass::is_expansion(decode) {
-            mtld3d_shared::log_once_warn!(
+            mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                "run_texture_upload: the upload pass declined a texel-widening expansion; no \
-                 blit can widen those texels, so the mip keeps its previous contents",
+                key: job.info.texture_id.raw(),
+                "run_texture_upload: the upload pass declined a texel-widening expansion for \
+                 texture {:#x}; no blit can widen those texels, so the mip keeps its previous \
+                 contents until the upload is retried",
+                job.info.texture_id.raw(),
             );
             return Some(false);
         }

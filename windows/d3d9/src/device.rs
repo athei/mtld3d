@@ -33,6 +33,7 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
+    upload_redirty::RedirtyQueue,
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
@@ -667,6 +668,16 @@ pub struct DeviceInner {
     /// create, release and Evict run one at a time, on the API thread or
     /// serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`.
     live_textures: Mutex<Vec<*mut TextureInner>>,
+    /// Uploads the encoder emitted nothing for, waiting to be marked dirty again.
+    ///
+    /// The bind-time flush clears a level's dirty bit and takes its pending
+    /// rectangle before the job crosses to the encoder thread, and
+    /// `UnlockRect` publishes only the rectangle the game locked, so a
+    /// decline downstream of the hand-off would otherwise leave the region
+    /// unannounced for the rest of the run. The encoder files the
+    /// subresource and its rectangle here; [`Self::apply_upload_redirty`]
+    /// drains the queue once a frame and marks them dirty again.
+    upload_redirty: Arc<RedirtyQueue>,
     /// Per-draw snapshot dirty-bitmask.
     ///
     /// Each bit marks one `CurrentSnapshot` piece as needing rebuild on the
@@ -1814,6 +1825,7 @@ impl DeviceInner {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
+        self.apply_upload_redirty();
         let (frame, seq) = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
@@ -2033,6 +2045,66 @@ impl DeviceInner {
         mtld3d_shared::log_once_info!(
             target: TEX_TRACE_TARGET,
             "EvictManagedResources: marked {evicted_count} textures dirty (cache eviction queued)"
+        );
+    }
+
+    /// The queue an upload job reports a failed emission to.
+    ///
+    /// Cloned onto every `TextureUploadJob`, so a job that emits nothing
+    /// names the device whose textures it belongs to without the encoder
+    /// having to track which device it is draining for.
+    pub fn upload_redirty(&self) -> Arc<RedirtyQueue> {
+        Arc::clone(&self.upload_redirty)
+    }
+
+    /// Mark every upload the encoder emitted nothing for dirty again.
+    ///
+    /// Runs once per `Present`, before the frame is stamped, so the next
+    /// frame's bind-time flush re-schedules the region. A texture released
+    /// between the decline and this drain has left the registry, and its
+    /// entries are dropped with it.
+    fn apply_upload_redirty(&self) {
+        if !self.upload_redirty.has_pending() {
+            return;
+        }
+        let entries = self.upload_redirty.take_pending();
+        if entries.is_empty() {
+            return;
+        }
+        let live: Vec<*mut TextureInner> = self
+            .live_textures
+            .lock()
+            .expect("live_textures mutex poisoned")
+            .clone();
+        let by_id: rustc_hash::FxHashMap<TextureId, *mut TextureInner> = live
+            .into_iter()
+            .map(|ptr| {
+                // SAFETY: `ptr` is a snapshot from `live_textures`; entries
+                // are removed before the `TextureInner` Box is freed, and
+                // nothing frees one while the API thread runs this.
+                let id = unsafe { &*ptr }.texture_id();
+                (id, ptr)
+            })
+            .collect();
+        let mut restored = 0u32;
+        for entry in &entries {
+            let Some(&ptr) = by_id.get(&entry.subresource.texture_id) else {
+                continue;
+            };
+            // SAFETY: same contract as the map build above.
+            let ti = unsafe { &mut *ptr };
+            crate::texture::redirty_declined_upload(
+                ti,
+                entry.face,
+                entry.level as usize,
+                entry.rect,
+            );
+            restored += 1;
+        }
+        mtld3d_shared::log_once_info!(
+            target: TEX_TRACE_TARGET,
+            "upload redirty: {restored} of {} declined uploads marked dirty again",
+            entries.len()
         );
     }
 
@@ -2736,6 +2808,7 @@ impl Direct3DDevice9 {
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
             live_textures: Mutex::new(Vec::new()),
+            upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: CurrentSnapshot::EMPTY,
             frame_dump: frame_dump::FrameDump::IDLE,
