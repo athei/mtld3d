@@ -34,6 +34,7 @@ use mtld3d_core::{
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
     upload_redirty::RedirtyQueue,
+    validate_device::{StageFilterVerdict, stage_filter_verdict},
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
@@ -44,23 +45,24 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
-    D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE, D3DFMT_ATI1, D3DFMT_INDEX16,
-    D3DFMT_INDEX32, D3DFMT_UYVY, D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
-    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
-    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
-    D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
-    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
-    D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
-    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
-    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR,
-    D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE,
-    D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
-    D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS,
-    D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
-    D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
-    D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
+    D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
+    D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
+    D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC,
+    D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL, D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE,
+    D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
+    D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS,
+    D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
+    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
+    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
+    D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE,
+    D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE,
+    D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE,
+    D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
@@ -71,9 +73,9 @@ use mtld3d_types::{
     D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
     D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
     D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES,
-    D3DUSAGE_POINTS, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
-    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
-    SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
+    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
+    D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl,
+    RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -9728,14 +9730,80 @@ extern "system" fn device_set_sampler_state(
     0 // S_OK
 }
 
+/// The `ValidateDevice` answer of the first sampler stage that rejects its filters.
+///
+/// Walks the sixteen fragment stages and then the four vertex-texture slots,
+/// so the stage reported is the lowest-numbered one that fails. `None` means
+/// every stage's filter setup runs, which is the only case that reports a
+/// pass count.
+fn rejected_filter_stage(dev: &DeviceInner) -> Option<i32> {
+    let float32_filtering =
+        crate::direct3d9::float32_filtering_supported(dev.config().deny_float32_filtering);
+    let filterable = |texture: *mut Direct3DTexture9| {
+        if texture.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null slot holds a live `Direct3DTexture9`; the binding
+        // owns a reference for as long as the slot does.
+        let format = unsafe { (*texture).d3d_format() };
+        Some(mtld3d_core::format::supports_usage_query(
+            format,
+            D3DUSAGE_QUERY_FILTER,
+            float32_filtering,
+        ))
+    };
+    let fragment = (0..STAGE_COUNT).map(|stage| {
+        (
+            dev.stage_bindings().sampler_states(stage),
+            dev.stage_bindings().texture(stage),
+        )
+    });
+    let vertex = dev
+        .vertex_sampler_states
+        .iter()
+        .zip(dev.vertex_textures.iter())
+        .map(|(states, texture)| (*states, texture.raw()));
+    for (sampler, (states, texture)) in fragment.chain(vertex).enumerate() {
+        match stage_filter_verdict(&states, filterable(texture)) {
+            StageFilterVerdict::Valid => {}
+            StageFilterVerdict::FilterDisabled => {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "IDirect3DDevice9::ValidateDevice: sampler {sampler} disables its mag or min \
+                     filter → UNSUPPORTEDTEXTUREFILTER"
+                );
+                return Some(D3DERR_UNSUPPORTEDTEXTUREFILTER);
+            }
+            StageFilterVerdict::TextureNotFilterable => {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "IDirect3DDevice9::ValidateDevice: sampler {sampler} filters a texture the \
+                     device point-samples → E_FAIL"
+                );
+                return Some(E_FAIL);
+            }
+        }
+    }
+    None
+}
+
 extern "system" fn device_validate_device(this: *mut c_void, num_passes: *mut u32) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // Metal validates pipeline state at PSO-creation time, and every
-    // fixed-function / shader state combination we accept renders in a single
-    // pass, so the current device state is always single-pass valid. Report one
-    // pass and succeed. Returning INVALIDCALL would
-    // wrongly push games onto a multi-pass / capability-fallback path.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return D3DERR_INVALIDCALL;
+    };
+    // A sampler stage whose filters cannot run is the one thing D3D9 reports
+    // here, and the pass count is left untouched when it does.
+    if let Some(hr) = rejected_filter_stage(obj.inner()) {
+        return hr;
+    }
+    // Metal validates the rest of the pipeline state at PSO-creation time, and
+    // every fixed-function / shader state combination we accept renders in a
+    // single pass, so the remaining state is always single-pass valid. Report
+    // one pass and succeed. Returning INVALIDCALL would wrongly push games onto
+    // a multi-pass / capability-fallback path.
     if !num_passes.is_null() {
         // SAFETY: caller-supplied writable `u32` out-param per the D3D9 ABI.
         unsafe { *num_passes = 1 };

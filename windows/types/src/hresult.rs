@@ -15,6 +15,12 @@ pub const E_NOINTERFACE: i32 = 0x8000_4002_u32.cast_signed();
 pub const E_NOTIMPL: i32 = 0x8000_4001_u32.cast_signed();
 pub const D3DERR_INVALIDCALL: i32 = 0x8876_086C_u32.cast_signed();
 pub const D3DERR_NOTAVAILABLE: i32 = 0x8876_086A_u32.cast_signed();
+/// `D3DERR_UNSUPPORTEDTEXTUREFILTER`: a sampler stage disables its mag or min filter.
+///
+/// `ValidateDevice` answers with it for any stage whose `D3DSAMP_MAGFILTER`
+/// or `D3DSAMP_MINFILTER` is `D3DTEXF_NONE`, whether or not the stage has a
+/// texture bound. `MAKE_D3DHRESULT(2082)`.
+pub const D3DERR_UNSUPPORTEDTEXTUREFILTER: i32 = 0x8876_0822_u32.cast_signed();
 pub const D3DERR_MOREDATA: i32 = 0x8876_0867_u32.cast_signed();
 pub const D3DERR_NOTFOUND: i32 = 0x8876_0866_u32.cast_signed();
 /// `D3DERR_DEVICENOTRESET`: a failed `Reset` must be retried before rendering resumes.
