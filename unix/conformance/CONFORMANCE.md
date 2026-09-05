@@ -62,6 +62,30 @@ and the job names the re-run of the failed jobs, which lands on a fresh runner.
 A hang on a real GPU is worth a look on its own (a shader that hangs the GPU is
 a bug), but the leg has to run again for its counts either way.
 
+A raw log is stdout followed by stderr, and ends with how the process ended:
+`[conformance] subtest exited: code N` or `signal N` (a number, never a name,
+so a fault the process survived cannot read as a crash to the scanner), or the
+`TIMED OUT` line when the runner killed it. A run without the framework's
+`tests executed` summary is a crash whatever else it holds, and this line is
+what tells an unhandled Win32 exception (Wine ends the process with the
+exception code, of which unix keeps the low byte: `code 5` is an access
+violation) from a signal (11 `SIGSEGV`, 10 `SIGBUS`, 6 `SIGABRT`, 9 `SIGKILL`).
+A run that reached its summary reads `code 0` once a device existed (the layer
+ends the process from its detach, see CONTRIBUTING.md), else the framework's
+failure count capped at 255.
+Each process is also told `log.dir=Z:<dir>/<leg>-<subtest>`, so its log file
+(`d3d9_test-<pid>.log`, and any GPU trace) lands in a directory beside its raw
+output, one per process. The runner's `--log <filter>` (`LOG=` for the Makefile
+targets) is the `RUST_LOG` those processes run under; the default `off` writes
+nothing, and the crash handlers' lines then go to stderr, i.e. into the raw log.
+
+A repeat run (`make conformance-isolate REPEAT=<n>`) keeps every run,
+`<leg>-<subtest>-<n>.log`, with its own log directory. Dispatching the workflow
+with `conformance_repeat=<n>` runs it on every conformance job, under
+`LOG=debug`, and uploads the lot as `conformance-raw-<image>-<arch>`: the way to
+make a subtest that dies one run in a few die in one sitting, on the machine
+where it does.
+
 There is no conformance-specific input to set. The test binaries ship inside the
 Wine SDK bundle (`$WINE_SDK/lib/wine/tests/{i386,x86_64}-windows/d3d9_test.exe`,
 published by the [wine-build](https://github.com/athei/wine-build) bundle step),

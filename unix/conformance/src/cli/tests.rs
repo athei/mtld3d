@@ -48,6 +48,16 @@ fn variant_defaults_to_native_and_parses_intel() {
 }
 
 #[test]
+fn log_defaults_to_off_and_takes_a_filter() {
+    let config = parse_args(base(&[])).unwrap();
+    assert_eq!(config.log, "off");
+    let config = parse_args(base(&["--log", "mtld3d=debug"])).unwrap();
+    assert_eq!(config.log, "mtld3d=debug");
+    let err = parse_args(base(&["--log"])).unwrap_err();
+    assert!(err.contains("--log"), "{err}");
+}
+
+#[test]
 fn assets_is_none_when_absent() {
     let config = parse_args(base(&[])).unwrap();
     assert!(config.assets.is_none());

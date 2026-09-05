@@ -26,6 +26,17 @@
 //! at startup on `CrossOver`'s arm64 Wine, and on any host it would have eaten
 //! the guest's own exception handling.
 //!
+//! One line is still written before such a fault is forwarded when its PC
+//! lies in a native image (a framework, libobjc, libsystem, Wine's own
+//! `.so`): `fault outside mtld3d.so:` with the signal number, the PC, the
+//! image and the thread. A fault there on a thread Wine does not own (ours,
+//! or a Metal completion thread) ends the process inside Wine's handler with
+//! nothing else said, and the game's log then has to name the image and the
+//! thread at least. Guest code and translated code resolve to no image and
+//! stay silent: those faults are Wine's ordinary work. The line is capped at
+//! a few per process and carries no signal name, since a fault Wine recovers
+//! must not read as a crash to anything that scans the log for one.
+//!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
 //! to the SIGABRT branch.
@@ -34,7 +45,7 @@ use core::{
     ffi::{c_int, c_void},
     mem, ptr,
 };
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use mtld3d_shared::crumb;
 
@@ -190,6 +201,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // SIGABRT is not shared this way: an abort is always terminal, and its PC
     // is inside libsystem rather than our code, so it stays ours to report.
     if signo != libc::SIGABRT && !fault_is_ours(ctx) {
+        report_foreign_fault(signo, ctx);
         forward_to_previous(signo, info, ctx);
         return;
     }
@@ -235,25 +247,11 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 
     // Faulting thread name. For a teardown race the *which thread* (API vs
     // `mtld3d-encoder` / `mtld3d-submit` / `mtld3d-prewarm`) is the first clue.
-    // `pthread_getname_np` only reads thread-local storage — signal-safe enough
-    // for a terminating handler.
     {
-        let mut name = [0u8; 64];
-        // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
-        let tid = unsafe { libc::pthread_self() };
-        // SAFETY: writes a NUL-terminated name (≤ len) into the buffer.
-        unsafe {
-            pthread_getname_np(
-                tid,
-                name.as_mut_ptr().cast::<core::ffi::c_char>(),
-                name.len(),
-            );
-        }
-        let nlen = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         let mut b = [0u8; 192];
         let mut p = 0;
         push(&mut b, &mut p, b"[mtld3d::unix] thread=");
-        push(&mut b, &mut p, &name[..nlen.min(96)]);
+        push_thread_name(&mut b, &mut p);
         push(&mut b, &mut p, b"\n");
         // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
         unsafe {
@@ -387,6 +385,80 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     unsafe { libc::_exit(1) };
 }
 
+/// Name a fault in someone else's native code before it is handed back.
+///
+/// Only when the PC resolves to an image: guest and translated code do not,
+/// and a fault there is Wine's ordinary work. Three writes rather than one
+/// buffer, because an image path can be longer than the line buffer. Stops
+/// after [`FOREIGN_REPORT_LIMIT`] lines, since a game may probe with faults
+/// of its own and every one would cost a lookup.
+fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
+    /// How many faults outside our image get a line.
+    const FOREIGN_REPORT_LIMIT: u32 = 4;
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+
+    let pc = fault_pc(ctx);
+    let Some(image) = dladdr_image(pc) else {
+        return;
+    };
+    if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
+        return;
+    }
+    let fd = crate::log_file::raw_fd();
+    let mut b = [0u8; 192];
+    let mut p = 0;
+    push(
+        &mut b,
+        &mut p,
+        b"[mtld3d::unix] fault outside mtld3d.so: signo=",
+    );
+    push_decimal(&mut b, &mut p, signo.cast_unsigned());
+    push(&mut b, &mut p, b" pc=");
+    push_hex(&mut b, &mut p, pc);
+    push(&mut b, &mut p, b" image=");
+    // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
+    unsafe {
+        let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+    }
+    // SAFETY: `image` is the NUL-terminated path dyld owns for a loaded
+    // image; `strlen` is async-signal-safe.
+    let image_len = unsafe { libc::strlen(image) };
+    // SAFETY: write(2) is async-signal-safe; `image_len` bytes at `image` are
+    // the path just measured.
+    unsafe {
+        let _ = libc::write(fd, image.cast::<c_void>(), image_len);
+    }
+    let mut b = [0u8; 192];
+    let mut p = 0;
+    push(&mut b, &mut p, b" thread=");
+    push_thread_name(&mut b, &mut p);
+    push(&mut b, &mut p, b"\n");
+    // SAFETY: as above.
+    unsafe {
+        let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+    }
+}
+
+/// Append the calling thread's name.
+///
+/// `pthread_getname_np` only reads thread-local storage, which is
+/// signal-safe enough for a terminating handler.
+fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
+    let mut name = [0u8; 64];
+    // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
+    let tid = unsafe { libc::pthread_self() };
+    // SAFETY: writes a NUL-terminated name (≤ len) into the buffer.
+    unsafe {
+        pthread_getname_np(
+            tid,
+            name.as_mut_ptr().cast::<core::ffi::c_char>(),
+            name.len(),
+        );
+    }
+    let nlen = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    push(buf, pos, &name[..nlen.min(96)]);
+}
+
 /// Scan the raw stack for return addresses into our own dylib and print them.
 ///
 /// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
@@ -465,6 +537,22 @@ fn scan_stack_for_our_frames(sp: u64) {
     }
 }
 
+/// The path of the loaded image `addr` lies in, or `None` outside every image.
+///
+/// Guest (PE) pages and translated code are not images dyld knows, so they
+/// resolve to nothing. `dladdr` allocates nothing, which is what lets a
+/// signal handler ask.
+fn dladdr_image(addr: u64) -> Option<*const core::ffi::c_char> {
+    // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
+    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
+    // SAFETY: `dladdr` reads `addr` only as an opaque value and fills `info`.
+    let ok = unsafe { libc::dladdr(addr as *const c_void, &raw mut info) };
+    if ok == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    Some(info.dli_fname)
+}
+
 /// True when `addr` resolves (via `dladdr`) into our own `.so`.
 ///
 /// The match is on a loaded image whose filename contains the bytes `mtld3d`.
@@ -476,14 +564,10 @@ fn dladdr_is_ours(addr: u64) -> bool {
     /// Bound on the path scan, so a corrupt `dli_fname` can't spin.
     const PATH_MAX_SCAN: usize = 4096;
 
-    // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
-    let mut info: libc::Dl_info = unsafe { mem::zeroed() };
-    // SAFETY: `dladdr` reads `addr` only as an opaque value and fills `info`.
-    let ok = unsafe { libc::dladdr(addr as *const c_void, &raw mut info) };
-    if ok == 0 || info.dli_fname.is_null() {
+    let Some(path) = dladdr_image(addr) else {
         return false;
-    }
-    let path = info.dli_fname.cast::<u8>();
+    };
+    let path = path.cast::<u8>();
     let mut idx = 0usize;
     let mut matched = 0usize;
     while idx < PATH_MAX_SCAN {
@@ -670,6 +754,22 @@ fn push(buf: &mut [u8; 192], pos: &mut usize, bytes: &[u8]) {
     let take = bytes.len().min(avail);
     buf[*pos..*pos + take].copy_from_slice(&bytes[..take]);
     *pos += take;
+}
+
+/// Append `v` in decimal, the form a signal number is read in.
+fn push_decimal(buf: &mut [u8; 192], pos: &mut usize, v: u32) {
+    let mut digits = [0u8; 10];
+    let mut n = digits.len();
+    let mut v = v;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + u8::try_from(v % 10).expect("a digit fits u8");
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    push(buf, pos, &digits[n..]);
 }
 
 fn push_hex(buf: &mut [u8; 192], pos: &mut usize, v: u64) {

@@ -25,6 +25,19 @@ on:
           log files uploaded.
         type: string
         default: ''
+      conformance_repeat:
+        description: >-
+          Run one conformance subtest this many times on every conformance
+          job instead of gating, with every run's raw output and the layer's
+          debug log uploaded (the way to catch a subtest that dies one run
+          in a few).
+        type: string
+        default: ''
+      conformance_only:
+        description: The subtest a `conformance_repeat` dispatch runs.
+        type: choice
+        options: [device, visual, stateblock, d3d9ex]
+        default: device
 
 permissions:
   contents: read
@@ -262,7 +275,15 @@ jobs:
       # regression never looks like that, and the machine will not recover,
       # so the answer is a re-run of the failed jobs, which lands on a fresh
       # runner, not another attempt here.
+      # A `conformance_repeat` dispatch runs one subtest that many times in
+      # place of the gate, on every job, and leaves the reading to the
+      # artifact: each run's raw output ends with how the process ended, and
+      # the layer's debug log sits beside it.
       - run: |
+          if [ -n "$CONFORMANCE_REPEAT" ]; then
+            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH=${{ matrix.arch }} REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || 'native' }} LOG=debug STAGE="$STAGE"
+            exit
+          fi
           if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || '' }}${{ matrix.arch }} STAGE="$STAGE"; then
             if grep -lq kIOAccelCommandBufferCallbackErrorHang "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null; then
               echo "::error::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short; not a regression when the other conformance jobs are green. Re-run the failed jobs to get a fresh machine: gh run rerun ${{ github.run_id }} --failed"
@@ -276,6 +297,8 @@ jobs:
           # job's own log reduces to per-site counts, and counts alone cannot
           # say why this environment diverges.
           MTLD3D_CONFORMANCE_RAW_DIR: ${{ runner.temp }}/conformance-raw
+          CONFORMANCE_REPEAT: ${{ inputs.conformance_repeat }}
+          CONFORMANCE_ONLY: ${{ inputs.conformance_only }}
 
       # `always()`, because a diverging run is exactly the one whose output is
       # worth reading, and the job reports failure whenever it diverges.

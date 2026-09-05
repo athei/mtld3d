@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, Read},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -63,6 +63,29 @@ pub const GPU_HANG_EXIT: u8 = 3;
 /// because `baseline.txt` is machine-owned per-site counts whose parser
 /// rejects anything else.
 const MAX_VALIDATION_ERRORS: usize = 0;
+
+/// What every spawn of the run shares.
+///
+/// Built once by the caller from the command line and the environment, so
+/// the spawn itself reads neither: a test can hand it a shell script as the
+/// loader and a scratch directory as the raw dir.
+pub struct Launch {
+    /// The Wine loader.
+    pub wine: PathBuf,
+    /// The `d3d9_test.exe` to run.
+    pub exe: PathBuf,
+    /// The `RUST_LOG` filter the test process runs under.
+    ///
+    /// `off` for a gating run: the counts are the measurement and our log is
+    /// noise there. A repeat run raises it to see what the layer did before
+    /// a process ended without its summary.
+    pub log: String,
+    /// Where each subtest's raw output and log file go, when they are kept.
+    ///
+    /// `None` keeps nothing. Set, it is made absolute, since the test process
+    /// is handed the same directory as a Windows path.
+    pub raw_dir: Option<PathBuf>,
+}
 
 /// How many detail lines one validation message keeps.
 ///
@@ -126,7 +149,8 @@ pub fn wine_version(wine: &Path) -> String {
 /// `leg` selects nothing about the binary (the caller already picked it); its
 /// variant adds the config entries the run is measured under, and the whole
 /// leg is the label the results, raw logs and validation lines are recorded
-/// under.
+/// under. `attempt` is the run's number in a repeat run, which keeps every
+/// run's raw output; `None` is the one run of a gating leg.
 ///
 /// stderr is read as it arrives, and the driver's GPU-hang line kills the
 /// process at once rather than after its budget: what the subtest reads from
@@ -143,18 +167,22 @@ pub fn wine_version(wine: &Path) -> String {
 ///
 /// Returns a message when `exe` is not a file or `wine` fails to spawn.
 pub fn run_subtest(
-    wine: &Path,
-    exe: &Path,
+    launch: &Launch,
     leg: Leg,
     subtest: Subtest,
+    attempt: Option<u32>,
 ) -> Result<SubtestRun, String> {
-    if !exe.is_file() {
+    if !launch.exe.is_file() {
         return Err(format!(
             "test exe not found: {}; a Wine SDK bundle carries these under \
              lib/wine/tests, so re-bundle if yours predates them",
-            exe.display()
+            launch.exe.display()
         ));
     }
+    let raw = launch
+        .raw_dir
+        .as_deref()
+        .map(|dir| RawTarget::new(dir, leg, subtest, attempt));
     // Metal API validation is left ON (`nslog` mode) so every conformance run
     // surfaces Metal misuse (format/attachment/binding mismatches, oversized
     // inline binds, …). `nslog` *logs* validation failures to stderr instead of
@@ -168,8 +196,8 @@ pub fn run_subtest(
     // shader that stops reading a slot), all deduplicated to a handful of
     // lines that read exactly like the error lines and bury them. Only errors
     // are reported, so a new validation line means a new misuse.
-    let mut child = Command::new(wine)
-        .arg(exe)
+    let mut child = Command::new(&launch.wine)
+        .arg(&launch.exe)
         .arg(subtest.arg())
         .env("MTL_DEBUG_LAYER", "1")
         .env("MTL_DEBUG_LAYER_ERROR_MODE", "nslog")
@@ -178,34 +206,13 @@ pub fn run_subtest(
         .env("WINEDEBUG", "-all")
         .env("WINEDLLOVERRIDES", HEADLESS_DLL_OVERRIDES)
         .env("WINEMSYNC", "1")
-        .env("RUST_LOG", "off")
-        // `shaderCache.enable=false`: disable the persistent on-disk shader
-        // cache (`mtld3d_shaders.bin`) for every conformance run so the DLL
-        // compiles shaders fresh each run — a change to the shader translator
-        // (or a SHADER_CACHE_SCHEMA bump) is always reflected without having to
-        // delete a stale cache by hand.
-        //
-        // `color.hdr.enable=false`: the shipped default is on, but it resolves
-        // off the running machine's panel, so an EDR Mac would present through
-        // the tone-mapping shader while another machine blits. The baseline has
-        // to mean the same thing on every machine that runs it, so pin the SDR
-        // path here.
-        //
-        // The leg's variant appends its own entries: the `intel` variant turns
-        // every `intel.*` key on so the whole suite runs under the answers an
-        // Intel/AMD Mac gives.
-        .env(
-            "MTLD3D_CONFIG",
-            format!(
-                "shaderCache.enable=false;color.hdr.enable=false{}",
-                leg.variant.config_entries()
-            ),
-        )
+        .env("RUST_LOG", &launch.log)
+        .env("MTLD3D_CONFIG", config_entries(leg, raw.as_ref()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", wine.display()))?;
+        .map_err(|e| format!("failed to spawn {}: {e}", launch.wine.display()))?;
 
     // Drain stdout/stderr on their own threads so a full pipe buffer can't
     // wedge the child while we poll for the timeout.
@@ -228,7 +235,7 @@ pub fn run_subtest(
     let status = loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|e| format!("wait on {} failed: {e}", wine.display()))?
+            .map_err(|e| format!("wait on {} failed: {e}", launch.wine.display()))?
         {
             break status;
         }
@@ -236,14 +243,14 @@ pub fn run_subtest(
             kill_group(&child);
             break child
                 .wait()
-                .map_err(|e| format!("reap of hung {} failed: {e}", wine.display()))?;
+                .map_err(|e| format!("reap of hung {} failed: {e}", launch.wine.display()))?;
         }
         if start.elapsed() >= timeout {
             kill_group(&child);
             timed_out = true;
             break child
                 .wait()
-                .map_err(|e| format!("reap of timed-out {} failed: {e}", wine.display()))?;
+                .map_err(|e| format!("reap of timed-out {} failed: {e}", launch.wine.display()))?;
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -272,6 +279,8 @@ pub fn run_subtest(
             "\n[conformance] subtest TIMED OUT after {}s and was killed\n",
             timeout.as_secs()
         );
+    } else {
+        let _ = write!(combined, "\n{}\n", exit_trailer(status));
     }
     if gpu_hang {
         let after = start.elapsed().as_secs();
@@ -290,9 +299,11 @@ pub fn run_subtest(
     // assertion message + the Metal-validation lines) for offline triage. The
     // normal run reduces this to per-site counts and drops the text; the actual
     // vs. expected values it carries are what distinguish a real defect from an
-    // accepted pixel/caps difference. Off unless `MTLD3D_CONFORMANCE_RAW_DIR` is
-    // set; a write failure is reported but never fails the run.
-    save_raw_output(leg, subtest, &combined);
+    // accepted pixel/caps difference. A write failure is reported but never
+    // fails the run.
+    if let Some(raw) = &raw {
+        raw.save(&combined);
+    }
 
     Ok(SubtestRun {
         result: scan::parse_subtest_output(&combined, signaled),
@@ -342,27 +353,101 @@ fn kill_group(child: &Child) {
     }
 }
 
-/// Persist a subtest's raw output to `$MTLD3D_CONFORMANCE_RAW_DIR/<leg>-<subtest>.log`.
+/// How the process ended, as the raw log's last line.
 ///
-/// Only when that variable is set. A no-op (and silent) when it is unset.
-fn save_raw_output(leg: Leg, subtest: Subtest, combined: &str) {
-    let Ok(dir) = std::env::var("MTLD3D_CONFORMANCE_RAW_DIR") else {
-        return;
-    };
-    let dir = PathBuf::from(dir);
-    if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!(
-            "  [conformance] could not create raw dir {}: {e}",
-            dir.display()
-        );
-        return;
+/// A process that ends without the framework's summary is a crash whatever
+/// else its output holds, and this line is what tells the shapes apart. Wine
+/// ends a process with an unhandled Win32 exception through the exception
+/// code, of which unix keeps the low byte, so an access violation
+/// (`0xC0000005`) reads as `code 5`. A run that reached its summary exits
+/// with `code 0` once a device existed (the layer ends the process from its
+/// detach), else with the framework's failure count capped at 255. A signal
+/// is the number alone (11 `SIGSEGV`, 10 `SIGBUS`, 6 `SIGABRT`, 9 `SIGKILL`):
+/// the scanner's crash markers are signal names, and a name here would turn
+/// a fault the process survived into a crash.
+fn exit_trailer(status: ExitStatus) -> String {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("[conformance] subtest exited: code {code}"),
+        (None, Some(signal)) => format!("[conformance] subtest exited: signal {signal}"),
+        (None, None) => "[conformance] subtest exited: unknown status".to_owned(),
     }
-    let path = dir.join(format!("{leg}-{subtest}.log"));
-    if let Err(e) = fs::write(&path, combined) {
-        eprintln!(
-            "  [conformance] could not write raw log {}: {e}",
-            path.display()
+}
+
+/// The `MTLD3D_CONFIG` a subtest runs under.
+///
+/// `shaderCache.enable=false`: disable the persistent on-disk shader cache
+/// (`mtld3d_shaders.bin`) for every conformance run so the DLL compiles
+/// shaders fresh each run — a change to the shader translator (or a
+/// `SHADER_CACHE_SCHEMA` bump) is always reflected without having to delete a
+/// stale cache by hand.
+///
+/// `color.hdr.enable=false`: the shipped default is on, but it resolves off
+/// the running machine's panel, so an EDR Mac would present through the
+/// tone-mapping shader while another machine blits. The baseline has to mean
+/// the same thing on every machine that runs it, so pin the SDR path here.
+///
+/// The leg's variant appends its own entries: the `intel` variant turns every
+/// `intel.*` key on so the whole suite runs under the answers an Intel/AMD Mac
+/// gives. A kept run adds `log.dir`, so the process's log file lands beside
+/// its raw output.
+fn config_entries(leg: Leg, raw: Option<&RawTarget>) -> String {
+    let mut entries = format!(
+        "shaderCache.enable=false;color.hdr.enable=false{}",
+        leg.variant.config_entries()
+    );
+    if let Some(raw) = raw {
+        let _ = write!(entries, ";log.dir={}", raw.log_dir_dos());
+    }
+    entries
+}
+
+/// Where one subtest's raw output and its process's log file go.
+///
+/// `<dir>/<leg>-<subtest>[-<attempt>].log` for the output and a directory of
+/// the same stem for the log file, one per process, so the layer's retention
+/// of ten files per directory never prunes one run's log to make room for
+/// another's.
+struct RawTarget {
+    dir: PathBuf,
+    stem: String,
+}
+
+impl RawTarget {
+    fn new(dir: &Path, leg: Leg, subtest: Subtest, attempt: Option<u32>) -> Self {
+        let stem = attempt.map_or_else(
+            || format!("{leg}-{subtest}"),
+            |n| format!("{leg}-{subtest}-{n}"),
         );
+        Self {
+            dir: dir.to_path_buf(),
+            stem,
+        }
+    }
+
+    /// The log directory as the test process names it.
+    ///
+    /// The layer reads `log.dir` on the Windows side, where the unix root is
+    /// drive `Z:`, the same convention the e2e legs use for their `LOG_DIR`.
+    fn log_dir_dos(&self) -> String {
+        format!("Z:{}", self.dir.join(&self.stem).display())
+    }
+
+    /// Persist the raw output; a failure is reported and never fails the run.
+    fn save(&self, combined: &str) {
+        if let Err(e) = fs::create_dir_all(&self.dir) {
+            eprintln!(
+                "  [conformance] could not create raw dir {}: {e}",
+                self.dir.display()
+            );
+            return;
+        }
+        let path = self.dir.join(format!("{}.log", self.stem));
+        if let Err(e) = fs::write(&path, combined) {
+            eprintln!(
+                "  [conformance] could not write raw log {}: {e}",
+                path.display()
+            );
+        }
     }
 }
 

@@ -664,10 +664,15 @@ CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --assets $(CURD
 # $(1) = arch (i686|x86_64), $(2) = extra runner args. Checks the exe up front
 # so a bundle that predates the published test binaries says so, rather than
 # failing four times inside the runner.
+# LOG=<filter> is the RUST_LOG the test processes run under (the runner's
+# default is `off`: the counts are the measurement). With
+# MTLD3D_CONFORMANCE_RAW_DIR set, each process's log file lands in a directory
+# beside its raw output, so LOG=debug there keeps what the layer did before a
+# process ended without its summary.
 define conformance_leg
 	$(MAKE) configure-test-prefix
 	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
-	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2)
+	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2) $(if $(LOG),--log $(LOG))
 endef
 
 conformance: conformance-i686 conformance-x86_64
@@ -710,13 +715,18 @@ conformance-baseline-intel-x86_64: install-windows-x86_64 install-unix-$(SDK_UNI
 
 # Flap characterization: run ONE subtest REPEAT times and print a per-site flap
 # report (which sites fire deterministically vs flutter run-to-run), the
-# evidence for tagging a site `flaky` in CONFORMANCE.md. Tune with ONLY (device|
-# visual|stateblock|d3d9ex), ARCH (i686|x86_64), REPEAT (default 20).
+# evidence for tagging a site `flaky` in CONFORMANCE.md, and the way to make a
+# subtest that dies one run in a few die in one sitting. Tune with ONLY (device|
+# visual|stateblock|d3d9ex), ARCH (i686|x86_64), REPEAT (default 20), VARIANT
+# (native|intel, the `intel` legs' forced answers) and LOG (see above). With
+# MTLD3D_CONFORMANCE_RAW_DIR set, every run keeps its own raw output,
+# `<leg>-<subtest>-<n>.log`, and its process's log file beside it.
 ONLY ?= device
 ARCH ?= i686
 REPEAT ?= 20
+VARIANT ?= native
 conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
-	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT))
+	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt

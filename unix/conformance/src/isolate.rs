@@ -13,11 +13,11 @@
 //! exception: a GPU hang ends the measurement, since every run after it would
 //! read off a GPU that runs nothing, and the caller exits for it.
 
-use std::{collections::BTreeMap, fmt::Write as _, path::Path};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 use crate::{
     model::{Leg, Site, Subtest},
-    run,
+    run::{self, Launch},
 };
 
 /// Per-site flap statistics over N runs of one `(arch, subtest)`.
@@ -78,8 +78,7 @@ struct Aggregate {
 /// Propagates a spawn/wait error from [`run::run_subtest`] (a missing
 /// `d3d9_test.exe`, or `wine` failing to launch).
 pub fn run_flap(
-    wine: &Path,
-    exe: &Path,
+    launch: &Launch,
     leg: Leg,
     subtests: &[Subtest],
     repeat: u32,
@@ -89,7 +88,7 @@ pub fn run_flap(
          a site is FLAPS unless it fired in every run at one constant count)\n"
     );
     for &subtest in subtests {
-        let agg = characterize(wine, exe, leg, subtest, repeat)?;
+        let agg = characterize(launch, leg, subtest, repeat)?;
         print!("{}", render(leg, subtest, &agg));
         if agg.hung_run.is_some() {
             return Ok(Some(subtest));
@@ -100,10 +99,10 @@ pub fn run_flap(
 
 /// Run one subtest `repeat` times, folding each run into an [`Aggregate`].
 ///
-/// Stops at the run the GPU hangs under.
+/// Stops at the run the GPU hangs under. Each run is numbered, so a kept raw
+/// output is one file per run rather than the last run overwriting the others.
 fn characterize(
-    wine: &Path,
-    exe: &Path,
+    launch: &Launch,
     leg: Leg,
     subtest: Subtest,
     repeat: u32,
@@ -112,7 +111,7 @@ fn characterize(
     for i in 1..=repeat {
         // Liveness to stderr — a full subtest can take many seconds.
         eprintln!("  [{leg}/{subtest}] run {i}/{repeat}…");
-        let run = run::run_subtest(wine, exe, leg, subtest)?;
+        let run = run::run_subtest(launch, leg, subtest, Some(i))?;
         let result = run.result;
         agg.runs += 1;
         if result.crash {

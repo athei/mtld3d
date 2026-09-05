@@ -32,13 +32,19 @@ pub struct Config {
     /// Prints a flap report instead of diffing. `1` (the default) keeps the
     /// normal gate.
     pub repeat: u32,
+    /// `--log <filter>`: the `RUST_LOG` the test processes run under.
+    ///
+    /// `off` (the default) for a gating run, whose measurement is the counts.
+    /// A repeat run raises it so the process's log file says what the layer
+    /// did before a process ended without its summary.
+    pub log: String,
 }
 
 /// Parse CLI args (excluding `argv[0]`).
 ///
 /// Recognised flags: `--update-baseline`, `--wine <path>`, `--exe <path>`,
 /// `--arch <arch>`, `--variant <native|intel>`, `--assets <dir>`,
-/// `--only <subtest>`, `--repeat <N>`.
+/// `--only <subtest>`, `--repeat <N>`, `--log <filter>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
 /// invocation runs one test binary, which is what lets a 32-bit and a 64-bit CI
@@ -61,6 +67,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut assets: Option<PathBuf> = None;
     let mut only: Option<Subtest> = None;
     let mut repeat: u32 = 1;
+    let mut log = "off".to_owned();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--update-baseline" => update = true,
@@ -109,6 +116,11 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                     return Err("--repeat must be >= 1".to_owned());
                 }
             }
+            "--log" => {
+                log = args
+                    .next()
+                    .ok_or_else(|| "--log needs a RUST_LOG filter".to_owned())?;
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -129,6 +141,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
         assets,
         only,
         repeat,
+        log,
     })
 }
 

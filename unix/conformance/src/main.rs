@@ -51,6 +51,22 @@ fn main() -> ExitCode {
 fn real_main() -> Result<ExitCode, String> {
     let config = cli::parse_args(std::env::args().skip(1))?;
     let wine_version = run::wine_version(&config.wine);
+    // The raw dir is read once, here, and handed to every spawn as a path:
+    // the test process is told the same directory as a Windows path, which
+    // needs it absolute, and the spawn itself reads no environment.
+    let raw_dir = match std::env::var_os("MTLD3D_CONFORMANCE_RAW_DIR") {
+        Some(dir) => Some(
+            std::path::absolute(&dir)
+                .map_err(|e| format!("MTLD3D_CONFORMANCE_RAW_DIR {}: {e}", dir.display()))?,
+        ),
+        None => None,
+    };
+    let launch = run::Launch {
+        wine: config.wine,
+        exe: config.exe,
+        log: config.log,
+        raw_dir,
+    };
     let leg = Leg {
         arch: config.arch,
         variant: config.variant,
@@ -66,14 +82,14 @@ fn real_main() -> Result<ExitCode, String> {
     // `--repeat N>1` is characterization, not a gate: run each selected subtest N
     // times and print a flap report, then exit 0 regardless of what fluttered.
     if config.repeat > 1 {
-        let hung = isolate::run_flap(&config.wine, &config.exe, leg, &subtests, config.repeat)?;
+        let hung = isolate::run_flap(&launch, leg, &subtests, config.repeat)?;
         return Ok(hung.map_or(ExitCode::SUCCESS, |subtest| gpu_hang_verdict(leg, subtest)));
     }
 
     let mut current: BTreeMap<(Leg, Subtest), SubtestResult> = BTreeMap::new();
     let mut validation_errors = 0;
     for &subtest in &subtests {
-        let run = run::run_subtest(&config.wine, &config.exe, leg, subtest)?;
+        let run = run::run_subtest(&launch, leg, subtest, None)?;
         if run.gpu_hang {
             return Ok(gpu_hang_verdict(leg, subtest));
         }

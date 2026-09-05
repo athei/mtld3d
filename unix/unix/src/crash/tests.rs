@@ -6,12 +6,21 @@
 //! only be exercised by taking the signal, so the test re-executes the binary,
 //! faults on a known address, and asserts the child died through the handler's
 //! own exit path with a decodable banner, PC, stack pointer and argument labels.
+//!
+//! The second test faults inside libsystem instead: a fault the handler does
+//! not own is handed back to the signal's default action, and the one line it
+//! writes first has to name the image and the thread.
+
+use std::os::unix::process::ExitStatusExt as _;
 
 /// Set in the re-executed child so it faults instead of asserting.
 ///
 /// A signal handler can only be exercised by actually taking the signal,
 /// which terminates the process, so the test spawns itself.
 const SELFTEST_ENV: &str = "MTLD3D_CRASH_SELFTEST";
+
+/// Set in the re-executed child so it faults in someone else's code.
+const FOREIGN_SELFTEST_ENV: &str = "MTLD3D_CRASH_FOREIGN_SELFTEST";
 
 /// The bad pointer the child dereferences.
 ///
@@ -102,4 +111,43 @@ fn fault_report_decodes_registers() {
         );
         assert_ne!(value_after(caller_label), zero, "{report}");
     }
+}
+
+/// A fault outside our image is named, then handed back.
+///
+/// `strlen` on the bad address faults inside libsystem, which the handler
+/// does not own: the child dies by the signal's default action rather than
+/// the handler's `_exit(1)`, and the report before that names the image and
+/// the calling thread.
+#[test]
+fn foreign_fault_is_named_then_forwarded() {
+    if std::env::var_os(FOREIGN_SELFTEST_ENV).is_some() {
+        super::install();
+        // SAFETY: deliberately unsound; this is the fault under test, taken
+        // in a child process that dies on it.
+        let len = unsafe { libc::strlen(std::hint::black_box(BAD_ADDR as *const libc::c_char)) };
+        unreachable!("the strlen above must fault, not return {len}");
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "crash::tests::foreign_fault_is_named_then_forwarded",
+            "--nocapture",
+        ])
+        .env(FOREIGN_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
+    assert!(!report.contains("FATAL"), "{report}");
+    let line = report
+        .lines()
+        .find(|l| l.contains("fault outside mtld3d.so"))
+        .unwrap_or_else(|| panic!("no foreign-fault line:\n{report}"));
+    assert!(line.contains("signo=11"), "{line}");
+    assert!(line.contains("image=/"), "{line}");
+    assert!(line.contains("thread="), "{line}");
 }
