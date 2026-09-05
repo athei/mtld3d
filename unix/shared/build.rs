@@ -35,15 +35,22 @@ fn build_id() -> String {
     // without touching a single source file or moving HEAD, and a release
     // artifact stamped with the previous version is the one mistake this line
     // exists to prevent.
-    if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        let dir = PathBuf::from(dir);
+    // `HEAD` is per-worktree, and names the ref rather than the commit, so it
+    // is the one file read from the worktree's own gitdir: it moves on a branch
+    // switch and stays put on a commit. Everything a ref names lives in the
+    // common gitdir instead, and resolving one against the worktree gitdir
+    // yields a path that does not exist, which the filter below silently drops.
+    if let (Some(git_dir), Some(common_dir)) = (
+        git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from),
+        common_dir(),
+    ) {
         let mut watch = vec![
-            dir.join("HEAD"),
-            dir.join("packed-refs"),
-            dir.join("refs").join("tags"),
+            git_dir.join("HEAD"),
+            common_dir.join("packed-refs"),
+            common_dir.join("refs").join("tags"),
         ];
         if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
-            watch.push(dir.join(head_ref));
+            watch.push(common_dir.join(head_ref));
         }
         for path in watch.iter().filter(|p| p.exists()) {
             println!("cargo:rerun-if-changed={}", path.display());
@@ -51,6 +58,21 @@ fn build_id() -> String {
     }
     git(&["describe", "--tags", "--always"])
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// The gitdir every worktree of a repository shares, as an absolute path.
+///
+/// Branch refs, tags and `packed-refs` all live here rather than in a
+/// worktree's own gitdir; outside a worktree the two are the same directory.
+/// `git` reports the path relative to the directory it ran in wherever that is
+/// shorter, and every `git` here runs in the manifest directory, so that is
+/// what a relative answer is anchored at.
+fn common_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(git(&["rev-parse", "--git-common-dir"])?);
+    if dir.is_absolute() {
+        return Some(dir);
+    }
+    Some(PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?).join(dir))
 }
 
 /// Run `git` in the manifest directory, returning trimmed stdout on success.
