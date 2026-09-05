@@ -49,14 +49,17 @@ overwrite each other's `d3d9.dll` and `mtld3d.so`, and a game launched from that
 tree meanwhile runs whichever build landed last. `make test ISOLATED=1` avoids
 both: it clones the SDK and the ambient prefix once into `.wine-isolated/`
 inside the checkout (APFS clones, so neither costs space or a prefix boot) and
-points the tools, the install and the prefix at the clones. Use it whenever
-another worktree may be testing or a game is running; a plain `make install`
-still targets the shared trees on purpose, since that is how the game gets a
-build. The clones and the persistent wineserver of the private prefix stay
-behind for the next run; `make clean-isolated` takes them down, and
-`make clean-isolated-all` does so for every worktree of the repository. A failing run
-whose log shows a `d3d9.dll v` stamp that is not your checkout's is that
-collision, not a regression.
+points the tools, the install and the prefix at the clones. Each clone is one
+`clonefile(2)` on the directory (the Makefile's `clone_tree`), so it costs a
+call rather than a walk of the file count, and falls back to `cp -c -R` and then
+to `cp -R` when the source sits on another volume or on a volume that is not
+APFS. Use it whenever another worktree may be testing or a game is running; a
+plain `make install` still targets the shared trees on purpose, since that is
+how the game gets a build. The clones and the persistent wineserver of the
+private prefix stay behind for the next run; `make clean-isolated` takes them
+down, and `make clean-isolated-all` does so for every worktree of the
+repository. A failing run whose log shows a `d3d9.dll v` stamp that is not your
+checkout's is that collision, not a regression.
 
 Both agent runners configured in this tree already print the conventions digest
 at session start and run `scripts/audit.sh --file` after every edit, so a
