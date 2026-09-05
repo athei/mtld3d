@@ -34,6 +34,20 @@ fragment float4 mtld3d_present_ps_copy(
     return src.sample(s, in.uv);
 }
 
+// Readback resolve for the single-precision float formats: the same copy with
+// a nearest sampler. `R32Float`, `RG32Float` and `RGBA32Float` filter only
+// where the device says so (never on the Mac2 family), and a readback has to
+// read the same on every GPU, so those formats snap to the nearest texel
+// everywhere instead of blending where they can.
+fragment float4 mtld3d_readback_ps_copy_nearest(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]]
+) {
+    constexpr sampler s(coord::normalized, filter::nearest,
+                        address::clamp_to_edge);
+    return src.sample(s, in.uv);
+}
+
 struct HdrUniforms {
     float l_hdr_nits;
     float p_hdr;            // 1 + 32 * pow(l_hdr_nits/10000, 1/2.4)

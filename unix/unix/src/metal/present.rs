@@ -36,16 +36,18 @@
 //! alongside the device and command queue.
 
 use core::ptr::NonNull;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
+use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLLibraryKind};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
     MTLPixelFormat, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
 };
+use rustc_hash::FxHashMap;
 
-use crate::LOG_TARGET;
+use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 /// MSL source for the present-pass library.
 ///
@@ -155,6 +157,102 @@ pub fn hdr_uniforms(peak: f32) -> [f32; 4] {
 
 static PIPELINES: OnceLock<PresentPipelines> = OnceLock::new();
 
+/// The compiled present library, retained for the process.
+///
+/// `create` builds the fixed present pipelines from it and the readback
+/// resolve builds one more per colour format on demand, so the library
+/// outlives the first call. A raw handle for the reason the pipelines are.
+static LIBRARY: OnceLock<u64> = OnceLock::new();
+
+/// Readback resolve pipelines, one per colour format and filter, built on demand.
+///
+/// The present pipelines write the two drawable formats; a readback resolve
+/// writes the source target's own format, whichever the game chose, so those
+/// states are keyed by format and by whether the copy snaps to the nearest
+/// texel. The values are retained `MTLRenderPipelineState` handles that live
+/// for the process, like the present pipelines.
+static READBACK_PIPELINES: LazyLock<Mutex<FxHashMap<(PixelFormat, bool), u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// The pipeline that resamples a texture of `format` into a scratch of `format` for a readback.
+///
+/// `nearest` selects the nearest-texel copy over the filtered one, for the
+/// single-precision float formats. Compiled on first use per key and cached
+/// for the process; `None` when the library, a function or the pipeline
+/// state could not be created, logged at the point of failure.
+pub fn ensure_readback_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    format: PixelFormat,
+    nearest: bool,
+) -> Option<u64> {
+    let key = (format, nearest);
+    if let Some(&handle) = READBACK_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(handle);
+    }
+    // Built outside the lock: a pipeline compile is milliseconds, and two
+    // threads building the same key both succeed, one copy is kept and the
+    // other's retain released.
+    let library = ensure_library(device)?;
+    let vs = library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs"))?;
+    let ps_name = if nearest {
+        "mtld3d_readback_ps_copy_nearest"
+    } else {
+        "mtld3d_present_ps_copy"
+    };
+    let ps = library.newFunctionWithName(&NSString::from_str(ps_name))?;
+    let filter = if nearest { "nearest" } else { "linear" };
+    let label = format!("mtld3d-readback-resolve-{format:?}-{filter}");
+    let pipeline = build_pipeline(
+        device,
+        &vs,
+        &ps,
+        super::texture::mtl_pixel_format(format),
+        &label,
+    )?;
+    let handle = Retained::into_raw(pipeline) as u64;
+    let kept = *READBACK_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(key)
+        .or_insert(handle);
+    if kept != handle {
+        // SAFETY: `handle` is the retain `into_raw` transferred above and
+        // nothing else holds it.
+        drop(unsafe {
+            Retained::from_raw(handle as *mut ProtocolObject<dyn MTLRenderPipelineState>)
+        });
+    }
+    Some(kept)
+}
+
+/// The present library, compiled on first use and retained for the process.
+///
+/// Two threads compiling at once both succeed and one copy is kept; the
+/// other's retain is released.
+fn ensure_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    if let Some(&handle) = LIBRARY.get() {
+        // SAFETY: the handle is the retained library `compile_library` produced
+        // and `LIBRARY` holds for the process.
+        return unsafe { MetalHandle::<MTLLibraryKind>::new(handle) }.into_retained();
+    }
+    let library = compile_library(device)?;
+    let handle = Retained::into_raw(library) as u64;
+    let kept = *LIBRARY.get_or_init(|| handle);
+    if kept != handle {
+        // SAFETY: `handle` is the retain `into_raw` transferred above and nothing
+        // else holds it.
+        drop(unsafe { Retained::from_raw(handle as *mut ProtocolObject<dyn MTLLibrary>) });
+    }
+    // SAFETY: `kept` is a retained library `LIBRARY` holds for the process.
+    unsafe { MetalHandle::<MTLLibraryKind>::new(kept) }.into_retained()
+}
+
 /// Lazily compile + cache the present-pass library + pipelines.
 ///
 /// Called from `submit_frame` on the encoder thread the first time present
@@ -173,7 +271,10 @@ pub fn ensure_resources(device: &ProtocolObject<dyn MTLDevice>) -> Option<Presen
     Some(*PIPELINES.get_or_init(|| resources))
 }
 
-fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
+/// Compile [`PRESENT_MSL`] for `device`.
+fn compile_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
     let source = NSString::from_str(PRESENT_MSL);
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
@@ -201,6 +302,11 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
         let label = NSString::from_str("mtld3d-present");
         library.setLabel(Some(&label));
     }
+    Some(library)
+}
+
+fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
+    let library = ensure_library(device)?;
 
     let vs_name = NSString::from_str("mtld3d_present_vs");
     let ps_copy_name = NSString::from_str("mtld3d_present_ps_copy");
