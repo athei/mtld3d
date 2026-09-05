@@ -8,7 +8,7 @@
 //! concatenates the two strings into one check target.
 
 use mtld3d_shared::mtl::{
-    PS_BOOL_CONST_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_FLOAT_CONST_SLOT,
+    PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_FLOAT_CONST_SLOT,
     VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
@@ -2837,6 +2837,68 @@ fn sm3_ps_vpos_via_misctype_reads_in_position_no_duplicate_position() {
         ps_msl.contains("oC0 = (in.position - 0.5);"),
         "vPos read must resolve to (in.position - 0.5):\n{ps_msl}"
     );
+}
+
+#[test]
+fn sm3_ps_vpos_under_the_render_scale_variant_reads_the_scaled_floored_position() {
+    // ps_3_0 { dcl_position vPos; mov oC0, vPos; } under `VPOS_SCALE`: the
+    // function takes the `PsDraw` uniform and the register is the pixel
+    // centre scaled into the reported space and floored, so `frc(vPos)`
+    // stays zero. The struct is emitted ahead of the function.
+    const TYPE_MISCTYPE: u32 = 17;
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_MISCTYPE, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_MISCTYPE, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let variant = VariantKey {
+        flags: VariantFlags::VPOS_SCALE,
+        ..VariantKey::default()
+    };
+    let ps_msl = emit_ps_programmable(&ps, variant).expect("emit PS3");
+    assert!(
+        ps_msl.contains("struct PsDraw {"),
+        "PsDraw declared:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains(&format!(
+            "constant PsDraw &ps_draw [[buffer({PS_DRAW_SLOT})]]"
+        )),
+        "the uniform is a fragment argument:\n{ps_msl}"
+    );
+    assert!(
+        ps_msl.contains(
+            "oC0 = float4(floor(in.position.xy * ps_draw.vpos_scale.xy), in.position.zw);"
+        ),
+        "vPos read resolves to the scaled, floored position:\n{ps_msl}"
+    );
+    assert_eq!(
+        ps_msl.matches("[[position").count(),
+        1,
+        "still one [[position]]:\n{ps_msl}"
+    );
+}
+
+#[test]
+fn the_render_scale_variant_leaves_a_shader_without_vpos_unchanged() {
+    // The bit rides only on a shader that declares `vPos`; for any other the
+    // draw path never sets it, and the emitter ignores it either way, so the
+    // MSL is byte-identical to the default variant's.
+    let ps = parse(&red_constant_ps()).expect("PS parse");
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit");
+    let variant = VariantKey {
+        flags: VariantFlags::VPOS_SCALE,
+        ..VariantKey::default()
+    };
+    let flagged = emit_ps_programmable(&ps, variant).expect("emit");
+    assert_eq!(plain, flagged);
+    assert!(!flagged.contains("PsDraw"));
 }
 
 #[test]

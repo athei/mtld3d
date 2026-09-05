@@ -5034,6 +5034,11 @@ pub struct LastBoundCache {
     ///
     /// Set only while a bound stage carries a non-zero bias.
     ps_lod_bias: Vec<u8>,
+    /// PS draw slot: the per-draw `PsDraw` uniform (the render scale a `vPos` read applies).
+    ///
+    /// Set only for a draw whose shader declares `vPos` into a scaled target;
+    /// `ps_draw::PS_DRAW_BYTES`.
+    ps_draw: Vec<u8>,
     /// Vertex stream slots 0..16 — bound `MTLBuffer` handle, byte offset, backing generation.
     ///
     /// Indexed by D3D9 stream, which is the Metal vertex buffer slot.
@@ -5085,6 +5090,7 @@ impl LastBoundCache {
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
             ps_lod_bias: Vec::new(),
+            ps_draw: Vec::new(),
             vertex_buffers: [(0, 0, 0); VERTEX_STREAM_SLOTS as usize],
             scissor_rect: None,
             blend_color: 0xFFFF_FFFF,
@@ -5115,6 +5121,7 @@ impl LastBoundCache {
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
         self.ps_lod_bias.clear();
+        self.ps_draw.clear();
         self.vertex_buffers = [(0, 0, 0); VERTEX_STREAM_SLOTS as usize];
         self.scissor_rect = None;
         self.blend_color = 0xFFFF_FFFF;
@@ -5333,6 +5340,12 @@ impl LastBoundCache {
     #[inline]
     pub fn ps_lod_bias_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.ps_lod_bias, bytes)
+    }
+
+    /// Record the `PsDraw` uniform; true when it differs from the last bound.
+    #[inline]
+    pub fn ps_draw_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_draw, bytes)
     }
 }
 

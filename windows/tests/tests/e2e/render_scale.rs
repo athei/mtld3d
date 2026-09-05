@@ -21,11 +21,11 @@
 //! between the two spaces rather than staying in one, so a run at the default
 //! scale would not exercise the conversion at all.
 
-use mtld3d_tests::{Harness, PosColorVertex, TexturedVertex, assert_pixel_eq};
+use mtld3d_tests::{Harness, PosColorVertex, RhwVertex, TexturedVertex, assert_pixel_eq};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8,
-    D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT,
-    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
+    D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DPOOL_DEFAULT, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
     D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
     D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
@@ -692,6 +692,150 @@ fn a_standalone_target_at_the_backbuffer_size_fills_and_copies_in_reported_coord
     assert_pixel_eq(h.read_pixel(460, 340), RED, "inside, near the bottom-right");
     assert_pixel_eq(h.read_pixel(40, 40), BLUE, "outside, above and left");
     assert_pixel_eq(h.read_pixel(600, 440), BLUE, "outside, below and right");
+}
+
+#[test]
+fn a_ps_3_0_vpos_reads_reported_pixel_coordinates_under_the_scale() {
+    // `vPos` is the pixel a fragment lands on, and a shader compares it
+    // against the back-buffer size it was told, or divides by that size for a
+    // screen-space UV. Under `render.scale` the fragment lands on a render
+    // pixel, so the register is scaled into the reported space and floored,
+    // which keeps its integer contract (`frc(vPos)` stays zero). The quadrant
+    // shader colours by `vPos` against the reported centre (320, 240): green
+    // once `vPos.x` reaches it, blue once `vPos.y` does. The fraction shader
+    // returns `frc(vPos)`. Every probe is well inside a quadrant, so the
+    // result is the same at every scale.
+    //
+    // Pins its own scale (a clean half) rather than inheriting the run's: at
+    // the identity the register needs no conversion, and this has to fail in
+    // the ordinary `make test` if it regresses.
+    //
+    // ps_3_0: dcl vPos.xy; sub r0.xy, vPos.xy, c0.zw; mov r1, c0;
+    // mov r2.a, c0.y; mov r2.r, c0.y; cmp r2.g, r0.x, r1.x, r1.y;
+    // cmp r2.b, r0.y, r1.x, r1.y; mov oC0, r2. With c0 = (1, 0, 320, 240).
+    const QUADRANT_PS: [u32; 31] = [
+        0xFFFF_0300,
+        0x0200_001F,
+        0x8000_0000,
+        0x9003_1000,
+        0x0300_0002,
+        0x8003_0000,
+        0x9054_1000,
+        0xA1FE_0000,
+        0x0200_0001,
+        0x800F_0001,
+        0xA0E4_0000,
+        0x0200_0001,
+        0x8008_0002,
+        0xA055_0000,
+        0x0200_0001,
+        0x8001_0002,
+        0xA055_0000,
+        0x0400_0058,
+        0x8002_0002,
+        0x8000_0000,
+        0x8000_0001,
+        0x8055_0001,
+        0x0400_0058,
+        0x8004_0002,
+        0x8055_0000,
+        0x8000_0001,
+        0x8055_0001,
+        0x0200_0001,
+        0x800F_0800,
+        0x80E4_0002,
+        0x0000_FFFF,
+    ];
+    // ps_3_0: def c0, 0, 0, 0, 0; dcl vPos.xy; mov r0, c0; frc r0.xy, vPos.xy;
+    // mov oC0, r0.
+    const FRACTION_PS: [u32; 20] = [
+        0xFFFF_0300,
+        0x0500_0051,
+        0xA00F_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0200_001F,
+        0x8000_0000,
+        0x9003_1000,
+        0x0200_0001,
+        0x800F_0000,
+        0xA0E4_0000,
+        0x0200_0013,
+        0x8003_0000,
+        0x9054_1000,
+        0x0200_0001,
+        0x800F_0800,
+        0x80E4_0000,
+        0x0000_FFFF,
+    ];
+    let h = Harness::with_config("render.scale=0.5");
+    let (width, height) = h.dims();
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let v = |x: f32, y: f32| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: WHITE,
+    };
+    // The reported dims fit u16; convert without a precision-loss cast.
+    let to_f = |v: u32| f32::from(u16::try_from(v).expect("reported dims fit u16"));
+    let (w, hgt) = (to_f(width), to_f(height));
+    let quad = [
+        v(0.0, 0.0),
+        v(w, 0.0),
+        v(0.0, hgt),
+        v(w, 0.0),
+        v(w, hgt),
+        v(0.0, hgt),
+    ];
+    let rgb = |x: u32, y: u32| h.read_pixel(x, y) & 0x00FF_FFFF;
+
+    let quadrant = h.create_pixel_shader(&QUADRANT_PS);
+    assert_eq!(h.set_pixel_shader(&quadrant), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 320.0, 240.0]),
+        0,
+        "the reported centre in c0.zw"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_eq!(
+        rgb(160, 120),
+        0x0000_0000,
+        "top-left: vPos short of the centre on both axes"
+    );
+    assert_eq!(
+        rgb(480, 120),
+        0x0000_FF00,
+        "top-right: vPos.x past the centre"
+    );
+    assert_eq!(
+        rgb(160, 360),
+        0x0000_00FF,
+        "bottom-left: vPos.y past the centre"
+    );
+    assert_eq!(
+        rgb(480, 360),
+        0x0000_FFFF,
+        "bottom-right: both past the centre"
+    );
+
+    let fraction = h.create_pixel_shader(&FRACTION_PS);
+    assert_eq!(h.set_pixel_shader(&fraction), 0, "SetPixelShader");
+    h.render_once(WHITE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_eq!(
+        rgb(160, 120),
+        0,
+        "frc(vPos) is zero: the register stays an integer"
+    );
+    assert_eq!(rgb(480, 360), 0, "and so in the far quadrant");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
 }
 
 /// A depth texture at the back-buffer size is charged the chain it occupies.
