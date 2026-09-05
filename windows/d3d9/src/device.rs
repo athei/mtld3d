@@ -2601,6 +2601,11 @@ pub struct DeviceCreateInfo {
     /// Resolved at attach from `cursor.software` and the layer mode; fixed for
     /// the device's lifetime.
     pub software_cursor: bool,
+    /// The words the unix side publishes into for this device; see `DisplaySinks`.
+    ///
+    /// Created before the attach that hands their addresses over, owned by
+    /// the device's cursor state from here on.
+    pub display_sinks: Box<crate::cursor::DisplaySinks>,
     /// Window state saved before a fullscreen `CreateDevice` took the window over.
     ///
     /// `None` for a windowed device. The device holds it for as long as it
@@ -2691,7 +2696,13 @@ impl Direct3DDevice9 {
             scissor_rect: [0, 0, info.backbuffer_width, info.backbuffer_height],
             viewport,
             clip_planes: [[0.0; 4]; CLIP_PLANE_SLOTS],
-            cursor: CursorState::new(info.hwnd, info.cursor_scale, info.software_cursor),
+            cursor: CursorState::new(
+                info.hwnd,
+                info.cursor_scale,
+                info.software_cursor,
+                info.view_handle,
+                info.display_sinks,
+            ),
             fullscreen: info.fullscreen,
             bound_rt: BoundRt::new(info.backbuffer_width, info.backbuffer_height),
             bound_buffers: BoundBuffers::new(),
@@ -4222,11 +4233,8 @@ extern "system" fn device_present(
     // display changes it, so the cursor upscale follows the window between
     // displays. One relaxed load and a compare on an unchanged value, which
     // is every frame that stays put.
-    if let Some(backing_scale) = crate::direct3d9::display_backing_scale() {
-        let (scale, _origin) =
-            crate::direct3d9::resolve_cursor_scale(backing_scale, dev.config().cursor_scale);
-        dev.cursor_mut().follow_scale(scale);
-    }
+    let cursor_scale = dev.config().cursor_scale;
+    dev.cursor_mut().follow_published_scale(cursor_scale);
     dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);

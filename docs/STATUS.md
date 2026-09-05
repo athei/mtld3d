@@ -28,6 +28,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.
+- Several devices alive at once, each on its own window, each owning its
+  display state on the unix side.
 
 ## Not implemented yet
 

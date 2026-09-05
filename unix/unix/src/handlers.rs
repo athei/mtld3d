@@ -267,8 +267,11 @@ pub extern "C" fn set_cursor_overlay_handler(args: *mut c_void) -> i32 {
             core::slice::from_raw_parts(params.pixels_ptr as *const u8, params.pixels_len as usize)
         })
     };
-    metal::set_cursor_overlay(&params, pixels);
-    STATUS_SUCCESS
+    if metal::set_cursor_overlay(&params, pixels) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
 }
 
 pub extern "C" fn set_display_sync_enabled_handler(args: *mut c_void) -> i32 {

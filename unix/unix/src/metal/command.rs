@@ -37,7 +37,7 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
     LOG_TARGET,
-    metal::{handle::IntoRetained, null_texture, texture::mtl_pixel_format},
+    metal::{handle::IntoRetained, macdrv::attachment, null_texture, texture::mtl_pixel_format},
 };
 
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
@@ -86,6 +86,8 @@ const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
 ///
 /// Half of the presented-cadence probe, see [`register_presented_probe`].
 /// Atomics because Metal runs the presented handler on its own thread.
+/// One pair for the process: two devices presenting at once interleave
+/// into one cadence line, which is what a debug probe can afford.
 static LAST_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
 /// Exponential running average of the presented interval, ns; 0 = unseeded.
 static TYPICAL_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
@@ -386,7 +388,21 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             return true;
         };
 
-        let drawable_opt = if super::macdrv::window_occluded() {
+        // The record attach created for this device's window carries the
+        // display state the present reads; a layer with no record presents
+        // with the defaults a session on no display would use.
+        let present_view = usize::try_from(params.present_view.raw())
+            .expect("a 64-bit host addresses every view pointer");
+        let attachment = attachment::find(present_view);
+        if attachment.is_none() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "submit_frame: present view {present_view:#x} has no attachment record; \
+                 presenting as not occluded, headroom 1.0, unthrottled, stretch route",
+            );
+        }
+        let occluded = attachment.as_ref().is_some_and(|att| att.window_occluded());
+        let drawable_opt = if occluded {
             // Window fully occluded: the compositor isn't recycling drawables,
             // so `nextDrawable` would block its full timeout for nothing that
             // reaches the screen. Skip the acquire entirely — the command
@@ -463,15 +479,17 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             };
             // An enlargement the geometry has not settled on yet takes the
             // shader rather than building a scaler for a size that is about
-            // to change again. See `SETTLED_PRESENTS`.
+            // to change again. See `SETTLED_PRESENTS`. The streak is the
+            // record's, so two devices at different geometries settle apart.
+            let settled = attachment
+                .as_ref()
+                .is_some_and(|att| att.present_settled(geometry));
             let route = match present_route(
                 geometry.src,
                 geometry.dst,
                 super::upscale::is_available(&device),
             ) {
-                PresentRoute::Upscale if !present_geometry_settled(geometry) => {
-                    PresentRoute::Stretch
-                }
+                PresentRoute::Upscale if !settled => PresentRoute::Stretch,
                 route => route,
             };
             // Reads what the main thread last published and queues the next
@@ -482,7 +500,9 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // is also what reconciles the layer with the display the window is
             // on, and a session that started SDR has to notice a panel with
             // headroom appearing under it.
-            let current = super::macdrv::current_headroom();
+            let current = attachment
+                .as_ref()
+                .map_or(1.0, attachment::current_headroom);
             // The pointer check rides the present cadence so a system tool
             // taking the pointer is noticed without a wakeup of its own.
             super::macdrv::poll_capture_from_present();
@@ -565,7 +585,9 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
             // production rates display at their actual rate. `0.0` means
             // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
             let drawable_obj = ProtocolObject::from_ref(&*drawable);
-            let min_duration = super::macdrv::min_present_duration_sec();
+            let min_duration = attachment
+                .as_ref()
+                .map_or(0.0, |att| att.min_present_duration_sec());
             if min_duration > 0.0 {
                 cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
             } else {
@@ -756,9 +778,37 @@ enum PresentRoute {
 /// Only ever compared, never measured against, so the axes stay in the
 /// tuples the Metal texture accessors hand back.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PresentGeometry {
-    src: (usize, usize),
-    dst: (usize, usize),
+pub struct PresentGeometry {
+    pub src: (usize, usize),
+    pub dst: (usize, usize),
+}
+
+/// One attachment's running count of consecutive presents at one geometry.
+///
+/// The state behind [`geometry_settled`], owned by the attachment record so
+/// that two devices presenting at different geometries each settle on their
+/// own. Only `submit_frame` advances it, from the thread that submits that
+/// device's frames; the mutex is for the shared record, not for contention.
+pub struct GeometryStreak(Mutex<Option<(PresentGeometry, u32)>>);
+
+impl GeometryStreak {
+    /// A streak that has seen no present yet.
+    pub const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Advance the count for `geometry`, and say whether it has settled.
+    pub fn settled(&self, geometry: PresentGeometry) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|mut seen| geometry_settled(&mut seen, geometry))
+    }
+}
+
+impl Default for GeometryStreak {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Consecutive presents at one geometry before `MetalFX` is worth building.
@@ -807,18 +857,6 @@ fn geometry_settled(seen: &mut Option<(PresentGeometry, u32)>, geometry: Present
             SETTLED_PRESENTS <= 1
         }
     }
-}
-
-/// [`geometry_settled`] against the encoder thread's own running count.
-fn present_geometry_settled(geometry: PresentGeometry) -> bool {
-    /// Last present geometry and how many consecutive presents have used it.
-    ///
-    /// Only `submit_frame` touches this, and only from the encoder thread;
-    /// the mutex is for the `static`, not for contention.
-    static SEEN: Mutex<Option<(PresentGeometry, u32)>> = Mutex::new(None);
-
-    SEEN.lock()
-        .is_ok_and(|mut seen| geometry_settled(&mut seen, geometry))
 }
 
 /// Pick the present route for one frame's geometry.

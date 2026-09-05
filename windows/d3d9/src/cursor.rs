@@ -16,7 +16,11 @@
 //! visibility, and the Win32 cursor this module realizes is a blank HCURSOR, so
 //! the `WindowServer` cursor plane never toggles on our account.
 
-use core::{ffi::c_void, ptr::null_mut};
+use core::{
+    ffi::c_void,
+    ptr::null_mut,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use std::{
     hash::Hasher,
     sync::{LazyLock, Mutex},
@@ -25,7 +29,9 @@ use std::{
 
 use log::{Level, debug, error, info, log_enabled, trace, warn};
 use mtld3d_core::perf::DeviceSubCategory;
-use mtld3d_shared::{InPtr, SetCursorOverlayParams, mtl::CursorOverlayFlags};
+use mtld3d_shared::{
+    InPtr, MetalHandle, SetCursorOverlayParams, mtl::CursorOverlayFlags, mtl_handle::NSViewKind,
+};
 use mtld3d_types::{
     D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO, IDirect3DSurface9Vtbl, POINT,
 };
@@ -253,6 +259,74 @@ static DEVICE_INSTANCES: LazyLock<Mutex<FxHashMap<usize, usize>>> =
 
 // ── CursorState ──
 
+/// The two words the unix side writes into from its main thread, at a stable address.
+///
+/// `AttachMetalLayer` hands the unix side both addresses, and the record it
+/// keeps for the device's view writes through them outside any thunk: the
+/// backing scale at attach and whenever the display-follow reconciliation
+/// derives another, the cursor kick when the pointer comes back from another
+/// process. The box is created before the attach and owned by the device's
+/// `CursorState`, so the addresses hold for the device's lifetime. Ordering
+/// against teardown is what makes that enough: device release issues
+/// `DestroyCommandQueue` while the inner box is still alive, that thunk
+/// unregisters the record under the unix registry lock, every unix write
+/// into a sink runs under the same lock with a liveness check, and the inner
+/// box drops only after the thunk has returned. So a write lands before the
+/// record is gone or not at all.
+pub struct DisplaySinks {
+    /// Wine's retina factor for the layer (2 in retina mode, else 1); `0` until published.
+    backing_scale: AtomicU32,
+    /// Set by the unix side to ask for a cursor re-apply; taken back to zero here.
+    ///
+    /// A system tool that borrows the pointer (the screenshot crosshair)
+    /// leaves its own cursor on screen, and Wine re-applies its cursor only
+    /// on a handle change. The cursor module takes the flag at the next
+    /// `WM_SETCURSOR` or `ShowCursor(TRUE)` and answers it with the
+    /// null-then-set kick.
+    cursor_kick: AtomicU32,
+}
+
+impl DisplaySinks {
+    pub const fn new() -> Self {
+        Self {
+            backing_scale: AtomicU32::new(0),
+            cursor_kick: AtomicU32::new(0),
+        }
+    }
+
+    /// The address `AttachMetalLayerParams::backing_scale_ptr` carries.
+    pub fn backing_scale_ptr(&self) -> u64 {
+        (&raw const self.backing_scale) as u64
+    }
+
+    /// The address `AttachMetalLayerParams::cursor_kick_ptr` carries.
+    pub fn cursor_kick_ptr(&self) -> u64 {
+        (&raw const self.cursor_kick) as u64
+    }
+
+    /// Wine's retina factor as last published, or `None` before attach published one.
+    pub fn display_backing_scale(&self) -> Option<u32> {
+        match self.backing_scale.load(Ordering::Relaxed) {
+            0 => None,
+            scale => Some(scale),
+        }
+    }
+
+    /// Take the pending cursor re-apply request, if the unix side left one.
+    ///
+    /// `Acquire` pairs with the unix side's `Release` store; the flag is the
+    /// whole message, so nothing else is read behind it.
+    pub fn take_cursor_kick(&self) -> bool {
+        self.cursor_kick.swap(0, Ordering::AcqRel) != 0
+    }
+}
+
+impl Default for DisplaySinks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 bitflags::bitflags! {
     /// Packed boolean state for `CursorState`.
     ///
@@ -335,6 +409,14 @@ const HITCH_MAX_INTERVAL_US: u64 = 500_000;
 pub struct CursorState {
     hwnd: *mut c_void,
     original_wndproc: *mut c_void,
+    /// The metal view the device attached, naming its unix-side attachment record.
+    ///
+    /// Every `SetCursorOverlay` carries it so the overlay follows this
+    /// device's window. Null for a headless device, which then sends no
+    /// overlay state at all.
+    view_handle: MetalHandle<NSViewKind>,
+    /// The words the unix side publishes the backing scale and the cursor kick into.
+    sinks: Box<DisplaySinks>,
     /// The HCURSOR realized while the D3D cursor is shown.
     ///
     /// The game's bitmap built by `build_hcursor` in hardware mode; the blank
@@ -381,7 +463,13 @@ struct CursorSource {
 }
 
 impl CursorState {
-    pub fn new(hwnd: *mut c_void, scale: u32, software: bool) -> Self {
+    pub fn new(
+        hwnd: *mut c_void,
+        scale: u32,
+        software: bool,
+        view_handle: MetalHandle<NSViewKind>,
+        sinks: Box<DisplaySinks>,
+    ) -> Self {
         // D3D9 starts the cursor hidden (ShowCursor reports FALSE until a
         // cursor image is set and shown).
         let mut flags = CursorFlags::DIRTY;
@@ -391,6 +479,8 @@ impl CursorState {
         Self {
             hwnd,
             original_wndproc: null_mut(),
+            view_handle,
+            sinks,
             handle: null_mut(),
             flags,
             hash: 0,
@@ -400,6 +490,25 @@ impl CursorState {
             scale: scale.clamp(1, 8),
             source: None,
         }
+    }
+
+    /// Follow the backing scale the unix side last published for this device's window.
+    ///
+    /// Called once per `Present`: one relaxed load and a compare on an
+    /// unchanged value, which is every frame that stays put. The unix side
+    /// republishes whenever the window's display changes the factor, so the
+    /// cursor upscale follows the window between displays without a thunk.
+    pub fn follow_published_scale(&mut self, cursor_scale: mtld3d_core::config::CursorScale) {
+        if let Some(backing_scale) = self.sinks.display_backing_scale() {
+            let (scale, _origin) =
+                crate::direct3d9::resolve_cursor_scale(backing_scale, cursor_scale);
+            self.follow_scale(scale);
+        }
+    }
+
+    /// Take the pending cursor re-apply request, if the unix side left one for this device.
+    pub fn take_cursor_kick(&self) -> bool {
+        self.sinks.take_cursor_kick()
     }
 
     /// Re-scale the pointer after the window moved to a display of another backing scale.
@@ -459,14 +568,14 @@ impl CursorState {
         }
         let flags = self.overlay_flags();
         if self.uploaded.contains(&hash) {
-            send_overlay_state(hash, flags, None);
+            send_overlay_state(self.view_handle, hash, flags, None);
             return;
         }
         let Some(source) = self.source.as_ref() else {
             return;
         };
         let sprite = upscale_sprite(source, self.scale);
-        if send_overlay_state(hash, flags, Some(&sprite)) {
+        if send_overlay_state(self.view_handle, hash, flags, Some(&sprite)) {
             self.uploaded.insert(hash);
         }
     }
@@ -479,12 +588,17 @@ impl CursorState {
     fn push_overlay_state(&self) {
         if self.software() {
             if self.hash != 0 {
-                send_overlay_state(self.hash, self.overlay_flags(), None);
+                send_overlay_state(self.view_handle, self.hash, self.overlay_flags(), None);
             }
         } else if !self.handle.is_null() {
             // A game that never set a D3D cursor shows none of ours, whatever
             // WM_SIZE pins: nothing for the pointer watch to look after.
-            send_overlay_state(0, self.overlay_flags() | CursorOverlayFlags::HARDWARE, None);
+            send_overlay_state(
+                self.view_handle,
+                0,
+                self.overlay_flags() | CursorOverlayFlags::HARDWARE,
+                None,
+            );
         }
     }
 
@@ -995,7 +1109,7 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
         // A pointer that came back from another process while the cursor was
         // hidden: the game's cursor was not on screen to kick then, so the
         // show pushes null first and Wine re-applies on the handle change.
-        if crate::direct3d9::take_cursor_kick() {
+        if cur.take_cursor_kick() {
             set_cursor(null_mut());
         }
     }
@@ -1113,7 +1227,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
             // back from another process, which left its own cursor behind.
             // Taken unconditionally: a kick left behind an already dirty
             // pass would fire again on the next, correct pass.
-            let kicked = crate::direct3d9::take_cursor_kick();
+            let kicked = cur.take_cursor_kick();
             let was_dirty = cur.dirty() || kicked;
             let started = Instant::now();
             if was_dirty {
@@ -1390,8 +1504,22 @@ fn upscale_sprite(source: &CursorSource, scale: u32) -> SpriteUpload {
 /// One `SetCursorOverlay` call: the wanted sprite and visibility, pixels attached or not.
 ///
 /// Returns whether the unix side accepted it. The pixel buffer only has to
-/// outlive the call: the unix side copies what it keeps.
-fn send_overlay_state(hash: u64, flags: CursorOverlayFlags, sprite: Option<&SpriteUpload>) -> bool {
+/// outlive the call: the unix side copies what it keeps. A device with no
+/// metal view (headless) has no attachment record for the overlay to follow,
+/// so nothing is sent and the call reports as not accepted.
+fn send_overlay_state(
+    view_handle: MetalHandle<NSViewKind>,
+    hash: u64,
+    flags: CursorOverlayFlags,
+    sprite: Option<&SpriteUpload>,
+) -> bool {
+    if view_handle.is_null() {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "SetCursorOverlay: no metal view attached (headless device), overlay state not sent",
+        );
+        return false;
+    }
     let started = Instant::now();
     let mut params = SetCursorOverlayParams {
         hash,
@@ -1404,6 +1532,7 @@ fn send_overlay_state(hash: u64, flags: CursorOverlayFlags, sprite: Option<&Spri
         scale: 0,
         flags,
         pad0: 0,
+        view_handle,
     };
     if let Some(s) = sprite {
         params.pixels_ptr = s.pixels.as_ptr() as u64;

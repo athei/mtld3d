@@ -8105,10 +8105,10 @@ pub struct FrameData {
     layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
-    /// Forwarded to `SubmitFrameParams.present_view` so the unix side can
-    /// follow the screen the window is on: its *dynamic* EDR headroom each
-    /// present, and its EDR capability across a display change. Which layer
-    /// configuration that resolves to is decided unix-side.
+    /// Forwarded to `SubmitFrameParams.present_view`: it names the attachment
+    /// record `submit_frame` reads its display state from (the window's
+    /// occlusion, the live EDR headroom, the present throttle, the geometry
+    /// streak), all of which the unix side derives for that window alone.
     view_handle: MetalHandle<NSViewKind>,
     /// Logical back-buffer width, the resolution D3D9 reports.
     ///
