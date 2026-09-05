@@ -1931,6 +1931,92 @@ fn a_cube_face_uploads_whole_onto_the_device_it_migrates_to() {
     }
 }
 
+/// A texture that migrates between two live devices leaves the first one's registry.
+///
+/// Each device keeps a registry of raw `TextureInner` pointers, and a texture
+/// drops out of it when it is freed, from the device it belongs to at that
+/// moment. Binding it on a second device that is alive beside the first moves
+/// it between them, so an entry the first device keeps names a texture it no
+/// longer owns. Releasing that device walks the registry and writes through
+/// every entry, and `EvictManagedResources` walks the same list.
+///
+/// The two textures cover the two shapes that walk reaches. One is freed
+/// first, so a stale entry would be dereferenced after its allocation is
+/// gone. The other is still live, where the walk detaches a texture that
+/// belongs to the second device, and `GetDevice` is what says so: a detached
+/// texture answers `D3DERR_INVALIDCALL`, so the migrated texture naming the
+/// device it migrated to is the assertion that the first device let go of it.
+#[test]
+fn a_texture_migrating_between_live_devices_leaves_the_first_devices_registry() {
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+
+    let first = Harness::new();
+    let second = Harness::new();
+
+    let kept = first.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    kept.lock_rect(0, 0).write_u32(&[GREEN; TEXELS]);
+    let freed = first.create_texture(SIZE, SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    freed.lock_rect(0, 0).write_u32(&[RED; TEXELS]);
+    assert_pixel_eq(
+        sample_center(&first, &kept).to_pixel(),
+        GREEN,
+        "the kept texture on the device that created it",
+    );
+    assert_pixel_eq(
+        sample_center(&first, &freed).to_pixel(),
+        RED,
+        "the freed texture on the device that created it",
+    );
+
+    // Both migrate on their first bind under the second device, which draws
+    // while the first device is still live.
+    assert_pixel_eq(
+        sample_center(&second, &kept).to_pixel(),
+        GREEN,
+        "the kept texture on the device it migrated to",
+    );
+    assert_pixel_eq(
+        sample_center(&second, &freed).to_pixel(),
+        RED,
+        "the freed texture on the device it migrated to",
+    );
+
+    // A bound stage holds a reference on the texture, so both devices give
+    // theirs up before either texture is freed.
+    assert_eq!(first.clear_texture(0), 0, "unbind on the first device");
+    assert_eq!(second.clear_texture(0), 0, "unbind on the second device");
+    drop(freed);
+    assert_eq!(
+        first.release_device(),
+        0,
+        "the first device is fully released"
+    );
+
+    let before = second.device_refcount();
+    let (hr, dev) = kept.get_device();
+    assert_eq!(hr, 0, "GetDevice on the texture that migrated");
+    assert_eq!(dev, second.device(), "the device the texture migrated to");
+    // SAFETY: `dev` is the reference `GetDevice` just handed out.
+    let back = unsafe { second.release_device_ref(dev) };
+    assert_eq!(
+        back, before,
+        "the reference handed out is the one given back"
+    );
+    assert_pixel_eq(
+        sample_center(&second, &kept).to_pixel(),
+        GREEN,
+        "the kept texture once the first device is gone",
+    );
+    assert_eq!(
+        second.clear_texture(0),
+        0,
+        "unbind before the texture is freed"
+    );
+}
+
 /// An `UpdateSurface` from system memory reaches the very next draw.
 ///
 /// The staging write only reaches the GPU through the bind-time

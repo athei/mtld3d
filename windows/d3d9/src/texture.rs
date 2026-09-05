@@ -4270,6 +4270,17 @@ fn rehydrate_for_device_slow(ti: &mut TextureInner, dev: &mut DeviceInner, dev_p
             ti.last_submit_seq[level] = 0;
         }
     }
+    // The device being left has to forget the texture: `finalize_texture`
+    // deregisters from `device_inner` alone, which by then names the adopting
+    // device, so an entry left on a device that is still alive dangles the
+    // moment the texture is freed. Both that device's release teardown and its
+    // `EvictManagedResources` walk their registry and dereference every entry.
+    // A zero here is a device already released, whose `detach_from_device`
+    // zeroed the link and whose registry went away with it.
+    if ti.device_inner != 0 {
+        DeviceInner::from_ptr(ti.device_inner)
+            .deregister_texture(std::ptr::from_mut::<TextureInner>(ti));
+    }
     ti.device_inner = dev_ptr;
     ti.device_handle = dev.device_handle();
     ti.point_cached_surfaces_at(std::ptr::from_mut::<DeviceInner>(dev));
