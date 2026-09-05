@@ -50,7 +50,8 @@ interface creates. The [sample](mtld3d.conf) documents every key with its
 default and the reason it exists; a missing file means defaults. Every key
 can also be set at launch through the `MTLD3D_CONFIG` environment variable,
 which wins over the file. Keys worth knowing by name: `render.scale` renders
-at a fraction of the presented size and lets MetalFX upscale, `present.maxFps`
+at a fraction of the presented size and lets MetalFX upscale (with
+`render.lodBias` keeping texture detail at the presented size), `present.maxFps`
 caps the frame rate, and `color.hdr.enable` and `cursor.software` govern the
 HDR present path and the cursor overlay that comes with it, both on by default
 on a display with EDR headroom.

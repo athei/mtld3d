@@ -112,3 +112,25 @@ fn factor_is_the_render_over_logical_ratio() {
     let scaled = 480.0_f32 * s.factor();
     assert!((scaled - 321.6).abs() < 0.05);
 }
+
+#[test]
+fn the_identity_has_no_lod_bias() {
+    assert_eq!(RenderScale::IDENTITY.lod_bias().to_bits(), 0.0f32.to_bits());
+}
+
+#[test]
+fn a_reduced_scale_biases_by_its_log2() {
+    assert_eq!(
+        RenderScale::from_percent(50).lod_bias().to_bits(),
+        (-1.0f32).to_bits()
+    );
+    assert_eq!(
+        RenderScale::from_percent(25).lod_bias().to_bits(),
+        (-2.0f32).to_bits()
+    );
+    let bias = RenderScale::from_percent(75).lod_bias();
+    assert!(
+        (bias - 0.75f32.log2()).abs() < 1e-6,
+        "75% biases by log2(0.75), got {bias}"
+    );
+}

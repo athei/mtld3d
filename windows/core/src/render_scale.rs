@@ -84,6 +84,21 @@ impl RenderScale {
         f32::from(u8::try_from(self.0).unwrap_or(100)) / 100.0
     }
 
+    /// The mip LOD bias that keeps texture detail at the logical resolution.
+    ///
+    /// A sampler derives its LOD from the render grid, which is `factor()`
+    /// times finer in each axis than the logical one, so it lands
+    /// `log2(1 / factor)` levels coarser than the logical size warrants.
+    /// This is the compensating bias, `log2(factor)`: exactly `0.0` at the
+    /// identity, `-1.0` at 50%.
+    #[must_use]
+    pub fn lod_bias(self) -> f32 {
+        if self.is_identity() {
+            return 0.0;
+        }
+        self.factor().log2()
+    }
+
     /// Convert one logical dimension to its render-resolution counterpart.
     ///
     /// Never returns zero for a non-zero input: a back buffer dimension of `0`

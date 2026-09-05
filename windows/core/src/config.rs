@@ -236,6 +236,15 @@ pub struct Mtld3dConfig {
     /// the struct keeps its `Eq`; the file key is written as a float. File
     /// key: `render.scale` (e.g. `0.75`), accepted range `(0, 1.0]`.
     pub render_scale_percent: u32,
+    /// Bias texture LOD by `log2(render.scale)` so textures keep their presented-size detail.
+    ///
+    /// A sampler picks its mip level from the render grid, so under a reduced
+    /// `render.scale` every texture is sampled coarser than the presented
+    /// resolution warrants. On (the default), every draw into a scaled target
+    /// adds `log2(scale)` to its sampled stages' bias, which is what the
+    /// spatial-upscaler integration guides prescribe. Nothing changes at the
+    /// identity. File key: `render.lodBias`.
+    pub render_lod_bias: bool,
     /// Present the adapter as a well-known GPU vendor.
     ///
     /// D3D9-era engines pick vendor-specific render paths (a depth copy
@@ -332,6 +341,7 @@ impl Default for Mtld3dConfig {
             pagebox_pool_cap_bytes: DEFAULT_PAGEBOX_POOL_CAP_BYTES,
             present_max_fps: 0,
             render_scale_percent: 100,
+            render_lod_bias: true,
             adapter_spoof: AdapterSpoof::None,
             df_formats: true,
         }
@@ -494,6 +504,7 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         "config: render.scale = {}",
         f64::from(cfg.render_scale_percent) / 100.0
     );
+    info!(target: crate::LOG_TARGET, "config: render.lodBias = {}", cfg.render_lod_bias);
     info!(
         target: crate::LOG_TARGET,
         "config: adapter.spoof = {}",
@@ -560,6 +571,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
+        "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
         "caps.dfFormats" => assign_bool(source, key, value, &mut cfg.df_formats),
         _ => log_once_warn!(
