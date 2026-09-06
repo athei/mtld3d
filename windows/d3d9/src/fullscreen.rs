@@ -62,9 +62,11 @@
 //! current monitor is a follow-up.
 
 use core::ffi::c_void;
+use std::sync::{LazyLock, Mutex};
 
 use log::{debug, warn};
 use mtld3d_core::display_mode::{ModeRequest, mode_set_attempts};
+use rustc_hash::FxHashMap;
 
 /// Sub-target shared with the display-enumeration probes in `direct3d9`.
 const LOG_TARGET: &str = "mtld3d::d3d9::display";
@@ -538,44 +540,70 @@ impl Rect {
 
 // ── Re-entrancy latch ──
 
-/// Nesting depth of mtld3d-driven window moves, process-wide.
+/// Nesting depth of mtld3d-driven moves, per window (`HWND` as `usize`).
 ///
 /// Every `SetWindowPos` below bounces a synchronous `WM_SIZE` back through the
 /// cursor subclass, which would otherwise rebuild the device's back buffer
 /// from inside our own window management.
 ///
-/// It is global rather than per-device because the message is delivered to
-/// whichever device is subclassed on that window, and that is not necessarily
-/// the device performing the move: a second `CreateDevice` on a window that
-/// already has one moves the window before its own device exists, so the
-/// bounce lands on the *first* device. A per-device flag cannot see that, and
-/// the stale device would rebuild its resources re-entrantly.
+/// It is keyed by the window rather than by the device because the message is
+/// delivered to whichever device is subclassed on that window, and that is not
+/// necessarily the device performing the move: a second `CreateDevice` on a
+/// window that already has one moves the window before its own device exists,
+/// so the bounce lands on the *first* device. A per-device flag cannot see
+/// that, and the stale device would rebuild its resources re-entrantly.
 ///
-/// A counter, not a flag: leaving and re-entering fullscreen for a retarget
-/// nests, and a plain flag would clear on the inner exit.
-static DRIVING_WINDOW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// It is not one process-wide count either: a move of one window says nothing
+/// about the messages another window receives meanwhile, and a device on
+/// another thread that is being retargeted while this one enters fullscreen
+/// has to keep answering the `WM_SIZE` and `WM_SETCURSOR` its own window gets,
+/// which a process-wide latch would send to the default procedure.
+///
+/// A count per window, not a flag: leaving and re-entering fullscreen for a
+/// retarget nests, and a plain flag would clear on the inner exit. An entry
+/// exists exactly while a move of its window is in flight.
+static DRIVING_WINDOWS: LazyLock<Mutex<FxHashMap<usize, u32>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-/// `true` while any mtld3d window move is in flight.
+/// `true` while an mtld3d move of `hwnd` is in flight.
 ///
 /// Read by the cursor subclass to skip the auto-resize for a `WM_SIZE` we
-/// caused ourselves.
-pub fn driving_window() -> bool {
-    DRIVING_WINDOW.load(core::sync::atomic::Ordering::Relaxed) != 0
+/// caused ourselves on that window.
+pub fn driving_window(hwnd: *mut c_void) -> bool {
+    DRIVING_WINDOWS
+        .lock()
+        .expect("driving-windows mutex poisoned")
+        .contains_key(&(hwnd as usize))
 }
 
-/// Holds [`DRIVING_WINDOW`] raised for the duration of a window move.
-struct DrivingGuard;
+/// Holds the [`DRIVING_WINDOWS`] count of one window raised for the duration of its move.
+struct DrivingGuard {
+    hwnd: usize,
+}
 
 impl DrivingGuard {
-    fn new() -> Self {
-        DRIVING_WINDOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        Self
+    fn new(hwnd: *mut c_void) -> Self {
+        let hwnd = hwnd as usize;
+        *DRIVING_WINDOWS
+            .lock()
+            .expect("driving-windows mutex poisoned")
+            .entry(hwnd)
+            .or_insert(0) += 1;
+        Self { hwnd }
     }
 }
 
 impl Drop for DrivingGuard {
     fn drop(&mut self) {
-        DRIVING_WINDOW.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        let mut driving = DRIVING_WINDOWS
+            .lock()
+            .expect("driving-windows mutex poisoned");
+        if let Some(depth) = driving.get_mut(&self.hwnd) {
+            *depth -= 1;
+            if *depth == 0 {
+                driving.remove(&self.hwnd);
+            }
+        }
     }
 }
 
@@ -645,7 +673,7 @@ pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) 
     // synchronously from inside it, and a game handler that answers by
     // resizing its window bounces a `WM_SIZE` the subclass would otherwise
     // auto-resize on; the window is placed right after anyway.
-    let _driving = DrivingGuard::new();
+    let _driving = DrivingGuard::new(hwnd);
     let mut saved = SavedWindow {
         hwnd,
         style: window_long(hwnd, GWL_STYLE),
@@ -671,7 +699,7 @@ pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) 
 /// nothing). The re-assert guard refills: a game-driven Reset is a fresh
 /// session.
 pub fn update(saved: &mut SavedWindow, mode: Option<ModeRequest>) {
-    let _driving = DrivingGuard::new();
+    let _driving = DrivingGuard::new(saved.hwnd);
     saved.mode = mode.filter(|request| set_display_mode(*request));
     if window_changes_suppressed(saved) {
         return;
@@ -688,7 +716,7 @@ pub fn update(saved: &mut SavedWindow, mode: Option<ModeRequest>) {
 /// rect is the mode's once more. Nothing to do for a device that set no
 /// mode, except re-covering a managed window.
 pub fn reactivate(saved: &mut SavedWindow) {
-    let _driving = DrivingGuard::new();
+    let _driving = DrivingGuard::new(saved.hwnd);
     let mode_set = saved.mode.is_some_and(set_display_mode);
     if window_changes_suppressed(saved) {
         return;
@@ -766,7 +794,7 @@ const fn fullscreen_exstyle(exstyle: u32) -> u32 {
 /// on its next `SetWindowPos`, so this is also what puts the `NSWindow` onto
 /// the physical monitor once the mode is in place.
 fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
-    let _driving = DrivingGuard::new();
+    let _driving = DrivingGuard::new(hwnd);
     let style = fullscreen_style(saved.style);
     let exstyle = fullscreen_exstyle(saved.exstyle);
     set_window_long(hwnd, GWL_STYLE, style);
@@ -811,7 +839,7 @@ pub fn leave(saved: &SavedWindow) {
     if window_changes_suppressed(saved) {
         return;
     }
-    let _driving = DrivingGuard::new();
+    let _driving = DrivingGuard::new(saved.hwnd);
     let hwnd = saved.hwnd;
     if !is_window(hwnd) {
         return;

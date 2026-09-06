@@ -3,6 +3,11 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
+use std::sync::{
+    Barrier, Mutex, PoisonError,
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+};
+
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
@@ -1609,6 +1614,246 @@ fn reset_windowed_retarget_moves_the_cursor_subclass() {
 
     drop(h);
     destroy_window(second);
+}
+
+/// Rounds every windowed worker of the concurrent-retarget test runs at least.
+const RETARGET_ROUNDS: u32 = 16;
+
+/// Fullscreen round trips the windowed workers keep retargeting through.
+const FULLSCREEN_TRIPS: u32 = 8;
+
+/// Rounds a windowed worker stops at even if the fullscreen worker is slow.
+const MAX_RETARGET_ROUNDS: u32 = 2000;
+
+/// What the workers of the concurrent-retarget test publish to each other.
+struct RetargetProgress {
+    /// Fullscreen round trips the fullscreen worker has completed.
+    transitions: AtomicU32,
+    /// Set once the fullscreen worker's loop is over, whichever way it ended.
+    fullscreen_stopped: AtomicBool,
+    /// Windowed workers that are done retargeting.
+    finished: AtomicUsize,
+}
+
+/// A `WM_SIZE` lparam: the client height in the high word, the width in the low.
+fn client_size_lparam(width: u32, height: u32) -> isize {
+    isize::try_from((height << 16) | width).expect("a client size fits 16 bits per axis")
+}
+
+/// Retarget one windowed device between its two windows, checking its messages each round.
+///
+/// Every round moves the device onto the other window with a windowed
+/// `Reset`, then sends that window a `WM_SIZE` and a `WM_SETCURSOR` and reads
+/// the back buffer and this thread's cursor back; a `WM_SIZE` on the window
+/// the device left has to change nothing. Runs `RETARGET_ROUNDS` rounds at
+/// least, and on until the fullscreen worker has completed `FULLSCREEN_TRIPS`
+/// round trips, so the rounds overlap its window moves. `Ok` carries the
+/// rounds run; `Err` names the first message that missed the device.
+fn retarget_and_check_messages(
+    h: &Harness,
+    second: usize,
+    ours: usize,
+    progress: &RetargetProgress,
+) -> Result<u32, String> {
+    const WM_SIZE: u32 = 0x0005;
+    const WM_SETCURSOR: u32 = 0x0020;
+    /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
+    const WM_MOUSEMOVE_LP: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
+    let mut round = 0;
+    while round < MAX_RETARGET_ROUNDS
+        && (round < RETARGET_ROUNDS
+            || (progress.transitions.load(Ordering::Acquire) < FULLSCREEN_TRIPS
+                && !progress.fullscreen_stopped.load(Ordering::Acquire)))
+    {
+        let even = round.is_multiple_of(2);
+        let (target, left) = if even {
+            (second, h.hwnd())
+        } else {
+            (h.hwnd(), second)
+        };
+        let (width, height): (u32, u32) = if even { (400, 300) } else { (320, 200) };
+
+        let mut pp = windowed_params(target, 640, 480);
+        let hr = h.reset_params(&mut pp);
+        if hr != D3D_OK {
+            return Err(format!(
+                "round {round}: windowed Reset onto window {target:#x} failed: 0x{hr:08X}"
+            ));
+        }
+
+        let _ = mtld3d_tests::send_message(target, WM_SIZE, 0, client_size_lparam(width, height));
+        let (hr, bb) = h.back_buffer(0).desc();
+        if hr != D3D_OK {
+            return Err(format!(
+                "round {round}: GetDesc after the resize failed: 0x{hr:08X}"
+            ));
+        }
+        if (bb.width, bb.height) != (width, height) {
+            return Err(format!(
+                "round {round}: WM_SIZE {width}x{height} on the device window {target:#x} left \
+                 the back buffer at {}x{}",
+                bb.width, bb.height,
+            ));
+        }
+
+        let _ = mtld3d_tests::send_message(left, WM_SIZE, 0, client_size_lparam(200, 150));
+        let (_, bb) = h.back_buffer(0).desc();
+        if (bb.width, bb.height) != (width, height) {
+            return Err(format!(
+                "round {round}: WM_SIZE on the window the device left {left:#x} resized its back \
+                 buffer to {}x{}",
+                bb.width, bb.height,
+            ));
+        }
+
+        h.set_thread_cursor(0);
+        let _ = mtld3d_tests::send_message(target, WM_SETCURSOR, target, lp_client_move);
+        let cursor = h.thread_cursor();
+        if cursor != ours {
+            return Err(format!(
+                "round {round}: WM_SETCURSOR on the device window {target:#x} realized cursor \
+                 {cursor:#x}, the device's is {ours:#x}"
+            ));
+        }
+        // A mode-set broadcasts `WM_DISPLAYCHANGE` to every window and waits
+        // for each to answer; the pump is that answer.
+        let _ = h.pump();
+        round += 1;
+    }
+    Ok(round)
+}
+
+/// Take one device through fullscreen and back until every windowed worker is done.
+///
+/// Each round trip is the `Reset` pair that moves the device's window: onto
+/// the monitor at the display's own resolution, which is a settable mode
+/// wherever the suite runs, and back to a windowed 640x480. `Ok` carries the
+/// round trips completed; `Err` names the first `Reset` that failed.
+fn cycle_fullscreen(
+    h: &Harness,
+    progress: &RetargetProgress,
+    windowed_workers: usize,
+) -> Result<u32, String> {
+    let (screen_w, screen_h) = Harness::screen_size();
+    let mut trips = 0;
+    while progress.finished.load(Ordering::Acquire) < windowed_workers {
+        let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
+        let hr = h.reset_params(&mut pp);
+        if hr != D3D_OK {
+            return Err(format!(
+                "round trip {trips}: fullscreen Reset failed: 0x{hr:08X}"
+            ));
+        }
+        let mut pp = windowed_params(h.hwnd(), 640, 480);
+        let hr = h.reset_params(&mut pp);
+        if hr != D3D_OK {
+            return Err(format!(
+                "round trip {trips}: windowed Reset failed: 0x{hr:08X}"
+            ));
+        }
+        trips += 1;
+        progress.transitions.store(trips, Ordering::Release);
+    }
+    Ok(trips)
+}
+
+/// Retargets on several threads keep their messages while another device moves its window.
+///
+/// Three threads each own a windowed device and a second window and move the
+/// device back and forth between the two, checking after every move that a
+/// `WM_SIZE` on the device window resizes that device's back buffer, that a
+/// `WM_SIZE` on the window it left does not, and that a `WM_SETCURSOR` on the
+/// device window realizes that device's cursor. A fourth thread takes its own
+/// device in and out of fullscreen the whole time, so the checks land inside
+/// its window moves. A device's window management filters the messages its
+/// own moves bounce back, and that filter has to be the window's: one that
+/// is shared by every device in the process sends the other devices'
+/// messages to the default procedure for the duration of the move, so the
+/// back buffer stays at the size the `Reset` gave it and the class cursor
+/// replaces the device's. Every device and window is created and torn down
+/// one thread at a time: the driver's window teardown and another thread's
+/// window update take two locks in opposite orders.
+#[test]
+fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
+    const WINDOWED_WORKERS: usize = 3;
+    let progress = RetargetProgress {
+        transitions: AtomicU32::new(0),
+        fullscreen_stopped: AtomicBool::new(false),
+        finished: AtomicUsize::new(0),
+    };
+    let one_at_a_time = Mutex::new(());
+    let armed = Barrier::new(WINDOWED_WORKERS + 1);
+    let done = Barrier::new(WINDOWED_WORKERS + 1);
+
+    std::thread::scope(|scope| {
+        let fullscreen = scope.spawn(|| {
+            let h = {
+                let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+                Harness::new()
+            };
+            armed.wait();
+            let outcome = cycle_fullscreen(&h, &progress, WINDOWED_WORKERS);
+            progress.fullscreen_stopped.store(true, Ordering::Release);
+            done.wait();
+            let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(h);
+            outcome
+        });
+        let windowed: Vec<_> = (0..WINDOWED_WORKERS)
+            .map(|_| {
+                scope.spawn(|| {
+                    let (h, second, ours) = {
+                        let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+                        let h = Harness::new();
+                        let second = create_window(640, 480, false);
+                        {
+                            let bitmap = h.create_offscreen_plain_surface(
+                                32,
+                                32,
+                                D3DFMT_A8R8G8B8,
+                                D3DPOOL_SCRATCH,
+                            );
+                            assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+                        }
+                        assert_eq!(h.show_cursor(true), 0, "cursor starts hidden");
+                        let ours = h.thread_cursor();
+                        assert_ne!(ours, 0, "ShowCursor(TRUE) must realize an HCURSOR");
+                        (h, second, ours)
+                    };
+                    armed.wait();
+                    let outcome = retarget_and_check_messages(&h, second, ours, &progress);
+                    progress.finished.fetch_add(1, Ordering::AcqRel);
+                    done.wait();
+                    let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+                    drop(h);
+                    destroy_window(second);
+                    outcome
+                })
+            })
+            .collect();
+
+        for (index, worker) in windowed.into_iter().enumerate() {
+            let rounds = worker
+                .join()
+                .expect("a windowed worker panicked")
+                .unwrap_or_else(|failure| panic!("windowed device {index}: {failure}"));
+            assert!(
+                rounds >= RETARGET_ROUNDS,
+                "windowed device {index} ran {rounds} rounds, fewer than {RETARGET_ROUNDS}",
+            );
+        }
+        let trips = fullscreen
+            .join()
+            .expect("the fullscreen worker panicked")
+            .unwrap_or_else(|failure| panic!("fullscreen device: {failure}"));
+        assert!(
+            trips >= FULLSCREEN_TRIPS,
+            "the fullscreen device made {trips} round trips, fewer than the {FULLSCREEN_TRIPS} \
+             the windowed rounds overlap with",
+        );
+    });
 }
 
 #[test]
