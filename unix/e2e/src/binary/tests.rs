@@ -1,8 +1,12 @@
-//! Unit tests for the binary naming and for what a dead process's stderr leaves behind.
+//! Unit tests for the binary naming and for the accounts a dead process leaves behind.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use super::{KEEP, binary_name, keep_stderr, stderr_tail};
+use super::{FATAL_LINES, KEEP, WineLauncher, binary_name, keep_stderr, layer_tail, stderr_tail};
+use crate::attribute::Launcher as _;
 
 /// A fresh directory under the temp dir, named after the test using it.
 fn dir(tag: &str) -> PathBuf {
@@ -94,4 +98,66 @@ fn the_kept_files_are_capped_and_never_touch_the_layers_logs() {
     };
     assert_eq!(kept("stderr"), KEEP);
     assert_eq!(kept("log"), 1);
+}
+
+#[test]
+fn a_layer_log_is_read_from_its_fatal_line_on() {
+    let work: String = (0..30)
+        .map(|i| format!("[2026-01-01T00:00:00Z INFO  mtld3d::unix] work {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let log = format!(
+        "{work}[mtld3d::unix] FATAL: SIGSEGV fault=0x0\n[mtld3d::unix] thread=mtld3d-encoder\n"
+    );
+    let tail = layer_tail(&log);
+    assert!(tail.starts_with("[mtld3d::unix] FATAL: SIGSEGV"), "{tail}");
+    assert!(tail.ends_with("thread=mtld3d-encoder"), "{tail}");
+    assert!(!tail.contains("work 29"), "{tail}");
+}
+
+#[test]
+fn a_layer_log_without_a_fatal_line_is_tailed_like_stderr() {
+    let log = (0..20)
+        .map(|i| format!("line {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    assert_eq!(layer_tail(&log), stderr_tail(&log));
+    assert!(layer_tail(&log).starts_with("line 5\n"));
+}
+
+#[test]
+fn a_fatal_line_early_in_a_long_log_is_quoted_to_a_bound() {
+    let log = format!(
+        "[mtld3d::unix] FATAL: SIGABRT\n{}",
+        (0..200)
+            .map(|i| format!("frame {i}\n"))
+            .collect::<Vec<_>>()
+            .concat()
+    );
+    assert_eq!(layer_tail(&log).lines().count(), FATAL_LINES);
+}
+
+#[test]
+fn the_layers_log_of_a_process_is_found_by_the_stem_and_the_pid() {
+    let dir = dir("layer");
+    let exe = Path::new("/t/deps/e2e-1030f4ab05278ecb.exe");
+    let launcher = WineLauncher::new(
+        Path::new("/usr/bin/true"),
+        exe,
+        Some(&dir),
+        Duration::from_secs(1),
+        Box::new(|_| {}),
+    );
+    assert!(
+        launcher.layer_log(4242).is_err(),
+        "a process that logged nothing has no file"
+    );
+    std::fs::write(
+        dir.join("e2e-1030f4ab05278ecb-4242.log"),
+        "[mtld3d::unix] FATAL: SIGSEGV fault=0x8\n",
+    )
+    .expect("layer log");
+    let (path, tail) = launcher.layer_log(4242).expect("the layer log");
+    assert_eq!(path, dir.join("e2e-1030f4ab05278ecb-4242.log"));
+    assert_eq!(tail, "[mtld3d::unix] FATAL: SIGSEGV fault=0x8");
 }

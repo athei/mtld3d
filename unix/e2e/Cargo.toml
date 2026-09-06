@@ -9,6 +9,10 @@ authors.workspace = true
 
 [dependencies]
 libc = { workspace = true }
+# The runner reads the log the layer wrote for a process it lost, so it takes
+# the file naming and the fatal banner from the crate that defines them rather
+# than restating either.
+mtld3d-shared = { workspace = true }
 
 [lints]
 workspace = true

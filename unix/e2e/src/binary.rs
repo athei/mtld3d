@@ -1,4 +1,8 @@
-//! A test binary on disk: its name, the launcher that runs it under Wine, and its stderr.
+//! A test binary on disk: its name, the launcher that runs it, and the accounts of its processes.
+//!
+//! Two accounts survive a process the runner lost: the stderr it kept in a
+//! file of its own, and the log the layer wrote, which is where the layer's
+//! crash report goes and the only place it goes.
 
 use std::{
     fs,
@@ -17,6 +21,13 @@ const KEEP: usize = 10;
 
 /// How many of the process's own stderr lines a report shows.
 const TAIL_LINES: usize = 15;
+
+/// How many layer-log lines a report shows once a fatal line anchors them.
+///
+/// The crash report is a banner, the faulting thread, the program counter,
+/// the registers and a symbolised stack: enough lines that the plain tail
+/// would cut the banner off, and few enough to quote whole.
+const FATAL_LINES: usize = 40;
 
 /// The classes Wine's debug channels print, the first field of every line they emit.
 const WINE_CLASSES: [&str; 4] = ["err", "warn", "fixme", "trace"];
@@ -141,6 +152,22 @@ impl Launcher for WineLauncher {
     fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String> {
         keep_stderr(&self.log_dir, &binary_name(&self.exe), pid, stderr)
     }
+
+    fn layer_log(&self, pid: u32) -> Result<(PathBuf, String), String> {
+        // The layer names the file after the executable's whole stem, cargo
+        // hash and all, and after the host pid, which is the one the runner
+        // spawned the process under.
+        let stem = self
+            .exe
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        let path = self
+            .log_dir
+            .join(mtld3d_shared::log_paths::log_file_name(stem, pid));
+        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok((path, layer_tail(&text)))
+    }
 }
 
 /// Write one dead process's whole stderr into `dir`, and name the file.
@@ -190,6 +217,25 @@ fn is_wine_chatter(line: &str) -> bool {
         return false;
     };
     WINE_CLASSES.contains(&class) && (class == "fixme" || channel == "dbghelp")
+}
+
+/// The part of a layer log that accounts for the process's end.
+///
+/// From the fatal banner when the layer wrote one, since everything after it
+/// is the crash report and everything before it is ordinary work; the last
+/// lines otherwise, which are what the layer was doing when it stopped.
+#[must_use]
+pub fn layer_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    let fatal = lines
+        .iter()
+        .position(|line| line.contains(mtld3d_shared::fatal::BANNER));
+    let (start, len) = fatal.map_or_else(
+        || (lines.len().saturating_sub(TAIL_LINES), TAIL_LINES),
+        |at| (at, FATAL_LINES),
+    );
+    let end = start.saturating_add(len).min(lines.len());
+    lines[start..end].join("\n")
 }
 
 /// Remove the oldest kept stderr files in `dir` beyond the newest `keep`.
