@@ -1,9 +1,9 @@
-//! `Direct3DCreate9Ex` resolves by name and reports D3D9Ex as unavailable.
+//! `Direct3DCreate9Ex` resolves by name and reports `D3D9Ex` as unavailable.
 //!
 //! A runtime probe that only resolves the name, the way a title's
 //! compatibility check tells a Vista-era d3d9 from an older one, must find
 //! the export; a caller that goes on to call it must get the documented
-//! failure of a runtime without D3D9Ex, `D3DERR_NOTAVAILABLE` with the out
+//! failure of a runtime without `D3D9Ex`, `D3DERR_NOTAVAILABLE` with the out
 //! slot nulled, so it takes its plain-D3D9 fallback instead of reading a
 //! stale pointer. A null out slot is `D3DERR_INVALIDCALL`.
 //!
