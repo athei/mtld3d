@@ -4962,6 +4962,54 @@ pub enum VertexBufferBind {
     ReusedHandle,
 }
 
+/// Last-bound immutable byte snapshot for one encoder slot.
+///
+/// Retains the latest token instead of copying its bytes. Tokens must return
+/// the same immutable slice for their entire cached lifetime. Arena-backed
+/// tokens must be reset before their arena is cleared, reused or transferred
+/// to another owner. A fresh render encoder also requires a reset.
+pub struct SnapshotBytesCache<T: AsRef<[u8]>> {
+    snapshot: Option<T>,
+}
+
+impl<T: AsRef<[u8]>> SnapshotBytesCache<T> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { snapshot: None }
+    }
+
+    /// Forget the token before its backing storage can be retired or reused.
+    pub fn reset(&mut self) {
+        self.snapshot = None;
+    }
+
+    /// Record a nonempty snapshot and report whether its binding changed.
+    ///
+    /// Equal pointers and lengths identify an unchanged immutable snapshot.
+    /// Distinct snapshots compare bytewise, preserving NaN payloads and signed
+    /// zero. Even an equal snapshot replaces the token so subsequent draws can
+    /// use its identity. Empty snapshots leave the existing binding untouched.
+    #[inline]
+    pub fn changed(&mut self, snapshot: T) -> bool {
+        let bytes = snapshot.as_ref();
+        if bytes.is_empty() {
+            return false;
+        }
+        let changed = self.snapshot.as_ref().is_none_or(|previous| {
+            let previous = previous.as_ref();
+            !(core::ptr::eq(previous, bytes) || previous == bytes)
+        });
+        self.snapshot = Some(snapshot);
+        changed
+    }
+}
+
+impl<T: AsRef<[u8]>> Default for SnapshotBytesCache<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-render-pass last-bound state cache.
 ///
 /// Skips redundant `setFragmentSamplerState` / `setFragmentTexture` /
@@ -4988,8 +5036,6 @@ pub struct LastBoundCache {
     depth_stencil: u64,
     stencil_reference: u32,
     cull_mode: Option<CullMode>,
-    /// VS float constant slot — programmable / FF vertex constant buffer.
-    vs_constants: Vec<u8>,
     /// VS pos-fixup slot — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
     ///
     /// Re-bound only when the viewport dims change (rare), so the per-draw
@@ -5001,8 +5047,6 @@ pub struct LastBoundCache {
     /// changes, so the per-draw cost is a length-then-memcmp against
     /// `vs_draw::VS_DRAW_BYTES`.
     vs_draw: Vec<u8>,
-    /// PS slot 15 — programmable / FF pixel constant buffer.
-    ps_constants: Vec<u8>,
     /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
     ps_alpha_ref: Vec<u8>,
     /// PS slot 13 — fog colour vec4, when fog is enabled.
@@ -5063,10 +5107,8 @@ impl LastBoundCache {
             depth_stencil: 0,
             stencil_reference: 0,
             cull_mode: None,
-            vs_constants: Vec::new(),
             vs_pos_fixup: Vec::new(),
             vs_draw: Vec::new(),
-            ps_constants: Vec::new(),
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
@@ -5094,10 +5136,8 @@ impl LastBoundCache {
         self.depth_stencil = 0;
         self.stencil_reference = 0;
         self.cull_mode = None;
-        self.vs_constants.clear();
         self.vs_pos_fixup.clear();
         self.vs_draw.clear();
-        self.ps_constants.clear();
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
@@ -5284,11 +5324,6 @@ impl LastBoundCache {
     }
 
     #[inline]
-    pub fn vs_constants_changed(&mut self, bytes: &[u8]) -> bool {
-        update_inline_bytes(&mut self.vs_constants, bytes)
-    }
-
-    #[inline]
     pub fn vs_pos_fixup_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_pos_fixup, bytes)
     }
@@ -5296,11 +5331,6 @@ impl LastBoundCache {
     #[inline]
     pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_draw, bytes)
-    }
-
-    #[inline]
-    pub fn ps_constants_changed(&mut self, bytes: &[u8]) -> bool {
-        update_inline_bytes(&mut self.ps_constants, bytes)
     }
 
     #[inline]

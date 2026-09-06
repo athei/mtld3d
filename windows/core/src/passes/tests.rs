@@ -985,8 +985,8 @@ fn last_bound_reset_clears_everything() {
     c.pipeline_changed(0xCCCC);
     c.depth_stencil_changed(0xDDDD);
     c.cull_mode_changed(CullMode::Back);
-    c.vs_constants_changed(&[1, 2, 3, 4]);
-    c.ps_constants_changed(&[5, 6, 7, 8]);
+    c.vs_draw_changed(&[1, 2, 3, 4]);
+    c.ps_draw_changed(&[5, 6, 7, 8]);
     c.ps_alpha_ref_changed(&[9, 10, 11, 12]);
     c.ps_fog_color_changed(&[13, 14, 15, 16]);
     c.vertex_buffer_changed(0, 0xEEEE, 32, 1);
@@ -998,8 +998,8 @@ fn last_bound_reset_clears_everything() {
     assert!(c.pipeline_changed(0xCCCC));
     assert!(c.depth_stencil_changed(0xDDDD));
     assert!(c.cull_mode_changed(CullMode::Back));
-    assert!(c.vs_constants_changed(&[1, 2, 3, 4]));
-    assert!(c.ps_constants_changed(&[5, 6, 7, 8]));
+    assert!(c.vs_draw_changed(&[1, 2, 3, 4]));
+    assert!(c.ps_draw_changed(&[5, 6, 7, 8]));
     assert!(c.ps_alpha_ref_changed(&[9, 10, 11, 12]));
     assert!(c.ps_fog_color_changed(&[13, 14, 15, 16]));
     assert_eq!(
@@ -1013,24 +1013,24 @@ fn last_bound_reset_clears_everything() {
 #[test]
 fn last_bound_inline_bytes_dedup() {
     let mut c = LastBoundCache::new();
-    assert!(c.ps_constants_changed(&[1, 2, 3, 4]));
-    assert!(!c.ps_constants_changed(&[1, 2, 3, 4]));
-    assert!(c.ps_constants_changed(&[1, 2, 3, 5]));
-    assert!(c.ps_constants_changed(&[1, 2, 3])); // length change
-    assert!(!c.ps_constants_changed(&[1, 2, 3]));
+    assert!(c.ps_draw_changed(&[1, 2, 3, 4]));
+    assert!(!c.ps_draw_changed(&[1, 2, 3, 4]));
+    assert!(c.ps_draw_changed(&[1, 2, 3, 5]));
+    assert!(c.ps_draw_changed(&[1, 2, 3])); // length change
+    assert!(!c.ps_draw_changed(&[1, 2, 3]));
 }
 
 #[test]
 fn last_bound_inline_bytes_slots_are_independent() {
     let mut c = LastBoundCache::new();
-    c.vs_constants_changed(&[1; 16]);
-    c.ps_constants_changed(&[2; 16]);
+    c.vs_draw_changed(&[1; 16]);
+    c.ps_draw_changed(&[2; 16]);
     c.ps_alpha_ref_changed(&[3; 4]);
     c.ps_fog_color_changed(&[4; 16]);
     // Identical content in a different slot must still report changed
     // (slot 13 hasn't seen this payload yet).
-    assert!(!c.vs_constants_changed(&[1; 16]));
-    assert!(!c.ps_constants_changed(&[2; 16]));
+    assert!(!c.vs_draw_changed(&[1; 16]));
+    assert!(!c.ps_draw_changed(&[2; 16]));
     assert!(!c.ps_alpha_ref_changed(&[3; 4]));
     assert!(!c.ps_fog_color_changed(&[4; 16]));
 }
@@ -1038,11 +1038,11 @@ fn last_bound_inline_bytes_slots_are_independent() {
 #[test]
 fn last_bound_inline_bytes_reset_keeps_capacity() {
     let mut c = LastBoundCache::new();
-    c.ps_constants_changed(&[0xAB; 256]);
-    let cap_before = c.ps_constants.capacity();
+    c.ps_draw_changed(&[0xAB; 256]);
+    let cap_before = c.ps_draw.capacity();
     c.reset();
-    assert_eq!(c.ps_constants.len(), 0);
-    assert_eq!(c.ps_constants.capacity(), cap_before);
+    assert_eq!(c.ps_draw.len(), 0);
+    assert_eq!(c.ps_draw.capacity(), cap_before);
 }
 
 #[test]
@@ -5115,4 +5115,59 @@ fn command_pool_converges_with_head_uploads_and_depth_resolves() {
         assert_eq!(next, allocations);
         assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
     }
+}
+
+#[test]
+fn snapshot_bytes_identity_and_equal_distinct_tokens() {
+    let a = vec![1, 2, 3, 4];
+    let b = a.clone();
+    let mut cache = super::SnapshotBytesCache::new();
+    assert!(cache.changed(a.as_slice()));
+    assert!(!cache.changed(a.as_slice()));
+    assert!(!cache.changed(b.as_slice()));
+    assert!(core::ptr::eq(cache.snapshot.unwrap(), b.as_slice()));
+    assert!(!cache.changed(b.as_slice()));
+}
+
+#[test]
+fn snapshot_bytes_changes_length_and_empty_preserves_binding() {
+    let bytes = [1, 2, 3, 4];
+    let changed = [1, 2, 3, 5];
+    let mut cache = super::SnapshotBytesCache::new();
+    assert!(!cache.changed(&bytes[..0]));
+    assert!(cache.changed(bytes.as_slice()));
+    assert!(cache.changed(changed.as_slice()));
+    assert!(cache.changed(&changed[..3]));
+    assert!(!cache.changed(&bytes[..0]));
+    assert!(!cache.changed(&changed[..3]));
+    assert!(cache.changed(changed.as_slice()));
+}
+
+#[test]
+fn snapshot_bytes_float_equality_is_bitwise() {
+    let nan = f32::from_bits(0x7fc0_0001).to_ne_bytes();
+    let same_nan = nan;
+    let other_nan = f32::from_bits(0x7fc0_0002).to_ne_bytes();
+    let positive_zero = 0.0_f32.to_ne_bytes();
+    let negative_zero = (-0.0_f32).to_ne_bytes();
+    let mut cache = super::SnapshotBytesCache::new();
+    assert!(cache.changed(nan.as_slice()));
+    assert!(!cache.changed(same_nan.as_slice()));
+    assert!(cache.changed(other_nan.as_slice()));
+    assert!(cache.changed(positive_zero.as_slice()));
+    assert!(cache.changed(negative_zero.as_slice()));
+}
+
+#[test]
+fn snapshot_bytes_reset_rebinds_reused_address() {
+    let mut bytes = std::rc::Rc::<[u8]>::from([1, 2, 3, 4]);
+    let address = bytes.as_ptr();
+    let mut cache = super::SnapshotBytesCache::new();
+    assert!(cache.changed(std::rc::Rc::clone(&bytes)));
+    cache.reset();
+    assert!(cache.snapshot.is_none());
+    std::rc::Rc::get_mut(&mut bytes).expect("reset released the snapshot")[0] = 5;
+    assert_eq!(bytes.as_ptr(), address);
+    assert!(cache.changed(std::rc::Rc::clone(&bytes)));
+    assert!(!cache.changed(bytes));
 }

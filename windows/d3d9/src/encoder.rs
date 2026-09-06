@@ -30,7 +30,7 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
-        LastBoundCache, Pass, PassState, StencilClearOutcome, StencilLoad,
+        LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
         StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
@@ -888,6 +888,9 @@ pub struct FrameEncoder {
     /// the previous draw in the same Metal render encoder. Reset on every
     /// new-pass entry from `begin_render_pass_if_needed`.
     last_bound: LastBoundCache,
+    /// Immutable VS/PS snapshots, valid only within their owning frame and encoder.
+    vs_bound_constants: SnapshotBytesCache<ScratchSlice>,
+    ps_bound_constants: SnapshotBytesCache<ScratchSlice>,
     /// Per-frame scratch arena for API→encoder copies.
     ///
     /// Shader constants and `DrawPrimitiveUP` inline vertices. A chunked
@@ -1562,6 +1565,8 @@ impl FrameEncoder {
         Self {
             pass_state: PassState::new(),
             last_bound: LastBoundCache::new(),
+            vs_bound_constants: SnapshotBytesCache::new(),
+            ps_bound_constants: SnapshotBytesCache::new(),
             scratch: ScratchArena::new(),
             frame_blit_commands: Vec::new(),
             flags: if config.shader_cache_enable {
@@ -2333,6 +2338,7 @@ impl FrameEncoder {
     }
 
     fn begin_frame(&mut self, frame: &FrameData) {
+        self.reset_bound_constants();
         self.scratch.clear();
         // Cached const-slice pointers alias the previous frame's
         // arena which is about to be cleared / reused. Drop them so
@@ -4043,11 +4049,25 @@ impl FrameEncoder {
     /// Flush `last_bound` for an encoder known to have just opened.
     fn reset_last_bound_for_fresh_encoder(&mut self) {
         self.last_bound.reset();
+        self.reset_bound_constants();
         // Keep the debug-build emitted-command shadow in lockstep with the
         // cache so the in-sync assertion shares the same fresh-encoder
         // baseline (no bindings yet).
         #[cfg(debug_assertions)]
         self.pass_state.debug_reset_emitted();
+    }
+
+    fn reset_bound_constants(&mut self) {
+        self.vs_bound_constants.reset();
+        self.ps_bound_constants.reset();
+    }
+
+    pub fn vs_constants_changed(&mut self, snapshot: ScratchSlice) -> bool {
+        self.vs_bound_constants.changed(snapshot)
+    }
+
+    pub fn ps_constants_changed(&mut self, snapshot: ScratchSlice) -> bool {
+        self.ps_bound_constants.changed(snapshot)
     }
 
     /// Debug-build invariant on the per-draw dedup cache (`last_bound`).
@@ -9398,6 +9418,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // one is submitted. Every move here is an O(1) `Vec`/arena header swap;
     // the heap behind `scratch` / `frame_blit_commands` is untouched, so
     // the raw pointers built into `params` below stay valid.
+    // Binding tokens can alias either arena carried by this submission. Forget
+    // them before either arena leaves the encoder's ownership.
+    enc.reset_bound_constants();
     let mut payload = enc.acquire_clean_payload();
     core::mem::swap(&mut payload.scratch, &mut enc.scratch);
     core::mem::swap(
