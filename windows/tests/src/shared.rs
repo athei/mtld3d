@@ -97,6 +97,43 @@ impl SharedDevice<'_> {
         }
     }
 
+    /// `BeginScene`.
+    #[must_use]
+    pub fn begin_scene(&self) -> i32 {
+        // SAFETY: vtable thunk; the device is live and callable from any thread.
+        unsafe { (self.vtbl().begin_scene)(self.device()) }
+    }
+
+    /// `EndScene`.
+    #[must_use]
+    pub fn end_scene(&self) -> i32 {
+        // SAFETY: vtable thunk; the device is live and callable from any thread.
+        unsafe { (self.vtbl().end_scene)(self.device()) }
+    }
+
+    /// `DrawPrimitiveUP` from a slice of vertices matching the bound FVF.
+    ///
+    /// The stride is `V`'s size, so the caller's vertex type has to be the
+    /// layout the FVF names.
+    ///
+    /// # Panics
+    /// Panics if `V` is larger than a `u32` stride can name.
+    #[must_use]
+    pub fn draw_primitive_up<V>(&self, prim: u32, prim_count: u32, verts: &[V]) -> i32 {
+        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
+        // SAFETY: vtable thunk; `verts` is read-only for the call and the
+        // device is callable from any thread.
+        unsafe {
+            (self.vtbl().draw_primitive_up)(
+                self.device(),
+                prim,
+                prim_count,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
     /// Read a backbuffer pixel as `0xAARRGGBB` through the D3D9 read-back chain.
     ///
     /// The chain `Harness::read_pixel` runs, callable from a worker thread:

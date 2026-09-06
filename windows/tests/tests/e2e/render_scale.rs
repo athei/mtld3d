@@ -19,18 +19,26 @@
 //! because the quantities they cover (a point's rasterized diameter, and the
 //! memory a resource created at the reported back-buffer size occupies) convert
 //! between the two spaces rather than staying in one, so a run at the default
-//! scale would not exercise the conversion at all.
+//! scale would not exercise the conversion at all. The two-device test pins
+//! both of its scales for a different reason: what it covers is a pair of
+//! devices at *different* scales, which no single run-wide value gives it.
 
-use mtld3d_tests::{Harness, PosColorVertex, RhwVertex, TexturedVertex, assert_pixel_eq};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, TexturedVertex,
+    assert_pixel_eq,
+};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DFMT_A8B8G8R8,
-    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_X8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_SYSTEMMEM, D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
-    D3DRS_POINTSIZE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL,
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
+    D3DPT_POINTLIST, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DRS_POINTSIZE,
+    D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
+    D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -695,6 +703,54 @@ fn a_standalone_target_at_the_backbuffer_size_fills_and_copies_in_reported_coord
     assert_pixel_eq(h.read_pixel(600, 440), BLUE, "outside, below and right");
 }
 
+/// The `ps_3_0` quadrant shader, which colours a fragment by its `vPos`.
+///
+/// `dcl vPos.xy; sub r0.xy, vPos.xy, c0.zw; mov r1, c0; mov r2.a, c0.y;
+/// mov r2.r, c0.y; cmp r2.g, r0.x, r1.x, r1.y; cmp r2.b, r0.y, r1.x, r1.y;
+/// mov oC0, r2.` Green once `vPos.x` has reached the centre in `c0.zw`, blue
+/// once `vPos.y` has, cyan past both and black short of either, with alpha
+/// zero everywhere. Every probe on it sits well inside a quadrant, so the
+/// colour is the same at every scale as long as the device applied its own.
+const QUADRANT_PS: [u32; 31] = [
+    0xFFFF_0300,
+    0x0200_001F,
+    0x8000_0000,
+    0x9003_1000,
+    0x0300_0002,
+    0x8003_0000,
+    0x9054_1000,
+    0xA1FE_0000,
+    0x0200_0001,
+    0x800F_0001,
+    0xA0E4_0000,
+    0x0200_0001,
+    0x8008_0002,
+    0xA055_0000,
+    0x0200_0001,
+    0x8001_0002,
+    0xA055_0000,
+    0x0400_0058,
+    0x8002_0002,
+    0x8000_0000,
+    0x8000_0001,
+    0x8055_0001,
+    0x0400_0058,
+    0x8004_0002,
+    0x8055_0000,
+    0x8000_0001,
+    0x8055_0001,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0002,
+    0x0000_FFFF,
+];
+
+/// The quadrant shader's `c0`: `(1, 0, centre x, centre y)`.
+///
+/// `.x` and `.y` are the true and false colours each comparison selects,
+/// `.zw` the centre of the 640x480 the harness reports.
+const QUADRANT_CENTRE: [f32; 4] = [1.0, 0.0, 320.0, 240.0];
+
 #[test]
 fn a_ps_3_0_vpos_reads_reported_pixel_coordinates_under_the_scale() {
     // `vPos` is the pixel a fragment lands on, and a shader compares it
@@ -711,42 +767,6 @@ fn a_ps_3_0_vpos_reads_reported_pixel_coordinates_under_the_scale() {
     // the identity the register needs no conversion, and this has to fail in
     // the ordinary `make test` if it regresses.
     //
-    // ps_3_0: dcl vPos.xy; sub r0.xy, vPos.xy, c0.zw; mov r1, c0;
-    // mov r2.a, c0.y; mov r2.r, c0.y; cmp r2.g, r0.x, r1.x, r1.y;
-    // cmp r2.b, r0.y, r1.x, r1.y; mov oC0, r2. With c0 = (1, 0, 320, 240).
-    const QUADRANT_PS: [u32; 31] = [
-        0xFFFF_0300,
-        0x0200_001F,
-        0x8000_0000,
-        0x9003_1000,
-        0x0300_0002,
-        0x8003_0000,
-        0x9054_1000,
-        0xA1FE_0000,
-        0x0200_0001,
-        0x800F_0001,
-        0xA0E4_0000,
-        0x0200_0001,
-        0x8008_0002,
-        0xA055_0000,
-        0x0200_0001,
-        0x8001_0002,
-        0xA055_0000,
-        0x0400_0058,
-        0x8002_0002,
-        0x8000_0000,
-        0x8000_0001,
-        0x8055_0001,
-        0x0400_0058,
-        0x8004_0002,
-        0x8055_0000,
-        0x8000_0001,
-        0x8055_0001,
-        0x0200_0001,
-        0x800F_0800,
-        0x80E4_0002,
-        0x0000_FFFF,
-    ];
     // ps_3_0: def c0, 0, 0, 0, 0; dcl vPos.xy; mov r0, c0; frc r0.xy, vPos.xy;
     // mov oC0, r0.
     const FRACTION_PS: [u32; 20] = [
@@ -797,7 +817,7 @@ fn a_ps_3_0_vpos_reads_reported_pixel_coordinates_under_the_scale() {
     let quadrant = h.create_pixel_shader(&QUADRANT_PS);
     assert_eq!(h.set_pixel_shader(&quadrant), 0, "SetPixelShader");
     assert_eq!(
-        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 320.0, 240.0]),
+        h.set_pixel_shader_constant_f(0, &QUADRANT_CENTRE),
         0,
         "the reported centre in c0.zw"
     );
@@ -1064,4 +1084,177 @@ fn a_standalone_surface_at_the_backbuffer_size_is_charged_its_scaled_extent() {
         OWN_SIZE * OWN_SIZE * 4,
         "an intermediate target costs the size it asked for"
     );
+}
+
+/// What one worker's quadrant probes came to.
+struct QuadrantOutcome {
+    /// Probes that read a colour other than the one their quadrant owes.
+    mismatches: u32,
+    /// The first mismatch, as `(frame, x, y, colour)`.
+    first_wrong: Option<(u32, u32, u32, u32)>,
+    /// The first failing call, by name, with its hr.
+    failed: Option<(&'static str, i32)>,
+}
+
+/// Draw the quadrant shader over the whole target and probe two pixels, `frames` times.
+///
+/// Both probes sit well inside their quadrant, so their colours hold at any
+/// scale as long as the device applied its own. A wrong colour is counted and
+/// the loop goes on, so the count says how often the crossing landed; the
+/// first failing call stops it.
+fn probe_own_quadrants(
+    device: &SharedDevice<'_>,
+    quad: &[RhwVertex; 6],
+    frames: u32,
+) -> QuadrantOutcome {
+    /// `(x, y, colour)` in reported coordinates, alpha masked off.
+    const PROBES: [(u32, u32, u32); 2] = [(480, 120, 0x0000_FF00), (160, 360, 0x0000_00FF)];
+
+    let mut outcome = QuadrantOutcome {
+        mismatches: 0,
+        first_wrong: None,
+        failed: None,
+    };
+    for frame in 0..frames {
+        let calls = [
+            ("Clear", device.clear_target(BLACK)),
+            ("BeginScene", device.begin_scene()),
+            (
+                "DrawPrimitiveUP",
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 2, quad),
+            ),
+            ("EndScene", device.end_scene()),
+            ("Present", device.present()),
+        ];
+        if let Some(&(call, hr)) = calls.iter().find(|(_, hr)| *hr < 0) {
+            outcome.failed = Some((call, hr));
+            return outcome;
+        }
+        for (x, y, owed) in PROBES {
+            match device.read_pixel(x, y) {
+                Ok(pixel) if pixel & 0x00FF_FFFF == owed => {}
+                Ok(pixel) => {
+                    outcome.mismatches += 1;
+                    outcome.first_wrong.get_or_insert((frame, x, y, pixel));
+                }
+                Err(failed) => {
+                    outcome.failed = Some(failed);
+                    return outcome;
+                }
+            }
+        }
+    }
+    outcome
+}
+
+#[test]
+fn two_devices_at_different_scales_read_their_own_vpos() {
+    // A `ps_3_0` shader that declares `vPos` into a target rasterized below
+    // the resolution D3D9 reports takes a shader variant whose `PsDraw`
+    // uniform carries that target's scale, and both the variant flag and the
+    // uniform come from the encoder of the device the target belongs to. Two
+    // devices drawing that shader at once want two different compensations
+    // and are owed the same picture in the reported space, so a compensation
+    // that reached one device from the other reads as that device answering
+    // in the wrong quadrants: at half scale an uncompensated `vPos` is short
+    // of the centre everywhere the probes look, and at the identity a doubled
+    // one is past it. Both devices pin their own scale so the pair is the
+    // same on a scaled run of the suite.
+    //
+    // The crossing is timing-dependent, so one run guards the derivation
+    // rather than proving it.
+    const FRAMES: u32 = 120;
+
+    let with_scale = |entries: &'static str| HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        config_entries: entries,
+        ..HarnessConfig::default()
+    };
+    let half = Harness::create(&with_scale("render.scale=0.5"));
+    let identity = Harness::create(&with_scale("render.scale=1.0"));
+
+    let half_shader = half.create_pixel_shader(&QUADRANT_PS);
+    assert_eq!(half.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(half.set_pixel_shader(&half_shader), 0, "SetPixelShader");
+    assert_eq!(
+        half.set_pixel_shader_constant_f(0, &QUADRANT_CENTRE),
+        0,
+        "the reported centre in c0.zw"
+    );
+    let identity_shader = identity.create_pixel_shader(&QUADRANT_PS);
+    assert_eq!(
+        identity.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE),
+        0,
+        "SetFVF"
+    );
+    assert_eq!(
+        identity.set_pixel_shader(&identity_shader),
+        0,
+        "SetPixelShader"
+    );
+    assert_eq!(
+        identity.set_pixel_shader_constant_f(0, &QUADRANT_CENTRE),
+        0,
+        "the reported centre in c0.zw"
+    );
+
+    // Both devices report 640x480, so one screen-covering quad serves both.
+    let (width, height) = half.dims();
+    // The reported dims fit u16; convert without a precision-loss cast.
+    let to_f = |v: u32| f32::from(u16::try_from(v).expect("reported dims fit u16"));
+    let (w, hgt) = (to_f(width), to_f(height));
+    let v = |x: f32, y: f32| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: WHITE,
+    };
+    let quad = [
+        v(0.0, 0.0),
+        v(w, 0.0),
+        v(0.0, hgt),
+        v(w, 0.0),
+        v(w, hgt),
+        v(0.0, hgt),
+    ];
+
+    let half_shared = half.shared();
+    let identity_shared = identity.shared();
+    let finished = AtomicU32::new(0);
+    std::thread::scope(|scope| {
+        let half_worker = scope.spawn(|| {
+            let outcome = probe_own_quadrants(&half_shared, &quad, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            outcome
+        });
+        let identity_worker = scope.spawn(|| {
+            let outcome = probe_own_quadrants(&identity_shared, &quad, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            outcome
+        });
+        while finished.load(Ordering::Acquire) < 2 {
+            assert!(half.pump(), "WM_QUIT on the half-scale window");
+            assert!(identity.pump(), "WM_QUIT on the identity window");
+            std::thread::yield_now();
+        }
+        for (name, worker) in [("half-scale", half_worker), ("identity", identity_worker)] {
+            let outcome = worker.join().expect("a worker thread panicked");
+            assert!(
+                outcome.failed.is_none(),
+                "{name} device: {} failed on its worker thread: 0x{:08X}",
+                outcome.failed.map_or("", |(call, _)| call),
+                outcome.failed.map_or(0, |(_, hr)| hr)
+            );
+            let (frame, x, y, pixel) = outcome.first_wrong.unwrap_or_default();
+            assert_eq!(
+                outcome.mismatches,
+                0,
+                "{name} device answered vPos in another device's space in {} of {} probes, \
+                 first at frame {frame}, reported ({x}, {y}), reading 0x{pixel:08X}",
+                outcome.mismatches,
+                FRAMES * 2
+            );
+        }
+    });
 }

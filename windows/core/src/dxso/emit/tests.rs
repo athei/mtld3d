@@ -19,7 +19,10 @@ use super::{
     VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers, emit_ps_programmable,
     emit_vs_programmable, emit_vs_programmable_named,
 };
-use crate::dxso::{ir::TextureType, parser::parse};
+use crate::{
+    dxso::{ir::TextureType, parser::parse},
+    shader_cache::ff_key_hash,
+};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -2882,6 +2885,29 @@ fn sm3_ps_vpos_under_the_render_scale_variant_reads_the_scaled_floored_position(
         ps_msl.matches("[[position").count(),
         1,
         "still one [[position]]:\n{ps_msl}"
+    );
+}
+
+#[test]
+fn the_render_scale_variant_is_a_shader_cache_key_of_its_own() {
+    // The compensation is not baked into a shared library: it reaches the
+    // function through the `PsDraw` uniform, and the flag that makes the
+    // function take that uniform is part of the key the library is cached
+    // under. A key that dropped the bit would serve the identity emission to
+    // a draw into a scaled target, so pin the separation on the hash the
+    // on-disk cache is addressed by, over the same `(program, variant)` pair
+    // the draw path hashes.
+    let plain = VariantKey::default();
+    let scaled = VariantKey {
+        flags: VariantFlags::VPOS_SCALE,
+        ..VariantKey::default()
+    };
+    assert_ne!(plain, scaled, "the flag is part of the key's identity");
+    let program = 0x1234_5678_9abc_def0u64;
+    assert_ne!(
+        ff_key_hash(&(program, plain)),
+        ff_key_hash(&(program, scaled)),
+        "one shader's two variants address two cache entries"
     );
 }
 
