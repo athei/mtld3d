@@ -3,6 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
+    # A release is a `v*` tag, and it runs the `release` job alone: see the
+    # comment above that job for why the matrix does not run a second time.
+    tags: ['v*']
   pull_request:
   # So a branch can be run through the whole matrix before it has a PR, or
   # only through the runner probe at the bottom.
@@ -79,14 +82,16 @@ env:
 # machines that carry no toolchain, the slow Intel image included, and no
 # compile happens twice. `check` runs every lint, doc and unit leg as steps of
 # one job, then builds the distribution bundle, since each of those is short and
-# a machine per leg cost more in setup than in work.
+# a machine per leg cost more in setup than in work. A tag push runs none of
+# that and only `release`, which reads the result the same commit already got
+# on main.
 jobs:
   # Everything a test machine needs, built once on the fast image: both PE
   # arches, both unix `.so` builds, the e2e test binaries, and the e2e and
   # conformance runners for both host arches. Primes the caches the check job
   # restores too.
   build:
-    if: ${{ !inputs.probe_only }}
+    if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26
     timeout-minutes: 20
     steps:
@@ -119,7 +124,7 @@ jobs:
   # the production profile's fat LTO is exercised here rather than first
   # failing when a release is cut.
   check:
-    if: ${{ !inputs.probe_only }}
+    if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26
     timeout-minutes: 20
     steps:
@@ -339,6 +344,104 @@ jobs:
           path: unix/conformance/baseline.txt
           retention-days: 14
           if-no-files-found: error
+
+  # A `v*` tag is a release, and the tag push runs this job on its own. The
+  # matrix is not run a second time: the gate here is main's own run at this
+  # exact commit, which is the same tree, so re-running it would cost half an
+  # hour to learn what merging the commit already established. What this job
+  # adds is the work a release used to take by hand, where each step was only
+  # as reliable as whoever remembered it.
+  #
+  # The tag has to agree with the version both workspaces carry, or the shipped
+  # DLLs name a release nobody published: every binary stamps `git describe`,
+  # which is also why the bundle is built here, after the tag exists, rather
+  # than taken from the `check` job that ran before it.
+  #
+  # It drafts and stops: the body it creates is empty because the notes are
+  # written by hand, and the maintainer publishes. CONTRIBUTING.md carries the
+  # procedure around this job.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-26
+    # Long, because the step below waits for main's run when the tag was pushed
+    # on the heels of the commit.
+    timeout-minutes: 60
+    permissions:
+      # The draft, and the query for main's run.
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-tags: true
+      # First, before a toolchain is fetched: a tag that disagrees with the
+      # manifests is answered in seconds instead of after a bundle build.
+      - name: version-check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make version-check TAG="$TAG"
+      # The gate that replaces re-running the matrix. A run that has not
+      # finished is waited on, since main is pushed and tagged in one sitting;
+      # a run that never appears means the tag names a commit that never landed
+      # on main, which no amount of waiting fixes, so that gets a short grace
+      # and then a verdict.
+      - name: The ci run for this commit on main is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          missing=0
+          for _ in $(seq 90); do
+            read -r status conclusion url <<<"$(gh run list --workflow ci.yml \
+              --commit "$GITHUB_SHA" --event push --branch main --limit 1 \
+              --json status,conclusion,url \
+              --jq '.[] | "\(.status) \(.conclusion) \(.url)"')"
+            if [ -z "$status" ]; then
+              missing=$((missing + 1))
+              if [ "$missing" -gt 10 ]; then
+                echo "::error::no ci run on main for $GITHUB_SHA: this tag names a commit that never landed there"
+                exit 1
+              fi
+              echo "no ci run for $GITHUB_SHA on main yet"
+            elif [ "$status" = completed ]; then
+              if [ "$conclusion" != success ]; then
+                echo "::error::$url concluded $conclusion, so this commit is not a release"
+                exit 1
+              fi
+              echo "$url is green"
+              exit 0
+            else
+              echo "$url is $status"
+            fi
+            sleep 30
+          done
+          echo "::error::main's ci run for $GITHUB_SHA had not finished after 45 minutes; re-run this job once it has"
+          exit 1
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
+      # PROD=1 is this target's default, so the archives carry the production
+      # profile, and the target verifies that every binary in them is stamped
+      # with the tag before it writes either one.
+      - name: bundle
+        run: make bundle
+      # Re-running the job after a failed upload finds the draft it already
+      # made and replaces the assets, rather than failing on a tag that has a
+      # release.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              windows/target/mtld3d.tar.xz windows/target/mtld3d-debug.tar.xz
+          else
+            gh release create "$TAG" --draft --title "$TAG" --notes "" \
+              windows/target/mtld3d.tar.xz windows/target/mtld3d-debug.tar.xz
+          fi
+          echo "Drafted $TAG with both archives. Write the notes, then publish:" >> "$GITHUB_STEP_SUMMARY"
+          echo '`gh release edit '"$TAG"' --draft=false --latest`' >> "$GITHUB_STEP_SUMMARY"
 
   # Manual only: what a hosted macOS runner exposes to Metal, on every image
   # the matrices above use. The OS, the device, and the capability bits

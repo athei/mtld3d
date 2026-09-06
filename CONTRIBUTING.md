@@ -307,3 +307,28 @@ reproduced or root-caused locally yet.
 
 File the issue with its labels attached. When a claim in an issue body stops
 being true, edit the body rather than correcting it in a comment trail.
+
+## Cutting a release
+
+A release is a `v*` tag, and pushing one is the whole trigger: CI drafts the
+release, attaches the two archives `make bundle` produces, and leaves the body
+empty for the notes, which are written by hand.
+
+The version lives in the `[workspace.package]` table of both `Cargo.toml`s and
+in the local-crate entries of both `Cargo.lock`s, so the bump is its own commit
+touching four files. Refresh each lock with `cargo metadata --format-version 1
+--manifest-path <workspace>/Cargo.toml > /dev/null`, which rewrites the version
+lines without the dependency churn `cargo update` would bring, and check the bump
+before tagging with `make version-check TAG=vX.Y.Z`.
+
+Land that commit, wait for its run on `main` to go green, then push the tag. The
+release job refuses a tag whose version disagrees with either workspace, and
+refuses one whose commit has no green run on `main`; a tag pushed while that run
+is still going is waited on rather than rejected. It builds the bundle itself,
+after the tag exists, because every binary stamps `git describe` and one built
+before the tag names the previous release.
+
+What is left is the notes and the publish. Group the points into sections rather
+than one flat list, give the two or three headline items a section each, and end
+every point with the pull requests that did it. Then
+`gh release edit vX.Y.Z --draft=false --latest`.
