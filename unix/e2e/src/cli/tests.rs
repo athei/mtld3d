@@ -1,6 +1,6 @@
 //! Unit tests for the runner's argument parser.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use super::parse_args;
 
@@ -20,6 +20,7 @@ fn defaults_fill_in_behind_the_mandatory_pair() {
     assert_eq!(config.timeout, Duration::from_mins(1));
     assert!(config.fail_fast);
     assert!(config.filter.is_empty());
+    assert!(config.log_dir.is_none());
     assert_eq!(config.exes.len(), 2);
 }
 
@@ -35,6 +36,8 @@ fn every_flag_is_read() {
         "--no-fail-fast",
         "--filter",
         "msaa:: stencil",
+        "--log-dir",
+        "/l",
         "--",
         "/a.exe",
     ]))
@@ -43,6 +46,7 @@ fn every_flag_is_read() {
     assert_eq!(config.timeout, Duration::from_mins(4));
     assert!(!config.fail_fast);
     assert_eq!(config.filter, ["msaa::", "stencil"]);
+    assert_eq!(config.log_dir.as_deref(), Some(Path::new("/l")));
 }
 
 #[test]
@@ -52,5 +56,6 @@ fn missing_and_malformed_inputs_name_themselves() {
     assert!(err(&["--wine", "/w"]).contains("no test binary"));
     assert!(err(&["--wine", "/w", "--jobs", "0", "--", "/a"]).contains("--jobs"));
     assert!(err(&["--wine", "/w", "--timeout", "x", "--", "/a"]).contains("--timeout"));
+    assert!(err(&["--wine", "/w", "--log-dir"]).contains("--log-dir"));
     assert!(err(&["--wine", "/w", "--bogus", "--", "/a"]).contains("--bogus"));
 }

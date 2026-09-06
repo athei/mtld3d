@@ -24,8 +24,7 @@ on:
       e2e_filter:
         description: >-
           Run only the end-to-end tests whose id contains one of these
-          whitespace-separated patterns (e.g. `stencil msaa::`), with their
-          log files uploaded.
+          whitespace-separated patterns (e.g. `stencil msaa::`).
         type: string
         default: ''
       conformance_repeat:
@@ -221,20 +220,33 @@ jobs:
       # hangs on the paravirtual GPU. The whole suite is reported rather than
       # the first failure, and a test that is only slow there gets four
       # minutes before it counts as a hang. A dispatch with `e2e_filter`
-      # narrows the run and collects the layer's log files, which are
-      # otherwise written beside each test binary and pruned to the ten
-      # newest.
+      # narrows the run.
+      # The layer's log of every test process, and the whole stderr of every
+      # process that died with tests unaccounted for, go under the runner's
+      # temp directory, where the step below picks them up, rather than beside
+      # the test binary. The job log carries only what reached stdout: the
+      # PASS/FAIL lines, the panic messages and the tail of stderr the runner
+      # prints. What the command buffers reported is in the layer's log, and
+      # that is what tells a runner whose GPU reads back black on every test
+      # from a regression in the commits since the last green run. The
+      # directory keeps the ten newest of each kind, so a leg that restarts
+      # more than ten processes hands back its last ten; a runner fault
+      # persists, so those carry it.
       - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           E2E_FILTER: ${{ inputs.e2e_filter }}
-          # The layer reads the path on the Windows side, where the unix
-          # root is drive Z.
-          LOG_DIR: ${{ inputs.e2e_filter && format('Z:{0}', runner.temp) || '' }}
+          LOG_DIR: ${{ runner.temp }}
+      # `always()`, as for the conformance output below: a diverging leg is
+      # the one whose logs are worth reading, and a leg cut off by its budget
+      # ends cancelled, not failed. A leg that dies before any process logs a
+      # line has nothing to upload, and that must not turn one red into two.
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && inputs.e2e_filter }}
+        if: always()
         with:
           name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
-          path: ${{ runner.temp }}/*.log
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/*.stderr
           retention-days: 14
           if-no-files-found: ignore
 

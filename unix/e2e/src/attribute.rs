@@ -15,7 +15,7 @@
 //! the exit code is then the whole assertion, since libtest never gets to
 //! report a result. A binary that carries such a test carries nothing else.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use crate::{
     binary::stderr_tail,
@@ -35,6 +35,7 @@ const ENDS_PROCESS_CODE: &str = " ends this process with exit code ";
 
 /// How a process of the binary ended, with everything it printed.
 pub struct ProcessEnd {
+    pub pid: u32,
     pub kind: ExitKind,
     pub stdout: String,
     pub stderr: String,
@@ -60,6 +61,17 @@ pub trait Launcher {
     ///
     /// Returns a message when the binary cannot list itself.
     fn list(&mut self) -> Result<Vec<String>, String>;
+
+    /// Keep the whole stderr of the process `pid`, and name the file it went to.
+    ///
+    /// A report shows only [`stderr_tail`], and a failure that starts
+    /// outside the test binary prints what it was long before that tail:
+    /// the file is where that first line survives.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the file cannot be written.
+    fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String>;
 }
 
 /// What became of one test.
@@ -225,8 +237,9 @@ pub fn run_binary(
         if in_flight.is_empty() {
             break;
         }
+        let kept = kept_stderr(launcher.keep_stderr(end.pid, &end.stderr));
         report.note(&format!(
-            "the process ended with {reason}; {} of its tests unaccounted for; its last lines:\n{}",
+            "the process ended with {reason}; {} of its tests unaccounted for; {kept}; its last lines:\n{}",
             in_flight.len(),
             stderr_tail(&end.stderr)
         ));
@@ -238,7 +251,7 @@ pub fn run_binary(
             // is broken, and running it again would only say so again.
             run.failed = true;
             let detail = format!(
-                "the process ended ({reason}) before running any test\n{}",
+                "the process ended ({reason}) before running any test; {kept}\n{}",
                 stderr_tail(&end.stderr)
             );
             for name in in_flight {
@@ -264,7 +277,7 @@ pub fn run_binary(
                 .and_then(|_| libtest::panic_report(&end.stderr, &name))
                 .unwrap_or_else(|| {
                     format!(
-                        "the process ended ({reason}) while this test ran\n{}",
+                        "the process ended ({reason}) while this test ran; {kept}\n{}",
                         stderr_tail(&end.stderr)
                     )
                 });
@@ -299,6 +312,14 @@ pub fn run_binary(
         remaining = Some(in_flight);
     }
     Ok(run)
+}
+
+/// Where a dead process's whole stderr went, or why it could not be kept.
+fn kept_stderr(kept: Result<PathBuf, String>) -> String {
+    match kept {
+        Ok(path) => format!("its full stderr is in {}", path.display()),
+        Err(why) => format!("its full stderr could not be kept ({why})"),
+    }
 }
 
 /// The test that ended its own process and the exit code it declared.

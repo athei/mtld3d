@@ -57,8 +57,9 @@ impl ExitKind {
     }
 }
 
-/// A process's end: how, and everything it wrote to stderr.
+/// A process's end: its pid, how it ended, and everything it wrote to stderr.
 pub struct Exit {
+    pub pid: u32,
     pub kind: ExitKind,
     pub stderr: String,
 }
@@ -104,6 +105,7 @@ pub fn run(
         .spawn()
         .map_err(|e| format!("failed to spawn {} {}: {e}", wine.display(), exe.display()))?;
 
+    let pid = child.id();
     let stdout = child.stdout.take().ok_or("stdout not piped")?;
     let mut stderr = child.stderr.take().ok_or("stderr not piped")?;
     let (lines, received) = mpsc::channel::<String>();
@@ -169,7 +171,7 @@ pub fn run(
     } else {
         ExitKind::Code(status.code().unwrap_or(-1))
     };
-    Ok(Exit { kind, stderr })
+    Ok(Exit { pid, kind, stderr })
 }
 
 /// Everything stderr delivered, and whether its end was seen.
