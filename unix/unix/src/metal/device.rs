@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use mtld3d_shared::{
     MetalHandle,
     mtl::DeviceCapsFlags,
@@ -15,14 +17,64 @@ use super::{
     handle::{IntoRetained, ReleaseRetain},
     macdrv::{detach_metal_layer, release_metal_view},
 };
+use crate::LOG_TARGET;
 
 // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
-/// Returns (`device_name`, `registry_id`, capability bits) from the system default Metal device.
+/// The one `MTLDevice` the process uses, as a retained handle.
+///
+/// The process-wide Metal caches (the present and cursor pipelines, the
+/// readback resolve library and its pipelines, the null textures, and the
+/// upload, clear and blit quads) hold objects built on whichever device first
+/// reached them, and Metal rejects an encode that mixes objects of two
+/// devices. Resolving the system default device once and handing that same
+/// object to every D3D device is what makes their grain correct rather than
+/// assumed.
+///
+/// The retain this handle carries is never released: the device is a
+/// process-lifetime object, like the caches built on it. `MetalHandle` is a
+/// transparent `u64` newtype, so the static is trivially `Send + Sync`.
+static PINNED_DEVICE: LazyLock<MetalHandle<MTLDeviceKind>> = LazyLock::new(|| {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return MetalHandle::<MTLDeviceKind>::NULL;
+    };
+    // SAFETY: `Retained::into_raw` transfers the retain into the `u64` and
+    // `MetalHandle::new` adopts it. Nothing releases this handle, so the
+    // retain stays live for the rest of the process.
+    unsafe { MetalHandle::<MTLDeviceKind>::new(Retained::into_raw(device) as u64) }
+});
+
+/// The process's Metal device, with one retain for the caller.
+///
+/// Warns once when the system default device is no longer the pinned one,
+/// which automatic graphics switching on a dual-GPU Mac can arrange between
+/// two D3D device creations. The pinned device is kept in that case, so every
+/// object in the process-wide caches keeps belonging to the device the next
+/// command buffer encodes against.
+fn pinned_device() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
+    let device = PINNED_DEVICE.into_retained()?;
+    if let Some(current) = MTLCreateSystemDefaultDevice()
+        && current.registryID() != device.registryID()
+    {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "the system default Metal device is now {} (registry id {}), not the pinned {} \
+             (registry id {}); the pinned device is kept, since the process-wide pipeline, \
+             texture and buffer caches were built on it",
+            current.name(),
+            current.registryID(),
+            device.name(),
+            device.registryID(),
+        );
+    }
+    Some(device)
+}
+
+/// Returns (`device_name`, `registry_id`, capability bits) from the process's Metal device.
 pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
-    let device = MTLCreateSystemDefaultDevice()?;
+    let device = pinned_device()?;
     let name = device.name().to_string();
     let registry_id = device.registryID();
     let mut caps = DeviceCapsFlags::empty();
@@ -145,11 +197,13 @@ pub struct DeviceCaps {
     pub min_linear_texture_align: u32,
 }
 
-/// Creates an `MTLDevice` + `MTLCommandQueue` pair.
+/// Creates an `MTLCommandQueue` on the process's Metal device.
 ///
-/// Snapshots the device caps the PE side needs at creation time.
+/// Snapshots the device caps the PE side needs at creation time. Every D3D
+/// device is handed the same `MTLDevice`, so the process-wide Metal caches and
+/// the command buffers that bind from them always name one device.
 pub fn create_command_queue() -> Option<DeviceCaps> {
-    let device = MTLCreateSystemDefaultDevice()?;
+    let device = pinned_device()?;
     let queue = device.newCommandQueue()?;
     let queue_label = objc2_foundation::NSString::from_str("mtld3d");
     queue.setLabel(Some(&queue_label));
@@ -162,7 +216,10 @@ pub fn create_command_queue() -> Option<DeviceCaps> {
     // SAFETY: `Retained::into_raw` transfers each retain into the
     // returned `u64`; `MetalHandle::new` adopts that retain into a
     // typed handle. The PE side keeps the handle alive until the
-    // matching destroy thunk fires.
+    // matching destroy thunk fires. The device retain is the one
+    // `pinned_device` took for this caller, not the pin's own, so
+    // `destroy_command_queue` releasing it leaves the pinned device live
+    // for the next D3D device and for the process-wide caches.
     let device_handle =
         unsafe { MetalHandle::<MTLDeviceKind>::new(Retained::into_raw(device) as u64) };
     // SAFETY: as above.
@@ -235,3 +292,6 @@ pub fn destroy_command_queue(
         release_metal_view(view_handle);
     }
 }
+
+#[cfg(test)]
+mod tests;

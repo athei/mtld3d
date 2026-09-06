@@ -115,12 +115,13 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// (`shader.rs`) — keeps the same library working on Intel/AMD Macs.
 const PRESENT_MSL: &str = include_str!("present.msl");
 
-/// Cached present-pass resources keyed on the device.
+/// Cached present-pass resources for the process's Metal device.
 ///
-/// mtld3d has one `MTLDevice` per process so a global `OnceLock` is the
-/// right grain; the fields are raw `u64` handles so the type is trivially
-/// `Send + Sync`. Handles leak at process exit — these are process-lifetime
-/// objects, the same as the device and command queue.
+/// The unix side resolves one `MTLDevice` and hands it to every D3D device
+/// (`metal::device`), so a global `OnceLock` is the right grain; the fields
+/// are raw `u64` handles so the type is trivially `Send + Sync`. Handles leak
+/// at process exit: these are process-lifetime objects, the same as the device
+/// and command queue.
 ///
 /// Six pipeline states share one MSL library, one per fragment entry
 /// point. `copy` writes the SDR drawable format; the two HDR states write
