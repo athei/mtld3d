@@ -56,9 +56,15 @@ to `cp -R` when the source sits on another volume or on a volume that is not
 APFS. Use it whenever another worktree may be testing or a game is running; a
 plain `make install` still targets the shared trees on purpose, since that is
 how the game gets a build. The clones and the persistent wineserver of the
-private prefix stay behind for the next run; `make clean-isolated` takes them
-down, and `make clean-isolated-all` does so for every worktree of the
-repository. A failing run whose log shows a `d3d9.dll v` stamp that is not your
+private prefix stay behind for the next run; `make clean-isolated` takes down
+the ones in the checkout you are in, and `make clean-isolated-orphans` the ones
+a removed checkout left behind. It finds them three ways: the clones beside the
+checkouts, the record every isolated checkout writes into the directory the
+worktrees share, and any server still running. So neither a removed directory,
+nor a checkout kept somewhere else, nor a reboot that took the servers hides
+one. A directory that is still a checkout is left alone there: its environment
+may be mid-run, and it is that checkout's own `make clean-isolated` to take
+down. A failing run whose log shows a `d3d9.dll v` stamp that is not your
 checkout's is that collision, not a regression.
 
 Both agent runners configured in this tree already print the conventions digest
