@@ -30,10 +30,30 @@ endef
 # `make install` and every test leg keep targeting the shared trees, which is
 # how the game gets a build.
 ISOLATED_ROOT := $(CURDIR)/.wine-isolated
+
+# Where a checkout records that it has an isolated environment: one line per
+# checkout root, in the one directory every worktree of this repository shares,
+# so `clean-isolated-orphans` can still find an environment whose checkout is
+# not beside the others and whose server is no longer running. Empty when git
+# does not answer, and every use of it is quoted, so nothing is read or written
+# then. Two checkouts registering at once can only ever duplicate a line, which
+# the reader folds away.
+ISOLATED_REGISTRY := $(patsubst %,%/mtld3d-isolated-roots,$(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null))
+
+# Cleaning is the one goal that must not make what it is about to delete: the
+# clones below are seeded at parse time, before any recipe runs, so `make
+# ISOLATED=1 clean-isolated` would re-clone the SDK and the prefix and then
+# remove them. Skipped only when every goal named is one of the two cleaners,
+# so a mixed command line still gets its clones.
+ISOLATED_CLEANING := $(if $(MAKECMDGOALS),$(if $(filter-out clean-isolated clean-isolated-orphans,$(MAKECMDGOALS)),,1))
+
 ifeq ($(ISOLATED),1)
 ISOLATED_PREFIX_SOURCE := $(or $(WINEPREFIX),$(HOME)/.wine)
+ifneq ($(ISOLATED_CLEANING),1)
 $(shell [ -d $(ISOLATED_ROOT)/sdk ] || $(call clone_tree,$(WINE_SDK),$(ISOLATED_ROOT)/sdk))
 $(shell [ -d $(ISOLATED_ROOT)/prefix ] || [ ! -d $(ISOLATED_PREFIX_SOURCE) ] || $(call clone_tree,$(ISOLATED_PREFIX_SOURCE),$(ISOLATED_ROOT)/prefix))
+$(if $(ISOLATED_REGISTRY),$(shell grep -qxF '$(CURDIR)' '$(ISOLATED_REGISTRY)' 2>/dev/null || echo '$(CURDIR)' >> '$(ISOLATED_REGISTRY)'))
+endif
 WINE_SDK := $(ISOLATED_ROOT)/sdk
 WINE_INSTALL_DIR := $(ISOLATED_ROOT)/sdk
 export WINEPREFIX := $(ISOLATED_ROOT)/prefix
@@ -280,7 +300,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle version-check stage clean-isolated clean-isolated-all \
+	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
@@ -952,29 +972,101 @@ clean:
 	cd windows && cargo +$(RUST_STABLE) clean
 	cd unix && cargo +$(RUST_STABLE) clean
 
-# Take down what ISOLATED=1 left in this checkout: the persistent wineserver of
-# the private prefix (and the winedevice residents it keeps), then the clones.
-# Named after the knob rather than folded into `clean`, which is about cargo
-# output and must stay usable while an isolated test is running.
-clean-isolated:
-	if [ -x $(ISOLATED_ROOT)/sdk/bin/wineserver ] && [ -d $(ISOLATED_ROOT)/prefix ]; then \
-		WINEPREFIX=$(ISOLATED_ROOT)/prefix $(ISOLATED_ROOT)/sdk/bin/wineserver -k >/dev/null 2>&1 ; \
-		WINEPREFIX=$(ISOLATED_ROOT)/prefix $(ISOLATED_ROOT)/sdk/bin/wineserver -w >/dev/null 2>&1 ; \
-	fi
-	rm -rf $(ISOLATED_ROOT)
+# Take down what ISOLATED=1 left under the isolated root $(1): the persistent
+# wineserver of its private prefix (and the winedevice residents it keeps)
+# first, then the clones. The server is ended by a signal rather than through
+# `wineserver -k`: that execs a binary out of the very tree that is about to go
+# and then waits, without a bound, for the server to exit, so a wedged prefix
+# would hold this and every root after it. The signal asks the server for the
+# same shutdown `-k` asks for, and here the wait for it is bounded: five
+# seconds, then SIGKILL. So the clones only go once nothing is running out of
+# them, a root whose SDK clone is already gone is still taken down, and nothing
+# is executed out of a directory that is about to be deleted. A server is
+# recognised by its executable path (`ps -o comm=`, one field however many
+# spaces it holds), never by splitting a command line into words. One logical
+# shell line, so a caller that found a root of its own can run it inside a
+# loop; $(1) arrives unquoted and is quoted here.
+define clean_isolated_at
+for pid in $$(pgrep -f '/\.wine-isolated/sdk/bin/wineserver'); do \
+	[ "$$(ps -o comm= -p $$pid 2>/dev/null)" = "$(1)/sdk/bin/wineserver" ] || continue ; \
+	kill $$pid 2>/dev/null || true ; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		kill -0 $$pid 2>/dev/null || break ; \
+		sleep 0.5 ; \
+	done ; \
+	kill -9 $$pid 2>/dev/null || true ; \
+done ; \
+rm -rf "$(1)"
+endef
 
-# The same for every worktree of this repository, from any of them: git knows
-# the worktrees, and each one cleans its own environment. A wineserver still
-# running out of a `.wine-isolated/sdk` afterwards belongs to a checkout that
-# was removed with its environment up (`git worktree remove` takes the
-# directory, not the process), so it is ended directly; the path is specific
-# enough that nothing else matches.
-clean-isolated-all:
-	git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r wt; do \
-		[ -d "$$wt/.wine-isolated" ] || continue ; \
-		$(MAKE) -C "$$wt" clean-isolated ; \
-	done
-	pkill -f '/\.wine-isolated/sdk/bin/wineserver' 2>/dev/null || true
+# The clones and the server of this checkout. Named after the knob rather than
+# folded into `clean`, which is about cargo output and must stay usable while an
+# isolated test is running.
+clean-isolated:
+	$(call clean_isolated_at,$(ISOLATED_ROOT))
+
+# The same for what a removed checkout left behind. Two things can survive it:
+# the clones, when the checkout went but its directory did not (a `git worktree
+# remove` that only got as far as the entry, a prune, a hand-deleted `.git`),
+# and the server, when the directory went but the process did not (`git worktree
+# remove` takes the directory, not the process). So the environments are
+# enumerated three ways, none of which needs a server to be running and none of
+# which needs the checkout to still be there:
+#
+#   - the clones by their place on disk, one and two levels under every
+#     directory that holds a checkout of this repository (the main one's parent,
+#     and the parent of each worktree git lists), which is where a worktree
+#     lives (`../mtld3d-foo`, `../mtld3d-issues/issue-N`) and where its
+#     neighbours are left behind;
+#   - the clones a checkout recorded in `ISOLATED_REGISTRY` when it made them,
+#     which is the only thing that reaches a checkout kept somewhere else, and
+#     is read filtered by what is still on disk;
+#   - the servers by the executable they are running, which is all that is left
+#     to name a checkout whose directory went with the worktree.
+#
+# What is still a checkout is then dropped from all three: a directory that
+# carries its own `.git` that git can still resolve is in use, and its
+# environment is that checkout's own `clean-isolated` to take down, never this
+# sweep's. What is left is shut down through its own SDK clone while the clones
+# are still there, its clones removed, and its server signalled by pid, never by
+# a pattern that could reach a checkout in use. A server is recognised by its
+# executable path alone, so a command line that merely carries one (an editor,
+# this recipe under a shell) is never taken for a server, and a path with a
+# space in it is still one field.
+#
+# The list of roots is fed to the loop on a descriptor of its own with the
+# loop's own input closed, so that nothing a takedown runs can read the roots
+# still to come. The record is rewritten at the end to what is still on disk,
+# which is how a line for a checkout that is gone leaves it.
+clean-isolated-orphans:
+	{ { dirname "$$(git rev-parse --path-format=absolute --git-common-dir)" ; \
+	    git worktree list --porcelain | sed -n 's|^worktree ||p' ; \
+	  } | while IFS= read -r checkout; do dirname "$$checkout" ; done | sort -u \
+	  | while IFS= read -r near; do \
+		for tree in "$$near"/*/.wine-isolated "$$near"/*/*/.wine-isolated; do \
+			[ -d "$$tree" ] && dirname "$$tree" ; \
+		done ; \
+	  done ; \
+	  [ -f '$(ISOLATED_REGISTRY)' ] && while IFS= read -r recorded; do \
+		[ -d "$$recorded/.wine-isolated" ] && printf '%s\n' "$$recorded" ; \
+	  done < '$(ISOLATED_REGISTRY)' ; \
+	  for pid in $$(pgrep -f '/\.wine-isolated/sdk/bin/wineserver'); do \
+		exe=$$(ps -o comm= -p $$pid 2>/dev/null) ; \
+		case "$$exe" in */.wine-isolated/sdk/bin/wineserver) \
+			printf '%s\n' "$${exe%/.wine-isolated/sdk/bin/wineserver}" ;; \
+		esac ; \
+	  done ; \
+	} | sort -u | while IFS= read -r root <&3; do \
+		{ [ -e "$$root/.git" ] && git -C "$$root" rev-parse --git-dir >/dev/null 2>&1 ; } && continue ; \
+		echo "==> orphan of $$root" ; \
+		$(call clean_isolated_at,$$root/.wine-isolated) ; \
+	done 3<&0 0</dev/null
+	if [ -f '$(ISOLATED_REGISTRY)' ]; then \
+		while IFS= read -r recorded; do \
+			[ -d "$$recorded/.wine-isolated" ] && printf '%s\n' "$$recorded" ; \
+		done < '$(ISOLATED_REGISTRY)' > '$(ISOLATED_REGISTRY).new' ; \
+		mv '$(ISOLATED_REGISTRY).new' '$(ISOLATED_REGISTRY)' ; \
+	fi
 
 upgrade:
 	cd windows && cargo +$(RUST_STABLE) update
