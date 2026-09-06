@@ -61,6 +61,7 @@ unsafe extern "system" {
     fn GetModuleHandleA(name: *const c_char) -> usize;
     fn GetCurrentProcess() -> *mut c_void;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    fn GetLastError() -> u32;
 }
 
 #[link(name = "gdi32")]
@@ -202,7 +203,8 @@ fn register_class() {
 ///
 /// # Panics
 ///
-/// Panics if `CreateWindowExA` fails.
+/// Panics if `CreateWindowExA` fails, with the thread's last error in the
+/// message.
 #[must_use]
 pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
     register_class();
@@ -227,7 +229,12 @@ pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
             core::ptr::null(),
         )
     };
-    assert!(hwnd != 0, "CreateWindowExA failed");
+    if hwnd == 0 {
+        // SAFETY: Win32 thunk with no preconditions; reads the calling
+        // thread's own last-error slot, which the failed call just set.
+        let err = unsafe { GetLastError() };
+        panic!("CreateWindowExA failed: GetLastError() = {err}");
+    }
     hwnd
 }
 
