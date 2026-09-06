@@ -1372,9 +1372,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // below the resolution D3D9 reports, a shader that declares the register
     // reads it through the `PsDraw` uniform so it stays in the reported space;
     // only such a shader pays for the variant and the bind.
-    let vpos_scaled = !enc.target_scale().is_identity()
-        && matches!(ps, PsSource::Programmable { ps_id, .. } if enc.ps_reads_vpos(*ps_id));
-    ps_variant.flags.set(VariantFlags::VPOS_SCALE, vpos_scaled);
+    //
+    // The variant flag and the uniform the variant reads are one value,
+    // built here from one read of this encoder's bound-target scale: the
+    // scale belongs to the device whose encoder this is, and a shader that
+    // took the flag can only ever be bound the bytes that came with it.
+    let vpos_target_scale = enc.target_scale();
+    let ps_draw_bytes = (!vpos_target_scale.is_identity()
+        && matches!(ps, PsSource::Programmable { ps_id, .. } if enc.ps_reads_vpos(*ps_id)))
+    .then(|| mtld3d_core::ps_draw::build_ps_draw_bytes(vpos_target_scale));
+    ps_variant
+        .flags
+        .set(VariantFlags::VPOS_SCALE, ps_draw_bytes.is_some());
     // `D3DRS_MULTISAMPLEMASK`: Metal has no pipeline-state sample mask, so a
     // narrowed mask becomes a `[[sample_mask]]` output in a pixel-shader
     // variant. The API thread already resolved the state against the bound
@@ -2168,18 +2177,17 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         }
     }
     // The render scale behind a scaled `vPos` read. Bound only for a draw
-    // whose shader took the variant; the encoder dedups it, and the scale
-    // changes only with the bound target.
-    if vpos_scaled {
-        let draw_bytes = mtld3d_core::ps_draw::build_ps_draw_bytes(enc.target_scale());
-        if enc.last_bound().ps_draw_changed(&draw_bytes) {
-            let ptr = enc.alloc_scratch(&draw_bytes);
-            enc.emit_command(Command::set_fragment_bytes_at(
-                ptr,
-                u32::try_from(mtld3d_core::ps_draw::PS_DRAW_BYTES).expect("16 fits u32"),
-                PS_DRAW_SLOT,
-            ));
-        }
+    // whose shader took the variant, from the bytes that decided the flag;
+    // the encoder dedups it, and the scale changes only with the bound target.
+    if let Some(draw_bytes) = ps_draw_bytes
+        && enc.last_bound().ps_draw_changed(&draw_bytes)
+    {
+        let ptr = enc.alloc_scratch(&draw_bytes);
+        enc.emit_command(Command::set_fragment_bytes_at(
+            ptr,
+            u32::try_from(mtld3d_core::ps_draw::PS_DRAW_BYTES).expect("16 fits u32"),
+            PS_DRAW_SLOT,
+        ));
     }
     // VS integer constants — bound only for the rare shader that reads a
     // dynamic integer constant. Re-bound unconditionally (no dedup): such
