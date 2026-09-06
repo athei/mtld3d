@@ -737,22 +737,33 @@ test-unit:
 # test rather than stopping at a summary.
 #
 # JOBS=<n> is how many tests run at once, each on its own thread with its
-# own device. The default is 1 until the Wine SDK carries the Mac driver fix
-# for a lock-order inversion its D3DMetal client-surface hack has:
-# `macdrv_DestroyWindow` releases those surfaces while it holds the window
-# data, taking win32u's surface lock, and every other window update
-# (`update_client_surfaces`, `detach_client_surfaces`) takes the two the
-# other way round, so a window torn down on one thread while another thread
-# creates, moves or destroys its own deadlocks the process. The runner's
-# watchdog then charges the hang and runs the rest one at a time, so a
-# `JOBS=4` run is correct today but slow (the suite is ~10 s when the
-# deadlock stays away and ~130 s when it hits); a CI runner, whose device
-# creation cannot overlap at all, stays at 1 either way. TIMEOUT=<secs> is
-# how long a process may go without reporting a result before the runner
-# kills it and charges the hang to the test that was running (default 60);
-# the same bound covers a process that has closed stdout but will not exit.
-# A process tree that keeps stderr open after the process is gone gets a
-# one-second grace, not the bound: nothing it says after that is the test's.
+# own device. Four rather than one is not about wall time, which it barely
+# moves. A parallel run is the only thing here that keeps several devices
+# alive at once, which is what a game does with a launcher or an overlay
+# beside it, so it is what holds the per-device rule: what one device owns
+# is keyed by that device, and a process-wide registry keyed without one
+# hands two devices each other's work.
+#
+# The default of 4 assumes a Wine built from `cx-26-patched` at or after
+# the winemac change that releases the D3DMetal client surfaces outside the
+# window data lock; no wine-build release up to `cx-26.3.0-3` carries it.
+# Without it the two locks are taken in both orders (`macdrv_DestroyWindow`
+# holds the window data and takes win32u's surface lock,
+# `update_client_surfaces` and `detach_client_surfaces` the other way
+# round), so a window torn down on one thread while another thread creates,
+# moves or destroys its own deadlocks the process. The report is still
+# right there, because the watchdog charges the hang and runs the rest one
+# at a time, but the suite takes ~130 s instead of ~10 s and JOBS=1 avoids
+# it outright. CI passes JOBS=1 for a reason of its own, that device
+# creation cannot overlap on a paravirtual GPU, so its value says nothing
+# about this default.
+#
+# TIMEOUT=<secs> is how long a process may go without reporting a result
+# before the runner kills it and charges the hang to the test that was
+# running (default 60); the same bound covers a process that has closed
+# stdout but will not exit. A process tree that keeps stderr open after the
+# process is gone gets a one-second grace, not the bound: nothing it says
+# after that is the test's.
 #
 # A scaled or Intel-variant run reports the whole suite instead of stopping at
 # the first failure, and FAIL_FAST=0 asks for that on any run. The point of
@@ -765,7 +776,7 @@ test-unit:
 # path>`, e.g. `e2e::msaa::resolve_counts_edge_pixels`) contains any of the
 # whitespace-separated patterns: `msaa::` is one file, `stencil` every test
 # with the word. A filter that selects nothing passes.
-JOBS ?= 1
+JOBS ?= 4
 TIMEOUT ?= 60
 E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE)$(INTEL),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)') $(if $(LOG_DIR),--log-dir '$(LOG_DIR)')
 
