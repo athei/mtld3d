@@ -36,13 +36,21 @@
 //! Robustness comes from the plaintext `frame_len` prefix plus the xxh3:
 //! torn writes (frame runs past EOF) ⇒ `break`; xxh3 mismatch ⇒ skip;
 //! decompress failure or bad UTF-8 ⇒ skip; unknown `kind` ⇒ skip via
-//! `frame_len` (forward-compat hook).
+//! `frame_len` (forward-compat hook); a file header found where a chunk
+//! header belongs ⇒ skip its 16 bytes.
 //!
-//! This module owns the binary format only — it is pure-Rust and host-
-//! testable. Encoder-side write hooks and pre-warm-thread plumbing live in
-//! `windows/d3d9`.
+//! This module owns the binary format and the creation of the file that
+//! holds it, both pure-Rust and host-testable. Encoder-side write hooks
+//! and pre-warm-thread plumbing live in `windows/d3d9`.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    fs::{self, File, OpenOptions},
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
+};
 
 use rustc_hash::FxHashSet;
 use xxhash_rust::xxh3::Xxh3;
@@ -451,9 +459,9 @@ pub fn read_header(bytes: &[u8]) -> Result<u32, CacheReadError> {
 ///   well-formed Bundle chunk with no inner duplicates and reached EOF
 ///   cleanly. `true` whenever anything else was observed: any Single
 ///   chunks, more than one Bundle, a torn / corrupt / unknown-kind chunk,
-///   trailing partial-header garbage, or duplicate keys. The pre-warm
-///   thread uses this to decide whether to rewrite the file as a single
-///   dense Bundle.
+///   a stray file header mid-file, trailing partial-header garbage, or
+///   duplicate keys. The pre-warm thread uses this to decide whether to
+///   rewrite the file as a single dense Bundle.
 ///
 /// Empty input (parsed zero entries) always returns
 /// `needs_compaction = false` — there is nothing to compact.
@@ -477,6 +485,15 @@ pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
     let mut duplicates = false;
 
     while off + CHUNK_HEADER_LEN <= bytes.len() {
+        if bytes[off..off + 8] == SHADER_CACHE_MAGIC {
+            // A file header inside the file is a stray from a duplicate
+            // creation: skip its 16 bytes and keep parsing. No chunk header
+            // can be mistaken for it, since the magic's leading byte would
+            // have to be a `kind` outside `0..=7` and `RECORD_KIND_BUNDLE`.
+            other_chunk = true;
+            off += HEADER_LEN;
+            continue;
+        }
         let header_start = off;
         let kind_byte = bytes[off];
         let key = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap());
@@ -611,6 +628,99 @@ pub fn write_bundle(buf: &mut Vec<u8>, entries: &[CacheEntry]) {
     let frame = zstd::encode_all(plain.as_slice(), ZSTD_BUNDLE_LEVEL)
         .expect("zstd encode_all of in-memory plain-record blob");
     push_chunk(buf, RECORD_KIND_BUNDLE, 0, &frame);
+}
+
+/// Open the cache file at `path` for append, creating it with its header when absent.
+///
+/// Creation goes through `create_new`, so when several writers reach a cold
+/// cache together the file system elects exactly one of them: that writer
+/// emits the 16-byte header, and every other one opens the file it finds and
+/// appends its chunks behind that header. Exactly one header therefore
+/// reaches the file however many writers race for it.
+///
+/// # Errors
+///
+/// Any I/O error from the create, from the header write, or from the append
+/// open taken when the file already exists.
+pub fn open_for_append(path: &Path) -> std::io::Result<File> {
+    use std::io::Write as _;
+
+    match OpenOptions::new().append(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            let mut header = Vec::with_capacity(HEADER_LEN);
+            write_header(&mut header);
+            file.write_all(&header)?;
+            Ok(file)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = OpenOptions::new().append(true).open(path)?;
+            await_header(&file);
+            Ok(file)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Attempts `await_header` makes before it gives up on the header appearing.
+///
+/// The elected writer's create and its header write are consecutive, so one
+/// attempt is the normal case; the bound is what keeps a file left empty by a
+/// killed process from stalling a caller.
+const HEADER_WAIT_ATTEMPTS: u32 = 25;
+
+/// Interval between `await_header` attempts.
+const HEADER_WAIT_INTERVAL: Duration = Duration::from_micros(200);
+
+// Wait for the electing writer's header before appending behind it. A writer
+// that finds the file already there has to leave the first 16 bytes to
+// whoever created it, or its chunk would land at the offset the reader skips
+// as the header.
+fn await_header(file: &File) {
+    for _ in 0..HEADER_WAIT_ATTEMPTS {
+        if file
+            .metadata()
+            .is_ok_and(|m| m.len() >= u64::try_from(HEADER_LEN).unwrap_or(u64::MAX))
+        {
+            return;
+        }
+        thread::sleep(HEADER_WAIT_INTERVAL);
+    }
+}
+
+/// Replace the file at `path` with a header plus one Bundle chunk holding `entries`.
+///
+/// The bytes go to a temporary beside `path` and the temporary is renamed
+/// over it, so a reader observes either the previous file or the whole new
+/// one. The temporary's name carries the process id and a per-call counter,
+/// so two writers compacting at once cannot interleave into one scratch file.
+///
+/// Returns the number of bytes written.
+///
+/// # Errors
+///
+/// Any I/O error from the temporary write or from the rename; the temporary
+/// is removed when the rename fails.
+pub fn replace_with_bundle(path: &Path, entries: &[CacheEntry]) -> std::io::Result<usize> {
+    let mut buf = Vec::new();
+    write_header(&mut buf);
+    write_bundle(&mut buf, entries);
+
+    let tmp = temp_sibling(path);
+    fs::write(&tmp, &buf)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(buf.len())
+}
+
+// Name a scratch file beside `path`, unique to this process and this call.
+fn temp_sibling(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}-{seq}.tmp", std::process::id()));
+    PathBuf::from(name)
 }
 
 /// Hash any `Hash`-implementing FF state key to a u64 disk identifier.

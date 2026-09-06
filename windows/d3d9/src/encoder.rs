@@ -1,6 +1,6 @@
 use std::{
     collections::{VecDeque, hash_map::Entry},
-    fs::{File, OpenOptions},
+    fs::File,
     io::Write as _,
     path::PathBuf,
     sync::{
@@ -9880,21 +9880,16 @@ pub fn shader_cache_path() -> Option<PathBuf> {
     Some(parent.join("mtld3d_shaders.bin"))
 }
 
-/// Open the cache file in append mode, creating it (and writing the 16-byte header) if absent.
+/// Open the cache file in append mode, creating it with its header if absent.
 ///
 /// Caller invokes lazily on first miss-compile, after the pre-warm thread
 /// has already validated the file's schema, so a non-empty file we
 /// encounter here is guaranteed to already start with a valid header.
+/// `shader_cache::open_for_append` owns the creation, so two encoders
+/// arriving at a cold cache together still produce one header.
 fn open_or_create_cache_file() -> std::io::Result<File> {
     let Some(path) = shader_cache_path() else {
         return Err(std::io::Error::other("shader_cache_path unavailable"));
     };
-    let exists = path.exists();
-    let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
-    if !exists {
-        let mut hdr = Vec::with_capacity(shader_cache::HEADER_LEN);
-        shader_cache::write_header(&mut hdr);
-        f.write_all(&hdr)?;
-    }
-    Ok(f)
+    shader_cache::open_for_append(&path)
 }
