@@ -92,6 +92,11 @@ pub struct HarnessConfig {
     pub depth_format: Option<u32>,
     /// `WS_VISIBLE`. Hidden (default) keeps parallel runs off-screen.
     pub visible: bool,
+    /// Borderless by default; window-management tests opt into a non-client frame.
+    ///
+    /// Wine builds the title bar and controls on the `AppKit` main thread,
+    /// serializing window creation and destruction even for hidden windows.
+    pub window_style: win32::WindowStyle,
     /// Configuration entries for this harness's interface alone.
     ///
     /// `key=value` entries, `;`-separated, appended to the suite-wide
@@ -121,6 +126,7 @@ impl Default for HarnessConfig {
             back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
             depth_format: None,
             visible: false,
+            window_style: win32::WindowStyle::Borderless,
             config_entries: "",
             windowed: 1,
             behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
@@ -361,7 +367,7 @@ impl Harness {
 
         let width = i32::try_from(cfg.width).expect("width fits i32");
         let height = i32::try_from(cfg.height).expect("height fits i32");
-        let hwnd = win32::create_window(width, height, cfg.visible);
+        let hwnd = win32::create_styled_window(width, height, cfg.visible, &cfg.window_style);
 
         let mut pp = present_params(cfg, hwnd);
         let mut device: *mut c_void = core::ptr::null_mut();

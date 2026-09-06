@@ -11,7 +11,7 @@ use std::sync::{
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, assert_pixel_eq, config_var, create_window, destroy_window,
+    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, destroy_window,
     enumerate_display_sizes, window_rect,
 };
 use mtld3d_types::{
@@ -1242,10 +1242,18 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     if !display_lists_640x480() {
         return;
     }
-    let h = Harness::new();
+    let h = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Framed,
+        ..HarnessConfig::default()
+    });
     let hwnd = h.hwnd();
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
+    assert_ne!(
+        windowed_style & WS_CAPTION,
+        0,
+        "starts with a caption to restore"
+    );
 
     // 640x480 is a settable mode (one user32 accepts), so the Reset sets it and the monitor
     // rect the window adopts is the mode's. Read after the transition: the
@@ -1312,11 +1320,17 @@ fn nowindowchanges_leaves_the_device_window_alone() {
         return;
     }
     let h = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Framed,
         behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES,
         ..HarnessConfig::default()
     });
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
+    assert_ne!(
+        windowed_style & WS_CAPTION,
+        0,
+        "starts with a caption to preserve"
+    );
     let windowed_exstyle = h.window_exstyle();
     assert_eq!(
         windowed_style & WS_VISIBLE,

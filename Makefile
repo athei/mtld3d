@@ -737,12 +737,15 @@ test-unit:
 # test rather than stopping at a summary.
 #
 # JOBS=<n> is how many tests run at once, each on its own thread with its
-# own device. Four rather than one is not about wall time, which it barely
-# moves. A parallel run is the only thing here that keeps several devices
+# own device. A parallel run is the only thing here that keeps several devices
 # alive at once, which is what a game does with a launcher or an overlay
 # beside it, so it is what holds the per-device rule: what one device owns
 # is keyed by that device, and a process-wide registry keyed without one
 # hands two devices each other's work.
+# Rendering tests use borderless windows: Wine builds a framed window's
+# title bar and controls on the AppKit main thread, serializing the tests
+# even when their windows stay hidden. Window-management tests explicitly
+# keep framed windows so that their style and teardown paths stay covered.
 #
 # The default of 4 assumes a Wine built from `cx-26-patched` at or after
 # the winemac change that releases the D3DMetal client surfaces outside the
