@@ -529,7 +529,8 @@ stage: all
 #
 # LOG_DIR=<path> puts every test process's log file (and its GPU traces) in
 # one directory instead of beside each test binary, so a machine that is only
-# reachable through its artifacts (a CI runner) can hand the logs back. The
+# reachable through its artifacts (a CI runner) can hand the logs back, which
+# every CI end-to-end leg does. The
 # path is read on the PE side: an absolute Windows path (`Z:\...` for a unix
 # path under Wine). Ten files are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
