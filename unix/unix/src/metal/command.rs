@@ -561,6 +561,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                         super::upscale::encode(
                             &cmd_buf,
                             &device,
+                            params.queue_handle,
                             &present_texture,
                             &drawable_texture,
                             MTLFXSpatialScalerColorProcessingMode::Perceptual,
@@ -1075,8 +1076,9 @@ fn encode_hdr_present_upscaled(
     let device = cmd_buf.device();
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
     let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
-    // The scratch is this queue's alone: another device presenting at the
-    // same render size tone-maps into its own.
+    // The scratch and the scaler are this queue's alone: another device
+    // presenting at the same render size tone-maps and upscales through its
+    // own.
     let scratch = if super::upscale::is_available(&device) {
         super::upscale::scratch_target(
             &device,
@@ -1091,6 +1093,7 @@ fn encode_hdr_present_upscaled(
     let Some(scratch) = scratch.filter(|scratch| {
         super::upscale::can_scale(
             &device,
+            queue_handle,
             scratch,
             drawable,
             MTLFXSpatialScalerColorProcessingMode::HDR,
@@ -1111,6 +1114,7 @@ fn encode_hdr_present_upscaled(
         && super::upscale::encode(
             cmd_buf,
             &device,
+            queue_handle,
             &scratch,
             drawable,
             MTLFXSpatialScalerColorProcessingMode::HDR,
