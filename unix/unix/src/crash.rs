@@ -100,6 +100,28 @@ static PREV: [PrevDisposition; 4] = [
 /// reads the atomic.
 static WINE_CURRENT_TEB: AtomicUsize = AtomicUsize::new(0);
 
+// macOS interfaces absent or deprecated in libc, provided by libSystem.
+unsafe extern "C" {
+    static mut mach_task_self_: libc::mach_port_t;
+    fn mach_vm_read_overwrite(
+        target_task: libc::vm_map_t,
+        address: libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        data: libc::mach_vm_address_t,
+        outsize: *mut libc::mach_vm_size_t,
+    ) -> libc::kern_return_t;
+    fn backtrace(array: *mut *mut c_void, size: c_int) -> c_int;
+    fn backtrace_symbols_fd(array: *const *mut c_void, size: c_int, fd: c_int);
+    /// macOS `pthread_getname_np` (not exposed by the `libc` crate).
+    ///
+    /// Reads the calling thread's name into `buf`.
+    fn pthread_getname_np(
+        thread: libc::pthread_t,
+        buf: *mut core::ffi::c_char,
+        len: usize,
+    ) -> c_int;
+}
+
 /// Index into [`PREV`] for a signal we handle, or `None` for anything else.
 const fn signal_slot(signo: c_int) -> Option<usize> {
     match signo {
@@ -569,9 +591,9 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     }
 
     // The faulting stack. The fault may be one Wine recovers, so the scan
-    // must not fault itself: it probes each page before reading it rather
-    // than trusting a stack bound, since a Wine thread runs its unix calls
-    // on a stack Wine allocated, not the one its pthread record names.
+    // must not fault itself: the kernel copies each word or reports failure.
+    // A mapping probe cannot establish readability, and a Wine thread runs
+    // unix calls on a stack Wine allocated, not its pthread stack.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
@@ -635,10 +657,10 @@ fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
 ///
 /// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
 /// value that `dladdr` resolves into a module whose path contains `mtld3d`.
-/// Caps the printed count so a deep stack can't flood. Async-signal-safe: only
-/// `dladdr` (no malloc on the resolve path here) + `backtrace_symbols_fd` + raw
-/// stack reads. Arch-neutral: a spilled return address is a stack word on both
-/// arches, and the 4-byte step below already tolerates either alignment.
+/// Caps the printed count so a deep stack can't flood. Stack words are copied
+/// by the kernel into local storage, without dereferencing the faulting stack.
+/// Arch-neutral: a spilled return address is a stack word on both arches, and
+/// the 4-byte step below already tolerates either alignment.
 fn scan_stack_for_our_frames(sp: u64) {
     /// Header for the guest-stack pass below.
     const GUEST_HDR: &[u8] = b"[mtld3d::unix] guest (PE) stack words:\n";
@@ -646,7 +668,6 @@ fn scan_stack_for_our_frames(sp: u64) {
     const GUEST_CAP: u32 = 64;
 
     our_frames_on_stack(sp, STACK_SCAN_WORDS);
-    let base = sp as *const u8;
     // Second pass: the 32-bit guest stack. `dladdr` can't see Wine's PE
     // builtins (not dyld images), so collect raw 4-byte words that land in the
     // PE-builtin zone [0x7A00_0000, 0x7C00_0000) (ntdll/user32/win32u/d3d9/…)
@@ -666,11 +687,10 @@ fn scan_stack_for_our_frames(sp: u64) {
     let mut guest_printed = 0u32;
     let mut slot = 0usize;
     while slot < STACK_SCAN_WORDS && guest_printed < GUEST_CAP {
-        // SAFETY: as the loop above, an offset into stack memory near `sp`.
-        let word = unsafe { base.add(slot * 4) };
-        // SAFETY: as above; an unmapped read re-faults into the re-entrancy
-        // guard, bounding the walk.
-        let guest_addr = unsafe { word.cast::<u32>().read_unaligned() };
+        let Some(bytes) = stack_word(sp, slot) else {
+            break;
+        };
+        let guest_addr = u32::from_ne_bytes(bytes);
         let in_builtin = (0x7A00_0000..0x7C00_0000).contains(&guest_addr);
         let in_exe = (0x0040_0000..0x0080_0000).contains(&guest_addr);
         if in_builtin || in_exe {
@@ -702,27 +722,13 @@ fn our_frames_on_stack(sp: u64, words: usize) {
     /// Print cap for the pass.
     const OURS_CAP: u32 = 48;
 
-    let base = sp as *const u8;
     let mut printed = 0u32;
     let mut slot = 0usize;
-    let mut probed_page = 0u64;
     while slot < words && printed < OURS_CAP {
-        // The word plus the seven bytes after it; a read that would cross
-        // into a page nobody mapped ends the walk instead of faulting.
-        let end = sp.wrapping_add((slot * 4) as u64 + 7);
-        let page = page_of(end);
-        if page != probed_page {
-            if !page_is_mapped(page) {
-                break;
-            }
-            probed_page = page;
-        }
-        // SAFETY: an offset into stack memory near `sp`, on a page the probe
-        // above found mapped.
-        let word = unsafe { base.add(slot * 4) };
-        // SAFETY: as above; `read_unaligned` tolerates a 4-byte-aligned 32-bit
-        // stack.
-        let addr = unsafe { word.cast::<u64>().read_unaligned() };
+        let Some(bytes) = stack_word(sp, slot) else {
+            break;
+        };
+        let addr = u64::from_ne_bytes(bytes);
         if addr >= 0x1000 && dladdr_is_ours(addr) {
             let mut frame = [addr as *mut c_void; 1];
             // SAFETY: single in-bounds frame pointer; `backtrace_symbols_fd`
@@ -734,24 +740,48 @@ fn our_frames_on_stack(sp: u64, words: usize) {
     }
 }
 
-/// The page `addr` lies on.
-fn page_of(addr: u64) -> u64 {
-    // SAFETY: `sysconf` reads a constant.
-    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-        .unwrap_or(4096)
-        .max(1);
-    addr & !(page - 1)
-}
-
-/// Whether the page at `page` is mapped, asked of the kernel rather than found out by a fault.
+/// Copy a stack word without dereferencing the faulting stack.
 ///
-/// `mincore` answers `ENOMEM` for an address no mapping covers and is a
-/// plain system call, which is what a signal handler can afford.
-fn page_is_mapped(page: u64) -> bool {
-    let mut vec = [0i8; 1];
-    // SAFETY: `mincore` reads no user memory but the one-byte out vector.
-    let rc = unsafe { libc::mincore(page as *const c_void, 1, vec.as_mut_ptr()) };
-    rc == 0
+/// The Mach call copies into fixed local storage and returns an error for an
+/// unreadable source, including a mapping whose protection changes during the
+/// copy. Only a complete copy is used. No allocation or logger lock is needed;
+/// a failed read writes directly to the crash descriptor and ends that scan.
+fn stack_word<const N: usize>(sp: u64, slot: usize) -> Option<[u8; N]> {
+    const UNREADABLE: &[u8] = b"[mtld3d::unix] stack read unavailable, stopping scan\n";
+
+    let address = slot
+        .checked_mul(4)
+        .and_then(|offset| sp.checked_add(offset as u64))
+        .filter(|address| address.checked_add(N as u64).is_some());
+    if let Some(address) = address {
+        let mut bytes = [0u8; N];
+        let mut copied = 0;
+        // SAFETY: reads libSystem's task port for this process.
+        let task = unsafe { mach_task_self_ };
+        // SAFETY: the kernel validates the source address. The destination
+        // holds N writable bytes, and `copied` is a live size out-parameter.
+        let status = unsafe {
+            mach_vm_read_overwrite(
+                task,
+                address,
+                N as u64,
+                bytes.as_mut_ptr() as usize as u64,
+                &raw mut copied,
+            )
+        };
+        if status == libc::KERN_SUCCESS && copied == N as u64 {
+            return Some(bytes);
+        }
+    }
+    // SAFETY: write(2) is async-signal-safe; the bytes have static storage.
+    unsafe {
+        let _ = libc::write(
+            crate::log_file::raw_fd(),
+            UNREADABLE.as_ptr().cast::<c_void>(),
+            UNREADABLE.len(),
+        );
+    }
+    None
 }
 
 /// What dyld knows about `addr`: its image, and the nearest symbol below it.
@@ -867,17 +897,10 @@ const CALLER_LABEL: &[u8] = b"caller(lr)=";
 ///
 /// `x86_64` `CALL` pushes it, so for a jump-through-garbage fault (which faults
 /// at the callee's first instruction, before any prologue) it is the word at
-/// `[rsp]`; a bad `rsp` re-faults into the re-entrancy guard rather than
-/// looping.
+/// `[rsp]`; an unreadable `rsp` reports no return address.
 #[cfg(target_arch = "x86_64")]
 fn caller_pc(_ctx: *mut c_void, sp: u64) -> u64 {
-    if sp == 0 {
-        return 0;
-    }
-    // SAFETY: `sp` is the faulting stack pointer, whose top word is the return
-    // address the faulting `CALL` pushed. An unmapped read terminates through
-    // the re-entrancy guard.
-    unsafe { (sp as *const u64).read() }
+    stack_word(sp, 0).map_or(0, u64::from_ne_bytes)
 }
 
 /// The return address of the frame that faulted, or 0 if it can't be read.
@@ -954,21 +977,6 @@ const fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
     let field = unsafe { mctx.add(offset) };
     // SAFETY: reads the saved register (unaligned-safe, no write).
     unsafe { field.cast::<u64>().read_unaligned() }
-}
-
-// Declared here because the `libc` crate does not expose the macOS
-// `<execinfo.h>` family; both live in libSystem, which is always linked.
-unsafe extern "C" {
-    fn backtrace(array: *mut *mut c_void, size: c_int) -> c_int;
-    fn backtrace_symbols_fd(array: *const *mut c_void, size: c_int, fd: c_int);
-    /// macOS `pthread_getname_np` (not exposed by the `libc` crate).
-    ///
-    /// Reads the calling thread's name into `buf`.
-    fn pthread_getname_np(
-        thread: libc::pthread_t,
-        buf: *mut core::ffi::c_char,
-        len: usize,
-    ) -> c_int;
 }
 
 const fn signal_name(signo: libc::c_int) -> &'static [u8] {
