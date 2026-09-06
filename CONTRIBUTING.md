@@ -139,6 +139,13 @@ culprit. So a failure costs one result and one extra process, and the
 `processes` count in the summary says how many the run took: eight is a
 clean `make test`.
 
+The harness defaults to hidden borderless windows. Wine builds a framed
+window's title bar and controls on the AppKit main thread, so creating and
+destroying them for every rendering test serializes a parallel run.
+Tests of window-style changes use `HarnessConfig::window_style` with
+`WindowStyle::Framed`, as does the window-lifecycle stress test. Keep that
+choice explicit when a test needs the non-client frame.
+
 ## Which suite is right when they disagree
 
 Wine's d3d9 test suite is the spec oracle. The end-to-end suite is our own

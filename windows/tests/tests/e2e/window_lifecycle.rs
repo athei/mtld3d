@@ -13,7 +13,7 @@
 //! the harness window's `WM_DESTROY` posts `WM_QUIT` to its thread's queue,
 //! so a thread that destroyed one window cannot render on the next.
 
-use mtld3d_tests::Harness;
+use mtld3d_tests::{Harness, HarnessConfig, WindowStyle};
 
 /// Lanes creating and destroying at once.
 const LANES: usize = 6;
@@ -33,7 +33,10 @@ fn devices_and_windows_come_and_go_on_several_threads_at_once() {
                 for _ in 0..ROUNDS {
                     std::thread::scope(|round| {
                         round.spawn(|| {
-                            let h = Harness::new();
+                            let h = Harness::create(&HarnessConfig {
+                                window_style: WindowStyle::Framed,
+                                ..HarnessConfig::default()
+                            });
                             h.render_once(0xFF00_FF00, |_| {});
                         });
                     });

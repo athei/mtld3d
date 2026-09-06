@@ -151,6 +151,14 @@ const IDC_ARROW: usize = 32512;
 static REGISTER_CLASS: Once = Once::new();
 const CLASS_NAME: &core::ffi::CStr = c"mtld3d_test_window";
 
+/// Whether a test window needs a title bar and resizing controls.
+pub enum WindowStyle {
+    /// A popup with no non-client frame, for rendering tests.
+    Borderless,
+    /// An overlapped window, for window-management tests.
+    Framed,
+}
+
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_DESTROY {
         // SAFETY: Win32 message-loop thunk with no preconditions.
@@ -207,10 +215,29 @@ fn register_class() {
 /// message.
 #[must_use]
 pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
+    create_styled_window(width, height, visible, &WindowStyle::Framed)
+}
+
+/// Create a test window with the requested non-client frame.
+///
+/// # Panics
+///
+/// Panics if the window class cannot be registered or the window cannot be created.
+#[must_use]
+pub fn create_styled_window(
+    width: i32,
+    height: i32,
+    visible: bool,
+    window_style: &WindowStyle,
+) -> usize {
     register_class();
     // SAFETY: Win32 thunk; null module name returns the current process handle.
     let instance = unsafe { GetModuleHandleA(core::ptr::null()) };
-    let style = WS_OVERLAPPEDWINDOW | if visible { WS_VISIBLE } else { 0 };
+    let (style, position) = match window_style {
+        WindowStyle::Borderless => (WS_POPUP, 0),
+        WindowStyle::Framed => (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT),
+    };
+    let style = style | if visible { WS_VISIBLE } else { 0 };
     // SAFETY: Win32 thunk; the class atom is registered above, the c-strings are
     // valid for the call, and `instance` is this process's module handle.
     let hwnd = unsafe {
@@ -219,8 +246,8 @@ pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
             CLASS_NAME.as_ptr(),
             c"mtld3d test".as_ptr(),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            position,
+            position,
             width,
             height,
             0,

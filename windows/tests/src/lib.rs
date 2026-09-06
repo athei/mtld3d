@@ -31,6 +31,7 @@ pub use vertex::{
     VolumeVertex,
 };
 pub use win32::{
-    Rect, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, create_window,
-    destroy_window, enumerate_display_sizes, send_message, set_window_pos, window_rect,
+    Rect, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle,
+    create_window, destroy_window, enumerate_display_sizes, send_message, set_window_pos,
+    window_rect,
 };
