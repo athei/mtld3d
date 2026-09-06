@@ -25,12 +25,19 @@
 //! (`PresentPipelines::copy`), which covers any ratio; this module is the
 //! quality path, not the correctness one.
 //!
-//! Scalers are cached per (input size, output size, format, colour mode).
+//! Scalers are cached per (queue, input size, output size, format, colour
+//! mode). The queue is the device: the input and output textures are
+//! properties set on the scaler and read by the encode that follows them, so a
+//! scaler keyed by geometry alone would hand two devices presenting at one
+//! window size a single object to write each other's frames through.
+//!
 //! Unlike the pipelines in `blit.rs` / `clear_quad.rs` / `present.rs`, they are
 //! **not** leaked for the process: a resize walks through a new key per size
 //! the window rests at, and each one holds ~16 MiB of intermediates. The cache
-//! is bounded ([`MAX_CACHED_SCALERS`]) and evicts least-recently-used, with the
-//! release deferred to a command buffer that outlives the evicted scaler.
+//! is bounded per queue ([`MAX_CACHED_SCALERS`]) and evicts that queue's
+//! least-recently-used entry, with the release deferred to a command buffer of
+//! the same queue; a queue's scalers, live and evicted, are released in
+//! `DestroyCommandQueue`.
 
 use std::{
     collections::hash_map::Entry,
@@ -55,12 +62,17 @@ use rustc_hash::FxHashMap;
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
-/// Cache key: a scaler is bound to its exact geometry, formats and colour mode.
+/// Cache key: a scaler is bound to its queue, geometry, formats and colour mode.
 ///
-/// `MTLFXSpatialScaler` fixes all of these at creation, so a change in any of
-/// them needs a new instance rather than a mutation.
+/// `MTLFXSpatialScaler` fixes the geometry, the formats and the mode at
+/// creation, so a change in any of them needs a new instance rather than a
+/// mutation. The queue is the device identity every submit already carries,
+/// and it is in the key because the scaler is stateful across an encode: its
+/// colour and output textures are properties, so two devices sharing one
+/// object could each encode with the other's textures set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScalerKey {
+    queue: u64,
     input_width: u32,
     input_height: u32,
     output_width: u32,
@@ -70,7 +82,7 @@ struct ScalerKey {
     mode: MTLFXSpatialScalerColorProcessingMode,
 }
 
-/// Scaler geometries kept alive at once.
+/// Scaler geometries one queue keeps alive at once.
 ///
 /// A scaler is not a cheap thing to hold: measured on an M-series GPU, one at
 /// `1920x1200 → 2560x1600` costs **~16 MiB** of device memory for its
@@ -78,7 +90,9 @@ struct ScalerKey {
 /// the HDR float scratch), so this never evicts during a game. What it bounds
 /// is a *window being resized*, which walks through a new geometry for every
 /// size the user rests at: twelve of them in forty seconds of dragging,
-/// measured, which unbounded is ~190 MiB that never comes back.
+/// measured, which unbounded is ~190 MiB that never comes back. The bound is
+/// per queue because the thing it sizes is per device: a second device drags a
+/// window of its own, and its geometries must not evict the game's.
 const MAX_CACHED_SCALERS: usize = 8;
 
 /// Scaler cache, `None` once the device is known unsupported.
@@ -93,12 +107,13 @@ struct ScalerCache {
     scalers: FxHashMap<ScalerKey, ScalerEntry>,
     /// Monotonic lookup counter that orders [`ScalerEntry::last_used`].
     tick: u64,
-    /// Evicted scalers, awaiting a command buffer to outlive them.
+    /// Evicted scalers per queue, awaiting a command buffer to outlive them.
     ///
     /// Eviction cannot release: a scaler may still be referenced by a command
-    /// buffer the GPU has not finished. They wait here until [`encode`] has a
-    /// command buffer to hang the release off.
-    evicted: Vec<ScalerSlot>,
+    /// buffer the GPU has not finished. They wait under their queue until
+    /// [`encode`] has a command buffer *of that queue* to hang the release
+    /// off, which is the only ordering Metal offers.
+    evicted: FxHashMap<u64, Vec<ScalerSlot>>,
 }
 
 /// One cached scaler and its recency.
@@ -121,6 +136,10 @@ unsafe impl Send for ScalerSlot {}
 
 /// Encode a `MetalFX` spatial upscale of `src` into `dst`.
 ///
+/// `queue` is the queue `cmd_buf` was made on: it selects this device's own
+/// scaler, and it is the queue whose command buffers order the release of what
+/// this call evicts.
+///
 /// Returns `false` when `MetalFX` cannot serve this pair: an unsupported GPU
 /// or a scaler Metal declined to build. The caller then falls to the present
 /// shader's stretch, which serves any pair; never to the 1:1 blit, which
@@ -128,16 +147,32 @@ unsafe impl Send for ScalerSlot {}
 pub fn encode(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     device: &ProtocolObject<dyn MTLDevice>,
+    queue: MetalHandle<MTLCommandQueueKind>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> bool {
-    let Some(slot) = scaler_for(device, src, dst, mode) else {
+    let Some(key) = scaler_key(queue.raw(), src, dst, mode) else {
         return false;
     };
-    // SAFETY: `slot.0` came from `build_scaler` and is released only from a
-    // completion handler on a command buffer committed after this one, so the
-    // pointee outlives this borrow and the work encoded from it.
+    let Some(cache) = scaler_cache(device) else {
+        return false;
+    };
+    // The lock is held across the two property writes and the encode. The
+    // queue in the key already means no second device reaches this object; the
+    // lock is what keeps that from resting on how many threads one device
+    // encodes from, and it costs one uncontended acquire the lookup pays
+    // anyway.
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    let Some(slot) = scaler_in(&mut cache, device, key) else {
+        return false;
+    };
+    // SAFETY: `slot.0` came from `build_scaler`. It is released either from a
+    // completion handler on a command buffer of this queue committed after
+    // this one, or by `retire_scalers` after this queue's shutdown fence, so
+    // the pointee outlives this borrow and the work encoded from it.
     let scaler = unsafe { &*slot.0 };
 
     // SAFETY: objc2 typed binding; `src` is a live texture carrying the
@@ -149,31 +184,28 @@ pub fn encode(
     // SAFETY: objc2 typed binding; encoding opens no render pass of its own,
     // and the caller guarantees no encoder is currently open on `cmd_buf`.
     unsafe { scaler.encodeToCommandBuffer(cmd_buf) };
-    release_evicted_when_retired(cmd_buf);
+    let evicted = take_evicted(&mut cache, key.queue);
+    drop(cache);
+    release_when_retired(cmd_buf, evicted);
     true
 }
 
-/// Release evicted scalers once `cmd_buf` retires.
+/// Release `evicted` once `cmd_buf` retires.
 ///
 /// A scaler cannot be released at eviction: the GPU may still be running work
-/// encoded from it. Metal executes a queue's command buffers in commit order
-/// and mtld3d has one queue, so this buffer completing means every buffer that
-/// could reference an already-evicted scaler has completed too.
+/// encoded from it. Metal executes a queue's command buffers in commit order,
+/// and every slot here was evicted from the key of the queue `cmd_buf` belongs
+/// to, so this buffer completing means every buffer that could reference one
+/// of them has completed too. Another queue's evictions wait for a buffer of
+/// their own, or for [`retire_scalers`] when that queue goes away.
 ///
 /// The block owns the slots through a mutex so that a handler Metal somehow
 /// ran twice would find the list empty rather than over-release.
-fn release_evicted_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>) {
-    let Some(cache) = CACHE.get().and_then(Option::as_ref) else {
-        return;
-    };
-    let Ok(mut cache) = cache.lock() else {
-        return;
-    };
-    if cache.evicted.is_empty() {
+fn release_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, evicted: Vec<ScalerSlot>) {
+    if evicted.is_empty() {
         return;
     }
-    let evicted = Mutex::new(core::mem::take(&mut cache.evicted));
-    drop(cache);
+    let evicted = Mutex::new(evicted);
 
     let handler = RcBlock::new(
         move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -194,6 +226,11 @@ fn release_evicted_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>) 
     unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
 }
 
+/// Take the scalers `queue` has evicted and not yet released.
+fn take_evicted(cache: &mut ScalerCache, queue: u64) -> Vec<ScalerSlot> {
+    cache.evicted.remove(&queue).unwrap_or_default()
+}
+
 /// Whether [`encode`] would serve this pair, without encoding anything.
 ///
 /// The HDR present path has to tone-map into a scratch texture *before* the
@@ -201,24 +238,34 @@ fn release_evicted_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>) 
 /// the tone-mapped frame: the fallback tone-maps the back buffer again,
 /// straight to the drawable. Asking first keeps that fallback free.
 ///
-/// Builds and caches the scaler on the way, so the [`encode`] that follows a
-/// `true` answer is a hash lookup.
+/// Builds and caches `queue`'s scaler on the way, so the [`encode`] that
+/// follows a `true` answer is a hash lookup.
 pub fn can_scale(
     device: &ProtocolObject<dyn MTLDevice>,
+    queue: MetalHandle<MTLCommandQueueKind>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> bool {
-    scaler_for(device, src, dst, mode).is_some()
+    let Some(key) = scaler_key(queue.raw(), src, dst, mode) else {
+        return false;
+    };
+    let Some(cache) = scaler_cache(device) else {
+        return false;
+    };
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    scaler_in(&mut cache, device, key).is_some()
 }
 
-/// Look up, or build and cache, the scaler for this pair.
-fn scaler_for(
-    device: &ProtocolObject<dyn MTLDevice>,
+/// The key this pair scales under, or `None` when `MetalFX` cannot serve it.
+fn scaler_key(
+    queue: u64,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
-) -> Option<ScalerSlot> {
+) -> Option<ScalerKey> {
     let (in_w, in_h) = (src.width(), src.height());
     let (out_w, out_h) = (dst.width(), dst.height());
     // Defensive: the scaler only enlarges, and `render.scale` is capped at
@@ -239,9 +286,8 @@ fn scaler_for(
         );
         return None;
     }
-
-    let cache = CACHE.get_or_init(|| init_cache(device)).as_ref()?;
-    let key = ScalerKey {
+    Some(ScalerKey {
+        queue,
         input_width: truncate(in_w),
         input_height: truncate(in_h),
         output_width: truncate(out_w),
@@ -249,9 +295,20 @@ fn scaler_for(
         color_format: src.pixelFormat().0,
         output_format: dst.pixelFormat().0,
         mode,
-    };
+    })
+}
 
-    let mut cache = cache.lock().ok()?;
+/// The scaler cache, or `None` once this GPU is known to have no `MetalFX`.
+fn scaler_cache(device: &ProtocolObject<dyn MTLDevice>) -> Option<&'static Mutex<ScalerCache>> {
+    CACHE.get_or_init(|| init_cache(device)).as_ref()
+}
+
+/// Look up, or build and cache, the scaler for `key`.
+fn scaler_in(
+    cache: &mut ScalerCache,
+    device: &ProtocolObject<dyn MTLDevice>,
+    key: ScalerKey,
+) -> Option<ScalerSlot> {
     cache.tick += 1;
     let tick = cache.tick;
     if let Some(entry) = cache.scalers.get_mut(&key) {
@@ -262,8 +319,8 @@ fn scaler_for(
     // A miss builds, which is expensive enough that the settle gate in
     // `command.rs` keeps transient geometry from ever reaching here.
     let slot = build_scaler(device, &key)?;
-    if cache.scalers.len() >= MAX_CACHED_SCALERS {
-        evict_least_recently_used(&mut cache);
+    if live_for_queue(cache, key.queue) >= MAX_CACHED_SCALERS {
+        evict_least_recently_used(cache, key.queue);
     }
     cache.scalers.insert(
         key,
@@ -272,18 +329,29 @@ fn scaler_for(
             last_used: tick,
         },
     );
-    drop(cache);
     Some(slot)
 }
 
-/// Move the least recently used scaler to the eviction list.
+/// Scalers `queue` currently holds.
+fn live_for_queue(cache: &ScalerCache, queue: u64) -> usize {
+    cache
+        .scalers
+        .keys()
+        .filter(|key| key.queue == queue)
+        .count()
+}
+
+/// Move `queue`'s least recently used scaler to its eviction list.
 ///
 /// Least-recently-used rather than oldest-built: the geometry present is
 /// currently running is refreshed on every lookup, so it is never the victim.
-fn evict_least_recently_used(cache: &mut ScalerCache) {
+/// The victim comes from the evicting queue's own entries: the bound is per
+/// queue, and another device's scalers are not this one's to retire.
+fn evict_least_recently_used(cache: &mut ScalerCache, queue: u64) {
     let Some(victim) = cache
         .scalers
         .iter()
+        .filter(|(key, _)| key.queue == queue)
         .min_by_key(|(_, entry)| entry.last_used)
         .map(|(key, _)| *key)
     else {
@@ -292,12 +360,12 @@ fn evict_least_recently_used(cache: &mut ScalerCache) {
     if let Some(entry) = cache.scalers.remove(&victim) {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
-            "present: more than {MAX_CACHED_SCALERS} MetalFX geometries in use, \
+            "present: more than {MAX_CACHED_SCALERS} MetalFX geometries in use on one device, \
              retiring the least recently used ({}x{} → {}x{})",
             victim.input_width, victim.input_height,
             victim.output_width, victim.output_height,
         );
-        cache.evicted.push(entry.slot);
+        cache.evicted.entry(queue).or_default().push(entry.slot);
     }
 }
 
@@ -319,7 +387,7 @@ pub fn is_supported(device_handle: MetalHandle<MTLDeviceKind>) -> bool {
 /// handle. They ask this before allocating anything a declined scaler would
 /// orphan.
 pub fn is_available(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    CACHE.get_or_init(|| init_cache(device)).is_some()
+    scaler_cache(device).is_some()
 }
 
 /// One-shot `supportsDevice` probe, latched for the process.
@@ -337,7 +405,7 @@ fn init_cache(device: &ProtocolObject<dyn MTLDevice>) -> Option<Mutex<ScalerCach
     Some(Mutex::new(ScalerCache {
         scalers: FxHashMap::default(),
         tick: 0,
-        evicted: Vec::new(),
+        evicted: FxHashMap::default(),
     }))
 }
 
@@ -386,9 +454,57 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
         "present: MetalFX spatial upscale {}x{} → {}x{}",
         key.input_width, key.input_height, key.output_width, key.output_height,
     );
-    // Leaked for process lifetime, same as the present/blit pipelines: the
-    // Metal device and queue outlive every frame and are themselves leaked.
+    // The cache owns this retain from here: an eviction hands it to a
+    // completion handler on a command buffer of the same queue, and
+    // `retire_scalers` releases whatever the queue still holds.
     Some(ScalerSlot(Retained::into_raw(scaler)))
+}
+
+/// Release every scaler `queue` was served.
+///
+/// Called from `DestroyCommandQueue` after the queue's shutdown fence, so no
+/// command buffer of the queue can still encode from one of them, and so an
+/// eviction of its own is not left waiting for a command buffer that will
+/// never be committed. Entries of other queues stay. A cache that was never
+/// created has nothing to retire.
+pub fn retire_scalers(queue: MetalHandle<MTLCommandQueueKind>) {
+    let Some(cache) = CACHE.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let retired = {
+        let Ok(mut cache) = cache.lock() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "retire_scalers: the scaler cache lock is poisoned; the queue's scalers stay \
+                 allocated"
+            );
+            return;
+        };
+        take_queue_scalers(&mut cache, queue.raw())
+    };
+    for slot in retired {
+        // SAFETY: the pointer came from `Retained::into_raw` in
+        // `build_scaler` and `take_queue_scalers` removed it from the cache,
+        // so it is turned back into a `Retained` exactly once; the queue's
+        // shutdown fence has passed, so nothing on the GPU still reads it.
+        drop(unsafe { Retained::from_raw(slot.0) });
+    }
+}
+
+/// Remove `queue`'s scalers, live and evicted, returning their slots.
+///
+/// The map half of [`retire_scalers`], kept apart so a unit test can pin which
+/// entries a retire takes without a Metal object behind them.
+fn take_queue_scalers(cache: &mut ScalerCache, queue: u64) -> Vec<ScalerSlot> {
+    let mut retired = take_evicted(cache, queue);
+    cache.scalers.retain(|key, entry| {
+        if key.queue == queue {
+            retired.push(entry.slot);
+            return false;
+        }
+        true
+    });
+    retired
 }
 
 /// Identity of one scratch target: the queue it serves, and its geometry and format.
