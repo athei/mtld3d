@@ -246,6 +246,13 @@ DEBUG_STAGE  := $(CURDIR)/windows/target/bundle-debug
 BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
                         sed -n 's/^version = "\(.*\)"/v\1/p' windows/Cargo.toml)
 
+# The tag a release is cut at. Defaults to the one on HEAD, so a checkout of a
+# tag needs no argument; the release job passes the ref it was triggered by, and
+# a maintainer about to cut a release passes the tag they are about to create
+# (`make version-check TAG=v0.9.0`), which is the only way to check a bump
+# before the tag exists.
+TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
+
 # Target naming, two vocabularies with one rule each:
 #
 #   windows / unix   the two cargo workspaces, which are also the two
@@ -265,7 +272,7 @@ BUILD_ID     := $(shell git describe --tags --always 2>/dev/null || \
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle stage configure-test-prefix clean-isolated clean-isolated-all \
+	bundle version-check stage configure-test-prefix clean-isolated clean-isolated-all \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -411,6 +418,43 @@ install-unix-arm64: $(if $(STAGE),,unix-arm64)
 		fi ; \
 	done
 
+# The gate a release tag has to pass. Every shipped binary stamps `git describe`
+# (BUILD_ID above), so a tag that disagrees with the version the workspaces
+# carry ships DLLs naming a release nobody published, and nothing says so until
+# a user reports a version that does not exist. The locks are read alongside the
+# manifests because they record the version of every local crate: a bump that
+# refreshed one workspace's lock and not the other leaves the tree disagreeing
+# with itself.
+#
+# A local crate is one the lock gives no `source`. Clearing the name on that
+# line is what keeps a registry crate's own version out of the comparison, since
+# every package but ours has one.
+define LOCK_VERSIONS
+function chk() {
+    if (n != "" && v != "\"" w "\"") {
+        printf "version-check: %s records %s for %s, the manifest says \"%s\"\n", \
+            FILENAME, v, n, w
+        e = 1
+    }
+    n = ""; v = ""
+}
+/^name = /    { n = $$3 }
+/^version = / { v = $$3 }
+/^source = /  { n = "" }
+/^$$/         { chk() }
+END           { chk(); exit e }
+endef
+export LOCK_VERSIONS
+
+version-check:
+	test -n "$(TAG)" || { echo "version-check: HEAD carries no tag and none was given; pass the tag you are about to create, TAG=vX.Y.Z" >&2; exit 2; }
+	for ws in windows unix; do \
+		manifest=$$(sed -n 's/^version = "\(.*\)"/v\1/p' $$ws/Cargo.toml | head -1) ; \
+		test "$$manifest" = "$(TAG)" || { echo "version-check: $$ws/Cargo.toml says $$manifest, the tag says $(TAG)" >&2; exit 1; } ; \
+		awk -v w="$${manifest#v}" "$$LOCK_VERSIONS" $$ws/Cargo.lock >&2 || exit 1 ; \
+	done
+	echo "version-check: $(TAG) matches both workspaces"
+
 # Distribution bundle, serving both install routes (see INSTALL.md, which is
 # shipped inside): wine/ mirrors a Wine installation's lib/wine/ with every
 # PE builtin-marked (drop-in for a Wine tree the user owns), while native/
@@ -452,6 +496,19 @@ bundle: all
 	cp -c $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/INSTALL.md             $(BUNDLE_STAGE)/
 	cp -c $(CURDIR)/LICENSE                $(BUNDLE_STAGE)/
+	# The identity every binary stamps has to be this build's: a bundle
+	# assembled from a stale target dir is how a release ships DLLs naming the
+	# previous tag, and neither the version gate nor the archive itself can see
+	# that. A binary carries exactly one of these, so finding this one is
+	# enough. The two prefix markers are winebuild placeholders holding no code,
+	# so they carry no stamp and are not swept.
+	test -n "$(BUILD_ID)" || { echo "bundle: this build has no identity to check the binaries against" >&2; exit 1; }
+	for f in $(BUNDLE_STAGE)/wine/i386-windows/*.dll \
+	         $(BUNDLE_STAGE)/wine/x86_64-windows/*.dll \
+	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/mtld3d.so \
+	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so ; do \
+		LC_ALL=C grep -a -q -F "$(BUILD_ID)" $$f || { echo "bundle: $$f is not stamped $(BUILD_ID); it was built at another commit, rebuild it" >&2; exit 1; } ; \
+	done
 	tar -cJf $(BUNDLE_OUT) -C $(BUNDLE_STAGE) wine native prefix-markers mtld3d.conf INSTALL.md LICENSE
 	# The symbols for exactly these binaries, as a second archive. Laid out by
 	# arch alone, with no wine/native split: debug info has no install route, and
