@@ -30,14 +30,21 @@
 //! lies in a native image (a framework, libobjc, libsystem, Wine's own
 //! `.so`): `fault outside mtld3d.so:` with the signal number, the thread id
 //! and name, the PC as image plus offset and nearest symbol, then the return
-//! addresses into our own dylib found on the faulting stack. A fault there on
-//! a thread Wine does not own (ours, or a Metal completion thread) ends the
-//! process inside Wine's handler with nothing else said, and the game's log
-//! then has to name the image, the thread and our frames under it at least.
-//! Guest code and translated code resolve to no image and stay silent: those
-//! faults are Wine's ordinary work. The report is capped at a few per process
-//! and carries no signal name, since a fault Wine recovers
-//! must not read as a crash to anything that scans the log for one.
+//! addresses into our own dylib found on the faulting stack. Guest code and
+//! translated code resolve to no image and stay silent: those faults are
+//! Wine's ordinary work. The report is capped at a few per process and
+//! carries no signal name, since a fault Wine recovers must not read as a
+//! crash to anything that scans the log for one.
+//!
+//! Forwarding needs a thread Wine can serve. Wine's unix side keeps each
+//! thread's TEB in a pthread key and reads it as soon as a fault reaches
+//! `segv_handler`, so on a thread it did not create (the Cocoa main thread
+//! `winemac` runs its event loop on, or one of ours) the forward faults
+//! inside Wine, and the fault the report then names is that second one. The
+//! handler therefore asks Wine for the calling thread's TEB first, through
+//! the `NtCurrentTeb` its own code goes through, and a foreign fault on a
+//! thread without one is reported in full here and ends the process, so the
+//! report leads with the fault that caused it.
 //!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
@@ -85,6 +92,14 @@ static PREV: [PrevDisposition; 4] = [
     PrevDisposition::new(),
 ];
 
+/// Wine's `NtCurrentTeb`, resolved once so the handler can ask from a signal.
+///
+/// Zero when Wine's unix library is not in the process, which is every context
+/// but a Wine one, the unit tests among them. `dlsym` allocates and takes the
+/// loader's lock, so the lookup happens at install time and the handler only
+/// reads the atomic.
+static WINE_CURRENT_TEB: AtomicUsize = AtomicUsize::new(0);
+
 /// Index into [`PREV`] for a signal we handle, or `None` for anything else.
 const fn signal_slot(signo: c_int) -> Option<usize> {
     match signo {
@@ -111,6 +126,8 @@ pub fn install() {
         // concurrent reads/writes, which can't happen here.
         unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
     }
+
+    resolve_wine_current_teb();
 
     // Diagnostic escape hatch: with `MTLD3D_NO_CRASH_HANDLER=1` we do NOT
     // intercept SIGSEGV/SIGBUS, so Wine's own SEH machinery translates the
@@ -146,6 +163,55 @@ fn install_signal_handler(signo: libc::c_int) {
         PREV[slot].action.store(old.sa_sigaction, Ordering::Relaxed);
         PREV[slot].flags.store(old.sa_flags, Ordering::Relaxed);
     }
+}
+
+/// Resolve Wine's `NtCurrentTeb` into [`WINE_CURRENT_TEB`].
+///
+/// `ntdll.so` publishes it into the process's global symbol space, and the
+/// handle `dlopen` returns for a null path is how to reach it without naming a
+/// path of Wine's. That handle is kept rather than closed: it stands for the
+/// process itself, and the address has to stay resolvable for as long as the
+/// handler can run.
+fn resolve_wine_current_teb() {
+    // SAFETY: `dlopen` with a null path loads nothing; it hands back a handle
+    // for the symbol space the process already has.
+    let handle = unsafe { libc::dlopen(ptr::null(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: `handle` is the process handle just opened and the name is a
+    // NUL-terminated C string; `dlsym` answers null when nothing exports it.
+    let entry = unsafe { libc::dlsym(handle, c"NtCurrentTeb".as_ptr()) };
+    WINE_CURRENT_TEB.store(entry as usize, Ordering::Relaxed);
+}
+
+/// The calling thread's Wine TEB, or 0 when the thread has none.
+///
+/// Wine's unix side stores it in a pthread key and reaches it through
+/// `NtCurrentTeb`, which reads that key and nothing else, so a signal handler
+/// can afford to ask. Zero on every thread Wine did not create, and in every
+/// process where the symbol did not resolve.
+fn wine_teb() -> u64 {
+    let entry = WINE_CURRENT_TEB.load(Ordering::Relaxed);
+    if entry == 0 {
+        return 0;
+    }
+    // SAFETY: `entry` is the address `dlsym` resolved for Wine's
+    // `NtCurrentTeb`, which takes no argument and returns the calling thread's
+    // TEB pointer.
+    let current_teb: extern "C" fn() -> *mut c_void = unsafe { mem::transmute::<usize, _>(entry) };
+    current_teb() as usize as u64
+}
+
+/// Whether Wine's own handler can serve a fault taken on the calling thread.
+///
+/// A forward lands in `segv_handler`, which saves the faulting context, and
+/// the debug registers it saves live in the TEB: a thread without one faults
+/// there instead of having its fault translated. True when Wine's unix library
+/// is absent, where the previous disposition is not Wine's and there is
+/// nothing to guard against.
+fn wine_serves_this_thread() -> bool {
+    WINE_CURRENT_TEB.load(Ordering::Relaxed) == 0 || wine_teb() != 0
 }
 
 /// True when the faulting instruction is in our own `.so`.
@@ -208,9 +274,28 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // SIGABRT is not shared this way: an abort is always terminal, and its PC
     // is inside libsystem rather than our code, so it stays ours to report.
     if signo != libc::SIGABRT && !fault_is_ours(ctx) {
-        report_foreign_fault(signo, ctx);
-        forward_to_previous(signo, info, ctx);
-        return;
+        /// Says why a foreign fault ends here rather than going back.
+        const NO_TEB: &[u8] =
+            b"[mtld3d::unix] faulting thread has no Wine TEB: reporting here, not forwarding\n";
+
+        // Wine's handler reads the TEB of the thread it is serving. On a
+        // thread that has none it faults doing so, and its fault, not this
+        // one, is what a report would name. Report this one in full instead
+        // and end the process below.
+        let terminal = !wine_serves_this_thread();
+        report_foreign_fault(signo, ctx, terminal);
+        if !terminal {
+            forward_to_previous(signo, info, ctx);
+            return;
+        }
+        // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
+        unsafe {
+            let _ = libc::write(
+                crate::log_file::raw_fd(),
+                NO_TEB.as_ptr().cast::<c_void>(),
+                NO_TEB.len(),
+            );
+        }
     }
 
     // Bail on the first re-entry (a faulting register/stack read below would
@@ -403,7 +488,11 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 /// in pieces rather than one buffer, because an image path can be longer than
 /// the line buffer. Stops after [`FOREIGN_REPORT_LIMIT`] reports, since a game
 /// may probe with faults of its own and every one would cost the lookups.
-fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
+///
+/// `terminal` says the fault is not going back to anyone, so the cap does not
+/// apply to it and the stack pass is left to the fatal report that follows,
+/// which prints a superset of it.
+fn report_foreign_fault(signo: c_int, ctx: *mut c_void, terminal: bool) {
     /// How many faults outside our image get a report.
     const FOREIGN_REPORT_LIMIT: u32 = 4;
     static REPORTS: AtomicU32 = AtomicU32::new(0);
@@ -412,7 +501,7 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
     let Some(info) = dladdr_info(pc) else {
         return;
     };
-    if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
+    if REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT && !terminal {
         return;
     }
     let fd = crate::log_file::raw_fd();
@@ -486,7 +575,7 @@ fn report_foreign_fault(signo: c_int, ctx: *mut c_void) {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let sp = mcontext_u64(ctx, SP_OFFSET);
-        if sp != 0 {
+        if sp != 0 && !terminal {
             const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
             // SAFETY: write(2) is async-signal-safe; the descriptor is the log file's or fd 2.
             unsafe {
@@ -511,7 +600,10 @@ fn thread_id() -> u64 {
 /// Append the calling thread's name.
 ///
 /// `pthread_getname_np` only reads thread-local storage, which is
-/// signal-safe enough for a terminating handler.
+/// signal-safe enough for a terminating handler. A thread nobody named is
+/// named by what it is instead, because the one that matters here carries no
+/// name: the process's main thread is `AppKit`'s, and a fault under
+/// `winemac`'s Cocoa event loop lands on it.
 fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
     let mut name = [0u8; 64];
     // SAFETY: `pthread_self` is always safe to call; reads the current TLS.
@@ -525,6 +617,17 @@ fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
         );
     }
     let nlen = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    if nlen == 0 {
+        // SAFETY: `pthread_main_np` compares the calling thread against the
+        // process's first one and reads nothing else.
+        let label: &[u8] = if unsafe { libc::pthread_main_np() } == 0 {
+            b"unnamed"
+        } else {
+            b"cocoa main"
+        };
+        push(buf, pos, label);
+        return;
+    }
     push(buf, pos, &name[..nlen.min(96)]);
 }
 
