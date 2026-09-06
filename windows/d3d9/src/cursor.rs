@@ -1242,7 +1242,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
     // does: a device filters the messages its own window management sends.
     // Games answer `WM_SIZE` by calling `Reset`, which would recurse into
     // the transition that sent it.
-    if crate::fullscreen::driving_window() && msg != WM_DISPLAYCHANGE {
+    if crate::fullscreen::driving_window(hwnd) && msg != WM_DISPLAYCHANGE {
         return def_window_proc(hwnd, msg, wp, lp);
     }
 
@@ -1347,12 +1347,13 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // auto-resize so a windowed back buffer keeps matching the
         // client area the game sees.
         //
-        // Skipped while mtld3d is the one moving a window: a fullscreen
+        // Skipped while mtld3d is the one moving this window: a fullscreen
         // transition's own `SetWindowPos` bounces back here, and that
-        // path already resolved the back-buffer size. The latch is
-        // process-global because the bounce is delivered to whichever
-        // device is subclassed on the window, which need not be the
-        // device doing the move. A fullscreen device never follows the
+        // path already resolved the back-buffer size. The latch is keyed
+        // by the window because the bounce is delivered to whichever
+        // device is subclassed on it, which need not be the device doing
+        // the move, while a move of another device's window says nothing
+        // about this one. A fullscreen device never follows the
         // window: its logical size is the requested mode, and an external
         // shrink is answered by re-covering the monitor — deferred through
         // a posted message, because native leaves the app-set rect in
@@ -1363,7 +1364,7 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for
         // the lifetime of the subclass.
         let dev = unsafe { &mut *dev_ptr };
-        if new_width != 0 && new_height != 0 && !crate::fullscreen::driving_window() {
+        if new_width != 0 && new_height != 0 && !crate::fullscreen::driving_window(hwnd) {
             if dev.fullscreen_window().is_some() {
                 post_message(hwnd, WM_APP_REASSERT_FULLSCREEN, 0, lp);
             } else {
