@@ -7,17 +7,26 @@
 //! one thread to find its test, a hang is the test whose start line has no
 //! outcome, a binary that dies before any test fails whole, fail-fast stops
 //! after the first failure with the rest reported unrun, and a test that
-//! declares the code it ends its process with passes only on that code.
+//! declares the code it ends its process with passes only on that code,
+//! and a dead process keeps its whole stderr in a file the note names.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 use super::{Launcher, ProcessEnd, Report, TestResult, Verdict, run_binary};
-use crate::{libtest::Parser, run::ExitKind};
+use crate::{binary::keep_stderr, libtest::Parser, run::ExitKind};
+
+/// The pid every scripted process ends under, so a test knows the file's name.
+const PID: u32 = 4242;
 
 /// One scripted process: its stdout, stderr, and how it ends.
 struct Script {
     stdout: &'static str,
-    stderr: &'static str,
+    stderr: String,
     kind: ExitKind,
 }
 
@@ -26,14 +35,23 @@ struct Scripted {
     scripts: VecDeque<Script>,
     /// `(names, threads)` of every process launched.
     launched: Vec<(Option<Vec<String>>, u32)>,
+    /// A directory of this launcher's own, so tests running at once do not share one.
+    log_dir: PathBuf,
 }
 
 impl Scripted {
     fn new(tests: &[&'static str], scripts: Vec<Script>) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let log_dir = std::env::temp_dir().join(format!(
+            "mtld3d-e2e-attr-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         Self {
             tests: tests.to_vec(),
             scripts: scripts.into(),
             launched: Vec::new(),
+            log_dir,
         }
     }
 }
@@ -54,14 +72,19 @@ impl Launcher for Scripted {
             }
         }
         Ok(ProcessEnd {
+            pid: PID,
             kind: script.kind,
             stdout: script.stdout.to_owned(),
-            stderr: script.stderr.to_owned(),
+            stderr: script.stderr,
         })
     }
 
     fn list(&mut self) -> Result<Vec<String>, String> {
         Ok(self.tests.iter().map(|t| (*t).to_owned()).collect())
+    }
+
+    fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String> {
+        keep_stderr(&self.log_dir, "scripted", pid, stderr)
     }
 }
 
@@ -109,7 +132,7 @@ fn a_clean_run_costs_one_process_and_never_lists() {
         &["a::one", "a::two", "b::three"],
         vec![Script {
             stdout: "running 3 tests\ntest a::one ... ok\ntest a::two ... ignored\ntest b::three ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(0),
         }],
     );
@@ -133,12 +156,12 @@ fn a_panic_names_its_test_and_the_rest_run_again() {
         vec![
             Script {
                 stdout: "running 3 tests\ntest a::one ... ok\n",
-                stderr: "thread 'a::two' panicked at x.rs:1:1:\nassertion failed: it\n",
+                stderr: "thread 'a::two' panicked at x.rs:1:1:\nassertion failed: it\n".to_owned(),
                 kind: ExitKind::Code(101),
             },
             Script {
                 stdout: "running 1 test\ntest b::three ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
-                stderr: "",
+                stderr: String::new(),
                 kind: ExitKind::Code(0),
             },
         ],
@@ -166,12 +189,12 @@ fn an_unnamed_crash_under_threads_is_attributed_on_one_thread() {
         vec![
             Script {
                 stdout: "running 3 tests\ntest a::one ... ok\n",
-                stderr: "wine: Unhandled page fault\n",
+                stderr: "wine: Unhandled page fault\n".to_owned(),
                 kind: ExitKind::Code(5),
             },
             Script {
                 stdout: "running 2 tests\ntest a::two ... ok\ntest b::three ... ",
-                stderr: "wine: Unhandled page fault\n",
+                stderr: "wine: Unhandled page fault\n".to_owned(),
                 kind: ExitKind::Code(5),
             },
         ],
@@ -196,12 +219,12 @@ fn a_hang_is_the_test_whose_start_line_has_no_outcome() {
         vec![
             Script {
                 stdout: "running 2 tests\ntest a::one ... ",
-                stderr: "",
+                stderr: String::new(),
                 kind: ExitKind::TimedOut(Duration::from_secs(5)),
             },
             Script {
                 stdout: "running 1 test\ntest a::two ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
-                stderr: "",
+                stderr: String::new(),
                 kind: ExitKind::Code(0),
             },
         ],
@@ -219,12 +242,12 @@ fn a_binary_that_dies_before_any_test_fails_whole_without_a_retry_loop() {
         vec![
             Script {
                 stdout: "",
-                stderr: "wine: could not load d3d9.dll\n",
+                stderr: "wine: could not load d3d9.dll\n".to_owned(),
                 kind: ExitKind::Code(1),
             },
             Script {
                 stdout: "",
-                stderr: "wine: could not load d3d9.dll\n",
+                stderr: "wine: could not load d3d9.dll\n".to_owned(),
                 kind: ExitKind::Code(1),
             },
         ],
@@ -243,7 +266,7 @@ fn fail_fast_stops_after_the_first_failure_and_reports_the_rest_unrun() {
         &["a::one", "a::two", "b::three"],
         vec![Script {
             stdout: "running 3 tests\ntest a::one ... ",
-            stderr: "thread 'a::one' panicked at x.rs:1:1:\nno\n",
+            stderr: "thread 'a::one' panicked at x.rs:1:1:\nno\n".to_owned(),
             kind: ExitKind::Code(101),
         }],
     );
@@ -265,7 +288,7 @@ fn a_failure_libtest_survived_is_read_from_its_report() {
         &["a::one", "a::two"],
         vec![Script {
             stdout: "running 2 tests\ntest a::one ... FAILED\ntest a::two ... ok\n\nfailures:\n\n---- a::one stdout ----\nleft != right\n\n\nfailures:\n    a::one\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(101),
         }],
     );
@@ -284,7 +307,7 @@ fn a_selected_name_the_binary_does_not_know_is_a_failure() {
         &["a::one"],
         vec![Script {
             stdout: "running 1 test\ntest a::one ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.1s\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(0),
         }],
     );
@@ -304,7 +327,7 @@ fn an_unclean_exit_after_a_full_tally_costs_no_list_and_no_process() {
         &["a::one", "a::two"],
         vec![Script {
             stdout: "running 2 tests\ntest a::one ... ok\ntest a::two ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(3),
         }],
     );
@@ -326,7 +349,7 @@ fn a_declared_exit_code_the_process_ends_with_passes_its_test() {
         &["a::ends"],
         vec![Script {
             stdout: "running 1 test\ntest a::ends ... \n[e2e] test a::ends ends this process with exit code 42\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(42),
         }],
     );
@@ -344,7 +367,7 @@ fn a_declared_exit_code_the_process_misses_fails_its_test() {
         &["a::ends"],
         vec![Script {
             stdout: "running 1 test\ntest a::ends ... [e2e] test a::ends ends this process with exit code 42\n",
-            stderr: "",
+            stderr: String::new(),
             kind: ExitKind::Code(0),
         }],
     );
@@ -353,4 +376,34 @@ fn a_declared_exit_code_the_process_misses_fails_its_test() {
     assert_eq!(run.processes, 1);
     assert!(run.failed);
     assert_eq!(verdicts(&log.results), [("a::ends", "fail")]);
+}
+
+#[test]
+fn a_dead_process_keeps_its_whole_stderr_and_the_note_names_the_file() {
+    let chatter: String = (0..40)
+        .map(|i| format!("fixme:dbghelp:elf_search_auxv can't find symbol {i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let stderr = format!("IOSurfaceClientCreate failed\n{chatter}wine = 929;\n");
+    let mut launcher = Scripted::new(
+        &["a::one", "a::two"],
+        vec![Script {
+            stdout: "running 2 tests\ntest a::one ... ok\n",
+            stderr: stderr.clone(),
+            kind: ExitKind::Signal(11),
+        }],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 1, true, &mut log).unwrap();
+    assert_eq!(run.processes, 1);
+    let path = launcher.log_dir.join(format!("scripted-{PID}.stderr"));
+    let note = log.notes.first().expect("a note about the dead process");
+    assert!(note.contains(&path.display().to_string()), "{note}");
+    assert!(note.contains("IOSurfaceClientCreate failed"), "{note}");
+    assert!(note.contains("wine = 929;"), "{note}");
+    assert!(!note.contains("fixme:dbghelp"), "{note}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the kept stderr"),
+        stderr
+    );
 }

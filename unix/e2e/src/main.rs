@@ -46,7 +46,13 @@ fn real_main() -> Result<ExitCode, String> {
             println!("SKIP {name}:: (not run after a failure)");
             continue;
         }
-        let mut launcher = WineLauncher::new(&config.wine, exe, config.timeout, Box::new(|_| {}));
+        let mut launcher = WineLauncher::new(
+            &config.wine,
+            exe,
+            config.log_dir.as_deref(),
+            config.timeout,
+            Box::new(|_| {}),
+        );
         let selection = if config.filter.is_empty() {
             None
         } else {

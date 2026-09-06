@@ -584,13 +584,15 @@ stage: all
 # too; a test that probes a capability asks the device and asserts the answer
 # it gets, which is also what lets the suite run on real Intel hardware.
 #
-# LOG_DIR=<path> puts every test process's log file (and its GPU traces) in
-# one directory instead of beside each test binary, so a machine that is only
-# reachable through its artifacts (a CI runner) can hand the logs back. The
-# path is read on the PE side: an absolute Windows path (`Z:\...` for a unix
-# path under Wine). Ten files are kept per directory.
+# LOG_DIR=<absolute unix path> puts every test process's log file (and its GPU
+# traces) in one directory instead of beside each test binary, so a machine
+# that is only reachable through its artifacts (a CI runner) can hand the logs
+# back, which every CI end-to-end leg does. The layer reads the directory on
+# the PE side, where the unix root is drive Z, and the runner writes the whole
+# stderr of every process that died there beside those logs. Ten files of each
+# kind are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
-MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=$(LOG_DIR))
+MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
@@ -691,7 +693,7 @@ test-unit:
 # with the word. A filter that selects nothing passes.
 JOBS ?= 1
 TIMEOUT ?= 60
-E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE)$(INTEL),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)')
+E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(SCALE)$(INTEL),--no-fail-fast) $(if $(FILTER),--filter '$(FILTER)') $(if $(LOG_DIR),--log-dir '$(LOG_DIR)')
 
 # The test binaries of one PE arch, from cargo's own account of what it built:
 # `cargo test --no-run` prints one JSON message per artifact, and the test

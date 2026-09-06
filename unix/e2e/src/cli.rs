@@ -15,6 +15,8 @@ pub struct Config {
     pub fail_fast: bool,
     /// `--filter`: substrings a test id has to contain one of; empty = every test.
     pub filter: Vec<String>,
+    /// `--log-dir`: where a dead process's stderr is kept; `None` = beside the test binary.
+    pub log_dir: Option<PathBuf>,
     /// The test binaries, after `--`.
     pub exes: Vec<PathBuf>,
 }
@@ -22,9 +24,11 @@ pub struct Config {
 /// Parse CLI args (excluding `argv[0]`).
 ///
 /// Recognised: `--wine <path>`, `--jobs <N>`, `--timeout <secs>`,
-/// `--no-fail-fast`, `--filter <patterns>` (whitespace-separated), then
-/// `--` and the test binaries. `--wine` and at least one binary are
-/// mandatory; `--jobs` defaults to 1 and `--timeout` to 60 seconds.
+/// `--no-fail-fast`, `--filter <patterns>` (whitespace-separated),
+/// `--log-dir <path>`, then `--` and the test binaries. `--wine` and at
+/// least one binary are mandatory; `--jobs` defaults to 1, `--timeout` to
+/// 60 seconds, and the log directory to the one the layer writes its own
+/// per-process logs to, `mtld3d-logs` beside the test binary.
 ///
 /// # Errors
 ///
@@ -36,6 +40,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut timeout = Duration::from_mins(1);
     let mut fail_fast = true;
     let mut filter = Vec::new();
+    let mut log_dir: Option<PathBuf> = None;
     let mut exes = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -73,6 +78,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                     .ok_or_else(|| "--filter needs patterns".to_owned())?;
                 filter.extend(value.split_whitespace().map(str::to_owned));
             }
+            "--log-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--log-dir needs a path".to_owned())?;
+                log_dir = Some(PathBuf::from(value));
+            }
             "--" => {
                 exes.extend(args.by_ref().map(PathBuf::from));
             }
@@ -89,6 +100,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
         timeout,
         fail_fast,
         filter,
+        log_dir,
         exes,
     })
 }

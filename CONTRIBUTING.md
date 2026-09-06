@@ -82,6 +82,25 @@ summary on both architectures. mtld3d's log of each test process is a file,
 `<binary>-<pid>.log` under `mtld3d-logs` next to the test executable in
 `windows/target`, one per process, so one file carries the whole suite's log.
 
+A process that ends with tests unaccounted for leaves its whole stderr in the
+same directory as `<binary>-<pid>.stderr`, and every line the runner prints
+about that process names the file. What it prints inline is the last fifteen
+lines the process itself wrote: Wine's `fixme` lines and everything its
+`dbghelp` channel prints are left out, because dozens of them surround each
+backtrace and a raw tail rarely reaches back past them to the message that
+says what failed.
+
+In CI every end-to-end leg uploads both kinds of file as its
+`e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
+directory holds the ten newest of each, so a leg that restarted more than ten
+processes hands back its last ten. They are the layer's side of a red leg,
+which the job log lacks: when one image reads back black on test after test
+while its sibling legs are green, re-run the failed jobs first (`gh run rerun
+<run-id> --failed`, which lands on a fresh machine) and read the command
+buffer errors in the artifact's log, since a hosted runner's GPU can fail that
+way with no hang line in the job log and nothing else tells it from a
+regression.
+
 Two things are worth knowing when a test process looks wrong. `d3d9.dll`
 terminates the process from its `DLL_PROCESS_DETACH` once a device exists
 (it cannot survive the allocator's thread-local teardown on Wine's 1 MB
