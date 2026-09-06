@@ -7,10 +7,10 @@
 //! reaches `d3d9.dll` names itself here instead, and the runner reads the
 //! names it has no outcome line for as the set that was in flight.
 //!
-//! The name is the thread's, because libtest names every test thread after
-//! its test. The main thread is skipped: that is where libtest runs the
-//! tests when there is one thread, and there its own start line already
-//! names them. Once per thread, since a test may build more than one
+//! The name is the thread's, because libtest runs every test on a thread
+//! named after it, at any thread count. The main thread is skipped: libtest
+//! runs a test there only when it cannot spawn a thread, and then the name
+//! would be nobody's. Once per thread, since a test may build more than one
 //! interface and libtest gives each test a thread of its own.
 
 use std::{cell::Cell, thread};

@@ -10,7 +10,7 @@ of that one Wine process, each test with its own device and window;
 binaries because each needs a process of its own. The runner is `unix/e2e`, and the
 host-native `mtld3d-core`/`mtld3d-shared` unit tests run too.
 
-Two things follow from sharing a process. A test that needs a non-default
+Three things follow from sharing a process. A test that needs a non-default
 option asks for it on its own harness (`Harness::with_config`,
 `Harness::factory_only_with_config`, or `HarnessConfig::config_entries`):
 configuration resolves at each `Direct3DCreate9` and belongs to the
@@ -34,6 +34,15 @@ rasterized spaces instead of staying in one of them, `cursor.software` in
 the counting cases pin it false so they read the count rather than the
 permissive stub the fence reading of a FLUSH poll answers with, and one case
 pins it true for the stub itself.
+
+And a process that dies takes every test in flight with it, which libtest
+does not name: past one test thread it prints a test's name only once the
+test has finished. So a test names itself on stdout as it reaches the layer
+([`in_flight.rs`](src/in_flight.rs)), and the runner reports the names it has
+no outcome line for as the set that was running and runs only those again one
+at a time. A test that returns before it builds an interface names nothing,
+which is the right coverage: it never reached the code that could end the
+process.
 
 The whole suite also runs under every `intel.*` key at once with
 `make test INTEL=1`, the way it would on an Intel/AMD Mac, for a machine

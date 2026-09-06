@@ -13,7 +13,8 @@
 //! Two more pin what a death nothing on stderr accounts for still says: the
 //! note names the tests that had named themselves and not finished, and
 //! only those run again one at a time, and the layer's own log of the
-//! process is quoted with them.
+//! process is quoted with them and kept under a name the layer's retention
+//! does not match.
 
 use std::{
     collections::VecDeque,
@@ -24,13 +25,16 @@ use std::{
 
 use super::{Launcher, ProcessEnd, Report, TestResult, Verdict, run_binary};
 use crate::{
-    binary::{keep_stderr, layer_tail},
+    binary::{LayerLog, keep_layer_log, keep_stderr},
     libtest::Parser,
     run::ExitKind,
 };
 
 /// The pid every scripted process ends under, so a test knows the file's name.
 const PID: u32 = 4242;
+
+/// The stem the layer names a scripted process's log after: the binary's name and a hash.
+const STEM: &str = "scripted-0a1b2c3d";
 
 /// One scripted process: its stdout, stderr, the layer's log of it, and how it ends.
 struct Script {
@@ -102,12 +106,13 @@ impl Launcher for Scripted {
         keep_stderr(&self.log_dir, "scripted", pid, stderr)
     }
 
-    fn layer_log(&self, pid: u32) -> Result<(PathBuf, String), String> {
-        let path = self.log_dir.join(format!("scripted-{pid}.log"));
-        let log = self
-            .layer
-            .ok_or_else(|| format!("{}: no such file", path.display()))?;
-        Ok((path, layer_tail(log)))
+    fn keep_layer_log(&self, pid: u32) -> Result<LayerLog, String> {
+        // The layer's file exists only when the script says it logged; the
+        // real move then runs on it, so the note names the file it made.
+        if let Some(log) = self.layer {
+            std::fs::write(self.log_dir.join(format!("{STEM}-{pid}.log")), log).expect("layer log");
+        }
+        keep_layer_log(&self.log_dir, STEM, "scripted", pid)
     }
 }
 
@@ -520,15 +525,19 @@ fn a_death_stderr_is_silent_about_is_quoted_from_the_layers_own_log() {
     assert!(note.contains("exit code 1"), "{note}");
     assert!(note.contains("[mtld3d::unix] FATAL: SIGSEGV"), "{note}");
     assert!(note.contains("thread=mtld3d-encoder"), "{note}");
+    assert!(!note.contains("ordinary line"), "{note}");
+    let kept = launcher.log_dir.join(format!("scripted-{PID}.layer-log"));
     assert!(
-        note.contains(
-            &launcher
-                .log_dir
-                .join(format!("scripted-{PID}.log"))
-                .display()
-                .to_string()
-        ),
+        note.contains(&format!("kept as {}", kept.display())),
         "{note}"
     );
-    assert!(!note.contains("ordinary line"), "{note}");
+    assert_eq!(
+        std::fs::read_to_string(&kept).expect("the kept layer log"),
+        "ordinary line\n[mtld3d::unix] FATAL: SIGSEGV fault=0x0\n[mtld3d::unix] thread=mtld3d-encoder\n",
+        "the whole log is kept, not the quoted part"
+    );
+    assert!(
+        !launcher.log_dir.join(format!("{STEM}-{PID}.log")).exists(),
+        "the layer's own file is gone, so its retention has nothing to remove"
+    );
 }

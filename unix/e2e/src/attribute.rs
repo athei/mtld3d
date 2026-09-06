@@ -20,7 +20,9 @@
 //!
 //! The layer keeps an account of its own. Its log file, not the process's
 //! stderr, is where its crash report goes, so a note about a process that
-//! ended unaccounted for quotes both.
+//! ended unaccounted for quotes both, and the runner moves that log out of
+//! the layer's retention (the newest ten logs, which the runs that follow
+//! soon exceed) so the account is still there when someone reads the note.
 //!
 //! One kind of test ends its process on purpose: it declares its name and
 //! the code it is about to exit with on stdout (see [`declared_exit`]), and
@@ -30,7 +32,7 @@
 use std::{collections::BTreeSet, mem, path::PathBuf};
 
 use crate::{
-    binary::stderr_tail,
+    binary::{LayerLog, stderr_tail},
     libtest::{self, Event, Outcome, Summary},
     run::ExitKind,
 };
@@ -92,17 +94,20 @@ pub trait Launcher {
     /// Returns the reason when the file cannot be written.
     fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String>;
 
-    /// The layer's own log of the process `pid`: the file, and its account of the end.
+    /// Keep the layer's own log of the process `pid`, and read its account of the end.
     ///
     /// The layer writes every line, its crash report included, into this
     /// file and never to the pipes the runner reads, so a process the layer
     /// ended says nothing on stderr and the file is the only account of it.
+    /// The layer also removes all but its newest ten logs as later processes
+    /// create theirs, so the file is moved to a name that retention never
+    /// matches, beside the kept stderr.
     ///
     /// # Errors
     ///
     /// Returns the reason when the file cannot be read, which for a process
     /// that logged nothing is that it was never created.
-    fn layer_log(&self, pid: u32) -> Result<(PathBuf, String), String>;
+    fn keep_layer_log(&self, pid: u32) -> Result<LayerLog, String>;
 }
 
 /// What became of one test.
@@ -287,7 +292,7 @@ pub fn run_binary(
                 in_flight.len(),
                 in_flight_line(&running),
                 stderr_tail(&end.stderr),
-                layer_log(launcher.layer_log(end.pid))
+                kept_layer_log(launcher.keep_layer_log(end.pid))
             ));
             let named = libtest::panicked_tests(&end.stderr)
                 .into_iter()
@@ -400,10 +405,22 @@ fn in_flight_line(running: &[String]) -> String {
     format!("in flight when it ended: {}\n", running.join(", "))
 }
 
-/// Where the layer's own log of a dead process is and what it says about the end.
-fn layer_log(read: Result<(PathBuf, String), String>) -> String {
-    match read {
-        Ok((path, tail)) => format!("the layer's own log is {}:\n{tail}", path.display()),
+/// Where the layer's own log of a dead process is kept and what it says about the end.
+fn kept_layer_log(kept: Result<LayerLog, String>) -> String {
+    match kept {
+        Ok(LayerLog {
+            path,
+            tail,
+            not_kept: None,
+        }) => format!("the layer's own log is kept as {}:\n{tail}", path.display()),
+        Ok(LayerLog {
+            path,
+            tail,
+            not_kept: Some(why),
+        }) => format!(
+            "the layer's own log is still {}, which its retention will remove ({why}):\n{tail}",
+            path.display()
+        ),
         Err(why) => format!("the layer wrote no log of it ({why})"),
     }
 }

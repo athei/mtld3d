@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use super::{FATAL_LINES, KEEP, WineLauncher, binary_name, keep_stderr, layer_tail, stderr_tail};
+use super::{
+    FATAL_LINES, KEEP, LAYER_LOG_EXT, WineLauncher, binary_name, keep_layer_log, keep_stderr,
+    layer_tail, stderr_tail,
+};
 use crate::attribute::Launcher as _;
 
 /// A fresh directory under the temp dir, named after the test using it.
@@ -83,11 +86,13 @@ fn the_whole_stderr_lands_in_a_file_the_report_can_name() {
 }
 
 #[test]
-fn the_kept_files_are_capped_and_never_touch_the_layers_logs() {
+fn the_kept_files_are_capped_per_kind_and_never_touch_the_layers_logs() {
     let dir = dir("capped");
     std::fs::write(dir.join("e2e-1.log"), "the layer's own").expect("log");
     for pid in 0..u32::try_from(KEEP).expect("small") + 5 {
         keep_stderr(&dir, "e2e", pid, "stderr").expect("kept");
+        std::fs::write(dir.join(format!("e2e-abcd-{pid}.log")), "dead").expect("layer log");
+        keep_layer_log(&dir, "e2e-abcd", "e2e", pid).expect("kept");
     }
     let kept = |ext: &str| {
         std::fs::read_dir(&dir)
@@ -97,7 +102,8 @@ fn the_kept_files_are_capped_and_never_touch_the_layers_logs() {
             .count()
     };
     assert_eq!(kept("stderr"), KEEP);
-    assert_eq!(kept("log"), 1);
+    assert_eq!(kept(LAYER_LOG_EXT), KEEP);
+    assert_eq!(kept("log"), 1, "a live process's log is not the runner's");
 }
 
 #[test]
@@ -138,7 +144,7 @@ fn a_fatal_line_early_in_a_long_log_is_quoted_to_a_bound() {
 }
 
 #[test]
-fn the_layers_log_of_a_process_is_found_by_the_stem_and_the_pid() {
+fn the_layers_log_of_a_dead_process_is_moved_out_of_the_layers_retention() {
     let dir = dir("layer");
     let exe = Path::new("/t/deps/e2e-1030f4ab05278ecb.exe");
     let launcher = WineLauncher::new(
@@ -149,15 +155,36 @@ fn the_layers_log_of_a_process_is_found_by_the_stem_and_the_pid() {
         Box::new(|_| {}),
     );
     assert!(
-        launcher.layer_log(4242).is_err(),
+        launcher.keep_layer_log(4242).is_err(),
         "a process that logged nothing has no file"
     );
-    std::fs::write(
-        dir.join("e2e-1030f4ab05278ecb-4242.log"),
-        "[mtld3d::unix] FATAL: SIGSEGV fault=0x8\n",
-    )
-    .expect("layer log");
-    let (path, tail) = launcher.layer_log(4242).expect("the layer log");
-    assert_eq!(path, dir.join("e2e-1030f4ab05278ecb-4242.log"));
-    assert_eq!(tail, "[mtld3d::unix] FATAL: SIGSEGV fault=0x8");
+    let log = "ordinary line\n[mtld3d::unix] FATAL: SIGSEGV fault=0x8\n";
+    let own = dir.join("e2e-1030f4ab05278ecb-4242.log");
+    std::fs::write(&own, log).expect("layer log");
+    let kept = launcher.keep_layer_log(4242).expect("the layer log");
+    assert_eq!(kept.path, dir.join("e2e-4242.layer-log"));
+    assert_eq!(kept.tail, "[mtld3d::unix] FATAL: SIGSEGV fault=0x8");
+    assert!(kept.not_kept.is_none());
+    assert!(
+        kept.path.extension().is_none_or(|ext| ext != "log"),
+        "the layer prunes by the `log` extension"
+    );
+    assert!(!own.exists(), "moved, not copied");
+    assert_eq!(std::fs::read_to_string(&kept.path).expect("read"), log);
+}
+
+#[test]
+fn a_layer_log_that_cannot_be_moved_is_still_quoted_where_it_is() {
+    let dir = dir("unmovable");
+    let own = dir.join("e2e-abcd-7.log");
+    std::fs::write(&own, "[mtld3d::unix] FATAL: SIGBUS\n").expect("layer log");
+    // A directory in the way of the kept name makes the move fail.
+    std::fs::create_dir(dir.join("e2e-7.layer-log")).expect("blocker");
+    let kept = keep_layer_log(&dir, "e2e-abcd", "e2e", 7).expect("read");
+    assert_eq!(kept.path, own);
+    assert_eq!(kept.tail, "[mtld3d::unix] FATAL: SIGBUS");
+    assert!(
+        kept.not_kept
+            .is_some_and(|why| why.contains("e2e-7.layer-log"))
+    );
 }

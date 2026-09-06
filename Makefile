@@ -589,8 +589,9 @@ stage: all
 # that is only reachable through its artifacts (a CI runner) can hand the logs
 # back, which every CI end-to-end leg does. The layer reads the directory on
 # the PE side, where the unix root is drive Z, and the runner writes the whole
-# stderr of every process that died there beside those logs. Ten files of each
-# kind are kept per directory.
+# stderr of every process that died there beside those logs and moves the
+# layer's log of that process next to it, out of the layer's own retention.
+# Ten files of each kind are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
 MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
