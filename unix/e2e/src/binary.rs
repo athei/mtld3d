@@ -123,7 +123,7 @@ impl Launcher for WineLauncher {
             (self.on_line)(line);
             stdout.push_str(line);
             stdout.push('\n');
-            if let Some(event) = parser.line(line) {
+            for event in parser.line(line) {
                 on_event(event);
             }
         })?;
