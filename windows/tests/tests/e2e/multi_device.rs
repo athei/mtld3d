@@ -6,10 +6,12 @@
 //! paths that look a record up: interleaved presents past the interval at
 //! which the presenting thread asks the main thread for a display
 //! reconciliation, a teardown beside a device that keeps presenting, and an
-//! attach beside a device that is already live. The last test moves the two
-//! devices onto two threads, where each one's wait for its own frame meets
-//! the other's submissions in the unix-side registry of in-flight command
-//! buffers.
+//! attach beside a device that is already live. The last two tests move the
+//! devices onto two threads: one where each device's wait for its own frame
+//! meets the other's submissions in the unix-side registry of in-flight
+//! command buffers, and one where two devices under `render.scale` read back
+//! at once, so each device's readback resolve has to run in a scratch texture
+//! of its own.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -190,4 +192,115 @@ fn two_devices_on_two_threads_wait_for_their_own_frames() {
         GREEN,
         "second device after its thread stopped",
     );
+}
+
+/// What one worker's readbacks came to.
+struct ReadbackOutcome {
+    /// Readbacks that returned a colour other than the one cleared to.
+    mismatches: u32,
+    /// The first mismatch, as `(frame, pixel)`.
+    first_wrong: Option<(u32, u32)>,
+    /// The first failing call, by name, with its hr.
+    failed: Option<(&'static str, i32)>,
+}
+
+/// Clear, present and read back the centre pixel `frames` times.
+///
+/// Stops at the first failing call; a wrong colour is counted and the loop
+/// goes on, so the count says how often the collision landed.
+fn readback_own_colour(device: &SharedDevice<'_>, colour: u32, frames: u32) -> ReadbackOutcome {
+    let mut outcome = ReadbackOutcome {
+        mismatches: 0,
+        first_wrong: None,
+        failed: None,
+    };
+    for frame in 0..frames {
+        let hr = device.clear_target(colour);
+        if hr < 0 {
+            outcome.failed = Some(("Clear", hr));
+            return outcome;
+        }
+        let hr = device.present();
+        if hr < 0 {
+            outcome.failed = Some(("Present", hr));
+            return outcome;
+        }
+        match device.read_pixel(320, 240) {
+            Ok(pixel) if pixel == colour => {}
+            Ok(pixel) => {
+                outcome.mismatches += 1;
+                outcome.first_wrong.get_or_insert((frame, pixel));
+            }
+            Err(failed) => {
+                outcome.failed = Some(failed);
+                return outcome;
+            }
+        }
+    }
+    outcome
+}
+
+/// Two scaled devices on two threads each read back their own pixels.
+///
+/// Under `render.scale` a readback resolves the render-resolution back buffer
+/// up to its reported size in a scratch texture, then blits the scratch into
+/// the caller's memory, both on the device's own queue. Two devices at one
+/// size and format asked for the scratch at once, and Metal orders command
+/// buffers within a queue only, so the other device's resolve could land
+/// between this device's resolve and its blit: each read the other's frame.
+/// The scratch is keyed by the queue now, and this drives two devices of the
+/// same geometry through the readback at once. The collision is
+/// timing-dependent, so one run guards the keying rather than proving it.
+#[test]
+fn two_scaled_devices_on_two_threads_read_back_their_own_pixels() {
+    const FRAMES: u32 = 300;
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    let config = HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        config_entries: "render.scale=0.5",
+        ..HarnessConfig::default()
+    };
+    let first = Harness::create(&config);
+    let second = Harness::create(&config);
+    let first_shared = first.shared();
+    let second_shared = second.shared();
+    let finished = AtomicU32::new(0);
+
+    std::thread::scope(|scope| {
+        let first_worker = scope.spawn(|| {
+            let results = readback_own_colour(&first_shared, RED, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        let second_worker = scope.spawn(|| {
+            let results = readback_own_colour(&second_shared, GREEN, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        while finished.load(Ordering::Acquire) < 2 {
+            assert!(first.pump(), "WM_QUIT on the first window");
+            assert!(second.pump(), "WM_QUIT on the second window");
+            std::thread::yield_now();
+        }
+        for (name, worker) in [("first", first_worker), ("second", second_worker)] {
+            let outcome = worker.join().expect("a worker thread panicked");
+            assert!(
+                outcome.failed.is_none(),
+                "{name} device: {} failed on its worker thread: 0x{:08X}",
+                outcome.failed.map_or("", |(call, _)| call),
+                outcome.failed.map_or(0, |(_, hr)| hr)
+            );
+            assert_eq!(
+                outcome.mismatches,
+                0,
+                "{name} device read another device's pixels in {} of {FRAMES} readbacks, \
+                 first at frame {} reading 0x{:08X}",
+                outcome.mismatches,
+                outcome.first_wrong.map_or(0, |(frame, _)| frame),
+                outcome.first_wrong.map_or(0, |(_, pixel)| pixel)
+            );
+        }
+    });
 }
