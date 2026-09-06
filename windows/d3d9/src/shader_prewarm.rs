@@ -10,7 +10,7 @@
 
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -222,44 +222,23 @@ fn run(
 
 /// Replace `path` with a fresh file containing one Bundle chunk holding every entry.
 ///
-/// Written to `<path>.tmp` first and then atomically renamed over the
-/// original. Best-effort: any I/O failure logs once and leaves the original
-/// file untouched (worst case is a missed size optimisation; the next launch
-/// tries again).
+/// `shader_cache::replace_with_bundle` owns the write, which goes through a
+/// temporary and a rename. Best-effort: any I/O failure logs once and leaves
+/// the original file untouched (worst case is a missed size optimisation;
+/// the next launch tries again).
 fn rewrite_as_bundle(path: &Path, entries: &[CacheEntry]) {
-    let mut buf = Vec::new();
-    shader_cache::write_header(&mut buf);
-    shader_cache::write_bundle(&mut buf, entries);
-
-    let tmp: PathBuf = {
-        let mut p = path.as_os_str().to_owned();
-        p.push(".tmp");
-        PathBuf::from(p)
-    };
-    if let Err(e) = fs::write(&tmp, &buf) {
-        mtld3d_shared::log_once_warn!(
+    match shader_cache::replace_with_bundle(path, entries) {
+        Ok(len) => info!(
             target: LOG_TARGET,
-            "shader_cache: compaction write to {} failed → leaving original: {e}",
-            tmp.display()
-        );
-        return;
-    }
-    if let Err(e) = fs::rename(&tmp, path) {
-        mtld3d_shared::log_once_warn!(
+            "shader_cache: compacted {} entries into one Bundle ({len} bytes)",
+            entries.len()
+        ),
+        Err(e) => mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "shader_cache: compaction rename {} → {} failed → leaving original: {e}",
-            tmp.display(),
+            "shader_cache: compaction of {} failed → leaving original: {e}",
             path.display()
-        );
-        let _ = fs::remove_file(&tmp);
-        return;
+        ),
     }
-    info!(
-        target: LOG_TARGET,
-        "shader_cache: compacted {} entries into one Bundle ({} bytes)",
-        entries.len(),
-        buf.len()
-    );
 }
 
 const fn stage_for_kind(kind: CachedKind) -> StageTag {

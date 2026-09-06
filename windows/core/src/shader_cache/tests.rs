@@ -1,9 +1,11 @@
 //! Unit tests for the on-disk shader-cache binary format.
 //!
 //! Hand-built files cover the round trips, the damage paths (torn tail, flipped chunk-header
-//! bit, scrambled zstd frame, unknown chunk kind), duplicate keys and a header-only file. Every
-//! one of those but the scrambled-frame case pins the `needs_compaction` verdict the pre-warm
-//! rewrite keys off. Further tests cover header validation, `CachedKind` mapping and
+//! bit, scrambled zstd frame, unknown chunk kind, stray file header), duplicate keys and a
+//! header-only file. Every one of those but the scrambled-frame case pins the
+//! `needs_compaction` verdict the pre-warm rewrite keys off. The file-level tests write real
+//! files under the system temp root and pin that many writers reaching a cold cache together
+//! still produce one header. Further tests cover header validation, `CachedKind` mapping and
 //! `ff_key_hash` stability.
 
 use super::*;
@@ -23,6 +25,37 @@ fn write_file(entries_per_chunk: &[Vec<CacheEntry>], bundle_last: bool) -> Vec<u
         }
     }
     buf
+}
+
+/// Count the occurrences of the file magic in `bytes`.
+///
+/// A file carrying its header once has exactly one; a duplicate creation
+/// leaves a second run of the magic further in.
+fn magic_count(bytes: &[u8]) -> usize {
+    bytes
+        .windows(SHADER_CACHE_MAGIC.len())
+        .filter(|w| **w == SHADER_CACHE_MAGIC)
+        .count()
+}
+
+/// An empty directory under the system temp root, unique to this process and this call.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "mtld3d-shader-cache-{tag}-{}-{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Append one record to the cache file at `path`, creating the file when absent.
+fn append_one(path: &std::path::Path, entry: &CacheEntry) {
+    let mut file = open_for_append(path).expect("open cache file");
+    let mut buf = Vec::new();
+    write_record(&mut buf, entry);
+    std::io::Write::write_all(&mut file, &buf).expect("append record");
 }
 
 fn sample_entries() -> Vec<CacheEntry> {
@@ -305,4 +338,91 @@ fn ff_key_hash_is_stable() {
     let a = (1u32, 2u32, 3u32);
     let b = (1u32, 2u32, 3u32);
     assert_eq!(ff_key_hash(&a), ff_key_hash(&b));
+}
+
+#[test]
+fn stray_file_header_mid_file_is_skipped() {
+    let entries = sample_entries();
+    let mut buf = Vec::new();
+    write_header(&mut buf);
+    write_record(&mut buf, &entries[0]);
+    // A second creation's header, landing where a chunk header belongs.
+    write_header(&mut buf);
+    write_record(&mut buf, &entries[1]);
+    let (read, needs_compaction) = read_records(&buf);
+    assert_eq!(read, vec![entries[0].clone(), entries[1].clone()]);
+    // The stray header is a reason to rewrite the file dense.
+    assert!(needs_compaction);
+}
+
+#[test]
+fn open_for_append_writes_one_header_across_writers() {
+    let dir = scratch_dir("append");
+    let path = dir.join("mtld3d_shaders.bin");
+    let entries = sample_entries();
+    for entry in &entries {
+        append_one(&path, entry);
+    }
+    let bytes = std::fs::read(&path).expect("read cache file");
+    assert_eq!(magic_count(&bytes), 1);
+    assert_eq!(read_header(&bytes), Ok(SHADER_CACHE_SCHEMA_VERSION));
+    let (read, _) = read_records(&bytes);
+    assert_eq!(read, entries);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn concurrent_open_for_append_writes_one_header() {
+    const WRITERS: usize = 8;
+
+    let dir = scratch_dir("race");
+    let path = dir.join("mtld3d_shaders.bin");
+    // Every writer reaches the cold cache in the same instant, which is what a
+    // set of devices whose first miss-compiles coincide does.
+    let start = std::sync::Barrier::new(WRITERS);
+    std::thread::scope(|scope| {
+        for key in 0..WRITERS {
+            let path = path.as_path();
+            let start = &start;
+            scope.spawn(move || {
+                let key = u64::try_from(key).expect("writer index fits u64");
+                start.wait();
+                append_one(
+                    path,
+                    &CacheEntry {
+                        kind: CachedKind::Sm2Ps,
+                        key,
+                        msl: format!("fragment float4 ps{key}() {{ return float4({key}); }}"),
+                    },
+                );
+            });
+        }
+    });
+    let bytes = std::fs::read(&path).expect("read cache file");
+    assert_eq!(magic_count(&bytes), 1);
+    assert_eq!(read_header(&bytes), Ok(SHADER_CACHE_SCHEMA_VERSION));
+    let (read, _) = read_records(&bytes);
+    assert_eq!(read.len(), WRITERS);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn replace_with_bundle_renames_one_dense_file_into_place() {
+    let dir = scratch_dir("bundle");
+    let path = dir.join("mtld3d_shaders.bin");
+    let entries = sample_entries();
+    for entry in &entries {
+        append_one(&path, entry);
+    }
+    let len = replace_with_bundle(&path, &entries).expect("replace with bundle");
+    let bytes = std::fs::read(&path).expect("read cache file");
+    assert_eq!(bytes.len(), len);
+    assert_eq!(magic_count(&bytes), 1);
+    let (read, needs_compaction) = read_records(&bytes);
+    assert_eq!(read, entries);
+    assert!(!needs_compaction);
+    // The temporary is renamed rather than left beside the cache file.
+    let leftovers = std::fs::read_dir(&dir).expect("list scratch dir").count();
+    assert_eq!(leftovers, 1);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
