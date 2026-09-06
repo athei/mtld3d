@@ -38,3 +38,4 @@ mod texture_stages;
 mod textures;
 mod transforms_ff;
 mod vertex_decl;
+mod window_lifecycle;
