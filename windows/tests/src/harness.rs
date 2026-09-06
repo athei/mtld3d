@@ -143,6 +143,17 @@ pub struct DrawIndexedUpParams {
     pub index_format: u32,
 }
 
+/// The suite-wide `MTLD3D_CONFIG`, read under the shared environment lock.
+///
+/// `None` when the variable is unset. The lock keeps a harness that is
+/// publishing entries of its own out of the read, so the value is always
+/// the suite-wide one, never a merged window in flight on another thread.
+#[must_use]
+pub fn config_var() -> Option<String> {
+    let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+    std::env::var(CONFIG_VAR).ok()
+}
+
 /// True when the suite rasterizes at the resolution D3D9 reports.
 ///
 /// `make test SCALE=<n>` puts `render.scale` in `MTLD3D_CONFIG` for every test
@@ -159,11 +170,7 @@ pub struct DrawIndexedUpParams {
 /// [`HarnessConfig::config_entries`] knows what it asked for.
 #[must_use]
 pub fn render_scale_is_identity() -> bool {
-    let config = {
-        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
-        std::env::var(CONFIG_VAR)
-    };
-    let Ok(config) = config else {
+    let Some(config) = config_var() else {
         return true;
     };
     let Some(value) = config
