@@ -16,7 +16,17 @@
 //! several unaccounted for is narrowed to the tests that had named
 //! themselves and not finished. Those run one at a time, where a start line
 //! names the culprit; the rest wait for a process of their own at the width
-//! the caller asked for, since nothing so far says they were involved.
+//! the caller asked for, since nothing so far says they were involved. The
+//! announcements are on stderr, where they cannot land inside a result
+//! line libtest is writing to stdout.
+//!
+//! A process that ends cleanly is still checked against libtest's own
+//! account. Its `test result:` line counts the results it printed, and a
+//! tally short of that count means a result never reached the runner
+//! whatever the reason. The tests with no outcome are then named, out of
+//! the selection or out of `--list`, and run again in a fresh process, so
+//! the run reports on every test it was asked for rather than on a smaller
+//! suite.
 //!
 //! The layer keeps an account of its own. Its log file, not the process's
 //! stderr, is where its crash report goes, so a note about a process that
@@ -47,11 +57,12 @@ const ENDS_PROCESS: &str = "[e2e] test ";
 /// What separates the test's name from its exit code in the marker.
 const ENDS_PROCESS_CODE: &str = " ends this process with exit code ";
 
-/// The stdout marker of a test that has started; what follows it is its name.
+/// The stderr marker of a test that has started; what follows it is its name.
 ///
 /// Printed by the test binary's shared harness on the thread libtest named
-/// after the test. Searched for rather than matched at the start, for the
-/// same reason as [`ENDS_PROCESS`].
+/// after the test, and on stderr so that it can never land inside the
+/// result line libtest is writing to stdout. Searched for rather than
+/// matched at the start, since Wine's own chatter shares the stream.
 const RUNNING: &str = "[e2e] running ";
 
 /// How a process of the binary ended, with everything it printed.
@@ -200,7 +211,8 @@ pub fn run_binary(
                 Event::Summary(summary) => round.summary = Some(summary),
             })?;
             let ran_something = !round.finished.is_empty();
-            let reported = round.finished.len();
+            let reported = u32::try_from(round.finished.len()).unwrap_or(u32::MAX);
+            let before = done.len();
             let declared = declared_exit(&end.stdout);
             let ends_itself = declared.is_some();
             if let Some((name, code)) = declared {
@@ -233,17 +245,41 @@ pub fn run_binary(
             }
 
             let clean = ends_itself || (end.kind == ExitKind::Code(0) && round.summary.is_some());
+            let counted = round.summary.as_ref().map_or(0, Summary::counted);
+            // libtest's own tally, when it got that far, says whether anything
+            // was still in flight without a `--list`.
+            let tallied = round.summary.is_some() && counted == reported;
+            // A test that ends its own process is its whole account; libtest
+            // never reaches its summary line, so there is nothing to check.
+            let accounted = ends_itself || tallied;
             let complete = remaining
                 .as_ref()
                 .is_none_or(|names| names.iter().all(|name| done.contains(name)));
-            if clean && complete {
+            if clean && accounted && complete {
                 break;
             }
             if clean {
-                // libtest ran to the end without these: they are not tests it knows.
-                for name in remaining.take().into_iter().flatten() {
-                    if done.insert(name.clone()) {
-                        run.failed = true;
+                // A clean end that does not add up: libtest printed results
+                // the runner never read, or ran to completion without a test
+                // it was given. Either way the names with no outcome are what
+                // the run still owes, and only naming them costs a `--list`.
+                let narrowed = remaining.is_some();
+                let asked = match remaining.take() {
+                    Some(names) => names,
+                    None => launcher.list()?,
+                };
+                let owed: Vec<String> = asked
+                    .into_iter()
+                    .filter(|name| !done.contains(name))
+                    .collect();
+                if owed.is_empty() {
+                    break;
+                }
+                if accounted {
+                    // libtest ran to the end without these: they are not tests it knows.
+                    run.failed = true;
+                    for name in owed {
+                        done.insert(name.clone());
                         report.result(TestResult {
                             name,
                             verdict: Verdict::Failed(
@@ -251,15 +287,38 @@ pub fn run_binary(
                             ),
                         });
                     }
+                    break;
                 }
-                break;
+                report.note(&format!(
+                    "libtest counted {counted} results and the runner read {reported}; \
+                     no outcome for: {}",
+                    owed.join(", ")
+                ));
+                if narrowed && done.len() == before {
+                    // This round was already the one that ran nothing but
+                    // these, and it reported none of them: another would end
+                    // the same way.
+                    run.failed = true;
+                    for name in owed {
+                        done.insert(name.clone());
+                        report.result(TestResult {
+                            name,
+                            verdict: Verdict::Failed(
+                                "libtest counted a result for this test that never reached the runner"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                    break;
+                }
+                report.note(&format!(
+                    "running the {} tests with no outcome in a fresh process",
+                    owed.len()
+                ));
+                remaining = Some(owed);
+                continue;
             }
             let reason = end.kind.describe();
-            // libtest's own tally, when it got that far, says whether anything
-            // was still in flight without a `--list`.
-            let tallied = round.summary.as_ref().is_some_and(|s| {
-                s.passed + s.failed + s.ignored == u32::try_from(reported).unwrap_or(u32::MAX)
-            });
             if tallied && complete {
                 report.note(&format!(
                 "the process ended with {reason} after reporting every test; nothing to run again"
@@ -282,7 +341,7 @@ pub fn run_binary(
             let kept = kept_stderr(launcher.keep_stderr(end.pid, &end.stderr));
             // The tests that had named themselves and never reported a result:
             // exactly what was running on the threads when the process ended.
-            let mut running: Vec<String> = announced(&end.stdout)
+            let mut running: Vec<String> = announced(&end.stderr)
                 .into_iter()
                 .filter(|name| in_flight.contains(name))
                 .collect();
@@ -388,9 +447,9 @@ pub fn run_binary(
     Ok(run)
 }
 
-/// The tests that named themselves on `stdout`, in the order they did.
-fn announced(stdout: &str) -> Vec<String> {
-    stdout
+/// The tests that named themselves on `stderr`, in the order they did.
+fn announced(stderr: &str) -> Vec<String> {
+    stderr
         .lines()
         .filter_map(|line| line.split_once(RUNNING))
         .map(|(_, name)| name.trim().to_owned())

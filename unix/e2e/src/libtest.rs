@@ -5,10 +5,15 @@
 //! libtest writes `test <name> ... ` before it runs the test and the outcome
 //! after, so a process that dies mid-test leaves the name of the test it was
 //! running as an unfinished line; with more threads every line is written on
-//! completion. The tests run with `--nocapture`, so a test's own prints can
-//! land between the two halves of a line; the parser treats a `test` line
-//! without an outcome as a start and a bare outcome line as the finish of
-//! the last started test.
+//! completion.
+//!
+//! Three writes make one result line: the name, the outcome word, and the
+//! newline. The tests run with `--nocapture`, so a print from a test thread
+//! can land between any two of them. The parser treats a `test` line without
+//! an outcome as a start, a bare outcome line as the finish of the last
+//! started test, and an outcome with text after it as the finish plus a line
+//! of its own, which is what a print between the outcome and its newline
+//! leaves behind.
 //!
 //! stderr carries the panic reports: the default hook writes
 //! `thread '<name>' panicked at ...`, and libtest names every test thread
@@ -48,6 +53,14 @@ pub struct Summary {
     pub filtered_out: u32,
 }
 
+impl Summary {
+    /// How many results libtest says it printed: everything but what the filter left out.
+    #[must_use]
+    pub const fn counted(&self) -> u32 {
+        self.passed + self.failed + self.ignored
+    }
+}
+
 /// Line-by-line reader of one process's stdout.
 #[derive(Default)]
 pub struct Parser {
@@ -56,36 +69,75 @@ pub struct Parser {
 }
 
 impl Parser {
-    /// The event `line` carries, if any.
-    pub fn line(&mut self, line: &str) -> Option<Event> {
+    /// The events `line` carries, in the order libtest wrote them.
+    ///
+    /// None or one for a line nothing interrupted; two where a print landed
+    /// between an outcome and its newline, since what follows the outcome is
+    /// read again as a line of its own.
+    pub fn line(&mut self, line: &str) -> Vec<Event> {
+        let mut events = Vec::new();
+        self.read(line, &mut events);
+        events
+    }
+
+    /// Push what `line` carries onto `events`, recursing into the text after an outcome.
+    ///
+    /// Each recursion drops at least the outcome word, so the line shrinks
+    /// and the recursion ends.
+    fn read(&mut self, line: &str, events: &mut Vec<Event>) {
         if let Some(counts) = line.strip_prefix("test result: ") {
-            return Some(Event::Summary(parse_summary(counts)));
+            events.push(Event::Summary(parse_summary(counts)));
+            return;
         }
         if let Some((name, tail)) = line
             .strip_prefix("test ")
             .and_then(|rest| rest.split_once(" ... "))
         {
             let name = name.to_owned();
-            if let Some(outcome) = parse_outcome(tail) {
-                self.pending = None;
-                return Some(Event::Finished { name, outcome });
-            }
-            self.pending = Some(name.clone());
-            return Some(Event::Started(name));
+            let Some((outcome, rest)) = parse_outcome(tail) else {
+                self.pending = Some(name.clone());
+                events.push(Event::Started(name));
+                return;
+            };
+            self.pending = None;
+            events.push(Event::Finished { name, outcome });
+            self.read(rest, events);
+            return;
         }
-        let outcome = parse_outcome(line.trim())?;
-        let name = self.pending.take()?;
-        Some(Event::Finished { name, outcome })
+        let Some((outcome, rest)) = parse_outcome(line.trim()) else {
+            return;
+        };
+        let Some(name) = self.pending.take() else {
+            return;
+        };
+        events.push(Event::Finished { name, outcome });
+        self.read(rest, events);
     }
 }
 
-fn parse_outcome(tail: &str) -> Option<Outcome> {
-    match tail.trim_end() {
-        "ok" => Some(Outcome::Ok),
-        "FAILED" => Some(Outcome::Failed),
-        tail if tail.starts_with("ignored") => Some(Outcome::Ignored),
-        _ => None,
+/// The outcome `tail` opens with, and whatever is left of the line after it.
+///
+/// libtest writes the outcome word and the newline after it as two writes,
+/// so a test thread's print can put its text right behind the word. The
+/// word ends where a character that cannot continue it does, which keeps a
+/// print that itself opens with one of the words from being read as it.
+/// `ignored` carries a free-text reason and nothing tells that reason from
+/// such a print, so nothing is left after it.
+fn parse_outcome(tail: &str) -> Option<(Outcome, &str)> {
+    if let Some(rest) = word_after("ok", tail) {
+        return Some((Outcome::Ok, rest));
     }
+    if let Some(rest) = word_after("FAILED", tail) {
+        return Some((Outcome::Failed, rest));
+    }
+    tail.starts_with("ignored")
+        .then_some((Outcome::Ignored, ""))
+}
+
+/// What follows `word` in `tail`, when `tail` opens with `word` as a whole word.
+fn word_after<'a>(word: &str, tail: &'a str) -> Option<&'a str> {
+    let rest = tail.strip_prefix(word)?;
+    (!rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')).then(|| rest.trim())
 }
 
 /// The counts out of `ok. 3 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; ...`.

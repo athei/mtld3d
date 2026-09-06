@@ -2,8 +2,8 @@
 //!
 //! The lines are what a test binary prints under Wine: the threaded and the
 //! single-threaded forms of a result, a start line a dying process leaves
-//! behind, a test's own output landing inside a line, the summary counts,
-//! and the panic report that names the failing test.
+//! behind, a test's own output landing inside a line and behind an outcome,
+//! the summary counts, and the panic report that names the failing test.
 
 use super::{
     Event, Outcome, Parser, Summary, failure_report, listed_tests, panic_report, panicked_test,
@@ -17,45 +17,53 @@ fn finished(name: &str, outcome: Outcome) -> Event {
     }
 }
 
+fn one(events: Vec<Event>) -> Option<Event> {
+    assert!(events.len() <= 1, "{events:?}");
+    events.into_iter().next()
+}
+
 #[test]
 fn a_whole_result_line_finishes_a_test() {
     let mut parser = Parser::default();
     assert_eq!(
-        parser.line("test textures::lock_a8r8g8b8 ... ok"),
+        one(parser.line("test textures::lock_a8r8g8b8 ... ok")),
         Some(finished("textures::lock_a8r8g8b8", Outcome::Ok))
     );
     assert_eq!(
-        parser.line("test device::reset ... FAILED"),
+        one(parser.line("test device::reset ... FAILED")),
         Some(finished("device::reset", Outcome::Failed))
     );
     assert_eq!(
-        parser.line("test msaa::resolve ... ignored, no 4x"),
+        one(parser.line("test msaa::resolve ... ignored, no 4x")),
         Some(finished("msaa::resolve", Outcome::Ignored))
     );
-    assert_eq!(parser.line("running 3 tests"), None);
-    assert_eq!(parser.line(""), None);
+    assert_eq!(one(parser.line("running 3 tests")), None);
+    assert_eq!(one(parser.line("")), None);
 }
 
 #[test]
 fn a_start_line_is_closed_by_the_next_bare_outcome() {
     let mut parser = Parser::default();
     assert_eq!(
-        parser.line("test draw::quad ... "),
+        one(parser.line("test draw::quad ... ")),
         Some(Event::Started("draw::quad".to_owned()))
     );
-    assert_eq!(parser.line("ok"), Some(finished("draw::quad", Outcome::Ok)));
-    assert_eq!(parser.line("ok"), None, "nothing pending any more");
+    assert_eq!(
+        one(parser.line("ok")),
+        Some(finished("draw::quad", Outcome::Ok))
+    );
+    assert_eq!(one(parser.line("ok")), None, "nothing pending any more");
 }
 
 #[test]
 fn a_print_inside_a_start_line_still_starts_the_test() {
     let mut parser = Parser::default();
     assert_eq!(
-        parser.line("test draw::quad ... device created"),
+        one(parser.line("test draw::quad ... device created")),
         Some(Event::Started("draw::quad".to_owned()))
     );
     assert_eq!(
-        parser.line("FAILED"),
+        one(parser.line("FAILED")),
         Some(finished("draw::quad", Outcome::Failed))
     );
 }
@@ -65,7 +73,7 @@ fn the_summary_counts_are_read() {
     let mut parser = Parser::default();
     let line = "test result: FAILED. 3 passed; 1 failed; 2 ignored; 0 measured; 5 filtered out; finished in 0.23s";
     assert_eq!(
-        parser.line(line),
+        one(parser.line(line)),
         Some(Event::Summary(Summary {
             passed: 3,
             failed: 1,
@@ -120,5 +128,48 @@ fn the_list_output_yields_the_names() {
     assert_eq!(
         listed_tests("a::b: test\nc: test\n\n2 tests, 0 benchmarks\n"),
         ["a::b", "c"]
+    );
+}
+
+/// A print landing between an outcome and its newline still yields the result.
+///
+/// libtest writes the outcome word and the newline after it separately, so
+/// with more than one test thread a print from another test lands between
+/// them and the two share a line. Reading that line as a start would lose
+/// the result the process did report.
+#[test]
+fn a_print_behind_an_outcome_does_not_lose_the_result() {
+    let mut parser = Parser::default();
+    assert_eq!(
+        parser.line("test clip_planes::state_block ... ok[e2e] running textures::lock"),
+        [finished("clip_planes::state_block", Outcome::Ok)]
+    );
+    assert_eq!(
+        one(parser.line("")),
+        None,
+        "the newline libtest wrote after the print is a line of its own"
+    );
+    assert_eq!(
+        parser.line("test device::reset ... FAILED[e2e] running msaa::resolve"),
+        [finished("device::reset", Outcome::Failed)]
+    );
+    assert_eq!(
+        parser.line("test draw::quad ... "),
+        [Event::Started("draw::quad".to_owned())]
+    );
+    assert_eq!(
+        parser.line("ok[e2e] running draw::tri"),
+        [finished("draw::quad", Outcome::Ok)],
+        "a bare outcome carries a print behind it too"
+    );
+}
+
+/// A word that only opens with an outcome is not one.
+#[test]
+fn a_print_that_opens_like_an_outcome_is_not_read_as_one() {
+    let mut parser = Parser::default();
+    assert_eq!(
+        parser.line("test draw::quad ... okay, device created"),
+        [Event::Started("draw::quad".to_owned())]
     );
 }

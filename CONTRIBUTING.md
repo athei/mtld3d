@@ -82,6 +82,15 @@ summary on both architectures. mtld3d's log of each test process is a file,
 `<binary>-<pid>.log` under `mtld3d-logs` next to the test executable in
 `windows/target`, one per process, so one file carries the whole suite's log.
 
+A process that ends cleanly is still checked against libtest's own account.
+Its `test result:` line counts the results it printed, and a runner tally
+short of that count means a result never arrived, whatever tore it off the
+pipe. The note is `libtest counted <n> results and the runner read <m>; no
+outcome for: <names>`, the named tests run again in a fresh process, and the
+summary's total therefore never falls short of the set the run was asked for.
+A second process that reports none of them again fails them rather than
+looping.
+
 A process that ends with tests unaccounted for leaves its whole stderr in the
 same directory as `<binary>-<pid>.stderr`, and every line the runner prints
 about that process names the file. What it prints inline is the last fifteen

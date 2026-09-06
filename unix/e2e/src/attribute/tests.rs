@@ -15,6 +15,11 @@
 //! only those run again one at a time, and the layer's own log of the
 //! process is quoted with them and kept under a name the layer's retention
 //! does not match.
+//!
+//! The last three pin the cross-check a clean end gets: a torn result line
+//! costs nothing because the parser reads it, a tally short of libtest's
+//! own count names the tests with no outcome and runs them again, and a
+//! second round that loses the same result fails it rather than looping.
 
 use std::{
     collections::VecDeque,
@@ -86,7 +91,7 @@ impl Launcher for Scripted {
         self.layer = script.layer;
         let mut parser = Parser::default();
         for line in script.stdout.lines() {
-            if let Some(event) = parser.line(line) {
+            for event in parser.line(line) {
                 on_event(event);
             }
         }
@@ -458,8 +463,9 @@ fn the_note_names_what_was_in_flight_and_only_those_run_one_at_a_time() {
         &["a::one", "a::two", "a::three", "a::four"],
         vec![
             Script {
-                stdout: "running 4 tests\n[e2e] running a::one\n[e2e] running a::two\n[e2e] running a::three\ntest a::one ... ok\n",
-                stderr: String::new(),
+                stdout: "running 4 tests\ntest a::one ... ok\n",
+                stderr: "[e2e] running a::one\n[e2e] running a::two\n[e2e] running a::three\n"
+                    .to_owned(),
                 layer: None,
                 kind: ExitKind::Code(1),
             },
@@ -504,8 +510,8 @@ fn a_death_stderr_is_silent_about_is_quoted_from_the_layers_own_log() {
         &["a::one", "a::two"],
         vec![
             Script {
-                stdout: "running 2 tests\n[e2e] running a::one\n[e2e] running a::two\n",
-                stderr: String::new(),
+                stdout: "running 2 tests\n",
+                stderr: "[e2e] running a::one\n[e2e] running a::two\n".to_owned(),
                 layer: Some(
                     "ordinary line\n[mtld3d::unix] FATAL: SIGSEGV fault=0x0\n[mtld3d::unix] thread=mtld3d-encoder\n",
                 ),
@@ -539,5 +545,107 @@ fn a_death_stderr_is_silent_about_is_quoted_from_the_layers_own_log() {
     assert!(
         !launcher.log_dir.join(format!("{STEM}-{PID}.log")).exists(),
         "the layer's own file is gone, so its retention has nothing to remove"
+    );
+}
+
+/// A result and an announcement sharing a line still count as a result.
+///
+/// The tally is complete, so nothing is noted and no second process runs.
+#[test]
+fn a_torn_result_line_costs_no_note_and_no_process() {
+    let mut launcher = Scripted::new(
+        &["a::one", "a::two"],
+        vec![Script {
+            stdout: "running 2 tests\ntest a::one ... ok[e2e] running a::two\n\ntest a::two ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+            stderr: String::new(),
+            layer: None,
+            kind: ExitKind::Code(0),
+        }],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 4, true, &mut log).unwrap();
+    assert_eq!(run.processes, 1);
+    assert!(!run.failed);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a::one", "pass"), ("a::two", "pass")]
+    );
+    assert!(log.notes.is_empty(), "{:?}", log.notes);
+}
+
+/// A tally short of libtest's own count names what has no outcome and runs it again.
+#[test]
+fn a_tally_short_of_the_summary_is_noted_and_run_again() {
+    let mut launcher = Scripted::new(
+        &["a::one", "a::two", "a::three"],
+        vec![
+            Script {
+                stdout: "running 3 tests\ntest a::one ... ok\ntest a::three ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "running 1 test\ntest a::two ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 4, true, &mut log).unwrap();
+    assert_eq!(run.processes, 2);
+    assert!(!run.failed);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a::one", "pass"), ("a::three", "pass"), ("a::two", "pass")],
+        "every test the binary lists is reported on"
+    );
+    assert!(
+        log.notes[0].contains("libtest counted 3 results and the runner read 2"),
+        "{:?}",
+        log.notes
+    );
+    assert!(
+        log.notes[0].contains("no outcome for: a::two"),
+        "{:?}",
+        log.notes
+    );
+    assert_eq!(
+        launcher.launched[1],
+        (Some(vec!["a::two".to_owned()]), 4),
+        "only the test with no outcome runs again"
+    );
+}
+
+/// A second round that loses the same result fails the test instead of looping.
+#[test]
+fn a_result_lost_twice_fails_its_test() {
+    let short = Script {
+        stdout: "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+        stderr: String::new(),
+        layer: None,
+        kind: ExitKind::Code(0),
+    };
+    let mut launcher = Scripted::new(
+        &["a::one"],
+        vec![
+            short,
+            Script {
+                stdout: "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 1, false, &mut log).unwrap();
+    assert_eq!(run.processes, 2, "one round to lose it, one to say so");
+    assert!(run.failed);
+    assert_eq!(verdicts(&log.results), [("a::one", "fail")]);
+    assert!(
+        matches!(&log.results[0].verdict, Verdict::Failed(r) if r.contains("never reached the runner"))
     );
 }
