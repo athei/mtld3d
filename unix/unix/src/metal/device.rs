@@ -213,6 +213,10 @@ pub fn destroy_command_queue(
         fence.commit();
         fence.waitUntilCompleted();
     }
+    // The queue's scratch targets (readback resolve, HDR present) go after
+    // the fence, which is what proves no command buffer of this queue still
+    // touches them, and before the queue itself.
+    super::upscale::retire_scratch(queue_handle);
 
     // SAFETY: PE side has flushed the GPU and is dropping its only
     // copy of each handle, so the canonical retain transferred at creation

@@ -41,7 +41,7 @@ use block2::RcBlock;
 use mtld3d_shared::{
     MetalHandle,
     mtl::PixelFormat,
-    mtl_handle::{MTLDeviceKind, MTLTextureKind},
+    mtl_handle::{MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -391,24 +391,37 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     Some(ScalerSlot(Retained::into_raw(scaler)))
 }
 
-/// Cache key for a scratch target: one texture per size and format.
+/// Identity of one scratch target: the queue it serves, and its geometry and format.
+///
+/// The queue is the device: every readback and every submit already carries
+/// its device's `MTLCommandQueue` handle, and Metal orders command buffers
+/// within one queue only. Two devices at one size and format asked for a
+/// scratch keyed by geometry alone got one texture, so one device's resolve
+/// could land between the other's resolve and its blit on the other queue,
+/// and each read the other's frame (#445). With the queue in the key each
+/// device resolves in a texture of its own.
 ///
 /// Two callers share the cache: the readback resolve wants a `BGRA8Unorm`
 /// target at the reported back-buffer size, the HDR present path wants an
-/// `Rgba16Float` one at render size — so the format is what tells their
+/// `Rgba16Float` one at render size, so the format is what tells their
 /// entries apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScratchKey {
+    queue: u64,
     width: u32,
     height: u32,
     format: PixelFormat,
 }
 
-/// Process-lifetime cache of scratch targets, by raw texture handle.
+/// Cache of scratch targets by raw texture handle, one set per queue.
 ///
 /// Stores the wire handle rather than a `Retained` so the map is trivially
 /// `Send`; each use re-borrows through `IntoRetained`, which bumps the refcount
-/// and leaves the cache's own retain live.
+/// and leaves the cache's own retain live. A queue's entries live until
+/// [`retire_scratch`] takes them out in `DestroyCommandQueue`: without that a
+/// device recreated at the same size would leak one scratch per lifetime, and
+/// a queue address the allocator hands out again would find a dead device's
+/// scratch under its key.
 static SCRATCH: OnceLock<Mutex<FxHashMap<ScratchKey, u64>>> = OnceLock::new();
 
 /// Get, or create and cache, a `Private` scratch texture of this size and format.
@@ -421,11 +434,13 @@ static SCRATCH: OnceLock<Mutex<FxHashMap<ScratchKey, u64>>> = OnceLock::new();
 /// missing scratch means for its path.
 pub fn scratch_target(
     device: &ProtocolObject<dyn MTLDevice>,
+    queue: MetalHandle<MTLCommandQueueKind>,
     width: u32,
     height: u32,
     format: PixelFormat,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     let key = ScratchKey {
+        queue: queue.raw(),
         width,
         height,
         format,
@@ -444,6 +459,47 @@ pub fn scratch_target(
     // SAFETY: the handle came from `create_upscale_target`, which adopted the
     // texture's canonical retain; the cache holds it for process lifetime.
     unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()
+}
+
+/// Release every scratch target `queue` was served.
+///
+/// Called from `DestroyCommandQueue` after the queue's shutdown fence, so no
+/// command buffer of the queue can still read or write them. Entries of other
+/// queues stay. A cache that was never created has nothing to retire.
+pub fn retire_scratch(queue: MetalHandle<MTLCommandQueueKind>) {
+    let Some(cache) = SCRATCH.get() else {
+        return;
+    };
+    let retired = {
+        let Ok(mut scratch) = cache.lock() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "retire_scratch: the scratch cache lock is poisoned; the queue's scratch \
+                 targets stay allocated"
+            );
+            return;
+        };
+        take_queue_entries(&mut scratch, queue.raw())
+    };
+    for handle in retired {
+        super::texture::destroy_texture(handle);
+    }
+}
+
+/// Remove the entries keyed by `queue` from `scratch`, returning their handles.
+///
+/// The map half of [`retire_scratch`], kept apart so a unit test can pin
+/// which entries a retire takes without a Metal object behind them.
+fn take_queue_entries(scratch: &mut FxHashMap<ScratchKey, u64>, queue: u64) -> Vec<u64> {
+    let mut retired = Vec::new();
+    scratch.retain(|key, handle| {
+        if key.queue == queue {
+            retired.push(*handle);
+            return false;
+        }
+        true
+    });
+    retired
 }
 
 /// Narrow a Metal texture dimension to the `u32` the cache key stores.

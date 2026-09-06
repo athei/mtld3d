@@ -537,6 +537,7 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
                 match route {
                     PresentRoute::Upscale => encode_hdr_present_upscaled(
                         &cmd_buf,
+                        params.queue_handle,
                         &present_texture,
                         &drawable_texture,
                         current,
@@ -1066,6 +1067,7 @@ fn clear_texture(
 /// consume.
 fn encode_hdr_present_upscaled(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
@@ -1073,8 +1075,16 @@ fn encode_hdr_present_upscaled(
     let device = cmd_buf.device();
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
     let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
+    // The scratch is this queue's alone: another device presenting at the
+    // same render size tone-maps into its own.
     let scratch = if super::upscale::is_available(&device) {
-        super::upscale::scratch_target(&device, width, height, PixelFormat::Rgba16Float)
+        super::upscale::scratch_target(
+            &device,
+            queue_handle,
+            width,
+            height,
+            PixelFormat::Rgba16Float,
+        )
     } else {
         None
     };
@@ -2855,6 +2865,7 @@ pub struct BlitArgs {
 /// end of the texture.
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
     device: &ProtocolObject<dyn MTLDevice>,
     texture: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
@@ -2871,7 +2882,15 @@ fn resolve_readback_source(
     if tex_w == out_w as usize && tex_h == out_h as usize {
         return None;
     }
-    let resolved = encode_readback_resolve(cmd_buf, device, texture, (level, slice), out_w, out_h);
+    let resolved = encode_readback_resolve(
+        cmd_buf,
+        queue_handle,
+        device,
+        texture,
+        (level, slice),
+        out_w,
+        out_h,
+    );
     if resolved.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -2906,6 +2925,7 @@ fn resolve_readback_source(
 /// `src` directly.
 fn encode_readback_resolve(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
     device: &ProtocolObject<dyn MTLDevice>,
     src: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
@@ -2929,7 +2949,11 @@ fn encode_readback_resolve(
         );
         return None;
     }
-    let Some(target) = super::upscale::scratch_target(device, out_w, out_h, format) else {
+    // The scratch is this queue's alone. The resolve and the caller's blit
+    // are ordered on this queue only, so a shared scratch would let another
+    // device's resolve land between them.
+    let Some(target) = super::upscale::scratch_target(device, queue_handle, out_w, out_h, format)
+    else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "readback resolve target {out_w}x{out_h} {format:?} could not be created; readback \
@@ -3068,6 +3092,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // the default scale and this is skipped.
     let source = resolve_readback_source(
         &cmd_buf,
+        queue_handle,
         &device,
         &texture,
         (mip_level, slice),
