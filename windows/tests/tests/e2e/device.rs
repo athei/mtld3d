@@ -6,8 +6,8 @@
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, assert_pixel_eq, create_window, destroy_window, enumerate_display_sizes,
-    window_rect,
+    WS_VISIBLE, assert_pixel_eq, config_var, create_window, destroy_window,
+    enumerate_display_sizes, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -2284,11 +2284,13 @@ fn a_second_device_renders_after_the_first_is_destroyed() {
 fn a_harness_with_its_own_configuration_leaves_the_environment_alone() {
     // The entries a harness carries are resolved by its own `Direct3DCreate9`
     // and never stay in `MTLD3D_CONFIG`, where every later interface in the
-    // process would read them.
-    let before = std::env::var("MTLD3D_CONFIG").ok();
+    // process would read them. Both reads go through the shared lock, so a
+    // window another test holds open on its own thread cannot be mistaken
+    // for a leak.
+    let before = config_var();
     let own = Harness::factory_only_with_config("caps.dfFormats=false");
     assert_eq!(
-        std::env::var("MTLD3D_CONFIG").ok(),
+        config_var(),
         before,
         "the variable is back before the constructor returns"
     );
