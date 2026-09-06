@@ -38,6 +38,9 @@ const ILL_SELFTEST_ENV: &str = "MTLD3D_CRASH_ILL_SELFTEST";
 /// Set in the re-executed child so its foreign fault has no TEB behind it.
 const NO_TEB_SELFTEST_ENV: &str = "MTLD3D_CRASH_NO_TEB_SELFTEST";
 
+/// Set in a child that scans across a protected stack boundary.
+const STACK_SELFTEST_ENV: &str = "MTLD3D_CRASH_STACK_SELFTEST";
+
 /// The byte a stand-in TEB pointer points at; only its address is ever used.
 static FAKE_TEB: u8 = 0;
 
@@ -309,4 +312,141 @@ fn illegal_instruction_in_our_code_is_fatal() {
     let report = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{report}");
     assert!(report.contains("FATAL: SIGILL"), "{report}");
+}
+
+#[test]
+fn native_stack_scan_stops_at_unreadable_memory() {
+    check_stack_boundaries(
+        "crash::tests::native_stack_scan_stops_at_unreadable_memory",
+        |sp| super::our_frames_on_stack(sp, 16),
+    );
+}
+
+#[test]
+fn stack_words_preserve_unaligned_values() {
+    let bytes = [
+        0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+    ];
+    let sp = bytes.as_ptr() as usize as u64 + 1;
+    assert_eq!(
+        super::stack_word::<4>(sp, 0),
+        Some([0x22, 0x33, 0x44, 0x55])
+    );
+    assert_eq!(
+        super::stack_word::<8>(sp, 1),
+        Some([0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd])
+    );
+    assert_eq!(super::stack_word::<8>(sp, usize::MAX), None);
+    assert_eq!(super::stack_word::<4>(u64::MAX - 1, 1), None);
+}
+
+#[test]
+fn unreadable_stack_does_not_prevent_signal_forwarding() {
+    check_stack_boundaries(
+        "crash::tests::unreadable_stack_does_not_prevent_signal_forwarding",
+        forward_with_stack,
+    );
+}
+
+/// A previous signal owner reached with the original signal ends the child successfully.
+extern "C" fn forwarded_signal(signo: libc::c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+    // SAFETY: ends only the regression-test child, without running exit hooks.
+    unsafe { libc::_exit(i32::from(signo != libc::SIGSEGV)) }
+}
+
+/// Run the real handler with a foreign PC and a stack that ends at a guard page.
+fn forward_with_stack(sp: u64) {
+    // SAFETY: all-zero sigaction is a valid starting value for initialization.
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_sigaction = forwarded_signal as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    // SAFETY: action contains a valid mask out-parameter.
+    assert_eq!(unsafe { libc::sigemptyset(&raw mut action.sa_mask) }, 0);
+    assert_eq!(
+        // SAFETY: installs a correctly typed handler in this child process only.
+        unsafe { libc::sigaction(libc::SIGSEGV, &raw const action, ptr::null_mut()) },
+        0
+    );
+    super::install();
+
+    // Model the kernel-owned context with live, aligned local storage. Only
+    // the register slots read by the handler need nonzero values.
+    let mut registers = [0u64; 40];
+    #[cfg(target_arch = "x86_64")]
+    let pc_slot = 144 / 8;
+    #[cfg(target_arch = "aarch64")]
+    let pc_slot = 272 / 8;
+    registers[pc_slot] = libc::strlen as *const () as usize as u64;
+    registers[super::SP_OFFSET / 8] = sp;
+    let mut context = [0u64; 7];
+    context[0x30 / 8] = registers.as_ptr() as usize as u64;
+    super::handler(libc::SIGSEGV, ptr::null_mut(), context.as_mut_ptr().cast());
+    unreachable!("the previous signal owner must terminate the child");
+}
+
+#[test]
+fn guest_stack_scan_stops_at_unreadable_memory() {
+    check_stack_boundaries(
+        "crash::tests::guest_stack_scan_stops_at_unreadable_memory",
+        super::scan_stack_for_our_frames,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn caller_stack_read_tolerates_unreadable_memory() {
+    check_stack_boundaries(
+        "crash::tests::caller_stack_read_tolerates_unreadable_memory",
+        |sp| assert_eq!(super::caller_pc(ptr::null_mut(), sp), 0),
+    );
+}
+
+/// Exercise stack readers in a child so an unsafe read fails one test only.
+///
+/// The first page is readable and zero-filled, the second is mapped with no
+/// access. Reads start just before the boundary, on it, and after unmapping
+/// both pages; overflowing addresses must also return without a signal.
+fn check_stack_boundaries(test: &str, scan: fn(u64)) {
+    if std::env::var_os(STACK_SELFTEST_ENV).is_some() {
+        // SAFETY: sysconf reads the process's constant page size.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .expect("positive page size");
+        // SAFETY: anonymous mapping with no fixed address or backing file.
+        let mapping = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let base = mapping as usize as u64;
+        let boundary = base + page as u64;
+        // SAFETY: the second page is inside the live mapping and page-aligned.
+        let protected = unsafe { libc::mprotect(boundary as *mut c_void, page, libc::PROT_NONE) };
+        assert_eq!(protected, 0);
+        scan(boundary - 8);
+        scan(boundary - 4);
+        scan(boundary - 2);
+        scan(boundary);
+        // SAFETY: releases the complete mapping created above, exactly once.
+        assert_eq!(unsafe { libc::munmap(mapping, page * 2) }, 0);
+        scan(base);
+        scan(0);
+        scan(u64::MAX - 3);
+        return;
+    }
+
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", test, "--nocapture"])
+        .env(STACK_SELFTEST_ENV, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}: {report}", out.status);
+    assert!(!report.contains("FATAL"), "{report}");
+    assert!(report.contains("stack read unavailable"), "{report}");
 }
