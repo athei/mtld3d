@@ -1110,14 +1110,10 @@ blend (`0xdf0020` for `0xff0000`) in both the declaration and the FVF form
 
 ### d3d9ex.c clusters
 
-### d3d9ex.c
-No sites.
-
-`Direct3DCreate9Ex` is exported and answers `D3DERR_NOTAVAILABLE`, so
-START_TEST resolves it and proceeds instead of taking the
+No sites. `Direct3DCreate9Ex` is exported and answers `D3DERR_NOTAVAILABLE`,
+so START_TEST resolves it and proceeds instead of taking the
 `win_skip("Failed to get address of Direct3DCreate9Ex")` that counted as a
-failure under Wine. Every test then fails to create its Ex device and skips,
-which is not a failure, so the suite reports none. D3D9Ex itself remains out
-of scope; only the entry point resolves. (The former site, 5184=expected, was
-that win_skip. Previously mis-attributed to test_scene, which never
-executes.)
+failure under Wine (formerly site 5184, classified expected). Every test then
+fails to create its Ex device and skips, which is not a failure, so the suite
+reports none. D3D9Ex itself remains out of scope; only the entry point
+resolves.

@@ -180,8 +180,8 @@ pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
 /// truthfully, where a missing one reads as a broken `d3d9.dll`.
 ///
 /// Nothing is created here, so unlike `Direct3DCreate9` this resolves no
-/// configuration and does not hold the logging thread. `ppD3D` is cleared so no
-/// caller reads an uninitialised pointer after a failed create.
+/// configuration and does not hold the logging thread. The out slot is cleared
+/// so no caller reads an uninitialised pointer after a failed create.
 #[unsafe(export_name = "Direct3DCreate9Ex")]
 pub extern "system" fn direct3d_create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
     mtld3d_shared::log_once_warn!(
