@@ -41,6 +41,14 @@ $(info ==> ISOLATED=1: Wine SDK, install dir and prefix under $(ISOLATED_ROOT))
 endif
 export WINE_SDK
 
+# The prefix the test legs boot, named unconditionally: ISOLATED=1 points it at
+# the clone above, otherwise it is the ambient `WINEPREFIX` or Wine's default.
+# `configure-test-prefix` serialises on a lock file inside it, so the legs that
+# share one prefix are exactly the legs that contend for it, and two checkouts
+# with their own clones never wait on each other.
+TEST_PREFIX      := $(or $(WINEPREFIX),$(HOME)/.wine)
+TEST_PREFIX_LOCK := $(TEST_PREFIX)/.mtld3d-configure.lock
+
 # The Wine tools this Makefile runs, named by absolute path out of the same
 # install we build against and install into. Not found on PATH, and NOT by
 # exporting one either: make execs a simple recipe line itself rather than
@@ -272,7 +280,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 # Wine install, never into a file named after the target.
 .PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
-	bundle version-check stage configure-test-prefix clean-isolated clean-isolated-all \
+	bundle version-check stage clean-isolated clean-isolated-all \
+	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	test test-unit test-e2e-i686 test-e2e-x86_64 \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -608,7 +617,51 @@ define WINE_REG_ADD
 out=$$($(WINE) reg add $(1) 2>&1) || { echo "wine reg add $(1) failed:" >&2; echo "$$out" >&2; exit 1; }
 endef
 
+# Reads one value back through the running wineserver, so the answer is the
+# session's own rather than what the prefix last flushed to disk. False for a
+# value that is absent, and for one that holds anything else. Wine's own
+# chatter goes to stderr and is dropped; `reg query` prints the value name, its
+# type and its data on one line, and ends that line the Windows way, so the
+# pattern has to allow the carriage return the data is followed by.
+# $(1) = the key, $(2) = the value name, $(3) = the data it must hold.
+define WINE_REG_IS
+$(WINE) reg query $(1) /v $(2) 2>/dev/null | grep -qE '^[[:space:]]*$(2)[[:space:]]+REG_[A-Z]+[[:space:]]+$(3)[[:space:]]*$$'
+endef
+
+# Pin the prefix's display state for the tests, once per prefix rather than
+# once per leg.
+#
+# Configuring ends the prefix's wineserver, so a leg that does it beside a
+# running leg takes down the server that leg's test processes are attached to,
+# and they end with their tests unaccounted for. Two guards make that
+# impossible. `lockf` holds an exclusive flock(2) on a file in the prefix for
+# the sub-make, waits for whoever holds it, and drops it when that sub-make
+# ends however it ends, so a leg killed mid-configure leaves no stale lock. And
+# the sub-make configures nothing when the prefix is already configured, which
+# it is from the first leg of a checkout on.
 configure-test-prefix:
+	mkdir -p $(TEST_PREFIX)
+	lockf -k $(TEST_PREFIX_LOCK) $(MAKE) configure-test-prefix-locked
+
+# Runs only while that lock is held. A prefix whose persistent wineserver is up
+# and whose three keys read back through it is configured, and there is nothing
+# to restart. `wineserver -k0` is the server probe: it sends signal 0 to
+# whatever holds the server's lock file, so it reports whether a server runs
+# without touching one and without blocking, which `-w` cannot do here since
+# the persistent server below never terminates on its own. The answer cannot go
+# stale between the probe and the decision: the lock is what a leg holds while
+# it ends and reboots a server, so nothing can be mid-boot here, and a probe
+# that finds no server also proves this prefix has no test process attached to
+# one.
+configure-test-prefix-locked:
+	if $(WINESERVER) -k0 >/dev/null 2>&1 \
+		&& $(call WINE_REG_IS,'HKCU\Software\Wine\WineDbg',ShowCrashDialog,0x0) \
+		&& $(call WINE_REG_IS,'HKCU\Software\Wine\X11 Driver',EmulateModeset,Y) \
+		&& $(call WINE_REG_IS,'HKCU\Software\Wine\Mac Driver',RetinaMode,Y); \
+	then exit 0; fi; \
+	$(MAKE) configure-test-prefix-session
+
+configure-test-prefix-session:
 	# Keep automated tests non-interactive and independent of mutable prefix
 	# display settings. EmulateModeset prevents physical host mode changes;
 	# RetinaMode keeps Win32 monitor geometry in the same physical-pixel space
