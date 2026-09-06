@@ -843,7 +843,14 @@ pub fn attach_metal_layer(
     // SAFETY: `win_data` is non-null per the check above and points to a
     // wine-macdrv `struct macdrv_win_data` valid until `release_win_data`.
     let client_view = unsafe { (*win_data).client_cocoa_view };
-    let hint = view_display_caps(client_view);
+    // The window-data lock keeps the view alive across the dispatch. AppKit
+    // owns its window and screen relationships on the main thread.
+    let mut hint = None;
+    run_on_main_thread_sync(|| {
+        let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
+        hint = Some(view_display_caps(client_view, mtm));
+    });
+    let hint = hint.expect("synchronous display lookup completed");
     // SAFETY: `macdrv_view_create_metal_view` is the dlsym'd wine export;
     // `client_view` is the Cocoa view we just read from `win_data`.
     let view = unsafe {
@@ -1200,13 +1207,8 @@ impl MacdrvFuncs {
 /// The colorspace flows through to `configure_metal_layer_inner` and drives
 /// the layer's `colorspace` property — SDR uses it directly (identity = max
 /// vibrance per display), HDR classifies it into an extended-linear variant.
-fn view_display_caps(view: *mut c_void) -> DisplayHint {
-    use objc2::MainThreadMarker;
+fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> DisplayHint {
     use objc2_app_kit::{NSScreen, NSView};
-
-    // SAFETY: see `set_display_sync_enabled` for the off-main-thread
-    // NSScreen rationale — we read static display capabilities only.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
     // Prefer the NSScreen attached to the view's window so
     // multi-monitor setups with mixed scales pick the right display;
