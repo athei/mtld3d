@@ -216,11 +216,11 @@ jobs:
       - uses: ./.github/actions/runner
         with:
           wine-release: ${{ env.WINE_RELEASE }}
-      # One test at a time (`JOBS=1`): concurrent device creation aborts or
-      # hangs on the paravirtual GPU. The whole suite is reported rather than
-      # the first failure, and a test that is only slow there gets four
-      # minutes before it counts as a hang. A dispatch with `e2e_filter`
-      # narrows the run.
+      # One test at a time (`JOBS=1`, against the Makefile's default of four):
+      # concurrent device creation aborts or hangs on the paravirtual GPU
+      # these images have. The whole suite is reported rather than the first
+      # failure, and a test that is only slow there gets four minutes before
+      # it counts as a hang. A dispatch with `e2e_filter` narrows the run.
       # The layer's log of every test process, and the whole stderr of every
       # process that died with tests unaccounted for, go under the runner's
       # temp directory, where the step below picks them up, rather than beside

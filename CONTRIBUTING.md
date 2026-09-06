@@ -77,16 +77,17 @@ that touches `docs/CONVENTIONS.md`.
 
 The end-to-end suite is four test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
-`JOBS` threads of that process (one at a time by default; the Makefile says
-what a higher `JOBS` waits for). It prints one `PASS`/`FAIL`/`SKIP` line per test and a
-summary that counts every test, so the summary is the thing to read; a
-failure is fatal to the default run (`FAIL_FAST=0` reports the whole suite).
-One trap remains: a pipeline reports the last stage's status, so
-`make test | tee log` returns the exit code of `tee`. Capture with a plain
-redirect, `make test > out.log 2>&1`, and judge the run by the runner's
-summary on both architectures. mtld3d's log of each test process is a file,
-`<binary>-<pid>.log` under `mtld3d-logs` next to the test executable in
-`windows/target`, one per process, so one file carries the whole suite's log.
+`JOBS` threads of that process (four at a time by default; the Makefile says
+what that assumes of the Wine it runs under). It prints one
+`PASS`/`FAIL`/`SKIP` line per test and a summary that counts every test, so
+the summary is the thing to read; a failure is fatal to the default run
+(`FAIL_FAST=0` reports the whole suite). One trap remains: a pipeline
+reports the last stage's status, so `make test | tee log` returns the exit
+code of `tee`. Capture with a plain redirect, `make test > out.log 2>&1`,
+and judge the run by the runner's summary on both architectures. mtld3d's
+log of each test process is a file, `<binary>-<pid>.log` under `mtld3d-logs`
+next to the test executable in `windows/target`, one per process, so one
+file carries the whole suite's log.
 
 A process that ends cleanly is still checked against libtest's own account.
 Its `test result:` line counts the results it printed, and a runner tally
@@ -301,9 +302,9 @@ where a real Intel/AMD Mac's driver does not. On an Apple-family machine the
 forced answers (`make test INTEL=1`, `make conformance-intel`) are the way to
 run the Intel paths without the hardware.
 
-The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`),
-because parallel device creation aborts on a runner. A flake there is not
-fixed by re-enabling parallelism.
+The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`, against
+a local default of four), because parallel device creation aborts on a runner.
+A flake there is not fixed by re-enabling parallelism.
 
 ## What sends a pull request back
 
