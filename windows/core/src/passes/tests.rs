@@ -37,6 +37,11 @@ fn backbuffer_srgb() -> MetalHandle<MTLTextureKind> {
 
 fn fresh() -> PassState {
     let mut s = PassState::new();
+    reset_test_frame(&mut s);
+    s
+}
+
+fn reset_test_frame(s: &mut PassState) {
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
         backbuffer_srgb: backbuffer_srgb(),
@@ -51,7 +56,6 @@ fn fresh() -> PassState {
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
     });
-    s
 }
 
 /// A frame rasterizing the back buffer at half the reported resolution.
@@ -3467,8 +3471,14 @@ fn rule_e_merges_a_clear_only_pass_into_the_same_target_set() {
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert_eq!(s.passes().len(), 3);
+    let original = command_allocations(s.passes());
     s.coalesce_clear_only_passes();
     assert_eq!(s.passes().len(), 2, "clear-only pass folded");
+    assert_eq!(command_allocations(s.passes()), original[1..]);
+    assert_eq!(s.command_vec_pool.len(), 1);
+    assert_eq!(s.command_vec_pool[0].as_ptr(), original[0].0);
+    assert_eq!(s.command_vec_pool[0].capacity(), original[0].1);
+    assert!(s.command_vec_pool[0].is_empty());
     let merged = &s.passes()[1];
     let clear = ColorLoad::Clear {
         r: 1,
@@ -4864,4 +4874,245 @@ fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
         matches!(s.passes()[2].color_load(), ColorLoad::Load),
         "the draw after the resolve loads what it wrote"
     );
+}
+
+fn uneven_command_frame(s: &mut PassState) {
+    for pass in 0..37 {
+        for _ in 0..(65 << (pass % 6)) {
+            s.emit_command(dummy_draw());
+        }
+        s.end_current_pass("test");
+    }
+}
+
+fn command_allocations(passes: &[Pass]) -> Vec<(*const Command, usize)> {
+    passes
+        .iter()
+        .map(|p| (p.commands.as_ptr(), p.commands.capacity()))
+        .collect()
+}
+
+#[test]
+fn command_pool_reuses_37_uneven_passes_on_reset() {
+    let mut s = fresh();
+    uneven_command_frame(&mut s);
+    let allocations = command_allocations(s.passes());
+    let capacity = PassState::cmd_vec_capacity_bytes(s.passes());
+    let warmup_copies = s.take_cmd_vec_realloc_bytes();
+    assert!(warmup_copies > 0);
+    for _ in 0..8 {
+        reset_test_frame(&mut s);
+        assert_eq!(s.command_vec_pool.len(), 37);
+        uneven_command_frame(&mut s);
+        assert_eq!(command_allocations(s.passes()), allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+        assert_eq!(PassState::cmd_vec_capacity_bytes(s.passes()), capacity);
+    }
+    println!(
+        "37 passes: retained={capacity} bytes, warmup growth copy estimate={warmup_copies} bytes, steady growth copy estimate=0, steady command-vector allocations=0"
+    );
+}
+
+#[test]
+fn command_pool_reuses_detached_passes_and_accounts_only_the_payload() {
+    let mut s = fresh();
+    uneven_command_frame(&mut s);
+    let mut payload = s.take_finished_passes();
+    let allocations = command_allocations(&payload);
+    let capacity = PassState::cmd_vec_capacity_bytes(&payload);
+    assert!(capacity > 0);
+    assert_eq!(PassState::cmd_vec_capacity_bytes(s.passes()), 0);
+    reset_test_frame(&mut s);
+    assert!(s.command_vec_pool.is_empty());
+    for _ in 0..8 {
+        let pass_capacity = payload.capacity();
+        s.recycle_passes(&mut payload);
+        assert_eq!(payload.capacity(), pass_capacity);
+        assert!(payload.is_empty());
+        uneven_command_frame(&mut s);
+        assert_eq!(command_allocations(s.passes()), allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+        payload = s.take_finished_passes();
+        assert_eq!(PassState::cmd_vec_capacity_bytes(&payload), capacity);
+        reset_test_frame(&mut s);
+    }
+}
+
+#[test]
+fn command_pool_keeps_two_outstanding_payloads_disjoint() {
+    let mut s = fresh();
+    uneven_command_frame(&mut s);
+    let mut first = s.take_finished_passes();
+    let first_allocations = command_allocations(&first);
+    reset_test_frame(&mut s);
+    uneven_command_frame(&mut s);
+    let mut second = s.take_finished_passes();
+    let second_allocations = command_allocations(&second);
+    reset_test_frame(&mut s);
+    uneven_command_frame(&mut s);
+    let third_allocations = command_allocations(s.passes());
+    assert_eq!(command_allocations(&first), first_allocations);
+    assert_eq!(command_allocations(&second), second_allocations);
+    for (left, right) in [
+        (&first_allocations, &second_allocations),
+        (&first_allocations, &third_allocations),
+        (&second_allocations, &third_allocations),
+    ] {
+        assert!(
+            left.iter()
+                .all(|(ptr, _)| right.iter().all(|(other, _)| ptr != other))
+        );
+    }
+    let mut third = s.take_finished_passes();
+    reset_test_frame(&mut s);
+    for _ in 0..8 {
+        s.recycle_passes(&mut first);
+        uneven_command_frame(&mut s);
+        assert_eq!(command_allocations(s.passes()), first_allocations);
+        assert_eq!(command_allocations(&second), second_allocations);
+        assert_eq!(command_allocations(&third), third_allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+        first = s.take_finished_passes();
+        reset_test_frame(&mut s);
+        s.recycle_passes(&mut second);
+        uneven_command_frame(&mut s);
+        assert_eq!(command_allocations(s.passes()), second_allocations);
+        assert_eq!(command_allocations(&first), first_allocations);
+        assert_eq!(command_allocations(&third), third_allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+        second = s.take_finished_passes();
+        reset_test_frame(&mut s);
+        s.recycle_passes(&mut third);
+        uneven_command_frame(&mut s);
+        assert_eq!(command_allocations(s.passes()), third_allocations);
+        assert_eq!(command_allocations(&first), first_allocations);
+        assert_eq!(command_allocations(&second), second_allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+        third = s.take_finished_passes();
+        reset_test_frame(&mut s);
+    }
+    let capacity = PassState::cmd_vec_capacity_bytes(&first)
+        + PassState::cmd_vec_capacity_bytes(&second)
+        + PassState::cmd_vec_capacity_bytes(&third);
+    s.recycle_passes(&mut first);
+    s.recycle_passes(&mut second);
+    s.recycle_passes(&mut third);
+    assert_eq!(s.command_vec_pool.len(), 111);
+    assert_eq!(
+        s.command_vec_pool
+            .iter()
+            .map(|v| v.capacity() as u64 * size_of::<Command>() as u64)
+            .sum::<u64>(),
+        capacity
+    );
+    println!(
+        "Two outstanding payloads plus a live 37-pass list: retained={capacity} bytes, steady growth copy estimate=0, steady command-vector allocations=0"
+    );
+}
+
+#[test]
+fn command_pool_retires_dead_clears_without_reordering_survivors() {
+    let mut s = fresh();
+    for _ in 0..6 {
+        s.ensure_pass_open();
+        s.end_current_pass("test");
+    }
+    s.passes[0].commands.push(dummy_draw());
+    s.passes[1].color_store = StoreAction::DontCare;
+    s.passes[1].depth_store = StoreAction::DontCare;
+    s.passes[2].leading_blits.push(dummy_blit());
+    s.passes[3].color_store = StoreAction::DontCare;
+    s.passes[3].depth_store = StoreAction::DontCare;
+    s.passes[4].color_store = StoreAction::Store;
+    s.passes[5].color_resolve_texture = tex(0x4000);
+    let original = command_allocations(s.passes());
+    s.cull_dead_clear_only_passes();
+    assert_eq!(
+        command_allocations(s.passes()),
+        [original[0], original[2], original[4], original[5]]
+    );
+    assert_eq!(s.command_vec_pool.len(), 2);
+    let pooled: Vec<_> = s
+        .command_vec_pool
+        .iter()
+        .map(|v| (v.as_ptr(), v.capacity()))
+        .collect();
+    assert!(pooled.contains(&original[1]));
+    assert!(pooled.contains(&original[3]));
+    assert!(s.command_vec_pool.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn command_pool_does_not_park_unallocated_blit_pass_vectors() {
+    let mut s = fresh();
+    s.ensure_pass_open();
+    s.end_current_pass("test");
+    let allocation = command_allocations(s.passes());
+    s.ensure_pass_open();
+    s.end_current_pass("test");
+    s.passes[1].commands = Vec::new();
+    s.passes[1].leading_blits.push(dummy_blit());
+    let mut payload = s.take_finished_passes();
+    s.recycle_passes(&mut payload);
+    assert_eq!(s.command_vec_pool.len(), 1);
+    reset_test_frame(&mut s);
+    s.ensure_pass_open();
+    assert_eq!(command_allocations(s.passes()), allocation);
+}
+
+fn mixed_command_frame(s: &mut PassState) {
+    for count in [65, 513, 129] {
+        for _ in 0..count {
+            s.emit_command(dummy_draw());
+        }
+        s.end_current_pass("test");
+    }
+    assert!(s.resolve_depth_texture(&DepthResolve {
+        source: depth(),
+        level: 0,
+        size: BB_SIZE,
+        destination: tex(0x4000),
+        filter: DepthResolveFilter::Sample0,
+        source_is_sampleable: true,
+    }));
+    for target in [tex(0x5000), tex(0x6000)] {
+        s.push_upload_pass(
+            &UploadPassTarget {
+                texture: target,
+                subresource: (0, 0),
+                size: BB_SIZE,
+                format: BB_FORMAT,
+                rect: (0, 0, BB_SIZE.0, BB_SIZE.1),
+            },
+            &[dummy_draw()],
+        );
+    }
+    assert_eq!(s.passes.len(), 6);
+    assert_eq!(s.passes[0].color_texture, tex(0x5000));
+    assert_eq!(s.passes[1].color_texture, tex(0x6000));
+    assert!(s.passes[5].commands.is_empty());
+    assert_eq!(s.passes[5].depth_resolve_texture, tex(0x4000));
+}
+
+#[test]
+fn command_pool_converges_with_head_uploads_and_depth_resolves() {
+    let mut s = fresh();
+    // Uploads move to the front after borrowing vectors in recording order,
+    // so their capacity alignment can take more than one frame to converge.
+    for _ in 0..12 {
+        mixed_command_frame(&mut s);
+        reset_test_frame(&mut s);
+    }
+    mixed_command_frame(&mut s);
+    let mut allocations = command_allocations(s.passes());
+    allocations.sort_unstable();
+    for _ in 0..12 {
+        reset_test_frame(&mut s);
+        assert_eq!(s.command_vec_pool.len(), 6);
+        mixed_command_frame(&mut s);
+        let mut next = command_allocations(s.passes());
+        next.sort_unstable();
+        assert_eq!(next, allocations);
+        assert_eq!(s.take_cmd_vec_realloc_bytes(), 0);
+    }
 }
