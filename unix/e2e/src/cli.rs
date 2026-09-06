@@ -15,7 +15,7 @@ pub struct Config {
     pub fail_fast: bool,
     /// `--filter`: substrings a test id has to contain one of; empty = every test.
     pub filter: Vec<String>,
-    /// `--log-dir`: where a dead process's stderr is kept; `None` = beside the test binary.
+    /// `--log-dir`: where the files of a dead process go; `None` = beside the test binary.
     pub log_dir: Option<PathBuf>,
     /// The test binaries, after `--`.
     pub exes: Vec<PathBuf>,

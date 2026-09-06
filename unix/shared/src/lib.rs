@@ -3,6 +3,7 @@ use strum::{EnumCount, VariantArray};
 pub mod blit_geometry;
 mod commands;
 pub mod crumb;
+pub mod fatal;
 pub mod ffi_boundary;
 pub mod ftol;
 pub mod identity;

@@ -212,9 +212,14 @@ pub struct Harness {
 /// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
 /// put back afterwards, for a harness that carries entries of its own.
 ///
+/// The thread names the test it runs first: this is the one call every test
+/// that reaches the layer makes, so the account of what was in flight when a
+/// process died is written before anything can end it.
+///
 /// # Panics
 /// Panics if the factory cannot be created.
 fn create_factory(entries: &str) -> *mut c_void {
+    crate::in_flight::announce();
     let d3d9 = if entries.is_empty() {
         let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: Win32-style factory entrypoint with no preconditions.

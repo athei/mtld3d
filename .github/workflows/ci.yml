@@ -224,7 +224,10 @@ jobs:
       # The layer's log of every test process, and the whole stderr of every
       # process that died with tests unaccounted for, go under the runner's
       # temp directory, where the step below picks them up, rather than beside
-      # the test binary. The job log carries only what reached stdout: the
+      # the test binary. The layer's log of such a process is moved to
+      # `.layer-log` there, out of the layer's ten-newest retention, so the
+      # account of the death is in the artifact however many processes ran
+      # after it. The job log carries only what reached stdout: the
       # PASS/FAIL lines, the panic messages and the tail of stderr the runner
       # prints. What the command buffers reported is in the layer's log, and
       # that is what tells a runner whose GPU reads back black on every test
@@ -247,6 +250,7 @@ jobs:
           path: |
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/*.stderr
+            ${{ runner.temp }}/*.layer-log
           retention-days: 14
           if-no-files-found: ignore
 

@@ -49,7 +49,7 @@ use core::{
 };
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
-use mtld3d_shared::crumb;
+use mtld3d_shared::{crumb, fatal};
 
 /// Re-entrancy guard: reading the faulting stack/registers can itself fault on a corrupted context.
 ///
@@ -223,7 +223,7 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // takes locks. Stack-buffered hex formatting via `write_hex`.
     let mut buf = [0u8; 192];
     let mut pos = 0;
-    push(&mut buf, &mut pos, b"[mtld3d::unix] FATAL: ");
+    push(&mut buf, &mut pos, fatal::BANNER.as_bytes());
     push(&mut buf, &mut pos, signal_name(signo));
 
     if !info.is_null() && (signo == libc::SIGSEGV || signo == libc::SIGBUS) {

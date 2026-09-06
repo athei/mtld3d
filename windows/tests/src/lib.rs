@@ -9,6 +9,7 @@
 mod check;
 mod ffi;
 mod harness;
+mod in_flight;
 mod pixel;
 mod resource;
 mod shared;

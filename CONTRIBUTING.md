@@ -88,9 +88,14 @@ about that process names the file. What it prints inline is the last fifteen
 lines the process itself wrote: Wine's `fixme` lines and everything its
 `dbghelp` channel prints are left out, because dozens of them surround each
 backtrace and a raw tail rarely reaches back past them to the message that
-says what failed.
+says what failed. The layer's own log of that process is the other account,
+and the only one of a death the layer's crash handler ended: its fatal banner,
+registers and stack go there and never to stderr. The runner moves that log
+to `<binary>-<pid>.layer-log` beside the stderr, because the layer keeps only
+its ten newest logs and the next run would remove it, and quotes it in the
+same note from the banner on when there is one.
 
-In CI every end-to-end leg uploads both kinds of file as its
+In CI every end-to-end leg uploads all three kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
 directory holds the ten newest of each, so a leg that restarted more than ten
 processes hands back its last ten. They are the layer's side of a red leg,
