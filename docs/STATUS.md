@@ -45,8 +45,10 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 
 ## Deliberately not implemented
 
-- D3D9Ex: no `Direct3DCreate9Ex`, shared handles or D3D9On12. A different
-  contract, built for the Vista compositor.
+- D3D9Ex: `Direct3DCreate9Ex` resolves and answers `D3DERR_NOTAVAILABLE`, so
+  a runtime probe sees a d3d9 without 9Ex rather than a broken DLL; no
+  `IDirect3D9Ex`, shared handles or D3D9On12. A different contract, built for
+  the Vista compositor.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
   README's [Fullscreen](../README.md#fullscreen) section.
 - Device loss: no exclusive mode is taken, so nothing is ever lost, and

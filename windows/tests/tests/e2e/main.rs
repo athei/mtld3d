@@ -11,6 +11,7 @@
 
 mod buffers;
 mod clip_planes;
+mod d3d9ex;
 mod d3dperf;
 mod device;
 mod draw;
