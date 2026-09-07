@@ -6222,27 +6222,24 @@ extern "system" fn device_update_surface(
             );
             return D3DERR_INVALIDCALL;
         }
-        match (dst_surf.cube_face(), src_surf.cube_face()) {
-            (Some(dst_face), Some(src_face)) => {
-                let _ = dst.update_cube_sub_region_from(
-                    (dst_face, dst_level),
-                    src,
-                    src_face,
-                    src_level,
-                    rect,
-                    point,
-                );
-            }
-            (None, None) => {
-                let _ = dst.update_sub_region_from(dst_level, src, src_level, rect, point);
-            }
-            _ => {
-                mtld3d_shared::log_once_warn!(
-                    target: crate::LOG_TARGET,
-                    "reject UpdateSurface: cube face mixed with a plain surface → INVALIDCALL"
-                );
-                return D3DERR_INVALIDCALL;
-            }
+        let Some(image) = src.surface_source_image(src_surf.cube_face(), src_level) else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: source surface has no staging → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        };
+        let copied = if let Some(dst_face) = dst_surf.cube_face() {
+            dst.update_bytes_to_cube_staging_region(dst_face, dst_level, &image, rect, point)
+        } else {
+            dst.update_bytes_to_staging_region(dst_level, &image, rect, point)
+        };
+        if !copied {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: source region outside the destination mip → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
         }
         D3D_OK
     })
