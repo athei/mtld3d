@@ -1211,22 +1211,6 @@ impl DeviceInner {
         &mut self.stage_bindings
     }
 
-    pub fn set_fvf_field(&mut self, fvf: u32) {
-        self.fvf = fvf;
-        // FVF change can flip the same `vs_key` fields that VDECL does
-        // (has_rhw, vertex_blend_count). Mirror the conservative mark
-        // in `replace_vertex_decl`.
-        self.ff_state.mark_ff_vs_dirty(
-            mtld3d_core::ff_state::FfVsDirty::WV
-                | mtld3d_core::ff_state::FfVsDirty::PROJ
-                | mtld3d_core::ff_state::FfVsDirty::FOG
-                | mtld3d_core::ff_state::FfVsDirty::AMBIENT
-                | mtld3d_core::ff_state::FfVsDirty::MATERIAL
-                | mtld3d_core::ff_state::FfVsDirty::LIGHTS
-                | mtld3d_core::ff_state::FfVsDirty::PALETTE,
-        );
-    }
-
     pub const fn fvf_field(&self) -> u32 {
         self.fvf
     }
