@@ -270,6 +270,19 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
     lookup_d3d_format(d3d_format).is_some()
 }
 
+/// True for colour formats creatable as GPU-backed volume textures.
+///
+/// The backend has no 3D sampling path for block-compressed or packed-YUV
+/// formats. `D3DPOOL_SCRATCH` volumes keep a separate CPU-only exception for
+/// those formats, but that is not a hardware capability for `CheckDeviceFormat`.
+#[must_use]
+pub const fn is_volume_texture_format(d3d_format: u32) -> bool {
+    let Some(mapping) = lookup_d3d_format(d3d_format) else {
+        return false;
+    };
+    !mapping.is_compressed() && !matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
+}
+
 /// `map_d3d_format`, honouring whether the device has the packed 16-bit formats.
 ///
 /// On a device with native packed 16-bit support the answer is identical to

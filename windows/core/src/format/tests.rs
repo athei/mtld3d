@@ -20,19 +20,19 @@ use super::{
     D3DFMT_A32B32G32R32F, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8,
     D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16,
     D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
-    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
-    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat, RenderScale,
-    StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count, compute_mip_size,
-    compute_volume_mip_count, depth_format_bytes_per_pixel, format_name, is_depth_format,
-    is_mapped_color_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
-    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
-    usage_allowed_for_rtype,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
+    RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
+    compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
+    is_depth_format, is_mapped_color_format, is_volume_texture_format, linear_mip_size,
+    linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
+    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
 #[test]
@@ -239,6 +239,22 @@ fn is_mapped_color_format_tracks_the_lookup() {
     for fmt in [0, 0xFFFF_FFFF, D3DFMT_D24S8] {
         assert!(!is_mapped_color_format(fmt), "format {fmt}");
         assert!(map_d3d_format(fmt).is_none(), "format {fmt}");
+    }
+}
+
+#[test]
+fn volume_texture_formats_are_uncompressed_colour_mappings() {
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_R5G6B5,
+        D3DFMT_R8G8B8,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_G32R32F,
+    ] {
+        assert!(is_volume_texture_format(fmt), "format {fmt}");
+    }
+    for fmt in [D3DFMT_DXT1, D3DFMT_YUY2, D3DFMT_UYVY, D3DFMT_D24S8, 0] {
+        assert!(!is_volume_texture_format(fmt), "format {fmt}");
     }
 }
 
