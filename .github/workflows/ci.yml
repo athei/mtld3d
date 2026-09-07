@@ -136,6 +136,9 @@ jobs:
       - name: test-isolation
         if: ${{ !cancelled() }}
         run: make test-isolation
+      - name: test-e2e-discovery
+        if: ${{ !cancelled() }}
+        run: make test-e2e-discovery
       - name: doc-unix
         if: ${{ !cancelled() }}
         run: make doc-unix

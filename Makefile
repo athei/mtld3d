@@ -319,7 +319,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
-	clippy-native audit test-isolation doc doc-windows doc-unix check clean upgrade \
+	clippy-native audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -584,8 +584,8 @@ stage: all
 	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
 	cp -c $(OUT_unix_arm64)/mtld3d.so $(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(STAGE_DIR)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
-	cp -c $(call E2E_EXES,$(PE_i386)) $(STAGE_DIR)/tests/i686/
-	cp -c $(call E2E_EXES,$(PE_x64)) $(STAGE_DIR)/tests/x86_64/
+	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_i386))); cp -c $$exes $(STAGE_DIR)/tests/i686/
+	$(call E2E_EXES_ASSIGN,$(call E2E_EXES,$(PE_x64))); cp -c $$exes $(STAGE_DIR)/tests/x86_64/
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_x64)
 	cd unix && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e --target $(UNIX_TARGET_arm64)
 	cp -c unix/target/$(UNIX_TARGET_x64)/$(PROFILE)/mtld3d-e2e $(STAGE_DIR)/e2e/x86_64/
@@ -798,11 +798,24 @@ E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(
 
 # The test binaries of one PE arch, from cargo's own account of what it built:
 # `cargo test --no-run` prints one JSON message per artifact, and the test
-# targets are the only ones with an executable. A glob over `deps/` would also
-# pick up the stale hashes of earlier builds. Expanded inside a recipe, where
-# the `$$(...)` is the shell's. From a stage the binaries are the staged ones.
+# targets are the only ones with an executable. The JSON is held until Cargo
+# succeeds, so a partial artifact list from a failed build never reaches a
+# consumer. A glob over `deps/` would also pick up the stale hashes of earlier
+# builds. Expanded inside a recipe, where the `$$(...)` is the shell's. From a
+# stage the binaries are the staged ones.
+define E2E_EXES_BUILD
+cd windows && cargo +$(RUST_STABLE) test --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics
+endef
 define E2E_EXES
-$$(cd windows && cargo +$(RUST_STABLE) test --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics | sed -n 's/^.*"executable":"\([^"]*\.exe\)".*/\1/p')
+$$(output=$$(mktemp "$${TMPDIR:-/tmp}/mtld3d-e2e-exes.XXXXXX") || exit; \
+	$(call E2E_EXES_BUILD,$(1)) > "$$output"; result_code=$$?; \
+	if [ "$$result_code" -eq 0 ]; then \
+		sed -n 's/^.*"executable":"\([^"]*\.exe\)".*/\1/p' "$$output"; result_code=$$?; \
+	fi; \
+	rm -f "$$output"; exit "$$result_code")
+endef
+define E2E_EXES_ASSIGN
+exes="$(1)" || exit $$?
 endef
 E2E_EXES_i686   = $(if $(STAGE),$(STAGE)/tests/i686/*.exe,$(call E2E_EXES,$(PE_i386)))
 E2E_EXES_x86_64 = $(if $(STAGE),$(STAGE)/tests/x86_64/*.exe,$(call E2E_EXES,$(PE_x64)))
@@ -815,12 +828,12 @@ E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/$(HOST_ARCH)/mtld3d-e2e,cargo +$(RU
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	exes="$(E2E_EXES_i686)"; cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
+	$(call E2E_EXES_ASSIGN,$(E2E_EXES_i686)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE) $(E2E_FLAGS) -- $$exes
 
 test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	exes="$(E2E_EXES_x86_64)"; cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
+	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE) $(E2E_FLAGS) -- $$exes
 
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
@@ -972,6 +985,9 @@ audit:
 test-isolation:
 	python3 scripts/test-isolation.py
 
+test-e2e-discovery:
+	python3 scripts/test-e2e-discovery.py
+
 # rustdoc's own lints, which no other target sees: broken and private intra-doc
 # links, malformed HTML in doc comments. `audit` gates the *shape* of a doc block
 # and clippy gates its prose; only rustdoc knows whether its links resolve.
@@ -988,15 +1004,16 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# conventions audit, the Makefile isolation regression, and the doc build.
-# fmt-check first (fast, fails early on drift); clippy reuses the target above;
-# audit and test-isolation are fast; doc stays last. Each leg is also its own
-# target, so CI runs them as parallel jobs instead of this sequence.
+# conventions audit, the Makefile regressions, and the doc build. fmt-check first
+# (fast, fails early on drift); clippy reuses the target above; audit and the
+# Makefile regressions are fast; doc stays last. Each leg is also its own target,
+# so CI runs them as parallel jobs instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
 	$(MAKE) audit
 	$(MAKE) test-isolation
+	$(MAKE) test-e2e-discovery
 	$(MAKE) doc
 
 clean:
