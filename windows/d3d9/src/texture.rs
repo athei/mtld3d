@@ -1195,11 +1195,6 @@ impl TextureInner {
         ) else {
             return false;
         };
-        let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
-            return false;
-        };
-        let dst_box = &dst_cube.staging[dst_index];
-        let src_box = &src_cube.staging[src_index];
         let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, sw, sh),
@@ -1239,6 +1234,13 @@ impl TextureInner {
         ) else {
             return false;
         };
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
+            return false;
+        };
+        let dst_box = &dst_cube.staging[dst_index];
+        let src_box = &src_cube.staging[src_index];
         let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
         let (dx, dy) = (dst_rect.x, dst_rect.y);
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
@@ -1266,7 +1268,7 @@ impl TextureInner {
             // SAFETY: both ranges are in-bounds and belong to distinct textures.
             unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes) };
         }
-        self.mark_cube_dirty(dst_face, dst_level);
+        self.mark_cube_written_region(dst_face, dst_level, dst_rect);
         true
     }
 
@@ -1465,10 +1467,6 @@ impl TextureInner {
         ) else {
             return false;
         };
-        let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
-            return false;
-        };
-        let (dst_box, src_box) = (&dst_cube.staging[dst_index], &src_cube.staging[src_index]);
         let (sw, sh) = (src.mip_width(src_level), src.mip_height(src_level));
         let (rx, ry, rw, rh) = match src_rect {
             None => (0u32, 0u32, sw, sh),
@@ -1506,6 +1504,12 @@ impl TextureInner {
         ) else {
             return false;
         };
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
+            return false;
+        };
+        let (dst_box, src_box) = (&dst_cube.staging[dst_index], &src_cube.staging[src_index]);
         let src_pitch = src.mip_bytes_per_row(src_level) as usize;
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         let region = pixel_convert::ConvertRegion {
@@ -1536,7 +1540,7 @@ impl TextureInner {
         if !pixel_convert::convert_region(dst_bytes, dst_fmt, src_bytes, src_fmt, &region) {
             return false;
         }
-        self.mark_cube_dirty(dst_face, dst_level);
+        self.mark_cube_written_region(dst_face, dst_level, dst_rect);
         true
     }
 
@@ -1662,13 +1666,6 @@ impl TextureInner {
         let Some(dst_index) = self.cube_subresource_index(dst_face, dst_level) else {
             return false;
         };
-        let Some(dst_box) = self
-            .cube
-            .as_deref()
-            .and_then(|cube| cube.staging.get(dst_index))
-        else {
-            return false;
-        };
         let &SourceImage {
             bytes: src_bytes,
             pitch: src_pitch,
@@ -1700,6 +1697,21 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        let dst_rect = DirtyRect {
+            x: dx,
+            y: dy,
+            w: rw,
+            h: rh,
+        };
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        let Some(dst_box) = self
+            .cube
+            .as_deref()
+            .and_then(|cube| cube.staging.get(dst_index))
+        else {
+            return false;
+        };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
         if src_pitch == 0 {
@@ -1726,7 +1738,7 @@ impl TextureInner {
             // SAFETY: both ranges are in-bounds and cannot overlap.
             unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes) };
         }
-        self.mark_cube_dirty(dst_face, dst_level);
+        self.mark_cube_written_region(dst_face, dst_level, dst_rect);
         true
     }
 
@@ -1839,16 +1851,18 @@ impl TextureInner {
         let Some(dst_index) = self.cube_subresource_index(dst_face, dst_level) else {
             return false;
         };
+        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
+        let Some((src_rect, dst_rect)) =
+            clip_texel_region(src_rect, dst_point, (src.width, src.height), (dw, dh))
+        else {
+            return false;
+        };
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_subresource_to_staging(dst_face, dst_level, whole);
         let Some(dst_box) = self
             .cube
             .as_deref()
             .and_then(|cube| cube.staging.get(dst_index))
-        else {
-            return false;
-        };
-        let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
-        let Some((src_rect, dst_rect)) =
-            clip_texel_region(src_rect, dst_point, (src.width, src.height), (dw, dh))
         else {
             return false;
         };
@@ -1876,7 +1890,7 @@ impl TextureInner {
         if !pixel_convert::convert_region(dst_bytes, dst_fmt, src.bytes, src.format, &region) {
             return false;
         }
-        self.mark_cube_dirty(dst_face, dst_level);
+        self.mark_cube_written_region(dst_face, dst_level, dst_rect);
         true
     }
 
