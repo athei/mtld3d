@@ -22,6 +22,7 @@ fn empty_input_returns_defaults() {
 fn defaults_match_documented_values() {
     let d = Mtld3dConfig::default();
     assert!(!d.caps_all);
+    assert!(!d.main_thread_checker);
     assert!(!d.expand_packed16);
     assert!(!d.deny_float32_filtering);
     assert!(!d.managed_memory);
@@ -305,6 +306,21 @@ fn comments_and_blank_lines_are_skipped() {
 }
 
 #[test]
+fn main_thread_checker_defaults_off_and_parses_on() {
+    assert!(!parse(None, "", None).main_thread_checker, "off by default");
+    assert!(parse(None, "debug.mainThreadChecker = true\n", None).main_thread_checker);
+    assert!(!parse(None, "debug.mainThreadChecker = false\n", None).main_thread_checker);
+    assert!(
+        !parse(None, "debug.mainThreadChecker = maybe\n", None).main_thread_checker,
+        "an unparsable value keeps the default"
+    );
+    assert!(
+        parse(None, "", Some("debug.mainThreadChecker=true")).main_thread_checker,
+        "the env override reaches the key"
+    );
+}
+
+#[test]
 fn render_lod_bias_defaults_on_and_parses_off() {
     assert!(parse(None, "", None).render_lod_bias, "on by default");
     assert!(!parse(None, "render.lodBias = false\n", None).render_lod_bias);
@@ -321,10 +337,12 @@ fn boolean_keys_round_trip_both_values() {
         None,
         "debug.capsAll = true\ncolor.hdr.enable = false\nshaderCache.enable = false\n\
          intel.expandPacked16 = true\nintel.denyFloat32Filtering = true\n\
-         intel.managedMemory = true\nintel.linearAlign256 = true\n",
+         intel.managedMemory = true\nintel.linearAlign256 = true\n\
+         debug.mainThreadChecker = true\n",
         None,
     );
     assert!(cfg.caps_all);
+    assert!(cfg.main_thread_checker);
     assert!(!cfg.hdr_enable);
     assert!(!cfg.shader_cache_enable);
     assert!(cfg.expand_packed16);

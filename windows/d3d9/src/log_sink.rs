@@ -73,7 +73,9 @@ type WineGetUnixFileName = unsafe extern "C" fn(*const u16) -> *mut c_char;
 /// when the key is empty; it is created here, the file itself by the unix
 /// side with the first line it writes. When the directory cannot be created
 /// or has no unix path, the thunk still goes out, empty, so the unix side
-/// releases its backlog to stderr instead of holding it forever.
+/// releases its backlog to stderr instead of holding it forever. The same
+/// thunk carries `debug.mainThreadChecker`, the one resolved option the unix
+/// side acts on once per process.
 pub fn open(cfg: &mtld3d_core::config::Mtld3dConfig) {
     let location = log_location(cfg);
     let (unix_dir, stem) = match &location {
@@ -92,6 +94,8 @@ pub fn open(cfg: &mtld3d_core::config::Mtld3dConfig) {
         stem_ptr: stem.as_ptr() as usize as u64,
         dir_len,
         stem_len,
+        main_thread_checker: u32::from(cfg.main_thread_checker),
+        pad0: 0,
     };
     unix_call(&mut params);
 }

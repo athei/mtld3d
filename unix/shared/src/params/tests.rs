@@ -55,9 +55,9 @@ fn set_cursor_overlay_layout() {
 #[test]
 fn open_log_layout() {
     use super::OpenLogParams;
-    // 2*u64 + 2*u32 = 16 + 8 = 24
+    // 2*u64 + 4*u32 = 16 + 16 = 32
     assert_eq!(core::mem::align_of::<OpenLogParams>(), 8);
-    assert_eq!(core::mem::size_of::<OpenLogParams>(), 24);
+    assert_eq!(core::mem::size_of::<OpenLogParams>(), 32);
 }
 
 #[test]

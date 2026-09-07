@@ -6,6 +6,7 @@ use strum::{EnumCount, VariantArray};
 mod crash;
 mod handlers;
 mod log_file;
+mod main_thread_checker;
 mod metal;
 
 /// `log` target used by every call inside this crate.

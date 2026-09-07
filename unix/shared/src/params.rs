@@ -97,12 +97,19 @@ impl Thunk for WriteLogParams {
 /// process of every fresh wineserver the same one. It opens
 /// `<dir>/<stem>-<pid>.log` on the first line it writes and numbers the
 /// traces `<dir>/<stem>-<pid>-<n>.gputrace`.
+///
+/// `main_thread_checker` rides along because this is the one thunk that
+/// fires once per process with the resolved configuration in hand: set, the
+/// unix side loads Apple's Main Thread Checker before it opens the log, so
+/// every `AppKit` call the layer makes from then on is checked.
 #[repr(C, align(8))]
 pub struct OpenLogParams {
-    pub dir_ptr: u64,  // in: *const u8
-    pub stem_ptr: u64, // in: *const u8
-    pub dir_len: u32,  // in: byte count
-    pub stem_len: u32, // in: byte count
+    pub dir_ptr: u64,             // in: *const u8
+    pub stem_ptr: u64,            // in: *const u8
+    pub dir_len: u32,             // in: byte count
+    pub stem_len: u32,            // in: byte count
+    pub main_thread_checker: u32, // in: 1 loads Apple's Main Thread Checker
+    pub pad0: u32,
 }
 
 impl Thunk for OpenLogParams {

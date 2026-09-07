@@ -81,12 +81,19 @@ pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
 ///
 /// The lines logged since `InitLogger` wait in the file sink's backlog for
 /// this, so the PE side sends it before it starts its own log thread. The
-/// file itself appears with the first line written after this.
+/// file itself appears with the first line written after this. The thunk
+/// also carries `debug.mainThreadChecker`, acted on here because this is the
+/// first thunk that runs with the configuration resolved.
 pub extern "C" fn open_log_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut OpenLogParams.
     let Some(params) = (unsafe { InPtrMut::<OpenLogParams>::opt(args) }) else {
         return -1;
     };
+    // Ahead of the location checks: the checker gates AppKit use for the
+    // rest of the process whether or not this process gets a log file.
+    if params.main_thread_checker != 0 {
+        crate::main_thread_checker::load();
+    }
     if params.dir_ptr == 0 || params.dir_len == 0 || params.stem_ptr == 0 {
         // The PE side found no usable location; its warn said why.
         crate::log_file::fall_back_to_stderr();
