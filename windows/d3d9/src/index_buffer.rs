@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use mtld3d_core::{
-    buffer_backing::{BufferBacking, classify_backing, may_release_backing},
+    buffer_backing::{BackingState, BufferBacking, classify_backing, may_release_backing},
     buffer_rename::{
         BufferMapMode, LockPlan, PreserveKind, classify_map_mode, may_trust_lock_bounds, plan_lock,
         records_dirty_range,
@@ -97,15 +97,14 @@ impl IndexBufferInner {
         self.length
     }
 
-    /// Whether the buffer holds no CPU copy of its contents.
+    /// Whether CPU reads need a complete copy from the device buffer.
     ///
-    /// True only for a `D3DUSAGE_WRITEONLY` default-pool buffer whose
-    /// upload has been queued: its bytes live on the GPU alone until a
-    /// later `Lock` re-creates the backing, or the indexed triangle-fan
-    /// rewrite reads them back.
+    /// A released backing has no bytes; a partial backing holds only the
+    /// ranges written since its restoration. Neither can supply fan indices
+    /// outside those ranges until readback completes the mirror.
     #[must_use]
-    pub const fn backing_is_released(&self) -> bool {
-        self.backing.is_released()
+    pub const fn backing_needs_readback(&self) -> bool {
+        !matches!(self.backing.state(), BackingState::Mirrors)
     }
 
     /// Adopt index bytes read back out of the device buffer.
