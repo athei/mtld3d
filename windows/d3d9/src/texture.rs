@@ -780,6 +780,10 @@ impl TextureInner {
         self.mip_heights[level]
     }
 
+    pub fn mip_depth(&self, level: usize) -> u32 {
+        (self.depth >> level).max(1)
+    }
+
     /// What this texture's Metal levels are rasterized at, relative to what D3D9 reports.
     ///
     /// Fixed when the texture is created and carried for its whole life, so a

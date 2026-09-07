@@ -6377,8 +6377,14 @@ extern "system" fn device_update_texture(
         // per the D3D9 UpdateTexture smallest-mip alignment rule. For an
         // equal-or-smaller source `src_skip` stays 0 and this is identical to
         // a plain index-aligned copy.
-        let mut s = src.mip_width(0).max(src.mip_height(0));
-        let d = dst.mip_width(0).max(dst.mip_height(0));
+        let mut s = src
+            .mip_width(0)
+            .max(src.mip_height(0))
+            .max(src.mip_depth(0));
+        let d = dst
+            .mip_width(0)
+            .max(dst.mip_height(0))
+            .max(dst.mip_depth(0));
         let mut src_skip = 0usize;
         while s > d {
             s >>= 1;
