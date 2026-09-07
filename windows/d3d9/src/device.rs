@@ -3485,6 +3485,9 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // Restore the game's original window proc *before* freeing DeviceInner;
         // the subclass's global back-pointer becomes dangling once we drop.
         device_inner.cursor().uninstall_subclass();
+        // The HCURSORs the device built die with it, now that no message can
+        // realize one of them again.
+        device_inner.cursor_mut().destroy_handles();
 
         // Release bound surfaces + buffers + textures (if any) before teardown.
         device_inner.bound_rt_mut().teardown();

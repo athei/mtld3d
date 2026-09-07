@@ -11,8 +11,8 @@ use std::sync::{
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, destroy_window,
-    enumerate_display_sizes, spawn_scoped, window_rect,
+    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
+    destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -2345,6 +2345,89 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
         h.thread_cursor(),
         class_arrow,
         "hidden again: WM_SETCURSOR forwarded to the class cursor",
+    );
+}
+
+/// Releasing the device destroys every HCURSOR it built.
+///
+/// `SetCursorProperties` builds one Win32 cursor per distinct bitmap and
+/// keeps every one of them for the device's lifetime, so a game that cycles
+/// through pointers hands the device a growing set of handles. They are the
+/// device's alone and go with it. The handle that is the thread's cursor at
+/// release is replaced by the window's class cursor first: user32 frees a
+/// cursor even while it is current, and the thread would otherwise keep a
+/// destroyed handle as its cursor.
+#[test]
+fn device_release_destroys_the_cursors_it_built() {
+    const WM_SETCURSOR: u32 = 0x0020;
+    /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
+    const WM_MOUSEMOVE_LP: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    const SIDE: usize = 32;
+    let h = Harness::new();
+    let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
+
+    // Hidden, the message is forwarded and the class cursor is what applies.
+    h.set_thread_cursor(0);
+    h.send_window_message(WM_SETCURSOR, h.hwnd(), lp_client_move);
+    let class_arrow = h.thread_cursor();
+    assert_ne!(class_arrow, 0, "the window class carries a cursor");
+
+    let mut built = Vec::new();
+    for fill in [0xFF00_0000_u32, 0xFFFF_0000, 0xFF00_FF00] {
+        let bitmap = h.create_offscreen_plain_surface(
+            u32::try_from(SIDE).expect("cursor side fits u32"),
+            u32::try_from(SIDE).expect("cursor side fits u32"),
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SCRATCH,
+        );
+        {
+            let mut locked = bitmap.lock_rect(0);
+            locked.write_u32_rect(SIDE, SIDE, &[fill; SIDE * SIDE]);
+        }
+        assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+        assert_eq!(
+            h.show_cursor(true),
+            i32::from(!built.is_empty()),
+            "ShowCursor(TRUE) reports the previous visibility",
+        );
+        let handle = h.thread_cursor();
+        assert_ne!(handle, 0, "ShowCursor(TRUE) must realize an HCURSOR");
+        assert_ne!(
+            handle, class_arrow,
+            "the device cursor is not the class cursor"
+        );
+        assert!(
+            !built.contains(&handle),
+            "a distinct bitmap builds a distinct cursor: {handle:#x} again",
+        );
+        assert!(
+            cursor_is_live(handle),
+            "the realized handle is a live cursor"
+        );
+        built.push(handle);
+    }
+    assert_eq!(
+        h.release_device(),
+        0,
+        "the harness held the only device reference"
+    );
+
+    for handle in &built {
+        assert!(
+            !cursor_is_live(*handle),
+            "cursor {handle:#x} outlived the device that built it",
+        );
+    }
+    assert!(
+        !built.contains(&h.thread_cursor()),
+        "the thread cursor must not be a destroyed handle: {:#x}",
+        h.thread_cursor(),
+    );
+    assert_eq!(
+        h.thread_cursor(),
+        class_arrow,
+        "the window's class cursor replaces the device's on the thread",
     );
 }
 
