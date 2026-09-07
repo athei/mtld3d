@@ -294,11 +294,12 @@ bitflags::bitflags! {
         /// `EndScene` without an open scene both return `D3DERR_INVALIDCALL`.
         /// Rendering does not otherwise depend on scene state.
         const IN_SCENE = 1 << 1;
-        /// Set by a `Reset` that failed after validating its parameters.
+        /// Set when the implicit presentation resources could not be rebuilt.
         ///
-        /// `TestCooperativeLevel` reports `D3DERR_DEVICENOTRESET` until a
-        /// later `Reset` succeeds, which is how an app learns it must retry
-        /// (after releasing the `D3DPOOL_DEFAULT` resources that blocked it).
+        /// `Present` and `TestCooperativeLevel` report
+        /// `D3DERR_DEVICENOTRESET` until a later `Reset` succeeds, which is
+        /// how an app learns it must retry (after releasing any
+        /// `D3DPOOL_DEFAULT` resources that blocked it).
         const NOT_RESET = 1 << 2;
         /// Set once the last `Release` has begun tearing the device down.
         ///
@@ -2596,6 +2597,7 @@ impl DeviceInner {
             self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_depth_stencil_handle(MetalHandle::NULL);
+            self.flags.insert(DeviceFlags::NOT_RESET);
             return;
         }
         self.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
@@ -3016,6 +3018,11 @@ impl DeviceInner {
     /// Normalised present parameters the implicit swapchain reports.
     pub const fn present_params(&self) -> &D3DPRESENT_PARAMETERS {
         &self.present_params
+    }
+
+    /// `true` when presentation must wait for a successful `Reset`.
+    pub const fn needs_reset(&self) -> bool {
+        self.flags.contains(DeviceFlags::NOT_RESET)
     }
 
     /// `true` when the device is fullscreen.
@@ -3641,10 +3648,10 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
     // The device is never lost (no exclusive mode is ever taken), so the only
-    // non-OK answer is the latch a failed `Reset` leaves behind.
+    // non-OK answer is the latch a failed implicit-resource rebuild leaves behind.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let not_reset = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
-        .is_some_and(|obj| obj.inner().flags.contains(DeviceFlags::NOT_RESET));
+        .is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET
     } else {
@@ -4454,6 +4461,9 @@ extern "system" fn device_present(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if dev.needs_reset() {
+        return mtld3d_types::D3DERR_DEVICENOTRESET;
+    }
 
     mtld3d_shared::crumb!("d3d9:present");
     // The unix side republishes the backing scale whenever the window's

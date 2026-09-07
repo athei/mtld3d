@@ -804,6 +804,38 @@ fn cooperative_level_ok() {
 }
 
 #[test]
+fn failed_auto_resize_requires_a_reset_before_presenting() {
+    const WM_SIZE: u32 = 0x0005;
+    const OVERSIZE_DIMENSION: isize = 0xffff;
+
+    let h = Harness::new();
+    h.send_window_message(WM_SIZE, 0, (OVERSIZE_DIMENSION << 16) | OVERSIZE_DIMENSION);
+
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3DERR_DEVICENOTRESET,
+        "an oversized auto-resize back-buffer failure requires Reset"
+    );
+    assert_eq!(
+        h.present(),
+        D3DERR_DEVICENOTRESET,
+        "Present must not submit the frame with null implicit handles"
+    );
+
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "a valid Reset rebuilds the back buffer"
+    );
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3D_OK,
+        "a successful Reset clears the latch"
+    );
+    assert_eq!(h.present(), D3D_OK, "presentation resumes after Reset");
+}
+
+#[test]
 fn reset_rejects_outstanding_default_pool_resources() {
     // D3D9 rejects Reset while the app still references a D3DPOOL_DEFAULT
     // resource or an implicit surface, and TestCooperativeLevel reports

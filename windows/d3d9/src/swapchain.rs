@@ -11,7 +11,9 @@
 use core::ffi::c_void;
 
 use mtld3d_shared::{InPtr, OutPtr};
-use mtld3d_types::{D3DDISPLAYMODE, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl};
+use mtld3d_types::{
+    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DPRESENT_PARAMETERS, Guid, IDirect3DSwapChain9Vtbl,
+};
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, device::DeviceInner};
 use crate::surface::Direct3DSurface9;
@@ -248,6 +250,9 @@ extern "system" fn swapchain_present(
     // outlives its swapchains per D3D9 lifetime rules. There is one drawable,
     // so presenting any swapchain presents the device frame.
     let dev = unsafe { &mut *device_inner };
+    if dev.needs_reset() {
+        return D3DERR_DEVICENOTRESET;
+    }
     let fresh = dev.fresh_frame();
     dev.present(fresh);
     D3D_OK
