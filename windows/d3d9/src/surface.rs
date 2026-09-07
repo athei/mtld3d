@@ -1001,23 +1001,31 @@ impl Direct3DSurface9 {
 
     /// CPU backing of a standalone offscreen surface.
     ///
-    /// Yields `(ptr, len, width, height, format)`. `None` for any GPU-backed or
-    /// texture-backed surface. The pool is not filtered, so a
+    /// Yields `(ptr, len, pitch, width, height, format)`. `None` for any
+    /// GPU-backed or texture-backed surface. The pool is not filtered, so a
     /// `D3DPOOL_SCRATCH` surface answers as well as a `D3DPOOL_SYSTEMMEM` one;
     /// a caller that needs a valid `UpdateSurface` source checks
-    /// [`Self::standalone_pool`] too. The row pitch is `width * bpp` rounded up
-    /// to 4 (the layout `CreateOffscreenPlainSurface` allocated and
-    /// `systemmem_lock_rect` reports), so the caller recomputes it from
-    /// `format`.
-    pub fn system_memory_source(&self) -> Option<(*const u8, usize, u32, u32, u32)> {
+    /// [`Self::standalone_pool`] too. The row pitch is the layout
+    /// `CreateOffscreenPlainSurface` allocated and `systemmem_lock_rect`
+    /// reports: a block-row stride for compressed formats and a dword-aligned
+    /// pixel-row stride for linear formats.
+    pub fn system_memory_source(&self) -> Option<(*const u8, usize, usize, u32, u32, u32)> {
         if !self.inner().parent_texture.is_null() {
             return None;
         }
         let inner = self.inner();
+        let fmt = mtld3d_core::format::map_d3d_format(inner.standalone_format)?;
+        let pitch = mtld3d_core::format::block_row_pitch(
+            inner.standalone_width,
+            fmt.block_width(),
+            fmt.block_bytes(),
+            fmt.bytes_per_pixel(),
+        );
         inner.system_memory.as_ref().map(|p| {
             (
                 p.as_ptr(),
                 p.len(),
+                usize::try_from(pitch).expect("u32 pitch fits usize on PE targets"),
                 inner.standalone_width,
                 inner.standalone_height,
                 inner.standalone_format,
