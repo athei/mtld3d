@@ -1801,6 +1801,110 @@ fn sample_cube_face_quadrants(h: &Harness, cube: &mtld3d_tests::CubeTexture<'_>)
     sampled
 }
 
+enum CubeUpdateSource {
+    StandaloneSurface,
+    CubeSurface,
+    CubeTexture,
+}
+
+fn check_partial_cube_update_preserves_gpu_pixels(format: u32, source: &CubeUpdateSource) {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let dst = h.create_cube_texture_owned(
+        4,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(h.color_fill_hr(&dst.surface(0, 0), RED), 0);
+    // Sampling and reading the primer completes the GPU write before the copy.
+    for pixel in sample_cube_face_quadrants(&h, &dst) {
+        assert_pixel_eq(pixel, RED, "completed ColorFill primer");
+    }
+    let blue = if format == D3DFMT_X8R8G8B8 {
+        BLUE & 0x00FF_FFFF
+    } else {
+        BLUE
+    };
+    match source {
+        CubeUpdateSource::StandaloneSurface => {
+            let src = h.create_offscreen_plain_surface(2, 2, format, D3DPOOL_SYSTEMMEM);
+            src.lock_rect(0).write_u32(&[blue; 4]);
+            assert_eq!(h.update_surface_hr(&src, &dst.surface(0, 0)), 0);
+        }
+        CubeUpdateSource::CubeSurface => {
+            let src = h.create_cube_texture_owned(4, 1, 0, format, D3DPOOL_SYSTEMMEM);
+            src.lock_rect(1, 0, 0).write_u32(&[blue; 16]);
+            assert_eq!(
+                h.update_surface_region_hr(
+                    &src.surface(1, 0),
+                    &D3DRECT {
+                        x1: 0,
+                        y1: 0,
+                        x2: 2,
+                        y2: 2
+                    },
+                    &dst.surface(0, 0),
+                    (0, 0),
+                ),
+                0,
+            );
+        }
+        CubeUpdateSource::CubeTexture => {
+            let src = h.create_cube_texture_owned(4, 1, 0, format, D3DPOOL_SYSTEMMEM);
+            let consumed = h.create_cube_texture_owned(4, 1, 0, format, D3DPOOL_DEFAULT);
+            // Consume the creation-time whole-face dirty regions before the partial lock.
+            assert_eq!(h.update_cube_texture_hr(&src, &consumed), 0);
+            src.lock_rect_partial(0, 0, &[0, 0, 2, 2], 0)
+                .write_u32_rect(2, 2, &[blue; 4]);
+            assert_eq!(h.update_cube_texture_hr(&src, &dst), 0);
+        }
+    }
+    let sampled = sample_cube_face_quadrants(&h, &dst);
+    assert_pixel_eq(sampled[0], BLUE, "copied quadrant");
+    for (index, (_, _, name)) in QUADRANTS.into_iter().enumerate().skip(1) {
+        assert_pixel_eq(sampled[index], RED, name);
+    }
+}
+
+#[test]
+fn partial_cube_update_from_standalone_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(
+        D3DFMT_A8R8G8B8,
+        &CubeUpdateSource::StandaloneSurface,
+    );
+}
+
+#[test]
+fn partial_cube_update_from_converting_standalone_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(
+        D3DFMT_X8R8G8B8,
+        &CubeUpdateSource::StandaloneSurface,
+    );
+}
+
+#[test]
+fn partial_cube_update_from_cube_surface_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(D3DFMT_A8R8G8B8, &CubeUpdateSource::CubeSurface);
+}
+
+#[test]
+fn partial_cube_update_from_converting_cube_surface_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(D3DFMT_X8R8G8B8, &CubeUpdateSource::CubeSurface);
+}
+
+#[test]
+fn partial_cube_update_texture_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(D3DFMT_A8R8G8B8, &CubeUpdateSource::CubeTexture);
+}
+
+#[test]
+fn partial_cube_update_texture_converting_preserves_gpu_pixels() {
+    check_partial_cube_update_preserves_gpu_pixels(D3DFMT_X8R8G8B8, &CubeUpdateSource::CubeTexture);
+}
+
 /// A partial lock's `UnlockRect` publishes the rect it named, on every upload path.
 ///
 /// Each quadrant is locked while the previous draw's upload is in flight and
