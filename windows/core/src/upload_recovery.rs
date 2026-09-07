@@ -255,7 +255,7 @@ impl<T> UploadRecoveryQueue<T> {
 
     /// Take every queued entry, leaving the queue empty.
     ///
-    /// Reset and shutdown call this after the GPU has gone idle: the
+    /// Shutdown calls this after the GPU has gone idle: the
     /// payloads own Metal wrappers and PE-heap backings the caller must
     /// tear down in its own destroy-then-drop order.
     pub fn drain_all(&mut self) -> Vec<PendingUpload<T>> {

@@ -7998,7 +7998,25 @@ impl FrameEncoder {
         //    Texture-kind retention entries merge into the `textures`
         //    Vec collected from the live cache above.
         mtld3d_shared::crumb!("phase:SdDrain");
-        let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
+        let mut held = self.drain_retention_and_wait(&mut buffers, &mut textures);
+        // Shutdown has no future frame to replay uploads into. Reset keeps
+        // these queues because its resource caches survive, and a failed
+        // final flush still owes their copies at the next begin_frame.
+        for entry in self.pending_stage_uploads.drain_all() {
+            let retry = entry.into_payload();
+            if !retry.transient.is_null() {
+                buffers.push(retry.transient.raw());
+            }
+            self.perf.bump_vbib_retained_sub(retry.page_box.len());
+            self.sub_retained_bytes(retry.page_box.len());
+            held.pageboxes.push(retry.page_box);
+        }
+        // Texture jobs own only a clone of the texture's staging Arc; park
+        // it with the other staging keepalives so it outlives the bulk
+        // destroy of the `MTLBuffer`s that wrap those pages.
+        for entry in self.pending_texture_uploads.drain_all() {
+            held.staging_arcs.push(entry.into_payload().arc);
+        }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.
@@ -8108,25 +8126,6 @@ impl FrameEncoder {
         textures: &mut Vec<u64>,
     ) -> HeldBackings {
         let mut held = HeldBackings::default();
-        // Un-acknowledged uploads go the same way as retention: the GPU is
-        // about to be idle, so there is nothing left to replay into. Their
-        // bytes leave the shared retention total here, which is the only
-        // place besides `settle_stage_uploads` that subtracts them.
-        for entry in self.pending_stage_uploads.drain_all() {
-            let retry = entry.into_payload();
-            if !retry.transient.is_null() {
-                buffers.push(retry.transient.raw());
-            }
-            self.perf.bump_vbib_retained_sub(retry.page_box.len());
-            self.sub_retained_bytes(retry.page_box.len());
-            held.pageboxes.push(retry.page_box);
-        }
-        // Texture jobs own only a clone of the texture's staging Arc; park
-        // it with the other staging keepalives so it outlives the bulk
-        // destroy of the `MTLBuffer`s that wrap those pages.
-        for entry in self.pending_texture_uploads.drain_all() {
-            held.staging_arcs.push(entry.into_payload().arc);
-        }
         while let Some(entry) = self.pending_resource_retention.pop_front() {
             if entry.handle != 0 {
                 match entry.kind {
@@ -8174,22 +8173,24 @@ impl FrameEncoder {
         held
     }
 
-    /// Block until `coherent_seq >= current_submit_seq`.
+    /// Wait for committed work through the current submission.
     ///
-    /// Parks on the unix-side `WaitForGpuRetire` thunk, which calls Metal's
-    /// `MTLCommandBuffer::waitUntilCompleted` on the registered cmdbuf for
-    /// `current_submit_seq`. Skips immediately when the encoder hasn't yet
-    /// been given a `coherent_seq` pointer or hasn't submitted any frame —
-    /// both states arrive together in `begin_frame`.
+    /// Delegates to the unix-side retirement wait. If the current sequence
+    /// has no registered buffer, the wait falls back to earlier committed
+    /// work without publishing the missing sequence as retired. CPU submission
+    /// failure separately drains committed work before retiring its sequence.
+    /// Skips when the encoder has no retirement counter or current sequence.
     fn wait_for_gpu_idle(&self) {
         self.wait_for_gpu_retire(self.current_submit_seq);
     }
 
-    /// Block until `coherent_seq >= target_seq`.
+    /// Wait for a submitted sequence, falling back to earlier committed work.
     ///
-    /// A target of 0 names no frame, and a target the encoder never
-    /// submitted is answered by the atomic alone on the unix side, so
-    /// neither waits.
+    /// A target of 0 names no frame. The unix side also skips an already
+    /// retired target; otherwise it waits for the smallest registered sequence
+    /// at or beyond the target, or the latest earlier entry if none exists.
+    /// Only the sequence actually waited for is published, so a missing target
+    /// may remain above the retirement counter when this call returns.
     fn wait_for_gpu_retire(&self, target_seq: u64) {
         if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;

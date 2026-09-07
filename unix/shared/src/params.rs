@@ -913,12 +913,15 @@ pub struct SubmitFrameParams {
     /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
     /// VB/IB.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    /// Highest submit seq whose command buffer the GPU aborted.
+    /// Highest submit seq whose CPU encoding or GPU execution failed.
     ///
     /// Both completion handlers `fetch_max` `submit_seq` into
     /// `*(failed_submit_seq_ptr as *const AtomicU64)` when the command
-    /// buffer reaches `MTLCommandBufferStatus::Error`. Deliberately a
-    /// second counter rather than a gate on `coherent_seq`: an aborted
+    /// buffer reaches `MTLCommandBufferStatus::Error`. A CPU encoding
+    /// failure first drains all committed draw/upload buffers and their
+    /// handlers, then records the failed sequence before advancing retirement
+    /// to that sequence. Deliberately a second counter rather than a gate on
+    /// `coherent_seq`: an aborted
     /// command buffer *is* finished with its source memory, so withholding
     /// the retirement bump would pin every seq-gated queue behind a seq
     /// that never retires and deadlock `wait_for_gpu_retire`. Retirement
