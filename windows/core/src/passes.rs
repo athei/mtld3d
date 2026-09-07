@@ -1231,9 +1231,9 @@ pub struct PassState {
     /// game-created render target is measured against is this one, not the
     /// rasterized extent.
     backbuffer_logical_size: (u32, u32),
-    /// Texture handles ever bound as a fragment sampler input in any pass this frame.
+    /// Texture handles ever bound as a sampler input in any pass this frame.
     ///
-    /// Populated in `emit_command` from `SetFragmentTexture` commands.
+    /// Populated in `emit_command` from fragment and vertex texture commands.
     /// Consumed by Rule A (`ensure_pass_open`) and
     /// `finalize_load_actions` to skip / revert `LoadAction::DontCare` on
     /// attachments whose content a sampler reads elsewhere in the frame,
@@ -1245,7 +1245,7 @@ pub struct PassState {
     /// entry leaves only through `unregister_texture`, when the `MTLTexture`
     /// behind the handle is destroyed.
     seen_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
-    /// Texture handles bound as a fragment sampler input so far THIS frame, in op-stream order.
+    /// Texture handles bound as a sampler input so far THIS frame, in op-stream order.
     ///
     /// Populated at the `emit_command` funnel beside
     /// `seen_sampled_textures`; unlike that session-wide set, this one is
@@ -2246,7 +2246,7 @@ impl PassState {
         format
     }
 
-    /// True when `handle` was bound as a fragment sampler input by an earlier draw this frame.
+    /// True when `handle` was bound as a sampler input by an earlier draw this frame.
     ///
     /// Drives texture rename-at-overlap: an upload into such a texture must go
     /// to a fresh `MTLTexture` (the upload blit executes frame-head, before
@@ -2461,10 +2461,7 @@ impl PassState {
         // cached-slot emit that bypassed its `LastBoundCache` gate.
         #[cfg(debug_assertions)]
         self.debug_emitted.record(&cmd);
-        if cmd.cmd == CommandType::SetFragmentTexture as u32 && cmd.param_b != 0 {
-            // SAFETY: SetFragmentTexture's param_b holds a non-null MTLTexture
-            // handle, packed from the encoder's typed cache via .raw().
-            let tex = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
+        if let Some(tex) = command_sampled_texture(&cmd) {
             self.seen_sampled_textures.insert(tex);
             self.frame_sampled_textures.insert(tex);
             // An sRGB twin bind reads its base texture's storage — record the
@@ -2479,7 +2476,8 @@ impl PassState {
             // stays empty when off; `take_cascade_frame_summary` then
             // returns an empty Vec and the encoder-side summary block
             // short-circuits without further work.
-            if log_enabled!(target: CASCADE_PROBE_TARGET, Level::Trace)
+            if cmd.cmd == CommandType::SetFragmentTexture as u32
+                && log_enabled!(target: CASCADE_PROBE_TARGET, Level::Trace)
                 && self.seen_sampleable_depth_textures.contains(&tex)
             {
                 *self.frame_cascade_samples.entry(tex).or_insert(0) += 1;
@@ -4177,7 +4175,7 @@ impl PassState {
     /// target removes the spurious pass entirely.
     ///
     /// A merge is safe iff no intervening pass reads the target (as a
-    /// fragment sampler input or as a blit source). If anything in
+    /// fragment or vertex sampler input, or as a blit source). If anything in
     /// between *would* observe the cleared content, the clear-only
     /// pass must materialise where it was originally placed.
     ///
@@ -4273,7 +4271,7 @@ impl PassState {
     ///
     /// The target color/depth must come back with `Load` so we can move
     /// Rule E's Clear into it. Bail on any intervening pass that reads
-    /// the target as a fragment sampler input, as a blit source, or
+    /// the target as a fragment or vertex sampler input, as a blit source, or
     /// attaches it in any colour slot without being the merge target (such a
     /// pass either overwrites whatever we'd move or draws content the move
     /// would wipe), and on any intervening leading blit or multisample
@@ -4437,7 +4435,7 @@ impl PassState {
         None
     }
 
-    /// Rule A correction — revert `Load = DontCare` on attachments a fragment sampler reads.
+    /// Rule A correction: revert `Load = DontCare` on attachments a sampler reads.
     ///
     /// The revert fires whenever the attachment's content is read
     /// elsewhere in this frame. `ensure_pass_open` decides the load
@@ -4518,8 +4516,8 @@ impl PassState {
     /// provably overwrites the prior contents, so storing them is
     /// wasted bandwidth.
     ///
-    /// Both rules skip the flip when the texture is bound as a fragment
-    /// sampler somewhere in the frame (`seen_sampled_textures`): the
+    /// Both rules skip the flip when the texture is bound as a sampler
+    /// somewhere in the frame (`seen_sampled_textures`): the
     /// sampler reads VRAM at draw time, so `DontCare` would discard the
     /// content it expects (CSM cascade written here, sampled in the
     /// scene pass).
@@ -4808,8 +4806,8 @@ impl PassState {
 
 /// True if `pass` would observe the contents of `target_handle`.
 ///
-/// Either as a fragment-sampler input inside the pass (the typical
-/// case) or as a leading blit's source texture. Used by
+/// Either as a fragment- or vertex-sampler input inside the pass, or as a
+/// leading blit's source texture. Used by
 /// `coalesce_clear_only_passes` to decide whether moving a Clear past
 /// this pass is safe: if the pass reads the pre-Clear contents, the
 /// merge changes observable behaviour and is rejected.
@@ -4825,19 +4823,15 @@ fn pass_reads_texture(
         return false;
     }
     let target_raw = target_handle.raw();
-    let sampler_reads = pass.commands.iter().any(|c| {
-        if c.cmd != CommandType::SetFragmentTexture as u32 {
+    let sampler_reads = pass.commands.iter().any(|command| {
+        let Some(texture) = command_sampled_texture(command) else {
             return false;
-        }
-        if c.param_b == target_raw {
+        };
+        if texture == target_handle {
             return true;
         }
         // A bind of the target's sRGB twin view reads the same storage.
-        // SAFETY: SetFragmentTexture's param_b holds a non-null MTLTexture
-        // handle, packed from the encoder's typed cache via .raw().
-        !srgb_twin_to_base.is_empty()
-            && srgb_twin_to_base.get(&unsafe { MetalHandle::new(c.param_b) })
-                == Some(&target_handle)
+        !srgb_twin_to_base.is_empty() && srgb_twin_to_base.get(&texture) == Some(&target_handle)
     });
     if sampler_reads {
         return true;
@@ -4849,6 +4843,18 @@ fn pass_reads_texture(
             Some(BlitCommandType::GenerateMipmaps) => b.dst_handle == target_raw,
             _ => false,
         })
+}
+
+/// Return the texture view a real sampler bind reads.
+const fn command_sampled_texture(command: &Command) -> Option<MetalHandle<MTLTextureKind>> {
+    let is_texture_bind = command.cmd == CommandType::SetFragmentTexture as u32
+        || command.cmd == CommandType::SetVertexTexture as u32;
+    if !is_texture_bind || command.param_b == 0 {
+        return None;
+    }
+    // SAFETY: Both texture-bind commands store a non-null MTLTexture handle
+    // in param_b, packed from the encoder's typed cache via .raw().
+    Some(unsafe { MetalHandle::new(command.param_b) })
 }
 
 /// True if `pass` resolves one of its colour attachments into `target_handle`.

@@ -732,6 +732,55 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
 }
 
 #[test]
+fn vertex_texture_fetch_keeps_intra_frame_versions() {
+    // The upload after the left draw is ordered before the right draw. The
+    // encoder executes uploads at frame start, so it must rename the sampled
+    // Metal texture to keep the later bytes out of the earlier draw.
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    tex.lock_rect(0, 0).write_u32(&[0xFFFF_0000]);
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(-0.5)),
+            0,
+            "left draw"
+        );
+        tex.lock_rect(0, 0).write_u32(&[0xFF00_FF00]);
+        assert_eq!(d.set_texture(257, &tex), 0, "rebind vertex sampler 0");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+            0,
+            "right draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 264),
+        0xFFFF_0000,
+        "the first draw keeps the texture bytes current at that draw"
+    );
+    assert_eq!(
+        h.read_pixel(480, 264),
+        0xFF00_FF00,
+        "the second draw sees the texture upload issued between the draws"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
+#[test]
 fn vertex_texture_fetch_follows_the_bound_kind_not_the_declaration() {
     // A vs_3_0 may declare one sampler kind and sample another: native
     // drivers read the texture the game bound and ignore the dcl. Metal
