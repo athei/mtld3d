@@ -299,6 +299,8 @@ case "${1:-}" in
         'extern "stdcall"' "$file"
     banned 'msg_send!|(^|[^_A-Za-z0-9])class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
         'untyped Obj-C selector' "$file"
+    banned 'MainThreadMarker::new_unchecked' 'AppKit work runs on the main thread' \
+        'unchecked MainThreadMarker: dispatch to the main thread and use MainThreadMarker::new().expect(..)' "$file"
     banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
         'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$file"
     banned 'DefaultHasher|RandomState' 'FxHash for maps, xxh3 for content' \
@@ -362,6 +364,8 @@ banned 'extern "stdcall"' 'extern "system" everywhere, not extern "stdcall"' \
     'extern "stdcall"' "$@"
 banned 'msg_send!|(^|[^_A-Za-z0-9])class!\(|sel!\(' 'No raw msg_send! — use typed objc2-* bindings' \
     'untyped Obj-C selector' "$@"
+banned 'MainThreadMarker::new_unchecked' 'AppKit work runs on the main thread' \
+    'unchecked MainThreadMarker: dispatch to the main thread and use MainThreadMarker::new().expect(..)' "$@"
 banned '(^|[^A-Za-z0-9_])Hash(Map|Set)([^A-Za-z0-9_]|$)' 'FxHash for maps, xxh3 for content' \
     'std HashMap/HashSet: use rustc_hash::FxHashMap / FxHashSet' "$@"
 banned 'DefaultHasher|RandomState' 'FxHash for maps, xxh3 for content' \

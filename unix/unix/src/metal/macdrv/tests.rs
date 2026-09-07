@@ -13,7 +13,10 @@
 //! their two neighbours in the same reconciliation. All four are the whole of
 //! the display-follow decision, so the tests below pin both directions of a
 //! display change, the user's off switch, the degenerate ceilings, and the
-//! case that must *not* reconfigure.
+//! case that must *not* reconfigure. A Reset that flips the guest's
+//! `PresentationInterval` reaches the throttle through the same
+//! reconciliation with the panel unchanged, so both directions of that flip
+//! and the user cap that holds through it are pinned there too.
 //!
 //! `screen_params_filter_step` decides what one attempt to take
 //! `NSApplicationDidChangeScreenParametersNotification` over from Wine does.
@@ -224,6 +227,63 @@ fn a_free_running_session_stays_unthrottled_on_any_panel() {
     let applied = min_present_duration(120.0, &pacing);
     assert_eq!(applied.to_bits(), 0.0_f64.to_bits());
     assert_eq!(min_present_duration_change(applied, 60.0, &pacing), None);
+}
+
+#[test]
+fn a_reset_to_immediate_lifts_the_throttle() {
+    let vsync = PresentPacing {
+        vsync_requested: true,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(60.0, &vsync);
+    assert_eq!(applied.to_bits(), (1.0_f64 / 60.0).to_bits());
+    let immediate = PresentPacing {
+        vsync_requested: false,
+        max_fps: 0,
+    };
+    let changed = min_present_duration_change(applied, 60.0, &immediate).expect("the pacing moved");
+    assert_eq!(changed.to_bits(), 0.0_f64.to_bits());
+}
+
+#[test]
+fn a_reset_back_to_vsync_restores_the_panel_throttle() {
+    let immediate = PresentPacing {
+        vsync_requested: false,
+        max_fps: 0,
+    };
+    let applied = min_present_duration(60.0, &immediate);
+    assert_eq!(applied.to_bits(), 0.0_f64.to_bits());
+    let vsync = PresentPacing {
+        vsync_requested: true,
+        max_fps: 0,
+    };
+    let changed = min_present_duration_change(applied, 60.0, &vsync).expect("the pacing moved");
+    assert_eq!(changed.to_bits(), (1.0_f64 / 60.0).to_bits());
+}
+
+#[test]
+fn a_user_cap_holds_the_throttle_through_a_vsync_flip() {
+    // The cap is the lower rate whichever way the guest's interval goes, so
+    // the duration the present site uses does not move in either direction.
+    let capped_vsync = PresentPacing {
+        vsync_requested: true,
+        max_fps: 30,
+    };
+    let capped_immediate = PresentPacing {
+        vsync_requested: false,
+        max_fps: 30,
+    };
+    let applied = min_present_duration(60.0, &capped_vsync);
+    assert_eq!(applied.to_bits(), (1.0_f64 / 30.0).to_bits());
+    assert_eq!(
+        min_present_duration_change(applied, 60.0, &capped_immediate),
+        None
+    );
+    let applied = min_present_duration(60.0, &capped_immediate);
+    assert_eq!(
+        min_present_duration_change(applied, 60.0, &capped_vsync),
+        None
+    );
 }
 
 #[test]

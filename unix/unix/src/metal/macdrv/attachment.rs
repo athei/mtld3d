@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use std::sync::{Arc, LazyLock, Mutex};
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
-use objc2::rc::Retained;
+use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
 use crate::metal::command::{GeometryStreak, PresentGeometry};
@@ -157,8 +157,9 @@ pub struct Attachment {
     ///
     /// The longer of the vsync-equivalent cap (`1 / panel_max_hz`) and the
     /// user's `present.maxFps` cap. Set at attach from the panel under the
-    /// window; the D3D9 Reset path re-queries the panel and overwrites, and
-    /// the display-follow path re-derives it for another panel.
+    /// window, and after that written only by the main-thread
+    /// reconciliation, which re-derives it for the panel the window is on
+    /// now whenever the display or the pacing a Reset latched moved.
     min_present_duration_bits: AtomicU64,
     /// Present pacing latched from the PE side, encoded by `pack_pacing`.
     ///
@@ -307,6 +308,31 @@ impl Attachment {
             .store(false, Ordering::Release);
     }
 
+    /// A Reset re-paced this record: make a reconciliation due now, and say whether to queue it.
+    ///
+    /// The pacing the record now carries reaches the present throttle only
+    /// through the main-thread reconciliation, so the present counter is set
+    /// to already due before the pending flag is tried. `true` when no refresh
+    /// is in flight: the caller queues one, and the counter restarts with it
+    /// so the Reset costs one refresh, not one plus the next present's.
+    /// `false` while a refresh queued earlier has not run yet; that one may
+    /// have read the pacing before the Reset wrote it, and the counter left
+    /// due makes the next present queue another as soon as it reports back.
+    pub fn request_refresh(&self) -> bool {
+        self.presents_since_headroom_refresh
+            .store(HEADROOM_REFRESH_PRESENTS, Ordering::Relaxed);
+        if self
+            .headroom_refresh_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.presents_since_headroom_refresh
+            .store(0, Ordering::Relaxed);
+        true
+    }
+
     /// The present throttle in seconds, `0.0` = none.
     #[must_use]
     pub fn min_present_duration_sec(&self) -> f64 {
@@ -408,8 +434,14 @@ pub fn live() -> Vec<Arc<Attachment>> {
 
 /// Retain the record's `NSView`, or `None` once it is no longer live.
 ///
-/// **Main thread only**, because the caller goes on to walk the view.
-pub fn retain_view(att: &Arc<Attachment>) -> Option<Retained<objc2_app_kit::NSView>> {
+/// The marker is the caller's proof that it is on the main thread, where it
+/// goes on to walk the view; the registry only answers whether the record is
+/// still live. This and [`retain_layer`] are the only places a view or a
+/// layer is resurrected from the address a record holds.
+pub fn retain_view(
+    att: &Arc<Attachment>,
+    _mtm: MainThreadMarker,
+) -> Option<Retained<objc2_app_kit::NSView>> {
     let map = lock();
     if !is_live(&map, att) {
         return None;
@@ -423,8 +455,13 @@ pub fn retain_view(att: &Arc<Attachment>) -> Option<Retained<objc2_app_kit::NSVi
 
 /// Retain the record's `CAMetalLayer`, or `None` once it is no longer live.
 ///
-/// **Main thread only**, for the same reason [`retain_view`] is.
-pub fn retain_layer(att: &Arc<Attachment>) -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
+/// The marker is the caller's proof that it is on the main thread, where it
+/// goes on to configure the layer, for the same reason [`retain_view`] takes
+/// one.
+pub fn retain_layer(
+    att: &Arc<Attachment>,
+    _mtm: MainThreadMarker,
+) -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
     let map = lock();
     if !is_live(&map, att) {
         return None;
