@@ -2787,6 +2787,8 @@ impl PassState {
     /// render-target binding, viewport and per-draw dedup cache are all
     /// untouched.
     ///
+    /// `leading_blits` carries the uploads and preservation copies issued
+    /// since the preceding upload pass, so both upload forms keep API order.
     /// The upload lands at the head of the frame, where the blit uploads it
     /// replaces already land: a draw earlier in the frame that sampled the
     /// destination is served by the encoder's texture rename, exactly as
@@ -2798,7 +2800,12 @@ impl PassState {
     /// the attachment instead of discarding it (Rule A), and the sampled set
     /// so the pass's own colour store survives (Rules C/D) even in a frame
     /// where nothing samples the texture.
-    pub fn push_upload_pass(&mut self, target: &UploadPassTarget, commands: &[Command]) {
+    pub fn push_upload_pass(
+        &mut self,
+        target: &UploadPassTarget,
+        commands: &[Command],
+        leading_blits: Vec<BlitCommand>,
+    ) {
         let (x, y, w, h) = target.rect;
         let covers = x == 0 && y == 0 && w == target.size.0 && h == target.size.1;
         let color_load = if ENABLE_FIRST_USE_DONTCARE && covers {
@@ -2839,7 +2846,7 @@ impl PassState {
             depth_resolve_filter: DepthResolveFilter::Sample0,
             viewport: (x, y, w, h),
             commands: cmds,
-            leading_blits: Vec::new(),
+            leading_blits,
             has_counting_visibility: false,
             depth_is_sampleable: false,
             // The quad writes colour, so Rule H must not strip the attachment
@@ -2866,6 +2873,12 @@ impl PassState {
                 target.size.1,
             );
         }
+    }
+
+    /// Number of upload passes preceding the application's passes.
+    #[must_use]
+    pub const fn upload_pass_count(&self) -> usize {
+        self.upload_pass_end
     }
 
     /// Queue a blit to run before the *next* pass that opens.

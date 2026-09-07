@@ -391,61 +391,61 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
         cmd_buf.setLabel(Some(&label));
     }
 
-    if params.blit_commands_ptr != 0 && params.blit_command_count > 0 {
-        // SAFETY: PE supplied `blit_commands_ptr` as a `[BlitCommand; count]`
-        // valid for the call duration per the SubmitFrame wire contract.
-        let blits = unsafe {
+    if params.upload_pass_count > params.pass_count
+        || (params.pass_count != 0 && params.passes_ptr == 0)
+        || (params.blit_command_count != 0 && params.blit_commands_ptr == 0)
+    {
+        error!(target: LOG_TARGET, "submit_frame: invalid upload prefix or command array");
+        return false;
+    }
+    let blits = if params.blit_command_count == 0 {
+        &[]
+    } else {
+        // SAFETY: PE supplied a non-null array of `blit_command_count`
+        // commands, owned by the frame payload until this call returns.
+        unsafe {
             core::slice::from_raw_parts(
                 params.blit_commands_ptr as *const BlitCommand,
                 params.blit_command_count as usize,
             )
-        };
-        if params.upload_coherent_seq_ptr != 0 {
-            // Separate-upload-CB path: encode the frame-leading blits
-            // into their OWN command buffer committed *before* the draw
-            // `cmd_buf`. Metal's queue is
-            // in-order, so the partial order "all frame-leading blits
-            // before all passes" is preserved (same-frame draws still see
-            // the uploaded texels) — but this CB retires as soon as the
-            // blits finish, ~a frame before the draw CB, and its
-            // completion handler advances the PE-side
-            // `upload_coherent_seq`. That lets the next frame's texture
-            // `LockRect` observe the staging as retired and write in place
-            // instead of renaming + memcpying. The draw `cmd_buf` keeps
-            // its own `coherent_seq` handler (below) for VB/IB + draws.
-            if !submit_upload_cmd_buf(
-                &queue,
-                blits,
-                params.blit_commands_need_encoder != 0,
-                params.submit_seq,
-                params.upload_coherent_seq_ptr,
-                params.failed_submit_seq_ptr,
-            ) {
-                return false;
-            }
-        } else if !encode_leading_blits(
-            &cmd_buf,
-            blits,
-            params.blit_commands_need_encoder != 0,
-            BlitSite::FrameLeading,
-        ) {
-            return false;
         }
-    }
-
-    if params.passes_ptr != 0 && params.pass_count > 0 {
-        // SAFETY: PE supplied `passes_ptr` as a `[PassDescriptor; pass_count]`
-        // valid for the call duration per the SubmitFrame wire contract.
-        let passes = unsafe {
+    };
+    let passes = if params.pass_count == 0 {
+        &[]
+    } else {
+        // SAFETY: PE supplied a non-null array of `pass_count` descriptors,
+        // owned by the frame payload until this call returns.
+        unsafe {
             core::slice::from_raw_parts(
                 params.passes_ptr as *const PassDescriptor,
                 params.pass_count as usize,
             )
-        };
-        for (pass_idx, pass) in passes.iter().enumerate() {
-            if !encode_pass(&cmd_buf, pass, pass_idx) {
-                return false;
-            }
+        }
+    };
+    let upload_pass_count = params.upload_pass_count as usize;
+    let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
+        if (!blits.is_empty() || upload_pass_count != 0)
+            && !submit_upload_cmd_buf(&queue, blits, &passes[..upload_pass_count], params)
+        {
+            return false;
+        }
+        upload_pass_count
+    } else {
+        if !blits.is_empty()
+            && !encode_leading_blits(
+                &cmd_buf,
+                blits,
+                params.blit_commands_need_encoder != 0,
+                BlitSite::FrameLeading,
+            )
+        {
+            return false;
+        }
+        0
+    };
+    for (pass_idx, pass) in passes.iter().enumerate().skip(draw_pass_start) {
+        if !encode_pass(&cmd_buf, pass, pass_idx) {
+            return false;
         }
     }
 
@@ -772,15 +772,16 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
 /// same sequence has a distinct key. CPU failure can leave this buffer
 /// committed without a draw buffer, and must wait for it and its handler
 /// before releasing the PE backing or either callback sink.
-/// Returns `false` if command-buffer creation or blit encoding failed.
+/// Render uploads and their interleaved blits share this buffer, so its
+/// retirement covers every staging read. Returns `false` on creation or encoding failure.
 fn submit_upload_cmd_buf(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     blits: &[BlitCommand],
-    need_encoder: bool,
-    submit_seq: u64,
-    upload_coherent_seq_ptr: u64,
-    failed_submit_seq_ptr: u64,
+    passes: &[PassDescriptor],
+    params: &SubmitFrameParams,
 ) -> bool {
+    let submit_seq = params.submit_seq;
+    let upload_coherent_seq_ptr = params.upload_coherent_seq_ptr;
     mtld3d_shared::crumb!("submit:upcmdbuf");
     let Some(upload_cb) = queue.commandBuffer() else {
         error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
@@ -790,19 +791,31 @@ fn submit_upload_cmd_buf(
         let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
         upload_cb.setLabel(Some(&label));
     }
-    if !encode_leading_blits(&upload_cb, blits, need_encoder, BlitSite::FrameLeading) {
+    if !blits.is_empty()
+        && !encode_leading_blits(
+            &upload_cb,
+            blits,
+            params.blit_commands_need_encoder != 0,
+            BlitSite::FrameLeading,
+        )
+    {
         return false;
+    }
+    for (pass_idx, pass) in passes.iter().enumerate() {
+        if !encode_pass(&upload_cb, pass, pass_idx) {
+            return false;
+        }
     }
     if submit_seq > 0 {
         let atomic_ptr = usize::try_from(upload_coherent_seq_ptr)
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = submit_seq;
-        let failed_seq_ptr = failed_submit_seq_ptr;
+        let failed_seq_ptr = params.failed_submit_seq_ptr;
         let handler = RcBlock::new(
             move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                // Tripwire: this command buffer carries every frame-leading
-                // blit, so an abort here loses texture uploads and `Staged`
-                // VB/IB dirty-range copies rather than rendering. Nothing
+                // This buffer carries every upload pass and blit, so an
+                // abort loses texture uploads and `Staged` VB/IB dirty-range
+                // copies. Nothing
                 // in the API stream ever re-announces them, so the loss is
                 // permanent unless the PE side replays it: record the seq
                 // before the retirement bump (both `Release`, so a reader
@@ -2117,11 +2130,9 @@ fn encode_pass(
     let to_u32 =
         |v: u64| u32::try_from(v).expect("PE wire u64 low-half fits u32 by packing contract");
     mtld3d_shared::crumb!("pass:enter", pass_idx as u64, pass.command_count);
-    // Per-pass leading blits: a `StretchRect` between two D3D9 draws
-    // queues a `BlitCommand` against the *next* pass to open, so it
-    // orders correctly between the source pass's draws and this pass's
-    // draws. Runs in its own `MTLBlitCommandEncoder` before the render
-    // encoder begins.
+    // Leading blits order uploads before their dependent upload pass,
+    // or a surface copy between the application's render passes. A
+    // notification-only list needs no MTLBlitCommandEncoder.
     if pass.leading_blits_ptr != 0 && pass.leading_blits_count > 0 {
         // SAFETY: PE supplied `leading_blits_ptr` as a `[BlitCommand; n]`
         // valid for the call duration per the PassDescriptor wire contract.

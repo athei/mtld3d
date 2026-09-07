@@ -2025,10 +2025,10 @@ impl TextureInner {
     /// A blit upload reads the staging from the frame-leading blit command
     /// buffer, which is committed before the draw command buffer and retires
     /// ~a frame earlier, so `upload_coherent_seq` frees the staging sooner. A
-    /// mip the encoder writes with the GPU upload pass instead is read by a
-    /// render pass on the draw command buffer, so it must wait for
-    /// `coherent_seq`. The predicate mirrors the encoder's own upload-path
-    /// choice, off the same format pair, mip pitch and device alignment.
+    /// mip the encoder writes with a GPU upload pass conservatively waits
+    /// for `coherent_seq`, which also covers the upload command buffer.
+    /// The predicate mirrors the encoder's upload-path choice, off the same
+    /// format pair, mip pitch and device alignment.
     fn staging_coherent_seq(&self, level: usize) -> u64 {
         if self.device_inner == 0 {
             return 0;
