@@ -1055,6 +1055,11 @@ pub struct FrameEncoder {
 
     // Persistent caches (survive across frames)
     device_handle: MetalHandle<MTLDeviceKind>,
+    /// The device's frame queue, adopted from each frame alongside `device_handle`.
+    ///
+    /// Carried into `CreateTexturesBatch`: a creation-time clear has to be
+    /// encoded on the queue the frames run on to be ordered ahead of them.
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
     pipeline_cache: FxHashMap<PipelineKey, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-format-combo "clear-quad" pipeline handles.
@@ -1602,6 +1607,7 @@ impl FrameEncoder {
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
             device_handle: MetalHandle::NULL,
+            queue_handle: MetalHandle::NULL,
             depth_stencil_cache: FxHashMap::default(),
             pipeline_cache: FxHashMap::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
@@ -1681,6 +1687,7 @@ impl FrameEncoder {
             u32::try_from(descs.len()).expect("batch_create_textures: descs.len() exceeds u32");
         let mut params = CreateTexturesBatchParams {
             device_handle: self.device_handle,
+            queue_handle: self.queue_handle,
             count,
             pad0: 0,
             descs_ptr: descs.as_ptr() as u64,
@@ -1736,6 +1743,17 @@ impl FrameEncoder {
         // what the upload path selects per upload, so an upload never finds a
         // texture without the usage.
         let mut usage_flags = info.usage_flags;
+        // Read from the application's own usage, before the OR below: that
+        // one marks a texture whose upload needs an attachment, and an upload
+        // defines the pixels it writes. Depth is excluded although its usage
+        // carries the render-target bit, since D3D9 leaves depth contents
+        // undefined and the frame-end discard already takes that licence.
+        let mut flags = info.create_flags;
+        flags.set(
+            TextureCreateFlags::CLEAR_ON_CREATE,
+            usage_flags.contains(TextureUsage::RENDER_TARGET)
+                && !usage_flags.contains(TextureUsage::DEPTH_STENCIL),
+        );
         if mtld3d_core::upload_pass::needs_render_target(
             info.d3d_format,
             info.pixel_format,
@@ -1753,7 +1771,7 @@ impl FrameEncoder {
             levels: info.levels,
             pixel_format: info.pixel_format,
             storage_mode,
-            flags: info.create_flags,
+            flags,
             swizzle_r: info.swizzle[0],
             swizzle_g: info.swizzle[1],
             swizzle_b: info.swizzle[2],
@@ -2371,6 +2389,7 @@ impl FrameEncoder {
         self.backbuffer_width = frame.backbuffer_width;
         self.backbuffer_height = frame.backbuffer_height;
         self.device_handle = frame.device_handle;
+        self.queue_handle = frame.queue_handle;
         self.perf.begin_frame(frame.perf());
         // Drain VB/IB retention entries whose seq has retired on the
         // GPU. Intake of *this* frame's entries is deferred to

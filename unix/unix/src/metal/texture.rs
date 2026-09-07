@@ -45,18 +45,12 @@ fn mint<T: objc2::Message>(texture: Retained<T>) -> u64 {
 
 /// Creates a persistent `BGRA8Unorm` render target texture for use as a backbuffer.
 ///
-/// The new texture is cleared to opaque black before it is returned. A
-/// fresh `MTLTexture` has undefined contents, and the back buffer is
-/// presentable before the application's first draw or clear reaches it
-/// (a `Present` with no rendering is legal D3D9, and routine right after
-/// a `Reset`). D3D9 leaves post-`Reset` contents formally undefined, but
-/// real drivers hand out zeroed surfaces, and applications visibly rely
-/// on that during scene transitions. The clear is encoded on the frame
-/// queue, so commit order is the fence: every later frame command buffer
-/// observes a black back buffer, with no CPU wait.
+/// The caller passes the result to [`clear_new_color_textures`] before the
+/// handle reaches the PE side: the back buffer is presentable before the
+/// application's first draw or clear reaches it (a `Present` with no
+/// rendering is legal D3D9, and routine right after a `Reset`).
 pub fn create_backbuffer(
     device_handle: MetalHandle<MTLDeviceKind>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
     width: u32,
     height: u32,
 ) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
@@ -85,7 +79,6 @@ pub fn create_backbuffer(
         PixelFormat::Bgra8Unorm,
         "mtld3d-backbuffer",
     )?;
-    clear_texture_black(queue_handle, &texture);
     let srgb_handle = srgb_twin_view(
         &texture,
         PixelFormat::Bgra8Unorm,
@@ -185,52 +178,133 @@ fn srgb_twin_view(
     mint(view)
 }
 
-/// Clear a freshly created render target to opaque black.
+/// The contents a fresh colour texture starts with.
 ///
-/// One empty render pass with `LoadAction::Clear` in its own command
-/// buffer. Runs on the creation paths only (device create, `Reset`,
-/// auto-resize), so cost is irrelevant. Failure to encode leaves the
-/// texture with undefined contents, which is what creation produced
-/// anyway, so it is logged and tolerated rather than failing creation.
-fn clear_texture_black(
+/// Transparent black, which is what a zeroed allocation reads as, alpha
+/// included. The back buffer takes [`OPAQUE_BLACK`] instead: it can be
+/// presented before anything draws into it, and a presented surface owes an
+/// opaque alpha.
+pub const TRANSPARENT_BLACK: MTLClearColor = MTLClearColor {
+    red: 0.0,
+    green: 0.0,
+    blue: 0.0,
+    alpha: 0.0,
+};
+
+/// The back buffer's creation contents. See [`TRANSPARENT_BLACK`].
+pub const OPAQUE_BLACK: MTLClearColor = MTLClearColor {
+    red: 0.0,
+    green: 0.0,
+    blue: 0.0,
+    alpha: 1.0,
+};
+
+/// Clear freshly created colour textures to `clear_color`.
+///
+/// Why a texture has to start defined is on
+/// [`TextureCreateFlags::CLEAR_ON_CREATE`], the wire value both sides read.
+/// This is the one place the ordering rule is stated.
+///
+/// One empty render pass with `LoadAction::Clear` per subresource, all of
+/// them in one command buffer on the frame queue, so commit order is the
+/// fence: every later frame command buffer observes the cleared texture and
+/// no CPU wait is involved.
+///
+/// Each texture must carry `RenderTarget` usage and a renderable pixel
+/// format. A null handle is skipped, so a caller can pass an optional
+/// companion without testing it first. Failure to encode leaves the contents
+/// undefined, which is what creation produced anyway, so it is logged and
+/// tolerated rather than failing the create.
+pub fn clear_new_color_textures(
     queue_handle: MetalHandle<MTLCommandQueueKind>,
-    texture: &ProtocolObject<dyn MTLTexture>,
+    handles: &[MetalHandle<MTLTextureKind>],
+    clear_color: MTLClearColor,
 ) {
+    let textures: Vec<_> = handles
+        .iter()
+        .filter_map(|handle| handle.into_retained())
+        .collect();
+    if textures.is_empty() {
+        return;
+    }
     let Some(queue) = queue_handle.into_retained() else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "create_backbuffer: no queue for the creation-time clear; \
-             the new backbuffer starts with undefined contents",
+            "clear_new_color_textures: no queue for the creation-time clear; \
+             the new texture starts with undefined contents",
         );
         return;
     };
     let Some(cmd_buf) = queue.commandBuffer() else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "create_backbuffer: commandBuffer() returned nil for the creation-time \
-             clear; the new backbuffer starts with undefined contents",
+            "clear_new_color_textures: commandBuffer() returned nil for the creation-time \
+             clear; the new texture starts with undefined contents",
         );
         return;
     };
-    let pass_desc = MTLRenderPassDescriptor::new();
-    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
-    // subscript 0 is always valid.
-    let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
-    color0.setTexture(Some(texture));
-    color0.setLoadAction(MTLLoadAction::Clear);
-    color0.setClearColor(MTLClearColor {
-        red: 0.0,
-        green: 0.0,
-        blue: 0.0,
-        alpha: 1.0,
-    });
-    color0.setStoreAction(MTLStoreAction::Store);
-    if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
-        let label = objc2_foundation::NSString::from_str("mtld3d-backbuffer-init-clear");
-        enc.setLabel(Some(&label));
-        enc.endEncoding();
+    let cmd_label = objc2_foundation::NSString::from_str("mtld3d-init-clear");
+    cmd_buf.setLabel(Some(&cmd_label));
+    for texture in &textures {
+        clear_one_texture(&cmd_buf, texture, clear_color);
     }
     cmd_buf.commit();
+}
+
+/// Encode the clear passes of one texture into an open command buffer.
+///
+/// A cube reports `arrayLength() == 1` while carrying six addressable faces,
+/// so its slice count is the constant rather than the reported length.
+fn clear_one_texture(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    clear_color: MTLClearColor,
+) {
+    let slices = if texture.textureType() == MTLTextureType::TypeCube {
+        6
+    } else {
+        texture.arrayLength()
+    };
+    let name = texture
+        .label()
+        .map_or_else(|| String::from("mtld3d-texture"), |label| label.to_string());
+    // No volume carries the flag today, since only the 2D and cube creates set
+    // the render-target usage it keys on. The plane walk stays anyway: a
+    // partly cleared texture is the defect this exists to stop.
+    for level in 0..texture.mipmapLevelCount() {
+        let planes = (texture.depth() >> level).max(1);
+        for slice in 0..slices {
+            for plane in 0..planes {
+                let pass_desc = MTLRenderPassDescriptor::new();
+                // SAFETY: `colorAttachments()` returns a non-null descriptor
+                // array; subscript 0 is always valid.
+                let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+                color0.setTexture(Some(texture));
+                color0.setLevel(level);
+                color0.setSlice(slice);
+                color0.setDepthPlane(plane);
+                color0.setLoadAction(MTLLoadAction::Clear);
+                color0.setClearColor(clear_color);
+                color0.setStoreAction(MTLStoreAction::Store);
+                if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
+                    // One batch clears the whole render-target working set, so
+                    // each pass names its texture and subresource: a capture is
+                    // how anyone answers which surface a stray pixel came from.
+                    let label = objc2_foundation::NSString::from_str(&format!(
+                        "{name}-init-clear-l{level}s{slice}p{plane}"
+                    ));
+                    enc.setLabel(Some(&label));
+                    enc.endEncoding();
+                } else {
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "clear_new_color_textures: no encoder for the creation-time clear; \
+                         the new texture starts with undefined contents",
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Creates a standalone depth/stencil texture for `CreateDepthStencilSurface`.

@@ -666,6 +666,18 @@ bitflags! {
         const HAS_SWIZZLE = 1 << 0;
         const TYPE_3D = 1 << 1;
         const TYPE_CUBE = 1 << 2;
+        /// Zero every subresource before handing the texture back.
+        ///
+        /// Set for a colour texture whose pixels are draw output rather than
+        /// upload: nothing else ever writes it, so whatever a draw leaves
+        /// untouched is what the application reads. A fresh `MTLTexture`
+        /// carries whatever its memory last held, while D3D9 hands out a
+        /// surface whose pixels are defined, and applications rely on that:
+        /// a `Present` before the first draw, a scene transition through a
+        /// `Reset`, an effect target composited in full but only ever drawn
+        /// into in part. Without this, such a target is sampled and
+        /// presented carrying another resource's content.
+        const CLEAR_ON_CREATE = 1 << 3;
     }
 }
 

@@ -27,6 +27,9 @@ const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
 const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
+const MAGENTA: u32 = 0xFFFF_00FF;
+/// What a colour render target reads as before anything draws into it.
+const FRESH: u32 = 0x0000_0000;
 
 /// `left`/`top`/`right`/`bottom` in surface coordinates.
 const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
@@ -3114,6 +3117,43 @@ fn read_surface_pixel(h: &Harness, surface: &mtld3d_tests::Surface<'_>, x: u32, 
     locked.as_u32(idx + 1)[idx]
 }
 
+/// The distinct pixel values on `surface`, ascending, at most `CAP` + 1.
+///
+/// The whole-extent counterpart of [`read_surface_pixel`], for the questions
+/// a sample of one pixel cannot answer: a single row or column that differs
+/// from the rest shows up as a second entry. The cap is what keeps a failure
+/// reportable: a surface of recycled contents holds thousands of distinct
+/// values, and every caller only needs to see that more than one is there.
+fn surface_colors(h: &Harness, surface: &mtld3d_tests::Surface<'_>) -> Vec<u32> {
+    const CAP: usize = 8;
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, 0, "GetDesc for surface_colors");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(surface, &sysmem),
+        0,
+        "GetRenderTargetData for surface_colors"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((desc.height * pitch_px) as usize);
+    let mut colors = std::collections::BTreeSet::new();
+    for y in 0..desc.height {
+        for x in 0..desc.width {
+            colors.insert(pixels[(y * pitch_px + x) as usize]);
+            if colors.len() > CAP {
+                return colors.into_iter().collect();
+            }
+        }
+    }
+    colors.into_iter().collect()
+}
+
 /// Draw a full-target triangle in `color` through the diffuse channel.
 fn draw_fill(h: &Harness, color: u32) {
     // Lighting defaults on and would replace the diffuse with black.
@@ -5004,5 +5044,171 @@ fn get_render_target_data_from_a_cube_face_reads_that_face() {
         read_surface_pixel(&h, &face0, 1, 1),
         RED,
         "face 0 still reads its own fill"
+    );
+}
+
+#[test]
+fn a_fresh_render_target_starts_black() {
+    // A render target reaches the application with its pixels already
+    // defined. Nothing uploads one, so the pixels a draw does not cover are
+    // whatever creation left there, and a title that composites a target in
+    // full while only ever drawing part of it puts those on screen. D3D9
+    // leaves the contents formally undefined, but the surfaces real drivers
+    // hand out read as black, and titles are built against that.
+    //
+    // Painting targets and releasing them first gives the allocator blocks
+    // with known contents to hand back, which makes an undefined target
+    // read as the previous one's magenta rather than as black. It makes the
+    // difference likely to show, not certain: what proves the test bites is
+    // that it fails with the create flag forced off.
+    const EDGE: u32 = 256;
+    let h = Harness::new();
+    for _ in 0..4 {
+        let painted = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+        assert_eq!(h.color_fill_hr(&painted, MAGENTA), D3D_OK, "paint a target");
+        // Read it back before it retires: the fill has to have reached the
+        // texture for its memory to carry magenta into the next create.
+        assert_eq!(
+            read_surface_pixel(&h, &painted, 0, 0),
+            MAGENTA,
+            "the painted target holds its fill",
+        );
+        drop(painted);
+        // A released target's texture retires on a frame boundary, so its
+        // memory is only back with the allocator once a frame has gone by.
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        surface_colors(&h, &fresh),
+        vec![FRESH],
+        "a freshly created render target is zeroed over its whole extent",
+    );
+}
+
+#[test]
+fn a_fresh_render_target_texture_starts_black() {
+    // The `CreateTexture(D3DUSAGE_RENDERTARGET)` half of
+    // `a_fresh_render_target_starts_black`, which reaches Metal through the
+    // batched texture create rather than the standalone colour-target thunk.
+    // Its mip chain is part of the claim: a game samples a level the draws
+    // never rendered into, so every level starts defined, not only level 0.
+    const EDGE: u32 = 256;
+    const LEVELS: u32 = 3;
+    let h = Harness::new();
+    for _ in 0..4 {
+        let painted = h.create_texture(
+            EDGE,
+            EDGE,
+            LEVELS,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        for level in 0..LEVELS {
+            let surface = painted.surface_level(level);
+            assert_eq!(
+                h.color_fill_hr(&surface, MAGENTA),
+                D3D_OK,
+                "paint a render-target texture level",
+            );
+            assert_eq!(
+                read_surface_pixel(&h, &surface, 0, 0),
+                MAGENTA,
+                "the painted level holds its fill",
+            );
+        }
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_texture(
+        EDGE,
+        EDGE,
+        LEVELS,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    for level in 0..LEVELS {
+        assert_eq!(
+            surface_colors(&h, &fresh.surface_level(level)),
+            vec![FRESH],
+            "level {level} of a freshly created render-target texture is zeroed",
+        );
+    }
+}
+
+#[test]
+fn a_render_target_row_no_draw_covers_reads_black() {
+    // The shape the defect takes in a title: bind a render target, draw over
+    // part of it, composite the whole thing. Whatever the draw misses is
+    // never written by anything, so the contents the allocation arrived with
+    // are what the composite samples and puts on screen.
+    const EDGE: u32 = 256;
+    let h = Harness::new();
+    // Leave magenta behind for the allocator, so an undefined row is
+    // visibly not black rather than passing on a zeroed block.
+    for _ in 0..4 {
+        let painted = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+        assert_eq!(h.color_fill_hr(&painted, MAGENTA), D3D_OK, "paint a target");
+        assert_eq!(
+            read_surface_pixel(&h, &painted, 0, 0),
+            MAGENTA,
+            "the painted target holds its fill",
+        );
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let rt = h.create_texture(
+        EDGE,
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // Bound but never cleared: a `Clear` here would define the row the draw
+    // misses, which is the whole question.
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind the RT");
+    // Row 0 sits outside the viewport, so a full-target triangle cannot reach
+    // it however the rasterizer rounds. Set after the bind, which snaps it.
+    let viewport = D3DVIEWPORT9 {
+        x: 0,
+        y: 1,
+        width: EDGE,
+        height: EDGE - 1,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&viewport), 0, "viewport excluding row 0");
+    assert_eq!(h.begin_scene(), 0);
+    draw_fill(&h, GREEN);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &rt_surface, EDGE / 2, 1),
+        GREEN,
+        "the rows the draw covers hold the draw",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt_surface, EDGE / 2, 0),
+        FRESH,
+        "the row no draw covers reads zeroed, not what the allocation held",
+    );
+    assert_eq!(
+        surface_colors(&h, &rt_surface),
+        vec![FRESH, GREEN],
+        "the target holds the draw and the creation clear, nothing else",
     );
 }

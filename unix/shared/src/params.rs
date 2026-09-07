@@ -971,6 +971,8 @@ impl Thunk for CreateDepthTextureParams {
 #[repr(C, align(8))]
 pub struct CreateColorTargetParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
+    /// Frame queue the creation-time clear is encoded on.
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
     pub width: u32,                                // in
     pub height: u32,                               // in
     pub pixel_format: PixelFormat, // in (resolved via mtld3d_core::format::map_d3d_format)
@@ -1072,6 +1074,10 @@ pub struct TextureCreateDesc {
 #[repr(C, align(8))]
 pub struct CreateTexturesBatchParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
+    /// Frame queue the creation-time clears are encoded on.
+    ///
+    /// One command buffer covers the whole batch.
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
     pub count: u32,                                // in
     // allow: FFI struct padding; pub for cross-crate field-init.
     pub pad0: u32,
