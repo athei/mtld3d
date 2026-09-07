@@ -2132,11 +2132,12 @@ fn callnz_reads_negated_predicate_source_with_replicate_swizzle() {
 }
 
 #[test]
-fn predicated_instruction_wraps_dst_write_in_p0_check() {
+fn predicated_instruction_selects_destination_components_from_p0() {
     // ps_3_0 {
-    //   dcl t0;
-    //   setp_lt p0, t0, t0;
-    //   (p0) mov oC0, t0;
+    //   def c0, 0, 1, 0, 1; def c1, 0.5, 0.5, 0.5, 0.5;
+    //   def c2, 1, 1, 1, 1; def c3, 0, 0, 0, 0;
+    //   mov r0, c3; mov r1, c0; setp_lt p0, r1, c1;
+    //   (p0) mov r0, c2; mov oC0, r0;
     // }
     // Token format for the predicated mov: opcode bits, predicate flag
     // (bit 28), token_count covering predicate operand + dst + src.
@@ -2144,29 +2145,143 @@ fn predicated_instruction_wraps_dst_write_in_p0_check() {
     let predicated_mov_token = u32::from(OP_MOV) | (1u32 << 28) | (3u32 << 24); // predicated, count=3
     let bc = vec![
         PS3_HEADER,
-        opcode_token(OP_DCL, 2),
-        dcl_usage_token(DCL_TEXCOORD, 0),
-        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 0, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 1, 0xF, false),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 2, 0xF, false),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 3, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(0.0),
+        f32::to_bits(0.0),
+        f32::to_bits(0.0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 3, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 1, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
         setp_lt_token,
         dst_token(TYPE_PREDICATE, 0, 0xF, false),
-        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
-        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_TEMP, 1, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
         predicated_mov_token,
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
         dst_token(TYPE_COLOROUT, 0, 0xF, false),
-        src_token(TYPE_PREDICATE, 0, 0x00 /* .xxxx */, 0),
-        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
         END_TOKEN,
     ];
     let ps = parse(&bc).expect("PS3 parse");
     let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
     assert!(
-        ps_msl.contains("if (p0.x) {"),
-        "predicated mov must gate the write on p0.x:\n{ps_msl}"
+        ps_msl.contains("r[0] = select(r[0], c2, p0);"),
+        "predicated mov must select each destination component from p0:\n{ps_msl}"
     );
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
+fn negated_predicate_inverts_each_destination_component() {
+    // ps_3_0 { setp_lt p0, c0, c1; (!p0) mov r0, c2; mov oC0, r0; }
+    let setp_lt_token = u32::from(OP_SETP) | ((4u32) << 16) | (3u32 << 24);
+    let predicated_mov_token = u32::from(OP_MOV) | (1u32 << 28) | (3u32 << 24);
+    let bc = vec![
+        PS3_HEADER,
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        predicated_mov_token,
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_IDENTITY, 13 /* logical NOT */),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
     assert!(
-        ps_msl.contains("oC0 = in.texcoord0;"),
-        "the wrapped store_dst must still emit the underlying write:\n{ps_msl}"
+        ps_msl.contains("r[0] = select(r[0], ps_c[2], !(p0));"),
+        "predicate NOT must invert every selected component:\n{ps_msl}"
     );
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
+fn replicate_predicate_intersects_partial_destination_mask() {
+    // ps_3_0 { setp_lt p0, c0, c1; (p0.z) mov r0.yw, c2; mov oC0, r0; }
+    let setp_lt_token = u32::from(OP_SETP) | ((4u32) << 16) | (3u32 << 24);
+    let predicated_mov_token = u32::from(OP_MOV) | (1u32 << 28) | (3u32 << 24);
+    let bc = vec![
+        PS3_HEADER,
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        predicated_mov_token,
+        dst_token(TYPE_TEMP, 0, 0b1010, false),
+        src_token(TYPE_PREDICATE, 0, 0xAA /* .zzzz */, 0),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains("r[0].yw = select(r[0].yw, (ps_c[2]).yw, p0.zz);"),
+        "replicate predicate must cover only destination-written components:\n{ps_msl}"
+    );
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
+fn predicate_intersects_single_component_destination_mask() {
+    // ps_3_0 { setp_lt p0, c0, c1; (p0) mov r0.w, c2; mov oC0, r0; }
+    let setp_lt_token = u32::from(OP_SETP) | ((4u32) << 16) | (3u32 << 24);
+    let predicated_mov_token = u32::from(OP_MOV) | (1u32 << 28) | (3u32 << 24);
+    let bc = vec![
+        PS3_HEADER,
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        predicated_mov_token,
+        dst_token(TYPE_TEMP, 0, 0b1000, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains("r[0].w = select(r[0].w, (ps_c[2]).w, p0.w);"),
+        "predicate must narrow to the single destination component:\n{ps_msl}"
+    );
+    metal_compile_or_fail(&ps_msl);
 }
 
 #[test]
