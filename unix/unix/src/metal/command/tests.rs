@@ -34,8 +34,11 @@ use mtld3d_shared::{
     ExtraColorDesc, MetalHandle, PassDescriptor, SubmitFrameParams,
     mtl::{BlockLayout, DepthResolveFilter, LoadAction, PixelFormat, StoreAction},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
+use objc2::{
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat,
@@ -45,9 +48,10 @@ use objc2_metal::{
 
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
-    PresentGeometry, PresentRoute, SETTLED_PRESENTS, copy_buffer_to_texture_reject,
-    copy_texture_reject, copy_texture_to_buffer_reject, first_pending, geometry_settled,
-    present_route, submit_frame, submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
+    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
+    copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
+    first_pending, geometry_settled, present_route, readback_completed, submit_frame, submit_frame_with,
+    submit_upload_cmd_buf, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -1084,4 +1088,51 @@ fn upload_test_pixel(
     assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
     // SAFETY: the shared buffer holds the completed four-byte pixel copy.
     unsafe { buffer.contents().cast::<[u8; 4]>().read() }
+}
+
+/// Completion is success only for the successful terminal state.
+#[test]
+fn readback_completion_rejects_failed_and_unfinished_states() {
+    for status in [
+        MTLCommandBufferStatus::NotEnqueued,
+        MTLCommandBufferStatus::Enqueued,
+        MTLCommandBufferStatus::Committed,
+        MTLCommandBufferStatus::Scheduled,
+        MTLCommandBufferStatus::Error,
+    ] {
+        assert!(!readback_completed(status, || None), "{status:?}");
+    }
+    assert!(readback_completed(
+        MTLCommandBufferStatus::Completed,
+        || { panic!("a successful readback must not fetch error diagnostics") }
+    ));
+}
+
+/// A real `NSError` crosses the same completion decision without any GPU submission.
+#[test]
+fn readback_completion_preserves_driver_error_details() {
+    let description = "Caused GPU Hang Error (00000003:kIOAccelCommandBufferCallbackErrorHang)";
+    let value = NSString::from_str(description);
+    // SAFETY: Foundation exports this immutable NSString key.
+    let key = unsafe { NSLocalizedDescriptionKey };
+    let info = NSDictionary::from_slices(&[key], &[AsRef::<AnyObject>::as_ref(&*value)]);
+    // SAFETY: the user-info dictionary contains an NSString under the description key.
+    let error = unsafe {
+        NSError::errorWithDomain_code_userInfo(
+            &NSString::from_str("MTLCommandBufferErrorDomain"),
+            2,
+            Some(&info),
+        )
+    };
+    assert_eq!(
+        command_buffer_error(Some(&error)),
+        (2, description.to_owned())
+    );
+    assert_eq!(command_buffer_error(None), (0, String::new()));
+    let mut inspected = false;
+    assert!(!readback_completed(MTLCommandBufferStatus::Error, || {
+        inspected = true;
+        Some(error)
+    }));
+    assert!(inspected, "a failed readback must inspect its driver error");
 }
