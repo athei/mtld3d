@@ -1176,6 +1176,80 @@ fn update_surface_copies_a_cube_face_into_a_2d_level() {
     );
 }
 
+/// A whole cube-face update preserves the content captured by earlier draws.
+///
+/// The updated face is not face zero, and the other face and mip stay readable
+/// after the rename. Both linear and sRGB bindings must retain their old storage.
+#[test]
+fn intra_frame_cube_update_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    const YELLOW: u32 = 0xFFFF_FF00;
+    let h = Harness::new();
+    for (size, srgb) in [(2, 0), (2, 1), (64, 0), (64, 1)] {
+        let texels = usize::try_from(size * size).expect("small cube face");
+        let mip_texels = texels / 4;
+        let cube = h.create_cube_texture_owned(size, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        let source =
+            h.create_offscreen_plain_surface(size, size, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        let mip_source = h.create_offscreen_plain_surface(
+            size / 2,
+            size / 2,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM,
+        );
+        mip_source.lock_rect(0).write_u32(&vec![YELLOW; mip_texels]);
+        for face in 0..6 {
+            let color = if face == 1 { RED } else { GREEN };
+            source.lock_rect(0).write_u32(&vec![color; texels]);
+            assert_eq!(h.update_surface_hr(&source, &cube.surface(face, 0)), 0);
+            assert_eq!(h.update_surface_hr(&mip_source, &cube.surface(face, 1)), 0);
+        }
+        assert_eq!(
+            h.set_sampler_state(0, mtld3d_types::D3DSAMP_SRGBTEXTURE, srgb),
+            0
+        );
+        assert_pixel_eq(sample_cube_x(&h, &cube, -1.0), RED, "primed face");
+        assert_eq!(h.set_cube_texture(0, &cube), 0);
+        source.lock_rect(0).write_u32(&vec![BLUE; texels]);
+        let face = cube.surface(1, 0);
+        let quad = |left, right| {
+            [
+                cube_vertex(left, 1.0, -1.0),
+                cube_vertex(right, 1.0, -1.0),
+                cube_vertex(left, -1.0, -1.0),
+                cube_vertex(right, 1.0, -1.0),
+                cube_vertex(right, -1.0, -1.0),
+                cube_vertex(left, -1.0, -1.0),
+            ]
+        };
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(-1.0, 0.0)),
+                0
+            );
+            assert_eq!(h.update_surface_hr(&source, &face), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0.0, 1.0)),
+                0
+            );
+        });
+        let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+        assert_eq!(
+            pixels,
+            [RED, BLUE],
+            "cube draws bracketing UpdateSurface, size={size}, sRGB={srgb}"
+        );
+        assert_pixel_eq(sample_cube_x(&h, &cube, 1.0), GREEN, "untouched face");
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+        assert_pixel_eq(sample_cube_x(&h, &cube, -1.0), YELLOW, "untouched mip");
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    }
+}
+
 /// Run the frame that releases the staging of the levels uploaded so far.
 ///
 /// A level of the class that releases its staging after an upload keeps it
