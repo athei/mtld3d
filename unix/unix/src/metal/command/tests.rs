@@ -31,20 +31,23 @@ use std::{
 };
 
 use mtld3d_shared::{
-    MetalHandle, SubmitFrameParams,
-    mtl::{BlockLayout, PixelFormat},
+    ExtraColorDesc, MetalHandle, PassDescriptor, SubmitFrameParams,
+    mtl::{BlockLayout, DepthResolveFilter, LoadAction, PixelFormat, StoreAction},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLPixelFormat, MTLSharedEvent,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat,
+    MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureUsage,
 };
 
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
     PresentGeometry, PresentRoute, SETTLED_PRESENTS, copy_buffer_to_texture_reject,
     copy_texture_reject, copy_texture_to_buffer_reject, first_pending, geometry_settled,
-    present_route, submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
+    present_route, submit_frame, submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -762,6 +765,8 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     }
     upload_gate.commit();
     let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+    let texture = upload_test_texture(&queue);
+    let upload_pass = upload_test_pass(&texture);
     let (done, watchdog) = release_event_after_wait(event);
     let mut committed_upload = None;
     let success = submit_frame_with(&mut params, |params| {
@@ -769,10 +774,8 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
             assert!(submit_upload_cmd_buf(
                 &queue,
                 &[],
-                false,
-                params.submit_seq,
-                upload_counter,
-                params.failed_submit_seq_ptr
+                core::slice::from_ref(&upload_pass),
+                params
             ));
             // The upload at seq 2 is parked behind its own gate. Register
             // a draw at the same seq to prove the counter identities do not collide.
@@ -848,7 +851,7 @@ fn test_submit_params(
         blit_commands_need_encoder: 0,
         passes_ptr: 0,
         pass_count: 0,
-        pad1: 0,
+        upload_pass_count: 0,
         present_layer: MetalHandle::NULL,
         present_texture: MetalHandle::NULL,
         submit_seq: 2,
@@ -913,4 +916,172 @@ fn flat_texture_copies_reject_multiple_depth_planes() {
         copy_texture_reject(&endpoint(4), &endpoint(4), 4, 4, 2),
         Some(CopyRejectReason::SourceRegionOutOfBounds)
     );
+}
+
+#[test]
+fn upload_prefix_finishes_before_its_retirement_signal() {
+    let queue = test_queue();
+    let texture = upload_test_texture(&queue);
+    let pass = upload_test_pass(&texture);
+    let coherent = AtomicU64::new(0);
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let params = test_submit_params(&queue, &coherent, &upload, &failed);
+    assert!(submit_upload_cmd_buf(&queue, &[], &[pass], &params));
+    wait_for_gpu_retire(
+        params.submit_seq,
+        atomic_address(&upload),
+        atomic_address(&failed),
+    );
+    assert_eq!(upload.load(Ordering::Acquire), params.submit_seq);
+    assert_eq!(coherent.load(Ordering::Acquire), 0);
+    assert_eq!(failed.load(Ordering::Acquire), 0);
+    assert_eq!(upload_test_pixel(&queue, &texture), [0, 0, 255, 255]);
+}
+
+#[test]
+fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
+    for (pass_count, upload_count, separate_upload) in
+        [(0, 0, true), (1, 0, true), (1, 1, true), (1, 1, false)]
+    {
+        let queue = test_queue();
+        let texture = upload_test_texture(&queue);
+        let pass = upload_test_pass(&texture);
+        let coherent = AtomicU64::new(0);
+        let upload = AtomicU64::new(0);
+        let failed = AtomicU64::new(0);
+        let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+        params.pass_count = pass_count;
+        params.upload_pass_count = upload_count;
+        if pass_count != 0 {
+            params.passes_ptr = core::ptr::from_ref(&pass) as u64;
+        }
+        if !separate_upload {
+            params.upload_coherent_seq_ptr = 0;
+        }
+        assert!(submit_frame(&mut params));
+        wait_for_gpu_retire(
+            params.submit_seq,
+            atomic_address(&coherent),
+            atomic_address(&failed),
+        );
+        if separate_upload && upload_count != 0 {
+            wait_for_gpu_retire(
+                params.submit_seq,
+                atomic_address(&upload),
+                atomic_address(&failed),
+            );
+        }
+        assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
+        assert_eq!(failed.load(Ordering::Acquire), 0);
+        assert_eq!(
+            upload.load(Ordering::Acquire),
+            if separate_upload && upload_count != 0 {
+                params.submit_seq
+            } else {
+                0
+            }
+        );
+        if pass_count != 0 {
+            assert_eq!(upload_test_pixel(&queue, &texture), [0, 0, 255, 255]);
+        }
+    }
+}
+
+#[test]
+fn frame_submission_rejects_invalid_upload_prefix_and_null_arrays() {
+    for (pass_count, upload_count, blit_count) in [(0, 1, 0), (1, 2, 0), (1, 0, 0), (0, 0, 1)] {
+        let queue = test_queue();
+        let coherent = AtomicU64::new(0);
+        let upload = AtomicU64::new(0);
+        let failed = AtomicU64::new(0);
+        let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+        params.pass_count = pass_count;
+        params.upload_pass_count = upload_count;
+        params.blit_command_count = blit_count;
+        assert!(!submit_frame(&mut params));
+        assert_eq!(failed.load(Ordering::Acquire), params.submit_seq);
+        assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
+        assert_eq!(upload.load(Ordering::Acquire), params.submit_seq);
+    }
+}
+
+fn upload_test_texture(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    // SAFETY: a 1x1 non-mipmapped BGRA8 texture is a valid 2D descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            1,
+            1,
+            false,
+        )
+    };
+    desc.setStorageMode(MTLStorageMode::Private);
+    desc.setUsage(MTLTextureUsage::RenderTarget);
+    let texture = queue
+        .device()
+        .newTextureWithDescriptor(&desc)
+        .expect("upload texture");
+    texture.setLabel(Some(&NSString::from_str("mtld3d-test-upload-texture")));
+    texture
+}
+
+fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor {
+    PassDescriptor {
+        // SAFETY: the test owns this texture until the command buffer retires.
+        color_texture: unsafe { MetalHandle::new(core::ptr::from_ref(texture) as u64) },
+        color_resolve_texture: MetalHandle::NULL,
+        depth_texture: MetalHandle::NULL,
+        depth_resolve_texture: MetalHandle::NULL,
+        commands_ptr: 0,
+        visibility_result_buffer: MetalHandle::NULL,
+        leading_blits_ptr: 0,
+        color_load_action: LoadAction::Clear,
+        color_store_action: StoreAction::Store,
+        clear_r: 1.0f32.to_bits(),
+        clear_g: 0,
+        clear_b: 0,
+        clear_a: 1.0f32.to_bits(),
+        depth_load_action: LoadAction::DontCare,
+        depth_store_action: StoreAction::DontCare,
+        depth_clear_value: 0,
+        stencil_load_action: LoadAction::DontCare,
+        stencil_clear_value: 0,
+        command_count: 0,
+        leading_blits_count: 0,
+        pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
+        depth_resolve_filter: DepthResolveFilter::Sample0,
+        pad0: 0,
+        extra_color: [ExtraColorDesc::NONE; 3],
+    }
+}
+
+fn upload_test_pixel(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+) -> [u8; 4] {
+    let buffer = queue
+        .device()
+        .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+        .expect("readback buffer");
+    buffer.setLabel(Some(&NSString::from_str("mtld3d-test-upload-pixel")));
+    let cmd = queue.commandBuffer().expect("readback command buffer");
+    cmd.setLabel(Some(&NSString::from_str("mtld3d-test-upload-readback")));
+    let blit = cmd.blitCommandEncoder().expect("readback blit");
+    blit.setLabel(Some(&NSString::from_str("mtld3d-test-upload-copy")));
+    // SAFETY: the source is 1x1, the destination holds a 256-byte aligned
+    // row, and both resources stay alive until the copy completes.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: 1, height: 1, depth: 1 }, &buffer, 0, 256, 256,
+        );
+    }
+    blit.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(cmd.status(), MTLCommandBufferStatus::Completed);
+    // SAFETY: the shared buffer holds the completed four-byte pixel copy.
+    unsafe { buffer.contents().cast::<[u8; 4]>().read() }
 }

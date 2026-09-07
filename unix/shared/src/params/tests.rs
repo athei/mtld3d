@@ -109,13 +109,18 @@ fn frame_param_layouts_match_wow64() {
     // SubmitFrameParams:
     //   8 queue_handle
     //   + 8 blit_commands_ptr + 4 blit_command_count + 4 blit_commands_need_encoder
-    //   + 8 passes_ptr + 4 pass_count + 4 _pad1
+    //   + 8 passes_ptr + 4 pass_count + 4 upload_pass_count
     //   + 8 present_layer + 8 present_texture
     //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
     //   + 8 failed_submit_seq_ptr
     //   + 8 drawable_wait_ns + 8 present_view
     //   = 104
     assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 104);
+    assert_eq!(
+        core::mem::offset_of!(SubmitFrameParams, upload_pass_count),
+        36
+    );
+    assert_eq!(core::mem::offset_of!(SubmitFrameParams, present_layer), 40);
 
     // CreateTexturesBatchParams:
     //   8 device_handle + 8 queue_handle + 4 count + 4 _pad0 + 8 descs_ptr

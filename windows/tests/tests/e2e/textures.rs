@@ -3741,3 +3741,113 @@ fn r8g8b8_expands_and_samples_its_texels() {
     );
     assert_2x2_quadrants(&h, &tex, "R8G8B8");
 }
+
+/// An untouched mip uploaded in the same frame survives a texture rename.
+#[test]
+fn intra_frame_rename_preserves_earlier_mip_upload() {
+    const RED: u32 = 0xFFFF_0000;
+    const YELLOW: u32 = 0xFFFF_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(4, 4, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[RED; 16]);
+    texture.lock_rect(1, 0).write_u32(&[YELLOW; 4]);
+    assert_eq!(h.set_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(-1.0, 0.0)),
+            0
+        );
+        texture.lock_rect(0, 0).write_u32(&[BLUE; 16]);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(0.0, 1.0)),
+            0
+        );
+    });
+    assert_eq!(
+        [h.read_pixel(160, 240), h.read_pixel(480, 240)],
+        [RED, BLUE],
+        "updated mip keeps per-draw contents"
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_pixel_eq(
+        sample_texel(&h, &texture, 0.5, 0.5),
+        YELLOW,
+        "earlier upload of untouched mip survives rename",
+    );
+}
+
+/// A partial update preserves texels an earlier upload pass wrote outside its rectangle.
+#[test]
+fn intra_frame_rename_preserves_earlier_upload_outside_patch() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    texture.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let patch = h.create_offscreen_plain_surface(1, 1, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    patch.lock_rect(0).write_u32(&[BLUE]);
+    let level = texture.surface_level(0);
+    assert_eq!(h.set_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(-1.0, 0.0)),
+            0
+        );
+        assert_eq!(d.update_surface_hr(&patch, &level), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(0.0, 1.0)),
+            0
+        );
+    });
+    // The earlier sample stays outside the patch, so an in-place staging
+    // update cannot affect this control.
+    assert_pixel_eq(h.read_pixel(240, 360), RED, "earlier untouched texel");
+    assert_pixel_eq(h.read_pixel(400, 120), BLUE, "updated texel");
+    assert_pixel_eq(h.read_pixel(560, 360), RED, "preserved untouched texel");
+}
+
+/// Each renamed autogen texture generates its mip chain after its own upload.
+#[test]
+fn intra_frame_rename_keeps_generated_mips_in_upload_order() {
+    const COLORS: [u32; 3] = [0xFFFF_0000, 0xFF00_00FF, 0xFF00_FF00];
+    const EDGES: [f32; 4] = [-1.0, -0.333_333_34, 0.333_333_34, 1.0];
+    let h = Harness::new();
+    let texture = h.create_texture(
+        2,
+        2,
+        0,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(h.set_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        for (index, color) in COLORS.into_iter().enumerate() {
+            texture.lock_rect(0, 0).write_u32(&[color; 4]);
+            assert_eq!(
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &horizontal_quad(EDGES[index], EDGES[index + 1]),
+                ),
+                0
+            );
+        }
+    });
+    for (x, color) in [106, 320, 533].into_iter().zip(COLORS) {
+        assert_pixel_eq(h.read_pixel(x, 240), color, "generated mip at its draw");
+    }
+}

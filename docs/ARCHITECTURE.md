@@ -77,6 +77,24 @@ API-thread thunks are restricted to device lifecycle only (`CreateCommandQueue`,
 
 Thunks are Metal-level operations, not D3D9 calls. Name thunks after what they do in Metal (`GetDeviceInfo`, `CreateCommandQueue`), not after D3D9 methods. D3D9 logic stays in `d3d9.dll`. Objects with no Metal state (like `IDirect3D9`) are PE-only.
 
+## Upload order and retirement
+
+Texture and buffer uploads form an ordered prefix before the application's render passes.
+A texture upload that requires a render pass carries the preceding upload blits in its
+`leading_blits`; preservation copies and subsequent uploads therefore keep their API order
+across both encoder kinds. Blits after the final upload render pass form a final blit-only
+descriptor in the prefix. `SubmitFrameParams.upload_pass_count` counts that prefix, and
+the unix side rejects a count beyond the supplied pass list.
+
+The prefix executes in the upload command buffer, committed before the draw command buffer
+on the same queue. Its completion handler advances `upload_coherent_seq` only after every
+staging read in the prefix finishes. The draw buffer executes the remaining passes and
+advances `coherent_seq`. Both buffers retain their encoded Metal resources, and
+`FramePayload` owns all command, descriptor and inline-byte backing until submission
+returns. Mip generation after an upload stays in the upload prefix; generation after an
+application render-target write or `StretchRect` remains ordered among the application's
+passes.
+
 ## One attachment record per device
 
 D3D9 allows several devices per process, and the e2e suite creates two live ones. Everything the display decides for one device's window therefore lives on a per-device record on the unix side (`metal/macdrv/attachment.rs`), not in process statics: whether the layer carries the HDR configuration, the live EDR headroom, the present throttle, the window's occlusion, the backing scale published to the PE side, and the present-geometry streak that gates the MetalFX route. `AttachMetalLayer` registers the record, keyed by the raw address of the metal view it created, which is the handle the device's later thunks already carry: `SubmitFrame` looks its record up by `present_view`, `DestroyCommandQueue` retires it by `view_handle`, `SetDisplaySyncEnabled` finds it by `layer_handle`, and `SetCursorOverlay` names it by the `view_handle` it carries. A thunk whose view has no record warns once and, for a present, uses the defaults a session on no display would (not occluded, headroom 1.0, no throttle, the stretch route).

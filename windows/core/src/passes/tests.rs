@@ -5289,6 +5289,7 @@ fn mixed_command_frame(s: &mut PassState) {
                 rect: (0, 0, BB_SIZE.0, BB_SIZE.1),
             },
             &[dummy_draw()],
+            Vec::new(),
         );
     }
     assert_eq!(s.passes.len(), 6);
@@ -5374,4 +5375,72 @@ fn snapshot_bytes_reset_rebinds_reused_address() {
     assert_eq!(bytes.as_ptr(), address);
     assert!(cache.changed(std::rc::Rc::clone(&bytes)));
     assert!(!cache.changed(bytes));
+}
+
+/// Mixed uploads keep their blits in API order without closing the application's pass.
+#[test]
+fn upload_prefix_preserves_order_through_pass_optimization() {
+    let mut s = fresh();
+    s.emit_command(dummy_draw());
+    let application_commands = s.passes()[0].commands().as_ptr();
+    let old = tex(0x8000);
+    let fresh_texture = tex(0x9000);
+    for (target, blits) in [
+        (
+            old,
+            vec![BlitCommand::notify_buffer_did_modify_range(0x7000, 0, 16)],
+        ),
+        (fresh_texture, vec![copy_blit(old, fresh_texture)]),
+    ] {
+        s.push_upload_pass(
+            &UploadPassTarget {
+                texture: target,
+                subresource: (0, 1),
+                size: (2, 2),
+                format: BB_FORMAT,
+                rect: (0, 0, 2, 2),
+            },
+            &[dummy_draw()],
+            blits,
+        );
+        assert!(!s.current_pass_closed());
+        assert_eq!(s.current_color_texture(), backbuffer());
+        assert_eq!(s.current_depth_texture(), depth());
+        assert_eq!(s.effective_viewport(), (0, 0, BB_SIZE.0, BB_SIZE.1));
+        s.emit_command(dummy_draw());
+    }
+    assert_eq!(s.upload_pass_count(), 2);
+    assert_eq!(s.passes()[2].commands().as_ptr(), application_commands);
+    assert_eq!(s.passes()[2].commands().len(), 4);
+    let prefix_commands: Vec<_> = s.passes()[..2]
+        .iter()
+        .map(|pass| pass.commands().as_ptr())
+        .collect();
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.strip_color_from_no_color_draw_passes(&FxHashMap::default());
+    s.cull_dead_clear_only_passes();
+    assert_eq!(s.passes().len(), 3);
+    for (index, texture) in [old, fresh_texture].into_iter().enumerate() {
+        let pass = &s.passes()[index];
+        assert_eq!(pass.color_texture(), texture);
+        assert_eq!(pass.color_level(), 1);
+        assert_eq!(pass.commands().as_ptr(), prefix_commands[index]);
+        assert_eq!(pass.color_store(), StoreAction::Store);
+        assert_eq!(pass.leading_blits().len(), 1);
+    }
+    assert_eq!(
+        s.passes()[0].leading_blits()[0].cmd,
+        BlitCommandType::NotifyBufferDidModifyRange as u32,
+    );
+    assert_eq!(s.passes()[1].leading_blits()[0].src_handle, old.raw());
+    assert_eq!(
+        s.passes()[1].leading_blits()[0].dst_handle,
+        fresh_texture.raw()
+    );
+    reset_test_frame(&mut s);
+    assert_eq!(s.upload_pass_count(), 0);
 }

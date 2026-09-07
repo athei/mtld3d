@@ -669,13 +669,13 @@ struct FramePayload {
     ///
     /// Taken from `PassState`. `descriptors` point into these.
     passes: Vec<Pass>,
-    /// One `PassDescriptor` per pass (plus an optional trailing blit-only pass).
+    /// One descriptor per pass, plus optional upload-tail and trailing blit-only descriptors.
     ///
     /// `SubmitFrameParams.passes_ptr` aliases this vec's backing.
     descriptors: Vec<PassDescriptor>,
     /// Frame-leading blits (texture uploads, GPU preserves, notifies).
     ///
-    /// `SubmitFrameParams.blit_commands_ptr` aliases this vec's backing.
+    /// The initial blit pointer or the upload-tail descriptor aliases this backing.
     frame_blit_commands: Vec<BlitCommand>,
     /// `StretchRect` blits queued after the last draw of the frame.
     ///
@@ -1089,13 +1089,6 @@ pub struct FrameEncoder {
     /// buffer argument. Process-lifetime, same posture as
     /// `blit_pipeline_cache`.
     upload_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
-    /// Textures whose content the GPU upload pass wrote this frame.
-    ///
-    /// Those writes land in render passes spliced into the head of the
-    /// frame, after the leading blit stream, so an `AUTOGENMIPMAP` regen
-    /// that follows one has to run in the ordered blit stream instead of the
-    /// leading one or it would read a stale level 0.
-    upload_pass_textures: FxHashSet<TextureId>,
     /// Reusable command buffer for one texture-upload pass.
     ///
     /// Held on the encoder so the six commands an upload pass carries cost
@@ -1613,7 +1606,6 @@ impl FrameEncoder {
             clear_quad_pipeline_cache: FxHashMap::default(),
             blit_pipeline_cache: FxHashMap::default(),
             upload_pipeline_cache: FxHashMap::default(),
-            upload_pass_textures: FxHashSet::default(),
             upload_pass_commands: Vec::new(),
             dc_write_back_scratch: MetalHandle::NULL,
             dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
@@ -2368,7 +2360,6 @@ impl FrameEncoder {
         // from the persistent mirror.
         self.ff_vs_const_scratch_cache = None;
         self.frame_blit_commands.clear();
-        self.upload_pass_textures.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
         mtld3d_shared::crumb!("phase:BfRecl");
@@ -6936,17 +6927,10 @@ impl FrameEncoder {
     /// trigger). The blit is appended to `frame_blit_commands` right after
     /// the mip-0 `CopyBufferToTexture`, so the unix side replays
     /// `generateMipmapsForTexture` inside the frame's own shared
-    /// leading-blit encoder, no per-texture command buffer. A level 0 the
-    /// GPU upload pass wrote instead is not in that stream, so it diverts to
-    /// the ordered form.
+    /// upload command buffer, after any render pass that uploaded level 0.
+    /// Render-target writes use `run_generate_mipmaps_ordered` instead,
+    /// because their regeneration belongs between application passes.
     pub fn run_generate_mipmaps(&mut self, texture_id: TextureId) {
-        // A GPU upload pass writes level 0 from a render pass at the head of
-        // the frame, which is *after* the leading blit stream; the regen has
-        // to follow it in the ordered stream instead.
-        if self.upload_pass_textures.contains(&texture_id) {
-            self.run_generate_mipmaps_ordered(texture_id);
-            return;
-        }
         let Some(state) = self.texture_cache.get(&texture_id) else {
             // Texture has no MTL backing yet (no draw has bound it) —
             // mipgen will run on the upload that precedes the first
@@ -7315,7 +7299,7 @@ impl FrameEncoder {
             return false;
         }
         // Non-UMA: the game wrote these pages on the CPU. The notify rides
-        // the frame-head blit stream, which runs before every pass.
+        // the leading blits of the upload pass that reads these pages.
         self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
 
         let mip_w = (job.info.width.max(1) >> job.level).max(1);
@@ -7362,7 +7346,6 @@ impl FrameEncoder {
              row pitch under the {}-byte linear texture alignment) render into the destination",
             self.gpu_caps.min_linear_texture_align,
         );
-        self.upload_pass_textures.insert(job.info.texture_id);
         self.perf.bump_texture_blit_upload();
         self.perf.bump_texture_expand_upload();
         // The pass reads the staging at command-buffer execution time, long
@@ -7424,7 +7407,12 @@ impl FrameEncoder {
             format: emit.format,
             rect,
         };
-        self.pass_state.push_upload_pass(&target, &cmds);
+        self.pass_state.push_upload_pass(
+            &target,
+            &cmds,
+            core::mem::take(&mut self.frame_blit_commands),
+        );
+        self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.upload_pass_commands = cmds;
     }
 
@@ -8411,7 +8399,7 @@ pub struct FrameData {
     ///
     /// Same lifetime guarantee as `coherent_seq_ptr`. Forwarded verbatim
     /// into `SubmitFrameParams::upload_coherent_seq_ptr`; non-zero tells
-    /// the unix side to split the frame-leading blits into their own,
+    /// the unix side to split the ordered upload prefix into its own,
     /// earlier-retiring command buffer. 0 only before the frame is
     /// stamped (`FrameData::new` default); every submitted frame carries
     /// the real pointer.
@@ -9451,7 +9439,20 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // next `begin_frame` keeps the seen-rt sets for the continuation's Rule A.
     let no_present = frame.flags.contains(FrameDataFlags::NO_PRESENT);
     enc.prev_submit_no_present = no_present;
+    let mut upload_pass_count = enc.pass_state.upload_pass_count();
+    #[cfg(debug_assertions)]
+    let upload_commands: Vec<_> = enc.pass_state.passes()[..upload_pass_count]
+        .iter()
+        .map(|pass| pass.commands().as_ptr())
+        .collect();
     apply_pass_rules(enc, no_present);
+    // Upload passes contain draws and must survive every load/store rule
+    // at their original prefix positions.
+    #[cfg(debug_assertions)]
+    for (pass, commands) in enc.pass_state.passes().iter().zip(&upload_commands) {
+        debug_assert_eq!(pass.commands().as_ptr(), *commands);
+    }
+    debug_assert!(enc.pass_state.passes().len() >= upload_pass_count);
     log_cascade_frame_summary(enc);
 
     // StretchRect blits queued after the last draw of the frame have no
@@ -9471,6 +9472,17 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         .iter()
         .map(|p| pass_to_descriptor(p, visibility_buffer_handle))
         .collect();
+    // Blits after the final upload pass still precede all application
+    // passes. Their backing moves into the payload below without moving
+    // its allocation, just like the frame-leading fast path's backing.
+    let has_upload_passes = upload_pass_count != 0;
+    if has_upload_passes && !enc.frame_blit_commands.is_empty() {
+        descriptors.insert(
+            upload_pass_count,
+            trailing_blit_descriptor(&enc.frame_blit_commands),
+        );
+        upload_pass_count += 1;
+    }
     if !trailing_blits.is_empty() {
         descriptors.push(trailing_blit_descriptor(&trailing_blits));
     }
@@ -9495,20 +9507,23 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
 
     let params = SubmitFrameParams {
         queue_handle: frame.queue_handle,
-        blit_commands_ptr: if payload.frame_blit_commands.is_empty() {
+        blit_commands_ptr: if has_upload_passes || payload.frame_blit_commands.is_empty() {
             0
         } else {
             payload.frame_blit_commands.as_ptr() as u64
         },
-        blit_command_count: u32::try_from(payload.frame_blit_commands.len())
-            .expect("frame blit count fits u32"),
+        blit_command_count: if has_upload_passes {
+            0
+        } else {
+            u32::try_from(payload.frame_blit_commands.len()).expect("frame blit count fits u32")
+        },
         blit_commands_need_encoder: u32::from(
             enc.flags
                 .contains(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER),
         ),
         passes_ptr: payload.descriptors.as_ptr() as u64,
         pass_count: u32::try_from(payload.descriptors.len()).expect("pass count fits u32"),
-        pad1: 0,
+        upload_pass_count: u32::try_from(upload_pass_count).expect("upload pass count fits u32"),
         present_layer: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
@@ -9651,13 +9666,10 @@ fn pass_to_descriptor(
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
-        // Per-pass leading blits today are only StretchRect CopyTexture
-        // commands (notifies go in the frame-level list), so any
-        // non-empty leading list needs the encoder. If a future caller
-        // threads notifies through here, switch to a tracked flag on
-        // `Pass`.
         pass_flags: PassDescriptor::pack_flags(
-            !leading.is_empty(),
+            leading
+                .iter()
+                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
             p.color_slice(),
             p.color_level(),
             p.depth_level(),
@@ -9722,9 +9734,9 @@ fn log_pass_depth_attach(p: &Pass) {
 
 /// Synthetic blit-only `PassDescriptor`.
 ///
-/// Carries trailing `StretchRect` blits queued after the last draw of the
-/// frame. No color/depth attachments, no commands; the unix side spins an
-/// encoder only because `CopyTextureToTexture` needs one.
+/// Carries an upload-prefix tail or trailing `StretchRect` blits, with no
+/// color/depth attachments or render commands. A notification-only list
+/// needs no blit encoder.
 fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
     PassDescriptor {
         color_texture: MetalHandle::NULL,
@@ -9748,7 +9760,14 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
-        pass_flags: PassDescriptor::pack_flags(true, 0, 0, 0),
+        pass_flags: PassDescriptor::pack_flags(
+            trailing_blits
+                .iter()
+                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+            0,
+            0,
+            0,
+        ),
         depth_resolve_filter: DepthResolveFilter::Sample0,
         pad0: 0,
         extra_color: [ExtraColorDesc::NONE; 3],

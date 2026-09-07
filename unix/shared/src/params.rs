@@ -885,8 +885,12 @@ pub struct SubmitFrameParams {
     // Render pass list
     pub passes_ptr: u64, // in: *const PassDescriptor
     pub pass_count: u32, // in
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad1: u32,
+    /// Leading descriptors executed in the upload command buffer, at most `pass_count`.
+    ///
+    /// Each carries the blits preceding its upload render pass. A final
+    /// blit-only descriptor carries uploads after the last render upload.
+    /// The remaining descriptors belong to the draw command buffer.
+    pub upload_pass_count: u32,
     // Present (NULL = skip)
     pub present_layer: MetalHandle<CAMetalLayerKind>, // in (NULL = no present)
     pub present_texture: MetalHandle<MTLTextureKind>, // in: blit to drawable
@@ -900,8 +904,8 @@ pub struct SubmitFrameParams {
     pub coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
     /// Texture-upload completion fence.
     ///
-    /// When non-zero, the texture-upload (frame-leading) blits are encoded
-    /// into their OWN command buffer committed *before* the draw CB; that
+    /// When non-zero, the frame-leading blits and `upload_pass_count`
+    /// descriptors are encoded into a command buffer committed before the draw CB; that
     /// CB's `addCompletedHandler` `fetch_max`es `submit_seq` into
     /// `*(upload_coherent_seq_ptr as *const AtomicU64)`. Because the queue
     /// is in-order the uploads still finish before any same-frame draw
@@ -909,7 +913,7 @@ pub struct SubmitFrameParams {
     /// CB — so the next frame's texture `LockRect` sees the staging retired
     /// and skips the synchronous preserve memcpy. Every submitted frame
     /// carries the real pointer; 0 (a defensive null guard) falls back to
-    /// encoding the leading blits on the draw CB. Distinct from
+    /// encoding the leading blits and all passes on the draw CB. Distinct from
     /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
     /// VB/IB.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
