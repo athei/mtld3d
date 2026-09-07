@@ -829,6 +829,53 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) {
     );
 }
 
+/// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.
+///
+/// Client-area validation must see the restored window. Keep the original
+/// session intact for a retry, and roll back to the actual display mode and
+/// window state, which the application may have changed while fullscreen.
+/// A failed snapshot rejects the transition before anything moves.
+pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
+    let mut mode = empty_devmode();
+    if !enum_display_settings(ENUM_CURRENT_SETTINGS, &mut mode) {
+        warn!(target: LOG_TARGET, "cannot snapshot the display mode for a windowed Reset");
+        return false;
+    }
+    let rect = if saved.manage_window && is_window(saved.hwnd) {
+        let Some(rect) = window_rect(saved.hwnd) else {
+            warn!(target: LOG_TARGET, "cannot snapshot the fullscreen window for a windowed Reset");
+            return false;
+        };
+        Some(rect)
+    } else {
+        None
+    };
+    let style = window_long(saved.hwnd, GWL_STYLE);
+    let exstyle = window_long(saved.hwnd, GWL_EXSTYLE);
+    // Covers the display-change broadcasts as well as both window moves:
+    // the provisional geometry must never trigger a device auto-resize.
+    let _driving = DrivingGuard::new(saved.hwnd);
+    leave(saved);
+    if accept() {
+        return true;
+    }
+    let result = change_display_settings(Some(&mut mode), CDS_FULLSCREEN);
+    if result != DISP_CHANGE_SUCCESSFUL {
+        warn!(target: LOG_TARGET, "failed to restore the display after a rejected Reset (ret={result})");
+    }
+    if let Some(rect) = rect {
+        set_window_long(saved.hwnd, GWL_STYLE, style);
+        set_window_long(saved.hwnd, GWL_EXSTYLE, exstyle);
+        set_window_pos(
+            saved.hwnd,
+            core::ptr::null_mut(),
+            rect,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    false
+}
+
 /// Restore the display mode and the window state captured by [`enter`].
 pub fn leave(saved: &SavedWindow) {
     // Leaving fullscreen (windowed `Reset` or device destruction) puts the

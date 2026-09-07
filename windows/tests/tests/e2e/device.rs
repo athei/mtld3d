@@ -1346,6 +1346,126 @@ const fn windowed_params(hwnd: usize, width: u32, height: u32) -> D3DPRESENT_PAR
 }
 
 #[test]
+fn rejected_reset_keeps_the_window_mode() {
+    let h = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Framed,
+        ..HarnessConfig::default()
+    });
+    let original_rect = h.window_rect();
+    let original_style = h.window_style();
+    let original_exstyle = h.window_exstyle();
+
+    let mut pp = fullscreen_params(h.hwnd(), 137, 101);
+    pp.multi_sample_type = u32::MAX;
+    assert_eq!(h.reset_params(&mut pp), D3DERR_INVALIDCALL);
+    assert_eq!(h.window_rect(), original_rect, "rejected fullscreen entry");
+    assert_eq!(h.window_style(), original_style);
+    assert_eq!(h.window_exstyle(), original_exstyle);
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+
+    pp.multi_sample_type = 0;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK);
+    let fullscreen_rect = h.window_rect();
+    let fullscreen_style = h.window_style();
+    let fullscreen_exstyle = h.window_exstyle();
+    let fullscreen_screen = Harness::screen_size();
+    let other = create_window(173, 119, false);
+    let other_rect = window_rect(other);
+
+    for mut rejected in [
+        windowed_params(h.hwnd(), 320, 240),
+        fullscreen_params(other, 800, 600),
+    ] {
+        rejected.multi_sample_type = u32::MAX;
+        assert_eq!(h.reset_params(&mut rejected), D3DERR_INVALIDCALL);
+        assert_eq!(h.window_rect(), fullscreen_rect, "rejected mode change");
+        assert_eq!(h.window_style(), fullscreen_style);
+        assert_eq!(h.window_exstyle(), fullscreen_exstyle);
+        assert_eq!(Harness::screen_size(), fullscreen_screen);
+        assert_eq!(window_rect(other), other_rect, "rejected retarget");
+        assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+    }
+    destroy_window(other);
+    assert_eq!(h.reset(320, 240), D3D_OK, "retry can leave fullscreen");
+    assert_eq!(h.window_rect(), original_rect);
+    assert_eq!(h.window_style() & !WS_VISIBLE, original_style & !WS_VISIBLE);
+    assert_eq!(h.test_cooperative_level(), D3D_OK);
+}
+
+#[test]
+fn rejected_zero_dimension_reset_restores_fullscreen() {
+    let h = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Framed,
+        ..HarnessConfig::default()
+    });
+    let original_rect = h.window_rect();
+    let original_client = h.client_size();
+    let original_style = h.window_style();
+    let mut pp = fullscreen_params(h.hwnd(), 137, 101);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK);
+    let fullscreen_rect = h.window_rect();
+    let fullscreen_style = h.window_style();
+    let fullscreen_exstyle = h.window_exstyle();
+    let fullscreen_screen = Harness::screen_size();
+
+    let gone = create_window(173, 119, false);
+    destroy_window(gone);
+    let mut rejected = windowed_params(gone, 0, 0);
+    assert_eq!(h.reset_params(&mut rejected), D3DERR_INVALIDCALL);
+    assert_eq!(
+        h.window_rect(),
+        fullscreen_rect,
+        "failed client-area resolution"
+    );
+    assert_eq!(h.window_style(), fullscreen_style);
+    assert_eq!(h.window_exstyle(), fullscreen_exstyle);
+    assert_eq!(Harness::screen_size(), fullscreen_screen);
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+
+    let mut retry = windowed_params(0, 0, 0);
+    assert_eq!(h.reset_params(&mut retry), D3D_OK);
+    assert_eq!(
+        h.window_rect(),
+        original_rect,
+        "retry retains the original saved window"
+    );
+    assert_eq!(h.window_style() & !WS_VISIBLE, original_style & !WS_VISIBLE);
+    assert_eq!(
+        (retry.back_buffer_width, retry.back_buffer_height),
+        original_client,
+        "successful zero dimensions use the restored client rect"
+    );
+    assert_eq!(h.test_cooperative_level(), D3D_OK);
+}
+
+#[test]
+fn zero_dimension_reset_can_leave_a_destroyed_fullscreen_window() {
+    let h = Harness::new();
+    let old_target = create_window(320, 240, false);
+    let mut pp = fullscreen_params(old_target, 137, 101);
+    assert_eq!(h.reset_params(&mut pp), D3D_OK);
+    let target = create_window(320, 240, false);
+    destroy_window(old_target);
+
+    let mut pp = windowed_params(target, 0, 0);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "retarget from a destroyed window"
+    );
+    assert!(pp.back_buffer_width > 0 && pp.back_buffer_height > 0);
+    let (hr, backbuffer) = h.back_buffer(0).desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(
+        (backbuffer.width, backbuffer.height),
+        (pp.back_buffer_width, pp.back_buffer_height)
+    );
+    assert_eq!(h.test_cooperative_level(), D3D_OK);
+    drop(h);
+    destroy_window(target);
+}
+
+#[test]
 fn reset_fullscreen_adopts_monitor_rect_and_restores() {
     if !display_lists_640x480() {
         return;
