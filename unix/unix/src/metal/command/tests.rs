@@ -284,7 +284,7 @@ fn endpoint(size: usize) -> CopyEndpoint {
 #[test]
 fn a_matching_pair_is_accepted() {
     assert_eq!(
-        copy_texture_reject(&endpoint(256), &endpoint(256), 256, 256),
+        copy_texture_reject(&endpoint(256), &endpoint(256), 256, 256, 1),
         None
     );
 }
@@ -295,7 +295,7 @@ fn a_sample_count_change_is_rejected() {
     let mut src = endpoint(256);
     src.sample_count = 4;
     assert_eq!(
-        copy_texture_reject(&src, &endpoint(256), 256, 256),
+        copy_texture_reject(&src, &endpoint(256), 256, 256, 1),
         Some(CopyRejectReason::SampleCountMismatch)
     );
 }
@@ -306,7 +306,7 @@ fn a_format_change_is_rejected() {
     let mut dst = endpoint(256);
     dst.pixel_format = MTLPixelFormat::RGBA8Unorm;
     assert_eq!(
-        copy_texture_reject(&endpoint(256), &dst, 256, 256),
+        copy_texture_reject(&endpoint(256), &dst, 256, 256, 1),
         Some(CopyRejectReason::FormatMismatch)
     );
 }
@@ -316,8 +316,14 @@ fn a_format_change_is_rejected() {
 fn an_srgb_twin_is_accepted_in_either_direction() {
     let mut srgb = endpoint(256);
     srgb.pixel_format = MTLPixelFormat::BGRA8Unorm_sRGB;
-    assert_eq!(copy_texture_reject(&endpoint(256), &srgb, 256, 256), None);
-    assert_eq!(copy_texture_reject(&srgb, &endpoint(256), 256, 256), None);
+    assert_eq!(
+        copy_texture_reject(&endpoint(256), &srgb, 256, 256, 1),
+        None
+    );
+    assert_eq!(
+        copy_texture_reject(&srgb, &endpoint(256), 256, 256, 1),
+        None
+    );
 }
 
 /// The format check runs before the sample-count check, so it reports first.
@@ -327,7 +333,7 @@ fn a_pair_that_differs_in_both_reports_the_format() {
     src.pixel_format = MTLPixelFormat::RGBA8Unorm;
     src.sample_count = 4;
     assert_eq!(
-        copy_texture_reject(&src, &endpoint(256), 256, 256),
+        copy_texture_reject(&src, &endpoint(256), 256, 256, 1),
         Some(CopyRejectReason::FormatMismatch)
     );
 }
@@ -336,11 +342,11 @@ fn a_pair_that_differs_in_both_reports_the_format() {
 #[test]
 fn a_region_leaving_either_end_is_rejected() {
     assert_eq!(
-        copy_texture_reject(&endpoint(128), &endpoint(256), 256, 256),
+        copy_texture_reject(&endpoint(128), &endpoint(256), 256, 256, 1),
         Some(CopyRejectReason::SourceRegionOutOfBounds)
     );
     assert_eq!(
-        copy_texture_reject(&endpoint(256), &endpoint(128), 256, 256),
+        copy_texture_reject(&endpoint(256), &endpoint(128), 256, 256, 1),
         Some(CopyRejectReason::DestinationRegionOutOfBounds)
     );
 }
@@ -351,9 +357,9 @@ fn an_offset_sub_rect_is_bounded_by_the_origin() {
     let mut src = endpoint(256);
     src.origin_x = 128;
     src.origin_y = 128;
-    assert_eq!(copy_texture_reject(&src, &endpoint(256), 128, 128), None);
+    assert_eq!(copy_texture_reject(&src, &endpoint(256), 128, 128, 1), None);
     assert_eq!(
-        copy_texture_reject(&src, &endpoint(256), 129, 128),
+        copy_texture_reject(&src, &endpoint(256), 129, 128, 1),
         Some(CopyRejectReason::SourceRegionOutOfBounds)
     );
 }
@@ -366,9 +372,9 @@ fn the_bound_is_the_addressed_mip_level() {
     src.level = 2;
     let mut dst = endpoint(64);
     dst.levels = 7;
-    assert_eq!(copy_texture_reject(&src, &dst, 64, 64), None);
+    assert_eq!(copy_texture_reject(&src, &dst, 64, 64, 1), None);
     assert_eq!(
-        copy_texture_reject(&src, &dst, 65, 64),
+        copy_texture_reject(&src, &dst, 65, 64, 1),
         Some(CopyRejectReason::SourceRegionOutOfBounds)
     );
 }
@@ -379,13 +385,13 @@ fn a_missing_mip_level_is_rejected() {
     let mut src = endpoint(256);
     src.level = 1;
     assert_eq!(
-        copy_texture_reject(&src, &endpoint(256), 1, 1),
+        copy_texture_reject(&src, &endpoint(256), 1, 1, 1),
         Some(CopyRejectReason::SourceLevelMissing)
     );
     let mut dst = endpoint(256);
     dst.level = 1;
     assert_eq!(
-        copy_texture_reject(&endpoint(256), &dst, 1, 1),
+        copy_texture_reject(&endpoint(256), &dst, 1, 1, 1),
         Some(CopyRejectReason::DestinationLevelMissing)
     );
 }
@@ -864,4 +870,47 @@ fn release_event_after_wait(
         event.setSignaledValue(1);
     });
     (done, watchdog)
+}
+
+/// Volume depth shrinks per mip and is checked at both ends independently.
+#[test]
+fn texture_copy_depth_is_bounded_by_each_mip() {
+    let mut src = endpoint(8);
+    src.depth = 8;
+    src.levels = 4;
+    src.level = 1;
+    let mut dst = endpoint(4);
+    dst.depth = 4;
+    dst.levels = 3;
+    assert_eq!(copy_texture_reject(&src, &dst, 4, 4, 4), None);
+    assert_eq!(
+        copy_texture_reject(&src, &dst, 4, 4, 5),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+    dst.depth = 2;
+    assert_eq!(
+        copy_texture_reject(&src, &dst, 4, 4, 3),
+        Some(CopyRejectReason::DestinationRegionOutOfBounds)
+    );
+    assert_eq!(copy_texture_reject(&src, &dst, 4, 4, 2), None);
+    src.level = 3;
+    dst.level = 2;
+    assert_eq!(copy_texture_reject(&src, &dst, 1, 1, 1), None);
+    assert_eq!(
+        copy_texture_reject(&src, &dst, 1, 1, 2),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
+}
+
+/// Ordinary 2D and cube mip copies address one depth plane.
+#[test]
+fn flat_texture_copies_reject_multiple_depth_planes() {
+    assert_eq!(
+        copy_texture_reject(&endpoint(4), &endpoint(4), 4, 4, 1),
+        None
+    );
+    assert_eq!(
+        copy_texture_reject(&endpoint(4), &endpoint(4), 4, 4, 2),
+        Some(CopyRejectReason::SourceRegionOutOfBounds)
+    );
 }

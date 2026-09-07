@@ -1570,6 +1570,7 @@ fn copy_texture_reject(
     dst: &CopyEndpoint,
     region_w: usize,
     region_h: usize,
+    region_depth: usize,
 ) -> Option<CopyRejectReason> {
     if !pixel_formats_copy_compatible(src.pixel_format, dst.pixel_format) {
         return Some(CopyRejectReason::FormatMismatch);
@@ -1584,10 +1585,14 @@ fn copy_texture_reject(
         return Some(CopyRejectReason::DestinationLevelMissing);
     };
     let region = (region_w, region_h);
-    if !region_fits((src.origin_x, src.origin_y), region, src_extent) {
+    if !region_fits((src.origin_x, src.origin_y), region, src_extent)
+        || region_depth > src.level_depth().expect("source level checked above")
+    {
         return Some(CopyRejectReason::SourceRegionOutOfBounds);
     }
-    if !region_fits((dst.origin_x, dst.origin_y), region, dst_extent) {
+    if !region_fits((dst.origin_x, dst.origin_y), region, dst_extent)
+        || region_depth > dst.level_depth().expect("destination level checked above")
+    {
         return Some(CopyRejectReason::DestinationRegionOutOfBounds);
     }
     None
@@ -1973,11 +1978,14 @@ fn encode_leading_blits(
                 };
                 let region_w = cmd.region_w;
                 let region_h = cmd.region_h;
+                // Zero retains the single-slice wire form of 2D and cube copies.
+                let region_depth = cmd.depth.max(1);
                 if let Some(reason) = copy_texture_reject(
                     &src_endpoint,
                     &dst_endpoint,
                     region_w as usize,
                     region_h as usize,
+                    region_depth as usize,
                 ) {
                     let reason_text = reason.as_str();
                     let src_handle = cmd.src_handle;
@@ -1988,14 +1996,15 @@ fn encode_leading_blits(
                         "encode_leading_blits: {reason_text}, copy skipped. \
                          src handle={src_handle:#x} {src_endpoint}, \
                          dst handle={dst_handle:#x} {dst_endpoint}, \
-                         region {region_w}x{region_h}"
+                         region {region_w}x{region_h}x{region_depth}"
                     );
                     continue;
                 }
                 mtld3d_shared::crumb!("blit:tex2tex", cmd.src_handle, cmd.dst_handle);
                 // SAFETY: objc2 typed binding; `src`/`dst` are retained Metal
-                // textures live for the call; geometry comes from a packed
-                // PE-side `BlitCommand` per the wire contract.
+                // textures live for the call; the region fits both live mip
+                // extents, including depth, as checked above. Array slices
+                // come from the PE-side command's texture subresource.
                 unsafe {
                     blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         &src,
@@ -2009,7 +2018,7 @@ fn encode_leading_blits(
                         MTLSize {
                             width: cmd.region_w as usize,
                             height: cmd.region_h as usize,
-                            depth: 1,
+                            depth: region_depth as usize,
                         },
                         &dst,
                         cmd.dst_slice as usize,

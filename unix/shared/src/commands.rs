@@ -620,7 +620,9 @@ pub enum BlitCommandType {
 ///   u64) << 32 | dst_x as u64`; `src_slice` and `dst_slice` select the
 ///   array slice at each end. For a full-mip preserve blit emit src
 ///   origin = (0, 0), region = (`mip_w`, `mip_h`), `dst_offset` = 0 (dst
-///   origin (0, 0)). `bytes_per_row` / `byte_size` unused.
+///   origin (0, 0)). `depth` is the region depth from z=0 at both ends;
+///   zero retains the single-slice copy used by 2D and cube commands.
+///   `bytes_per_row` / `byte_size` unused.
 /// - `CopyBufferToBuffer`: `src_handle` / `dst_handle` = buffers,
 ///   `src_offset` / `dst_offset` = byte offsets, `byte_size` = copy
 ///   size in bytes. `mip_level` / `origin_*` / `region_*` /
@@ -643,9 +645,11 @@ pub struct BlitCommand {
     pub region_h: u32,
     pub dst_offset: u64,
     pub byte_size: u64,
-    /// Slice count for `CopyBufferToTexture` (1 = 2D, >1 = volume/3D).
+    /// Region depth for buffer-to-texture and texture-to-texture copies.
     ///
-    /// Unused (0) for the other command types.
+    /// `CopyBufferToTexture` requires one for a 2D copy. `CopyTextureToTexture`
+    /// accepts zero as one for existing 2D and cube commands; a volume preserve
+    /// carries its full mip depth. Both copies start at z=0. Unused otherwise.
     pub depth: u32,
     /// Byte stride between slices for `CopyBufferToTexture`.
     ///
@@ -764,6 +768,28 @@ impl BlitCommand {
             dst_mip_level: mip_level,
             dst_slice: 0,
             src_slice: 0,
+        }
+    }
+
+    /// Preserve every depth slice of a volume mip from z=0 at both ends.
+    #[must_use]
+    pub const fn copy_texture_to_texture_full_volume_mip(
+        src_texture: u64,
+        dst_texture: u64,
+        mip_level: u32,
+        mip_w: u32,
+        mip_h: u32,
+        mip_depth: u32,
+    ) -> Self {
+        Self {
+            depth: mip_depth,
+            ..Self::copy_texture_to_texture_full_mip(
+                src_texture,
+                dst_texture,
+                mip_level,
+                mip_w,
+                mip_h,
+            )
         }
     }
 

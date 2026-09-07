@@ -7,18 +7,18 @@ use mtld3d_tests::{
     assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5,
-    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DXT1,
-    D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY,
-    D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE,
-    D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC,
-    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_RENDERTARGET,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
+    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY,
+    D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE,
+    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND,
+    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -2547,24 +2547,7 @@ fn update_texture_accepts_a_source_with_a_level_locked() {
 
 /// Sample the volume bound on stage 0 at texcoord `(0.5, 0.5, w)` with point filtering.
 fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
-    const WHITE: u32 = 0xFFFF_FFFF;
-    let v = |x: f32, y: f32| VolumeVertex {
-        x,
-        y,
-        z: 0.5,
-        color: WHITE,
-        u: 0.5,
-        v: 0.5,
-        w,
-    };
-    let quad = [
-        v(-1.0, 1.0),
-        v(1.0, 1.0),
-        v(-1.0, -1.0),
-        v(1.0, 1.0),
-        v(1.0, -1.0),
-        v(-1.0, -1.0),
-    ];
+    let quad = volume_sample_quad(-1.0, 1.0, [0.5, 0.5, w]);
     h.render_once(BLACK, |d| {
         assert_eq!(
             d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
@@ -2573,6 +2556,151 @@ fn sample_volume_depth(h: &Harness, w: f32) -> u32 {
         );
     });
     h.read_pixel(320, 240)
+}
+
+/// A full upload of a one-slice upper mip preserves every other mip and depth slice.
+#[test]
+fn volume_upper_mip_rename_preserves_every_slice() {
+    check_volume_upper_mip_rename(false);
+}
+
+/// A partial upper-mip lock preserves its complement and every other mip and slice.
+#[test]
+fn volume_upper_mip_partial_rename_preserves_every_slice() {
+    check_volume_upper_mip_rename(true);
+}
+
+fn check_volume_upper_mip_rename(partial: bool) {
+    const BLUE: u32 = 0xFF00_00FF;
+    const COLORS: [[u32; 4]; 4] = [
+        [0xFFFF_0000, 0xFF00_FF00, 0xFFFF_FF00, 0xFFFF_00FF],
+        [0xFF00_FFFF, 0xFFFF_FFFF, 0, 0],
+        [0xFFFF_0000, 0, 0, 0],
+        [0xFF00_FF00, 0, 0, 0],
+    ];
+    let h = Harness::new();
+    let (hr, texture) =
+        h.try_create_volume_texture([8, 8, 4], 4, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let texture = texture.expect("volume texture");
+    for (level, colors) in COLORS.iter().enumerate() {
+        let width = 8 >> level;
+        let depth = (4 >> level).max(1);
+        let texels: Vec<u32> = colors[..depth]
+            .iter()
+            .flat_map(|color| core::iter::repeat_n(*color, width * width))
+            .collect();
+        texture.write_u32(u32::try_from(level).expect("four levels"), &texels);
+    }
+    assert_eq!(h.set_volume_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    assert_pixel_eq(
+        sample_volume_depth(&h, 0.875),
+        COLORS[0][3],
+        "primed deep slice",
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                2,
+                &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
+            ),
+            0
+        );
+        if partial {
+            texture.write_box_u32(
+                2,
+                &D3DBOX {
+                    left: 1,
+                    top: 1,
+                    right: 2,
+                    bottom: 2,
+                    front: 0,
+                    back: 1,
+                },
+                &[BLUE],
+            );
+        } else {
+            texture.write_u32(2, &[BLUE; 4]);
+        }
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                2,
+                &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
+            ),
+            0
+        );
+    });
+    assert_eq!(
+        [h.read_pixel(160, 240), h.read_pixel(480, 240)],
+        [COLORS[0][3]; 2],
+        "upper mip update preserves the deep base slice across the rename"
+    );
+    for (level, colors) in COLORS.iter().enumerate() {
+        assert_eq!(
+            h.set_sampler_state(
+                0,
+                D3DSAMP_MAXMIPLEVEL,
+                u32::try_from(level).expect("four levels")
+            ),
+            0
+        );
+        let depth = (4 >> level).max(1);
+        for (slice, color) in colors[..depth].iter().enumerate() {
+            let w = (f32::from(u8::try_from(slice).expect("four slices")) + 0.5)
+                / f32::from(u8::try_from(depth).expect("four slices"));
+            for uv in [0.25, 0.75] {
+                h.render_once(BLACK, |d| {
+                    assert_eq!(
+                        d.draw_primitive_up(
+                            D3DPT_TRIANGLELIST,
+                            2,
+                            &volume_sample_quad(-1.0, 1.0, [uv, uv, w])
+                        ),
+                        0
+                    );
+                });
+                let expected = if level == 2 && (!partial || uv > 0.5) {
+                    BLUE
+                } else {
+                    *color
+                };
+                assert_pixel_eq(
+                    h.read_pixel(320, 240),
+                    expected,
+                    &format!("mip {level} slice {slice} uv {uv}"),
+                );
+            }
+        }
+    }
+}
+
+fn volume_sample_quad(left: f32, right: f32, coord: [f32; 3]) -> [VolumeVertex; 6] {
+    let vertex = |x, y| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: coord[0],
+        v: coord[1],
+        w: coord[2],
+    };
+    [
+        vertex(left, 1.0),
+        vertex(right, 1.0),
+        vertex(left, -1.0),
+        vertex(right, 1.0),
+        vertex(right, -1.0),
+        vertex(left, -1.0),
+    ]
 }
 
 /// `UpdateTexture` carries every slice of a SYSTEMMEM volume into its DEFAULT twin.
