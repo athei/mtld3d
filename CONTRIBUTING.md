@@ -292,8 +292,11 @@ The description is what survives, and for anything non-trivial it carries:
 CI compiles on two machines and replays everywhere else. One job builds the
 stage (`make stage`: both PE arches, both unix `.so` builds, the e2e test
 binaries, the e2e and conformance runners for both host arches) and another
-runs every lint, doc and unit leg as steps of one job before building the
-bundle. The test machines carry no toolchain: they install the stage
+runs formatting and audit first, then documentation, Clippy and unit tests
+as steps of one job. Production bundles are built by the release job only.
+Every run on `main` has its own concurrency group so pending runs survive
+later pushes and every commit keeps its CI result. PR updates cancel the
+superseded run. The test machines carry no toolchain: they install the stage
 (`STAGE=<dir>`) and run the end-to-end and conformance suites on three
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
