@@ -56,7 +56,7 @@ static MODESET_HELD: Mutex<bool> = Mutex::new(false);
 static MODESET_RELEASED: Condvar = Condvar::new();
 
 /// Take the session's display mode, waiting for the harness that holds it.
-fn hold_display_mode() {
+fn take_display_mode() {
     let mut held = MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner);
     while *held {
         held = MODESET_RELEASED
@@ -361,7 +361,7 @@ impl Harness {
         let d3d9 = create_factory(cfg.config_entries);
         let mut state = HarnessState::empty();
         if cfg.windowed == 0 {
-            hold_display_mode();
+            take_display_mode();
             state |= HarnessState::HOLDS_DISPLAY_MODE;
         }
 
@@ -2616,15 +2616,25 @@ impl Harness {
         hr
     }
 
+    /// Hold the session's display mode before reading geometry for a fullscreen transition.
+    ///
+    /// A following fullscreen [`Self::reset_params`] keeps the same ownership
+    /// interval rather than taking the non-reentrant mode lock again.
+    pub fn hold_display_mode(&self) {
+        if !self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            take_display_mode();
+            self.set(HarnessState::HOLDS_DISPLAY_MODE, true);
+        }
+    }
+
     /// `Reset` with caller-built parameters (for malformed-input tests).
     ///
     /// Returns the hr; does not touch [`Self::dims`]. A fullscreen request
     /// takes the session's display mode before the call; a windowed one
     /// that succeeds gives it back.
     pub fn reset_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
-        if pp.windowed == 0 && !self.has(HarnessState::HOLDS_DISPLAY_MODE) {
-            hold_display_mode();
-            self.set(HarnessState::HOLDS_DISPLAY_MODE, true);
+        if pp.windowed == 0 {
+            self.hold_display_mode();
         }
         // SAFETY: vtable thunk; `pp` is writable for the call.
         let hr = unsafe {
