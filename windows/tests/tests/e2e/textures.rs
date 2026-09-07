@@ -1093,6 +1093,89 @@ fn update_surface_uploads_the_selected_cube_face() {
     );
 }
 
+/// `UpdateSurface` copies a system-memory 2D level into one cube face level.
+///
+/// The source's level zero and the destination's other face carry different
+/// colours, so the rendered result pins both endpoint selections independently.
+#[test]
+fn update_surface_copies_a_2d_level_into_a_cube_face() {
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::new();
+    let src = h.create_texture(8, 8, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write::<u32>(&[BLUE; 64]);
+    src.lock_rect(1, 0).write::<u32>(&[GREEN; 16]);
+
+    let dst = h.create_cube_texture_owned(8, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let control = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    control.lock_rect(0).write_u32(&[RED; 16]);
+    assert_eq!(
+        h.update_surface_hr(&control, &dst.surface(0, 1)),
+        0,
+        "standalone source into positive-X mip 1"
+    );
+    assert_eq!(
+        h.update_surface_hr(&src.surface_level(1), &dst.surface(1, 1)),
+        0,
+        "2D mip 1 into negative-X mip 1"
+    );
+
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_pixel_eq(sample_cube_x(&h, &dst, 1.0), RED, "positive-X control face");
+    assert_pixel_eq(
+        sample_cube_x(&h, &dst, -1.0),
+        GREEN,
+        "negative-X updated face",
+    );
+}
+
+/// `UpdateSurface` copies one system-memory cube face level into a 2D level.
+///
+/// Other source subresources and destination level zero carry different
+/// colours, so the rendered result pins the chosen face and both mip levels.
+#[test]
+fn update_surface_copies_a_cube_face_into_a_2d_level() {
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    const WHITE: u32 = 0xFFFF_FFFF;
+    let h = Harness::new();
+    let src = h.create_cube_texture_owned(8, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 1, 0).write_u32(&[BLUE; 16]);
+    src.lock_rect(1, 0, 0).write_u32(&[WHITE; 64]);
+    src.lock_rect(1, 1, 0).write_u32(&[GREEN; 16]);
+
+    let dst = h.create_texture(8, 8, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let control = h.create_texture(8, 8, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    control.lock_rect(0, 0).write::<u32>(&[RED; 64]);
+    assert_eq!(
+        h.update_surface_hr(&control.surface_level(0), &dst.surface_level(0)),
+        0,
+        "2D control into destination mip 0"
+    );
+    assert_eq!(
+        h.update_surface_hr(&src.surface(1, 1), &dst.surface_level(1)),
+        0,
+        "negative-X mip 1 into 2D mip 1"
+    );
+
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        RED,
+        "destination mip 0 control",
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        GREEN,
+        "destination mip 1 update",
+    );
+}
+
 /// Run the frame that releases the staging of the levels uploaded so far.
 ///
 /// A level of the class that releases its staging after an upload keeps it

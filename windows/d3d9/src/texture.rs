@@ -526,6 +526,32 @@ impl TextureInner {
         Some((page.as_ptr() as u64, page.len()))
     }
 
+    /// Borrow one surface subresource as a standalone source image.
+    ///
+    /// `face` selects cube staging; a plain 2D level uses the ordinary staging
+    /// vector. Keeping that choice here lets `UpdateSurface` select each
+    /// endpoint independently without losing the face or mip it was handed.
+    pub fn surface_source_image(&self, face: Option<u32>, level: usize) -> Option<SourceImage<'_>> {
+        let page = match (face, self.cube.as_deref()) {
+            (Some(face), Some(cube)) => {
+                let index = self.cube_subresource_index(face, level)?;
+                cube.staging.get(index)?
+            }
+            (None, None) => self.staging.get(level)?,
+            _ => return None,
+        };
+        // SAFETY: `page` owns this allocation for the lifetime of the returned
+        // image, and `logical_len` is the initialized D3D staging extent.
+        let bytes = unsafe { std::slice::from_raw_parts(page.as_ptr(), page.logical_len()) };
+        Some(SourceImage {
+            bytes,
+            pitch: usize::try_from(*self.mip_bytes_per_row.get(level)?).ok()?,
+            width: *self.mip_widths.get(level)?,
+            height: *self.mip_heights.get(level)?,
+            format: self.d3d_format,
+        })
+    }
+
     /// Whether `level`'s staging can go once its upload has retired.
     ///
     /// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked
