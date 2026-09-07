@@ -2304,6 +2304,34 @@ fn update_surface_from_system_memory_reaches_the_next_draw() {
     );
 }
 
+/// `UpdateSurface` copies a compressed standalone system-memory source.
+///
+/// A DXT1 surface reports one row of eight-byte blocks rather than a linear
+/// bytes-per-pixel pitch. The copy must carry that block-row stride into the
+/// destination texture without weakening the existing format and pool checks.
+#[test]
+fn update_surface_copies_a_compressed_standalone_source() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_DXT1, D3DPOOL_SYSTEMMEM);
+    {
+        let mut locked = src.lock_rect(0);
+        assert_eq!(locked.pitch(), 8, "one DXT1 block row");
+        locked.write::<u8>(&dxt1_solid_block(0xF800));
+    }
+
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_DXT1, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.update_surface_hr(&src, &dst.surface_level(0)),
+        0,
+        "UpdateSurface from a DXT1 standalone source"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        0xFFFF_0000,
+        "copied DXT1 block",
+    );
+}
+
 /// `UpdateSurface` rejects a destination outside `D3DPOOL_DEFAULT`.
 ///
 /// The source is a standalone system-memory offscreen surface, which reaches

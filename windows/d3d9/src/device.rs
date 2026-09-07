@@ -6129,7 +6129,8 @@ extern "system" fn device_update_surface(
     // staging and mark it dirty so a subsequent bind / StretchRect uploads it.
     if src_parent.is_null()
         && !dst_parent.is_null()
-        && let Some((src_ptr, src_len, src_w, src_h, src_fmt)) = src_surf.system_memory_source()
+        && let Some((src_ptr, src_len, src_pitch, src_w, src_h, src_fmt)) =
+            src_surf.system_memory_source()
     {
         // An `UpdateSurface` source is a `D3DPOOL_SYSTEMMEM` surface. A
         // `D3DPOOL_SCRATCH` one carries the same CPU backing but is not a
@@ -6142,15 +6143,14 @@ extern "system" fn device_update_surface(
             return D3DERR_INVALIDCALL;
         }
         let dst_level = dst_surf.mip_level() as usize;
-        let Some(bpp) = map_d3d_format(src_fmt).map(|m| m.bytes_per_pixel()) else {
+        if map_d3d_format(src_fmt).is_none() {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "reject UpdateSurface: unmapped source format {} (0x{src_fmt:x}) → INVALIDCALL",
                 mtld3d_core::format::format_name(src_fmt)
             );
             return D3DERR_INVALIDCALL;
-        };
-        let src_pitch = linear_row_pitch(src_w, bpp) as usize;
+        }
         // SAFETY: optional *const RECT / *const POINT per the ABI; null → None.
         let rect = (unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(src_rect) })
             .map(|r| (r.x1, r.y1, r.x2, r.y2));
