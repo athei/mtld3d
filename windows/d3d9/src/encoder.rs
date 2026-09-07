@@ -6756,18 +6756,7 @@ impl FrameEncoder {
             .pass_state
             .texture_sampled_this_frame(unsafe { MetalHandle::new(handle) });
         if sampled {
-            if job
-                .info
-                .create_flags
-                .contains(TextureCreateFlags::TYPE_CUBE)
-            {
-                mtld3d_shared::log_once_warn_by!(
-                    target: LOG_TARGET,
-                    key: job.info.texture_id.raw(),
-                    "run_texture_upload: cube texture {:#x} uploaded after being sampled this frame; per-draw cube versioning is not implemented",
-                    job.info.texture_id.raw(),
-                );
-            } else if job.depth > 1 {
+            if job.depth > 1 {
                 mtld3d_shared::log_once_warn_by!(
                     target: LOG_TARGET,
                     key: job.info.texture_id.raw(),
@@ -6845,10 +6834,9 @@ impl FrameEncoder {
             return old_handle;
         }
 
-        // Carry over every mip this upload does not fully rewrite. The
-        // upload's own mip is skipped when the job covers it entirely
-        // (the standard whole-mip Lock path); a partial-rect job needs
-        // the old content underneath.
+        // A cube rename replaces every face and mip, so preserve each
+        // subresource except the one this job fully rewrites. A partial
+        // rectangle needs the old content underneath on its own face too.
         let mip_w = (info.width.max(1) >> job.level).max(1);
         let mip_h = (info.height.max(1) >> job.level).max(1);
         let is_volume = info.create_flags.contains(TextureCreateFlags::TYPE_3D);
@@ -6858,31 +6846,40 @@ impl FrameEncoder {
             && job.origin_y == 0
             && job.region_w >= mip_w
             && job.region_h >= mip_h;
-        for level in 0..info.levels {
-            if level == job.level && full_cover {
-                continue;
+        let slices = if info.create_flags.contains(TextureCreateFlags::TYPE_CUBE) {
+            6
+        } else {
+            1
+        };
+        for slice in 0..slices {
+            for level in 0..info.levels {
+                if slice == job.destination_slice && level == job.level && full_cover {
+                    continue;
+                }
+                let lw = (info.width.max(1) >> level).max(1);
+                let lh = (info.height.max(1) >> level).max(1);
+                let mut preserve = if is_volume {
+                    BlitCommand::copy_texture_to_texture_full_volume_mip(
+                        old_handle,
+                        fresh.raw(),
+                        level,
+                        lw,
+                        lh,
+                        (info.depth.max(1) >> level).max(1),
+                    )
+                } else {
+                    BlitCommand::copy_texture_to_texture_full_mip(
+                        old_handle,
+                        fresh.raw(),
+                        level,
+                        lw,
+                        lh,
+                    )
+                };
+                preserve.src_slice = slice;
+                preserve.dst_slice = slice;
+                self.frame_blit_commands.push(preserve);
             }
-            let lw = (info.width.max(1) >> level).max(1);
-            let lh = (info.height.max(1) >> level).max(1);
-            let preserve = if is_volume {
-                BlitCommand::copy_texture_to_texture_full_volume_mip(
-                    old_handle,
-                    fresh.raw(),
-                    level,
-                    lw,
-                    lh,
-                    (info.depth.max(1) >> level).max(1),
-                )
-            } else {
-                BlitCommand::copy_texture_to_texture_full_mip(
-                    old_handle,
-                    fresh.raw(),
-                    level,
-                    lw,
-                    lh,
-                )
-            };
-            self.frame_blit_commands.push(preserve);
         }
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
 
