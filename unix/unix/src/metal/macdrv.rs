@@ -12,7 +12,8 @@ use mtld3d_shared::{
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
 };
 use objc2::{
-    rc::Retained,
+    MainThreadMarker,
+    rc::{Retained, autoreleasepool},
     runtime::{NSObjectProtocol, ProtocolObject},
 };
 use objc2_core_graphics::{CGColor, CGColorSpace};
@@ -109,7 +110,9 @@ fn install_occlusion_tracking(att: &Arc<Attachment>) {
 
     let att = Arc::clone(att);
     run_on_main_thread_sync(move || {
-        let window = attachment::retain_view(&att).and_then(|view| view.window());
+        let mtm =
+            MainThreadMarker::new().expect("install_occlusion_tracking runs on the main thread");
+        let window = attachment::retain_view(&att, mtm).and_then(|view| view.window());
         let Some(window) = window else {
             // No host window yet: assume visible so a present is never
             // wrongly suppressed; the observer corrects it on the first
@@ -124,10 +127,8 @@ fn install_occlusion_tracking(att: &Arc<Attachment>) {
             .contains(NSWindowOcclusionState::Visible);
         att.set_window_occluded(occluded);
         install_occlusion_observer_once();
-        // SAFETY: inside the main-thread dispatch above.
-        let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
         install_screen_params_filter(mtm);
-        cursor_overlay::install_pointer_watch();
+        cursor_overlay::install_pointer_watch(mtm);
     });
 }
 
@@ -270,7 +271,7 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     use core::ptr::NonNull;
 
     use block2::RcBlock;
-    use objc2::{MainThreadMarker, runtime::ProtocolObject};
+    use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{
         NSApplication, NSApplicationDelegate, NSApplicationDidChangeScreenParametersNotification,
         NSScreen,
@@ -316,48 +317,50 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     core::mem::forget(delegate);
 
     let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
-        let count = SCREEN_PARAM_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
-        // SAFETY: AppKit posts this notification on the main thread.
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let config = current_screen_configuration(mtm);
-        let changed = {
-            let mut last = LAST_SCREEN_CONFIGURATION
-                .lock()
-                .expect("screen-configuration mutex poisoned");
-            let changed = last.as_ref() != Some(&config);
-            if changed {
-                *last = Some(config);
+        autoreleasepool(|_| {
+            let count = SCREEN_PARAM_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+            let mtm = MainThreadMarker::new()
+                .expect("the screen-parameter notification is posted on the main thread");
+            let config = current_screen_configuration(mtm);
+            let changed = {
+                let mut last = LAST_SCREEN_CONFIGURATION
+                    .lock()
+                    .expect("screen-configuration mutex poisoned");
+                let changed = last.as_ref() != Some(&config);
+                if changed {
+                    *last = Some(config);
+                }
+                changed
+            };
+            if log_enabled!(target: LOG_TARGET, log::Level::Debug) {
+                let headroom = NSScreen::mainScreen(mtm)
+                    .map_or(0.0, |s| s.maximumExtendedDynamicRangeColorComponentValue());
+                debug!(
+                    target: LOG_TARGET,
+                    "screen params changed #{count}: headroom={headroom:.3} {}",
+                    if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
+                );
             }
-            changed
-        };
-        if log_enabled!(target: LOG_TARGET, log::Level::Debug) {
-            let headroom = NSScreen::mainScreen(mtm)
-                .map_or(0.0, |s| s.maximumExtendedDynamicRangeColorComponentValue());
-            debug!(
-                target: LOG_TARGET,
-                "screen params changed #{count}: headroom={headroom:.3} {}",
-                if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
-            );
-        }
-        if !changed {
-            return;
-        }
-        // A real topology or mode change is the moment a display was
-        // attached, removed or reconfigured, so reconcile every layer now
-        // rather than waiting out the present-counted poll interval.
-        refresh_all_on_main();
-        let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
-        if delegate_ptr == 0 {
-            return;
-        }
-        // SAFETY: the pointer was taken from a `Retained` that is leaked
-        // above, so the delegate outlives this block, and the call is on
-        // the main thread, which is the delegate's thread.
-        let delegate =
-            unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
-        // SAFETY: the notification pointer is valid for the handler's
-        // duration; Wine implements this optional delegate method.
-        unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
+            if !changed {
+                return;
+            }
+            // A real topology or mode change is the moment a display was
+            // attached, removed or reconfigured, so reconcile every layer now
+            // rather than waiting out the present-counted poll interval.
+            refresh_all_on_main();
+            let delegate_ptr = WINE_APP_DELEGATE_PTR.load(Ordering::Acquire);
+            if delegate_ptr == 0 {
+                return;
+            }
+            // SAFETY: the pointer was taken from a `Retained` that is leaked
+            // above, so the delegate outlives this block, and the call is on
+            // the main thread, which is the delegate's thread.
+            let delegate =
+                unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
+            // SAFETY: the notification pointer is valid for the handler's
+            // duration; Wine implements this optional delegate method.
+            unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
+        });
     });
     // SAFETY: objc2 typed binding; the center copies the block, and the
     // token is leaked below so the observer is never removed.
@@ -398,29 +401,31 @@ fn install_occlusion_observer_once() {
         // `addObserverForName:object:queue:usingBlock:`'s sendable-block
         // contract.
         let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
-            // SAFETY: AppKit hands a valid `NSNotification` for the call.
-            let notification = unsafe { notification.as_ref() };
-            let Some(object) = notification.object() else {
-                return;
-            };
-            let object_ptr = Retained::as_ptr(&object) as usize;
-            let ours: Vec<Arc<Attachment>> = attachment::live()
-                .into_iter()
-                .filter(|att| object_ptr != 0 && att.window() == object_ptr)
-                .collect();
-            if ours.is_empty() {
-                return;
-            }
-            // SAFETY: `object` is the live window that posted the notification;
-            // its pointer matches a window an attach found, so it is one of
-            // our `NSWindow`s, and it stays retained for this call. Occlusion
-            // notifications are delivered on the main thread, where the
-            // `occlusionState` read is valid.
-            let window = unsafe { &*(object_ptr as *const NSWindow) };
-            let occluded = !window.occlusionState().contains(NSWindowOcclusionState::Visible);
-            for att in &ours {
-                att.set_window_occluded(occluded);
-            }
+            autoreleasepool(|_| {
+                // SAFETY: AppKit hands a valid `NSNotification` for the call.
+                let notification = unsafe { notification.as_ref() };
+                let Some(object) = notification.object() else {
+                    return;
+                };
+                let object_ptr = Retained::as_ptr(&object) as usize;
+                let ours: Vec<Arc<Attachment>> = attachment::live()
+                    .into_iter()
+                    .filter(|att| object_ptr != 0 && att.window() == object_ptr)
+                    .collect();
+                if ours.is_empty() {
+                    return;
+                }
+                // SAFETY: `object` is the live window that posted the notification;
+                // its pointer matches a window an attach found, so it is one of
+                // our `NSWindow`s, and it stays retained for this call. Occlusion
+                // notifications are delivered on the main thread, where the
+                // `occlusionState` read is valid.
+                let window = unsafe { &*(object_ptr as *const NSWindow) };
+                let occluded = !window.occlusionState().contains(NSWindowOcclusionState::Visible);
+                for att in &ours {
+                    att.set_window_occluded(occluded);
+                }
+            });
         });
 
         let center = NSNotificationCenter::defaultCenter();
@@ -742,6 +747,12 @@ static MACDRV_LIB: LazyLock<Library> = LazyLock::new(Library::this);
 /// `OnMainThread` (`dlls/winemac.drv/cocoa_window.m`); mtld3d mirrors that
 /// posture for its own layer configuration.
 ///
+/// The closure runs in an autorelease pool of its own, so the objects it
+/// autoreleases drain when it returns rather than at the end of whatever
+/// pool the main thread's caller holds open around its own work; winemac
+/// runs its request loop inside one, and an object released into it lives
+/// until that loop's iteration ends.
+///
 /// `panic = "abort"` in our profile means the closure's panic aborts
 /// the process — no unwinding across the `extern "C"` boundary, no UB.
 fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
@@ -754,7 +765,7 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
         // worker function unchanged.
         let ctx = unsafe { &mut *(ctx.cast::<CallCtx<F>>()) };
         if let Some(f) = ctx.f.take() {
-            f();
+            autoreleasepool(|_| f());
         }
     }
     let mut ctx = CallCtx { f: Some(f) };
@@ -772,16 +783,25 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
 ///
 /// The asynchronous twin of [`run_on_main_thread_sync`], for callers that must
 /// not put the main run loop in their critical path: the thunk that carries the
-/// software cursor's state runs on the API thread, and the display
-/// reconciliation runs on the submit thread's cadence. The closure is boxed and
-/// handed to libdispatch, which runs it once on the main queue and frees it.
+/// software cursor's state runs on the API thread, the display reconciliation
+/// runs on the submit thread's cadence, and a Reset's re-pacing runs on the
+/// encoder thread. The closure is boxed and handed to libdispatch, which runs
+/// it once on the main queue and frees it, in an autorelease pool of its own
+/// for the reason the synchronous twin gives.
+///
+/// This is also the only hop a thread may take while another thread can be
+/// waiting on it. winemac's main thread waits on Wine threads in a private
+/// run-loop mode that does not drain the main queue, and the thread it waits
+/// on can be the API thread inside `Present`, holding the device lock and
+/// blocked on the encoder's channel; a synchronous hop from the encoder
+/// thread would then close a cycle that the asynchronous one cannot.
 fn run_on_main_thread_async<F: FnOnce() + Send + 'static>(f: F) {
     extern "C" fn thunk<F: FnOnce()>(ctx: *mut c_void) {
         // SAFETY: `ctx` is the `Box<F>` leaked below; libdispatch hands it to
         // the work function exactly once, so taking it back here is the one
         // and only owner.
         let f = unsafe { Box::from_raw(ctx.cast::<F>()) };
-        f();
+        autoreleasepool(|_| f());
     }
     let ctx = Box::into_raw(Box::new(f));
     // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton, a valid
@@ -958,28 +978,27 @@ pub fn attach_metal_layer(
 
 /// Apply a runtime change to the guest's vsync request.
 ///
-/// The D3D9 Reset path honouring a
-/// `D3DPRESENT_PARAMETERS::PresentationInterval` flip. The layer's
-/// `displaySyncEnabled` stays `false` from attach time onward; what actually
-/// changes is the present-throttle duration on the layer's attachment
-/// record, consulted at the present site and recomputed from
-/// `NSScreen.mainScreen` here (the PE side re-sends the `present.maxFps` cap
-/// so it survives Resets). The mainScreen lookup may pick the wrong panel in
-/// a multi-monitor setup; the display-follow reconciliation walks to the
-/// window's own screen and corrects it within one poll interval, which is
-/// why this path stays a one-line read. A device's Reset re-paces that
-/// device alone.
+/// The D3D9 Reset path honouring a `D3DPRESENT_PARAMETERS::PresentationInterval`
+/// flip, run by the encoder thread on the first frame after the Reset. The
+/// layer's `displaySyncEnabled` stays `false` from attach time onward; what
+/// changes is the present-throttle duration on the layer's attachment record,
+/// consulted at the present site. The encoder thread latches the new pacing
+/// on the record (the PE side re-sends the `present.maxFps` cap so it survives
+/// Resets) and queues the same main-thread reconciliation the display-follow
+/// poll uses, which walks to the window's own screen and re-derives the
+/// throttle from the latched pacing ([`follow_screen_present_throttle`]). So
+/// the panel is the one under the window rather than the main screen, nothing
+/// here touches `AppKit` off the main thread, and the new throttle is live
+/// within one present. A device's Reset re-paces that device alone.
 ///
-/// The new pacing is latched on the record for that reconciliation too, so
-/// a throttle it re-derives on another panel keeps the interval the guest
-/// just asked for.
+/// The hop is the asynchronous one, and has to be: the encoder thread is what
+/// the API thread waits on from inside `Present`, and winemac's main thread can
+/// be waiting on that API thread in turn ([`run_on_main_thread_async`]). The
+/// registry lock is released by the lookup before the hop is queued.
 pub fn set_display_sync_enabled(
     layer_handle: MetalHandle<CAMetalLayerKind>,
     pacing: &PresentPacing,
 ) {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSScreen;
-
     let layer_addr =
         usize::try_from(layer_handle.raw()).expect("a 64-bit host addresses every layer pointer");
     let Some(att) = attachment::find_by_layer(layer_addr) else {
@@ -990,16 +1009,10 @@ pub fn set_display_sync_enabled(
         );
         return;
     };
-    // SAFETY: NSScreen is MainThreadOnly per objc2-app-kit's class
-    // annotation, but mtld3d reads only display-metadata properties
-    // (`maximumFramesPerSecond`, `frame`, `convertRectToBacking`), which
-    // Apple documents as retrievable from any thread ("NSScreen objects
-    // can be retrieved from any thread"). This is the canonical statement
-    // of that posture; the other NSScreen readers in this file cite it.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
     att.set_pacing_bits(pack_pacing(pacing));
-    let panel_max_hz = NSScreen::mainScreen(mtm).map_or(0.0_f64, |s| screen_max_hz(&s));
-    att.set_min_present_duration(min_present_duration(panel_max_hz, pacing));
+    if att.request_refresh() {
+        run_on_main_thread_async(move || refresh_attachment_on_main(&att));
+    }
 }
 
 /// Host-time seconds (`CFTimeInterval`) to nanoseconds, saturating.
@@ -1378,16 +1391,13 @@ fn refresh_all_on_main() {
 /// consumes ([`follow_layer_backing_scale`]). A record that was retired
 /// between the queueing and the run finds no view and does nothing.
 fn refresh_attachment_on_main(att: &Arc<Attachment>) {
-    use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
 
     att.end_headroom_refresh();
-    let Some(view_obj) = attachment::retain_view(att) else {
+    let mtm = MainThreadMarker::new().expect("refresh_attachment_on_main runs on the main thread");
+    let Some(view_obj) = attachment::retain_view(att, mtm) else {
         return;
     };
-    // SAFETY: we are on the main thread (dispatched to the main queue), where
-    // NSScreen's main-thread-only class annotation is satisfied for real.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
     // The attach that registered this record may have run before Wine had an
     // application delegate, which leaves the notification unfiltered. This is
     // the recurring main-thread pass, so it is where the install is retried;
@@ -1414,11 +1424,11 @@ fn refresh_attachment_on_main(att: &Arc<Attachment>) {
     // between displays reports none, and the layer is better left as it is
     // than reconfigured twice against a screen the window is leaving.
     if let Some(screen) = screen.as_deref() {
-        follow_screen_layer_mode(att, screen);
+        follow_screen_layer_mode(att, screen, mtm);
         follow_screen_present_throttle(att, screen);
-        follow_layer_backing_scale(att);
+        follow_layer_backing_scale(att, mtm);
     }
-    log_headroom_change_if_any(att, headroom, &view_obj);
+    log_headroom_change_if_any(att, headroom, &view_obj, mtm);
     cursor_overlay::reconcile_on_main();
 }
 
@@ -1438,6 +1448,7 @@ fn log_headroom_change_if_any(
     att: &Arc<Attachment>,
     current_headroom: f32,
     view: &objc2_app_kit::NSView,
+    mtm: MainThreadMarker,
 ) {
     let last = att.last_logged_headroom();
     let should_log = last.is_none_or(|last| ((current_headroom - last).abs() / last) > 0.05);
@@ -1446,7 +1457,7 @@ fn log_headroom_change_if_any(
     }
     let last = last.unwrap_or(0.0);
     att.set_last_logged_headroom(current_headroom);
-    let screen = view_screen_name(view);
+    let screen = view_screen_name(view, mtm);
     let screen_ref = screen.as_deref().unwrap_or("(unknown screen)");
     info!(
         target: LOG_TARGET,
@@ -1460,14 +1471,9 @@ fn log_headroom_change_if_any(
 /// logged screen identity matches the screen whose headroom we just read.
 /// **Main thread only**, for the same reason that one is. Returns `None`
 /// if the view has no window or no screen association yet.
-fn view_screen_name(view: &objc2_app_kit::NSView) -> Option<String> {
-    use objc2::MainThreadMarker;
+fn view_screen_name(view: &objc2_app_kit::NSView, mtm: MainThreadMarker) -> Option<String> {
     use objc2_app_kit::NSScreen;
 
-    // SAFETY: the sole caller is `log_headroom_change_if_any`, itself reached
-    // only from the main-queue refresh, so NSScreen's main-thread-only class
-    // annotation is satisfied for real rather than asserted.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let screen = view
         .window()
         .and_then(|w| w.screen())
@@ -1817,7 +1823,11 @@ fn screen_color_profile(
 /// re-formatting the layer on a brightness step would drop the drawable pool
 /// for a value the present shader already tracks per frame. Reconfiguring is
 /// therefore rare, and each one gets a log line.
-fn follow_screen_layer_mode(att: &Arc<Attachment>, screen: &objc2_app_kit::NSScreen) {
+fn follow_screen_layer_mode(
+    att: &Arc<Attachment>,
+    screen: &objc2_app_kit::NSScreen,
+    mtm: MainThreadMarker,
+) {
     let applied = if att.hdr_active() {
         LayerMode::Hdr
     } else {
@@ -1831,7 +1841,7 @@ fn follow_screen_layer_mode(att: &Arc<Attachment>, screen: &objc2_app_kit::NSScr
     };
     // A record retired since the refresh was queued leaves no layer to
     // reconcile.
-    let Some(layer) = attachment::retain_layer(att) else {
+    let Some(layer) = attachment::retain_layer(att, mtm) else {
         return;
     };
     let color_space = att.color_space();
@@ -1895,8 +1905,8 @@ fn follow_screen_present_throttle(att: &Arc<Attachment>, screen: &objc2_app_kit:
 ///
 /// A session whose mode stays put reads back the scale it already published,
 /// and nothing is stored or logged.
-fn follow_layer_backing_scale(att: &Arc<Attachment>) {
-    let Some(layer) = attachment::retain_layer(att) else {
+fn follow_layer_backing_scale(att: &Arc<Attachment>, mtm: MainThreadMarker) {
+    let Some(layer) = attachment::retain_layer(att, mtm) else {
         return;
     };
     let applied = att.backing_scale();

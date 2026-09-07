@@ -35,7 +35,10 @@ const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
 /// and pin every resource they encoded — `bytesNoCopy` pages stay wired
 /// and `newBufferWithBytesNoCopy:` eventually returns nil. Each macro
 /// invocation defines a uniquely-scoped `extern "C"` wrapper so wrapping
-/// every handler is two new tokens at the call site.
+/// every handler is two new tokens at the call site. The thunks of
+/// `macdrv::run_on_main_thread_sync` and `macdrv::run_on_main_thread_async`
+/// are its main-thread twins: every closure the layer dispatches there runs
+/// in a pool of its own for the same reason.
 macro_rules! arp {
     ($inner:path) => {{
         extern "C" fn arp_wrap(args: *mut c_void) -> i32 {

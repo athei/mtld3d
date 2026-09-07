@@ -883,6 +883,33 @@ fn reset_clears_scene_state() {
     );
 }
 
+#[test]
+fn reset_flips_the_presentation_interval() {
+    let h = Harness::new();
+    assert_eq!(
+        h.present(),
+        D3D_OK,
+        "a present at the interval the device was created with"
+    );
+    // A Reset queues the new pacing for the frames that follow it, and the
+    // presents after each one carry it to the layer, which re-derives the
+    // present throttle off the panel's cadence and back onto it. Several
+    // presents rather than one, so the frame that carries the pacing is sent
+    // and the device outlives the re-derivation it queues.
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to IMMEDIATE");
+    for _ in 0..8 {
+        assert_eq!(h.present(), D3D_OK, "a present of the free run");
+    }
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
+    for _ in 0..8 {
+        assert_eq!(h.present(), D3D_OK, "a present at the display rate");
+    }
+}
+
 /// A full-target quad whose texture coordinates address a cube's +X face.
 ///
 /// The whole face carries one colour, so the sampled texel does not depend on

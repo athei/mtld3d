@@ -18,6 +18,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `pub(crate)` = 0 | §No `pub(crate)` |
 | `extern "stdcall"` = 0 | §`extern "system"` everywhere |
 | `msg_send!` / `class!` / `sel!` = 0 | §No raw `msg_send!` |
+| `MainThreadMarker::new_unchecked` = 0 | §AppKit work runs on the main thread |
 | `HashMap` / `HashSet` = 0 (maps are `FxHashMap` / `FxHashSet`) | §FxHash for maps, xxh3 for content |
 | `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
@@ -402,11 +403,19 @@ How to apply:
 - Feature dependencies are not transitive: enabling `NSView` requires `NSResponder`; methods returning `CGFloat`/`NSRect` need the `objc2-core-foundation` feature on `objc2-app-kit`. The compile error names the missing item; the crate's `Cargo.toml` `[features]` section names the gate.
 - `*mut c_void` from FFI → `Retained::retain(ptr.cast::<TypedClass>())`, then call typed methods. Pattern used throughout `macdrv.rs`.
 - Protocol inheritance (e.g. handing a `CAMetalDrawable` to `MTLCommandBuffer::presentDrawable`) uses `ProtocolObject::from_ref(&*sub_obj)` — sound because the sub-protocol trait extends the super-protocol trait. Type inference at the call site picks the target protocol.
-- `MainThreadOnly` classes (`NSScreen` / `NSView` / `NSWindow` / most of AppKit): mtld3d runs the API thread off the AppKit main thread, so class methods that require `MainThreadMarker` need `unsafe { MainThreadMarker::new_unchecked() }` with a SAFETY comment naming the read-only property being queried.
+- `MainThreadOnly` classes (`NSScreen` / `NSView` / `NSWindow` / most of AppKit) are reached from the main thread alone, through the two dispatchers; §"AppKit work runs on the main thread" has the rule and the marker it takes.
 
 Hard rule: no new `msg_send!`, `class!`, or `sel!` callsites — they're a grep away from being banned mechanically. If a binding is genuinely missing from objc2 framework crates, declare it locally via `objc2::extern_class!` / `extern_methods!` (the same macros the framework crates use) so the surface stays typed.
 
 This is one instance of the general rule in §"Unsafe is a last resort": prefer typed safe wrappers over raw unsafe. `msg_send!` is unsafe surface that already has typed alternatives.
+
+## AppKit work runs on the main thread
+
+Every `AppKit` object the layer touches (a view, its window, the screen under it, `NSApp`, the notification center and the observers it hands back) is created, read and released on the main thread, and so is the Core Animation layer configuration that has to land in a main-thread `CATransaction`. The API, encoder and submit threads never reach one directly: main-thread-only work is dispatched through `run_on_main_thread_sync` or `run_on_main_thread_async` in `unix/unix/src/metal/macdrv.rs`, the only two doors, and the dispatched closure runs in an autorelease pool of its own, so what it autoreleases drains when it returns rather than in whatever pool the main thread's caller holds open. A thread that another thread may be waiting on takes the asynchronous door: winemac's main thread waits on Wine threads in a run-loop mode that does not drain the main queue, and the thread it waits on can be the API thread blocked on the encoder, so a synchronous hop from the encoder thread closes a cycle.
+
+Inside the dispatch, the marker is the checked `MainThreadMarker::new().expect("<function> runs on the main thread")`. The check is one `pthread_main_np` call on a path that is already a main-queue block, and an off-main use aborts with a named site instead of corrupting `AppKit`'s per-thread state. `unsafe { MainThreadMarker::new_unchecked() }` is banned by `make audit`; a property documented as readable from any thread is no exception, because the walk to the object that has the property is the part that is not.
+
+A view or a layer is resurrected from the address an attachment record holds in exactly one place: the registry helpers `retain_view` and `retain_layer` in `metal/macdrv/attachment.rs`, which check the record is still live under the registry lock and take a `MainThreadMarker`, so the contract is type-enforced where the address is turned back into an object. A new reader of a record's view or layer goes through them.
 
 ## Doc comments
 

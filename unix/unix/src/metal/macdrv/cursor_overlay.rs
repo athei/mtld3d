@@ -87,7 +87,7 @@ use mtld3d_shared::{
 };
 use objc2::{
     MainThreadMarker, MainThreadOnly, extern_class, extern_methods,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyClass, NSObject, ProtocolObject},
 };
 use objc2_app_kit::{
@@ -677,9 +677,7 @@ thread_local! {
 }
 
 fn apply_on_main_inner(create_if_missing: bool) {
-    // SAFETY: every caller runs on the main thread (a main-queue block or an
-    // AppKit callback), where NSWindow and NSView access is valid.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let mtm = MainThreadMarker::new().expect("apply_on_main_inner runs on the main thread");
     let wanted = snapshot_wanted();
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
@@ -724,9 +722,7 @@ fn on_pointer_event_main() {
 
 /// Bring the overlay, if there is one, in line with the pointer. **Main thread only.**
 fn sync_overlay_on_main() {
-    // SAFETY: every caller runs on the main thread (a main-queue block or an
-    // AppKit callback).
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let mtm = MainThreadMarker::new().expect("sync_overlay_on_main runs on the main thread");
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             return;
@@ -763,7 +759,7 @@ impl Overlay {
     /// `None` when there is no attachment to borrow a layer's device from or
     /// Metal refuses a command queue; the next apply tries again.
     fn create(mtm: MainThreadMarker) -> Option<Self> {
-        let game_layer = attachment::retain_layer(&active_attachment()?)?;
+        let game_layer = attachment::retain_layer(&active_attachment()?, mtm)?;
         let device = game_layer.device()?;
         let queue = device.newCommandQueue()?;
         queue.setLabel(Some(&NSString::from_str("mtld3d-cursor-queue")));
@@ -1040,7 +1036,7 @@ impl Overlay {
             self.ensure_content(Content::Transparent);
             return;
         };
-        let game = attachment::retain_view(&att)
+        let game = attachment::retain_view(&att, mtm)
             .and_then(|view| view.window().map(|window| (view, window)));
         let Some((view, game_window)) = game else {
             self.ensure_content(Content::Transparent);
@@ -1176,17 +1172,19 @@ extern "C-unwind" fn follow_warp(
     _activity: CFRunLoopActivity,
     _info: *mut core::ffi::c_void,
 ) {
-    let now = wine_last_warp_uptime();
-    let warped = WARP_FOLLOWED.with(|followed| {
-        let seen = warp_since(followed.get(), now);
-        if seen {
-            followed.set(now);
+    autoreleasepool(|_| {
+        let now = wine_last_warp_uptime();
+        let warped = WARP_FOLLOWED.with(|followed| {
+            let seen = warp_since(followed.get(), now);
+            if seen {
+                followed.set(now);
+            }
+            seen
+        });
+        if warped {
+            sync_overlay_on_main();
         }
-        seen
     });
-    if warped {
-        sync_overlay_on_main();
-    }
 }
 
 /// The number of the window a click at `point` would land on, in any application.
@@ -1200,7 +1198,7 @@ fn window_under_pointer(point: CGPoint, mtm: MainThreadMarker) -> NSInteger {
 /// The screen the game window is on; the main screen when it is on none or none is followed.
 fn game_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
     active_attachment()
-        .and_then(|att| attachment::retain_view(&att))
+        .and_then(|att| attachment::retain_view(&att, mtm))
         .and_then(|view| view.window())
         .and_then(|window| window.screen())
         .or_else(|| NSScreen::mainScreen(mtm))
@@ -1283,18 +1281,22 @@ fn upload_sprite_texture(
 
 /// Install the pointer watch: the mouse-move monitor and the activation observers.
 ///
-/// **Main thread only.** Called at every attach and installed once per
-/// process, for every device whatever its cursor mode. The monitor sees every
-/// mouse-moved and dragged event the Wine process receives, before Wine
-/// dispatches it, and returns it unchanged. Every token is leaked for the
-/// process lifetime like the other `AppKit` observers in this module's parent.
-pub fn install_pointer_watch() {
+/// Called at every attach and installed once per process, for every device
+/// whatever its cursor mode; the marker is the attach's main-thread hop. The
+/// monitor sees every mouse-moved and dragged event the Wine process
+/// receives, before Wine dispatches it, and returns it unchanged. Every token
+/// is leaked for the process lifetime like the other `AppKit` observers in
+/// this module's parent, and every callback runs in an autorelease pool of its
+/// own, as the main-thread hops do.
+pub fn install_pointer_watch(mtm: MainThreadMarker) {
     if POINTER_WATCH_INSTALLED.replace(true) {
         return;
     }
     let monitor = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
-        on_pointer_event_main();
-        event.as_ptr()
+        autoreleasepool(|_| {
+            on_pointer_event_main();
+            event.as_ptr()
+        })
     });
     // Presses and releases count as events too: the last event's position
     // has to be fresh when a game warps the pointer on release.
@@ -1343,9 +1345,6 @@ pub fn install_pointer_watch() {
         );
     }
 
-    // SAFETY: the caller runs on the main thread (the attach handler's
-    // main-thread hop), where the application object may be read.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
     APP_ACTIVE.store(
         NSApplication::sharedApplication(mtm).isActive(),
         Ordering::Relaxed,
@@ -1361,8 +1360,10 @@ pub fn install_pointer_watch() {
     };
     for (name, active) in names {
         let block = RcBlock::new(move |_: NonNull<NSNotification>| {
-            APP_ACTIVE.store(active, Ordering::Relaxed);
-            on_pointer_event_main();
+            autoreleasepool(|_| {
+                APP_ACTIVE.store(active, Ordering::Relaxed);
+                on_pointer_event_main();
+            });
         });
         // SAFETY: objc2 typed binding; the center copies the block, and the
         // token is leaked so the observer lives for the process.
