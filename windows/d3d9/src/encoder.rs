@@ -27,7 +27,7 @@ use mtld3d_core::{
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
-    page_box::PageBox,
+    page_box::{PageBox, PageBoxRead},
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
         LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
@@ -325,7 +325,7 @@ pub struct ColorFillTarget {
 /// signature to a single argument.
 pub struct TextureUploadJob {
     pub info: TextureInfo,
-    pub arc: Arc<PageBox>,
+    pub staging: PageBoxRead,
     pub level: u32,
     /// Destination array slice.
     ///
@@ -555,27 +555,25 @@ pub struct TextureGpuState {
 
 /// Frame-lifetime retention for blit-source PE-heap staging.
 ///
-/// Each entry keeps one `Arc<PageBox>` alive from blit-encode time
+/// Each entry keeps one staging read alive from blit-encode time
 /// through GPU retirement of the owning command buffer, keyed by the
 /// frame's `submit_seq`. Drained FIFO in `begin_frame` once the seq is ≤
 /// `coherent_seq`.
-struct PendingBlitArc {
+struct PendingBlitRead {
     submit_seq: u64,
-    arc: Arc<PageBox>,
+    read: PageBoxRead,
 }
 
-impl PendingBlitArc {
-    const fn new(submit_seq: u64, arc: Arc<PageBox>) -> Self {
-        Self { submit_seq, arc }
+impl PendingBlitRead {
+    const fn new(submit_seq: u64, read: PageBoxRead) -> Self {
+        Self { submit_seq, read }
     }
 
     /// Strong-count probe used by the reclaim loop's debug checks.
     ///
-    /// Also ensures the `arc` field stays `#[warn(dead_code)]`-clean
-    /// — the field's real job is to keep the Box alive until drop,
-    /// which rustc doesn't count as a "read".
+    /// Includes the guard's owning reference to the backing allocation.
     fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.arc)
+        Arc::strong_count(self.read.backing())
     }
 
     /// Byte length of the retained staging Box.
@@ -583,7 +581,7 @@ impl PendingBlitArc {
     /// Used by the reclaim loop to decrement `tex_staging_retained_bytes`
     /// by the exact amount the matching submit-time push added.
     fn byte_len(&self) -> usize {
-        self.arc.len()
+        self.read.backing().len()
     }
 }
 
@@ -952,16 +950,16 @@ pub struct FrameEncoder {
     /// group so the trace node and the `[dump] draw N` line name each other.
     /// `None` outside a dump; cleared in `begin_frame`.
     dump_draw: Option<u32>,
-    /// Arc clones of staging `PageBoxes` referenced by blits emitted this frame.
+    /// Read guards for staging referenced by blits emitted this frame.
     ///
     /// Moved into `pending_blit_retention` at submit time with the frame's
     /// `submit_seq`; drained from `pending_blit_retention` in `begin_frame`
     /// once `coherent_seq` catches up.
-    current_blit_retention: Vec<Arc<PageBox>>,
-    /// Prior frames' retained staging Arcs, keyed by `submit_seq`.
+    current_blit_retention: Vec<PageBoxRead>,
+    /// Prior frames' staging read guards, keyed by `submit_seq`.
     ///
     /// Entries drop when their seq is ≤ the latest `coherent_seq`.
-    pending_blit_retention: VecDeque<PendingBlitArc>,
+    pending_blit_retention: VecDeque<PendingBlitRead>,
     /// Pointer to the shared `coherent_seq` atomic, copied from `FrameData` in `begin_frame`.
     ///
     /// Read on the encoder thread to drain `pending_blit_retention`. 0
@@ -1499,6 +1497,7 @@ struct StagedUploadRetry {
 struct HeldBackings {
     pageboxes: Vec<PageBox>,
     staging_arcs: Vec<Arc<PageBox>>,
+    staging_reads: Vec<PageBoxRead>,
 }
 
 /// Intersect a D3D9 `RECT` `(x1, y1, x2, y2)` with the viewport `(x, y, w, h)`.
@@ -6391,8 +6390,7 @@ impl FrameEncoder {
             .map(mtld3d_core::upload_recovery::PendingUpload::into_payload)
             .collect();
         self.free_stage_upload_transients(freed);
-        // Texture jobs own only a staging Arc clone, so dropping them here
-        // is the whole release.
+        // Dropping each acknowledged job releases its read guard.
         drop(
             self.pending_texture_uploads
                 .release_acknowledged(settled, failed),
@@ -6401,9 +6399,9 @@ impl FrameEncoder {
 
     /// Settle the texture half of the upload recovery.
     ///
-    /// Cheaper than the VB/IB half: the job holds a clone of the texture's
-    /// own staging `Arc` rather than a private snapshot, so a released entry
-    /// frees only the clone and a replay re-reads the same pages the
+    /// Cheaper than the VB/IB half: the job holds a read of the texture's
+    /// own staging rather than a private snapshot, so a released entry
+    /// drops the guard and a replay re-reads the same pages the
     /// original upload did (the cached per-mip `MTLBuffer` still wraps
     /// them, so it is a cache hit). When the PE side has since swapped that
     /// `Arc` for a fresh box, the newer upload's own entry orders after this
@@ -6446,8 +6444,7 @@ impl FrameEncoder {
                         "the aborted-submit replay emitted nothing",
                     );
                 }
-                // Acknowledged: dropping the job releases the staging Arc
-                // clone, which is all the entry owns.
+                // Acknowledged: dropping the job releases its staging read.
                 UploadFate::Released => {}
             }
         }
@@ -6580,8 +6577,8 @@ impl FrameEncoder {
 
     /// Drain `pending_blit_retention` entries whose `submit_seq` has been retired by the GPU.
     ///
-    /// Arcs drop here, bringing staging Box refcounts back to 1 (sole
-    /// owner: the texture's `TextureInner`).
+    /// A recovery job may still read these pages again after the emitted read
+    /// retires, so its guard is independent of this queue.
     fn reclaim_retired_blit_retention(&mut self) {
         if self.coherent_seq_ptr == 0 {
             return;
@@ -6594,8 +6591,7 @@ impl FrameEncoder {
             if front.submit_seq > coh {
                 break;
             }
-            // Arc drops here — staging Box refcount falls back to 1
-            // (the texture's TextureInner remains the sole owner).
+            // Release this emitted read; a replayable job retains its own guard.
             let entry = self
                 .pending_blit_retention
                 .pop_front()
@@ -6718,8 +6714,8 @@ impl FrameEncoder {
     ///
     /// Every path wraps the staging Box in a Shared `MTLBuffer` (lazy on
     /// first upload, cached per mip); the blit paths emit a
-    /// `BlitCopyBufferToTexture` into `frame_blit_commands`. The
-    /// `job.arc` clone is retained in `current_blit_retention` so the
+    /// `BlitCopyBufferToTexture` into `frame_blit_commands`.
+    /// A staging read is retained in `current_blit_retention` so the
     /// Box stays alive until the GPU retires the frame — blit reads
     /// happen at command-buffer execution time, long after this
     /// function returns.
@@ -6776,8 +6772,8 @@ impl FrameEncoder {
             // this answer may let it go.
             job.redirty.note_emitted(job.emitted_answer());
             // Keep the job so an aborted upload command buffer can replay
-            // it. It only holds a clone of the texture's own persistent
-            // staging Arc, so the memory cost is the clone.
+            // it. Its guard keeps writable whole-level locks renaming while
+            // the job remains replayable, even after its first submit retires.
             self.pending_texture_uploads.push(
                 job.info.texture_id.raw(),
                 self.current_submit_seq,
@@ -6965,7 +6961,7 @@ impl FrameEncoder {
             return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.arc.len() as u64;
+        let backing_length = job.staging.backing().len() as u64;
         if backing_length == 0 {
             return false;
         }
@@ -6976,8 +6972,11 @@ impl FrameEncoder {
         // not pixel rows: it turns `region_h` into the row count the GPU
         // actually reads, both for the alignment-pad repack below and for
         // the slice size the copy is given.
-        let staging_buffer_handle =
-            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
+        let staging_buffer_handle = self.get_or_create_staging_buffer(
+            job.info.texture_id,
+            job.staging_index,
+            job.staging.backing(),
+        );
         if staging_buffer_handle == 0 {
             return false;
         }
@@ -7075,7 +7074,7 @@ impl FrameEncoder {
         // behaviour is officially undefined. Repack the affected rows
         // into a transient padded MTLBuffer and aim the blit there.
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
-            match self.repack_blit_source_padded(&job.arc, &info, num_blit_rows) {
+            match self.repack_blit_source_padded(job.staging.backing(), &info, num_blit_rows) {
                 Some(padded_info) => padded_info,
                 None => return false,
             }
@@ -7106,12 +7105,13 @@ impl FrameEncoder {
         self.perf.bump_texture_blit_upload();
         // Retain the staging Box for the GPU's view of this frame —
         // even on the padded path the source bytes were just copied
-        // out, but keeping the Arc alive is harmless and uniform.
-        // `pending_blit_retention` releases this clone once
-        // `coherent_seq >= submit_seq`; the caller's own clone in
+        // out, but keeping the read guard is conservative and uniform.
+        // `pending_blit_retention` releases this read once
+        // `coherent_seq >= submit_seq`; the caller's own guard in
         // `pending_texture_uploads` outlives it by however long the
         // upload takes to be acknowledged.
-        self.current_blit_retention.push(Arc::clone(&job.arc));
+        self.current_blit_retention
+            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
         true
     }
 
@@ -7139,7 +7139,7 @@ impl FrameEncoder {
             return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.arc.len() as u64;
+        let backing_length = job.staging.backing().len() as u64;
         if backing_length == 0 {
             return false;
         }
@@ -7155,8 +7155,11 @@ impl FrameEncoder {
         let mip_w = (job.info.width.max(1) >> job.level).max(1);
         let mip_h = (job.info.height.max(1) >> job.level).max(1);
 
-        let staging_buffer_handle =
-            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
+        let staging_buffer_handle = self.get_or_create_staging_buffer(
+            job.info.texture_id,
+            job.staging_index,
+            job.staging.backing(),
+        );
         if staging_buffer_handle == 0 {
             return false;
         }
@@ -7182,7 +7185,7 @@ impl FrameEncoder {
         // widen the slice stride to the padded row stride.
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
             let total_rows = region_rows.saturating_mul(depth);
-            match self.repack_blit_source_padded(&job.arc, &info, total_rows) {
+            match self.repack_blit_source_padded(job.staging.backing(), &info, total_rows) {
                 Some(mut padded_info) => {
                     padded_info.bytes_per_image =
                         padded_info.bytes_per_row.saturating_mul(region_rows);
@@ -7199,7 +7202,8 @@ impl FrameEncoder {
             .push(BlitCommand::copy_buffer_to_texture(&info));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
-        self.current_blit_retention.push(Arc::clone(&job.arc));
+        self.current_blit_retention
+            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
         true
     }
 
@@ -7271,7 +7275,7 @@ impl FrameEncoder {
         decode: UploadDecode,
     ) -> bool {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.arc.len() as u64;
+        let backing_length = job.staging.backing().len() as u64;
         if backing_length == 0 || job.bytes_per_pixel != decode.bytes_per_texel() {
             return false;
         }
@@ -7279,8 +7283,11 @@ impl FrameEncoder {
         if pipeline == 0 {
             return false;
         }
-        let staging_buffer_handle =
-            self.get_or_create_staging_buffer(job.info.texture_id, job.staging_index, &job.arc);
+        let staging_buffer_handle = self.get_or_create_staging_buffer(
+            job.info.texture_id,
+            job.staging_index,
+            job.staging.backing(),
+        );
         if staging_buffer_handle == 0 {
             return false;
         }
@@ -7336,7 +7343,8 @@ impl FrameEncoder {
         self.perf.bump_texture_expand_upload();
         // The pass reads the staging at command-buffer execution time, long
         // after this returns; hold the Box for the GPU's view of the frame.
-        self.current_blit_retention.push(Arc::clone(&job.arc));
+        self.current_blit_retention
+            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
         true
     }
 
@@ -7999,11 +8007,10 @@ impl FrameEncoder {
             self.sub_retained_bytes(retry.page_box.len());
             held.pageboxes.push(retry.page_box);
         }
-        // Texture jobs own only a clone of the texture's staging Arc; park
-        // it with the other staging keepalives so it outlives the bulk
-        // destroy of the `MTLBuffer`s that wrap those pages.
+        // Park the jobs' guards with the other staging keepalives until
+        // the bulk destroy releases every wrapper around their pages.
         for entry in self.pending_texture_uploads.drain_all() {
-            held.staging_arcs.push(entry.into_payload().arc);
+            held.staging_reads.push(entry.into_payload().staging);
         }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
@@ -8104,7 +8111,7 @@ impl FrameEncoder {
     /// boundary, and the next `begin_frame` reopens it against the fresh
     /// buffer, so the drain takes the buffers and leaves the open set. Does
     /// NOT touch the
-    /// `pending_blit_retention` / `current_blit_retention` Arcs (those must
+    /// `pending_blit_retention` / `current_blit_retention` guards (those must
     /// outlive the bulk destroy of the staging `MTLBuffers` that wrap them
     /// via `bytesNoCopy`). Caller drops the returned `HeldBackings` after
     /// `destroy_resources_bulk`.
@@ -9538,7 +9545,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // keeps them alive regardless of which thread later runs the blits, so
     // this is safe to do here before handing the payload off.
     retire_visibility_buffer(enc, frame.submit_seq);
-    retire_blit_arcs(enc, frame.submit_seq);
+    retire_blit_reads(enc, frame.submit_seq);
 
     (params, payload)
 }
@@ -9854,18 +9861,18 @@ fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
         });
 }
 
-/// Move this frame's blit-source Arc retentions into the pending queue.
+/// Move this frame's blit-source read guards into the pending queue.
 ///
 /// Keyed by the frame's `submit_seq`. They're released when `coherent_seq`
 /// reaches `submit_seq` — checked next `begin_frame`. Called from
 /// `finalize_submit`, before the thunk is issued: the move into
-/// `pending_blit_retention` is what keeps the Arcs alive across the blit
+/// `pending_blit_retention` keeps the reads alive across the blit
 /// encode + commit path, whichever thread runs it.
-fn retire_blit_arcs(enc: &mut FrameEncoder, submit_seq: u64) {
-    for arc in enc.current_blit_retention.drain(..) {
-        enc.perf.bump_tex_staging_retained_add(arc.len());
+fn retire_blit_reads(enc: &mut FrameEncoder, submit_seq: u64) {
+    for read in enc.current_blit_retention.drain(..) {
+        enc.perf.bump_tex_staging_retained_add(read.backing().len());
         enc.pending_blit_retention
-            .push_back(PendingBlitArc::new(submit_seq, arc));
+            .push_back(PendingBlitRead::new(submit_seq, read));
     }
 }
 
