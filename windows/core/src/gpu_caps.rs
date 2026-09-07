@@ -12,6 +12,8 @@
 //!
 //! See `storage_policy` for the consumer fns.
 
+use mtld3d_shared::mtl::DeviceCapsFlags;
+
 /// The linear-texture row alignment a Mac2 (Intel/AMD) device reports for `BGRA8Unorm`.
 ///
 /// Apple-family devices report 16. `intel.linearAlign256` raises a smaller
@@ -33,6 +35,12 @@ pub struct GpuCaps {
     /// 16 on Apple Silicon, 256 on Mac2 (AMD/Intel). Used as the floor
     /// for blit-staging `bytes_per_row`.
     pub min_linear_texture_align: u32,
+    /// The device's boolean answers from the `GetDeviceInfo` thunk.
+    ///
+    /// The encoder consults one of them, `RESOLVE_NEEDS_RETIRE`, through
+    /// [`Self::resolve_needs_retire`]; the caps advertisement reads the
+    /// rest from its own process-wide copy of the same answer.
+    pub device_caps: DeviceCapsFlags,
 }
 
 impl GpuCaps {
@@ -44,7 +52,21 @@ impl GpuCaps {
         Self {
             unified_memory: true,
             min_linear_texture_align: 16,
+            device_caps: DeviceCapsFlags::empty(),
         }
+    }
+
+    /// Whether a copy out of a resolve target waits for the resolving command buffer.
+    ///
+    /// Metal orders the command buffers of one queue, so the answer is no on
+    /// every real GPU; the paravirtualized device answers yes because it can
+    /// hand a later command buffer's copy the content the target held before
+    /// the resolve. The forced Intel answers leave it alone: they describe an
+    /// Intel/AMD Mac, whose GPU orders its queue.
+    #[must_use]
+    pub const fn resolve_needs_retire(self) -> bool {
+        self.device_caps
+            .contains(DeviceCapsFlags::RESOLVE_NEEDS_RETIRE)
     }
 
     /// Apply the `intel.managedMemory` and `intel.linearAlign256` answers over the device's.
@@ -66,6 +88,7 @@ impl GpuCaps {
         Self {
             unified_memory: self.unified_memory && !managed_memory,
             min_linear_texture_align,
+            device_caps: self.device_caps,
         }
     }
 }

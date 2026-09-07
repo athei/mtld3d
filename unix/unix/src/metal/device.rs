@@ -102,6 +102,10 @@ pub fn default_device_info() -> Option<(String, u64, DeviceCapsFlags)> {
         DeviceCapsFlags::SAMPLE_COUNT_8,
         device.supportsTextureSampleCount(8),
     );
+    caps.set(
+        DeviceCapsFlags::RESOLVE_NEEDS_RETIRE,
+        resolve_needs_retire(&device),
+    );
     Some((name, registry_id, caps))
 }
 
@@ -133,6 +137,18 @@ pub fn supports_sampler_mirror_clamp(device: &ProtocolObject<dyn MTLDevice>) -> 
 /// its name instead.
 fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     device.name().to_string().contains("Paravirtual")
+}
+
+/// True when a copy out of a resolve target has to wait for the resolve's command buffer.
+///
+/// Every real GPU orders the command buffers of one queue, so a copy in a
+/// later command buffer reads the resolved content. The paravirtualized
+/// device can hand that copy the content the target held before the
+/// resolve, so the encoder waits for the resolving command buffer to
+/// complete first on it. Metal offers no query for the fault, so the
+/// device's name is the whole predicate.
+fn resolve_needs_retire(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    is_paravirtual(device)
 }
 
 /// True when the device belongs to Metal's Apple GPU family.

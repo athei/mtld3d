@@ -483,7 +483,7 @@ fn depth_test_holds_on_a_multisampled_target() {
     let row = back_buffer_row(&h);
     assert!(
         count_intermediate(&row) > 0,
-        "the depth-tested 4x edge still resolves"
+        "the depth-tested 4x edge still resolves: {row:02X?}"
     );
     assert_pixel_eq(
         row[INSIDE_X as usize],

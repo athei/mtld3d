@@ -700,6 +700,17 @@ bitflags! {
         const SAMPLE_COUNT_4 = 1 << 4;
         /// `supportsTextureSampleCount:8` answered yes.
         const SAMPLE_COUNT_8 = 1 << 5;
+        /// A copy out of a resolve target must wait for the resolving command buffer to complete.
+        ///
+        /// Metal orders one queue's command buffers, so a copy that follows
+        /// a multisample resolve reads the resolved content. The
+        /// paravirtualized device a CI runner exposes does not honour that
+        /// across a command-buffer boundary: the copy can read what the
+        /// target held before the resolve. Metal has no query for it, so
+        /// the unix side answers from the device's name, and the encoder
+        /// waits for the last submitted command buffer before it copies
+        /// out of a resolve target when this is set.
+        const RESOLVE_NEEDS_RETIRE = 1 << 6;
     }
 }
 

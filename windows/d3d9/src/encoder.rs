@@ -8163,15 +8163,43 @@ impl FrameEncoder {
     /// been given a `coherent_seq` pointer or hasn't submitted any frame —
     /// both states arrive together in `begin_frame`.
     fn wait_for_gpu_idle(&self) {
-        if self.coherent_seq_ptr == 0 || self.current_submit_seq == 0 {
+        self.wait_for_gpu_retire(self.current_submit_seq);
+    }
+
+    /// Block until `coherent_seq >= target_seq`.
+    ///
+    /// A target of 0 names no frame, and a target the encoder never
+    /// submitted is answered by the atomic alone on the unix side, so
+    /// neither waits.
+    fn wait_for_gpu_retire(&self, target_seq: u64) {
+        if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;
         }
         let mut params = WaitForGpuRetireParams {
-            target_seq: self.current_submit_seq,
+            target_seq,
             coherent_seq_ptr: self.coherent_seq_ptr,
             failed_submit_seq_ptr: self.failed_seq_ptr,
         };
         let _ = unix_call(&mut params);
+    }
+
+    /// Hold a copy out of a resolve target until the resolving command buffer has completed.
+    ///
+    /// A no-op unless the device answered `RESOLVE_NEEDS_RETIRE`. There, a
+    /// copy that reads a multisample resolve target from a later command
+    /// buffer can see the content the target held before the resolve, so
+    /// the copy waits for every command buffer submitted so far. The ops of
+    /// a frame run before that frame is submitted, so the last submitted
+    /// command buffer is the one before `current_submit_seq`; the submit
+    /// thread is drained first so that buffer is committed and registered
+    /// for the wait. A resolve recorded in the frame being built is ordered
+    /// by the pass list itself, through `note_msaa_read`.
+    pub fn wait_for_resolve_retire(&mut self) {
+        if !self.gpu_caps.resolve_needs_retire() {
+            return;
+        }
+        self.drain_submit_thread();
+        self.wait_for_gpu_retire(self.current_submit_seq.saturating_sub(1));
     }
 }
 

@@ -7432,6 +7432,12 @@ fn emit_stretch_rect_blit(
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
+    // A source with a multisampled companion is a resolve target, and a
+    // resolve the last submission stored into it must have completed before
+    // this copy reads it on a device that does not order that itself.
+    if !src_info.msaa.is_null() {
+        enc.wait_for_resolve_retire();
+    }
     let dst_handle = match &dst_info.kind {
         StretchKind::Texture(info) => enc.get_or_create_texture(info),
         StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),

@@ -10,6 +10,10 @@
 //! nothing else, a device already at that answer is left alone, a larger device alignment is
 //! kept, and no overrides mean no change. Nothing D3D9-visible proves a forced override took, so
 //! these are the only place the fold itself is checked.
+//!
+//! The resolve-retire tests pin `resolve_needs_retire` to the `RESOLVE_NEEDS_RETIRE` bit of the
+//! device's answer and pin the overrides to leaving it alone: the forced Intel answers describe
+//! an Intel/AMD Mac, whose GPU orders its queue, so they must not turn the wait on.
 
 use super::*;
 
@@ -53,6 +57,7 @@ fn overrides_are_idempotent_on_a_mac2_device() {
     let mac2 = GpuCaps {
         unified_memory: false,
         min_linear_texture_align: 256,
+        device_caps: DeviceCapsFlags::empty(),
     };
     let caps = mac2.with_intel_overrides(true, true);
     assert!(!caps.unified_memory);
@@ -64,7 +69,35 @@ fn linear_align256_keeps_a_larger_device_alignment() {
     let wide = GpuCaps {
         unified_memory: true,
         min_linear_texture_align: 512,
+        device_caps: DeviceCapsFlags::empty(),
     };
     let caps = wide.with_intel_overrides(false, true);
     assert_eq!(caps.min_linear_texture_align, 512);
+}
+
+#[test]
+fn resolve_retire_follows_the_device_bit() {
+    assert!(!GpuCaps::apple_silicon_default().resolve_needs_retire());
+    let paravirtual = GpuCaps {
+        device_caps: DeviceCapsFlags::RESOLVE_NEEDS_RETIRE | DeviceCapsFlags::SAMPLE_COUNT_4,
+        ..GpuCaps::apple_silicon_default()
+    };
+    assert!(paravirtual.resolve_needs_retire());
+    let other_bits = GpuCaps {
+        device_caps: DeviceCapsFlags::SAMPLER_BORDER | DeviceCapsFlags::SAMPLE_COUNT_4,
+        ..GpuCaps::apple_silicon_default()
+    };
+    assert!(!other_bits.resolve_needs_retire());
+}
+
+#[test]
+fn intel_overrides_leave_resolve_retire_alone() {
+    let caps = GpuCaps::apple_silicon_default().with_intel_overrides(true, true);
+    assert!(!caps.resolve_needs_retire());
+    let paravirtual = GpuCaps {
+        device_caps: DeviceCapsFlags::RESOLVE_NEEDS_RETIRE,
+        ..GpuCaps::apple_silicon_default()
+    }
+    .with_intel_overrides(true, true);
+    assert!(paravirtual.resolve_needs_retire());
 }

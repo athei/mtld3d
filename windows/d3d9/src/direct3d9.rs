@@ -1743,6 +1743,7 @@ fn spawn_encoder_and_prewarm(
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
         unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
+        device_caps: device_caps_flags(),
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
     let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg));
