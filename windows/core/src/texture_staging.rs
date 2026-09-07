@@ -10,7 +10,7 @@
 //!
 //! Decision tree:
 //! - `D3DLOCK_NOOVERWRITE` / `D3DLOCK_READONLY`, or uncontended
-//!   (`last_submit_seq <= coherent_seq`): `WriteInPlace`.
+//!   (no in-flight or replayable upload): `WriteInPlace`.
 //! - `D3DLOCK_DISCARD` on a whole-mip Lock of a `D3DPOOL_DEFAULT`
 //!   texture: Rename, no preserve (game promised the old bytes are
 //!   gone). Every other DISCARD is dropped first, see
@@ -172,10 +172,9 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 
 /// Decide the Lock action for a single mip.
 ///
-/// - `coherent_seq` is the encoder thread's last retired submit seq.
-/// - `slot_last_submit_seq` is the submit seq at which this mip's
-///   staging was last referenced by a GPU-visible command. Zero if
-///   never uploaded.
+/// - `contended` includes both in-flight submits and retained upload readers.
+///   A retired upload can still be replayed, so retirement alone does not end
+///   its read lifetime.
 /// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A DISCARD the
 ///   Lock cannot honour is dropped here as well as in the caller (see
 ///   [`honoured_lock_flags`]), so a verdict never rests on one.
@@ -187,8 +186,7 @@ const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
 /// `log_once_warn!`.
 #[must_use]
 pub const fn decide_lock_action(
-    coherent_seq: u64,
-    slot_last_submit_seq: u64,
+    contended: bool,
     flags: u32,
     pool: u32,
     rect: Option<DirtyRect>,
@@ -198,7 +196,7 @@ pub const fn decide_lock_action(
     if flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE) != 0 {
         return LockAction::WriteInPlace;
     }
-    if !is_in_flight(slot_last_submit_seq, coherent_seq) {
+    if !contended {
         return LockAction::WriteInPlace;
     }
     if flags & D3DLOCK_DISCARD != 0 {

@@ -6,9 +6,71 @@
 //! itself: page-aligned pointers, a padded length rounded up to a page multiple
 //! (one page even at zero), and the full logical range readable and writable.
 
+use std::sync::{Arc, mpsc};
+
 use super::{
-    PAGE_SIZE, PageBox, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache, snmalloc_chunk_size,
+    PAGE_SIZE, PageBox, PageBoxRead, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache,
+    snmalloc_chunk_size,
 };
+
+#[test]
+fn read_guards_exclude_cached_owners_and_survive_independent_drops() {
+    let backing = Arc::new(PageBox::new_zeroed(64));
+    let cached = Arc::clone(&backing);
+    let other = Arc::new(PageBox::new_zeroed(64));
+    assert!(!backing.has_readers());
+    let job = PageBoxRead::new(Arc::clone(&backing));
+    let emitted = PageBoxRead::new(Arc::clone(job.backing()));
+    assert!(backing.has_readers());
+    assert!(!other.has_readers());
+    drop(job);
+    assert!(backing.has_readers());
+    drop(emitted);
+    assert!(!backing.has_readers());
+    assert_eq!(Arc::strong_count(&backing), 2);
+    assert!(Arc::ptr_eq(&backing, &cached));
+}
+
+#[test]
+fn moving_read_guard_across_threads_keeps_it_live_until_release() {
+    let backing = Arc::new(PageBox::new_zeroed(64));
+    let read = PageBoxRead::new(Arc::clone(&backing));
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let (released_tx, released_rx) = mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            release_rx.recv().expect("release signal");
+            drop(read);
+            released_tx.send(()).expect("released signal");
+        });
+        assert!(backing.has_readers());
+        release_tx.send(()).expect("release signal");
+        released_rx.recv().expect("released signal");
+        assert!(!backing.has_readers());
+    });
+}
+
+#[test]
+fn recycled_backing_has_no_reader_state_to_reset() {
+    let backing = Arc::new(PageBox::new_zeroed(64));
+    let read = PageBoxRead::new(Arc::clone(&backing));
+    let backing = Arc::try_unwrap(backing)
+        .err()
+        .expect("read retains backing");
+    drop(read);
+    let backing = Arc::try_unwrap(backing).ok().expect("last read released");
+    let generation = backing.generation();
+    let pool = crate::page_box_pool::PageBoxPool::new(PAGE_SIZE);
+    assert!(pool.recycle(backing).is_none());
+    let reused = pool.acquire(128).expect("same page class");
+    assert_eq!(reused.generation(), generation);
+    assert!(!reused.has_readers());
+    let reused = Arc::new(reused);
+    let read = PageBoxRead::new(Arc::clone(&reused));
+    assert!(reused.has_readers());
+    drop(read);
+    assert!(!reused.has_readers());
+}
 
 /// The derived cutoff sits just above 1 MiB, and nothing hardcodes it.
 #[test]

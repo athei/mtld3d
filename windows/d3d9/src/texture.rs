@@ -6,7 +6,7 @@ use mtld3d_core::{
     format::block_row_pitch,
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
-    page_box::PageBox,
+    page_box::{PageBox, PageBoxRead},
     pixel_convert,
     render_scale::RenderScale,
     staging_coverage::StagingCoverage,
@@ -2239,14 +2239,10 @@ impl TextureInner {
 
         let coherent_seq = self.staging_coherent_seq(level);
         let last_submit_seq = self.cube.as_deref()?.last_submit_seq[index];
-        let action = decide_lock_action(
-            coherent_seq,
-            last_submit_seq,
-            flags,
-            self.d3d_pool,
-            rect,
-            self.mip_shape(level),
-        );
+        let contended = is_in_flight(last_submit_seq, coherent_seq)
+            || self.cube.as_deref()?.staging[index].has_readers();
+        let action =
+            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
         let device_inner = self.device_inner;
         let texture_id = self.texture_id;
         let cube = self.cube.as_deref_mut()?;
@@ -2255,10 +2251,7 @@ impl TextureInner {
                 // The kept divergence, counted like its VB/IB twin: a
                 // contended partial Lock handed back over bytes an upload
                 // may still be reading (README, "Faster than conformant").
-                if flags & D3DLOCK_NOOVERWRITE == 0
-                    && is_in_flight(last_submit_seq, coherent_seq)
-                    && device_inner != 0
-                {
+                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
                         .bump_texture_write_in_place_contended();
@@ -2486,14 +2479,10 @@ impl TextureInner {
         // command buffer that upload rides decides which retirement counter
         // frees it. See `staging_coherent_seq`.
         let coherent_seq = self.staging_coherent_seq(level);
-        let action = decide_lock_action(
-            coherent_seq,
-            self.last_submit_seq[level],
-            flags,
-            self.d3d_pool,
-            rect,
-            self.mip_shape(level),
-        );
+        let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
+            || self.staging[level].has_readers();
+        let action =
+            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
 
         let base: *mut u8 = match action {
             LockAction::WriteInPlace => {
@@ -2515,10 +2504,7 @@ impl TextureInner {
                 // bytes an upload may still be reading (README, "Faster
                 // than conformant"). READONLY returned above and an
                 // uncontended Lock is the specified behaviour.
-                if flags & D3DLOCK_NOOVERWRITE == 0
-                    && is_in_flight(self.last_submit_seq[level], coherent_seq)
-                    && self.device_inner != 0
-                {
+                if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()
                         .bump_texture_write_in_place_contended();
@@ -4140,7 +4126,7 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
     let upload_generation = ti.next_upload_generation(level_u);
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        arc: ti.staging_arc(level_u),
+        staging: PageBoxRead::new(ti.staging_arc(level_u)),
         level,
         destination_slice: 0,
         staging_index: level_u,
@@ -4206,12 +4192,12 @@ fn schedule_cube_upload(
         rect.h
     );
     let cube = ti.cube.as_deref_mut().expect("cube storage");
-    let arc = Arc::clone(&cube.staging[index]);
+    let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
     cube.last_submit_seq[index] = dev.current_seq();
     cube.was_uploaded[index] = true;
     let job = TextureUploadJob {
         info: ti.texture_info(),
-        arc,
+        staging,
         level,
         destination_slice: face,
         staging_index: index,

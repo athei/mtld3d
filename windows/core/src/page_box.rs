@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     alloc::{self, Layout},
     ptr::NonNull,
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 /// Bytes held by live `PageBox`es, always on: one add per alloc, one sub per free.
@@ -253,6 +254,8 @@ pub struct PageBox {
     layout: Layout,
     /// This allocation's [`PAGE_BOX_GENERATION`] stamp.
     generation: u64,
+    /// Upload jobs and emitted reads, excluding cached buffer-wrapper owners.
+    readers: AtomicUsize,
 }
 
 // SAFETY: PageBox owns a heap allocation with no interior sharing. Transferring
@@ -293,6 +296,7 @@ impl PageBox {
             logical_len,
             layout,
             generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
+            readers: AtomicUsize::new(0),
         }
     }
 
@@ -319,7 +323,14 @@ impl PageBox {
             logical_len,
             layout,
             generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
+            readers: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether a queued, replayable or in-flight upload still reads these pages.
+    #[must_use]
+    pub fn has_readers(&self) -> bool {
+        self.readers.load(core::sync::atomic::Ordering::Acquire) != 0
     }
 
     #[must_use]
@@ -427,6 +438,43 @@ impl Drop for PageBox {
         // SAFETY: same layout used to alloc; pointer came from that
         // allocator; nothing else owns this allocation.
         unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// A queued, replayable or in-flight read of a `PageBox`.
+///
+/// The owning `Arc` keeps the allocation alive. Its separate reader count lets
+/// a writer distinguish reads from cached wrappers that only keep pages alive.
+/// New reads must be acquired before publication to another thread, or from
+/// an already-held read, so a writer observing zero cannot race a new reader.
+pub struct PageBoxRead {
+    backing: Arc<PageBox>,
+}
+
+impl PageBoxRead {
+    #[must_use]
+    pub fn new(backing: Arc<PageBox>) -> Self {
+        // Every reader owns an Arc before incrementing, so this count never
+        // exceeds Arc's bounded strong count and cannot overflow.
+        backing
+            .readers
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Self { backing }
+    }
+
+    #[must_use]
+    pub const fn backing(&self) -> &Arc<PageBox> {
+        &self.backing
+    }
+}
+
+impl Drop for PageBoxRead {
+    fn drop(&mut self) {
+        // Construction increments once and the guard is move-only,
+        // so every drop has exactly one outstanding increment to release.
+        self.backing
+            .readers
+            .fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
 }
 
