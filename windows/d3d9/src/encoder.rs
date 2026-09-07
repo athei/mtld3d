@@ -2457,7 +2457,7 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        let caches = self.cache_sizes(&payload.scratch);
+        let caches = self.cache_sizes(payload);
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
         // One getrusage unix_call per 5 s window, only when the summary is
         // both enabled and about to emit; every other frame passes None.
@@ -2485,10 +2485,10 @@ impl FrameEncoder {
     /// Cache-length snapshot handed to `EncoderPerfState::log_frame_summary`.
     ///
     /// Walks every cache `HashMap` exactly once; cheap even at debug
-    /// log levels because `HashMap::len()` is O(1). `scratch` is passed in
-    /// (the just-submitted payload's filled arena) since `self.scratch` is
-    /// already the clean arena swapped in for the next frame.
-    fn cache_sizes(&self, scratch: &ScratchArena) -> CacheSizes {
+    /// log levels because `HashMap::len()` is O(1). The submitted payload owns
+    /// this frame's passes and filled scratch arena; the live encoder already
+    /// holds the clean state for the next frame.
+    fn cache_sizes(&self, payload: &FramePayload) -> CacheSizes {
         CacheSizes {
             textures: self.texture_cache.len(),
             pipelines: self.pipeline_cache.len(),
@@ -2496,10 +2496,10 @@ impl FrameEncoder {
             programs: self.program_cache.len(),
             libs: self.lib_cache.len(),
             depth_states: self.depth_stencil_cache.len(),
-            scratch_small_blocks: scratch.small_chunk_count(),
-            scratch_oversized_blocks: scratch.oversized_chunk_count(),
-            scratch_bytes: scratch.capacity_bytes(),
-            cmd_vec_capacity_bytes: self.pass_state.cmd_vec_capacity_bytes(),
+            scratch_small_blocks: payload.scratch.small_chunk_count(),
+            scratch_oversized_blocks: payload.scratch.oversized_chunk_count(),
+            scratch_bytes: payload.scratch.capacity_bytes(),
+            cmd_vec_capacity_bytes: PassState::cmd_vec_capacity_bytes(&payload.passes),
             pending_blit_retention_depth: self.pending_blit_retention.len(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,

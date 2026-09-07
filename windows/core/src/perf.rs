@@ -1625,12 +1625,12 @@ pub struct CacheSizes {
     /// is exceeding the chunk size and motivating its own chunk per frame.
     pub scratch_oversized_blocks: u32,
     pub scratch_bytes: u64,
-    /// Live `Vec<Command>` capacity in bytes across every pass at frame end.
+    /// Command-vector capacity bytes in this submission's payload.
     ///
-    /// Sourced from `PassState::cmd_vec_capacity_bytes`. The pool recycles
-    /// these vectors across frames, so this is resident footprint — paired
-    /// with `cmd_vec_realloc_bytes` on `FrameSample` (steady-state size
-    /// vs. growth churn).
+    /// Sourced from `PassState::cmd_vec_capacity_bytes` after passes detach.
+    /// Excludes idle pooled vectors and other outstanding payloads. Paired
+    /// with `cmd_vec_realloc_bytes` on `FrameSample` to separate reused
+    /// capacity from growth copies.
     pub cmd_vec_capacity_bytes: u64,
     pub pending_blit_retention_depth: usize,
     pub pending_resource_retention_depth: usize,
@@ -2316,22 +2316,22 @@ struct FrameSample {
     scratch_small_blocks: u32,
     scratch_oversized_blocks: u32,
     scratch_bytes: u64,
-    /// Resident `Vec<Command>` capacity bytes summed across every pass at end-of-frame.
+    /// Command-vector capacity bytes in this submission's payload.
     ///
-    /// Steady-state size of the encoder's command storage (the pool keeps
-    /// these around between frames). Paired with `cmd_vec_realloc_bytes`
-    /// below to separate footprint from churn.
+    /// Excludes idle pooled vectors and other outstanding payloads. Paired
+    /// with `cmd_vec_realloc_bytes` below to separate capacity from churn.
     cmd_vec_capacity_bytes: u64,
     vbib_retention_depth: usize,
     vbib_retained_bytes: usize,
     pending_blit_retention_depth: usize,
     tex_staging_retained_bytes: usize,
-    /// Per-frame total of bytes memcpy'd by `Pass::commands` `Vec` doublings.
+    /// Per-frame estimate of command-vector growth copy bytes.
     ///
     /// Sourced from `PassState::take_cmd_vec_realloc_bytes` once per
     /// frame. Paired with `cmd_vec_capacity_bytes` above so the diag row
-    /// shows growth churn next to resident footprint; a working pool
-    /// drives this near zero in steady state.
+    /// shows potential growth copies alongside submitted capacity. Initial
+    /// allocations are excluded, and in-place growth still counts the old
+    /// capacity. A warmed pool drives this to zero for stable workloads.
     cmd_vec_realloc_bytes: u64,
     /// This frame's `PageBox` allocations reaching the global allocator.
     ///
@@ -4567,7 +4567,7 @@ impl<'a> Summary<'a> {
             "  size",
             &format!("{cap_avg_fmt} avg"),
             Some(&format!("peak {cap_peak_fmt}")),
-            "pool-resident Vec<Command> capacity across frames (recycled, not freed)",
+            "submitted payload Vec<Command> capacity (excludes idle pool and other payloads)",
         );
         let realloc_avg_kb = u64_to_f64_exact(w.cmd_vec_realloc_bytes.sum) / f / 1024.0;
         let realloc_peak_kb = u64_to_f64_exact(w.cmd_vec_realloc_bytes.max) / 1024.0;
@@ -4577,7 +4577,7 @@ impl<'a> Summary<'a> {
             "  realloc",
             &format!("{realloc_avg_fmt} avg"),
             Some(&format!("peak {realloc_peak_fmt}")),
-            "Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)",
+            "Vec<Command> potential growth copies on emit_command (excludes initial allocations)",
         );
         // PageBox traffic that actually reached the global allocator this
         // window. Fresh pages fault on first touch under Wine, so a large
