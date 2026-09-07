@@ -16,7 +16,7 @@ use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
     WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
-    destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
+    cursor_mask_bits, destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -2680,6 +2680,48 @@ fn cursor_realization_recovers_from_external_clobber() {
         0,
         "ShowCursor(FALSE) must clear the cursor"
     );
+}
+
+#[test]
+fn cursor_and_mask_uses_word_aligned_ddb_rows() {
+    let h = Harness::with_config("cursor.scale=1;cursor.software=false");
+    let mut shown = false;
+
+    for side in [8usize, 16, 32] {
+        let side_u32 = u32::try_from(side).expect("cursor side fits u32");
+        let bitmap =
+            h.create_offscreen_plain_surface(side_u32, side_u32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        let mut pixels = vec![0xFF00_FFFF; side * side];
+        for row in 0..side {
+            pixels[row * side + row] = 0x0000_FFFF;
+        }
+        {
+            let mut locked = bitmap.lock_rect(0);
+            locked.write_u32_rect(side, side, &pixels);
+        }
+        assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+        if !shown {
+            assert_eq!(h.show_cursor(true), 0, "cursor starts hidden");
+            shown = true;
+        }
+
+        let word_stride = side.div_ceil(16) * 2;
+        let actual = cursor_mask_bits(h.thread_cursor(), word_stride * side);
+        let mut expected = vec![0u8; word_stride * side];
+        for row in 0..side {
+            expected[row * word_stride + row / 8] = 1u8 << (7 - (row & 7));
+        }
+        let reversed: Vec<u8> = expected
+            .chunks_exact(word_stride)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        assert!(
+            actual == expected || actual == reversed,
+            "{side}-pixel cursor AND rows were not preserved: {actual:02x?}",
+        );
+    }
 }
 
 #[test]

@@ -252,9 +252,9 @@ fn create_bitmap_packed(
     bpp: u32,
     bits: *const c_void,
 ) -> *mut c_void {
-    // SAFETY: CreateBitmap copies `bits` according to (width * height * bpp / 8)
-    // bytes; caller supplies a tight buffer with that many bytes (color
-    // bitmap is 32 bpp ARGB, mask bitmap is 1 bpp + row-padded to 32 bits).
+    // SAFETY: CreateBitmap copies `bits` as WORD-aligned DDB scanlines. The
+    // caller supplies every row in that layout: 32 bpp colour rows need no
+    // padding, and the 1 bpp mask is padded to 16 bits.
     unsafe { CreateBitmap(width, height, planes, bpp, bits) }
 }
 
@@ -1726,7 +1726,7 @@ fn send_overlay_state(
 fn build_blank_hcursor() -> Option<*mut c_void> {
     const SIDE: usize = 32;
     let color = vec![0u32; SIDE * SIDE];
-    // 1 bpp, rows padded to 32 bits: 32 pixels are 4 bytes per row.
+    // 1 bpp WORD-aligned rows: 32 pixels are 4 bytes per row.
     let mask = [0xFFu8; SIDE * 4];
     let cursor = create_cursor_from_bits(SIDE, SIDE, &color, &mask, (0, 0), "build_blank_hcursor")?;
     debug!(target: LOG_TARGET, "build_blank_hcursor: ok handle={cursor:p}");
@@ -1923,7 +1923,7 @@ fn scale_cursor_pixels(
 
 /// Derive an AND mask from upscaled alpha.
 ///
-/// The mask is 1-bit-per-pixel, row-padded to 32 bits; a bit of 1 means
+/// The DDB mask is 1-bit-per-pixel with WORD-aligned rows; a bit of 1 means
 /// "transparent, show screen", a bit of 0 means "opaque, use color".
 /// Keying on the upscaled alpha lines the upscaler's smoothed edges up with
 /// what the color bitmap actually shows on Wine's mono-cursor path (kicks in
@@ -1935,7 +1935,7 @@ fn scale_cursor_pixels(
 /// mask would leave the cursor fully transparent, so `any_alpha=false`
 /// returns an all-zeros mask.
 fn derive_and_mask(pixels: &[u32], sw: usize, sh: usize, any_alpha: bool) -> Vec<u8> {
-    let mask_stride = sw.div_ceil(32) * 4;
+    let mask_stride = sw.div_ceil(16) * 2;
     let mut and_mask = vec![0u8; mask_stride * sh];
     if any_alpha {
         for y in 0..sh {

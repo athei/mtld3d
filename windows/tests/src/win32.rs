@@ -71,6 +71,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn GetPixel(hdc: usize, x: i32, y: i32) -> u32;
     fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) -> u32;
+    fn GetBitmapBits(bitmap: *mut c_void, count: i32, bits: *mut c_void) -> i32;
     fn DeleteObject(object: *mut c_void) -> i32;
 }
 
@@ -324,6 +325,48 @@ pub fn cursor_is_live(cursor: usize) -> bool {
         }
     }
     live
+}
+
+/// Copy the AND-mask DDB from a live cursor.
+///
+/// `byte_len` is the WORD-aligned 1 bpp extent that `CreateBitmap` stores.
+/// The cursor must carry a colour bitmap, so `GetIconInfo` returns the AND mask
+/// at the cursor's own height rather than a stacked monochrome AND/XOR pair.
+///
+/// # Panics
+///
+/// Panics if the cursor is invalid or GDI does not return exactly `byte_len` bytes.
+#[must_use]
+pub fn cursor_mask_bits(cursor: usize, byte_len: usize) -> Vec<u8> {
+    let mut info = ICONINFO {
+        f_icon: 0,
+        x_hotspot: 0,
+        y_hotspot: 0,
+        hbm_mask: core::ptr::null_mut(),
+        hbm_color: core::ptr::null_mut(),
+    };
+    // SAFETY: Win32 thunk; `info` is an owned, writable ICONINFO for the
+    // call, and any handle value is accepted (an invalid one fails).
+    let live = unsafe { GetIconInfo(cursor, &raw mut info) } != 0;
+    assert!(live, "GetIconInfo rejected cursor {cursor:#x}");
+    assert!(!info.hbm_mask.is_null(), "cursor has no AND-mask bitmap");
+    assert!(
+        !info.hbm_color.is_null(),
+        "cursor must have a colour bitmap for an unstacked AND mask",
+    );
+
+    let mut bits = vec![0u8; byte_len];
+    let count = i32::try_from(byte_len).expect("cursor mask byte count fits i32");
+    // SAFETY: `hbm_mask` is the live bitmap copy `GetIconInfo` returned, and
+    // `bits` has `count` writable bytes.
+    let copied = unsafe { GetBitmapBits(info.hbm_mask, count, bits.as_mut_ptr().cast()) };
+    for bitmap in [info.hbm_mask, info.hbm_color] {
+        // SAFETY: each bitmap is a non-null copy `GetIconInfo` handed this
+        // caller, deleted exactly once after `GetBitmapBits` is finished.
+        unsafe { DeleteObject(bitmap) };
+    }
+    assert_eq!(copied, count, "GetBitmapBits copied the complete AND mask");
+    bits
 }
 
 /// Win32 `RECT`, as reported by `Harness::window_rect`.
