@@ -1829,14 +1829,16 @@ impl TextureInner {
         if !pixel_convert::can_convert(src.format, dst_fmt) {
             return false;
         }
-        self.ensure_staging(dst_level);
-        let Some(dst_box) = self.staging.get(dst_level) else {
-            return false;
-        };
         let (dw, dh) = (self.mip_width(dst_level), self.mip_height(dst_level));
         let Some((src_rect, dst_rect)) =
             clip_texel_region(src_rect, dst_point, (src.width, src.height), (dw, dh))
         else {
+            return false;
+        };
+        let whole = self.write_covers_level(dst_level, dst_rect);
+        self.move_subresource_to_staging(0, dst_level, whole);
+        self.ensure_staging(dst_level);
+        let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;

@@ -3958,6 +3958,98 @@ fn update_surface_converts_a_standalone_source_into_another_format() {
     );
 }
 
+/// A partial converting standalone update preserves GPU-written pixels outside its rectangle.
+///
+/// `ColorFill` writes only the destination's Metal texture. The later
+/// `UpdateSurface` converts into CPU staging, so it must read the GPU-owned
+/// level back before changing the top-left quadrant.
+#[test]
+fn a_partial_converting_standalone_update_preserves_gpu_pixels() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN_X8: u32 = 0x0000_FF00;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dst = h.create_texture(
+        4,
+        4,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(h.color_fill_hr(&dst.surface_level(0), RED), 0, "GPU fill");
+    for pixel in sample_quadrants(&h, &dst) {
+        assert_pixel_eq(pixel, RED, "completed GPU fill");
+    }
+
+    let src = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[GREEN_X8; 16]);
+    let rect = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 2,
+        y2: 2,
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&src, &rect, &dst.surface_level(0), (0, 0)),
+        0,
+        "partial converting UpdateSurface"
+    );
+
+    let sampled = sample_quadrants(&h, &dst);
+    assert_pixel_eq(sampled[0], GREEN, "converted quadrant");
+    for pixel in &sampled[1..] {
+        assert_pixel_eq(*pixel, RED, "GPU pixel outside the converted rectangle");
+    }
+}
+
+/// A whole converting standalone update remains authoritative before a later raw update.
+///
+/// The conversion replaces the whole GPU-owned level with blue in staging.
+/// A following raw update of the top-left quadrant must preserve that blue,
+/// rather than reading the older red GPU contents back over it.
+#[test]
+fn a_converting_standalone_update_survives_a_later_partial_raw_update() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE_X8: u32 = 0x0000_00FF;
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dst = h.create_texture(
+        4,
+        4,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(h.color_fill_hr(&dst.surface_level(0), RED), 0, "GPU fill");
+    for pixel in sample_quadrants(&h, &dst) {
+        assert_pixel_eq(pixel, RED, "completed GPU fill");
+    }
+
+    let whole = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    whole.lock_rect(0).write_u32(&[BLUE_X8; 16]);
+    assert_eq!(
+        h.update_surface_hr(&whole, &dst.surface_level(0)),
+        0,
+        "whole converting UpdateSurface"
+    );
+    let partial = h.create_offscreen_plain_surface(2, 2, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    partial.lock_rect(0).write_u32(&[GREEN; 4]);
+    assert_eq!(
+        h.update_surface_hr(&partial, &dst.surface_level(0)),
+        0,
+        "later raw UpdateSurface"
+    );
+
+    let sampled = sample_quadrants(&h, &dst);
+    assert_pixel_eq(sampled[0], GREEN, "raw quadrant");
+    for pixel in &sampled[1..] {
+        assert_pixel_eq(*pixel, BLUE, "converted pixel outside the later raw update");
+    }
+}
+
 /// The converting standalone-source `UpdateSurface` reaches a cube face.
 ///
 /// A cube destination takes its own staging path, keyed by face, so it needs
