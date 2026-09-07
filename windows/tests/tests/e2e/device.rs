@@ -1473,6 +1473,7 @@ fn reset_fullscreen_honors_a_settable_mode() {
 #[test]
 fn reset_fullscreen_non_mode_request_follows_the_window() {
     let h = Harness::new();
+    h.hold_display_mode();
     let (screen_w, screen_h) = Harness::screen_size();
     // 137x101 is in no display-mode list, so no game can depend on it being
     // honored: native would reject the request outright. Games that ask for
@@ -1510,11 +1511,12 @@ fn reset_fullscreen_non_mode_request_follows_the_window() {
 #[test]
 fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
     let h = Harness::new();
+    let second = create_window(320, 240, false);
     // The current resolution is a settable mode on any display, so this runs
     // wherever the suite does, unlike the tests that request 640x480.
-    let (screen_w, screen_h) = Harness::screen_size();
-    let second = create_window(320, 240, false);
+    h.hold_display_mode();
     let second_rect = window_rect(second);
+    let (screen_w, screen_h) = Harness::screen_size();
 
     let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
     assert_eq!(
@@ -1777,9 +1779,10 @@ fn cycle_fullscreen(
     progress: &RetargetProgress,
     windowed_workers: usize,
 ) -> Result<u32, String> {
-    let (screen_w, screen_h) = Harness::screen_size();
     let mut trips = 0;
     while progress.finished.load(Ordering::Acquire) < windowed_workers {
+        h.hold_display_mode();
+        let (screen_w, screen_h) = Harness::screen_size();
         let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
         let hr = h.reset_params(&mut pp);
         if hr != D3D_OK {
