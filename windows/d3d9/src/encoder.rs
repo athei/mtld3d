@@ -6756,21 +6756,10 @@ impl FrameEncoder {
             .pass_state
             .texture_sampled_this_frame(unsafe { MetalHandle::new(handle) });
         if sampled {
-            if job.depth > 1 {
-                mtld3d_shared::log_once_warn_by!(
-                    target: LOG_TARGET,
-                    key: job.info.texture_id.raw(),
-                    "run_texture_upload: volume texture {:#x} uploaded after being sampled \
-                     this frame — per-draw versioning not implemented for volumes, earlier \
-                     draws will sample the newer content",
-                    job.info.texture_id.raw(),
-                );
-            } else {
-                handle = self.rename_sampled_texture(&job, handle);
-                if handle == 0 {
-                    decline_texture_upload(&job, "the sampled-texture rename found no destination");
-                    return;
-                }
+            handle = self.rename_sampled_texture(&job, handle);
+            if handle == 0 {
+                decline_texture_upload(&job, "the sampled-texture rename found no destination");
+                return;
             }
         }
         // Volume (3D) textures take a dedicated full-box path; 2D textures
