@@ -43,6 +43,22 @@ static PROFILES: &[AppProfile] = &[
         original_filename: None,
         settings: "adapter.spoof=amd;caps.dfFormats=false;depth.aliasSameSize=true",
     },
+    // Halo 2. It locks a window of its shared world index buffer and writes
+    // past the size that lock announced. A `Staged` buffer uploads only the
+    // announced range, so those indices never reach the device buffer: of the
+    // 512 KiB buffer only the first 19 KiB arrive, every world draw indexes
+    // into the zero-filled remainder, and the degenerate triangles leave the
+    // scene target exactly as the clear left it. The HUD and the additive
+    // effects draw from their own buffers and are unaffected, so the symptom
+    // is a black world under an intact interface.
+    AppProfile {
+        name: "halo2",
+        exe: "halo2.exe",
+        company: Some("Microsoft Corporation"),
+        product: Some("Halo 2 for Windows Vista"),
+        original_filename: Some("Halo2.exe"),
+        settings: "buffer.ignoreLockBounds=true",
+    },
     // World of Warcraft, the 1.12 and 3.3.5 clients alike. Both use the
     // `GetData(D3DGETDATA_FLUSH)` poll loop as a GPU fence after every
     // loading-screen upload batch and never read the count it returns, so the

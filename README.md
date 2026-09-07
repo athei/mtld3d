@@ -61,12 +61,8 @@ options nobody should have to discover, so mtld3d ships profiles for them,
 matched on the executable name plus the version resource its vendor linked
 in. A profile only supplies starting values, which the file and the
 environment override key by key; `RUST_LOG=mtld3d::d3d9=info` names the
-profile that matched. The reason behind every key is the comment on the
-profile's entry in [`app_profile.rs`](windows/core/src/app_profile.rs).
-
-- `gta-iv`, Grand Theft Auto IV: `adapter.spoof=amd`, `caps.dfFormats=false`,
-  `depth.aliasSameSize=true`.
-- `wow`, World of Warcraft 1.12 and 3.3.5: `query.flushImmediate=true`.
+profile that matched. See [`app_profile.rs`](windows/core/src/app_profile.rs)
+for the profiles, their settings, and the reason behind each option.
 
 ## Fullscreen
 
