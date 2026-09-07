@@ -3191,7 +3191,7 @@ fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.materialize_subresource_for_dc(face, inner.mip_level as usize)
+    texture.materialize_subresource_for_cpu_read(face, inner.mip_level as usize)
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.

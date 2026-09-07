@@ -733,17 +733,15 @@ impl TextureInner {
         false
     }
 
-    /// Re-materialise a subresource's pixels for a `GetDC`.
+    /// Make a subresource's current pixels available in staging for a CPU read.
     ///
-    /// A device context is a read-write mapping of the subresource: GDI reads
-    /// the pixels through it and `ReleaseDC` keeps whatever GDI drew, which is
-    /// what a `LockRect` without `D3DLOCK_DISCARD` asks for, so it takes both of
-    /// the GPU reads that lock takes. A subresource claimed for the GPU holds
-    /// pixels its staging does not; a level whose staging was released after its
-    /// upload holds them nowhere else at all. The subresource is the one its
-    /// surface was handed out for; a cube never releases its staging, so only
-    /// the claim applies to a face.
-    pub fn materialize_subresource_for_dc(&mut self, face: u32, level: usize) -> bool {
+    /// `GetDC` and CPU format conversion both consume existing pixels. A
+    /// subresource claimed for the GPU holds pixels its staging does not; a
+    /// level whose staging was released after its upload holds them nowhere
+    /// else at all. A cube never releases its staging, so only the claim applies
+    /// to a face. A successful read clears the GPU claim without marking the
+    /// staging dirty, while a failed required read leaves GPU authority for retry.
+    pub fn materialize_subresource_for_cpu_read(&mut self, face: u32, level: usize) -> bool {
         self.move_subresource_to_staging(face, level, false)
             && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
