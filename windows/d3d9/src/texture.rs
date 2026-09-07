@@ -2240,7 +2240,7 @@ impl TextureInner {
                     unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
                 }
                 if device_inner != 0 {
-                    let perf = DeviceInner::from_ptr(device_inner).perf_mut();
+                    let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
                     match preserve {
                         PreserveKind::None => perf.bump_texture_discard(),
                         PreserveKind::Cpu => perf.bump_texture_preserve_cpu(),
@@ -3074,11 +3074,11 @@ impl Direct3DTexture9 {
 fn tex_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
     use mtld3d_core::perf::{ApiCategory, ApiTimer};
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
-    let perf_ptr = (unsafe { InPtr::<Direct3DTexture9>::opt(this) })
-        .map_or(core::ptr::null_mut(), |obj| {
-            DeviceInner::perf_ptr_of(obj.inner().device_inner as *mut DeviceInner)
-        });
-    ApiTimer::start(perf_ptr, ApiCategory::Texture)
+    let storage = (unsafe { InPtr::<Direct3DTexture9>::opt(this) }).and_then(|obj| {
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { DeviceInner::perf_storage_of(obj.inner().device_inner as *mut DeviceInner) }
+    });
+    ApiTimer::start(storage, ApiCategory::Texture)
 }
 
 extern "system" fn texture_query_interface(

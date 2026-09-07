@@ -322,11 +322,13 @@ fn summary_golden_layout() {
         "\n",
         "Resources (textures)  — same layout as VB/IB; n/a rows omitted\n",
         "rename      2                                                   API: fresh staging Arc on contended LockRect\n",
-        "  discards  1                                                   API: rename, no preserve (DISCARD or D3DUSAGE_DYNAMIC)\n",
-        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (non-DISCARD non-DYNAMIC contended)\n",
-        "uploads     2                                                   encoder: total texture uploads (raw + padded)\n",
+        "  discards  1                                                   API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)\n",
+        "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
+        "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
+        "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
-        "  padded    0                                                   encoder: blit; source repacked into transient buffer (alloc + memcpy + extra unix_call)\n",
+        "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
+        "  pass      0                                                   encoder: render pass; staging read by a fragment function (16-bit widening, sub-alignment pitch)\n",
         "reorder     1                                                   encoder: MTLTexture rename-at-overlap (upload hit a texture sampled earlier this frame)\n",
         "destroys    1                                                   encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + texture release)\n",
         "retention   depth= 0.0  0 KB avg    peak 0 KB                   encoder: blit source staging Arcs (separate from VB/IB retention; MTLTexture handles in destroys)\n",
@@ -358,8 +360,8 @@ fn summary_golden_layout() {
         "  size      72 KB avg               peak 72 KB                  high-water-reserved Vec<Op> capacity per frame (peak_ops_count)\n",
         "  realloc   32 KB avg               peak 32 KB                  Vec<Op> doubling memcpy on push_op (target ≈ 0 with peak_ops_count reserve)\n",
         "cmd_vec                                                         encoder→unix: Vec<Command> shipped via SubmitCommandBuffer; unix dispatches each Command to a Metal encoder\n",
-        "  size      64 KB avg               peak 64 KB                  pool-resident Vec<Command> capacity across frames (recycled, not freed)\n",
-        "  realloc   192 KB avg              peak 192 KB                 Vec<Command> doubling memcpy on emit_command (target ≈ 0 with Pass::commands pool)\n",
+        "  size      64 KB avg               peak 64 KB                  submitted payload Vec<Command> capacity (excludes idle pool and other payloads)\n",
+        "  realloc   192 KB avg              peak 192 KB                 Vec<Command> potential growth copies on emit_command (excludes initial allocations)\n",
         "pagebox     alloc=17  4.8 MB        free=15  4.6 MB             window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)\n",
         "  uncached  1 (5.9%)                peak 1/frame                allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time\n",
         "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
@@ -517,6 +519,7 @@ fn sample_window() -> PerfWindow {
             texture_renames: 2,
             texture_discards: 1,
             texture_preserve_cpu: 1,
+            texture_write_in_place_contended: 0,
             // AddDirtyRect probe fixture: 4 calls, 3 with a usable
             // sub-region; area sum 10000 bp ⇒ mean coverage 25% of the mip.
             texture_add_dirty_calls: 4,
@@ -571,6 +574,7 @@ fn sample_window() -> PerfWindow {
             vbib_mid_pass_reorders: 0,
             texture_blit_uploads: 2,
             texture_blit_padded_uploads: 0,
+            texture_expand_uploads: 0,
             texture_gpu_renames: 1,
             op_cycles: 1_400_000,
             // Decompose op_cyc 1.40M into the nine phases (six draw phases sum
@@ -742,4 +746,83 @@ fn exclusive_exit_saturates_when_children_exceed_elapsed() {
     // parent's measured span; self_time clamps to 0, never wraps.
     let (self_time, _) = exclusive_exit(10, 25, 0, 1);
     assert_eq!(self_time, 0);
+}
+
+/// A final Release may destroy its device inside a child Release's timer.
+#[test]
+fn api_timer_storage_outlives_nested_device_release() {
+    let mut storage = ApiPerfStorage::new();
+    let weak = Rc::downgrade(&storage.state);
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    storage.state_mut().bump_texture_rename();
+    assert_eq!(storage.state.borrow().timer_depth, 2);
+    drop(storage);
+    assert_eq!(weak.strong_count(), 2);
+    drop(inner);
+    {
+        let retained = weak.upgrade().expect("outer timer owns the state");
+        let state = retained.borrow();
+        assert_eq!(state.timer_depth, 1);
+        assert_eq!(state.counters.texture_renames, 1);
+        assert_eq!(
+            state.counters.api_call_counts_by_category[ApiCategory::Device as usize],
+            1
+        );
+    }
+    drop(outer);
+    assert!(weak.upgrade().is_none(), "last timer frees counter storage");
+}
+
+#[test]
+fn api_timer_storage_outlives_direct_device_release() {
+    let storage = ApiPerfStorage::new();
+    let weak = Rc::downgrade(&storage.state);
+    let timer = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    drop(storage);
+    assert_eq!(weak.strong_count(), 1);
+    drop(timer);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn api_timer_nested_writeback_balances_depth_and_counts() {
+    let storage = ApiPerfStorage::new();
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Surface);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+    drop(inner);
+    drop(outer);
+    let state = storage.state.borrow();
+    assert_eq!(state.timer_depth, 0);
+    assert_eq!(state.active_child_cycles, 0);
+    assert_eq!(
+        state.counters.api_call_counts_by_category[ApiCategory::Surface as usize],
+        1
+    );
+    assert_eq!(
+        state.counters.api_call_counts_by_category[ApiCategory::Texture as usize],
+        1
+    );
+}
+
+#[test]
+fn api_timer_disabled_does_not_retain_storage() {
+    // Unit tests install no logger, so the runtime gate remains disabled.
+    assert!(!perf_enabled());
+    let storage = ApiPerfStorage::new();
+    let weak = Rc::downgrade(&storage.state);
+    let timer = ApiTimer::start_device(Some(&storage), DeviceSubCategory::Misc);
+    assert_eq!(storage.state.borrow().timer_depth, 0);
+    assert_eq!(weak.strong_count(), 1);
+    drop(storage);
+    assert!(weak.upgrade().is_none());
+    drop(timer);
+}
+
+#[test]
+fn api_perf_storage_without_timers_is_reclaimed() {
+    let storage = ApiPerfStorage::new();
+    let weak = Rc::downgrade(&storage.state);
+    drop(storage);
+    assert!(weak.upgrade().is_none());
 }

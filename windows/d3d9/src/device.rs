@@ -1,4 +1,4 @@
-use core::{ffi::c_void, mem::MaybeUninit, ptr::NonNull};
+use core::{ffi::c_void, mem::MaybeUninit, ops::DerefMut, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -27,8 +27,8 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::ExtraColorSlot,
     perf::{
-        ApiPerfState, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer, DeviceSubCategory,
-        KeysGate,
+        ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
+        DeviceSubCategory, KeysGate,
     },
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
@@ -522,7 +522,7 @@ pub struct DeviceInner {
     /// Per-category timer buckets, Lock / texture counters, prev-present TSC.
     /// See `mtld3d_core::perf` for the field list. Drained into
     /// `FrameData::perf` at `Present`.
-    perf: ApiPerfState,
+    perf: ApiPerfStorage,
     /// Retention pipeline for VB/IB `PageBox`es whose in-flight frame hasn't yet retired.
     ///
     /// API thread pushes on Lock-rename and Release; drained into `FrameData`
@@ -1476,7 +1476,7 @@ impl DeviceInner {
         // encoder-side `cmd_vec` row.
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
-        self.perf.drain_into_payload(frame.perf_mut());
+        self.perf.state_mut().drain_into_payload(frame.perf_mut());
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
@@ -1779,13 +1779,13 @@ impl DeviceInner {
         // retention-cap check below (which exists to bound allocations).
         let pool = &*crate::page_box_pool::PAGEBOX_POOL;
         if let Some(b) = pool.acquire(logical_len) {
-            self.perf.bump_vbib_pool_hit();
+            self.perf.state_mut().bump_vbib_pool_hit();
             return b;
         }
         if pool.enabled() {
             // Misses count only while the pool is on, so the A/B baseline
             // arm reads hit=0 miss=0 rather than all-miss.
-            self.perf.bump_vbib_pool_miss();
+            self.perf.state_mut().bump_vbib_pool_miss();
         }
         // Before allocating, if live VB/IB retention is at the cap, drain
         // retired backings (cheap) and, if still over, force a mid-frame
@@ -1795,12 +1795,12 @@ impl DeviceInner {
             let retained =
                 self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
             if retained >= self.retention_cap_bytes {
-                self.perf.bump_retention_cap_drain();
+                self.perf.state_mut().bump_retention_cap_drain();
                 self.drain_retention_now();
                 let after =
                     self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
                 if after >= self.retention_cap_bytes {
-                    self.perf.bump_retention_cap_submit();
+                    self.perf.state_mut().bump_retention_cap_submit();
                     self.mid_frame_submit_for_retention();
                 }
             }
@@ -1835,32 +1835,32 @@ impl DeviceInner {
         self.mem_watch_present();
     }
 
-    pub const fn perf_mut(&mut self) -> &mut ApiPerfState {
-        &mut self.perf
+    pub fn perf_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
+        self.perf.state_mut()
     }
 
-    /// Raw pointer to the embedded `ApiPerfState`.
+    /// Borrow the storage while constructing a timer that retains it.
     ///
-    /// For `ApiTimer::start` at the top of every COM vtable fn. SAFETY at
-    /// the call site: the timer is dropped before the fn returns and the COM
-    /// object holds a ref to `DeviceInner` for its entire lifetime.
-    pub const fn perf_ptr(&mut self) -> *mut ApiPerfState {
-        &raw mut self.perf
+    /// # Safety
+    /// A non-null device must be live for the returned borrow, with its API
+    /// lock held when multithreaded. No counter borrow may span the timer.
+    pub unsafe fn perf_storage_of<'a>(dev: *mut Self) -> Option<&'a ApiPerfStorage> {
+        // SAFETY: the caller guarantees the device's lifetime and API lock.
+        unsafe { dev.as_ref() }.map(|dev| &dev.perf)
     }
 
     /// Null-tolerant wrapper: returns `null_mut()` for a null device.
     ///
-    /// Else the embedded `ApiPerfState` pointer. Used by every resource
-    /// `*_timer` helper (`vb_timer`, `tex_timer`, …) that may see a null
-    /// `device_inner` on standalone surfaces.
+    /// The subtimer finishes before the enclosing API timer, which retains
+    /// the separately allocated counter state in a PERF build.
     pub fn perf_ptr_of(dev: *mut Self) -> *mut ApiPerfState {
         if dev.is_null() {
             core::ptr::null_mut()
         } else {
             // SAFETY: caller guarantees a non-null valid device pointer
-            // for the duration of the timer (same contract as
-            // `from_ptr`).
-            unsafe { (*dev).perf_ptr() }
+            // while obtaining the counter pointer. The enclosing API timer
+            // retains its storage until the subtimer has finished.
+            unsafe { (*dev).perf.as_ptr() }
         }
     }
 
@@ -2811,7 +2811,7 @@ impl Direct3DDevice9 {
             outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.
             current_seq: 1,
-            perf: ApiPerfState::new(),
+            perf: ApiPerfStorage::new(),
             vbib_retention_pending: Vec::new(),
             pending_retention_bytes: 0,
             retention_cap_bytes: info.config.vbib_retention_cap_bytes,
@@ -3234,11 +3234,11 @@ pub fn device_api_lock(this: *mut c_void) -> ApiGuard {
 #[inline]
 pub fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let perf_ptr = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
-        .map_or(core::ptr::null_mut(), |obj| {
-            DeviceInner::perf_ptr_of(obj.inner)
-        });
-    ApiTimer::start_device(perf_ptr, sub)
+    let storage = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }).and_then(|obj| {
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { DeviceInner::perf_storage_of(obj.inner) }
+    });
+    ApiTimer::start_device(storage, sub)
 }
 
 /// Same shape as `device_timer` but for entry points whose `DeviceSubCategory` would be `Bind`.
@@ -3250,11 +3250,11 @@ pub fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
 #[inline]
 fn bind_timer(this: *mut c_void, sub: BindSubCategory) -> ApiTimer {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let perf_ptr = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
-        .map_or(core::ptr::null_mut(), |obj| {
-            DeviceInner::perf_ptr_of(obj.inner)
-        });
-    ApiTimer::start_bind(perf_ptr, sub)
+    let storage = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }).and_then(|obj| {
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { DeviceInner::perf_storage_of(obj.inner) }
+    });
+    ApiTimer::start_bind(storage, sub)
 }
 
 /// Pointer the Draw-internal `CycleAddTimer` for the snapshot phase writes into.
@@ -3268,8 +3268,8 @@ fn draw_snapshot_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
         return core::ptr::null_mut();
     }
     // SAFETY: caller obtained `perf_ptr` from `DeviceInner::perf_ptr_of`,
-    // which yields a `*mut ApiPerfState` pointing into the live device's
-    // embedded state for the duration of the COM call.
+    // which yields separately allocated counter storage retained by the
+    // enclosing API timer for the duration of the COM call.
     unsafe { (*perf_ptr).draw_snapshot_cycles_ptr() }
 }
 

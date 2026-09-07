@@ -777,10 +777,9 @@ fn capture_sampler_states(dev: &DeviceInner) -> [[u32; SAMPLER_STATE_COUNT]; STA
 fn sb_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
     use mtld3d_core::perf::{ApiCategory, ApiTimer};
     // SAFETY: vtable thunk; `this` is *mut Direct3DStateBlock9 per the
-    // IDirect3DStateBlock9 ABI. `opt` filters null, forwarding a null
-    // `perf_ptr` instead of dereferencing.
+    // IDirect3DStateBlock9 ABI. `opt` filters null without touching storage.
     let Some(obj) = (unsafe { InPtr::<Direct3DStateBlock9>::opt(this) }) else {
-        return ApiTimer::start(core::ptr::null_mut(), ApiCategory::StateBlock);
+        return ApiTimer::start(None, ApiCategory::StateBlock);
     };
     // SAFETY: `obj.inner` was installed by `new`/`from_recording` as a
     // `Box::into_raw` and lives until `sb_release` at refcount zero.
@@ -793,7 +792,8 @@ fn sb_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
         unsafe { (*sb_inner.device).inner_ptr() }
     };
     ApiTimer::start(
-        crate::device::DeviceInner::perf_ptr_of(dev_ptr),
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { crate::device::DeviceInner::perf_storage_of(dev_ptr) },
         ApiCategory::StateBlock,
     )
 }

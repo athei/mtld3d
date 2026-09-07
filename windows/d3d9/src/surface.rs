@@ -1443,11 +1443,11 @@ impl SurfaceInner {
 fn surf_timer(this: *mut c_void, sub: SurfaceSubCategory) -> mtld3d_core::perf::ApiTimer {
     use mtld3d_core::perf::ApiTimer;
     // SAFETY: vtable thunk; `this` is *mut Direct3DSurface9 per IDirect3DSurface9 ABI.
-    let perf_ptr = (unsafe { InPtr::<Direct3DSurface9>::opt(this) })
-        .map_or(core::ptr::null_mut(), |obj| {
-            crate::device::DeviceInner::perf_ptr_of(obj.inner().device_inner)
-        });
-    ApiTimer::start_surface(perf_ptr, sub)
+    let storage = (unsafe { InPtr::<Direct3DSurface9>::opt(this) }).and_then(|obj| {
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { crate::device::DeviceInner::perf_storage_of(obj.inner().device_inner) }
+    });
+    ApiTimer::start_surface(storage, sub)
 }
 
 extern "system" fn surface_query_interface(
