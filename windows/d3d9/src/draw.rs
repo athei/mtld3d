@@ -1027,27 +1027,22 @@ pub struct ShaderRef<'a> {
     pub variant: VariantKey,
 }
 
-/// Owning-by-reference slice into the current `FrameData::scratch` bump arena.
+/// Immutable slice token into the current frame or encoder scratch arena.
 ///
 /// Replaces `Vec<u8>` for per-draw constants (VS / PS / alpha-ref /
-/// fog-color). The API thread bump-allocates the bytes via
-/// [`arena_alloc_bytes`] and captures the resulting `ScratchSlice` in
-/// the draw closure; the encoder thread reads the bytes via
-/// [`ScratchSlice::as_slice`] or hands the raw `(ptr, len)` to a Metal
-/// `set_*_bytes_at` command.
+/// fog-color). The API thread captures tokens into its frame arena; the
+/// encoder snapshots constant mirrors into its own arena. Both allocate via
+/// [`arena_alloc_bytes`]. The encoder reads through [`ScratchSlice::as_slice`]
+/// or hands the raw `(ptr, len)` to a Metal `set_*_bytes_at` command.
 ///
 /// # Safety invariants
 ///
-/// 1. The pointed-to bytes live in the `ScratchArena` owned by the
-///    same `FrameData` whose `ops` vec holds the closure containing
-///    this `ScratchSlice`.
-/// 2. That `FrameData` is not dropped (and its arena not cleared)
-///    until the encoder thread has finished running every op-closure
-///    on it, so the pointer is valid for the entire window between
-///    API-side construction and encoder-side consumption.
-/// 3. Each closure is `FnOnce`; the encoder runs it once and drops it
-///    before dropping the owning `FrameData`. The slice is never used
-///    after the closure exits.
+/// 1. The bytes are immutable and live in the current `FrameData` or
+///    `FrameEncoder` scratch arena. Tokens do not extend the arena's lifetime.
+/// 2. Binding caches forget these tokens on every fresh render encoder and
+///    before frame scratch is cleared or transferred to a submit payload.
+/// 3. Commands may retain the raw pointer until submission completes. The
+///    submitted frame and payload own both arenas for that entire interval.
 #[derive(Clone, Copy)]
 pub struct ScratchSlice {
     ptr: NonNull<u8>,
@@ -1070,8 +1065,8 @@ impl ScratchSlice {
     /// Construct a `ScratchSlice` from a raw pointer + length.
     ///
     /// Both come back from `ScratchArena::alloc_uninit_slice`. Caller
-    /// asserts the pointer is live in a per-frame arena (drops with
-    /// `FrameData`) and that the referenced bytes are initialised.
+    /// asserts the pointer is live in the owning frame or encoder arena
+    /// and that the referenced bytes are initialised and immutable.
     #[must_use]
     pub const fn from_raw_parts(ptr: NonNull<u8>, len: u32) -> Self {
         Self { ptr, len }
@@ -1079,16 +1074,16 @@ impl ScratchSlice {
 
     /// Raw pointer + byte count suitable for the encoder's `set_*_bytes_at` commands.
     ///
-    /// Pointer stays valid until the owning `FrameData` is dropped (see
-    /// type-level invariants).
+    /// Pointer stays valid while the owning frame or payload retains its
+    /// arena unchanged (see type-level invariants).
     pub fn as_raw(&self) -> (u64, u32) {
         (self.ptr.as_ptr() as u64, self.len)
     }
 
     /// Slice view for encoder-side byte reads.
     ///
-    /// Lifetime of the returned slice is tied to `&self`, so the borrow
-    /// checker prevents stash past the closure body that holds `Self`.
+    /// The caller keeps the owning arena live and unchanged for the borrow;
+    /// the token itself does not enforce the arena's lifetime.
     pub const fn as_slice(&self) -> &[u8] {
         // SAFETY: per type-level invariants, `ptr` points to `len`
         // bytes in a live arena whenever a `ScratchSlice` is in scope.
@@ -1096,7 +1091,13 @@ impl ScratchSlice {
     }
 }
 
-/// Copy `bytes` into the given `FrameData::scratch` arena and return a `ScratchSlice` view.
+impl AsRef<[u8]> for ScratchSlice {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// Copy `bytes` into the given frame or encoder arena and return a `ScratchSlice` view.
 ///
 /// Empty inputs short-circuit to [`ScratchSlice::EMPTY`] so the encoder
 /// skips the bind cleanly.
@@ -1647,8 +1648,6 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         }
     };
     let vdecl_hash = attrs.vdecl_hash;
-    let vs_const_bytes = vs_constants.as_slice();
-    let ps_const_bytes = ps_constants.as_slice();
     let alpha_ref_bytes = alpha_ref_slice.as_slice();
     let fog_color_bytes = fog_color_slice.as_slice();
     let bump_env_bytes = bump_env_slice.as_slice();
@@ -2071,14 +2070,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_binds = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Binds));
     let t_cbind = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BCbind));
     // 5. Shader constants (VS float slot / PS slot 15), alpha-ref float (PS
-    //    slot 14), fog color (PS slot 13). Dedup via inline-bytes cache: when
+    //    slot 14), fog color (PS slot 13). VS/PS dedup uses snapshot tokens: when
     //    the same constants re-bind draw-after-draw (FF pass with one CB
     //    update at the head, or shadow-cast pass with shared light constants)
     //    we skip the `setBytes` command. The bytes already live in the owning
-    //    `FrameData::scratch` arena (bump-allocated on the API thread)
-    //    so we pass their `(ptr, len)` straight to the Metal command
-    //    without re-copying through the encoder's scratch.
-    if !vs_const_bytes.is_empty() && enc.last_bound().vs_constants_changed(vs_const_bytes) {
+    //    frame or encoder arena, so the Metal command takes their `(ptr, len)`
+    //    without an additional copy into a binding cache.
+    if enc.vs_constants_changed(vs_constants) {
         let (p, n) = vs_constants.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_FLOAT_CONST_SLOT));
     }
@@ -2134,7 +2132,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let (p, n) = vs_draw.as_raw();
         enc.emit_command(Command::set_vertex_bytes_at(p, n, VS_DRAW_SLOT));
     }
-    if !ps_const_bytes.is_empty() && enc.last_bound().ps_constants_changed(ps_const_bytes) {
+    if enc.ps_constants_changed(ps_constants) {
         let (p, n) = ps_constants.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 15));
     }

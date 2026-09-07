@@ -5,10 +5,10 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, PosVertex, VolumeVertex};
+use mtld3d_tests::{Harness, PosColorVertex, PosVertex, VolumeVertex};
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
-    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
+    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRS_ZENABLE,
 };
 
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
@@ -1138,4 +1138,105 @@ fn a_sampler_reads_the_bound_texture_kind_not_the_declared_one() {
     assert_eq!(h.clear_texture(0), 0, "unbind stage 0");
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// Both stages keep each draw's constants through submission and arena reuse.
+#[test]
+fn constant_snapshots_survive_updates_passes_and_frame_reuse() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_TRANSLATE);
+    let ps = h.create_pixel_shader(&PS_BC);
+    let depth = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    let tri = triangle_at(0.0);
+    for frame in 0..4 {
+        let colors = if frame % 2 == 0 {
+            [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]
+        } else {
+            [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]]
+        };
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(d.set_pixel_shader_constant_f(0, &colors[0]), 0);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+            assert_eq!(d.set_vertex_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(d.set_pixel_shader_constant_f(0, &colors[1]), 0);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+            // The same snapshots must bind on a fresh encoder. Draw into an
+            // untouched region so a missing bind cannot preserve correct pixels.
+            assert_eq!(d.clear_depth_stencil_surface(), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+                0
+            );
+        });
+        let expected = if frame % 2 == 0 {
+            [0xFFFF_0000, 0xFF00_FF00]
+        } else {
+            [0xFF00_FF00, 0xFFFF_0000]
+        };
+        assert_eq!(h.read_pixel(160, 264), expected[0], "left frame {frame}");
+        assert_eq!(h.read_pixel(320, 264), expected[1], "middle frame {frame}");
+        assert_eq!(h.read_pixel(480, 264), expected[1], "right frame {frame}");
+        assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    }
+}
+
+/// Readback submission and FF draws cannot leave programmable bindings stale.
+#[test]
+fn constant_snapshots_survive_readback_and_fixed_function_transition() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_TRANSLATE);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    let tri = triangle_at(0.0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.read_pixel(160, 264), 0xFFFF_0000, "mid-scene flush");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+        0
+    );
+    assert_eq!(
+        h.read_pixel(320, 264),
+        0xFFFF_0000,
+        "unchanged post-flush binding"
+    );
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.clear_vertex_shader(), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    for position in [-0.5, 0.0] {
+        let ff = triangle_at(position).map(|v| PosColorVertex {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+            color: 0xFF00_FF00,
+        });
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &ff), 0);
+    }
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    // Restore the same programmable bytes after FF bound different constants.
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[0.5, 0.0, 0.0, 0.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[0.0, 0.0, 1.0, 1.0]), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+    assert_eq!(h.read_pixel(160, 264), 0xFFFF_0000, "programmable restored");
+    assert_eq!(h.read_pixel(320, 264), 0xFF00_FF00, "FF constants");
+    assert_eq!(h.read_pixel(480, 264), 0xFF00_00FF, "post-flush update");
 }
