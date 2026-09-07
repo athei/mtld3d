@@ -918,9 +918,10 @@ pub struct SubmitFrameParams {
     /// Both completion handlers `fetch_max` `submit_seq` into
     /// `*(failed_submit_seq_ptr as *const AtomicU64)` when the command
     /// buffer reaches `MTLCommandBufferStatus::Error`. A CPU encoding
-    /// failure records the sequence and drains all committed draw/upload
-    /// buffers and their handlers before advancing retirement. Deliberately a
-    /// second counter rather than a gate on `coherent_seq`: an aborted
+    /// failure first drains all committed draw/upload buffers and their
+    /// handlers, then records the failed sequence before advancing retirement
+    /// to that sequence. Deliberately a second counter rather than a gate on
+    /// `coherent_seq`: an aborted
     /// command buffer *is* finished with its source memory, so withholding
     /// the retirement bump would pin every seq-gated queue behind a seq
     /// that never retires and deadlock `wait_for_gpu_retire`. Retirement

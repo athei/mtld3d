@@ -8173,22 +8173,24 @@ impl FrameEncoder {
         held
     }
 
-    /// Block until `coherent_seq >= current_submit_seq`.
+    /// Wait for committed work through the current submission.
     ///
-    /// Parks on the unix-side `WaitForGpuRetire` thunk, which calls Metal's
-    /// `MTLCommandBuffer::waitUntilCompleted` on the registered cmdbuf for
-    /// `current_submit_seq`. Skips immediately when the encoder hasn't yet
-    /// been given a `coherent_seq` pointer or hasn't submitted any frame —
-    /// both states arrive together in `begin_frame`.
+    /// Delegates to the unix-side retirement wait. If the current sequence
+    /// has no registered buffer, the wait falls back to earlier committed
+    /// work without publishing the missing sequence as retired. CPU submission
+    /// failure separately drains committed work before retiring its sequence.
+    /// Skips when the encoder has no retirement counter or current sequence.
     fn wait_for_gpu_idle(&self) {
         self.wait_for_gpu_retire(self.current_submit_seq);
     }
 
-    /// Block until `coherent_seq >= target_seq`.
+    /// Wait for a submitted sequence, falling back to earlier committed work.
     ///
-    /// A target of 0 names no frame, and a target the encoder never
-    /// submitted is answered by the atomic alone on the unix side, so
-    /// neither waits.
+    /// A target of 0 names no frame. The unix side also skips an already
+    /// retired target; otherwise it waits for the smallest registered sequence
+    /// at or beyond the target, or the latest earlier entry if none exists.
+    /// Only the sequence actually waited for is published, so a missing target
+    /// may remain above the retirement counter when this call returns.
     fn wait_for_gpu_retire(&self, target_seq: u64) {
         if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;
