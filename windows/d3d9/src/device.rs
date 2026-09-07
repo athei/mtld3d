@@ -9598,7 +9598,7 @@ extern "system" fn device_get_texture(
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::Texture);
     let vertex_slot = vertex_sampler_slot(stage);
-    if (vertex_slot.is_none() && stage >= 8) || texture.is_null() {
+    if (vertex_slot.is_none() && stage as usize >= STAGE_COUNT) || texture.is_null() {
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
