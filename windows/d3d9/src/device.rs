@@ -3986,49 +3986,12 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
-    // Window transition first, then size against the window it produced: a
-    // fullscreen or maximized Reset takes its back-buffer size from the client
-    // rect, which is only final once the window has moved.
-    let target_window = if pp.device_window == 0 {
-        dev.window()
-    } else {
-        pp.device_window
-    };
-    apply_reset_window_mode(dev, &pp);
-    crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
     if pp.windowed != 0 && pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
-    pp.back_buffer_count = pp.back_buffer_count.max(1);
-    warn_present_params_fields_once(&pp);
-    trace!(
-        target: LOG_TARGET,
-        "IDirect3DDevice9::Reset({}x{}, fmt={})",
-        pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format
-    );
-    // A Reset whose window has no readable client area must still carry
-    // explicit dimensions.
-    if pp.back_buffer_width == 0 || pp.back_buffer_height == 0 {
-        warn!(
-            target: LOG_TARGET,
-            "reject Reset({}x{}, fmt={}) — zero-dim present params",
-            pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
-        );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
-    }
-
-    // Report the resolved geometry back to the caller. D3D9 leaves
-    // hDeviceWindow and the mode flags as the caller set them.
-    pp_in.back_buffer_width = pp.back_buffer_width;
-    pp_in.back_buffer_height = pp.back_buffer_height;
-    pp_in.back_buffer_count = pp.back_buffer_count;
-    pp_in.back_buffer_format = pp.back_buffer_format;
-
     // `Reset` re-specifies the swap chain, multisample configuration
-    // included, so resolve it against the device before anything is recreated
-    // and treat a change as a resize: the back buffer and the implicit depth
-    // surface both have to be rebuilt at the new count.
+    // included. Its validation depends on the format and device caps alone,
+    // so reject it before changing the window or display mode.
     let Ok(new_sample_count) = mtld3d_core::multisample::resolve_sample_count(
         pp.multi_sample_type,
         pp.multi_sample_quality,
@@ -4044,6 +4007,35 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     };
+    let target_window = if pp.device_window == 0 {
+        dev.window()
+    } else {
+        pp.device_window
+    };
+    if !resolve_reset_window_mode(dev, target_window, &mut pp) {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset({}x{}, fmt={}) - no usable windowed client area",
+            pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
+        );
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return D3DERR_INVALIDCALL;
+    }
+    pp.back_buffer_count = pp.back_buffer_count.max(1);
+    warn_present_params_fields_once(&pp);
+    trace!(
+        target: LOG_TARGET,
+        "IDirect3DDevice9::Reset({}x{}, fmt={})",
+        pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format
+    );
+
+    // Report resolved geometry only after validation. The caller's window
+    // and mode flags stay as supplied.
+    pp_in.back_buffer_width = pp.back_buffer_width;
+    pp_in.back_buffer_height = pp.back_buffer_height;
+    pp_in.back_buffer_count = pp.back_buffer_count;
+    pp_in.back_buffer_format = pp.back_buffer_format;
+
     let multi_sample_changed = new_sample_count != dev.backbuffer_sample_count;
     dev.set_backbuffer_multi_sample(
         pp.multi_sample_type,
@@ -4152,12 +4144,40 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     D3D_OK
 }
 
+/// Resolve geometry after the window transition, undoing a rejected fullscreen exit.
+///
+/// Only windowed requests can still have zero dimensions here. Leaving
+/// fullscreen must precede their client-area query, but the fullscreen
+/// session stays owned until that query has produced a usable extent.
+fn resolve_reset_window_mode(
+    dev: &mut DeviceInner,
+    target: usize,
+    pp: &mut mtld3d_types::D3DPRESENT_PARAMETERS,
+) -> bool {
+    if pp.windowed != 0
+        && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0)
+        && let Some(saved) = dev.fullscreen.as_ref()
+    {
+        let accepted = crate::fullscreen::try_leave(saved, || {
+            crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
+            pp.back_buffer_width != 0 && pp.back_buffer_height != 0
+        });
+        if accepted {
+            dev.fullscreen = None;
+        }
+        return accepted;
+    }
+    apply_reset_window_mode(dev, pp);
+    crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
+    pp.back_buffer_width != 0 && pp.back_buffer_height != 0
+}
+
 /// Carry out the windowed/fullscreen transition a `Reset` asks for.
 ///
 /// All four combinations are legal and a game picks freely between them:
 /// entering fullscreen, leaving it, staying fullscreen (possibly on a new
-/// device window), and staying windowed. Nothing here can fail: no display
-/// mode is involved, so there is no mode to reject.
+/// device window), and staying windowed. A refused display mode uses the
+/// existing monitor-covering fallback.
 fn apply_reset_window_mode(dev: &mut DeviceInner, pp: &mtld3d_types::D3DPRESENT_PARAMETERS) {
     if pp.windowed != 0 {
         dev.leave_fullscreen();
