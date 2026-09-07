@@ -1159,12 +1159,9 @@ impl DeviceInner {
 
     /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
     ///
-    /// Swaps the bound-slot refcount, flushes the texture's dirty mips
-    /// (vertex slots are off the snapshot path that flushes fragment
-    /// binds), and mirrors the id to the encoder. Later CPU writes to a
-    /// texture bound ONLY here reach the GPU on its next fragment bind or
-    /// re-bind, a shape no known title uses (the fetched textures are
-    /// render targets).
+    /// Swaps the bound-slot refcount, flushes the texture's dirty mips,
+    /// and mirrors the id to the encoder. Later CPU writes dirty the draw
+    /// snapshot, which flushes the same slots before the next draw.
     pub fn set_vertex_texture_slot(
         &mut self,
         slot: usize,
@@ -10848,7 +10845,20 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // `current_frame.ops`. Done before we hold our own `&mut` on
     // scratch/ops below.
     let stage_bindings_arr_opt = if dirty.contains(SnapshotDirty::STAGES) {
-        let (arr, ff_mask, packed_mask) = snapshot_stage_bindings(obj.inner());
+        let dev = obj.inner();
+        // Vertex bindings ride encoder ops, but their CPU writes dirty the
+        // snapshot just like fragment writes. Flush before queuing this draw.
+        for slot in 0..dev.vertex_textures.len() {
+            let tex = dev.vertex_texture(slot);
+            if tex.is_null() {
+                continue;
+            }
+            // SAFETY: the bound-slot refcount keeps this separate texture
+            // allocation live; the device API lock serialises its access.
+            let bound = unsafe { &mut *tex };
+            crate::texture::flush_dirty_mips(bound.inner_mut(), dev);
+        }
+        let (arr, ff_mask, packed_mask) = snapshot_stage_bindings(dev);
         obj.inner().cached_bound_texture_mask = ff_mask;
         Some((arr, packed_mask))
     } else {
@@ -11539,10 +11549,8 @@ fn promote_cpu_only_texture(dev: &mut DeviceInner, tex: &mut crate::texture::Dir
 /// the layout `bump_packed_stage_bindings` copies into scratch. Returns
 /// `(packed prefix, FF bound-texture mask (stages 0–7), packed_mask)`.
 ///
-/// Uploads are handled independently of draw-time
-/// binding capture: `texture_unlock_rect` / `texture_add_dirty_rect` push
-/// their own upload closures onto the current frame, so this function no
-/// longer touches staging bytes.
+/// Writable texture unlocks dirty the draw snapshot. This walk schedules
+/// their pending uploads before capturing the bindings the draw consumes.
 fn snapshot_stage_bindings(
     dev: &mut DeviceInner,
 ) -> ([MaybeUninit<StageBinding>; STAGE_COUNT], u8, u16) {
