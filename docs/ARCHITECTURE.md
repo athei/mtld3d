@@ -123,6 +123,13 @@ How to apply:
 - Bit-flag fields use `bitflags!` (`TextureUsage`, `ColorWriteMask`).
 - `Command::param_a/b/c/d` carry polymorphic `u32`s whose meaning depends on `Command::cmd`. Stay `u32` on the struct; encode via `Enum::Variant as u32` in the `Command::foo` constructor and decode via `Enum::from_repr(raw)` (strum `FromRepr`) in the dispatcher — never a bare `match raw { 0 => …, 1 => …, … }`.
 
+A `BlitCommand::CopyTextureToTexture` carries its copy depth in `depth`,
+starting at z=0 at both ends. Zero keeps the original one-slice form for 2D
+and cube commands; volume preservation supplies the addressed mip's full
+depth. The unix side bounds-checks that depth against both live textures'
+mip dimensions before encoding the copy. Array slices remain separate in
+`src_slice` and `dst_slice`.
+
 ## The drawable is the layer's size, and present owns the resample
 
 `CAMetalLayer.drawableSize` is kept at the layer's own `bounds × contentsScale`, never at the guest's back-buffer size. `macdrv::sync_drawable_size` pushes it at attach and again before every `nextDrawable`, because the documented default is captured once and does not follow the layer: a freshly created wine metal view reports a real `bounds` beside a `0x0` `drawableSize`, and a window resize moves `bounds` without moving `drawableSize`.

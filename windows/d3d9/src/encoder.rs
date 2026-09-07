@@ -6860,7 +6860,10 @@ impl FrameEncoder {
         // the old content underneath.
         let mip_w = (info.width.max(1) >> job.level).max(1);
         let mip_h = (info.height.max(1) >> job.level).max(1);
-        let full_cover = job.origin_x == 0
+        let is_volume = info.create_flags.contains(TextureCreateFlags::TYPE_3D);
+        let mip_depth = (info.depth.max(1) >> job.level).max(1);
+        let full_cover = (!is_volume || job.depth >= mip_depth)
+            && job.origin_x == 0
             && job.origin_y == 0
             && job.region_w >= mip_w
             && job.region_h >= mip_h;
@@ -6870,14 +6873,25 @@ impl FrameEncoder {
             }
             let lw = (info.width.max(1) >> level).max(1);
             let lh = (info.height.max(1) >> level).max(1);
-            self.frame_blit_commands
-                .push(BlitCommand::copy_texture_to_texture_full_mip(
+            let preserve = if is_volume {
+                BlitCommand::copy_texture_to_texture_full_volume_mip(
                     old_handle,
                     fresh.raw(),
                     level,
                     lw,
                     lh,
-                ));
+                    (info.depth.max(1) >> level).max(1),
+                )
+            } else {
+                BlitCommand::copy_texture_to_texture_full_mip(
+                    old_handle,
+                    fresh.raw(),
+                    level,
+                    lw,
+                    lh,
+                )
+            };
+            self.frame_blit_commands.push(preserve);
         }
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
 

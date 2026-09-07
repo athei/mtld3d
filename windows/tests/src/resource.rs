@@ -8,7 +8,7 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3D_OK, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC,
+    D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC,
     D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
     IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
     IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
@@ -163,7 +163,7 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u32(&self, level: u32, texels: &[u32]) {
-        self.write_texels(level, texels);
+        self.write_texels(level, None, texels);
     }
 
     /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
@@ -171,27 +171,46 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u16(&self, level: u32, texels: &[u16]) {
-        self.write_texels(level, texels);
+        self.write_texels(level, None, texels);
     }
 
-    fn write_texels<T: Copy>(&self, level: u32, texels: &[T]) {
+    /// Fill a box of a 32-bit-per-texel volume, preserving texels outside it.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` does not fill the box exactly.
+    pub fn write_box_u32(&self, level: u32, region: &D3DBOX, texels: &[u32]) {
+        self.write_texels(level, Some(region), texels);
+    }
+
+    fn write_texels<T: Copy>(&self, level: u32, region: Option<&D3DBOX>, texels: &[T]) {
         let (hr, desc) = self.level_desc(level);
         expect_ok(hr, "VolumeTexture GetLevelDesc");
-        let (width, height, depth) = (
-            desc.width as usize,
-            desc.height as usize,
-            desc.depth as usize,
+        let (width, height, depth) = region.map_or((desc.width, desc.height, desc.depth), |b| {
+            assert!(b.left < b.right && b.top < b.bottom && b.front < b.back);
+            assert!(b.right <= desc.width && b.bottom <= desc.height && b.back <= desc.depth);
+            (b.right - b.left, b.bottom - b.top, b.back - b.front)
+        });
+        let (width, height, depth) = (width as usize, height as usize, depth as usize);
+        assert_eq!(
+            texels.len(),
+            width * height * depth,
+            "requested box of texels"
         );
-        assert_eq!(texels.len(), width * height * depth, "one level of texels");
         let mut locked = D3DLOCKED_BOX {
             row_pitch: 0,
             slice_pitch: 0,
             bits: core::ptr::null_mut(),
         };
         // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
-        // a null box locks the whole level.
+        // the optional box is borrowed through this call.
         let hr = unsafe {
-            (self.vtbl().lock_box)(self.ptr, level, &raw mut locked, core::ptr::null(), 0)
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                0,
+            )
         };
         expect_ok(hr, "VolumeTexture LockBox");
         assert!(!locked.bits.is_null(), "LockBox handed out a pointer");

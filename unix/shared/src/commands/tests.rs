@@ -218,6 +218,7 @@ fn copy_texture_to_texture_full_mip_zeros_sub_rect_fields() {
     assert_eq!(cmd.origin_y, 0);
     assert_eq!(cmd.region_w, 512);
     assert_eq!(cmd.region_h, 256);
+    assert_eq!(cmd.depth, 0, "zero preserves the single-slice wire form");
     assert_eq!(cmd.dst_offset, 0);
 }
 
@@ -315,4 +316,13 @@ fn draw_indexed_primitives_packs_index_count_and_type() {
     let (_, cnt, ty, _, _, _) = decode_draw_indexed(&cmd);
     assert_eq!(cnt, u32::MAX);
     assert_eq!(ty, IndexType::UInt32 as u32);
+}
+
+#[test]
+fn volume_mip_copy_carries_depth_separately_from_array_slices() {
+    let cmd = BlitCommand::copy_texture_to_texture_full_volume_mip(0xAA, 0xBB, 1, 8, 4, 2);
+    assert_eq!((cmd.region_w, cmd.region_h, cmd.depth), (8, 4, 2));
+    assert_eq!((cmd.mip_level, cmd.dst_mip_level), (1, 1));
+    assert_eq!((cmd.src_slice, cmd.dst_slice), (0, 0));
+    assert_eq!((cmd.origin_x, cmd.origin_y, cmd.dst_offset), (0, 0, 0));
 }
