@@ -74,6 +74,7 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
     let mut sites: BTreeMap<Site, u32> = BTreeMap::new();
     let mut flaky_marked: BTreeMap<Site, u32> = BTreeMap::new();
     let mut todo_marked: BTreeMap<Site, u32> = BTreeMap::new();
+    let mut skipped = BTreeMap::new();
     let mut crash = signaled || !output.contains(SUMMARY_MARKER);
     let mut panic: Option<String> = None;
     // The Rust panic message sits on the line *after* the `panicked at` header
@@ -107,6 +108,10 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
                 .or_insert(0) += 1;
             continue;
         }
+        if let Some(site) = skipped_assertion(line) {
+            skipped.insert(site, line.to_owned());
+            continue;
+        }
         if let Some(idx) = line.find(PANIC_MARKER) {
             crash = true;
             if panic.is_none() {
@@ -126,7 +131,26 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
         panic,
         flaky_marked,
         todo_marked,
+        skipped,
     }
+}
+
+/// Map the reviewed timing skip to the assertion it bypasses.
+///
+/// `test_occlusion_query` jumps from device.c:6706 to cleanup before 6780.
+/// Match both the source location and complete message shape so unrelated
+/// skips and upstream source drift cannot excuse an absent failure.
+fn skipped_assertion(line: &str) -> Option<Site> {
+    let elapsed = line
+        .strip_prefix("device.c:6706: Tests skipped: Test loop took too long (")?
+        .strip_suffix(" ms), skipping large query tests.")?;
+    if !elapsed.parse::<u32>().is_ok_and(|ms| ms > 70) {
+        return None;
+    }
+    Some(Site {
+        file: "device.c".to_owned(),
+        line: 6780,
+    })
 }
 
 /// Recover `<file>.c:<line>` from the text preceding [`FAILURE_MARKER`].

@@ -72,6 +72,12 @@ pub fn diff(
                 let in_baseline = base.is_some_and(|b| b.sites.contains_key(site));
                 let bc = base.and_then(|b| b.sites.get(site)).copied().unwrap_or(0);
                 let cc = cur.sites.get(site).copied().unwrap_or(0);
+                if let Some(reason) = cur.skipped_reason(site) {
+                    details.push(format!(
+                        "  {site}  SKIPPED (baseline count {bc} retained): {reason}"
+                    ));
+                    continue;
+                }
                 // A site a human pinned `flaky` fails non-deterministically on the
                 // identical binary; its count is not load-bearing, so a delta in
                 // *either* direction is a tolerated flutter, not a verdict — it
