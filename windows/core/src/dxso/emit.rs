@@ -2391,17 +2391,14 @@ fn translate_instruction(
             let _ = writeln!(out, "    p0 = ({} {} {});", srcs[0], op_str, srcs[1]);
             return Ok(());
         }
-        // `breakp pN` — predicate-gated break. The predicate operand
-        // is stored in `inst.predicate` (since `predicated` is set on
-        // the instruction); break when `any` of the gated lanes is
-        // true. `any(p0)` is conservative and matches D3D9 PS
-        // semantics where the swizzle picks specific lanes.
+        // `breakp p0.comp` consumes a regular predicate source. The generic
+        // source load above applies its required replicate swizzle and
+        // optional Boolean negation before this scalar test.
         Opcode::BreakP => {
-            let pred = inst.predicate.as_ref().ok_or_else(|| {
+            let pred = srcs.first().ok_or_else(|| {
                 EmitError::UnsupportedInstruction("breakp without predicate operand".into())
             })?;
-            let pred_expr = predicate_gate_expr(pred);
-            let _ = writeln!(out, "    if ({pred_expr}) break;");
+            let _ = writeln!(out, "    if (({pred}).x != 0.0) break;");
             return Ok(());
         }
         // `call sN` — inline-expand the labelled subroutine. The
@@ -2503,7 +2500,7 @@ fn expand_subroutine(out: &mut String, label: u32, ctx: &EmitContext) -> Result<
     Ok(())
 }
 
-/// Build the boolean MSL expression that gates a predicated instruction (or `breakp`).
+/// Build the Boolean MSL expression that gates a predicated instruction.
 ///
 /// The predicate operand carries a swizzle picking which p0 lane is the gate,
 /// and a `Not` modifier inverts the test. `any(p0)` is the fallback for an
@@ -2727,6 +2724,10 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
                 format!("float4(float((ps_b >> {}u) & 1u))", reg.index)
             }
         }
+        // `p0` is stored as bool4, while ordinary source operands flow through
+        // the float4 swizzle and modifier pipeline. Flow-control instructions
+        // consume one replicated component after those operations.
+        RegKind::Predicate => "float4(p0)".to_string(),
         // Label register reads only land here as the operand of
         // `Call sN` / `CallNz` — the emit arm pulls `reg.index`
         // directly off the parsed `SrcOperand` rather than this

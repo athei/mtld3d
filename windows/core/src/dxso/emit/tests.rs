@@ -84,7 +84,6 @@ const OP_ENDIF: u16 = 43;
 const OP_BREAK: u16 = 44;
 const OP_BREAKC: u16 = 45;
 const OP_DEFI: u16 = 48;
-const OP_BREAKP: u16 = 96;
 const OP_SETP: u16 = 94;
 
 const TYPE_PREDICATE: u32 = 19;
@@ -2077,6 +2076,62 @@ fn setp_lt_emits_componentwise_predicate_assignment() {
 }
 
 #[test]
+fn if_reads_predicate_source_with_replicate_swizzle() {
+    // ps_3_0 { setp_lt p0, c0, c1; if p0.x; mov oC0, c0; endif; }
+    let bc = vec![
+        PS3_HEADER,
+        u32::from(OP_SETP) | (4u32 << 16) | (3u32 << 24),
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        0x0100_0028,
+        0xb000_1000,
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains("if (((float4(p0)).xxxx).x != 0.0) {"),
+        "if must read the replicated p0.x source:\n{ps_msl}"
+    );
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
+fn callnz_reads_negated_predicate_source_with_replicate_swizzle() {
+    // vs_3_0 { callnz l0, !p0.z; ret; label l0; mov r0, c0; ret; }
+    let bc = vec![
+        VS3_HEADER,
+        0x0200_001a,
+        0xa0e4_1000,
+        0xbdaa_1000,
+        opcode_token(OP_RET, 0),
+        0x0100_001e,
+        0xa0e4_1000,
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("if ((float4(!bool4((float4(p0)).zzzz))).x != 0.0) {"),
+        "callnz must read and negate the replicated p0.z source:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("r[0] = vs_c[0];"),
+        "callnz body must inline-expand:\n{vs_msl}"
+    );
+    metal_compile_or_fail(&vs_msl);
+}
+
+#[test]
 fn predicated_instruction_wraps_dst_write_in_p0_check() {
     // ps_3_0 {
     //   dcl t0;
@@ -2116,8 +2171,7 @@ fn predicated_instruction_wraps_dst_write_in_p0_check() {
 
 #[test]
 fn breakp_emits_predicate_gated_break() {
-    // vs_3_0 { defi i0, 4,0,1,0; loop aL, i0; (p0) breakp p0; endloop; ... }
-    let predicated_breakp_token = u32::from(OP_BREAKP) | (1u32 << 28) | (1u32 << 24);
+    // vs_3_0 { defi i0, 4,0,1,0; loop aL, i0; breakp p0.w; endloop; ... }
     let bc = vec![
         VS3_HEADER,
         opcode_token(OP_DEFI, 5),
@@ -2132,8 +2186,8 @@ fn breakp_emits_predicate_gated_break() {
         opcode_token(OP_LOOP, 2),
         src_token(TYPE_LOOP, 0, SWIZ_IDENTITY, 0),
         src_token(TYPE_CONSTINT, 0, SWIZ_IDENTITY, 0),
-        predicated_breakp_token,
-        src_token(TYPE_PREDICATE, 0, 0x00 /* .xxxx */, 0),
+        0x0100_0060,
+        0xb0ff_1000,
         opcode_token(OP_ENDLOOP, 0),
         opcode_token(OP_MOV, 2),
         dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
@@ -2141,11 +2195,23 @@ fn breakp_emits_predicate_gated_break() {
         END_TOKEN,
     ];
     let vs = parse(&bc).expect("VS3 parse");
+    let breakp = vs
+        .instructions
+        .iter()
+        .find(|inst| inst.opcode == super::Opcode::BreakP)
+        .expect("breakp instruction");
+    assert!(
+        breakp.predicate.is_none(),
+        "breakp must not use the instruction predication operand"
+    );
+    assert_eq!(breakp.srcs.len(), 1, "breakp must have one regular source");
+    assert_eq!(breakp.srcs[0].reg.kind, super::RegKind::Predicate);
     let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
     assert!(
-        vs_msl.contains("if (p0.x) break;"),
+        vs_msl.contains("if (((float4(p0)).wwww).x != 0.0) break;"),
         "breakp must gate break on the predicate operand:\n{vs_msl}"
     );
+    metal_compile_or_fail(&vs_msl);
 }
 
 #[test]
