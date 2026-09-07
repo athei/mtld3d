@@ -12429,8 +12429,10 @@ extern "system" fn device_set_vertex_shader_constant_f(
     // SAFETY: `constant_data` is non-null and `count != 0` (checked
     // above); per the D3D9 ABI the caller guarantees `count * 4` `f32`s
     // are readable from `constant_data`.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[f32; 4]>(), count as usize) };
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[f32; 4]>(), count as usize)
+    };
+    let slice: &[[f32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantF {
             start: start_register,
@@ -12533,8 +12535,10 @@ extern "system" fn device_set_vertex_shader_constant_i(
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
     // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are readable.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[i32; 4]>(), count as usize) };
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[i32; 4]>(), count as usize)
+    };
+    let slice: &[[i32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantI {
             start: start_register,
@@ -12597,7 +12601,8 @@ extern "system" fn device_set_vertex_shader_constant_b(
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
     // per the D3D9 ABI the caller guarantees `count` `BOOL`s are readable.
-    let slice = unsafe { core::slice::from_raw_parts(constant_data, count as usize) };
+    let constants = unsafe { mtld3d_shared::slice_from_caller(constant_data, count as usize) };
+    let slice = &*constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantB {
             start: start_register,
@@ -12997,8 +13002,10 @@ extern "system" fn device_set_pixel_shader_constant_f(
     // SAFETY: `constant_data` is non-null and `count != 0` (checked
     // above); per the D3D9 ABI the caller guarantees `count * 4` `f32`s
     // are readable from `constant_data`.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[f32; 4]>(), count as usize) };
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[f32; 4]>(), count as usize)
+    };
+    let slice: &[[f32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantF {
             start: start_register,
@@ -13062,8 +13069,10 @@ extern "system" fn device_set_pixel_shader_constant_i(
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
     // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are readable.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[i32; 4]>(), count as usize) };
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[i32; 4]>(), count as usize)
+    };
+    let slice: &[[i32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantI {
             start: start_register,
@@ -13123,7 +13132,8 @@ extern "system" fn device_set_pixel_shader_constant_b(
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
     // per the D3D9 ABI the caller guarantees `count` `BOOL`s are readable.
-    let slice = unsafe { core::slice::from_raw_parts(constant_data, count as usize) };
+    let constants = unsafe { mtld3d_shared::slice_from_caller(constant_data, count as usize) };
+    let slice = &*constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantB {
             start: start_register,

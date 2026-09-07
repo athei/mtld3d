@@ -1626,6 +1626,25 @@ impl Harness {
         }
     }
 
+    /// `SetPixelShaderConstantF` from an arbitrary pointer.
+    ///
+    /// The typed setter above can only hand over a pointer the allocator
+    /// aligned. D3D9 copies these arrays and promises no alignment, so a test
+    /// needs to be able to pass one that is not aligned.
+    ///
+    /// # Safety
+    ///
+    /// `data` is readable for `count * 4` `f32`s.
+    pub unsafe fn set_pixel_shader_constant_f_raw(
+        &self,
+        start: u32,
+        data: *const f32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; the caller guarantees the extent.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_f)(self.device, start, data, count) }
+    }
+
     /// `SetVertexShaderConstantI` (each register is 4 ints).
     ///
     /// # Panics
