@@ -20,6 +20,11 @@
 //! costs nothing because the parser reads it, a tally short of libtest's
 //! own count names the tests with no outcome and runs them again, and a
 //! second round that loses the same result fails it rather than looping.
+//!
+//! A test with worker threads names itself once per thread, so two more pin
+//! that the announcements of one test read as one name, and that a panic
+//! on a worker carrying the test's name and its thread id is charged to
+//! that test with no serial round.
 
 use std::{
     collections::VecDeque,
@@ -28,7 +33,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Launcher, ProcessEnd, Report, TestResult, Verdict, run_binary};
+use super::{Launcher, ProcessEnd, Report, TestResult, Verdict, announced, run_binary};
 use crate::{
     binary::{LayerLog, keep_layer_log, keep_stderr},
     libtest::Parser,
@@ -501,6 +506,82 @@ fn the_note_names_what_was_in_flight_and_only_those_run_one_at_a_time() {
         launcher.launched[2],
         (Some(vec!["a::four".to_owned()]), 4),
         "the tests the narrowed round set aside run at the caller's width"
+    );
+}
+
+/// A test that announces on several threads is one name, where it was first seen.
+#[test]
+fn a_duplicated_announcement_yields_one_name() {
+    let stderr = "[e2e] running a::one\n\
+        0024:fixme:d3d9:something [e2e] running a::two\n\
+        [e2e] running a::one\n\
+        [e2e] running a::two\n\
+        [e2e] running a::three\n\
+        [e2e] running a::one\n";
+    assert_eq!(announced(stderr), ["a::one", "a::two", "a::three"]);
+    assert_eq!(announced(""), Vec::<String>::new());
+}
+
+/// A worker named after its test fails as that test, whatever else the test announced.
+///
+/// The thread id the hook puts between the name and the verb is the id of
+/// the worker, not of libtest's own thread for the test, and the test has
+/// announced once per thread; neither changes which test is charged.
+#[test]
+fn a_named_workers_panic_is_charged_to_its_test_without_a_serial_round() {
+    let mut launcher = Scripted::new(
+        &["a::one", "a::two", "b::three"],
+        vec![
+            Script {
+                stdout: "running 3 tests\ntest a::one ... ok\n",
+                stderr: "[e2e] running a::two\n[e2e] running b::three\n\
+                    [e2e] running a::two\n[e2e] running a::two\n\
+                    thread 'a::two' (12) panicked at tests/e2e/device.rs:1830:21:\n\
+                    attribution probe\n"
+                    .to_owned(),
+                layer: None,
+                kind: ExitKind::Code(101),
+            },
+            Script {
+                stdout: "running 1 test\ntest b::three ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 4, false, &mut log).unwrap();
+    assert_eq!(
+        run.processes, 2,
+        "the panic names its test: no serial round"
+    );
+    assert!(run.failed);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a::one", "pass"), ("a::two", "fail"), ("b::three", "pass")]
+    );
+    assert!(
+        matches!(&log.results[1].verdict, Verdict::Failed(r) if r.contains("attribution probe")),
+        "{:?}",
+        log.results[1].verdict
+    );
+    assert!(
+        log.notes[0].contains("in flight when it ended: a::two, b::three\n"),
+        "each name once: {:?}",
+        log.notes
+    );
+    assert!(
+        log.notes
+            .iter()
+            .all(|note| !note.contains("nothing names the test")),
+        "{:?}",
+        log.notes
+    );
+    assert_eq!(
+        launcher.launched[1],
+        (Some(vec!["b::three".to_owned()]), 4),
+        "only what was left runs again, at full width"
     );
 }
 

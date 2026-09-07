@@ -447,13 +447,22 @@ pub fn run_binary(
     Ok(run)
 }
 
-/// The tests that named themselves on `stderr`, in the order they did.
+/// The tests that named themselves on `stderr`, each once, in the order they first did.
+///
+/// A test names itself on every thread it creates a device from, and its
+/// worker threads carry its name, so one test can announce several times.
 fn announced(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter_map(|line| line.split_once(RUNNING))
-        .map(|(_, name)| name.trim().to_owned())
-        .collect()
+    let mut names: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        let Some((_, name)) = line.split_once(RUNNING) else {
+            continue;
+        };
+        let name = name.trim();
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
 }
 
 /// The report line naming what was in flight, or nothing when no test named itself.

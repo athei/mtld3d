@@ -37,10 +37,12 @@ pins it true for the stub itself.
 
 And a process that dies takes every test in flight with it, which libtest
 does not name: past one test thread it prints a test's name only once the
-test has finished. So a test names itself on stdout as it reaches the layer
+test has finished. So a test names itself on stderr as it reaches the layer
 ([`in_flight.rs`](src/in_flight.rs)), and the runner reports the names it has
 no outcome line for as the set that was running and runs only those again one
-at a time. A test that returns before it builds an interface names nothing,
+at a time. A worker thread a test spawns is named after the test through
+`spawn_scoped`, so its announcement and its panic report attribute to the
+test as well. A test that returns before it builds an interface names nothing,
 which is the right coverage: it never reached the code that could end the
 process.
 

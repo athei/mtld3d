@@ -91,7 +91,9 @@ fn the_panic_report_names_the_test_thread() {
         \x20 left: 0\n\
         \x20right: 1\n\
         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
-        wine: something else\n";
+        wine: something else\n\
+        thread 'device::concurrent_retargets' (12) panicked at tests/e2e/device.rs:1830:21:\n\
+        attribution probe\n";
     assert_eq!(
         panicked_test("thread 'device::reset_bad_dims' panicked at x.rs:1:1:"),
         Some("device::reset_bad_dims")
@@ -101,9 +103,18 @@ fn the_panic_report_names_the_test_thread() {
         Some("device::reset_bad_dims"),
         "the thread id the hook prints between name and verb"
     );
+    assert_eq!(
+        panicked_test("thread '<unnamed>' (13) panicked at x.rs:1:1:"),
+        Some("<unnamed>"),
+        "a worker with no name names no test, and nothing here invents one"
+    );
     assert_eq!(panicked_test("thread 'main' panicked at x.rs:1:1:"), None);
     assert_eq!(panicked_test("thread 'x' something else"), None);
-    assert_eq!(panicked_tests(stderr), ["device::reset_bad_dims"]);
+    assert_eq!(
+        panicked_tests(stderr),
+        ["device::reset_bad_dims", "device::concurrent_retargets"],
+        "a worker's report, thread id and all, names the test the worker is named after"
+    );
     let report = panic_report(stderr, "device::reset_bad_dims").unwrap();
     assert!(report.starts_with("thread 'device::reset_bad_dims' panicked"));
     assert!(report.ends_with("right: 1"), "{report}");

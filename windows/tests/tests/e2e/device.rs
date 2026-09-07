@@ -12,7 +12,7 @@ use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
     WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, destroy_window,
-    enumerate_display_sizes, window_rect,
+    enumerate_display_sizes, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -1802,7 +1802,7 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
     let done = Barrier::new(WINDOWED_WORKERS + 1);
 
     std::thread::scope(|scope| {
-        let fullscreen = scope.spawn(|| {
+        let fullscreen = spawn_scoped(scope, || {
             let h = {
                 let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                 Harness::new()
@@ -1817,7 +1817,7 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
         });
         let windowed: Vec<_> = (0..WINDOWED_WORKERS)
             .map(|_| {
-                scope.spawn(|| {
+                spawn_scoped(scope, || {
                     let (h, second, ours) = {
                         let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                         let h = Harness::new();
@@ -1952,28 +1952,27 @@ fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
     // The stand-in for the window manager: a size the back buffer does not
     // have, sent from another thread so it queues until the release pumps.
     let hwnd = h.hwnd();
-    let armed = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let sender = {
-        let armed = std::sync::Arc::clone(&armed);
-        std::thread::spawn(move || {
+    let armed = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let sender = spawn_scoped(scope, || {
             armed.wait();
             let _ = mtld3d_tests::send_message(hwnd, WM_SIZE, 0, (0x1C8 << 16) | 0x258);
-        })
-    };
-    armed.wait();
-    // Long enough for the sender to reach its `SendMessage` and block there;
-    // a message that arrives after the release is pumped harmlessly below.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        armed.wait();
+        // Long enough for the sender to reach its `SendMessage` and block there;
+        // a message that arrives after the release is pumped harmlessly below.
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-    assert_eq!(
-        h.release_device(),
-        0,
-        "the harness held the only device reference"
-    );
-    assert!(h.pump(), "no WM_QUIT expected");
-    sender
-        .join()
-        .expect("the sender thread ends once its message is answered");
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the harness held the only device reference"
+        );
+        assert!(h.pump(), "no WM_QUIT expected");
+        sender
+            .join()
+            .expect("the sender thread ends once its message is answered");
+    });
     let rect = h.window_rect();
     assert!(
         rect.right - rect.left > 0 && rect.bottom - rect.top > 0,

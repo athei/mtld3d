@@ -18,8 +18,22 @@
 //! runs a test there only when it cannot spawn a thread, and then the name
 //! would be nobody's. Once per thread, since a test may build more than one
 //! interface and libtest gives each test a thread of its own.
+//!
+//! A thread the test spawns itself carries no name of its own, so a device
+//! it creates would name nobody and a panic on it would read
+//! `thread '<unnamed>'`, which names no test either: the runner would have
+//! to run every test that was in flight again to find the culprit. Every
+//! worker of the suite is therefore spawned through [`spawn_scoped`], which
+//! gives it the spawning thread's name. That name is the test's libtest
+//! path on a thread libtest created, and on a worker it is the name that
+//! worker was given, so a worker of a worker is named after the test too.
+//! Each worker then announces once, the same name as its test, and the
+//! runner reads a name it has seen before as the one test.
 
-use std::{cell::Cell, thread};
+use std::{
+    cell::Cell,
+    thread::{self, Builder, Scope, ScopedJoinHandle},
+};
 
 /// The stderr marker; what follows it is the test's libtest path.
 const RUNNING: &str = "[e2e] running ";
@@ -39,4 +53,32 @@ pub fn announce() {
         return;
     };
     eprintln!("{RUNNING}{name}");
+}
+
+/// Spawn a scoped thread named after the current one.
+///
+/// The name is what a panic report and an announcement carry, so a worker
+/// spawned here fails and names itself as the test it works for rather
+/// than as `<unnamed>`. A thread with no name (the main thread of a binary
+/// that runs its tests there) spawns an unnamed worker, since there is no
+/// test to name.
+///
+/// # Panics
+///
+/// Panics when the thread cannot be spawned, which no test can recover
+/// from.
+pub fn spawn_scoped<'scope, 'env, F, T>(
+    scope: &'scope Scope<'scope, 'env>,
+    f: F,
+) -> ScopedJoinHandle<'scope, T>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    let current = thread::current();
+    current
+        .name()
+        .map_or_else(Builder::new, |name| Builder::new().name(name.to_owned()))
+        .spawn_scoped(scope, f)
+        .expect("a test's worker thread can be spawned")
 }
