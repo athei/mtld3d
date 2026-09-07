@@ -104,6 +104,8 @@ impl Launcher for Scripted {
             pid: PID,
             kind: script.kind,
             stdout: script.stdout.to_owned(),
+            gpu_hang: crate::run::is_gpu_hang_report(&script.stderr)
+                || script.layer.is_some_and(crate::run::is_gpu_hang_report),
             stderr: script.stderr,
         })
     }

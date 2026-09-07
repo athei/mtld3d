@@ -127,11 +127,13 @@ impl Launcher for WineLauncher {
                 on_event(event);
             }
         })?;
+        let layer_gpu_hang = self.layer_reported_gpu_hang(exit.pid)?;
         Ok(ProcessEnd {
             pid: exit.pid,
             kind: exit.kind,
             stdout,
             stderr: exit.stderr,
+            gpu_hang: exit.gpu_hang || layer_gpu_hang,
         })
     }
 
@@ -170,12 +172,43 @@ impl Launcher for WineLauncher {
         // The layer names the file after the executable's whole stem, cargo
         // hash and all, and after the host pid, which is the one the runner
         // spawned the process under.
-        let stem = self
-            .exe
+        let stem = self.exe_stem();
+        keep_layer_log(&self.log_dir, stem, &binary_name(&self.exe), pid)
+    }
+}
+
+impl WineLauncher {
+    /// The executable stem the layer uses in its per-process log name.
+    fn exe_stem(&self) -> &str {
+        self.exe
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .unwrap_or_default();
-        keep_layer_log(&self.log_dir, stem, &binary_name(&self.exe), pid)
+            .unwrap_or_default()
+    }
+
+    /// The layer's live log path for `pid`, before the runner preserves it.
+    fn layer_log_path(&self, pid: u32) -> PathBuf {
+        self.log_dir.join(mtld3d_shared::log_paths::log_file_name(
+            self.exe_stem(),
+            pid,
+        ))
+    }
+
+    /// Whether the layer's completed log reports a GPU hang.
+    ///
+    /// A process that never loaded mtld3d has no log. Any other read error
+    /// ends the runner rather than letting another process use a GPU whose
+    /// state could not be checked.
+    fn layer_reported_gpu_hang(&self, pid: u32) -> Result<bool, String> {
+        let path = self.layer_log_path(pid);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(run::is_gpu_hang_report(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!(
+                "could not read {} after process exit: {e}",
+                path.display()
+            )),
+        }
     }
 }
 

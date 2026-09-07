@@ -7,7 +7,8 @@
 //! `MTLD3D_CONFIG` and the Wine variables.
 //!
 //! Exit code 0 when every selected test passed, 1 when any failed or was
-//! left unrun by a failure, 2 when the runner itself could not do its job.
+//! left unrun by a failure, 2 when the runner itself could not do its job,
+//! and 3 when a GPU hang stopped the leg without a verdict.
 
 mod attribute;
 mod binary;
@@ -20,11 +21,14 @@ mod select;
 use std::process::ExitCode;
 
 use crate::{
-    attribute::Launcher as _,
+    attribute::{BinaryOutcome, Launcher as _},
     binary::{WineLauncher, binary_name},
     report::{BinaryReport, Tally},
     select::{selected, test_id},
 };
+
+/// A leg stopped after the driver reported a GPU hang, with no test verdict.
+const GPU_HANG_EXIT: u8 = 3;
 
 fn main() -> ExitCode {
     match real_main() {
@@ -40,8 +44,13 @@ fn real_main() -> Result<ExitCode, String> {
     let config = cli::parse_args(std::env::args().skip(1))?;
     let mut tally = Tally::default();
     let mut stopped_at: Option<String> = None;
+    let mut gpu_hang_at: Option<String> = None;
     for exe in &config.exes {
         let name = binary_name(exe);
+        if gpu_hang_at.is_some() {
+            println!("SKIP {name}:: (not run after a GPU hang)");
+            continue;
+        }
         if stopped_at.is_some() {
             println!("SKIP {name}:: (not run after a failure)");
             continue;
@@ -77,9 +86,16 @@ fn real_main() -> Result<ExitCode, String> {
             },
         )?;
         tally.processes += run.processes;
-        if run.failed && config.fail_fast {
+        if run.outcome == BinaryOutcome::GpuHang {
+            gpu_hang_at = Some(name);
+        } else if run.failed && config.fail_fast {
             stopped_at = Some(name);
         }
+    }
+    if let Some(name) = gpu_hang_at {
+        tally.print_summary();
+        println!("e2e: GPU HANG in {name}; the leg was cut short and has no verdict");
+        return Ok(ExitCode::from(GPU_HANG_EXIT));
     }
     if tally.total() == 0 {
         if config.filter.is_empty() {
