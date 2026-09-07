@@ -72,6 +72,25 @@ unsafe extern "system" {
     ) -> isize;
     fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
     fn PostMessageW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> i32;
+    fn GetCursor() -> *mut c_void;
+    fn DestroyCursor(cursor: *mut c_void) -> i32;
+    fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
+}
+
+// `GetClassLongPtrW` only exists on 64-bit Windows; 32-bit user32 exports
+// `GetClassLongW`, and the header aliases one to the other. One Rust-side
+// symbol per arch keeps the call site uniform.
+#[cfg(target_pointer_width = "64")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetClassLongPtrW(hwnd: *mut c_void, index: i32) -> usize;
+}
+
+#[cfg(target_pointer_width = "32")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "GetClassLongW"]
+    fn GetClassLongPtrW(hwnd: *mut c_void, index: i32) -> usize;
 }
 
 #[link(name = "kernel32")]
@@ -90,6 +109,34 @@ fn set_cursor(handle: *mut c_void) {
     unsafe {
         SetCursor(handle);
     }
+}
+
+/// The calling thread's current cursor, null for none.
+fn get_cursor() -> *mut c_void {
+    // SAFETY: GetCursor takes no arguments and cannot fail.
+    unsafe { GetCursor() }
+}
+
+/// Free `handle`; `false` when user32 refused, which the caller reports.
+fn destroy_cursor(handle: *mut c_void) -> bool {
+    // SAFETY: DestroyCursor accepts any handle value; an invalid one fails
+    // with FALSE and touches nothing.
+    unsafe { DestroyCursor(handle) != 0 }
+}
+
+/// The cursor `hwnd`'s window class carries, null when it has none or the window is gone.
+fn class_cursor(hwnd: *mut c_void) -> *mut c_void {
+    // SAFETY: GetClassLongPtrW (GetClassLongW on 32-bit) accepts any HWND
+    // and index; an invalid window answers 0.
+    unsafe { GetClassLongPtrW(hwnd, GCLP_HCURSOR) as *mut c_void }
+}
+
+/// The system arrow, a shared cursor user32 owns.
+fn load_arrow_cursor() -> *mut c_void {
+    // SAFETY: LoadCursorW with a null module loads a predefined cursor;
+    // `IDC_ARROW` is passed as MAKEINTRESOURCE, an integer in place of the
+    // name pointer, which the call is documented to accept.
+    unsafe { LoadCursorW(null_mut(), IDC_ARROW as *const u16) }
 }
 
 /// `set_cursor` plus its wall time in microseconds.
@@ -226,6 +273,9 @@ unsafe extern "system" {
 // ── Constants ──
 
 const GWLP_WNDPROC: i32 = -4;
+const GCLP_HCURSOR: i32 = -12;
+/// `IDC_ARROW`, the standard arrow's `MAKEINTRESOURCE` id.
+const IDC_ARROW: usize = 32512;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_ACTIVATEAPP: u32 = 0x001C;
@@ -855,6 +905,60 @@ impl CursorState {
             .lock()
             .expect("device-instances mutex poisoned")
             .remove(&(self.hwnd as usize));
+    }
+
+    /// Destroy every HCURSOR this device built.
+    ///
+    /// Call from the device-release path after `uninstall_subclass`, so no
+    /// window message realizes one of them again. The handles are the
+    /// device's alone: `CreateIconIndirect` copies the bitmaps, and user32
+    /// frees a cursor even while it is the thread's current one, which
+    /// would leave the thread pointing at a freed handle. So when the thread
+    /// cursor is one of ours the window's class cursor goes back first, the
+    /// pointer the window shows once the device no longer answers
+    /// `WM_SETCURSOR`, and the system arrow when the class has none or the
+    /// window is already gone. Once the restore has happened every refused
+    /// `DestroyCursor` is a real failure, and is reported as one.
+    pub fn destroy_handles(&mut self) {
+        let mut handles: Vec<*mut c_void> = self.cache.drain().map(|(_, h)| h).collect();
+        let current = core::mem::replace(&mut self.handle, null_mut());
+        if !current.is_null() && !handles.contains(&current) {
+            handles.push(current);
+        }
+        if handles.is_empty() {
+            return;
+        }
+        let thread_cursor = get_cursor();
+        let restored = if handles.contains(&thread_cursor) {
+            let mut replacement = if self.hwnd.is_null() {
+                null_mut()
+            } else {
+                class_cursor(self.hwnd)
+            };
+            if replacement.is_null() {
+                replacement = load_arrow_cursor();
+            }
+            set_cursor(replacement);
+            replacement
+        } else {
+            null_mut()
+        };
+        let mut failed = 0usize;
+        for &handle in &handles {
+            if !destroy_cursor(handle) {
+                failed += 1;
+                error!(
+                    target: LOG_TARGET,
+                    "destroy_handles: DestroyCursor({handle:p}) failed (thread_cursor={thread_cursor:p})",
+                );
+            }
+        }
+        debug!(
+            target: LOG_TARGET,
+            "destroy_handles: hwnd={:p} destroyed={} failed={failed} thread_cursor={thread_cursor:p} restored={restored:p}",
+            self.hwnd,
+            handles.len() - failed,
+        );
     }
 
     /// Move the subclass and the overlay's view onto another device window.

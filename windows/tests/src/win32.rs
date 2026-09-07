@@ -6,6 +6,8 @@
 use core::ffi::{c_char, c_void};
 use std::sync::{Mutex, Once, PoisonError};
 
+use mtld3d_types::ICONINFO;
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn RegisterClassExA(wc: *const WndClassExA) -> u16;
@@ -39,6 +41,7 @@ unsafe extern "system" {
     fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetCursor() -> usize;
     fn SetCursor(cursor: usize) -> usize;
+    fn GetIconInfo(icon: usize, info: *mut ICONINFO) -> i32;
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetClientRect(hwnd: usize, rect: *mut Rect) -> i32;
     fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
@@ -68,6 +71,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn GetPixel(hdc: usize, x: i32, y: i32) -> u32;
     fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) -> u32;
+    fn DeleteObject(object: *mut c_void) -> i32;
 }
 
 static FAILURE_EXIT_HOOK: Once = Once::new();
@@ -291,6 +295,35 @@ pub fn get_cursor() -> usize {
 pub fn set_cursor(cursor: usize) -> usize {
     // SAFETY: Win32 thunk; 0 (no cursor) is a valid argument.
     unsafe { SetCursor(cursor) }
+}
+
+/// `GetIconInfo`: whether `cursor` still names a live cursor or icon.
+///
+/// A destroyed handle fails the lookup. A live one answers with copies of
+/// its two bitmaps, which are deleted again here, so the probe leaves no
+/// GDI object behind.
+#[must_use]
+pub fn cursor_is_live(cursor: usize) -> bool {
+    let mut info = ICONINFO {
+        f_icon: 0,
+        x_hotspot: 0,
+        y_hotspot: 0,
+        hbm_mask: core::ptr::null_mut(),
+        hbm_color: core::ptr::null_mut(),
+    };
+    // SAFETY: Win32 thunk; `info` is an owned, writable ICONINFO for the
+    // call, and any handle value is accepted (an invalid one fails).
+    let live = unsafe { GetIconInfo(cursor, &raw mut info) } != 0;
+    if live {
+        for bitmap in [info.hbm_mask, info.hbm_color] {
+            if !bitmap.is_null() {
+                // SAFETY: Win32 thunk; the bitmap is the copy `GetIconInfo`
+                // handed this caller, deleted exactly once.
+                unsafe { DeleteObject(bitmap) };
+            }
+        }
+    }
+    live
 }
 
 /// Win32 `RECT`, as reported by `Harness::window_rect`.
