@@ -5132,17 +5132,6 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     D3D_OK
 }
 
-/// Whether `format` is block-compressed (BC/DXT/ATI) or packed-YUV.
-///
-/// Neither is creatable as a Metal 3D (volume) or cube texture, so the
-/// GPU-backed / driver pools reject them with INVALIDCALL (only the CPU-only
-/// `D3DPOOL_SCRATCH` accepts a volume). Block-compressed formats carry a >1
-/// block dimension; the packed-YUV formats back a 1×1-block 2-byte surface
-/// (RG8) so they need an explicit match.
-const fn is_block_or_yuv_format(format: u32, block_w: u32, block_h: u32) -> bool {
-    block_w > 1 || block_h > 1 || matches!(format, D3DFMT_YUY2 | D3DFMT_UYVY)
-}
-
 extern "system" fn device_create_volume_texture(
     this: *mut c_void,
     width: u32,
@@ -5201,7 +5190,7 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    if pool != D3DPOOL_SCRATCH && is_block_or_yuv_format(format, block_w, block_h) {
+    if pool != D3DPOOL_SCRATCH && !mtld3d_core::format::is_volume_texture_format(format) {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }

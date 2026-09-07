@@ -24,11 +24,11 @@ use mtld3d_types::{
     D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE,
     D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_FILLMODE,
-    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
+    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
 };
 
 #[test]
@@ -230,6 +230,83 @@ fn check_device_format_accept_and_reject() {
         ),
         D3D_OK,
         "cube render-target autogen query agrees with creation",
+    );
+}
+
+#[test]
+fn volume_format_queries_match_gpu_creation() {
+    let h = Harness::new();
+    for resource_type in [D3DRTYPE_VOLUMETEXTURE, D3DRTYPE_VOLUME] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, resource_type, D3DFMT_A8R8G8B8),
+            D3D_OK,
+            "an A8R8G8B8 volume is advertised for resource type {resource_type}",
+        );
+    }
+    assert_eq!(
+        h.create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED),
+        D3D_OK,
+        "the advertised managed volume creates",
+    );
+
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_DYNAMIC,
+            D3DRTYPE_VOLUMETEXTURE,
+            D3DFMT_A8R8G8B8,
+        ),
+        D3D_OK,
+        "a dynamic A8R8G8B8 volume is advertised",
+    );
+    assert_eq!(
+        h.create_volume_texture(
+            [4, 4, 4],
+            1,
+            D3DUSAGE_DYNAMIC,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        ),
+        D3D_OK,
+        "the advertised dynamic volume creates",
+    );
+
+    for (usage, name) in [
+        (D3DUSAGE_RENDERTARGET, "RENDERTARGET"),
+        (D3DUSAGE_DEPTHSTENCIL, "DEPTHSTENCIL"),
+        (D3DUSAGE_AUTOGENMIPMAP, "AUTOGENMIPMAP"),
+    ] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                usage,
+                D3DRTYPE_VOLUMETEXTURE,
+                D3DFMT_A8R8G8B8,
+            ),
+            D3DERR_NOTAVAILABLE,
+            "{name} is not available on a volume texture",
+        );
+        assert_eq!(
+            h.create_volume_texture([4, 4, 4], 1, usage, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,),
+            D3DERR_INVALIDCALL,
+            "CreateVolumeTexture rejects {name}",
+        );
+    }
+
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_VOLUMETEXTURE, D3DFMT_DXT1),
+        D3DERR_NOTAVAILABLE,
+        "a scratch-only DXT1 volume is not a GPU volume capability",
+    );
+    assert_eq!(
+        h.create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, D3DPOOL_DEFAULT),
+        D3DERR_INVALIDCALL,
+        "a GPU-backed DXT1 volume is rejected",
+    );
+    assert_eq!(
+        h.create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, D3DPOOL_SCRATCH),
+        D3D_OK,
+        "the CPU-only scratch exception remains creatable",
     );
 }
 
