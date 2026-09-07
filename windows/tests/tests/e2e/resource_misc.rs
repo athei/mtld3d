@@ -62,6 +62,42 @@ const POSITION_DECL: [D3DVERTEXELEMENT9; 2] = [
     },
 ];
 
+#[test]
+fn get_texture_accepts_all_fragment_and_vertex_slots() {
+    let h = Harness::new();
+    let texture = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let base = texture.refcount();
+
+    for stage in [15, 257, 260] {
+        assert_eq!(
+            h.set_texture(stage, &texture),
+            D3D_OK,
+            "SetTexture({stage})"
+        );
+        assert_eq!(
+            h.texture_matches_raw_result(stage, texture.as_ptr()),
+            (D3D_OK, true),
+            "GetTexture({stage}) returns the binding"
+        );
+        assert_eq!(
+            texture.refcount(),
+            base,
+            "GetTexture({stage}) reference is released"
+        );
+    }
+
+    assert_eq!(
+        h.set_texture(16, &texture),
+        D3DERR_INVALIDCALL,
+        "SetTexture rejects the first invalid fragment slot"
+    );
+    assert_eq!(
+        h.texture_matches_raw_result(16, core::ptr::null_mut()),
+        (D3DERR_INVALIDCALL, true),
+        "GetTexture rejects the first invalid fragment slot"
+    );
+}
+
 /// Every child resource forwards exactly one reference to the owning device.
 ///
 /// The reference is held for the child's public lifetime (the D3D9

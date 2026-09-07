@@ -959,7 +959,17 @@ impl Harness {
     /// Compare a bound texture pointer and release the `GetTexture` reference.
     #[must_use]
     pub fn texture_matches_raw(&self, stage: u32, expected: *mut c_void) -> bool {
-        let out = self.texture_raw(stage);
+        let (hr, matches) = self.texture_matches_raw_result(stage, expected);
+        expect_ok(hr, "GetTexture");
+        matches
+    }
+
+    /// Compare a `GetTexture` result and release any reference it returned.
+    #[must_use]
+    pub fn texture_matches_raw_result(&self, stage: u32, expected: *mut c_void) -> (i32, bool) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_texture)(self.device, stage, &raw mut out) };
         let matches = out == expected;
         if !out.is_null() {
             type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -972,7 +982,7 @@ impl Harness {
             // SAFETY: balances the reference returned by `GetTexture`.
             unsafe { release(out) };
         }
-        matches
+        (hr, matches)
     }
 
     /// `SetTransform`.
