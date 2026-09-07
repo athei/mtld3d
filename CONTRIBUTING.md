@@ -228,10 +228,11 @@ Each of these rots silently when it is left for later:
 - A new config key ships with its dispatch arm, its unit test, and its entry in
   the `mtld3d.conf` sample with the default and a short why.
 - A new built-in app profile ships with the rationale for every key it sets as
-  the comment on its entry in `windows/core/src/app_profile.rs`, a test that
-  resolves it from the version strings the shipped binary actually carries, and
-  its line in the README profile list. A profile that pins no version field is
-  not a profile, it is a name collision waiting to happen.
+  the comment on its entry in `windows/core/src/app_profile.rs` and a test that
+  resolves it from the version strings the shipped binary actually carries.
+  The README links to that file rather than duplicating the profile list.
+  A profile that pins no version field is not a profile, it is a name collision
+  waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
   (`scripts/audit.sh --update-derives`).
 
