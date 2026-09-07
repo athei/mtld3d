@@ -23,7 +23,7 @@ use mtld3d_shared::{
     perf::NanosSetTimer,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSRange;
+use objc2_foundation::{NSError, NSRange};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLDrawable, MTLIndexType,
@@ -272,7 +272,12 @@ fn record_failed_submit(
         let atomic = unsafe { &*(failed_submit_seq_ptr as *const AtomicU64) };
         atomic.fetch_max(seq, Ordering::Release);
     }
-    Some(cb.error().map_or_else(
+    Some(command_buffer_error(cb.error().as_deref()))
+}
+
+/// Preserve the driver description shared by frame and readback failure diagnostics.
+fn command_buffer_error(error: Option<&NSError>) -> (u64, String) {
+    error.map_or_else(
         || (0, String::new()),
         |e| {
             (
@@ -280,7 +285,7 @@ fn record_failed_submit(
                 e.localizedDescription().to_string(),
             )
         },
-    ))
+    )
 }
 
 // SubmitFrame breadcrumb probes via `mtld3d_shared::crumb!()`. Each
@@ -3096,13 +3101,12 @@ fn encode_readback_resolve(
 /// Synchronous texture→buffer readback into PE-addressable memory.
 ///
 /// Wraps the caller's page-aligned `dst_ptr / dst_len` via
-/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Shared), blits
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Managed), blits
 /// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
-/// stride, commits, and waits for completion. On return the caller's
-/// memory holds the pixels. Ordering against a prior `submit_frame` call
-/// on the same `queue_handle` is guaranteed by Metal's in-order queue
-/// execution — this command buffer will not start until the previously
-/// committed render command buffer has finished.
+/// stride, commits, and waits for completion. Only a true return guarantees
+/// the caller's memory holds the requested pixels. Metal orders this command
+/// buffer after every previously committed buffer on the same `queue_handle`.
+/// A failed readback may have written part of the destination.
 pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     use core::{ffi::c_void, ptr::NonNull};
 
@@ -3284,9 +3288,25 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     blit.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
-    // dst_buffer drops here — Metal wrapper released, caller's memory
-    // untouched (deallocator was None).
-    true
+    // The wrapper owns no pages; the caller keeps the destination allocation.
+    readback_completed(cmd_buf.status(), || cmd_buf.error())
+}
+
+/// Accept a readback only after Metal reports successful completion.
+fn readback_completed(
+    status: MTLCommandBufferStatus,
+    error: impl FnOnce() -> Option<Retained<NSError>>,
+) -> bool {
+    if status == MTLCommandBufferStatus::Completed {
+        return true;
+    }
+    let (code, desc) = command_buffer_error(error().as_deref());
+    error!(
+        target: LOG_TARGET,
+        "blit_texture_to_buffer: command buffer did not complete successfully \
+         (status {status:?}, code {code}: {desc}); readback failed"
+    );
+    false
 }
 
 #[cfg(test)]

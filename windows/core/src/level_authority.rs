@@ -4,8 +4,8 @@
 //! destination's Metal texture and never its CPU staging, so from that point
 //! the subresource's pixels live on the GPU alone. Every path that writes a
 //! subresource's staging asks [`LevelAuthorityMask::plan_write`] what to do
-//! about that first, and the answer records that the staging defines the
-//! subresource once the write lands.
+//! about that first, then calls [`LevelAuthorityMask::staging_wrote`] only
+//! after the staging contains the subresource's pixels.
 //!
 //! A subresource is a (face, level) pair: a 2D or volume texture uses face 0
 //! alone, a cube map all six. Face and level are tracked separately because a
@@ -69,21 +69,27 @@ impl LevelAuthorityMask {
             && self.gpu[face as usize] & (1u32 << level) != 0
     }
 
-    /// Plan a CPU write of `(face, level)` and record that its staging defines it after.
+    /// Plan a CPU write of `(face, level)` without releasing the GPU's claim.
     ///
     /// `whole_level` says the write covers every byte of the subresource. The
-    /// claim is released whichever branch the caller takes, so a read back that
-    /// cannot run costs one diagnostic rather than one per write, and a
-    /// subresource the caller overwrites costs no read back at all.
-    pub const fn plan_write(&mut self, face: u32, level: usize, whole_level: bool) -> WritePlan {
+    /// caller commits with [`Self::staging_wrote`] after a successful readback
+    /// or overwrite. A failed attempt leaves the GPU's pixels available for retry.
+    #[must_use]
+    pub const fn plan_write(&self, face: u32, level: usize, whole_level: bool) -> WritePlan {
         if !self.gpu_holds(face, level) {
             return WritePlan::WriteStaging;
         }
-        self.gpu[face as usize] &= !(1u32 << level);
         if whole_level {
             WritePlan::Overwrite
         } else {
             WritePlan::ReadBackFirst
+        }
+    }
+
+    /// Record that staging holds the complete contents of `(face, level)`.
+    pub const fn staging_wrote(&mut self, face: u32, level: usize) {
+        if face < FACE_COUNT && level < u32::BITS as usize {
+            self.gpu[face as usize] &= !(1u32 << level);
         }
     }
 }
