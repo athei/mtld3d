@@ -112,11 +112,11 @@ impl Direct3DVertexDeclaration9 {
 fn vdecl_timer(this: *mut c_void) -> mtld3d_core::perf::ApiTimer {
     use mtld3d_core::perf::{ApiCategory, ApiTimer};
     // SAFETY: vtable thunk; `this` is *mut Direct3DVertexDeclaration9 per ABI.
-    let perf_ptr = (unsafe { InPtr::<Direct3DVertexDeclaration9>::opt(this) })
-        .map_or(core::ptr::null_mut(), |obj| {
-            crate::device::DeviceInner::perf_ptr_of(obj.inner().device_inner)
-        });
-    ApiTimer::start(perf_ptr, ApiCategory::VertexDecl)
+    let storage = (unsafe { InPtr::<Direct3DVertexDeclaration9>::opt(this) }).and_then(|obj| {
+        // SAFETY: the entry point holds the API lock and the device is live at timer entry.
+        unsafe { crate::device::DeviceInner::perf_storage_of(obj.inner().device_inner) }
+    });
+    ApiTimer::start(storage, ApiCategory::VertexDecl)
 }
 
 extern "system" fn vd_query_interface(

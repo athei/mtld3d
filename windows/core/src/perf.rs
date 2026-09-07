@@ -9,7 +9,7 @@
 //! Structure:
 //! * `ApiCategory` + `ApiTimer`  — RAII guard that buckets TSC cycles
 //!   by COM vtable category on every D3D9 entry point.
-//! * `ApiPerfState` — embedded on `DeviceInner` (the API thread).
+//! * `ApiPerfStorage` owns the API thread's `ApiPerfState`.
 //!   Every counter the API thread bumps lands here.
 //! * `FramePerfPayload` — embedded on `FrameData`. Copy of the
 //!   API-thread counters that crosses the API→encoder channel.
@@ -24,12 +24,12 @@
 //!   spikes from sustained cost).
 //!
 //! Nothing in this module touches COM, `raw-dylib`, or `DeviceInner`.
-//! `ApiTimer` holds an `*mut ApiPerfState` so d3d9 is the only side
-//! that knows about `DeviceInner` — callers compute the perf pointer
-//! from their device pointer at construction time.
+//! Enabled `ApiTimer`s retain the counter storage independently of the
+//! device, including when a nested final Release destroys `DeviceInner`.
 
+use std::ops::DerefMut;
 #[cfg(perf_tracking)]
-use std::{fmt::Write as _, sync::LazyLock};
+use std::{cell::RefCell, fmt::Write as _, rc::Rc, sync::LazyLock};
 
 #[cfg(perf_tracking)]
 use log::{info, trace};
@@ -66,6 +66,12 @@ use super::passes::{ColorLoad, DepthLoad};
 /// switch — `mtld3d::d3d9::passes=trace` — so the default
 /// `RUST_LOG=info` never sees either.
 pub const SUMMARY_INTERVAL_SECS: u64 = 5;
+
+#[cfg(not(perf_tracking))]
+const _: () = {
+    assert!(size_of::<ApiPerfStorage>() == 0);
+    assert!(size_of::<ApiTimer>() == 0);
+};
 
 /// Perf telemetry has its own `log` target so the 5-second summary can be silenced.
 ///
@@ -305,6 +311,65 @@ pub enum OpSubDetail {
     BDraw,
 }
 
+/// Counter storage retained by the device and every enabled API timer.
+///
+/// The device may be destroyed inside a nested Release. The last timer
+/// owns the counters until its writeback finishes. Access stays under the
+/// device's API lock, and borrows never span nested entry points.
+pub struct ApiPerfStorage {
+    #[cfg(perf_tracking)]
+    state: Rc<RefCell<ApiPerfState>>,
+    #[cfg(not(perf_tracking))]
+    state: ApiPerfState,
+}
+
+impl Default for ApiPerfStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApiPerfStorage {
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(ApiPerfState::new())),
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: ApiPerfState::new(),
+        }
+    }
+
+    /// Borrow counters only for the update, never across a nested API call.
+    pub fn state_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
+        #[cfg(perf_tracking)]
+        {
+            self.state.borrow_mut()
+        }
+        #[cfg(not(perf_tracking))]
+        {
+            &mut self.state
+        }
+    }
+
+    /// Stable backing for subtimers nested inside an owning API timer.
+    #[cfg(perf_tracking)]
+    pub fn as_ptr(&mut self) -> *mut ApiPerfState {
+        self.state.as_ptr()
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn as_ptr(&mut self) -> *mut ApiPerfState {
+        core::ptr::null_mut()
+    }
+}
+
 /// RAII guard that measures TSC cycles spent inside a D3D9 COM vtable entry point.
 ///
 /// Adds the cycles to the owning device's `ApiPerfState`.
@@ -313,19 +378,19 @@ pub enum OpSubDetail {
 /// return path (happy, early-INVALIDCALL, panic unwind) without
 /// per-return-site bookkeeping.
 ///
-/// Null `perf_ptr` *or* perf-tracking disabled both skip the rdtsc and
-/// writeback — standalone resources (e.g. backbuffer surfaces from
+/// Absent storage or disabled perf tracking skips retention, rdtsc and
+/// writeback. Standalone resources (e.g. backbuffer surfaces from
 /// `GetBackBuffer`) stay safe, and the per-call cost is one Relaxed
 /// load + branch when the user isn't running with
-/// `RUST_LOG=mtld3d::perf=debug`.
+/// `RUST_LOG=mtld3d::perf=info`.
 ///
-/// Under `cfg(not(perf_tracking))` this collapses to a unit struct with no
-/// `Drop` — the entire timer disappears at compile time via LLVM DCE on
+/// Under `cfg(not(perf_tracking))` this collapses to a unit struct with an
+/// empty `Drop`. The entire timer disappears at compile time via LLVM DCE on
 /// every `let _timer = device_timer(...)` call site.
 #[cfg(perf_tracking)]
 pub struct ApiTimer {
     start: u64,
-    perf_ptr: *mut ApiPerfState,
+    state: Option<Rc<RefCell<ApiPerfState>>>,
     category: ApiCategory,
     /// Set on `Device`-category timers built via `start_device`.
     ///
@@ -353,7 +418,6 @@ pub struct ApiTimer {
     /// interval into both top-level buckets. Each bucket accrues only its
     /// own *self* time. See [`ApiPerfState::active_child_cycles`].
     saved_child_cycles: u64,
-    enabled: bool,
 }
 
 #[cfg(not(perf_tracking))]
@@ -368,16 +432,11 @@ impl ApiTimer {
     /// (returns 0) when disabled.
     #[cfg(perf_tracking)]
     #[inline]
-    fn enter_scope(perf_ptr: *mut ApiPerfState, enabled: bool) -> u64 {
-        if !enabled {
+    fn enter_scope(state: Option<&Rc<RefCell<ApiPerfState>>>) -> u64 {
+        let Some(state) = state else {
             return 0;
-        }
-        // SAFETY: access is exclusive (D3D9 objects are single-threaded, or
-        // serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`);
-        // this transient `&mut` never overlaps another live borrow, since
-        // parent timers touch the perf state only inside their own
-        // `start`/`Drop`, which are strictly nested around this call.
-        let perf = unsafe { &mut *perf_ptr };
+        };
+        let mut perf = state.borrow_mut();
         let saved = perf.active_child_cycles;
         perf.active_child_cycles = 0;
         perf.timer_depth = perf.timer_depth.saturating_add(1);
@@ -385,26 +444,31 @@ impl ApiTimer {
     }
 
     #[cfg(perf_tracking)]
-    pub fn start(perf_ptr: *mut ApiPerfState, category: ApiCategory) -> Self {
-        let enabled = !perf_ptr.is_null() && perf_enabled();
-        let saved_child_cycles = Self::enter_scope(perf_ptr, enabled);
-        let start = if enabled { rdtsc() } else { 0 };
+    #[must_use]
+    pub fn start(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
+        Self::new(storage.filter(|_| perf_enabled()), category)
+    }
+
+    #[cfg(perf_tracking)]
+    fn new(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
+        let state = storage.map(|s| Rc::clone(&s.state));
+        let saved_child_cycles = Self::enter_scope(state.as_ref());
+        let start = if state.is_some() { rdtsc() } else { 0 };
         Self {
             start,
-            perf_ptr,
+            state,
             category,
             device_sub: None,
             bind_sub: None,
             surface_sub: None,
             saved_child_cycles,
-            enabled,
         }
     }
 
     #[cfg(not(perf_tracking))]
     #[inline]
     #[must_use]
-    pub const fn start(_perf_ptr: *mut ApiPerfState, _category: ApiCategory) -> Self {
+    pub const fn start(_storage: Option<&ApiPerfStorage>, _category: ApiCategory) -> Self {
         Self
     }
 
@@ -414,26 +478,17 @@ impl ApiTimer {
     /// `Device` bucket and the matching sub-bucket under a single
     /// `rdtsc()` delta. Used by every `IDirect3DDevice9` vtable thunk.
     #[cfg(perf_tracking)]
-    pub fn start_device(perf_ptr: *mut ApiPerfState, sub: DeviceSubCategory) -> Self {
-        let enabled = !perf_ptr.is_null() && perf_enabled();
-        let saved_child_cycles = Self::enter_scope(perf_ptr, enabled);
-        let start = if enabled { rdtsc() } else { 0 };
-        Self {
-            start,
-            perf_ptr,
-            category: ApiCategory::Device,
-            device_sub: Some(sub),
-            bind_sub: None,
-            surface_sub: None,
-            saved_child_cycles,
-            enabled,
-        }
+    #[must_use]
+    pub fn start_device(storage: Option<&ApiPerfStorage>, sub: DeviceSubCategory) -> Self {
+        let mut timer = Self::start(storage, ApiCategory::Device);
+        timer.device_sub = Some(sub);
+        timer
     }
 
     #[cfg(not(perf_tracking))]
     #[inline]
     #[must_use]
-    pub const fn start_device(_perf_ptr: *mut ApiPerfState, _sub: DeviceSubCategory) -> Self {
+    pub const fn start_device(_storage: Option<&ApiPerfStorage>, _sub: DeviceSubCategory) -> Self {
         Self
     }
 
@@ -445,26 +500,17 @@ impl ApiTimer {
     /// Used by `IDirect3DDevice9::Set*` / `Get*` thunks whose
     /// `DeviceSubCategory` would otherwise be `Bind`.
     #[cfg(perf_tracking)]
-    pub fn start_bind(perf_ptr: *mut ApiPerfState, sub: BindSubCategory) -> Self {
-        let enabled = !perf_ptr.is_null() && perf_enabled();
-        let saved_child_cycles = Self::enter_scope(perf_ptr, enabled);
-        let start = if enabled { rdtsc() } else { 0 };
-        Self {
-            start,
-            perf_ptr,
-            category: ApiCategory::Device,
-            device_sub: Some(DeviceSubCategory::Bind),
-            bind_sub: Some(sub),
-            surface_sub: None,
-            saved_child_cycles,
-            enabled,
-        }
+    #[must_use]
+    pub fn start_bind(storage: Option<&ApiPerfStorage>, sub: BindSubCategory) -> Self {
+        let mut timer = Self::start_device(storage, DeviceSubCategory::Bind);
+        timer.bind_sub = Some(sub);
+        timer
     }
 
     #[cfg(not(perf_tracking))]
     #[inline]
     #[must_use]
-    pub const fn start_bind(_perf_ptr: *mut ApiPerfState, _sub: BindSubCategory) -> Self {
+    pub const fn start_bind(_storage: Option<&ApiPerfStorage>, _sub: BindSubCategory) -> Self {
         Self
     }
 
@@ -474,26 +520,20 @@ impl ApiTimer {
     /// bucket AND `surface_sub_cycles[sub]` in one pass. Used by every
     /// `IDirect3DSurface9` vtable thunk (via `surf_timer`).
     #[cfg(perf_tracking)]
-    pub fn start_surface(perf_ptr: *mut ApiPerfState, sub: SurfaceSubCategory) -> Self {
-        let enabled = !perf_ptr.is_null() && perf_enabled();
-        let saved_child_cycles = Self::enter_scope(perf_ptr, enabled);
-        let start = if enabled { rdtsc() } else { 0 };
-        Self {
-            start,
-            perf_ptr,
-            category: ApiCategory::Surface,
-            device_sub: None,
-            bind_sub: None,
-            surface_sub: Some(sub),
-            saved_child_cycles,
-            enabled,
-        }
+    #[must_use]
+    pub fn start_surface(storage: Option<&ApiPerfStorage>, sub: SurfaceSubCategory) -> Self {
+        let mut timer = Self::start(storage, ApiCategory::Surface);
+        timer.surface_sub = Some(sub);
+        timer
     }
 
     #[cfg(not(perf_tracking))]
     #[inline]
     #[must_use]
-    pub const fn start_surface(_perf_ptr: *mut ApiPerfState, _sub: SurfaceSubCategory) -> Self {
+    pub const fn start_surface(
+        _storage: Option<&ApiPerfStorage>,
+        _sub: SurfaceSubCategory,
+    ) -> Self {
         Self
     }
 }
@@ -528,15 +568,11 @@ const fn exclusive_exit(elapsed: u64, children: u64, saved: u64, depth: u32) -> 
 #[cfg(perf_tracking)]
 impl Drop for ApiTimer {
     fn drop(&mut self) {
-        if !self.enabled {
+        let Some(state) = &self.state else {
             return;
-        }
+        };
         let elapsed = rdtsc() - self.start;
-        // SAFETY: the owning extern fn holds the timer for its own
-        // duration; the COM object (and therefore the `ApiPerfState`
-        // it points into) cannot be freed while the game is inside
-        // one of its methods.
-        let perf = unsafe { &mut *self.perf_ptr };
+        let mut perf = state.borrow_mut();
         // Exclusive (self) time: subtract the cycles consumed by nested
         // timers (delegated D3D9 entry points) so their interval lands
         // in their own bucket, not double-counted into ours too. Then
@@ -1035,7 +1071,7 @@ impl EncoderFrameCounters {
     }
 }
 
-/// Per-frame API-thread state. Embedded on `DeviceInner`.
+/// Per-frame API-thread counters owned by [`ApiPerfStorage`].
 ///
 /// Under `cfg(not(perf_tracking))` this collapses to a unit struct; all
 /// `bump_*` / `add_*` / `*_cycles_ptr` methods become `const fn` no-ops
