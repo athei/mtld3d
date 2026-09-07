@@ -148,6 +148,25 @@ fn no_two_profiles_can_match_the_same_application() {
 }
 
 #[test]
+fn the_halo_2_profile_matches_and_stops_trusting_the_lock_bounds() {
+    let blob = blob(&[
+        ("CompanyName", "Microsoft Corporation"),
+        ("ProductName", "Halo 2 for Windows Vista"),
+        ("OriginalFilename", "Halo2.exe"),
+    ]);
+    let id = AppIdentity::new("halo2.exe".to_owned(), Some(&blob));
+    let profile = lookup(&id).expect("the halo2 profile matches");
+    assert_eq!(profile.name(), "halo2");
+    // The whole point of the entry: the default trusts the announced range and
+    // this title writes past it, so a typo here would render a black world.
+    assert!(!parse(None, "", None).buffer_ignore_lock_bounds);
+    assert!(parse(Some(profile), "", None).buffer_ignore_lock_bounds);
+    // A same-named binary from anyone else must not pick it up.
+    let impostor = AppIdentity::new("halo2.exe".to_owned(), None);
+    assert!(lookup(&impostor).is_none());
+}
+
+#[test]
 fn the_gta_iv_profile_resolves_to_the_options_it_names() {
     let id = AppIdentity::new("GTAIV.exe".to_owned(), Some(&blob(&GTA_IV)));
     let profile = lookup(&id).expect("the profile matches its own fixture");
