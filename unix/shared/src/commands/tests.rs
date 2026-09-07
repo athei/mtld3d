@@ -110,6 +110,32 @@ fn indexed_draw_counts_pack_without_overlap() {
 }
 
 #[test]
+fn draw_classification_covers_every_command_form() {
+    let commands = [
+        Command::draw_primitives(PrimitiveType::Triangle, 0, 3),
+        Command::draw_indexed_primitives(
+            PrimitiveType::Triangle,
+            3,
+            IndexType::UInt16,
+            0xA000,
+            0,
+            0,
+            1,
+        ),
+        Command::draw_indexed_primitives_up(
+            PrimitiveType::Triangle,
+            3,
+            IndexType::UInt16,
+            0xB000,
+            6,
+            1,
+        ),
+    ];
+    assert!(commands.iter().all(Command::is_draw));
+    assert!(!Command::set_render_pipeline_state(1).is_draw());
+}
+
+#[test]
 fn blit_command_layout_matches_wow64() {
     assert_eq!(core::mem::align_of::<BlitCommand>(), 8);
     // 4 cmd + 4 mip_level + 8 src_handle + 8 dst_handle + 8

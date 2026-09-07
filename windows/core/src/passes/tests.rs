@@ -6,7 +6,10 @@
 //! render scale, multiple render targets, and the `last_bound` dedup cache. A rule that
 //! fires one case too wide loses pixels, so each guard gets a case that fails without it.
 
-use mtld3d_shared::CommandType;
+use mtld3d_shared::{
+    CommandType,
+    mtl::{IndexType, PrimitiveType},
+};
 
 use super::*;
 
@@ -166,6 +169,38 @@ fn sampler_binds(texture: u64) -> [(CommandType, Command); 2] {
         (
             CommandType::SetVertexTexture,
             Command::set_vertex_texture(texture, 0),
+        ),
+    ]
+}
+
+fn every_draw_command() -> [(&'static str, Command); 3] {
+    [
+        (
+            "non-indexed",
+            Command::draw_primitives(PrimitiveType::Triangle, 0, 3),
+        ),
+        (
+            "bound indices",
+            Command::draw_indexed_primitives(
+                PrimitiveType::Triangle,
+                3,
+                IndexType::UInt16,
+                0xA000,
+                0,
+                0,
+                1,
+            ),
+        ),
+        (
+            "inline or generated indices",
+            Command::draw_indexed_primitives_up(
+                PrimitiveType::Triangle,
+                3,
+                IndexType::UInt16,
+                0xB000,
+                6,
+                1,
+            ),
         ),
     ]
 }
@@ -1916,6 +1951,82 @@ fn rule_f_keeps_pass_where_depth_is_sampled() {
 // ── Rule E: clear-only pass coalescing ────────────────────────
 
 #[test]
+fn every_draw_command_survives_the_complete_pass_rule_sequence() {
+    for (name, draw) in every_draw_command() {
+        let target = tex(0x4000);
+        let mut s = fresh();
+        s.set_color_render_target(
+            target,
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        s.clear_color(1, 2, 3, 4);
+        s.note_draw_color_write_mask(0xF);
+        s.emit_command(draw);
+        s.set_color_render_target(
+            tex(0x5000),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        s.note_draw_color_write_mask(0xF);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            target,
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        s.note_draw_color_write_mask(0xF);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+
+        assert_eq!(s.passes().len(), 3, "{name}: before pass rules");
+        s.coalesce_clear_only_passes();
+        assert_eq!(s.passes().len(), 3, "{name}: Rule E keeps the draw pass");
+        s.finalize_load_actions();
+        s.finalize_store_actions(false);
+        s.strip_dead_color_in_clear_only_passes();
+        s.strip_color_from_no_color_draw_passes(&FxHashMap::default());
+        s.cull_dead_clear_only_passes();
+
+        assert_eq!(
+            s.passes().len(),
+            3,
+            "{name}: Rules F through H keep the pass"
+        );
+        assert!(
+            matches!(
+                s.passes()[0].color_load(),
+                ColorLoad::Clear {
+                    r: 1,
+                    g: 2,
+                    b: 3,
+                    a: 4
+                }
+            ),
+            "{name}: the clear remains ordered before the draw",
+        );
+        assert!(
+            s.passes()[0]
+                .commands()
+                .iter()
+                .any(|command| command.cmd == draw.cmd),
+            "{name}: the draw command remains in the first pass",
+        );
+        assert_eq!(
+            s.passes()[2].color_load(),
+            ColorLoad::Load,
+            "{name}: the later draw loads the first pass's contribution",
+        );
+    }
+}
+
+#[test]
 fn rule_e_bb_clear_coalesces_into_scene_pass() {
     let other_rt = tex(0x3000);
     // The canonical WoW frame pattern that produced spurious BB
@@ -2194,10 +2305,7 @@ fn rule_e_aborts_when_intervening_pass_samples_target() {
             .find(|p| p.color_texture() == rt && matches!(p.color_load(), ColorLoad::Clear { .. }))
             .expect("clear-only rt pass must remain");
         let cmds = cleared.commands();
-        let has_draw = cmds.iter().any(|c| {
-            c.cmd == mtld3d_shared::CommandType::DrawPrimitives as u32
-                || c.cmd == mtld3d_shared::CommandType::DrawIndexedPrimitives as u32
-        });
+        let has_draw = cmds.iter().any(Command::is_draw);
         assert!(!has_draw, "{stage:?}");
     }
 }
@@ -2395,6 +2503,27 @@ const PSO_NO_COLOR: u64 = 0xBBBB_2222;
 
 fn set_pso(handle: u64) -> Command {
     Command::set_render_pipeline_state(handle)
+}
+
+#[test]
+fn rule_h_recognizes_every_draw_command() {
+    for (name, draw) in every_draw_command() {
+        let mut s = fresh();
+        s.note_draw_color_write_mask(0);
+        s.emit_command(set_pso(PSO_WITH));
+        s.emit_command(draw);
+        s.end_current_pass("test");
+        let mut alt = FxHashMap::default();
+        alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+
+        s.strip_color_from_no_color_draw_passes(&alt);
+
+        assert_eq!(
+            s.passes()[0].color_texture(),
+            MetalHandle::NULL,
+            "{name}: Rule H strips dead colour from a pass with draws",
+        );
+    }
 }
 
 #[test]

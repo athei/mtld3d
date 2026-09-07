@@ -3,12 +3,12 @@
 //! Phase 1 covers the pre-transformed (XYZRHW) screen-space path used by
 //! 2D/UI geometry.
 
-use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex};
+use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex, Surface};
 use mtld3d_types::{
-    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFVF_DIFFUSE, D3DFVF_XYZ,
-    D3DFVF_XYZRHW, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP,
-    D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE,
-    D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
+    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFMT_INDEX32,
+    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
 };
 
 const MAGENTA: u32 = 0xFFFF_00FF;
@@ -113,6 +113,89 @@ fn arm_diffuse(h: &Harness) {
     assert_eq!(h.clear_texture(0), 0, "no texture");
     h.select_diffuse_stage(0);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+}
+
+fn read_target_pixel(h: &Harness, target: &Surface<'_>, x: u32, y: u32) -> u32 {
+    let (hr, desc) = target.desc();
+    assert_eq!(hr, 0, "GetDesc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(target, &sysmem),
+        0,
+        "GetRenderTargetData",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_pixels = locked.pitch().cast_unsigned() / 4;
+    let index = usize::try_from(y * pitch_pixels + x).expect("pixel index fits usize");
+    locked.as_u32(index + 1)[index]
+}
+
+fn indexed_draw_survives_clear_pass_coalescing(draw: impl FnOnce(&Harness, &[PosColorVertex])) {
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "culling off",
+    );
+    let target = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    let other = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    let backbuffer = h.render_target(0);
+    let vertex = |x: f32, y: f32, color: u32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    };
+    let left = [
+        vertex(-0.9, 0.8, GREEN),
+        vertex(-0.1, 0.8, GREEN),
+        vertex(-0.1, -0.8, GREEN),
+        vertex(-0.9, -0.8, GREEN),
+    ];
+    let right = [
+        vertex(0.1, 0.8, MAGENTA),
+        vertex(0.9, 0.8, MAGENTA),
+        vertex(0.1, -0.8, MAGENTA),
+        vertex(0.9, 0.8, MAGENTA),
+        vertex(0.9, -0.8, MAGENTA),
+        vertex(0.1, -0.8, MAGENTA),
+    ];
+
+    assert_eq!(h.set_render_target(0, &target), 0, "bind first target");
+    assert_eq!(h.clear_target(BLACK), 0, "clear first target");
+    draw(&h, &left);
+    assert_eq!(h.set_render_target(0, &other), 0, "bind other target");
+    assert_eq!(h.clear_target(BLACK), 0, "clear other target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right),
+        0,
+        "draw into other target",
+    );
+    assert_eq!(h.set_render_target(0, &target), 0, "rebind first target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right),
+        0,
+        "draw into first target after rebind",
+    );
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    assert_eq!(
+        read_target_pixel(&h, &target, 16, 32),
+        GREEN,
+        "the indexed draw before the target switch remains visible",
+    );
+    assert_eq!(
+        read_target_pixel(&h, &target, 48, 32),
+        MAGENTA,
+        "the later draw contributes after loading the target",
+    );
 }
 
 #[test]
@@ -681,6 +764,77 @@ fn indexed_primitive_up_triangle_fan_draws() {
         BLACK,
         "corner is outside the fan diamond"
     );
+}
+
+#[test]
+fn bound_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let stride =
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+        let byte_len = stride * u32::try_from(vertices.len()).expect("vertex count fits u32");
+        let vertex_buffer =
+            h.create_vertex_buffer(byte_len, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+        vertex_buffer.lock(0, 0, 0).write(vertices);
+        assert_eq!(
+            h.set_stream_source(0, &vertex_buffer, 0, stride),
+            0,
+            "SetStreamSource",
+        );
+        let indices: [u16; 6] = [0, 1, 3, 1, 2, 3];
+        let index_buffer =
+            h.create_index_buffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        index_buffer.lock(0, 0, 0).write(&indices);
+        assert_eq!(h.set_indices(&index_buffer), 0, "SetIndices");
+        assert_eq!(
+            h.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2),
+            0,
+            "bound indexed draw",
+        );
+    });
+}
+
+#[test]
+fn inline_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let indices: [u16; 6] = [0, 1, 3, 1, 2, 3];
+        assert_eq!(
+            h.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLELIST,
+                    min_vertex_index: 0,
+                    num_vertices: 4,
+                    prim_count: 2,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &indices,
+                vertices,
+            ),
+            0,
+            "inline indexed draw",
+        );
+    });
+}
+
+#[test]
+fn generated_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let fan_indices: [u16; 4] = [0, 1, 2, 3];
+        assert_eq!(
+            h.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLEFAN,
+                    min_vertex_index: 0,
+                    num_vertices: 4,
+                    prim_count: 2,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &fan_indices,
+                vertices,
+            ),
+            0,
+            "fan rewritten to generated indices",
+        );
+    });
 }
 
 #[test]

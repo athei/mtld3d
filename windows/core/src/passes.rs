@@ -2919,14 +2919,7 @@ impl PassState {
             if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                 let idx = self.passes.len() - 1;
                 let last = &self.passes[idx];
-                let draws = last
-                    .commands
-                    .iter()
-                    .filter(|c| {
-                        c.cmd == CommandType::DrawPrimitives as u32
-                            || c.cmd == CommandType::DrawIndexedPrimitives as u32
-                    })
-                    .count();
+                let draws = last.commands.iter().filter(|c| c.is_draw()).count();
                 trace!(
                     target: TRACE_TARGET,
                     "pass-close idx={idx} caller={caller} color={:#x} depth={:#x} cmds={} draws={draws}",
@@ -3903,10 +3896,7 @@ impl PassState {
             return;
         }
         for pass in &mut self.passes {
-            let has_draw = pass.commands.iter().any(|c| {
-                c.cmd == CommandType::DrawPrimitives as u32
-                    || c.cmd == CommandType::DrawIndexedPrimitives as u32
-            });
+            let has_draw = pass.commands.iter().any(Command::is_draw);
             if has_draw || !pass.leading_blits.is_empty() {
                 continue;
             }
@@ -4026,11 +4016,11 @@ impl PassState {
             // A "real" draw is a draw command outside every clear-quad
             // block. A pass with only clear-quad blocks is somebody
             // else's territory (Rule F / Rule G).
-            let has_real_draw = pass.commands.iter().enumerate().any(|(idx, c)| {
-                !in_clear_quad(idx)
-                    && (c.cmd == CommandType::DrawPrimitives as u32
-                        || c.cmd == CommandType::DrawIndexedPrimitives as u32)
-            });
+            let has_real_draw = pass
+                .commands
+                .iter()
+                .enumerate()
+                .any(|(idx, c)| !in_clear_quad(idx) && c.is_draw());
             if !has_real_draw {
                 record_loads(&mut loaded_later);
                 continue;
@@ -4128,10 +4118,7 @@ impl PassState {
         }
         let before = self.passes.len();
         self.passes.retain_mut(|p| {
-            let has_draw = p.commands.iter().any(|c| {
-                c.cmd == CommandType::DrawPrimitives as u32
-                    || c.cmd == CommandType::DrawIndexedPrimitives as u32
-            });
+            let has_draw = p.commands.iter().any(Command::is_draw);
             if has_draw || !p.leading_blits.is_empty() {
                 return true;
             }
@@ -4179,21 +4166,16 @@ impl PassState {
     /// between *would* observe the cleared content, the clear-only
     /// pass must materialise where it was originally placed.
     ///
-    /// "Clear-only" means the pass has zero `DrawPrimitives` /
-    /// `DrawIndexedPrimitives` commands; any setviewport / setscissor /
-    /// setpipeline / setBlendColor that the encoder pushed without a
-    /// subsequent draw still counts as clear-only here. A pass carrying
+    /// "Clear-only" means the pass has no draw commands; any setviewport /
+    /// setscissor / setpipeline / setBlendColor that the encoder pushed without
+    /// a subsequent draw still counts as clear-only here. A pass carrying
     /// leading blits is never a candidate: the blits are real work that the
     /// merge would drop along with the pass.
     pub fn coalesce_clear_only_passes(&mut self) {
         let mut i = 0;
         while i < self.passes.len() {
             let p = &self.passes[i];
-            let has_draw = !p.leading_blits.is_empty()
-                || p.commands.iter().any(|c| {
-                    c.cmd == CommandType::DrawPrimitives as u32
-                        || c.cmd == CommandType::DrawIndexedPrimitives as u32
-                });
+            let has_draw = !p.leading_blits.is_empty() || p.commands.iter().any(Command::is_draw);
             // Any colour target of the pass with a Clear makes the colour
             // side a candidate; the whole set then moves together.
             let needs_color = !has_draw

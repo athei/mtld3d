@@ -2024,8 +2024,6 @@ impl EncoderPerfState {
         if !want_stats && !want_passes {
             return;
         }
-        let draw_prim = CommandType::DrawPrimitives as u32;
-        let draw_idx = CommandType::DrawIndexedPrimitives as u32;
         let set_pipeline = CommandType::SetRenderPipelineState as u32;
         let set_frag_tex = CommandType::SetFragmentTexture as u32;
 
@@ -2035,7 +2033,7 @@ impl EncoderPerfState {
             total_commands +=
                 u32::try_from(p.commands().len()).expect("per-pass command count fits u32");
             for cmd in p.commands() {
-                if cmd.cmd == draw_prim || cmd.cmd == draw_idx {
+                if cmd.is_draw() {
                     total_draws += 1;
                 }
             }
@@ -2166,7 +2164,7 @@ impl EncoderPerfState {
                 let mut pass_pipelines: u32 = 0;
                 let mut pass_frag_textures: u32 = 0;
                 for cmd in p.commands() {
-                    if cmd.cmd == draw_prim || cmd.cmd == draw_idx {
+                    if cmd.is_draw() {
                         pass_draws += 1;
                     } else if cmd.cmd == set_pipeline {
                         pass_pipelines += 1;
