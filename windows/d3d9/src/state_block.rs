@@ -390,7 +390,7 @@ impl RecordingStateBlock {
                     dev.set_clip_plane(*index, *plane);
                 }
                 StateOp::Fvf(fvf) => {
-                    dev.set_fvf_field(*fvf);
+                    dev.bind_fvf_decl(*fvf);
                 }
                 StateOp::Texture { stage, tex } => {
                     if let Some(slot) = crate::device::vertex_sampler_slot(*stage) {

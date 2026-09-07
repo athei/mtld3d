@@ -1,10 +1,10 @@
 //! State-block capture/apply round-trip.
 
-use mtld3d_tests::Harness;
+use mtld3d_tests::{Harness, PosColorVertex, VertexDeclaration};
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT9,
-    D3DRS_ALPHABLENDENABLE, D3DRS_LIGHTING, D3DSAMP_MINFILTER, D3DSBT_ALL, D3DSBT_PIXELSTATE,
-    D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT,
+    D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_LIGHTING, D3DSAMP_MINFILTER, D3DSBT_ALL,
+    D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT,
 };
 
 #[test]
@@ -45,6 +45,93 @@ fn vertex_state_block_restores_fvf() {
         h.fvf(),
         D3DFVF_XYZ | D3DFVF_DIFFUSE,
         "VERTEXSTATE restores FVF"
+    );
+}
+
+#[test]
+fn recorded_set_fvf_restores_implicit_declaration_and_draw_layout() {
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+    const TARGET_FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+    let h = Harness::new();
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "initial FVF");
+    let initial_decl = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_fvf(TARGET_FVF), D3D_OK, "record SetFVF");
+    let sb = h.end_state_block();
+    assert_eq!(sb.apply(), D3D_OK, "Apply recorded SetFVF");
+
+    assert_eq!(h.fvf(), TARGET_FVF, "Apply restores the recorded FVF");
+    let applied_decl = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_ne!(
+        applied_decl.as_ptr(),
+        initial_decl.as_ptr(),
+        "Apply binds the recorded FVF's implicit declaration",
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+    let tri = [
+        PosColorVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+            D3D_OK,
+            "draw with the recorded FVF layout",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "the restored declaration supplies vertex diffuse",
+    );
+}
+
+#[test]
+fn recorded_zero_fvf_keeps_the_last_nonzero_fvf_binding() {
+    const TARGET_FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+    let h = Harness::new();
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "initial FVF");
+    let initial_decl = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_fvf(TARGET_FVF), D3D_OK, "record nonzero SetFVF");
+    assert_eq!(h.set_fvf(0), D3D_OK, "record SetFVF(0)");
+    let sb = h.end_state_block();
+    assert_eq!(sb.apply(), D3D_OK, "Apply recorded FVF sequence");
+
+    assert_eq!(
+        h.fvf(),
+        TARGET_FVF,
+        "SetFVF(0) leaves the last nonzero FVF intact",
+    );
+    let applied_decl = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_ne!(
+        applied_decl.as_ptr(),
+        initial_decl.as_ptr(),
+        "SetFVF(0) leaves the last nonzero implicit declaration bound",
     );
 }
 
