@@ -120,7 +120,12 @@ while its sibling legs are green, re-run the failed jobs first (`gh run rerun
 <run-id> --failed`, which lands on a fresh machine) and read the command
 buffer errors in the artifact's log, since a hosted runner's GPU can fail that
 way with no hang line in the job log and nothing else tells it from a
-regression.
+regression. A `CreateBackbuffer` failure on the Intel image is read the same
+way: its unix line names the request and the device, and a sane request (the
+window's size, `BGRA8Unorm`, a sample count the device answered for) that
+`newTextureWithDescriptor` refused on that image's GPU, the paravirtual
+`AppleParavirtGPUMetal`, is the same runner fault, so re-run the failed jobs.
+A line naming a zero dimension or a null handle is the layer's own bug.
 
 Two things are worth knowing when a test process looks wrong. `d3d9.dll`
 terminates the process from its `DLL_PROCESS_DETACH` once a device exists

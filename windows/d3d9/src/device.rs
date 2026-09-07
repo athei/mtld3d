@@ -2605,7 +2605,12 @@ impl DeviceInner {
         if status != 0 || bb_params.texture_handle.is_null() {
             error!(
                 target: LOG_TARGET,
-                "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) — device unusable",
+                "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) for \
+                 {new_width}x{new_height} (render {}x{}) samples={} fmt={}; device unusable",
+                bb_params.width,
+                bb_params.height,
+                bb_params.sample_count,
+                self.present_params.back_buffer_format,
             );
             self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
@@ -4301,7 +4306,17 @@ fn reset_recreate_resources(
     };
     let status = unix_call(&mut bb_params);
     if status != 0 || bb_params.texture_handle.is_null() {
-        error!(target: LOG_TARGET, "Reset: CreateBackbuffer failed (0x{status:08X}) — device unusable");
+        error!(
+            target: LOG_TARGET,
+            "Reset: CreateBackbuffer failed (0x{status:08X}) for {}x{} (render {}x{}) samples={} \
+             fmt={}; device unusable",
+            pp.back_buffer_width,
+            pp.back_buffer_height,
+            bb_params.width,
+            bb_params.height,
+            bb_params.sample_count,
+            pp.back_buffer_format,
+        );
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
