@@ -109,7 +109,12 @@ and the only one of a death the layer's crash handler ended: its fatal banner,
 registers and stack go there and never to stderr. The runner moves that log
 to `<binary>-<pid>.layer-log` beside the stderr, because the layer keeps only
 its ten newest logs and the next run would remove it, and quotes it in the
-same note from the banner on when there is one.
+same note from the banner on when there is one. Every test process runs
+under Apple's Main Thread Checker (`debug.mainThreadChecker` in the suite's
+config, `docs/ARCHITECTURE.md` says how), so a kept `.stderr` that carries a
+`Main Thread Checker: UI API called on a background thread:` line names the
+AppKit call the layer made off the main thread and the thread that made it;
+that call is the failure, whatever the process printed after it.
 
 In CI every end-to-end leg uploads all three kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the

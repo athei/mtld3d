@@ -247,6 +247,13 @@ INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 # read.
 export MTL_HUD_ENABLED ?= 1
 export MTL_DEBUG_LAYER ?= 1
+# Apple's variable, read by the Main Thread Checker that the test config below
+# loads into every test process (`debug.mainThreadChecker=true`): with it set,
+# a report of an AppKit call off the main thread ends the process at the call,
+# on the offending thread, so the runner charges the death to the test that
+# made it instead of the report scrolling past in stderr. Inert for a process
+# that does not load the checker, which is every game.
+export MTC_CRASH_ON_REPORT ?= 1
 export WINEDLLOVERRIDES = mscoree,mshtml=
 export WINEDEBUG=+msync
 export WINEMSYNC=1
@@ -595,6 +602,10 @@ stage: all
 #     HDR present route on an EDR Mac and the SDR one elsewhere. Pin it so the
 #     results mean the same thing everywhere; the HDR route is exercised by real
 #     runs and by the present-pipeline tests, not by the e2e assertions.
+#   - debug.mainThreadChecker=true loads Apple's Main Thread Checker into each
+#     test process, so an AppKit call off the main thread fails the run where
+#     it is made (MTC_CRASH_ON_REPORT, exported above) instead of surfacing as
+#     a rare death later in Wine's own code.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
 # MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
 #
@@ -622,7 +633,7 @@ stage: all
 # layer's log of that process next to it, out of the layer's own retention.
 # Ten files of each kind are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
-MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
+MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=
