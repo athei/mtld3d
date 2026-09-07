@@ -36,6 +36,14 @@ unix/unix/src/metal/upscale.rs'
 
 INLINE_ALWAYS_SITES='unix/shared/src/crumb.rs'
 
+# The end-to-end tests that share one process. A thread one of them spawns
+# goes through the harness's `in_flight::spawn_scoped`, which names it after
+# the test, so a panic on it and the device it creates attribute to the test
+# rather than to `<unnamed>`; the raw spawn calls are banned here.
+E2E_TESTS_DIR=windows/tests/tests/e2e
+E2E_SPAWN='\.spawn(_scoped)?\(|thread::spawn\(|thread::Builder'
+E2E_SPAWN_MESSAGE='raw thread spawn in an end-to-end test: use mtld3d_tests::spawn_scoped, which names the worker after its test'
+
 # The COM entry points that hold the device's API lock: every
 # `extern "system" fn` defined in these files opens with `let _api =`. The
 # cursor window procedure is the one exception, by name: it runs on the window
@@ -301,6 +309,11 @@ case "${1:-}" in
         'OnceLock static outside the runtime-argument sites' "$ONCELOCK_SITES" "$file"
     confined '#\[allow\(' 'Warning suppressions' \
         'lint suppression outside the three accepted per-site exceptions' "$ALLOW_SITES" "$file"
+    case $file in
+    "$E2E_TESTS_DIR"/*.rs)
+        banned "$E2E_SPAWN" 'Every end-to-end test names itself' "$E2E_SPAWN_MESSAGE" "$file"
+        ;;
+    esac
 
     exit $status
     ;;
@@ -360,6 +373,12 @@ confined '^[ \t]*static .*: *OnceLock' 'LazyLock over OnceLock' \
     'OnceLock static outside the runtime-argument sites' "$ONCELOCK_SITES" "$@"
 confined '#\[allow\(' 'Warning suppressions' \
     'lint suppression outside the three accepted per-site exceptions' "$ALLOW_SITES" "$@"
+
+e2e_tests=$(git ls-files "$E2E_TESTS_DIR/*.rs" || true)
+if [ -n "$e2e_tests" ]; then
+    # shellcheck disable=SC2086
+    banned "$E2E_SPAWN" 'Every end-to-end test names itself' "$E2E_SPAWN_MESSAGE" $e2e_tests
+fi
 
 modules=$(git ls-files '*/mod.rs' || true)
 if [ -n "$modules" ]; then

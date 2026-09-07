@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mtld3d_tests::{Harness, HarnessConfig, Vertex, assert_pixel_eq};
+use mtld3d_tests::{Harness, HarnessConfig, Vertex, assert_pixel_eq, spawn_scoped};
 use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DCULL_CCW, D3DCULL_CW,
     D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
@@ -92,7 +92,7 @@ fn two_threads_drive_one_multithreaded_device() {
     let words = [0u32; 12];
 
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
+        let worker = spawn_scoped(scope, || {
             let mut results = Vec::new();
             let mut clockwise = false;
             while !stop.load(Ordering::Acquire) {
