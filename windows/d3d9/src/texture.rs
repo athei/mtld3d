@@ -1145,6 +1145,7 @@ impl TextureInner {
         let whole = self.write_covers_level(dst_level, dst_rect);
         self.move_subresource_to_staging(0, dst_level, whole);
         self.ensure_staging(dst_level);
+        self.prepare_volume_staging_write(dst_level);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1430,6 +1431,7 @@ impl TextureInner {
         let whole = self.write_covers_level(dst_level, dst_rect);
         self.move_subresource_to_staging(0, dst_level, whole);
         self.ensure_staging(dst_level);
+        self.prepare_volume_staging_write(dst_level);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -2521,78 +2523,7 @@ impl TextureInner {
                 }
                 self.staging[level].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => {
-                mtld3d_shared::log_once_trace_by!(
-                    target: TEX_TRACE_TARGET,
-                    key: (self.texture_id.raw() << 8)
-                        | (level as u64 & 0x7f)
-                        | (u64::from(preserve == PreserveKind::Cpu) << 7),
-                    "tex {:#x} mip {level} lock rename preserve={}",
-                    self.texture_id.raw(),
-                    preserve_label(preserve)
-                );
-                // Logical mip-byte length, not the page-padded total
-                // — the memcpy below moves exactly the bytes the game
-                // can read.
-                let mip_len = self.staging[level].logical_len();
-                let fresh = new_uninit_page_box(mip_len);
-                let old = core::mem::replace(&mut self.staging[level], Arc::new(fresh));
-                // `device_inner == 0` (between devices): no perf state to
-                // bump — perf lives on the freed `DeviceInner`. Skip the
-                // counters but still execute the rename + optional preserve.
-                let dev_inner_raw = self.device_inner;
-                let perf_attached = dev_inner_raw != 0;
-                match preserve {
-                    PreserveKind::None => {
-                        // A whole-level DISCARD: the game promised to
-                        // rewrite every byte before reading any. The
-                        // fresh allocation carries none of the old
-                        // pixels, so the written union starts over.
-                        self.reset_staging_coverage(level);
-                        if perf_attached {
-                            DeviceInner::from_ptr(dev_inner_raw)
-                                .perf_mut()
-                                .bump_texture_discard();
-                        }
-                    }
-                    PreserveKind::Cpu => {
-                        // Game might read old bytes through the Lock
-                        // pointer (whole-mip lock), OR the encoder's
-                        // compressed full-mip-fallback will read bytes
-                        // outside the locked rect. Either way: carry the
-                        // old bytes across synchronously on the API
-                        // thread. The `old` Arc keeps the source bytes
-                        // live for the duration of the copy.
-                        if perf_attached {
-                            DeviceInner::from_ptr(dev_inner_raw)
-                                .perf_mut()
-                                .bump_texture_preserve_cpu();
-                        }
-                        let dst = Arc::get_mut(&mut self.staging[level])
-                            .expect("fresh Arc is unique")
-                            .as_mut_ptr();
-                        // SAFETY: `old` and `dst` are distinct `PageBox`
-                        // allocations of `mip_len` bytes (logical mip
-                        // size); ranges don't alias.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len);
-                        }
-                    }
-                }
-                if perf_attached {
-                    DeviceInner::from_ptr(dev_inner_raw)
-                        .perf_mut()
-                        .bump_texture_rename();
-                }
-                // Mirror `vb_lock` — the fresh Arc has never been on
-                // the GPU. Reset so a back-to-back Lock pre-Unlock
-                // doesn't see the fresh Box as contended and force a
-                // second rename.
-                self.last_submit_seq[level] = 0;
-                Arc::get_mut(&mut self.staging[level])
-                    .expect("fresh Arc is unique")
-                    .as_mut_ptr()
-            }
+            LockAction::FreshBox { preserve } => self.rename_staging(level, preserve),
         };
 
         // SAFETY: `offset` is the byte offset of the locked sub-rect
@@ -2602,6 +2533,84 @@ impl TextureInner {
         // `offset + locked_bytes` bytes.
         let ptr = unsafe { base.add(offset) };
         (ptr, pitch, offset)
+    }
+
+    /// Rename one mip's staging while earlier uploads retain the old allocation.
+    fn rename_staging(&mut self, level: usize, preserve: PreserveKind) -> *mut u8 {
+        mtld3d_shared::log_once_trace_by!(
+            target: TEX_TRACE_TARGET,
+            key: (self.texture_id.raw() << 8)
+                | (level as u64 & 0x7f)
+                | (u64::from(preserve == PreserveKind::Cpu) << 7),
+            "tex {:#x} mip {level} staging rename preserve={}",
+            self.texture_id.raw(),
+            preserve_label(preserve)
+        );
+        // Copy only logical mip bytes, excluding the page-padded tail.
+        let mip_len = self.staging[level].logical_len();
+        let fresh = new_uninit_page_box(mip_len);
+        let old = core::mem::replace(&mut self.staging[level], Arc::new(fresh));
+        // A detached texture has no live device profiling state.
+        let dev_inner_raw = self.device_inner;
+        let perf_attached = dev_inner_raw != 0;
+        match preserve {
+            PreserveKind::None => {
+                // A whole-level DISCARD: the game promised to
+                // rewrite every byte before reading any. The
+                // fresh allocation carries none of the old
+                // pixels, so the written union starts over.
+                self.reset_staging_coverage(level);
+                if perf_attached {
+                    DeviceInner::from_ptr(dev_inner_raw)
+                        .perf_mut()
+                        .bump_texture_discard();
+                }
+            }
+            PreserveKind::Cpu => {
+                // A later lock or whole-mip upload can read bytes outside
+                // the write region, so preserve every logical byte across
+                // all depth slices. The old Arc keeps the source live.
+                if perf_attached {
+                    DeviceInner::from_ptr(dev_inner_raw)
+                        .perf_mut()
+                        .bump_texture_preserve_cpu();
+                }
+                let dst = Arc::get_mut(&mut self.staging[level])
+                    .expect("fresh Arc is unique")
+                    .as_mut_ptr();
+                // SAFETY: `old` and `dst` are distinct `PageBox`
+                // allocations of `mip_len` bytes (logical mip
+                // size); ranges don't alias.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len);
+                }
+            }
+        }
+        if perf_attached {
+            DeviceInner::from_ptr(dev_inner_raw)
+                .perf_mut()
+                .bump_texture_rename();
+        }
+        // The new allocation has never been queued for an upload.
+        self.last_submit_seq[level] = 0;
+        Arc::get_mut(&mut self.staging[level])
+            .expect("fresh Arc is unique")
+            .as_mut_ptr()
+    }
+
+    /// Preserve a volume mip before writing bytes another owner may still read.
+    fn prepare_volume_staging_write(&mut self, level: usize) {
+        if self.flags.contains(TextureFlags::VOLUME_TEXTURE)
+            && self
+                .staging
+                .get(level)
+                .is_some_and(|staging| Arc::strong_count(staging) > 1)
+        {
+            // Upload jobs may be replayed after their original submit retires.
+            // Arc ownership covers those readers as well as queued and GPU reads;
+            // a cached staging wrapper alone can conservatively force a rename.
+            self.rename_staging(level, PreserveKind::Cpu);
+        }
     }
 
     fn stash_lock(
@@ -4734,7 +4743,7 @@ extern "system" fn volume_lock_box(
     if inner.d3d_pool == D3DPOOL_DEFAULT && inner.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
         return D3DERR_INVALIDCALL;
     }
-    let Some((ptr, row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
+    let Some((_, row_pitch, slice_pitch)) = inner.lock_box(lvl) else {
         return D3DERR_INVALIDCALL;
     };
     // An optional box must be a non-empty, in-bounds half-open region; unlike
@@ -4788,6 +4797,8 @@ extern "system" fn volume_lock_box(
     } else {
         0
     };
+    inner.prepare_volume_staging_write(lvl);
+    let ptr = inner.staging[lvl].as_ptr().cast_mut();
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.
     inner.stash_lock(lvl, false, false, None);

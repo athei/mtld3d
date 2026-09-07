@@ -2929,6 +2929,255 @@ fn check_volume_upper_mip_rename(partial: bool) {
     }
 }
 
+/// Queued volume uploads retain the bytes each draw sampled.
+#[test]
+fn volume_staging_regular_updates() {
+    let h = Harness::new();
+    check_volume_staging_updates(&h, 4, D3DFMT_A8R8G8B8);
+}
+
+/// Converted volume uploads retain each queued version.
+#[test]
+fn volume_staging_regular_converted_updates() {
+    let h = Harness::new();
+    check_volume_staging_updates(&h, 4, D3DFMT_X8R8G8B8);
+}
+
+/// A single-slice volume retains each queued staging version.
+#[test]
+fn volume_staging_regular_single_slice_updates() {
+    let h = Harness::new();
+    check_volume_staging_updates(&h, 1, D3DFMT_A8R8G8B8);
+}
+
+/// A cold partial volume write preserves the first queued upload.
+#[test]
+fn volume_staging_regular_cold_partial_update() {
+    let h = Harness::new();
+    check_volume_staging_partial_updates(&h, false, false);
+}
+
+/// Repeated partial volume writes preserve draw versions and untouched mips.
+#[test]
+fn volume_staging_regular_partial_updates() {
+    let h = Harness::new();
+    check_volume_staging_partial_updates(&h, true, true);
+}
+
+/// Repeated cold volume writes retain every queued snapshot.
+#[test]
+fn volume_staging_regular_cold_partial_updates() {
+    let h = Harness::new();
+    check_volume_staging_partial_updates(&h, false, true);
+}
+
+/// Queued volume uploads retain the bytes each draw sampled.
+#[test]
+fn volume_staging_forced_updates() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_updates(&h, 4, D3DFMT_A8R8G8B8);
+}
+
+/// Converted volume uploads retain each queued version.
+#[test]
+fn volume_staging_forced_converted_updates() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_updates(&h, 4, D3DFMT_X8R8G8B8);
+}
+
+/// A single-slice volume retains each queued staging version.
+#[test]
+fn volume_staging_forced_single_slice_updates() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_updates(&h, 1, D3DFMT_A8R8G8B8);
+}
+
+/// A cold partial volume write preserves the first queued upload.
+#[test]
+fn volume_staging_forced_cold_partial_update() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_partial_updates(&h, false, false);
+}
+
+/// Repeated partial volume writes preserve draw versions and untouched mips.
+#[test]
+fn volume_staging_forced_partial_updates() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_partial_updates(&h, true, true);
+}
+
+/// Repeated cold volume writes retain every queued snapshot.
+#[test]
+fn volume_staging_forced_cold_partial_updates() {
+    let h = Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true");
+    check_volume_staging_partial_updates(&h, false, true);
+}
+
+fn check_volume_staging_updates(h: &Harness, depth: u32, destination_format: u32) {
+    const COLORS: [u32; 3] = [0xFFFF_0000, 0xFF00_00FF, 0xFF00_FF00];
+    let (hr, source) =
+        h.try_create_volume_texture([4, 4, depth], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0);
+    let source = source.expect("source volume");
+    let (hr, destination) =
+        h.try_create_volume_texture([4, 4, depth], 1, 0, destination_format, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0);
+    let destination = destination.expect("destination volume");
+    let texel_count = 16 * usize::try_from(depth).expect("four slices");
+    source.write_u32(0, &vec![COLORS[0]; texel_count]);
+    assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+    assert_eq!(h.set_volume_texture(0, &destination), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    assert_pixel_eq(sample_volume_depth(h, 0.875), COLORS[0], "primed volume");
+    h.render_once(BLACK, |d| {
+        for (index, (left, right)) in [(-1.0, -0.333), (-0.333, 0.333), (0.333, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            if index != 0 {
+                source.write_u32(0, &vec![COLORS[index]; texel_count]);
+                assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+            }
+            assert_eq!(
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &volume_sample_quad(left, right, [0.5, 0.5, 0.875]),
+                ),
+                0
+            );
+        }
+    });
+    assert_eq!(
+        [
+            h.read_pixel(100, 240),
+            h.read_pixel(320, 240),
+            h.read_pixel(540, 240)
+        ],
+        COLORS,
+        "volume versions across two UpdateTexture calls"
+    );
+    for w in [0.125, 0.375, 0.625, 0.875] {
+        assert_pixel_eq(sample_volume_depth(h, w), COLORS[2], "final volume slice");
+    }
+}
+
+fn check_volume_staging_partial_updates(h: &Harness, prime: bool, repeated: bool) {
+    const BLUE: u32 = 0xFF00_00FF;
+    const CYAN: u32 = 0xFF00_FFFF;
+    const COLORS: [[u32; 4]; 3] = [
+        [0xFFFF_0000, 0xFF00_FF00, 0xFFFF_FF00, 0xFFFF_00FF],
+        [0xFFFF_FFFF, 0xFF80_8080, 0, 0],
+        [0xFFFF_8000, 0, 0, 0],
+    ];
+    let final_color = if repeated { CYAN } else { BLUE };
+    let (hr, texture) =
+        h.try_create_volume_texture([4, 4, 4], 3, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let texture = texture.expect("managed volume");
+    for (level, colors) in COLORS.iter().enumerate() {
+        let width = 4 >> level;
+        let texels: Vec<_> = colors[..width]
+            .iter()
+            .flat_map(|color| core::iter::repeat_n(*color, width * width))
+            .collect();
+        texture.write_u32(u32::try_from(level).expect("three levels"), &texels);
+    }
+    assert_eq!(h.set_volume_texture(0, &texture), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    if prime {
+        assert_pixel_eq(sample_volume_depth(h, 0.875), COLORS[0][3], "primed volume");
+    }
+    h.render_once(BLACK, |d| {
+        for (index, (left, right)) in [(-1.0, -0.333), (-0.333, 0.333), (0.333, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 || (index == 2 && repeated) {
+                texture.write_box_u32(
+                    0,
+                    &D3DBOX {
+                        left: 2,
+                        top: 2,
+                        right: 4,
+                        bottom: 4,
+                        front: 2,
+                        back: 4,
+                    },
+                    &[if index == 1 { BLUE } else { CYAN }; 8],
+                );
+            }
+            assert_eq!(
+                d.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    2,
+                    &volume_sample_quad(left, right, [0.875, 0.875, 0.875]),
+                ),
+                0
+            );
+        }
+    });
+    assert_eq!(
+        [
+            h.read_pixel(100, 240),
+            h.read_pixel(320, 240),
+            h.read_pixel(540, 240)
+        ],
+        [COLORS[0][3], BLUE, final_color],
+        "partial volume versions (prime={prime})"
+    );
+    for (level, colors) in COLORS.iter().enumerate() {
+        assert_eq!(
+            h.set_sampler_state(
+                0,
+                D3DSAMP_MAXMIPLEVEL,
+                u32::try_from(level).expect("three levels")
+            ),
+            0
+        );
+        let depth = 4 >> level;
+        for (slice, color) in colors[..depth].iter().enumerate() {
+            let w = (f32::from(u8::try_from(slice).expect("four slices")) + 0.5)
+                / f32::from(u8::try_from(depth).expect("four slices"));
+            for u in [0.125, 0.875] {
+                for v in [0.125, 0.875] {
+                    h.render_once(BLACK, |d| {
+                        assert_eq!(
+                            d.draw_primitive_up(
+                                D3DPT_TRIANGLELIST,
+                                2,
+                                &volume_sample_quad(-1.0, 1.0, [u, v, w])
+                            ),
+                            0
+                        );
+                    });
+                    let expected = if level == 0 && slice >= 2 && u > 0.5 && v > 0.5 {
+                        final_color
+                    } else {
+                        *color
+                    };
+                    assert_pixel_eq(
+                        h.read_pixel(320, 240),
+                        expected,
+                        &format!("mip {level} slice {slice} uv {u},{v} (prime={prime})"),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn volume_sample_quad(left: f32, right: f32, coord: [f32; 3]) -> [VolumeVertex; 6] {
     let vertex = |x, y| VolumeVertex {
         x,
