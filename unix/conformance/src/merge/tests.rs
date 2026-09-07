@@ -106,3 +106,42 @@ fn a_single_leg_update_keeps_the_other_legs() {
     assert!(summary.new_sites.is_empty());
     assert!(summary.dropped_sites.is_empty());
 }
+
+#[test]
+fn an_observed_skip_keeps_the_prior_pin_without_inventing_a_failure() {
+    let key = (I686, Subtest::Device);
+    let mut prior = Baseline::default();
+    prior.entries.insert(
+        key,
+        SubtestBaseline {
+            crash: false,
+            sites: BTreeMap::from([(site(6780), 1), (site(5975), 2)]),
+        },
+    );
+    let output = "device.c:6706: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\n\
+        device: 58913 tests executed (75 marked as todo, 0 as flaky, 786 failures), 21 skipped.\n";
+    let result = crate::scan::parse_subtest_output(output, false);
+    assert!(result.sites.is_empty(), "a skip is not a measured failure");
+    let fresh = BTreeMap::from([(key, result)]);
+    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
+    assert_eq!(next.entries[&key].sites, BTreeMap::from([(site(6780), 1)]));
+    assert_eq!(summary.skipped_sites, vec![site(6780)]);
+    assert_eq!(summary.carried, 0, "no failures were measured");
+    assert_eq!(summary.dropped_sites, vec![site(5975)]);
+
+    let (new, summary) = merge(&Baseline::default(), I686, &fresh, "new".to_owned());
+    assert!(new.entries[&key].sites.is_empty(), "no pin to retain");
+    assert!(summary.skipped_sites.is_empty());
+
+    let output = format!(
+        "{output}device.c:6780: Test failed: Got unexpected query result.\n\
+        device.c:6780: Test failed: Got unexpected query result.\n"
+    );
+    let fresh = BTreeMap::from([(key, crate::scan::parse_subtest_output(&output, false))]);
+    let (next, summary) = merge(&prior, I686, &fresh, "new".to_owned());
+    assert_eq!(next.entries[&key].sites[&site(6780)], 2);
+    assert!(
+        summary.skipped_sites.is_empty(),
+        "observed failures take precedence"
+    );
+}

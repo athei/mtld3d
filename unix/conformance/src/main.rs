@@ -129,6 +129,9 @@ fn real_main() -> Result<ExitCode, String> {
         for site in &summary.new_sites {
             println!("  new: {site} - add to its CONFORMANCE.md cluster with a rationale");
         }
+        for site in &summary.skipped_sites {
+            println!("  skipped: {site} - kept prior count; assertion not run");
+        }
         for site in &summary.dropped_sites {
             let cluster = classes
                 .get(site)

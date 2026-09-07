@@ -140,6 +140,22 @@ pub struct SubtestResult {
     /// `flaky_marked`, kept out of `sites` and non-gating; recorded only for
     /// report visibility.
     pub todo_marked: BTreeMap<Site, u32>,
+    /// Assertions bypassed by a recognized upstream skip, with the full skip line as evidence.
+    pub skipped: BTreeMap<Site, String>,
+}
+
+impl SubtestResult {
+    /// Evidence that an absent assertion was skipped in a completed subtest.
+    ///
+    /// A crash cannot excuse a missing failure, and an observed failure takes
+    /// precedence over a skip marker in the same output.
+    #[must_use]
+    pub fn skipped_reason(&self, site: &Site) -> Option<&str> {
+        if self.crash || self.sites.contains_key(site) {
+            return None;
+        }
+        self.skipped.get(site).map(String::as_str)
+    }
 }
 
 impl Variant {

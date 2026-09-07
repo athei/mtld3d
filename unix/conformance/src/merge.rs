@@ -28,6 +28,8 @@ pub struct MergeSummary {
     /// Each of these still has a CONFORMANCE.md cluster entry that must be
     /// removed for `make test` to go green again.
     pub dropped_sites: Vec<Site>,
+    /// Skipped assertions whose prior counts were retained without a new measurement.
+    pub skipped_sites: Vec<Site>,
 }
 
 /// Build a new baseline from `fresh` results for `leg`.
@@ -62,6 +64,7 @@ pub fn merge(
     let mut summary = MergeSummary::default();
     for (&key, result) in fresh {
         let prior_sub = prior.entries.get(&key);
+        let mut sites = result.sites.clone();
         for site in result.sites.keys() {
             if prior_sub.is_some_and(|sub| sub.sites.contains_key(site)) {
                 summary.carried += 1;
@@ -70,10 +73,16 @@ pub fn merge(
             }
         }
         if let Some(sub) = prior_sub {
+            for (site, &count) in &sub.sites {
+                if result.skipped_reason(site).is_some() {
+                    sites.insert(site.clone(), count);
+                    summary.skipped_sites.push(site.clone());
+                }
+            }
             summary.dropped_sites.extend(
                 sub.sites
                     .keys()
-                    .filter(|site| !result.sites.contains_key(*site))
+                    .filter(|site| !sites.contains_key(*site))
                     .cloned(),
             );
         }
@@ -81,12 +90,13 @@ pub fn merge(
             key,
             SubtestBaseline {
                 crash: result.crash,
-                sites: result.sites.clone(),
+                sites,
             },
         );
     }
     summary.new_sites.dedup();
     summary.dropped_sites.dedup();
+    summary.skipped_sites.dedup();
     (next, summary)
 }
 

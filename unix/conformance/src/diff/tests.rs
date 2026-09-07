@@ -15,6 +15,9 @@ use crate::{
     triage::DocSite,
 };
 
+const OCCLUSION_SKIP: &str = "device.c:6706: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\r\n";
+const DEVICE_SUMMARY: &str = "00dc:device: 58913 tests executed (75 marked as todo, 0 as flaky, 786 failures), 21 skipped.\r\n";
+
 fn key() -> (Leg, Subtest) {
     (
         Leg {
@@ -239,4 +242,95 @@ fn baseline_site_without_a_class_entry_is_flagged_untriaged() {
     let report = diff(&base, &classes, &cur);
     assert!(!report.regressed);
     assert!(report.text.contains("untriaged"), "{}", report.text);
+}
+
+#[test]
+fn observed_occlusion_skip_is_not_a_passing_assertion() {
+    let base = baseline_with(&[(6780, 1)], false);
+    let classes = classes_with(&[(6780, Classification::Expected)]);
+    let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed, "{}", report.text);
+    assert!(!report.stale, "{}", report.text);
+    assert!(
+        report.text.contains("device.c:6780  SKIPPED"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains(OCCLUSION_SKIP.trim()),
+        "{}",
+        report.text
+    );
+
+    let passed = BTreeMap::from([(
+        key(),
+        crate::scan::parse_subtest_output(DEVICE_SUMMARY, false),
+    )]);
+    assert!(diff(&base, &classes, &passed).stale);
+}
+
+#[test]
+fn occlusion_skip_requires_the_reviewed_site_and_message() {
+    let base = baseline_with(&[(6780, 1)], false);
+    let classes = classes_with(&[(6780, Classification::Expected)]);
+    for skip in [
+        OCCLUSION_SKIP.replace("6706", "6707"),
+        OCCLUSION_SKIP.replace("device.c", "visual.c"),
+        OCCLUSION_SKIP.replace("large query tests", "other tests"),
+        OCCLUSION_SKIP.replace("100 ms", "70 ms"),
+        OCCLUSION_SKIP.replace("100 ms", "unknown ms"),
+        OCCLUSION_SKIP.replace("Tests skipped", "Test marked todo"),
+    ] {
+        let output = format!("{skip}{DEVICE_SUMMARY}");
+        let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+        let report = diff(&base, &classes, &cur);
+        assert!(report.stale, "{output}\n{}", report.text);
+        assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+    }
+}
+
+#[test]
+fn occlusion_skip_does_not_excuse_other_missing_or_failing_sites() {
+    let base = baseline_with(&[(6780, 1), (5975, 1)], false);
+    let classes = classes_with(&[
+        (6780, Classification::Expected),
+        (5975, Classification::Expected),
+    ]);
+    let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(report.stale, "{}", report.text);
+    assert!(
+        report
+            .text
+            .contains("device.c:5975  1 -> 0  STALE BASELINE")
+    );
+
+    let output = format!(
+        "{output}device.c:5975: Test failed: Got unexpected result.\n\
+        device.c:6780: Test failed: Got unexpected query result.\n\
+        device.c:6780: Test failed: Got unexpected query result.\n"
+    );
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(report.regressed, "{}", report.text);
+    assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+}
+
+#[test]
+fn occlusion_skip_does_not_hide_a_truncated_or_signaled_subtest() {
+    let base = baseline_with(&[(6780, 1)], false);
+    let classes = classes_with(&[(6780, Classification::Expected)]);
+    for (output, signaled) in [
+        (OCCLUSION_SKIP.to_owned(), false),
+        (format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}"), true),
+    ] {
+        let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, signaled))]);
+        let report = diff(&base, &classes, &cur);
+        assert!(report.regressed, "{}", report.text);
+        assert!(report.stale, "{}", report.text);
+        assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+    }
 }

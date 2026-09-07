@@ -144,6 +144,15 @@ regression can hide in. The fix for a stale baseline is `make
 conformance-baseline` plus the matching triage edit here, not a code hunt. The
 `flaky` and `ceiling` classes are the two tolerances (see below).
 
+A recognized upstream skip is an absent measurement, not a passing assertion.
+The runner retains the skip line separately from failures and reports the
+bypassed assertion as `SKIPPED`, without requiring a re-record. This applies
+only to the reviewed source location and message below, in a completed
+subtest with no failure at the affected assertion. Other missing failures
+still gate as stale, and crashes and counts above the pin still gate.
+Baseline recording retains an explicitly skipped assertion's prior count and
+reports that retention; it never invents a count when no prior pin exists.
+
 Metal validation is the third verdict, and it is independent of the counts: a
 leg that logged any `metal-validation:` line exits non-zero even when every
 site holds its pin, because API misuse is invisible to a pass/fail count. A
@@ -702,6 +711,16 @@ overdraw layers would need an encoder per draw under active queries,
 destroying pass batching; the kept optimization is single-encoder pass
 batching, so this is `expected`. Real-game occlusion (a bounding box tested
 against a populated depth buffer, read as zero/non-zero) is unaffected.
+
+Wine first times 1,000 query BEGIN/END pairs. If that loop takes more than
+70 ms, device.c:6706 prints `Tests skipped: Test loop took too long (...)`,
+ending with `skipping large query tests.`, and jumps to cleanup before 6780.
+An Intel CI run measured 100 ms and took that branch. The scanner recognizes
+that exact site and message shape, including the elapsed time above 70 ms,
+as evidence that 6780 did not run. The mapping must be reviewed with the
+baseline's source locations when Wine changes. The classification remains
+`expected` and its count stays pinned at one: `ceiling` would also tolerate
+an assertion that ran and passed, which this observation does not establish.
 
 ### device.c/test_lockrect_invalid
 Sites: 8664=expected 8682=expected 8701=expected
