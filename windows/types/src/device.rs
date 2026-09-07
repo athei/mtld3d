@@ -292,6 +292,9 @@ pub const D3DFMT_ATI1: u32 = 0x3149_5441;
 
 // ── D3D9 sampler state types ──
 
+/// First vertex texture sampler, followed by three consecutive slots.
+pub const D3DVERTEXTEXTURESAMPLER0: u32 = 257;
+
 pub const D3DSAMP_ADDRESSU: u32 = 1;
 pub const D3DSAMP_ADDRESSV: u32 = 2;
 pub const D3DSAMP_ADDRESSW: u32 = 3;
