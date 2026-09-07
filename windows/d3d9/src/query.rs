@@ -281,7 +281,7 @@ unsafe fn write_occlusion(data: *mut c_void, size: u32, value: u64) {
     let n = (size as usize).min(8);
     let bytes = value.to_le_bytes();
     // SAFETY: caller guarantees `data` is non-null with >= `size` writable
-    // bytes and `size >= 1` (size == 0 returns earlier); `n <= size`.
+    // bytes and `size >= 1`; `n <= size`.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data.cast::<u8>(), n) };
 }
 
@@ -298,8 +298,8 @@ extern "system" fn query_get_data(
         return D3DERR_INVALIDCALL;
     };
     let inner = obj.inner();
-    if data.is_null() || size == 0 {
-        // Caller is polling for "is it done?"; always yes.
+    let has_output = !data.is_null() && size != 0;
+    if !has_output && inner.query_type != D3DQUERYTYPE_OCCLUSION {
         return D3D_OK;
     }
     let device_inner_ptr = inner.device_inner;
@@ -323,8 +323,8 @@ extern "system" fn query_get_data(
             // `wanted` (capped at the advertised DWORD) is wrong here: the
             // runtime backs occlusion with a UINT64 and honors partial
             // (`size < 4`) and oversized (`size >= 8`) reads, so the write
-            // width is the caller's `size` capped at 8. `size == 0` already
-            // returned `D3D_OK` above, so `size >= 1` here.
+            // width is the caller's `size` capped at 8. When output is
+            // requested, `has_output` guarantees `size >= 1`.
             let Some(core) = inner.core.as_ref() else {
                 // No backing visibility slot (e.g. pool exhaustion). Report the
                 // permissive "fully visible" pixel count (`u32::MAX`), matching
@@ -334,9 +334,11 @@ extern "system" fn query_get_data(
                 dump_event(&format!(
                     "Query({this:?}) GetData → no slot, stub fully-visible"
                 ));
-                // SAFETY: `data` is non-null with >= `size` writable bytes per
-                // the ABI and `size >= 1`; `write_occlusion` writes `min(size, 8)`.
-                unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
+                if has_output {
+                    // SAFETY: `data` is non-null with >= `size` writable bytes per
+                    // the ABI and `size >= 1`; `write_occlusion` writes `min(size, 8)`.
+                    unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
+                }
                 return D3D_OK;
             };
             match core.status() {
@@ -344,8 +346,10 @@ extern "system" fn query_get_data(
                     // A query that has never been issued (`Issue(END)` never
                     // called) returns the runtime's uninitialised-result
                     // poison: every byte `0xdd`.
-                    // SAFETY: as above — non-null `data`, `size >= 1`.
-                    unsafe { write_occlusion(data, size, 0xdddd_dddd_dddd_dddd) };
+                    if has_output {
+                        // SAFETY: as above, non-null `data`, `size >= 1`.
+                        unsafe { write_occlusion(data, size, 0xdddd_dddd_dddd_dddd) };
+                    }
                     D3D_OK
                 }
                 QueryStatus::Pending => {
@@ -374,8 +378,10 @@ extern "system" fn query_get_data(
                                 "Query({this:?}) GetData(FLUSH) → stub fully-visible \
                                  (query.flushImmediate)"
                             ));
-                            // SAFETY: as above — non-null `data`, `size >= 1`.
-                            unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
+                            if has_output {
+                                // SAFETY: as above, non-null `data`, `size >= 1`.
+                                unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
+                            }
                             return D3D_OK;
                         }
                         // Spec-correct fallback (config off). The
@@ -417,8 +423,10 @@ extern "system" fn query_get_data(
                                     "Query({this:?}) GetData(FLUSH) → flushed, count {}",
                                     core.get_u64()
                                 ));
-                                // SAFETY: as above — non-null `data`, `size >= 1`.
-                                unsafe { write_occlusion(data, size, core.get_u64()) };
+                                if has_output {
+                                    // SAFETY: as above, non-null `data`, `size >= 1`.
+                                    unsafe { write_occlusion(data, size, core.get_u64()) };
+                                }
                                 return D3D_OK;
                             }
                         }
@@ -433,8 +441,10 @@ extern "system" fn query_get_data(
                         "Query({this:?}) GetData → count {}",
                         core.get_u64()
                     ));
-                    // SAFETY: as above — non-null `data`, `size >= 1`.
-                    unsafe { write_occlusion(data, size, core.get_u64()) };
+                    if has_output {
+                        // SAFETY: as above, non-null `data`, `size >= 1`.
+                        unsafe { write_occlusion(data, size, core.get_u64()) };
+                    }
                     D3D_OK
                 }
             }
@@ -449,9 +459,9 @@ extern "system" fn query_get_data(
             D3D_OK
         }
         other => {
-            // SAFETY: `data` is non-null (checked above) and per the D3D9
-            // ABI points to a buffer of at least `size` bytes; `wanted =
-            // min(data_size, size)` stays within that buffer.
+            // SAFETY: `data` is non-null and per the D3D9 ABI points to a
+            // buffer of at least `size` bytes; `wanted = min(data_size,
+            // size)` stays within that buffer.
             unsafe { core::ptr::write_bytes(data.cast::<u8>(), 0, wanted) };
             mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,

@@ -1563,6 +1563,13 @@ impl Query<'_> {
         };
         (hr, value)
     }
+
+    /// Poll query status without requesting its result. Returns the hr.
+    #[must_use]
+    pub fn status(&self, flags: u32) -> i32 {
+        // SAFETY: vtable thunk; a null output pointer is valid with a zero size.
+        unsafe { (self.vtbl().get_data)(self.ptr, core::ptr::null_mut(), 0, flags) }
+    }
 }
 
 impl Drop for Query<'_> {
