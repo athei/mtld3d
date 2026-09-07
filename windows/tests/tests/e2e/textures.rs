@@ -2534,6 +2534,54 @@ fn update_texture_copies_every_volume_slice() {
     }
 }
 
+/// `UpdateTexture` aligns depth-dominant volume mip chains at their lowest levels.
+///
+/// A 1x1x8 source has one more mip than a 1x1x4 destination. The source's red
+/// top level must be skipped, then every green lower level must line up with
+/// the destination level of the same extent.
+#[test]
+fn update_texture_matches_depth_dominant_volume_mips() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::new();
+    let (hr, src) =
+        h.try_create_volume_texture([1, 1, 8], 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "SYSTEMMEM source volume");
+    let src = src.expect("source volume");
+    assert_eq!(src.level_count(), 4, "1x1x8 full mip chain");
+    src.write_u32(0, &[RED; 8]);
+    src.write_u32(1, &[GREEN; 4]);
+    src.write_u32(2, &[GREEN; 2]);
+    src.write_u32(3, &[GREEN; 1]);
+
+    let (hr, dst) = h.try_create_volume_texture([1, 1, 4], 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "DEFAULT destination volume");
+    let dst = dst.expect("destination volume");
+    assert_eq!(dst.level_count(), 3, "1x1x4 full mip chain");
+    assert_eq!(h.update_volume_texture_hr(&src, &dst), 0, "UpdateTexture");
+
+    assert_eq!(h.set_volume_texture(0, &dst), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+    for (level, depth) in [(0, 4u8), (1, 2), (2, 1)] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        for z in 0..depth {
+            let w = (f32::from(z) + 0.5) / f32::from(depth);
+            assert_pixel_eq(
+                sample_volume_depth(&h, w),
+                GREEN,
+                &format!("destination mip {level} slice {z}"),
+            );
+        }
+    }
+}
+
 /// `UpdateTexture` rejects a source and destination of different resource types.
 ///
 /// D3D9 pairs the two resources by type, and the vtable slot takes an
