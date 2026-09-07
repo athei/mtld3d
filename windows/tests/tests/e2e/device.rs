@@ -3,9 +3,13 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
-use std::sync::{
-    Barrier, Mutex, PoisonError,
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Barrier, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
+    },
+    time::Duration,
 };
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
@@ -1745,14 +1749,79 @@ const FULLSCREEN_TRIPS: u32 = 8;
 /// Rounds a windowed worker stops at even if the fullscreen worker is slow.
 const MAX_RETARGET_ROUNDS: u32 = 2000;
 
-/// What the workers of the concurrent-retarget test publish to each other.
-struct RetargetProgress {
-    /// Fullscreen round trips the fullscreen worker has completed.
-    transitions: AtomicU32,
-    /// Set once the fullscreen worker's loop is over, whichever way it ended.
-    fullscreen_stopped: AtomicBool,
-    /// Windowed workers that are done retargeting.
-    finished: AtomicUsize,
+/// How long workers wait for a concurrent-retarget handshake or transition.
+const FULLSCREEN_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time the check deliberately leaves the fullscreen worker without display ownership.
+const DELAYED_FULLSCREEN_START: Duration = Duration::from_millis(100);
+
+/// Wait for every windowed worker to reach one handshake boundary.
+fn wait_for_windowed_workers(
+    receiver: &Receiver<()>,
+    workers: usize,
+    boundary: &str,
+) -> Result<(), String> {
+    for reached in 0..workers {
+        match receiver.recv_timeout(FULLSCREEN_PROGRESS_TIMEOUT) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "only {reached} of {workers} windowed workers reached {boundary} within {} \
+                     seconds",
+                    FULLSCREEN_PROGRESS_TIMEOUT.as_secs(),
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "a windowed worker stopped before all {workers} reached {boundary}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Publish a fullscreen transition to every windowed worker.
+fn publish_transition(senders: &[Sender<u32>], trips: u32) -> Result<(), String> {
+    for (index, sender) in senders.iter().enumerate() {
+        if sender.send(trips).is_err() {
+            return Err(format!(
+                "windowed worker {index} stopped before fullscreen trip {trips}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Wait until the fullscreen worker owns the display mode.
+fn wait_for_fullscreen_start(receiver: &Receiver<u32>) -> Result<(), String> {
+    match receiver.recv_timeout(FULLSCREEN_PROGRESS_TIMEOUT) {
+        Ok(0) => Ok(()),
+        Ok(trips) => Err(format!(
+            "the first fullscreen progress signal was trip {trips}, not the ownership signal"
+        )),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "the fullscreen worker did not acquire the display mode within {} seconds",
+            FULLSCREEN_PROGRESS_TIMEOUT.as_secs(),
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("the fullscreen worker stopped before acquiring the display mode".to_owned())
+        }
+    }
+}
+
+/// Wait for the fullscreen worker to publish its next transition.
+fn wait_for_transition(receiver: &Receiver<u32>, previous: u32) -> Result<u32, String> {
+    match receiver.recv_timeout(FULLSCREEN_PROGRESS_TIMEOUT) {
+        Ok(trips) => Ok(trips),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "the fullscreen worker made no progress after {previous} round trips for {} seconds",
+            FULLSCREEN_PROGRESS_TIMEOUT.as_secs(),
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(format!(
+            "the fullscreen worker stopped after {previous} of {FULLSCREEN_TRIPS} round trips"
+        )),
+    }
 }
 
 /// A `WM_SIZE` lparam: the client height in the high word, the width in the low.
@@ -1767,13 +1836,16 @@ fn client_size_lparam(width: u32, height: u32) -> isize {
 /// the back buffer and this thread's cursor back; a `WM_SIZE` on the window
 /// the device left has to change nothing. Runs `RETARGET_ROUNDS` rounds at
 /// least, and on until the fullscreen worker has completed `FULLSCREEN_TRIPS`
-/// round trips, so the rounds overlap its window moves. `Ok` carries the
-/// rounds run; `Err` names the first message that missed the device.
+/// round trips, so the rounds overlap its window moves. A worker that runs a
+/// full burst without a new transition waits for bounded progress instead of
+/// consuming the total round cap. `Ok` carries the rounds run; `Err` names the
+/// first message that missed the device or the bound that expired.
 fn retarget_and_check_messages(
     h: &Harness,
     second: usize,
     ours: usize,
-    progress: &RetargetProgress,
+    progress: &Receiver<u32>,
+    started: &Sender<()>,
 ) -> Result<u32, String> {
     const WM_SIZE: u32 = 0x0005;
     const WM_SETCURSOR: u32 = 0x0020;
@@ -1782,10 +1854,11 @@ fn retarget_and_check_messages(
     const HTCLIENT: isize = 1;
     let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
     let mut round = 0;
+    wait_for_fullscreen_start(progress)?;
+    let mut observed_transitions = 0;
+    let mut rounds_without_transition = 0;
     while round < MAX_RETARGET_ROUNDS
-        && (round < RETARGET_ROUNDS
-            || (progress.transitions.load(Ordering::Acquire) < FULLSCREEN_TRIPS
-                && !progress.fullscreen_stopped.load(Ordering::Acquire)))
+        && (round < RETARGET_ROUNDS || observed_transitions < FULLSCREEN_TRIPS)
     {
         let even = round.is_multiple_of(2);
         let (target, left) = if even {
@@ -1796,6 +1869,11 @@ fn retarget_and_check_messages(
         let (width, height): (u32, u32) = if even { (400, 300) } else { (320, 200) };
 
         let mut pp = windowed_params(target, 640, 480);
+        if round == 0 {
+            started.send(()).map_err(|_| {
+                "the fullscreen worker stopped before windowed work began".to_owned()
+            })?;
+        }
         let hr = h.reset_params(&mut pp);
         if hr != D3D_OK {
             return Err(format!(
@@ -1841,11 +1919,31 @@ fn retarget_and_check_messages(
         // for each to answer; the pump is that answer.
         let _ = h.pump();
         round += 1;
+        rounds_without_transition += 1;
+        while let Ok(transitions) = progress.try_recv() {
+            if transitions > observed_transitions {
+                observed_transitions = transitions;
+                rounds_without_transition = 0;
+            }
+        }
+        if round >= RETARGET_ROUNDS
+            && observed_transitions < FULLSCREEN_TRIPS
+            && rounds_without_transition >= RETARGET_ROUNDS
+        {
+            observed_transitions = wait_for_transition(progress, observed_transitions)?;
+            rounds_without_transition = 0;
+        }
+    }
+    if round == MAX_RETARGET_ROUNDS && observed_transitions < FULLSCREEN_TRIPS {
+        return Err(format!(
+            "reached the {MAX_RETARGET_ROUNDS}-round bound before the fullscreen worker completed \
+             {FULLSCREEN_TRIPS} round trips"
+        ));
     }
     Ok(round)
 }
 
-/// Take one device through fullscreen and back until every windowed worker is done.
+/// Take one device through the required fullscreen round trips.
 ///
 /// Each round trip is the `Reset` pair that moves the device's window: onto
 /// the monitor at the display's own resolution, which is a settable mode
@@ -1853,11 +1951,16 @@ fn retarget_and_check_messages(
 /// round trips completed; `Err` names the first `Reset` that failed.
 fn cycle_fullscreen(
     h: &Harness,
-    progress: &RetargetProgress,
-    windowed_workers: usize,
+    progress: &[Sender<u32>],
+    finished: &AtomicUsize,
 ) -> Result<u32, String> {
     let mut trips = 0;
-    while progress.finished.load(Ordering::Acquire) < windowed_workers {
+    while trips < FULLSCREEN_TRIPS {
+        if finished.load(Ordering::Acquire) != 0 {
+            return Err(format!(
+                "a windowed worker stopped after {trips} of {FULLSCREEN_TRIPS} round trips"
+            ));
+        }
         h.hold_display_mode();
         let (screen_w, screen_h) = Harness::screen_size();
         let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
@@ -1875,7 +1978,7 @@ fn cycle_fullscreen(
             ));
         }
         trips += 1;
-        progress.transitions.store(trips, Ordering::Release);
+        publish_transition(progress, trips)?;
     }
     Ok(trips)
 }
@@ -1893,38 +1996,82 @@ fn cycle_fullscreen(
 /// is shared by every device in the process sends the other devices'
 /// messages to the default procedure for the duration of the move, so the
 /// back buffer stays at the size the `Reset` gave it and the class cursor
-/// replaces the device's. Every device and window is created and torn down
-/// one thread at a time: the driver's window teardown and another thread's
-/// window update take two locks in opposite orders.
+/// replaces the device's. The fullscreen worker waits until all three
+/// windowed workers are held at the start boundary, then owns the display
+/// mode before releasing them, so a delayed fullscreen start cannot consume
+/// the bounded retarget rounds. After release, every windowed worker enters a
+/// measured round before the fullscreen cycles begin, and each pauses after a
+/// bounded burst without fullscreen progress. Every device and window is
+/// created and torn down one thread at a time: the driver's window teardown
+/// and another thread's window update take two locks in opposite orders.
 #[test]
 fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
     const WINDOWED_WORKERS: usize = 3;
-    let progress = RetargetProgress {
-        transitions: AtomicU32::new(0),
-        fullscreen_stopped: AtomicBool::new(false),
-        finished: AtomicUsize::new(0),
-    };
+    let finished = AtomicUsize::new(0);
     let one_at_a_time = Mutex::new(());
-    let armed = Barrier::new(WINDOWED_WORKERS + 1);
     let done = Barrier::new(WINDOWED_WORKERS + 1);
+    let (ready_sender, ready_receiver) = channel();
+    let (started_sender, started_receiver) = channel();
+    let (progress_senders, progress_receivers): (Vec<_>, Vec<_>) =
+        (0..WINDOWED_WORKERS).map(|_| channel()).unzip();
 
     std::thread::scope(|scope| {
-        let fullscreen = spawn_scoped(scope, || {
-            let h = {
+        let fullscreen = spawn_scoped(scope, {
+            let done = &done;
+            let finished = &finished;
+            let one_at_a_time = &one_at_a_time;
+            move || {
+                let h = {
+                    let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+                    Harness::new()
+                };
+                let outcome = wait_for_windowed_workers(
+                    &ready_receiver,
+                    WINDOWED_WORKERS,
+                    "the fullscreen ownership boundary",
+                )
+                .and_then(|()| {
+                    std::thread::sleep(DELAYED_FULLSCREEN_START);
+                    match started_receiver.try_recv() {
+                        Err(TryRecvError::Empty) => Ok(()),
+                        Ok(()) => Err(
+                            "a windowed worker began retargeting before fullscreen display \
+                             ownership"
+                                .to_owned(),
+                        ),
+                        Err(TryRecvError::Disconnected) => {
+                            Err("a windowed worker stopped during the delayed start".to_owned())
+                        }
+                    }
+                })
+                .and_then(|()| {
+                    h.hold_display_mode();
+                    publish_transition(&progress_senders, 0)
+                })
+                .and_then(|()| {
+                    wait_for_windowed_workers(
+                        &started_receiver,
+                        WINDOWED_WORKERS,
+                        "the first measured round",
+                    )
+                })
+                .and_then(|()| cycle_fullscreen(&h, &progress_senders, finished));
+                drop(progress_senders);
+                done.wait();
                 let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
-                Harness::new()
-            };
-            armed.wait();
-            let outcome = cycle_fullscreen(&h, &progress, WINDOWED_WORKERS);
-            progress.fullscreen_stopped.store(true, Ordering::Release);
-            done.wait();
-            let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
-            drop(h);
-            outcome
+                drop(h);
+                outcome
+            }
         });
-        let windowed: Vec<_> = (0..WINDOWED_WORKERS)
-            .map(|_| {
-                spawn_scoped(scope, || {
+        let windowed: Vec<_> = progress_receivers
+            .into_iter()
+            .map(|progress| {
+                let done = &done;
+                let finished = &finished;
+                let one_at_a_time = &one_at_a_time;
+                let ready_sender = ready_sender.clone();
+                let started_sender = started_sender.clone();
+                spawn_scoped(scope, move || {
                     let (h, second, ours) = {
                         let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                         let h = Harness::new();
@@ -1943,9 +2090,21 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
                         assert_ne!(ours, 0, "ShowCursor(TRUE) must realize an HCURSOR");
                         (h, second, ours)
                     };
-                    armed.wait();
-                    let outcome = retarget_and_check_messages(&h, second, ours, &progress);
-                    progress.finished.fetch_add(1, Ordering::AcqRel);
+                    let outcome = ready_sender
+                        .send(())
+                        .map_err(|_| {
+                            "the fullscreen worker stopped before the start boundary".to_owned()
+                        })
+                        .and_then(|()| {
+                            retarget_and_check_messages(
+                                &h,
+                                second,
+                                ours,
+                                &progress,
+                                &started_sender,
+                            )
+                        });
+                    finished.fetch_add(1, Ordering::AcqRel);
                     done.wait();
                     let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                     drop(h);
@@ -1954,6 +2113,8 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
                 })
             })
             .collect();
+        drop(ready_sender);
+        drop(started_sender);
 
         for (index, worker) in windowed.into_iter().enumerate() {
             let rounds = worker
