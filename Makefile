@@ -48,16 +48,18 @@ ISOLATED_REGISTRY := $(patsubst %,%/mtld3d-isolated-roots,$(shell git rev-parse 
 ISOLATED_CLEANING := $(if $(MAKECMDGOALS),$(if $(filter-out clean-isolated clean-isolated-orphans,$(MAKECMDGOALS)),,1))
 
 ifeq ($(ISOLATED),1)
+ISOLATED_SDK_SOURCE := $(WINE_SDK)
 ISOLATED_PREFIX_SOURCE := $(or $(WINEPREFIX),$(HOME)/.wine)
 ifneq ($(ISOLATED_CLEANING),1)
-$(shell [ -d $(ISOLATED_ROOT)/sdk ] || $(call clone_tree,$(WINE_SDK),$(ISOLATED_ROOT)/sdk))
+$(shell [ -d $(ISOLATED_ROOT)/sdk ] || $(call clone_tree,$(ISOLATED_SDK_SOURCE),$(ISOLATED_ROOT)/sdk))
 $(shell [ -d $(ISOLATED_ROOT)/prefix ] || [ ! -d $(ISOLATED_PREFIX_SOURCE) ] || $(call clone_tree,$(ISOLATED_PREFIX_SOURCE),$(ISOLATED_ROOT)/prefix))
 $(if $(ISOLATED_REGISTRY),$(shell grep -qxF '$(CURDIR)' '$(ISOLATED_REGISTRY)' 2>/dev/null || echo '$(CURDIR)' >> '$(ISOLATED_REGISTRY)'))
 endif
-WINE_SDK := $(ISOLATED_ROOT)/sdk
-WINE_INSTALL_DIR := $(ISOLATED_ROOT)/sdk
-export WINEPREFIX := $(ISOLATED_ROOT)/prefix
-$(info ==> ISOLATED=1: Wine SDK, install dir and prefix under $(ISOLATED_ROOT))
+override WINE_SDK := $(ISOLATED_ROOT)/sdk
+override WINE_INSTALL_DIR := $(ISOLATED_ROOT)/sdk
+override WINEPREFIX := $(ISOLATED_ROOT)/prefix
+export WINEPREFIX
+$(info ==> ISOLATED=1: WINE_SDK=$(WINE_SDK) WINE_INSTALL_DIR=$(WINE_INSTALL_DIR) WINEPREFIX=$(WINEPREFIX))
 endif
 export WINE_SDK
 
@@ -317,7 +319,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
-	clippy-native audit doc doc-windows doc-unix check clean upgrade \
+	clippy-native audit test-isolation doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -967,6 +969,9 @@ clippy-native:
 audit:
 	./scripts/audit.sh
 
+test-isolation:
+	python3 scripts/test-isolation.py
+
 # rustdoc's own lints, which no other target sees: broken and private intra-doc
 # links, malformed HTML in doc comments. `audit` gates the *shape* of a doc block
 # and clippy gates its prose; only rustdoc knows whether its links resolve.
@@ -983,14 +988,15 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# conventions audit, and the doc build. fmt-check first (fast, fails early on
-# drift); clippy reuses the target above; audit is pure grep; doc last. Each leg
-# is also its own target, so CI runs them as parallel jobs instead of this
-# sequence.
+# conventions audit, the Makefile isolation regression, and the doc build.
+# fmt-check first (fast, fails early on drift); clippy reuses the target above;
+# audit and test-isolation are fast; doc stays last. Each leg is also its own
+# target, so CI runs them as parallel jobs instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
 	$(MAKE) audit
+	$(MAKE) test-isolation
 	$(MAKE) doc
 
 clean:
