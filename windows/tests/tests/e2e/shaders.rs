@@ -1310,6 +1310,78 @@ const PS_SAMPLE_2D: [u32; 15] = [
     0x0000_FFFF,                                        // end
 ];
 
+/// `ps_3_0` sampling `s0.bbbb` into `r0.xz` after priming the other lanes.
+#[rustfmt::skip]
+const PS_SAMPLE_SWIZZLED: [u32; 24] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x3F80_0000, 0x0000_0000, 0x3F80_0000, //   0, 1, 0, 1
+    0x0200_0001, 0x800F_0000, 0xA0E4_0000,              // mov r0, c0
+    0x0300_0042, 0x8005_0000, 0x90E4_0000, 0xA0AA_0800, // texld r0.xz, v0, s0.bbbb
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn sampler_result_swizzle_precedes_the_destination_write_mask() {
+    let h = Harness::new();
+    let texture = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut locked = texture.lock_rect(0, 0);
+        locked.write_u32(&[0x8020_4060]);
+    }
+    assert_eq!(h.set_texture(0, &texture), 0, "bind texture");
+    for (state, value) in [
+        (mtld3d_types::D3DSAMP_MINFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MAGFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MIPFILTER, mtld3d_types::D3DTEXF_NONE),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+
+    let vs = h.create_vertex_shader(&VS_TEXCOORD_PASSTHROUGH);
+    let ps = h.create_pixel_shader(&PS_SAMPLE_SWIZZLED);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 0.5,
+        v: 0.5,
+        w: 0.0,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0xFF60_FF60,
+        "the source blue lane is replicated into the written red and blue lanes"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind stage 0");
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
 /// [`PS_SAMPLE_2D`] with `dcl_texcoord0 v0.xyz` and `dcl_volume s0`.
 #[rustfmt::skip]
 const PS_SAMPLE_VOLUME: [u32; 15] = [
