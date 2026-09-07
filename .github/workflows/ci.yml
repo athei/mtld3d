@@ -133,6 +133,9 @@ jobs:
       - name: audit
         if: ${{ !cancelled() }}
         run: make audit
+      - name: test-isolation
+        if: ${{ !cancelled() }}
+        run: make test-isolation
       - name: doc-unix
         if: ${{ !cancelled() }}
         run: make doc-unix
