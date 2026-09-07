@@ -886,6 +886,8 @@ pub struct FrameEncoder {
     /// the previous draw in the same Metal render encoder. Reset on every
     /// new-pass entry from `begin_render_pass_if_needed`.
     last_bound: LastBoundCache,
+    /// Derived LOD-bias uniform, keyed independently of per-pass bindings.
+    lod_bias_table: sampler_state::LodBiasTableCache,
     /// Immutable VS/PS snapshots, valid only within their owning frame and encoder.
     vs_bound_constants: SnapshotBytesCache<ScratchSlice>,
     ps_bound_constants: SnapshotBytesCache<ScratchSlice>,
@@ -1562,6 +1564,7 @@ impl FrameEncoder {
         Self {
             pass_state: PassState::new(),
             last_bound: LastBoundCache::new(),
+            lod_bias_table: sampler_state::LodBiasTableCache::new(),
             vs_bound_constants: SnapshotBytesCache::new(),
             ps_bound_constants: SnapshotBytesCache::new(),
             scratch: ScratchArena::new(),
@@ -5064,6 +5067,23 @@ impl FrameEncoder {
     /// hasn't changed since the previous draw in the current pass.
     pub const fn last_bound(&mut self) -> &mut LastBoundCache {
         &mut self.last_bound
+    }
+
+    /// Allocate the effective LOD-bias table when this pass needs its binding.
+    #[must_use]
+    pub fn alloc_lod_bias_if_changed(
+        &mut self,
+        biases: &[f32; sampler_state::LOD_BIAS_SLOTS],
+    ) -> Option<u64> {
+        let _ = self.lod_bias_table.update(biases);
+        if self
+            .last_bound
+            .ps_lod_bias_changed(self.lod_bias_table.bytes())
+        {
+            Some(self.scratch.alloc(self.lod_bias_table.bytes()))
+        } else {
+            None
+        }
     }
 
     /// Raw pointer to the `OpSub` slot of the encoder's per-frame perf accumulator.
