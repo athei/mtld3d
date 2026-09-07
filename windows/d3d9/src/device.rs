@@ -5741,13 +5741,11 @@ fn create_color_target_surface(
     // back rather than re-deriving the rule.
     // SAFETY: `device_inner` is the live owning device, non-null for every
     // caller of this fn (they hold it from the device thunk).
-    let scale = unsafe { &*device_inner }.scale_for_created_target(
-        width,
-        height,
-        usage & D3DUSAGE_RENDERTARGET != 0,
-    );
+    let device = unsafe { &*device_inner };
+    let scale = device.scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0);
     let mut params = CreateColorTargetParams {
         device_handle,
+        queue_handle: device.queue_handle(),
         width: scale.dimension(width),
         height: scale.dimension(height),
         pixel_format: mapping.metal_pixel_format(),

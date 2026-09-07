@@ -666,6 +666,16 @@ bitflags! {
         const HAS_SWIZZLE = 1 << 0;
         const TYPE_3D = 1 << 1;
         const TYPE_CUBE = 1 << 2;
+        /// Zero every subresource before handing the texture back.
+        ///
+        /// Set for a colour texture whose pixels are draw output rather than
+        /// upload: nothing else ever writes it, so whatever a draw leaves
+        /// untouched is what the application reads. D3D9 leaves initial
+        /// contents undefined, but some applications rely on zeroed render
+        /// targets. Clear colour targets at creation so untouched pixels read
+        /// as black: an effect target composited in full but only ever drawn
+        /// into in part must not carry another resource's content.
+        const CLEAR_ON_CREATE = 1 << 3;
     }
 }
 

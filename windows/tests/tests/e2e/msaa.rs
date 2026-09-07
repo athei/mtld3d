@@ -369,6 +369,58 @@ fn multisampled_render_target_resolves_the_edge() {
 }
 
 #[test]
+fn a_fresh_multisampled_target_keeps_undrawn_pixels_transparent_black() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let back = h.render_target(0);
+    let resolved = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    // Seed both the single-sample backing and the MSAA companion before
+    // retiring them. A resolve readback waits for those writes to reach the
+    // GPU; the next Present lets their textures retire after unbinding.
+    for _ in 0..4 {
+        let painted = h.create_render_target_ms(
+            (RT_SIZE, RT_SIZE),
+            D3DFMT_A8R8G8B8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        );
+        assert_eq!(h.set_render_target(0, &painted), D3D_OK);
+        assert_eq!(h.clear_target(WHITE), D3D_OK);
+        assert_eq!(h.set_render_target(0, &back), D3D_OK);
+        assert_eq!(h.stretch_rect(&painted, &resolved, D3DTEXF_NONE), D3D_OK);
+        assert!(render_target_row(&h, &resolved).iter().all(|&p| p == WHITE));
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    arm(&h);
+    assert_eq!(h.set_render_target(0, &fresh), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    // No Clear: the draw must load the companion's creation contents and
+    // preserve them outside the triangle, including alpha.
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.5, BLUE),
+        ),
+        D3D_OK,
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.set_render_target(0, &back), D3D_OK);
+    assert_eq!(h.stretch_rect(&fresh, &resolved, D3DTEXF_NONE), D3D_OK);
+    let row = render_target_row(&h, &resolved);
+    assert_eq!(row[INSIDE_X as usize], BLUE, "the draw reached the target");
+    assert!(
+        row[(RT_SIZE * 3 / 4) as usize..].iter().all(|&p| p == 0),
+        "pixels beyond the triangle stay transparent black after resolve: {row:08X?}",
+    );
+}
+
+#[test]
 fn multisampled_back_buffer_presents_a_resolved_edge() {
     let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
     let bb = h.back_buffer(0);

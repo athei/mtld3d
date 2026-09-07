@@ -12,7 +12,7 @@ use mtld3d_shared::{
     MetalHandle, OpenLogParams, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
     StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
     VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
-    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
+    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
@@ -395,12 +395,9 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateBackbufferParams = &mut params;
 
-    let Some((handle, srgb_handle)) = metal::create_backbuffer(
-        params.device_handle,
-        params.queue_handle,
-        params.width,
-        params.height,
-    ) else {
+    let Some((handle, srgb_handle)) =
+        metal::create_backbuffer(params.device_handle, params.width, params.height)
+    else {
         error!(
             target: LOG_TARGET,
             "failed to create {}x{} backbuffer (samples={})",
@@ -440,6 +437,11 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     // `msaa_srgb_handle` (0 when the companion has no sRGB twin).
     params.msaa_srgb_texture_handle =
         unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
+    metal::clear_new_color_textures(
+        params.queue_handle,
+        &[params.texture_handle, params.msaa_texture_handle],
+        metal::OPAQUE_BLACK,
+    );
     // debug, not info: it fires per-frame during a Reset-driven
     // window drag. The CreateDevice + AttachMetalLayer info
     // lines already cover the boot-time milestone.
@@ -712,6 +714,11 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     // `msaa_srgb_handle` (0 when the companion has no sRGB twin).
     params.msaa_srgb_texture_handle =
         unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
+    metal::clear_new_color_textures(
+        params.queue_handle,
+        &[params.texture_handle, params.msaa_texture_handle],
+        metal::TRANSPARENT_BLACK,
+    );
     STATUS_SUCCESS
 }
 
@@ -773,6 +780,9 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
         )
     };
     let mut any_failed = false;
+    // Collected rather than cleared per element, so the batch costs one
+    // command buffer instead of one each.
+    let mut clear_on_create: Vec<MetalHandle<MTLTextureKind>> = Vec::new();
     for ((desc, slot), srgb_slot) in descs.iter().zip(handles.iter_mut()).zip(srgb_handles) {
         if let Some((handle, srgb_handle)) = metal::create_texture(&device, desc) {
             // SAFETY: `create_texture` returns the raw u64s of freshly
@@ -780,6 +790,9 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             *slot = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
             // SAFETY: as above; 0 (no twin) adopts as NULL.
             *srgb_slot = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
+            if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
+                clear_on_create.push(*slot);
+            }
         } else {
             *slot = MetalHandle::NULL;
             *srgb_slot = MetalHandle::NULL;
@@ -791,6 +804,11 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             );
         }
     }
+    metal::clear_new_color_textures(
+        params.queue_handle,
+        &clear_on_create,
+        metal::TRANSPARENT_BLACK,
+    );
     if any_failed {
         STATUS_UNSUCCESSFUL
     } else {
