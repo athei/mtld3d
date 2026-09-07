@@ -50,8 +50,8 @@ use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
     PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
     copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
-    first_pending, geometry_settled, present_route, readback_completed, submit_frame, submit_frame_with,
-    submit_upload_cmd_buf, wait_for_gpu_retire,
+    first_pending, geometry_settled, present_route, readback_completed, submit_frame,
+    submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.

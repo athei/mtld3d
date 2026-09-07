@@ -6203,7 +6203,7 @@ extern "system" fn device_update_surface(
         if !copied {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
-                "reject UpdateSurface: source region outside the destination mip → INVALIDCALL"
+                "reject UpdateSurface: staging copy failed → INVALIDCALL"
             );
             return D3DERR_INVALIDCALL;
         }
@@ -6248,7 +6248,7 @@ extern "system" fn device_update_surface(
         if !copied {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
-                "reject UpdateSurface: source region outside the destination mip → INVALIDCALL"
+                "reject UpdateSurface: staging copy failed → INVALIDCALL"
             );
             return D3DERR_INVALIDCALL;
         }
@@ -6332,15 +6332,15 @@ extern "system" fn device_update_texture(
                     let sw = src.mip_width(src_level);
                     let sh = src.mip_height(src_level);
                     let Some(c) = dr.clamp(sw, sh) else { continue };
-                    if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
-                        let _ = dst.update_cube_sub_region_from(
+                    let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
+                        dst.update_cube_sub_region_from(
                             (face, level),
                             src,
                             face,
                             src_level,
                             None,
                             (0, 0),
-                        );
+                        )
                     } else {
                         let rect = (
                             c.x.cast_signed(),
@@ -6348,14 +6348,19 @@ extern "system" fn device_update_texture(
                             (c.x + c.w).cast_signed(),
                             (c.y + c.h).cast_signed(),
                         );
-                        let _ = dst.update_cube_sub_region_from(
+                        dst.update_cube_sub_region_from(
                             (face, level),
                             src,
                             face,
                             src_level,
                             Some(rect),
                             (c.x.cast_signed(), c.y.cast_signed()),
-                        );
+                        )
+                    };
+                    if !copied {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "reject UpdateTexture: cube staging copy failed → INVALIDCALL");
+                        return D3DERR_INVALIDCALL;
                     }
                 }
             }
@@ -6402,9 +6407,9 @@ extern "system" fn device_update_texture(
             let sw = src.mip_width(src_level);
             let sh = src.mip_height(src_level);
             let Some(c) = dr.clamp(sw, sh) else { continue };
-            if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
+            let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                 // Whole mip.
-                let _ = dst.update_sub_region_from(level, src, src_level, None, (0, 0));
+                dst.update_sub_region_from(level, src, src_level, None, (0, 0))
             } else {
                 let rect = (
                     c.x.cast_signed(),
@@ -6412,13 +6417,18 @@ extern "system" fn device_update_texture(
                     (c.x + c.w).cast_signed(),
                     (c.y + c.h).cast_signed(),
                 );
-                let _ = dst.update_sub_region_from(
+                dst.update_sub_region_from(
                     level,
                     src,
                     src_level,
                     Some(rect),
                     (c.x.cast_signed(), c.y.cast_signed()),
-                );
+                )
+            };
+            if !copied {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "reject UpdateTexture: staging copy failed → INVALIDCALL");
+                return D3DERR_INVALIDCALL;
             }
         }
         D3D_OK
@@ -7086,10 +7096,9 @@ extern "system" fn device_stretch_rect(
             .flags
             .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
     {
-        convert_stretch_dst_staging(
+        return convert_stretch_dst_staging(
             &obj, src_surf, dst_surf, &src_info, &dst_info, src_region, dst_region,
         );
-        return D3D_OK;
     }
     let render_quad = scaling || cross_format;
 
@@ -7196,9 +7205,15 @@ fn convert_stretch_dst_staging(
     dst_info: &StretchSurfaceInfo,
     src_region: mtld3d_core::stretch_rect::StretchRegion,
     dst_region: mtld3d_core::stretch_rect::StretchRegion,
-) {
+) -> i32 {
     if src_surf.is_null() || dst_surf.is_null() {
-        return;
+        return D3D_OK;
+    }
+    if !mtld3d_core::pixel_convert::can_convert(src_info.format, dst_info.format) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "StretchRect: cross-format offscreen pair (src=0x{:x}, dst=0x{:x}) not CPU-convertible → skipped (HR OK)",
+            src_info.format, dst_info.format);
+        return D3D_OK;
     }
     // SAFETY: caller-supplied live `Direct3DSurface9*` from the StretchRect
     // thunk (non-null checked above).
@@ -7210,7 +7225,7 @@ fn convert_stretch_dst_staging(
             target: crate::LOG_TARGET,
             "StretchRect: cross-format offscreen dst has no distinct texture backing → skipped (HR OK)"
         );
-        return;
+        return D3D_OK;
     }
     // SAFETY: non-null (checked) and a live `Direct3DTexture9` kept alive by
     // the source surface's reference.
@@ -7234,15 +7249,16 @@ fn convert_stretch_dst_staging(
     if !converted {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "StretchRect: cross-format offscreen pair (src=0x{:x}, dst=0x{:x}) not CPU-convertible → skipped (HR OK)",
+            "StretchRect: cross-format offscreen pair (src=0x{:x}, dst=0x{:x}) staging conversion failed → INVALIDCALL",
             src_info.format,
             dst_info.format
         );
-        return;
+        return D3DERR_INVALIDCALL;
     }
     // Upload the converted staging to the destination's Metal texture, mirroring
     // the GPU blit the same-format offscreen path emits.
     crate::texture::flush_dirty_mips(dst_tex.inner_mut(), obj.inner());
+    D3D_OK
 }
 
 /// Lazy texture upload: flush any pending dirty mips on the surfaces' parent textures.

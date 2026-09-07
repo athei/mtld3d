@@ -2693,14 +2693,6 @@ fn lockable_rt_lock_rect(
     if inner.system_memory.is_none() {
         return D3DERR_INVALIDCALL;
     }
-    // Re-locking an already-mapped surface returns INVALIDCALL with the
-    // caller's `D3DLOCKED_RECT` untouched (committed before any out-write).
-    if let Err(hr) = inner.try_begin_lock() {
-        return hr;
-    }
-    // Record the lock flags so `UnlockRect` can skip the staging→GPU upload for
-    // a `D3DLOCK_READONLY` lock (which never wrote the staging).
-    inner.lock_flags = flags;
     let Some(fmt) = mtld3d_core::format::map_d3d_format(inner.standalone_format) else {
         return D3DERR_INVALIDCALL;
     };
@@ -2710,6 +2702,10 @@ fn lockable_rt_lock_rect(
         // never reaches here (CreateRenderTarget rejects it).
         return D3DERR_INVALIDCALL;
     }
+    // Reject an existing mapping before any readback, without publishing a new lock.
+    if let Err(hr) = inner.try_begin_lock() {
+        return hr;
+    }
     // A sub-rect origin steps in whole pixels: `top * pitch + left * bpp`.
     let pitch = mtld3d_core::format::linear_row_pitch(inner.standalone_width, bpp);
     // A read (or read/modify) lock sees the current GPU content: sync the colour
@@ -2717,8 +2713,9 @@ fn lockable_rt_lock_rect(
     // skips it — the app will overwrite the whole surface. The read-back fills
     // the full surface (origin 0,0) so any sub-rect pointer derived below
     // indexes valid bytes.
-    if flags & D3DLOCK_DISCARD == 0 {
-        lockable_rt_readback_fill(inner, bpp);
+    if flags & D3DLOCK_DISCARD == 0 && !lockable_rt_readback_fill(inner, bpp) {
+        let _ = inner.try_end_lock();
+        return D3DERR_INVALIDCALL;
     }
     // SAFETY: `rect` is the *const D3DRECT delivered by LockRect; null → None.
     let (left, top) = unsafe { ValueIn::<D3DRECT>::read_opt(rect) }
@@ -2726,8 +2723,10 @@ fn lockable_rt_lock_rect(
     let to_i = |v: u32| isize::try_from(v).unwrap_or(isize::MAX);
     let offset = top * to_i(pitch) + left * to_i(bpp);
     let Some(page) = inner.system_memory.as_mut() else {
+        let _ = inner.try_end_lock();
         return D3DERR_INVALIDCALL;
     };
+    inner.lock_flags = flags;
     // SAFETY: `locked_rect` is non-null (checked by the caller before entry)
     // and per the D3D9 ABI points to a writable `D3DLOCKED_RECT`.
     let out = unsafe { &mut *locked_rect };
@@ -2742,13 +2741,11 @@ fn lockable_rt_lock_rect(
 ///
 /// The entry point for a caller that has no byte size of its own to pass:
 /// resolves the format's bytes per pixel and defers to
-/// [`lockable_rt_readback_fill`], which leaves the staging alone for a format
-/// with no CPU byte size (unreachable, the surface's creation validated an
-/// uncompressed colour format).
-fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) {
+/// [`lockable_rt_readback_fill`], rejecting a format with no CPU byte size.
+fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) -> bool {
     let bpp = mtld3d_core::format::map_d3d_format(inner.standalone_format)
         .map_or(0, |f| f.bytes_per_pixel());
-    lockable_rt_readback_fill(inner, bpp);
+    lockable_rt_readback_fill(inner, bpp)
 }
 
 /// Read the lockable render target's colour `MTLTexture` back into its CPU staging buffer.
@@ -2759,32 +2756,32 @@ fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) {
 /// `BlitTextureToBuffer` core the backbuffer / `GetRenderTargetData` path
 /// uses. Marks the texture
 /// read-back BEFORE the flush so the store-action optimiser (Rule D) keeps the
-/// rendered content. A blit failure leaves the staging as-is (the zero-init /
-/// prior content) — the lock still succeeds.
-fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
+/// rendered content. A failed blit rejects the mapping; staging may contain
+/// only part of the requested pixels.
+fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     let (width, height) = (inner.standalone_width, inner.standalone_height);
     let tex_handle = inner.live_color_handle();
     if bpp == 0 || width == 0 || height == 0 || tex_handle.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "lockable RT read-back skipped: bpp={bpp} extent={width}x{height} color_handle={:#x} (staging left as-is)",
+            "lockable RT read-back skipped: bpp={bpp} extent={width}x{height} color_handle={:#x} (readback failed)",
             tex_handle.raw()
         );
-        return;
+        return false;
     }
     let bytes_per_row = mtld3d_core::format::linear_row_pitch(width, bpp);
     let needed = (bytes_per_row as usize).saturating_mul(height as usize);
     if needed == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "lockable RT read-back skipped: zero byte size for {width}x{height} at {bpp} bpp (staging left as-is)"
+            "lockable RT read-back skipped: zero byte size for {width}x{height} at {bpp} bpp (readback failed)"
         );
-        return;
+        return false;
     }
     let device_ptr = inner.device_inner;
     if device_ptr.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "lockable RT read-back skipped: surface has no owning device (staging left as-is)"
+            "lockable RT read-back skipped: surface has no owning device (readback failed)"
         );
-        return;
+        return false;
     }
     // Borrow the staging (the blit destination) and the device separately;
     // `device_inner` is a distinct allocation from the `system_memory` PageBox,
@@ -2793,14 +2790,14 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "lockable RT read-back skipped: surface carries no CPU staging buffer"
         );
-        return;
+        return false;
     };
     if page.len() < needed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "lockable RT read-back skipped: staging {} bytes, {needed} needed for {width}x{height} at {bpp} bpp (staging left as-is)",
+            "lockable RT read-back skipped: staging {} bytes, {needed} needed for {width}x{height} at {bpp} bpp (readback failed)",
             page.len()
         );
-        return;
+        return false;
     }
     let dst_ptr = page.as_mut_ptr() as u64;
     let dst_len = page.len() as u64;
@@ -2840,9 +2837,11 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) {
     let status = unix_call(&mut params);
     if status != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "lockable RT LockRect read-back: BlitTextureToBuffer failed status={status:#x} (staging left as-is)"
+            "lockable RT LockRect read-back: BlitTextureToBuffer failed status={status:#x} (readback failed)"
         );
+        return false;
     }
+    true
 }
 
 /// `UnlockRect` upload for a lockable standalone render target.
@@ -3177,9 +3176,9 @@ impl SurfaceInner {
 /// texture it owns and takes them the same way: a `StretchRect` or a `ColorFill`
 /// claims it exactly as it claims any other texture level. Only the claim half
 /// reaches a cube face, which keeps its staging for the texture's life.
-fn refill_dc_texture_level(inner: &SurfaceInner) {
+fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     if inner.parent_texture.is_null() {
-        return;
+        return true;
     }
     // A 2D level surface carries no face; its texture keeps one staging
     // allocation per level, which the mask indexes as face zero.
@@ -3192,7 +3191,7 @@ fn refill_dc_texture_level(inner: &SurfaceInner) {
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.materialize_subresource_for_dc(face, inner.mip_level as usize);
+    texture.materialize_subresource_for_dc(face, inner.mip_level as usize)
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.
@@ -3277,10 +3276,12 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
     // `ColorFill`, a draw or a `StretchRect` into the surface is invisible to
     // the DC, exactly as it would be to a `LockRect` that skipped the same
     // read-back.
-    if inner.is_lockable_render_target() {
-        refresh_lockable_rt_staging(inner);
+    if inner.is_lockable_render_target() && !refresh_lockable_rt_staging(inner) {
+        return D3DERR_INVALIDCALL;
     }
-    refill_dc_texture_level(inner);
+    if !refill_dc_texture_level(inner) {
+        return D3DERR_INVALIDCALL;
+    }
     let Some(px) = inner.dc_pixels() else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "IDirect3DSurface9::GetDC on a surface with no host pixel store → INVALIDCALL");

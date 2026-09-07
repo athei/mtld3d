@@ -484,7 +484,7 @@ impl TextureInner {
         self.level_authority.gpu_wrote(face, level);
     }
 
-    /// Make a subresource's staging the copy that defines it, before a write lands in it.
+    /// Prepare a subresource's staging before a map or CPU write.
     ///
     /// Every path that gives the staging that role goes through here first: a
     /// map, a `GetDC`, and each of the copies. A write covering the whole level
@@ -492,10 +492,17 @@ impl TextureInner {
     /// untouched would otherwise push staging the GPU's pixels never reached
     /// back over them. `face` is a cube face index and zero for every other
     /// texture kind.
-    fn move_subresource_to_staging(&mut self, face: u32, level: usize, whole_level: bool) {
+    fn move_subresource_to_staging(&mut self, face: u32, level: usize, whole_level: bool) -> bool {
         match self.level_authority.plan_write(face, level, whole_level) {
-            WritePlan::WriteStaging | WritePlan::Overwrite => {}
-            WritePlan::ReadBackFirst => materialize_subresource_from_gpu(self, face, level),
+            // An overwrite releases the claim only once the caller finishes its write.
+            WritePlan::WriteStaging | WritePlan::Overwrite => true,
+            WritePlan::ReadBackFirst => {
+                if !materialize_subresource_from_gpu(self, face, level) {
+                    return false;
+                }
+                self.level_authority.staging_wrote(face, level);
+                true
+            }
         }
     }
 
@@ -679,9 +686,9 @@ impl TextureInner {
     /// never received skip it and take the pages as allocated: the first
     /// because the caller declared the old contents dead, the second because
     /// there are none to read.
-    fn ensure_staging_for_lock(&mut self, level: usize, flags: u32) {
+    fn ensure_staging_for_lock(&mut self, level: usize, flags: u32) -> bool {
         if self.dropped_staging & (1u32 << level) == 0 {
-            return;
+            return true;
         }
         let readback = mtld3d_core::texture_staging::released_level_lock_needs_readback(flags)
             && self.was_uploaded[level];
@@ -695,7 +702,7 @@ impl TextureInner {
                  received them",
                 self.texture_id.raw()
             );
-            return;
+            return true;
         }
         if self.read_level_from_gpu(level) {
             // The staging is a byte-for-byte copy of what the GPU holds, so
@@ -711,15 +718,19 @@ impl TextureInner {
                  is read back from the GPU, one blocking flush and blit per lock",
                 self.texture_id.raw()
             );
-            return;
+            return true;
         }
+        // Reallocation cleared the dropped bit; keep the readback obligation
+        // on the GPU claim so a later map or partial write retries it.
+        self.level_authority.gpu_wrote(0, level);
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: self.texture_id.raw(),
             "texture {:#x}: lock of level {level} after its staging was released and the read \
-             back of it failed; the lock sees uninitialised pixels",
+             back of it failed; the mapping is rejected",
             self.texture_id.raw()
         );
+        false
     }
 
     /// Re-materialise a subresource's pixels for a `GetDC`.
@@ -732,11 +743,9 @@ impl TextureInner {
     /// upload holds them nowhere else at all. The subresource is the one its
     /// surface was handed out for; a cube never releases its staging, so only
     /// the claim applies to a face.
-    pub fn materialize_subresource_for_dc(&mut self, face: u32, level: usize) {
-        self.move_subresource_to_staging(face, level, false);
-        if self.cube.is_none() {
-            self.ensure_staging_for_lock(level, 0);
-        }
+    pub fn materialize_subresource_for_dc(&mut self, face: u32, level: usize) -> bool {
+        self.move_subresource_to_staging(face, level, false)
+            && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
 
     /// Fill `level`'s staging from the GPU copy of the texture.
@@ -744,8 +753,8 @@ impl TextureInner {
     /// Flushes the frame so every pending upload has landed, resolves the
     /// texture's Metal handle on the encoder thread, then blits the level into
     /// the staging pages and waits for it. Returns false when the texture sits
-    /// between devices, has no Metal texture yet, or the blit fails, all of
-    /// which leave the pages as they were allocated.
+    /// between devices, has no Metal texture yet, or the blit fails. A failed
+    /// GPU operation may have written only part of the destination.
     ///
     /// Takes `&self`: the pages are written through the `PageBox` raw-pointer
     /// accessors, the same way every other staging writer in this file reaches
@@ -1140,10 +1149,11 @@ impl TextureInner {
         };
         let (rx, ry, rw, rh) = (src_rect.x, src_rect.y, src_rect.w, src_rect.h);
         let (dx, dy) = (dst_rect.x, dst_rect.y);
-        // The copy is what defines the destination level from here on, so the
-        // level moves off the GPU before a byte of it is written.
+        // Preserve GPU-only pixels before a partial write reaches staging.
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(0, dst_level, whole);
+        if !self.move_subresource_to_staging(0, dst_level, whole) {
+            return false;
+        }
         self.ensure_staging(dst_level);
         self.prepare_volume_staging_write(dst_level);
         let (Some(dst_box), Some(src_box)) =
@@ -1266,7 +1276,9 @@ impl TextureInner {
             return false;
         };
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
+            return false;
+        }
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1426,10 +1438,11 @@ impl TextureInner {
         ) else {
             return false;
         };
-        // The conversion is what defines the destination level from here on, so
-        // the level moves off the GPU before a byte of it is written.
+        // Preserve GPU-only pixels before a partial conversion reaches staging.
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(0, dst_level, whole);
+        if !self.move_subresource_to_staging(0, dst_level, whole) {
+            return false;
+        }
         self.ensure_staging(dst_level);
         self.prepare_volume_staging_write(dst_level);
         let (Some(dst_box), Some(src_box)) =
@@ -1537,7 +1550,9 @@ impl TextureInner {
             return false;
         };
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
+            return false;
+        }
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1626,8 +1641,7 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
-        // The copy is what defines the destination level from here on, so the
-        // level moves off the GPU before a byte of it is written.
+        // Preserve GPU-only pixels before a partial write reaches staging.
         let whole = self.write_covers_level(
             dst_level,
             DirtyRect {
@@ -1637,7 +1651,9 @@ impl TextureInner {
                 h: rh,
             },
         );
-        self.move_subresource_to_staging(0, dst_level, whole);
+        if !self.move_subresource_to_staging(0, dst_level, whole) {
+            return false;
+        }
         self.ensure_staging(dst_level);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
@@ -1736,7 +1752,9 @@ impl TextureInner {
             h: rh,
         };
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
+            return false;
+        }
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -1836,7 +1854,9 @@ impl TextureInner {
             return false;
         };
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(0, dst_level, whole);
+        if !self.move_subresource_to_staging(0, dst_level, whole) {
+            return false;
+        }
         self.ensure_staging(dst_level);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
@@ -1892,7 +1912,9 @@ impl TextureInner {
             return false;
         };
         let whole = self.write_covers_level(dst_level, dst_rect);
-        self.move_subresource_to_staging(dst_face, dst_level, whole);
+        if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
+            return false;
+        }
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -2376,6 +2398,7 @@ impl TextureInner {
 
     /// The cube form of `mark_written_region`.
     fn mark_cube_written_region(&mut self, face: u32, level: usize, rect: DirtyRect) {
+        self.level_authority.staging_wrote(face, level);
         if self.write_covers_level(level, rect) {
             self.mark_cube_dirty(face, level);
         } else {
@@ -2420,11 +2443,13 @@ impl TextureInner {
         level: usize,
         rect: Option<DirtyRect>,
         flags: u32,
-    ) -> (*mut u8, u32, usize) {
+    ) -> Option<(*mut u8, u32, usize)> {
         if self.d3d_pool == D3DPOOL_DEFAULT && self.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
             DEFAULT_STATIC_LOCKS.fetch_add(1, Ordering::Relaxed);
         }
-        self.ensure_staging_for_lock(level, flags);
+        if !self.ensure_staging_for_lock(level, flags) {
+            return None;
+        }
         let pitch = self.mip_bytes_per_row[level];
         let offset = mtld3d_core::texture_staging::texture_lock_offset(
             rect,
@@ -2467,7 +2492,7 @@ impl TextureInner {
             // `decide_lock_action`; the staging `PageBox` holds at least
             // `offset + locked_bytes` bytes.
             let ptr = unsafe { base.add(offset) };
-            return (ptr, pitch, offset);
+            return Some((ptr, pitch, offset));
         }
 
         // `device_inner == 0` after `detach_from_device` — texture is
@@ -2520,7 +2545,7 @@ impl TextureInner {
         // (either in-place or freshly renamed) and holds at least
         // `offset + locked_bytes` bytes.
         let ptr = unsafe { base.add(offset) };
-        (ptr, pitch, offset)
+        Some((ptr, pitch, offset))
     }
 
     /// Rename one mip's staging while earlier uploads retain the old allocation.
@@ -2719,6 +2744,7 @@ impl TextureInner {
     /// one narrows the upload to the written union. Volume levels always mark
     /// whole: the upload path has no sub-rect form for them.
     fn mark_written_region(&mut self, level: usize, rect: DirtyRect) {
+        self.level_authority.staging_wrote(0, level);
         if self.write_covers_level(level, rect) || self.depth > 1 {
             self.mark_mip_dirty(level);
         } else {
@@ -3648,11 +3674,9 @@ unsafe fn hand_back_cached_surface(cached: u64, out: *mut *mut c_void) {
 /// `D3DPOOL_DEFAULT` texture). Flush the frame so the write has landed, then
 /// blit the subresource into its staging through the same
 /// `BlitTextureToBuffer` core `GetRenderTargetData` uses; a D3D9 Lock of a
-/// GPU-written surface stalls on a real driver too. The caller has already
-/// released the claim, so a subresource whose Metal handle or staging cannot
-/// serve the read costs one warning rather than one per map, and keeps the
-/// bytes it has.
-fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usize) {
+/// GPU-written surface stalls on a real driver too. A failed read keeps the
+/// GPU authoritative so a later map or partial write retries the readback.
+fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usize) -> bool {
     let (width, height) = (ti.mip_width(level), ti.mip_height(level));
     let bytes_per_row = ti.mip_bytes_per_row(level);
     let block_rows = height.div_ceil(ti.block_h.max(1));
@@ -3660,7 +3684,9 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     let device_inner_ptr = ti.device_inner;
     let texture_id = ti.texture_id;
     if device_inner_ptr == 0 || width == 0 || height == 0 || needed == 0 {
-        return;
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "texture {texture_id:#x}: face {face} level {level} read-back has no device or extent");
+        return false;
     }
     // A cube keeps its faces in the sidecar and never releases one; every other
     // texture kind may have to allocate the level's staging again first.
@@ -3670,14 +3696,14 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     let Some((dst_ptr, dst_len)) = ti.subresource_staging_backing(face, level) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: face {face} level {level} has no staging to read back \
-             into → staging left as-is");
-        return;
+             into → materialization failed");
+        return false;
     };
     if dst_len < needed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: face {face} level {level} staging is too small for a \
-             read-back ({dst_len} < {needed}) → staging left as-is");
-        return;
+             read-back ({dst_len} < {needed}) → materialization failed");
+        return false;
     }
     // The staging `PageBox` and the `DeviceInner` are distinct allocations, so
     // the raw-pointer borrow below never overlaps the slice read above.
@@ -3704,8 +3730,8 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     if handle == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: no Metal handle for a face {face} level {level} \
-             read-back → staging left as-is");
-        return;
+             read-back → materialization failed");
+        return false;
     }
     let mut params = BlitTextureToBufferParams {
         queue_handle: dev.queue_handle(),
@@ -3736,8 +3762,15 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     if status != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: face {face} level {level} read-back \
-             BlitTextureToBuffer failed status={status:#x} → staging left as-is");
+             BlitTextureToBuffer failed status={status:#x} → materialization failed");
+        return false;
     }
+    if ti.cube.is_none()
+        && let Some(coverage) = ti.staging_coverage.get_mut(level)
+    {
+        coverage.mark_full();
+    }
+    true
 }
 
 extern "system" fn texture_lock_rect(
@@ -3823,11 +3856,16 @@ extern "system" fn texture_lock_rect(
     // `D3DLOCK_DISCARD` is a whole-level one and promises a whole-level
     // overwrite, so it skips the stall and the claim goes with it: the staging
     // this Lock hands out is what the level holds next.
-    ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0);
+    if !ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0) {
+        return D3DERR_INVALIDCALL;
+    }
     let read_only = flags & D3DLOCK_READONLY != 0;
     let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
 
-    let (ptr, pitch, _offset) = ti.lock_region_ptr(level_u, dirty_rect, flags);
+    let Some((ptr, pitch, _offset)) = ti.lock_region_ptr(level_u, dirty_rect, flags) else {
+        return D3DERR_INVALIDCALL;
+    };
+    ti.level_authority.staging_wrote(0, level_u);
     ti.stash_lock(level_u, read_only, no_dirty, dirty_rect);
 
     // SAFETY: `out_locked_rect` is non-null (checked above) and per the
@@ -5388,10 +5426,13 @@ pub extern "system" fn cube_lock_rect(
     // may rename the box. A surviving `D3DLOCK_DISCARD` is a whole-level one and
     // promises a whole-level overwrite, so it skips the stall and the claim goes
     // with it.
-    ti.move_subresource_to_staging(face, level_u, flags & D3DLOCK_DISCARD != 0);
+    if !ti.move_subresource_to_staging(face, level_u, flags & D3DLOCK_DISCARD != 0) {
+        return D3DERR_INVALIDCALL;
+    }
     let Some((ptr, pitch)) = ti.cube_lock_region_ptr(face, level_u, dirty_rect, flags) else {
         return D3DERR_INVALIDCALL;
     };
+    ti.level_authority.staging_wrote(face, level_u);
     ti.cube_stash_lock(
         face,
         level_u,
