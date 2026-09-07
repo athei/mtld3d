@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{ExitKind, run};
+use super::{ExitKind, ProcessGroup, run};
 
 const DRIVER_HANG: &str = "Caused GPU Hang Error \
     (00000003:kIOAccelCommandBufferCallbackErrorHang)";
@@ -155,7 +155,7 @@ fn a_descendant_holding_stderr_does_not_park_the_run() {
 }
 
 #[test]
-fn reaping_a_killed_leader_stops_a_descendant_missed_by_the_first_signal() {
+fn observing_a_killed_leader_stops_a_descendant_missed_by_the_first_signal() {
     let path = script("missed-child", "sleep 30 &\necho ready\nwait\n");
     let mut child = Command::new("/bin/sh")
         .arg(path)
@@ -174,8 +174,11 @@ fn reaping_a_killed_leader_stops_a_descendant_missed_by_the_first_signal() {
     // leader models a group signal whose snapshot missed the new child,
     // without requiring the signal to race a particular fork instruction.
     child.kill().expect("kill group leader");
-    let status = super::wait_killed(&mut child).expect("reap group leader");
+    let pid = child.id();
     let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut group = ProcessGroup { child: Some(child) };
+    group.wait_killed().expect("observe group leader");
+    assert_waitable(pid);
     let (closed, eof) = mpsc::channel();
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -185,12 +188,148 @@ fn reaping_a_killed_leader_stops_a_descendant_missed_by_the_first_signal() {
     });
     let collected = eof.recv_timeout(Duration::from_secs(1));
     // Clean up the fixture even when the assertion below fails.
-    super::kill_group(&child);
+    group.kill().expect("clean up group");
     reader.join().expect("stderr reader");
+    assert_waitable(pid);
+    let status = group.reap().expect("reap group leader");
     assert!(!status.success());
     assert!(
         collected.is_ok(),
         "descendant kept stderr open: {collected:?}"
     );
     assert_eq!(collected.expect("EOF delivered").expect("read stderr"), 0);
+}
+
+#[test]
+fn observing_a_clean_exit_keeps_the_leader_waitable() {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "exit 7"])
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    let pid = child.id();
+    let mut group = ProcessGroup { child: Some(child) };
+    let gpu_hang = std::sync::atomic::AtomicBool::new(false);
+    let observed = super::wait_bounded(&mut group, Duration::from_secs(2), &gpu_hang)
+        .expect("observe group leader");
+    assert!(matches!(observed, super::Wait::Exited));
+    assert_waitable(pid);
+    assert!(
+        group
+            .observe_exit(libc::WNOHANG)
+            .expect("observe exit again")
+    );
+    assert_waitable(pid);
+    let status = group.reap().expect("reap group leader");
+    assert_eq!(status.code(), Some(7));
+    assert_reaped(pid);
+}
+
+#[test]
+fn a_killed_leader_stays_waitable_until_the_final_signal() {
+    let child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    let pid = child.id();
+    let mut group = ProcessGroup { child: Some(child) };
+    assert!(
+        !group
+            .observe_exit(libc::WNOHANG)
+            .expect("observe running child")
+    );
+    group.kill().expect("first group signal");
+    group.wait_killed().expect("observe exit and signal again");
+    assert_waitable(pid);
+    assert!(
+        group
+            .observe_exit(libc::WNOHANG)
+            .expect("observe exit again")
+    );
+    group.kill().expect("final group signal");
+    assert_waitable(pid);
+    let status = group.reap().expect("reap group leader");
+    assert!(!status.success());
+    assert_reaped(pid);
+}
+
+#[test]
+fn losing_the_waitable_child_disables_group_signals() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    // Model an external waiter consuming the child, without reusing any ID.
+    child.wait().expect("external reap");
+    let mut group = ProcessGroup { child: Some(child) };
+    let error = group
+        .kill()
+        .expect_err("must not signal after external reap");
+    assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+    assert!(group.child.is_none());
+    let error = group.kill().expect_err("ownership stays revoked");
+    assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+}
+
+#[test]
+fn dropping_an_unfinished_group_stops_and_reaps_its_leader() {
+    let child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    let pid = child.id();
+    drop(ProcessGroup { child: Some(child) });
+    assert_reaped(pid);
+}
+
+#[test]
+fn an_unexpected_wait_error_retains_ownership_for_cleanup() {
+    let child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    let pid = child.id();
+    let mut group = ProcessGroup { child: Some(child) };
+    let error = group
+        .observe_exit(libc::c_int::MAX)
+        .expect_err("invalid wait options");
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    assert!(group.child.is_some());
+    drop(group);
+    assert_reaped(pid);
+}
+
+fn assert_waitable(pid: u32) {
+    let info = observe_fixture(pid).expect("exit observation must not reap the leader");
+    assert_eq!(info.si_pid.unsigned_abs(), pid);
+}
+
+fn assert_reaped(pid: u32) {
+    match observe_fixture(pid) {
+        Ok(_) => panic!("final reap left a waitable child"),
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECHILD)),
+    }
+}
+
+fn observe_fixture(pid: u32) -> std::io::Result<libc::siginfo_t> {
+    // SAFETY: siginfo_t contains integers and raw pointers, all valid when zeroed.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: info is writable and P_PID selects only this fixture's direct child.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result == 0 {
+        Ok(info)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }

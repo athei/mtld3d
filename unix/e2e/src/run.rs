@@ -116,7 +116,7 @@ pub fn run(
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Exit, String> {
     let cwd = exe.parent().unwrap_or_else(|| Path::new("."));
-    let mut child = Command::new(wine)
+    let child = Command::new(wine)
         .arg(exe)
         .args(args)
         .current_dir(cwd)
@@ -127,6 +127,8 @@ pub fn run(
         .spawn()
         .map_err(|e| format!("failed to spawn {} {}: {e}", wine.display(), exe.display()))?;
 
+    let mut group = ProcessGroup { child: Some(child) };
+    let child = group.child.as_mut().expect("just spawned group leader");
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("stdout not piped")?;
     let stderr = child.stderr.take().ok_or("stderr not piped")?;
@@ -163,13 +165,17 @@ pub fn run(
     let mut last_line = Instant::now();
     loop {
         if gpu_hang.load(Ordering::Relaxed) {
-            kill_group(&child);
+            group
+                .kill()
+                .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
             reported_gpu_hang = true;
             break;
         }
         let since_line = last_line.elapsed();
         if since_line >= timeout {
-            kill_group(&child);
+            group
+                .kill()
+                .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
             timed_out = true;
             break;
         }
@@ -185,25 +191,34 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let (status, hung) = if reported_gpu_hang || timed_out {
-        let status = wait_killed(&mut child)
+    let hung = if reported_gpu_hang || timed_out {
+        group
+            .wait_killed()
             .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
-        (status, false)
+        false
     } else {
-        match wait_bounded(&mut child, timeout, &gpu_hang) {
-            Wait::Exited(status) => (status, false),
+        match wait_bounded(&mut group, timeout, &gpu_hang)
+            .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?
+        {
+            Wait::Exited => false,
             Wait::GpuHang => {
-                kill_group(&child);
+                group
+                    .kill()
+                    .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
                 reported_gpu_hang = true;
-                let status = wait_killed(&mut child)
+                group
+                    .wait_killed()
                     .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
-                (status, false)
+                false
             }
             Wait::TimedOut => {
-                kill_group(&child);
-                let status = wait_killed(&mut child)
+                group
+                    .kill()
+                    .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+                group
+                    .wait_killed()
                     .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?;
-                (status, true)
+                true
             }
         }
     };
@@ -212,11 +227,16 @@ pub fn run(
         // Something the kill did not reach still holds the pipe: a process
         // that put itself in another group. Say so, and try the kill once
         // more for whatever did land in the group since.
-        kill_group(&child);
+        group
+            .kill()
+            .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
         stderr.text.push_str(
             "[e2e] stderr not collected in full: the process tree held it open past the end\n",
         );
     }
+    let status = group
+        .reap()
+        .map_err(|e| format!("reap {} failed: {e}", exe.display()))?;
     let stderr = stderr.text;
     let kind = if timed_out {
         ExitKind::TimedOut(timeout)
@@ -264,54 +284,159 @@ fn drain_stderr(chunks: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Stderr {
     }
 }
 
-/// Reap a killed child and stop descendants its group signal missed.
-fn wait_killed(child: &mut Child) -> std::io::Result<ExitStatus> {
-    let status = child.wait()?;
-    // A group signal visits a snapshot: a child forked while it is sent
-    // can miss it and keep the pipes open. Reaping the leader ensures its
-    // in-flight fork has finished before the group is signalled again.
-    kill_group(child);
-    Ok(status)
+/// A group whose leader stays unreaped until all group signals have been sent.
+///
+/// On macOS an unreaped child reserves its PID and process-group membership.
+/// Only this owner waits for the child; observing exit with WNOWAIT retains
+/// that reservation. ECHILD revokes ownership instead of trusting a numeric ID.
+struct ProcessGroup {
+    child: Option<Child>,
+}
+
+impl ProcessGroup {
+    /// Observe exit without releasing the leader's PID or group membership.
+    fn observe_exit(&mut self, options: libc::c_int) -> std::io::Result<bool> {
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+        loop {
+            // SAFETY: siginfo_t contains integers and raw pointers, valid when zeroed.
+            // macOS leaves it untouched for WNOHANG when the child is still running.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: info is writable and P_PID selects this owner's direct child.
+            // WNOWAIT observes exit without consuming the child's waitable status.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT | options,
+                )
+            };
+            if result == 0 {
+                return Ok(info.si_pid != 0);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                self.child.take();
+            }
+            return Err(error);
+        }
+    }
+
+    /// Verify that the leader is still ours before signalling its group.
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.observe_exit(libc::WNOHANG)?;
+        self.signal_group()
+    }
+
+    /// Stop descendants a group signal's fork snapshot may have missed.
+    fn wait_killed(&mut self) -> std::io::Result<()> {
+        self.observe_exit(0)?;
+        // The leader has exited, so its in-flight fork has finished. WNOWAIT
+        // retains its group identity through this second signal and stderr drain.
+        self.signal_group()
+    }
+
+    /// Release the reserved identity, consuming the ability to signal the group.
+    fn reap(mut self) -> std::io::Result<ExitStatus> {
+        let result = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?
+            .wait();
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECHILD))
+        {
+            self.child.take();
+        }
+        result
+    }
+
+    /// Signal the group while its leader remains owned and unreaped.
+    fn signal_group(&mut self) -> std::io::Result<()> {
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+        let pid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
+        // SAFETY: the child spawned as its own group leader and remains unreaped,
+        // so its PID reserves this group's identity until the consuming reap.
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // macOS skips zombies when signalling a group and returns EPERM when
+        // no live member could be signalled. The retained zombie alone therefore
+        // produces EPERM too. This does not prove every descendant exited;
+        // an open stderr pipe still reports a survivor.
+        if error.raw_os_error() == Some(libc::ESRCH)
+            || (error.raw_os_error() == Some(libc::EPERM) && self.observe_exit(libc::WNOHANG)?)
+        {
+            return Ok(());
+        }
+        Err(error)
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        if let Err(error) = self.observe_exit(libc::WNOHANG) {
+            eprintln!("[e2e] observe process during cleanup failed: {error}");
+        }
+        // ECHILD means another waiter consumed the identity. Never signal it.
+        if self.child.is_none() {
+            return;
+        }
+        if let Err(error) = self.signal_group() {
+            eprintln!("[e2e] stop process group during cleanup failed: {error}");
+        }
+        if let Err(error) = self.wait_killed() {
+            eprintln!("[e2e] wait for stopped process during cleanup failed: {error}");
+        }
+        if let Some(mut child) = self.child.take()
+            && let Err(error) = child.wait()
+        {
+            eprintln!("[e2e] reap process during cleanup failed: {error}");
+        }
+    }
 }
 
 /// The result of waiting for a process after its stdout closed.
 enum Wait {
-    Exited(ExitStatus),
+    Exited,
     GpuHang,
     TimedOut,
 }
 
 /// Wait for exit, a driver hang report, or `timeout` after stdout closed.
-fn wait_bounded(child: &mut Child, timeout: Duration, gpu_hang: &AtomicBool) -> Wait {
+fn wait_bounded(
+    group: &mut ProcessGroup,
+    timeout: Duration,
+    gpu_hang: &AtomicBool,
+) -> std::io::Result<Wait> {
     let deadline = Instant::now() + timeout;
     loop {
-        // A wait that fails is treated as a process that will not exit: the
-        // caller kills the group and waits again, and that wait reports.
-        if let Ok(Some(status)) = child.try_wait() {
-            return Wait::Exited(status);
+        if group.observe_exit(libc::WNOHANG)? {
+            return Ok(Wait::Exited);
         }
         if gpu_hang.load(Ordering::Relaxed) {
-            return Wait::GpuHang;
+            return Ok(Wait::GpuHang);
         }
         if Instant::now() >= deadline {
-            return Wait::TimedOut;
+            return Ok(Wait::TimedOut);
         }
         thread::sleep(EXIT_POLL);
-    }
-}
-
-/// SIGKILL the child's process group: the child and everything it forked.
-///
-/// The child is its own group leader (`process_group(0)` at spawn), so the
-/// group id is its pid. A group that is already gone is not an error.
-fn kill_group(child: &Child) {
-    let Ok(pid) = i32::try_from(child.id()) else {
-        return;
-    };
-    // SAFETY: kill(2) with a negative pid signals the group; it touches no
-    // memory of ours and a stale id is reported as ESRCH, not acted on.
-    unsafe {
-        let _ = libc::kill(-pid, libc::SIGKILL);
     }
 }
 
