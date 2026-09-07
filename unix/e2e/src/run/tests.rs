@@ -2,7 +2,12 @@
 
 use std::{
     fs,
+    io::{BufRead, BufReader, Read},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -147,4 +152,45 @@ fn a_descendant_holding_stderr_does_not_park_the_run() {
         exit.stderr
     );
     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}
+
+#[test]
+fn reaping_a_killed_leader_stops_a_descendant_missed_by_the_first_signal() {
+    let path = script("missed-child", "sleep 30 &\necho ready\nwait\n");
+    let mut child = Command::new("/bin/sh")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn group leader");
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("stdout piped"))
+        .read_line(&mut ready)
+        .expect("read readiness");
+    assert_eq!(ready, "ready\n");
+    // The child exists before the parent is killed. Signalling only the
+    // leader models a group signal whose snapshot missed the new child,
+    // without requiring the signal to race a particular fork instruction.
+    child.kill().expect("kill group leader");
+    let status = super::wait_killed(&mut child).expect("reap group leader");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let (closed, eof) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        closed
+            .send(stderr.read_to_end(&mut bytes))
+            .expect("report EOF");
+    });
+    let collected = eof.recv_timeout(Duration::from_secs(1));
+    // Clean up the fixture even when the assertion below fails.
+    super::kill_group(&child);
+    reader.join().expect("stderr reader");
+    assert!(!status.success());
+    assert!(
+        collected.is_ok(),
+        "descendant kept stderr open: {collected:?}"
+    );
+    assert_eq!(collected.expect("EOF delivered").expect("read stderr"), 0);
 }
