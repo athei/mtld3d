@@ -157,6 +157,19 @@ fn dummy_draw() -> Command {
     Command::draw_primitives(mtld3d_shared::mtl::PrimitiveType::Triangle, 0, 3)
 }
 
+fn sampler_binds(texture: u64) -> [(CommandType, Command); 2] {
+    [
+        (
+            CommandType::SetFragmentTexture,
+            Command::set_fragment_texture(texture, 0),
+        ),
+        (
+            CommandType::SetVertexTexture,
+            Command::set_vertex_texture(texture, 0),
+        ),
+    ]
+}
+
 fn unpack_scissor(cmd: &Command) -> (u32, u32, u32, u32) {
     assert_eq!(cmd.cmd, CommandType::SetScissorRect as u32);
     let x = cmd.param_a;
@@ -168,49 +181,55 @@ fn unpack_scissor(cmd: &Command) -> (u32, u32, u32, u32) {
 }
 
 #[test]
-fn frame_sampled_textures_tracks_fragment_binds_in_stream_order() {
-    let mut s = fresh();
-    let atlas = tex(0x7E10);
-    // Not sampled before any draw emitted a bind — an upload landing
-    // here must NOT rename (no earlier draw reads the old content).
-    assert!(!s.texture_sampled_this_frame(atlas));
-    s.emit_command(Command::set_fragment_texture(atlas.raw(), 0));
-    assert!(s.texture_sampled_this_frame(atlas));
-    // Unrelated handle stays unsampled (a renamed-fresh texture
-    // relies on exactly this).
-    assert!(!s.texture_sampled_this_frame(tex(0x7E20)));
+fn frame_sampled_textures_tracks_sampler_binds_in_stream_order() {
+    for (stage, bind) in sampler_binds(0x7E10) {
+        let mut s = fresh();
+        let atlas = tex(0x7E10);
+        // Not sampled before any draw emitted a bind: an upload landing
+        // here must not rename because no earlier draw reads the old content.
+        assert!(!s.texture_sampled_this_frame(atlas), "{stage:?}");
+        s.emit_command(bind);
+        assert!(s.texture_sampled_this_frame(atlas), "{stage:?}");
+        // Unrelated handle stays unsampled (a renamed-fresh texture
+        // relies on exactly this).
+        assert!(!s.texture_sampled_this_frame(tex(0x7E20)), "{stage:?}");
+    }
 }
 
 #[test]
 fn frame_sampled_textures_clears_on_reset_frame() {
-    let mut s = fresh();
-    let atlas = tex(0x7E10);
-    s.emit_command(Command::set_fragment_texture(atlas.raw(), 0));
-    assert!(s.texture_sampled_this_frame(atlas));
-    s.reset_frame(&FrameReset {
-        backbuffer: backbuffer(),
-        backbuffer_srgb: backbuffer_srgb(),
-        backbuffer_msaa: MetalHandle::NULL,
-        backbuffer_msaa_srgb: MetalHandle::NULL,
-        backbuffer_sample_count: 1,
-        backbuffer_size: BB_SIZE,
-        backbuffer_format: BB_FORMAT,
-        depth_texture: depth(),
-        depth_size: BB_SIZE,
-        depth_has_stencil: false,
-        render_scale: RenderScale::IDENTITY,
-        continues_frame: false,
-    });
-    // Per-frame set resets — a next-frame upload before the first
-    // sample goes to the live texture again.
-    assert!(!s.texture_sampled_this_frame(atlas));
+    for (stage, bind) in sampler_binds(0x7E10) {
+        let mut s = fresh();
+        let atlas = tex(0x7E10);
+        s.emit_command(bind);
+        assert!(s.texture_sampled_this_frame(atlas), "{stage:?}");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_srgb: backbuffer_srgb(),
+            backbuffer_msaa: MetalHandle::NULL,
+            backbuffer_msaa_srgb: MetalHandle::NULL,
+            backbuffer_sample_count: 1,
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_size: BB_SIZE,
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        // Per-frame set resets: a next-frame upload before the first
+        // sample goes to the live texture again.
+        assert!(!s.texture_sampled_this_frame(atlas), "{stage:?}");
+    }
 }
 
 #[test]
 fn frame_sampled_textures_ignores_null_bind() {
-    let mut s = fresh();
-    s.emit_command(Command::set_fragment_texture(0, 0));
-    assert!(!s.texture_sampled_this_frame(tex(0)));
+    for (stage, bind) in sampler_binds(0) {
+        let mut s = fresh();
+        s.emit_command(bind);
+        assert!(!s.texture_sampled_this_frame(tex(0)), "{stage:?}");
+    }
 }
 
 #[test]
@@ -2145,40 +2164,67 @@ fn rule_e_carries_the_stencil_clear_into_the_merge_target() {
 
 #[test]
 fn rule_e_aborts_when_intervening_pass_samples_target() {
-    let rt = tex(0x4000);
-    // If something between the clear-only pass and the candidate
-    // merge target SAMPLES the texture, moving the Clear past it
-    // would change the read; the merge must be rejected.
-    let mut s = fresh();
-    // Pass 0: clear-only on rt.
-    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.clear_color(1, 2, 3, 4);
-    // Force the pending clear to materialise by hopping rt
-    // (combined flush).
-    s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
-    s.emit_command(dummy_draw());
-    // Re-attach rt and draw. Without the read at 0x5000 this would
-    // be a valid merge target, but the intervening sample disables it.
-    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw());
-    s.end_current_pass("test");
-    let before = s.passes().len();
-    s.coalesce_clear_only_passes();
-    // Coalesce must not delete the clear-only pass.
-    assert_eq!(s.passes().len(), before);
-    // rt's clear-only pass is still there with its Clear load action.
-    let cleared = s
-        .passes()
-        .iter()
-        .find(|p| p.color_texture() == rt && matches!(p.color_load(), ColorLoad::Clear { .. }))
-        .expect("clear-only rt pass must remain");
-    let cmds = cleared.commands();
-    let has_draw = cmds.iter().any(|c| {
-        c.cmd == mtld3d_shared::CommandType::DrawPrimitives as u32
-            || c.cmd == mtld3d_shared::CommandType::DrawIndexedPrimitives as u32
-    });
-    assert!(!has_draw);
+    for (stage, bind) in sampler_binds(0x4000) {
+        let rt = tex(0x4000);
+        // If something between the clear-only pass and the candidate
+        // merge target samples the texture, moving the Clear past it
+        // would change the read; the merge must be rejected.
+        let mut s = fresh();
+        // Pass 0: clear-only on rt.
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        // Force the pending clear to materialise by hopping rt
+        // (combined flush).
+        s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(bind);
+        s.emit_command(dummy_draw());
+        // Re-attach rt and draw. Without the read at 0x5000 this would
+        // be a valid merge target, but the intervening sample disables it.
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        let before = s.passes().len();
+        s.coalesce_clear_only_passes();
+        // Coalesce must not delete the clear-only pass.
+        assert_eq!(s.passes().len(), before, "{stage:?}");
+        // rt's clear-only pass is still there with its Clear load action.
+        let cleared = s
+            .passes()
+            .iter()
+            .find(|p| p.color_texture() == rt && matches!(p.color_load(), ColorLoad::Clear { .. }))
+            .expect("clear-only rt pass must remain");
+        let cmds = cleared.commands();
+        let has_draw = cmds.iter().any(|c| {
+            c.cmd == mtld3d_shared::CommandType::DrawPrimitives as u32
+                || c.cmd == mtld3d_shared::CommandType::DrawIndexedPrimitives as u32
+        });
+        assert!(!has_draw, "{stage:?}");
+    }
+}
+
+#[test]
+fn rule_e_aborts_when_intervening_pass_samples_target_through_srgb_twin() {
+    for (stage, bind) in sampler_binds(0x4001) {
+        let rt = tex(0x4000);
+        let twin = tex(0x4001);
+        let mut s = fresh();
+        s.register_srgb_twin(twin, rt);
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.clear_color(1, 2, 3, 4);
+        s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(bind);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        let before = s.passes().len();
+        s.coalesce_clear_only_passes();
+        assert_eq!(
+            s.passes().len(),
+            before,
+            "{stage:?}: a sampler bind through the sRGB twin reads the base target"
+        );
+    }
 }
 
 #[test]
@@ -2213,27 +2259,29 @@ fn rule_d_non_backbuffer_color_last_use_is_dontcare() {
 
 #[test]
 fn rule_d_keeps_store_when_color_sampled_later() {
-    let rt = tex(0x4000);
-    // A non-backbuffer color rt that IS sampled by a later pass
-    // must preserve its content; Rule D must NOT flip Store to
-    // DontCare for it.
-    let mut s = fresh();
-    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw());
-    s.set_color_render_target(
-        backbuffer(),
-        BB_SIZE.0,
-        BB_SIZE.1,
-        BB_FORMAT,
-        s.render_scale,
-    );
-    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
-    s.emit_command(dummy_draw());
-    s.end_current_pass("test");
-    s.finalize_store_actions(false);
-    assert_eq!(s.passes().len(), 2);
-    assert_eq!(s.passes()[0].color_texture(), rt);
-    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+    for (stage, bind) in sampler_binds(0x4000) {
+        let rt = tex(0x4000);
+        // A non-backbuffer color rt that is sampled by a later pass
+        // must preserve its content; Rule D must not flip Store to
+        // DontCare for it.
+        let mut s = fresh();
+        s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.emit_command(dummy_draw());
+        s.set_color_render_target(
+            backbuffer(),
+            BB_SIZE.0,
+            BB_SIZE.1,
+            BB_FORMAT,
+            s.render_scale,
+        );
+        s.emit_command(bind);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.finalize_store_actions(false);
+        assert_eq!(s.passes().len(), 2, "{stage:?}");
+        assert_eq!(s.passes()[0].color_texture(), rt, "{stage:?}");
+        assert_eq!(s.passes()[0].color_store(), StoreAction::Store, "{stage:?}");
+    }
 }
 
 #[test]
@@ -2991,7 +3039,7 @@ fn cascade_rebind_with_the_same_sampleable_flag_is_a_no_op() {
 /// Frame N renders into `rt` and samples it, which puts the handle in the
 /// session-wide sampled set. Frame N+1 binds the same address as a colour
 /// target nothing reads. Returns that pass's load and store actions.
-fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
+fn colour_reuse_after_sample(retire: bool, bind: Command) -> (ColorLoad, StoreAction) {
     let rt = tex(0xCAFE_8000);
     let mut s = fresh();
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
@@ -3003,7 +3051,7 @@ fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
         BB_FORMAT,
         s.render_scale,
     );
-    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
+    s.emit_command(bind);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     if retire {
@@ -3052,18 +3100,23 @@ fn colour_reuse_after_sample(retire: bool) -> (ColorLoad, StoreAction) {
 /// the moment Metal is free to hand its address to an unrelated allocation.
 #[test]
 fn a_retired_colour_handle_drops_its_sampled_marking() {
-    assert_eq!(
-        colour_reuse_after_sample(true),
-        (ColorLoad::DontCare, StoreAction::DontCare),
-        "the reused address is a first use nothing reads: Rule A discards the load, \
-         Rule D drops the store",
-    );
-    assert_eq!(
-        colour_reuse_after_sample(false),
-        (ColorLoad::Load, StoreAction::Store),
-        "a live texture sampled last frame keeps both, which is what the prune must \
-         not weaken",
-    );
+    for ((stage, retired_bind), (_, live_bind)) in sampler_binds(0xCAFE_8000)
+        .into_iter()
+        .zip(sampler_binds(0xCAFE_8000))
+    {
+        assert_eq!(
+            colour_reuse_after_sample(true, retired_bind),
+            (ColorLoad::DontCare, StoreAction::DontCare),
+            "{stage:?}: the reused address is a first use nothing reads: Rule A discards \
+             the load, Rule D drops the store",
+        );
+        assert_eq!(
+            colour_reuse_after_sample(false, live_bind),
+            (ColorLoad::Load, StoreAction::Store),
+            "{stage:?}: a live texture sampled last frame keeps both, which is what the \
+             prune must not weaken",
+        );
+    }
 }
 
 /// Retiring a texture re-arms every frame-scoped record keyed on its handle.
@@ -4065,35 +4118,57 @@ fn viewport_coverage_converts_through_the_render_scale() {
 
 #[test]
 fn srgb_twin_bind_marks_the_base_texture_sampled() {
-    let mut s = fresh();
-    let base = tex(0x7E10);
-    let twin = tex(0x7E11);
-    s.register_srgb_twin(twin, base);
-    // A draw sampling through the sRGB twin reads the base's storage:
-    // rename-at-overlap and the store-action rules must see the base as
-    // sampled even though the command stream only carries the twin.
-    s.emit_command(Command::set_fragment_texture(twin.raw(), 0));
-    assert!(s.texture_sampled_this_frame(base));
-    assert!(s.texture_sampled_this_frame(twin));
-    // After the twin is unregistered (texture destroyed/renamed), a stray
-    // bind of the stale handle no longer implicates the base.
-    s.reset_frame(&FrameReset {
-        backbuffer: backbuffer(),
-        backbuffer_srgb: backbuffer_srgb(),
-        backbuffer_msaa: MetalHandle::NULL,
-        backbuffer_msaa_srgb: MetalHandle::NULL,
-        backbuffer_sample_count: 1,
-        backbuffer_size: BB_SIZE,
-        backbuffer_format: BB_FORMAT,
-        depth_texture: depth(),
-        depth_size: BB_SIZE,
-        depth_has_stencil: false,
-        render_scale: RenderScale::IDENTITY,
-        continues_frame: false,
-    });
-    s.unregister_srgb_twin(twin);
-    s.emit_command(Command::set_fragment_texture(twin.raw(), 0));
-    assert!(!s.texture_sampled_this_frame(base));
+    for ((stage, bind), (_, stale_bind)) in
+        sampler_binds(0x7E11).into_iter().zip(sampler_binds(0x7E11))
+    {
+        let mut s = fresh();
+        let base = tex(0x7E10);
+        let twin = tex(0x7E11);
+        s.register_srgb_twin(twin, base);
+        // A draw sampling through the sRGB twin reads the base's storage:
+        // rename-at-overlap and the store-action rules must see the base as
+        // sampled even though the command stream only carries the twin.
+        s.emit_command(bind);
+        assert!(s.texture_sampled_this_frame(base), "{stage:?}");
+        assert!(s.texture_sampled_this_frame(twin), "{stage:?}");
+        s.reset_frame(&FrameReset {
+            backbuffer: backbuffer(),
+            backbuffer_srgb: backbuffer_srgb(),
+            backbuffer_msaa: MetalHandle::NULL,
+            backbuffer_msaa_srgb: MetalHandle::NULL,
+            backbuffer_sample_count: 1,
+            backbuffer_size: BB_SIZE,
+            backbuffer_format: BB_FORMAT,
+            depth_texture: depth(),
+            depth_size: BB_SIZE,
+            depth_has_stencil: false,
+            render_scale: RenderScale::IDENTITY,
+            continues_frame: false,
+        });
+        assert!(!s.texture_sampled_this_frame(base), "{stage:?}");
+        assert!(!s.texture_sampled_this_frame(twin), "{stage:?}");
+        assert!(
+            s.seen_sampled_textures.contains(&base),
+            "{stage:?}: reset_frame must preserve the session-wide base read"
+        );
+        assert!(
+            s.seen_sampled_textures.contains(&twin),
+            "{stage:?}: reset_frame must preserve the session-wide view read"
+        );
+        // After the twin is unregistered (texture destroyed/renamed), a stray
+        // bind of the stale handle no longer implicates the base.
+        s.unregister_srgb_twin(twin);
+        s.emit_command(stale_bind);
+        assert!(!s.texture_sampled_this_frame(base), "{stage:?}");
+        assert!(
+            s.seen_sampled_textures.contains(&base),
+            "{stage:?}: unregistering the view mapping does not retire either texture"
+        );
+        s.unregister_texture(twin);
+        s.unregister_texture(base);
+        assert!(!s.seen_sampled_textures.contains(&base), "{stage:?}");
+        assert!(!s.seen_sampled_textures.contains(&twin), "{stage:?}");
+    }
 }
 
 /// `D3DRS_SRGBWRITEENABLE` attaches the render target's sRGB twin view.
