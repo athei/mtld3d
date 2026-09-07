@@ -552,8 +552,12 @@ struct StateSnapshot {
     fvf: u32,
     render_states: [u32; RENDER_STATE_COUNT],
     sampler_states: [[u32; SAMPLER_STATE_COUNT]; STAGE_COUNT],
+    vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
     ff: FfStateSnapshot,
     bound_textures: [CachedComPtr<Direct3DTexture9>; STAGE_COUNT],
+    bound_vertex_textures: [CachedComPtr<Direct3DTexture9>; 4],
+    viewport: D3DVIEWPORT9,
+    scissor_rect: [u32; 4],
     bound_vertex_shader: CachedComPtr<Direct3DVertexShader9>,
     bound_pixel_shader: CachedComPtr<Direct3DPixelShader9>,
     /// Vertex declaration + index buffer round-trip like the bound shaders.
@@ -598,6 +602,12 @@ impl StateSnapshot {
             // which is null or a live IDirect3DTexture9.
             unsafe { CachedComPtr::adopt(ptr) }
         });
+        let bound_vertex_textures = core::array::from_fn(|i| {
+            let ptr = dev.vertex_texture(i);
+            // SAFETY: `ptr` comes from the device's vertex-texture slot,
+            // which is null or a live IDirect3DTexture9.
+            unsafe { CachedComPtr::adopt(ptr) }
+        });
         let streams = core::array::from_fn(|s| {
             let bound = dev.bound_buffers();
             StreamSnapshot {
@@ -626,8 +636,12 @@ impl StateSnapshot {
             fvf,
             render_states: *dev.render_states(),
             sampler_states: capture_sampler_states(dev),
+            vertex_sampler_states: capture_vertex_sampler_states(dev),
             ff: FfStateSnapshot::from(dev.ff_state()),
             bound_textures,
+            bound_vertex_textures,
+            viewport: dev.viewport(),
+            scissor_rect: dev.scissor_rect(),
             bound_vertex_shader,
             bound_pixel_shader,
             bound_vertex_decl,
@@ -676,6 +690,13 @@ impl StateSnapshot {
                 }
             }
         }
+        for (slot, states) in self.vertex_sampler_states.iter().enumerate() {
+            for (samp_ty, &val) in (0u32..).zip(states.iter()) {
+                if block_type.includes_sampler_state(samp_ty) {
+                    dev.set_vertex_sampler_slot_state(slot, samp_ty as usize, val);
+                }
+            }
+        }
 
         // Fixed-function: transforms + material are ALL-only, lights are
         // vertex-pipeline, texture-stage states split per index.
@@ -708,12 +729,17 @@ impl StateSnapshot {
                 .write_ps_constants_b(0, self.ps_constants_b.as_ref());
         }
 
-        // Bound textures, index buffer and vertex streams are D3DSBT_ALL-only —
-        // a filtered block leaves them at their live values.
+        // Bound textures, viewport, scissor, index buffer and vertex streams
+        // are D3DSBT_ALL-only. A filtered block leaves them at their live values.
         if matches!(block_type, StateBlockType::All) {
             for (i, tex) in self.bound_textures.iter().enumerate() {
                 dev.stage_bindings_mut().replace_texture(i, tex.raw());
             }
+            for (slot, tex) in self.bound_vertex_textures.iter().enumerate() {
+                dev.set_vertex_texture_slot(slot, tex.raw());
+            }
+            dev.set_viewport(self.viewport);
+            dev.set_scissor_rect(self.scissor_rect);
             let bound = dev.bound_buffers_mut();
             bound.replace_index_buffer(self.bound_index_buffer.raw());
             for (s, stream) in self.streams.iter().enumerate() {
@@ -769,6 +795,10 @@ fn capture_sampler_states(dev: &DeviceInner) -> [[u32; SAMPLER_STATE_COUNT]; STA
         *row = dev.stage_bindings().sampler_states(stage);
     }
     out
+}
+
+fn capture_vertex_sampler_states(dev: &DeviceInner) -> [[u32; SAMPLER_STATE_COUNT]; 4] {
+    core::array::from_fn(|slot| core::array::from_fn(|type_| dev.vertex_sampler_state(slot, type_)))
 }
 
 // ── Vtable implementations ──
