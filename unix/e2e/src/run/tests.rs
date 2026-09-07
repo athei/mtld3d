@@ -8,6 +8,9 @@ use std::{
 
 use super::{ExitKind, run};
 
+const DRIVER_HANG: &str = "Caused GPU Hang Error \
+    (00000003:kIOAccelCommandBufferCallbackErrorHang)";
+
 /// A script in a fresh directory under the target dir, run as `sh <script>`.
 fn script(name: &str, body: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mtld3d-e2e-run-{}-{name}", std::process::id()));
@@ -34,6 +37,49 @@ fn a_clean_exit_reports_its_code_and_stderr() {
     assert_eq!(exit.kind, ExitKind::Code(3));
     assert_eq!(lines, ["one"]);
     assert_eq!(exit.stderr, "two\n");
+    assert!(!exit.gpu_hang);
+}
+
+#[test]
+fn a_gpu_hang_split_across_stderr_writes_stops_the_process() {
+    let path = script(
+        "gpu-hang",
+        "printf 'Caused GPU Hang Error (00000003:kIOAccelCommandBuffer' >&2\n\
+         sleep 0.1\n\
+         printf 'CallbackErrorHang)\\n' >&2\n\
+         sleep 30\n",
+    );
+    let started = Instant::now();
+    let (exit, elapsed, _) = run_script(&path, Duration::from_secs(5));
+    assert!(exit.gpu_hang);
+    assert_eq!(exit.stderr, format!("{DRIVER_HANG}\n"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "took {elapsed:?}: the runner waited instead of stopping the process"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn a_gpu_hang_racing_with_a_clean_exit_still_counts() {
+    let path = script(
+        "gpu-hang-clean",
+        &format!("printf '%s\\n' '{DRIVER_HANG}' >&2\nexit 0\n"),
+    );
+    let (exit, _, _) = run_script(&path, Duration::from_secs(5));
+    assert!(exit.gpu_hang);
+    assert_eq!(exit.stderr, format!("{DRIVER_HANG}\n"));
+}
+
+#[test]
+fn unrelated_gpu_errors_are_not_hang_reports() {
+    for stderr in [
+        "0000:err:d3d9: GPU hang is not what this line reports",
+        "command buffer failed with Internal Error",
+        "kIOAccelCommandBufferCallbackErrorNotPermitted",
+    ] {
+        assert!(!super::is_gpu_hang_report(stderr), "{stderr}");
+    }
 }
 
 #[test]

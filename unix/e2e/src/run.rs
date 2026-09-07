@@ -5,8 +5,9 @@
 //! while they run, and because a process that stops reporting is the only
 //! sign of a hung test: the watchdog kills it once no line has arrived for
 //! the caller's timeout. stderr is collected as it arrives too, but handed
-//! back whole once the process has ended; it carries the panic reports and
-//! Wine's own diagnostics.
+//! back whole once the process has ended; it carries the panic reports,
+//! Wine's own diagnostics, and the driver report that stops a process as
+//! soon as it says the GPU hung.
 //!
 //! The same timeout bounds a process that closes stdout and then never
 //! exits: it is killed once the timeout passes with no exit. What comes
@@ -20,11 +21,15 @@
 //! whole run, which belongs to the caller's group.
 
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -62,7 +67,24 @@ pub struct Exit {
     pub pid: u32,
     pub kind: ExitKind,
     pub stderr: String,
+    /// The driver reported a GPU hang before this process ended.
+    pub gpu_hang: bool,
 }
+
+/// Whether output reports one of the driver's hung-GPU codes.
+pub fn is_gpu_hang_report(text: &str) -> bool {
+    GPU_HANG_MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// The driver's codes for a hung GPU.
+///
+/// The conformance runner keeps the same two markers. The runners are
+/// separate binaries with no runner-support crate between them, while
+/// `mtld3d-shared` is the runtime's wire-format crate.
+const GPU_HANG_MARKERS: [&str; 2] = [
+    "kIOAccelCommandBufferCallbackErrorHang",
+    "kIOAccelCommandBufferCallbackErrorSubmissionsIgnored",
+];
 
 /// How often the bounded wait for the process's exit looks again.
 const EXIT_POLL: Duration = Duration::from_millis(20);
@@ -107,7 +129,7 @@ pub fn run(
 
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("stdout not piped")?;
-    let mut stderr = child.stderr.take().ok_or("stderr not piped")?;
+    let stderr = child.stderr.take().ok_or("stderr not piped")?;
     let (lines, received) = mpsc::channel::<String>();
     // Neither reader is joined: each ends when its pipe does, and a pipe a
     // killed process tree held open ends with the kill.
@@ -120,36 +142,73 @@ pub fn run(
     });
     // stderr comes over in chunks so that what the process wrote before it
     // died is in hand the moment it is gone; the sender dropping is the EOF.
+    let gpu_hang = Arc::new(AtomicBool::new(false));
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
+    let stderr_gpu_hang = Arc::clone(&gpu_hang);
     thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        while let Ok(n) = stderr.read(&mut chunk) {
-            if n == 0 || stderr_tx.send(chunk[..n].to_vec()).is_err() {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while let Ok(1..) = reader.read_until(b'\n', &mut line) {
+            if is_gpu_hang_report(&String::from_utf8_lossy(&line)) {
+                stderr_gpu_hang.store(true, Ordering::Relaxed);
+            }
+            if stderr_tx.send(std::mem::take(&mut line)).is_err() {
                 break;
             }
         }
     });
 
     let mut timed_out = false;
+    let mut reported_gpu_hang = false;
+    let mut last_line = Instant::now();
     loop {
-        match received.recv_timeout(timeout) {
-            Ok(line) => on_line(&line),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill_group(&child);
-                timed_out = true;
-                break;
+        if gpu_hang.load(Ordering::Relaxed) {
+            kill_group(&child);
+            reported_gpu_hang = true;
+            break;
+        }
+        let since_line = last_line.elapsed();
+        if since_line >= timeout {
+            kill_group(&child);
+            timed_out = true;
+            break;
+        }
+        let until_timeout = timeout
+            .checked_sub(since_line)
+            .expect("elapsed time checked against the timeout");
+        match received.recv_timeout(EXIT_POLL.min(until_timeout)) {
+            Ok(line) => {
+                on_line(&line);
+                last_line = Instant::now();
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let (status, hung) = if let Some(status) = wait_bounded(&mut child, timeout) {
-        (status, false)
-    } else {
-        kill_group(&child);
+    let (status, hung) = if reported_gpu_hang {
         let status = child
             .wait()
-            .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?;
-        (status, true)
+            .map_err(|e| format!("wait on {} after GPU hang failed: {e}", exe.display()))?;
+        (status, false)
+    } else {
+        match wait_bounded(&mut child, timeout, &gpu_hang) {
+            Wait::Exited(status) => (status, false),
+            Wait::GpuHang => {
+                kill_group(&child);
+                reported_gpu_hang = true;
+                let status = child
+                    .wait()
+                    .map_err(|e| format!("wait on {} after GPU hang failed: {e}", exe.display()))?;
+                (status, false)
+            }
+            Wait::TimedOut => {
+                kill_group(&child);
+                let status = child
+                    .wait()
+                    .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?;
+                (status, true)
+            }
+        }
     };
     let mut stderr = drain_stderr(&stderr_rx, STDERR_GRACE);
     if !stderr.complete {
@@ -171,7 +230,13 @@ pub fn run(
     } else {
         ExitKind::Code(status.code().unwrap_or(-1))
     };
-    Ok(Exit { pid, kind, stderr })
+    let gpu_hang = reported_gpu_hang || gpu_hang.load(Ordering::Relaxed);
+    Ok(Exit {
+        pid,
+        kind,
+        stderr,
+        gpu_hang,
+    })
 }
 
 /// Everything stderr delivered, and whether its end was seen.
@@ -202,17 +267,27 @@ fn drain_stderr(chunks: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Stderr {
     }
 }
 
-/// The process's exit status if it exits within `timeout`, `None` if it does not.
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+/// The result of waiting for a process after its stdout closed.
+enum Wait {
+    Exited(ExitStatus),
+    GpuHang,
+    TimedOut,
+}
+
+/// Wait for exit, a driver hang report, or `timeout` after stdout closed.
+fn wait_bounded(child: &mut Child, timeout: Duration, gpu_hang: &AtomicBool) -> Wait {
     let deadline = Instant::now() + timeout;
     loop {
         // A wait that fails is treated as a process that will not exit: the
         // caller kills the group and waits again, and that wait reports.
         if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
+            return Wait::Exited(status);
+        }
+        if gpu_hang.load(Ordering::Relaxed) {
+            return Wait::GpuHang;
         }
         if Instant::now() >= deadline {
-            return None;
+            return Wait::TimedOut;
         }
         thread::sleep(EXIT_POLL);
     }

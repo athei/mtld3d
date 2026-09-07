@@ -33,6 +33,8 @@
 //! ended unaccounted for quotes both, and the runner moves that log out of
 //! the layer's retention (the newest ten logs, which the runs that follow
 //! soon exceed) so the account is still there when someone reads the note.
+//! A driver GPU-hang report in either account ends the leg before attribution
+//! can launch another process, and both accounts are kept immediately.
 //!
 //! One kind of test ends its process on purpose: it declares its name and
 //! the code it is about to exit with on stdout (see [`declared_exit`]), and
@@ -71,6 +73,8 @@ pub struct ProcessEnd {
     pub kind: ExitKind,
     pub stdout: String,
     pub stderr: String,
+    /// The process or its layer log reported a GPU hang.
+    pub gpu_hang: bool,
 }
 
 /// Runs the processes of one test binary.
@@ -139,10 +143,19 @@ pub struct TestResult {
     pub verdict: Verdict,
 }
 
+/// Why a binary's measurement ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BinaryOutcome {
+    Complete,
+    /// The driver reported a GPU hang, so the leg has no verdict.
+    GpuHang,
+}
+
 /// What running a binary cost and whether anything in it failed.
 pub struct BinaryRun {
     pub processes: u32,
     pub failed: bool,
+    pub outcome: BinaryOutcome,
 }
 
 /// Where the results and the notes about a binary's processes go.
@@ -187,6 +200,7 @@ pub fn run_binary(
     let mut run = BinaryRun {
         processes: 0,
         failed: false,
+        outcome: BinaryOutcome::Complete,
     };
     // The inner loop runs one binary's rounds; leaving it means the rounds
     // are done, and the outer one picks up whatever a narrowed round set
@@ -210,6 +224,17 @@ pub fn run_binary(
                 }
                 Event::Summary(summary) => round.summary = Some(summary),
             })?;
+            if end.gpu_hang {
+                let kept = kept_stderr(launcher.keep_stderr(end.pid, &end.stderr));
+                report.note(&format!(
+                    "the driver reported a GPU hang; the leg stopped at this process and has no \
+                     verdict\n{kept}; its last lines:\n{}\n{}",
+                    stderr_tail(&end.stderr),
+                    kept_layer_log(launcher.keep_layer_log(end.pid))
+                ));
+                run.outcome = BinaryOutcome::GpuHang;
+                return Ok(run);
+            }
             let ran_something = !round.finished.is_empty();
             let reported = u32::try_from(round.finished.len()).unwrap_or(u32::MAX);
             let before = done.len();

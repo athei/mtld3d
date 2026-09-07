@@ -9,7 +9,26 @@ use super::{
     FATAL_LINES, KEEP, LAYER_LOG_EXT, WineLauncher, binary_name, keep_layer_log, keep_stderr,
     layer_tail, stderr_tail,
 };
-use crate::attribute::Launcher as _;
+use crate::attribute::{BinaryOutcome, Launcher as _, Report, TestResult, run_binary};
+
+const DRIVER_HANG: &str = "Caused GPU Hang Error \
+    (00000003:kIOAccelCommandBufferCallbackErrorHang)";
+
+#[derive(Default)]
+struct Log {
+    results: Vec<TestResult>,
+    notes: Vec<String>,
+}
+
+impl Report for Log {
+    fn result(&mut self, result: TestResult) {
+        self.results.push(result);
+    }
+
+    fn note(&mut self, note: &str) {
+        self.notes.push(note.to_owned());
+    }
+}
 
 /// A fresh directory under the temp dir, named after the test using it.
 fn dir(tag: &str) -> PathBuf {
@@ -186,5 +205,66 @@ fn a_layer_log_that_cannot_be_moved_is_still_quoted_where_it_is() {
     assert!(
         kept.not_kept
             .is_some_and(|why| why.contains("e2e-7.layer-log"))
+    );
+}
+
+#[test]
+fn a_clean_processes_layer_hang_stops_relaunch_and_keeps_both_accounts() {
+    let log_dir = dir("gpu-hang");
+    let script = log_dir.join("e2e-abcdef.sh");
+    let launch_count = log_dir.join("launches");
+    let body = format!(
+        "printf x >> '{}'\n\
+         echo '[e2e] running a::one' >&2\n\
+         echo 'initiating stderr' >&2\n\
+         printf '%s\\n' '{DRIVER_HANG}' > \"{}/e2e-abcdef-$$.log\"\n\
+         exit 0\n",
+        launch_count.display(),
+        log_dir.display()
+    );
+    std::fs::write(&script, body).expect("script");
+    let mut launcher = WineLauncher::new(
+        Path::new("/bin/sh"),
+        &script,
+        Some(&log_dir),
+        Duration::from_secs(5),
+        Box::new(|_| {}),
+    );
+    let selection = Some(vec!["a::one".to_owned(), "a::two".to_owned()]);
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 1, false, &mut log).expect("run fake child");
+
+    assert_eq!(run.processes, 1);
+    assert_eq!(run.outcome, BinaryOutcome::GpuHang);
+    assert!(!run.failed);
+    assert!(log.results.is_empty(), "a hung GPU gives no test verdict");
+    assert_eq!(
+        std::fs::read_to_string(&launch_count).expect("launch count"),
+        "x"
+    );
+    let note = log.notes.first().expect("GPU hang note");
+    assert!(note.contains("GPU hang"), "{note}");
+    assert!(note.contains("has no verdict"), "{note}");
+
+    let kept: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+        .expect("read log dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    let stderr = kept
+        .iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "stderr"))
+        .expect("kept stderr");
+    let layer = kept
+        .iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == LAYER_LOG_EXT))
+        .expect("kept layer log");
+    assert_eq!(
+        std::fs::read_to_string(stderr).expect("stderr evidence"),
+        "[e2e] running a::one\ninitiating stderr\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(layer).expect("layer evidence"),
+        format!("{DRIVER_HANG}\n")
     );
 }

@@ -116,6 +116,13 @@ config, `docs/ARCHITECTURE.md` says how), so a kept `.stderr` that carries a
 AppKit call the layer made off the main thread and the thread that made it;
 that call is the failure, whatever the process printed after it.
 
+An explicit driver GPU-hang report ends the leg with exit code 3 and no
+verdict, even under `FAIL_FAST=0` or when the process itself exits cleanly.
+The runner watches stderr while the process runs, checks the layer log before
+it can launch another process, and keeps both accounts of the initiating
+process. Assertions after that report are not measurements of the source: the
+later results may reflect the hosted GPU's failed state.
+
 In CI every end-to-end leg uploads all three kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
 directory holds the ten newest of each, so a leg that restarted more than ten
