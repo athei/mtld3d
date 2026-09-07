@@ -152,6 +152,14 @@ pub struct Command {
 }
 
 impl Command {
+    /// Whether this command encodes any supported draw form.
+    #[must_use]
+    pub const fn is_draw(&self) -> bool {
+        self.cmd == CommandType::DrawPrimitives as u32
+            || self.cmd == CommandType::DrawIndexedPrimitives as u32
+            || self.cmd == CommandType::DrawIndexedPrimitivesUp as u32
+    }
+
     /// `encoder.setRenderPipelineState(pipeline)`
     #[must_use]
     pub const fn set_render_pipeline_state(pipeline_handle: u64) -> Self {
