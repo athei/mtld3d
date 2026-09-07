@@ -1445,6 +1445,47 @@ fn texldp_divides_coord_by_w_before_sampling() {
 }
 
 #[test]
+fn texldb_adds_coord_w_to_the_sample_bias() {
+    // ps_3_0 { dcl_2d s0; dcl_texcoord0 v0; texldb r0, v0, s0; mov oC0, r0; }
+    const OP_TEXLD: u16 = 66;
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        0x9000_0000,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_TEXLD, 3) | 0x0002_0000,
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS parse");
+
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit texldb");
+    assert!(
+        plain.contains("bias((in.texcoord0).w)"),
+        "texldb must bias by coord.w:\n{plain}"
+    );
+    assert!(
+        !plain.contains("lod_bias"),
+        "zero sampler bias must not add the uniform:\n{plain}"
+    );
+
+    let sampler_biased = emit_ps_programmable(&ps, lod_bias_variant()).expect("emit texldb");
+    assert!(
+        sampler_biased.contains("bias((in.texcoord0).w + lod_bias[0].x)"),
+        "texldb must add coord.w and sampler bias:\n{sampler_biased}"
+    );
+    metal_compile_or_fail(&sampler_biased);
+}
+
+#[test]
 fn texldd_emits_sample_with_gradient2d_for_2d_sampler() {
     // ps_3_0 { dcl_2d s0; dcl t0; texldd r0, t0, s0, r1, r2; mov oC0, r0; }
     let bc = vec![

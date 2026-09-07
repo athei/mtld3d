@@ -7,8 +7,8 @@
 use super::{operand_token_count, parse};
 use crate::dxso::{
     ir::{
-        DeclUsage, Declaration, DstMods, DxsoError, RegKind, ShaderType, SrcModifier, Swizzle,
-        WriteMask,
+        DeclUsage, Declaration, DstMods, DxsoError, InstrFlags, RegKind, ShaderType, SrcModifier,
+        Swizzle, WriteMask,
     },
     opcode::Opcode,
 };
@@ -39,6 +39,7 @@ const OP_DEF: u16 = 81;
 const OP_CALL: u16 = 25;
 const OP_IF: u16 = 40;
 const OP_TEXKILL: u16 = 65;
+const OP_TEXLD: u16 = 66;
 
 fn reg_bits(reg_type: u32, index: u16) -> u32 {
     let low = reg_type & 0x7;
@@ -540,6 +541,29 @@ fn texkill_honors_partial_write_mask() {
     let dst = prog.instructions[0].dst.expect("texkill dst");
     assert_eq!(dst.reg.index, 1);
     assert_eq!(dst.write_mask, WriteMask(0b0111));
+}
+
+#[test]
+fn texld_controls_decode_as_distinct_flags() {
+    let parse_control = |control: u32| {
+        let bc = [
+            PS_HEADER,
+            opcode_token(OP_TEXLD, 3) | control,
+            dst_token(TYPE_TEMP, 0, 0xF, false),
+            src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+            src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_IDENTITY, 0),
+            END_TOKEN,
+        ];
+        parse(&bc).expect("ps_2_0 texld should parse").instructions[0].flags
+    };
+
+    assert_eq!(parse_control(0), InstrFlags::empty(), "plain texld");
+    assert_eq!(
+        parse_control(0x0001_0000),
+        InstrFlags::TEX_PROJECTED,
+        "texldp"
+    );
+    assert_eq!(parse_control(0x0002_0000), InstrFlags::TEX_BIASED, "texldb");
 }
 
 #[test]

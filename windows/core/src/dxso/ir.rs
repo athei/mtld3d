@@ -246,6 +246,12 @@ bitflags::bitflags! {
         /// honours it — a co-issued non-alpha `cnd` (`ps_1_1`..`1_3`) selects
         /// src1.
         const COISSUE = 1 << 2;
+        /// `texldb`: the `D3DSI_TEXLD_BIAS` control modifier (bit 17) on a SM2+ `texld`.
+        ///
+        /// The coordinate's `.w` is added to the sampler-state LOD bias at
+        /// the sample site. Clear for every other opcode (and for plain
+        /// `texld` / `texldp`).
+        const TEX_BIASED = 1 << 3;
     }
 }
 

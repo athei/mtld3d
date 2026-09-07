@@ -1968,7 +1968,7 @@ fn translate_instruction(
                     raw
                 }
             };
-            sample_or_compare(ctx, sampler_idx, &coord, None)
+            sample_or_compare(ctx, sampler_idx, &coord, None, None)
         }
         Opcode::TexLd => {
             // SM2/SM3 `texld dst, coord, sampler` — srcs[1] is the sampler
@@ -1981,20 +1981,24 @@ fn translate_instruction(
             // fixed-function projective divide whose divisor depends on the
             // texcoord count). The downstream swizzle in `sample_or_compare`
             // then takes `.xy` / `.xyz` of the already-projected coordinate.
-            if inst.flags.contains(InstrFlags::TEX_PROJECTED) {
+            let coord = if inst.flags.contains(InstrFlags::TEX_PROJECTED) {
                 let coord = &srcs[0];
-                let projected = format!("(({coord}) / ({coord}).w)");
-                sample_or_compare(ctx, sampler_idx, &projected, None)
+                format!("(({coord}) / ({coord}).w)")
             } else {
-                sample_or_compare(ctx, sampler_idx, &srcs[0], None)
-            }
+                srcs[0].clone()
+            };
+            let instruction_bias = inst
+                .flags
+                .contains(InstrFlags::TEX_BIASED)
+                .then(|| format!("({}).w", srcs[0]));
+            sample_or_compare(ctx, sampler_idx, &coord, None, instruction_bias.as_deref())
         }
         // SM3 texldl — sample with explicit LOD in coord.w.
         // `s.sample(samp, coord, level(lod))` is the MSL form.
         Opcode::TexLdL => {
             let sampler_idx = inst.srcs[1].reg.index;
             let suffix = format!(", level(({coord}).w)", coord = srcs[0]);
-            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix))
+            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix), None)
         }
         // SM3 texldd — sample with explicit gradients in srcs[2]/srcs[3].
         // 2D samplers use `gradient2d(ddx.xy, ddy.xy)`. The swizzle
@@ -2030,7 +2034,7 @@ fn translate_instruction(
                 ),
             };
             let suffix = format!(", {gradient}");
-            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix))
+            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix), None)
         }
         Opcode::TexKill => {
             // D3D9 texkill encodes its single operand in DST-form (write
@@ -2109,7 +2113,7 @@ fn translate_instruction(
             let u = format!("{bx} + {m00} * ({bump}).x + {m10} * ({bump}).y");
             let v = format!("{by} + {m01} * ({bump}).x + {m11} * ({bump}).y");
             let coord4 = format!("float4({u}, {v}, 0.0, 0.0)");
-            let sampled = sample_or_compare(ctx, n, &coord4, None);
+            let sampled = sample_or_compare(ctx, n, &coord4, None, None);
             store_dst(out, *dst, &sampled, ctx);
             if matches!(inst.opcode, Opcode::TexBemL) {
                 let target = register_write_target(dst.reg, ctx);
@@ -2168,7 +2172,7 @@ fn translate_instruction(
             let v = format!("dot(({coord}).xyz, ({s}).xyz)", s = srcs[0]);
             let u = format!("t[{}].x", m.saturating_sub(1));
             let coord4 = format!("float4({u}, {v}, 0.0, 0.0)");
-            sample_or_compare(ctx, m, &coord4, None)
+            sample_or_compare(ctx, m, &coord4, None, None)
         }
         // `texm3x2depth tM, src` (ps_1_3) — z = pad result (t[M-1].x),
         // w = dot(coord_m, src); write fragment depth = z / w.
@@ -2205,7 +2209,7 @@ fn translate_instruction(
                 Opcode::TexM3x3 => format!("float4({normal}, 1.0)"),
                 Opcode::TexM3x3Tex => {
                     let coord4 = format!("float4({normal}, 0.0)");
-                    sample_or_compare(ctx, m, &coord4, None)
+                    sample_or_compare(ctx, m, &coord4, None, None)
                 }
                 _ => {
                     let eye = if matches!(inst.opcode, Opcode::TexM3x3Spec) {
@@ -2222,7 +2226,7 @@ fn translate_instruction(
                         "(2.0 * dot({normal}, {eye}) / dot({normal}, {normal}) * {normal} - {eye})"
                     );
                     let coord4 = format!("float4({refl}, 0.0)");
-                    sample_or_compare(ctx, m, &coord4, None)
+                    sample_or_compare(ctx, m, &coord4, None, None)
                 }
             }
         }
@@ -2235,7 +2239,7 @@ fn translate_instruction(
                 .as_ref()
                 .ok_or_else(|| EmitError::UnsupportedInstruction("texreg2ar missing dst".into()))?;
             let coord4 = format!("float4(({s}).w, ({s}).x, 0.0, 0.0)", s = srcs[0]);
-            sample_or_compare(ctx, dst.reg.index, &coord4, None)
+            sample_or_compare(ctx, dst.reg.index, &coord4, None, None)
         }
         Opcode::TexReg2Gb => {
             let dst = inst
@@ -2243,14 +2247,14 @@ fn translate_instruction(
                 .as_ref()
                 .ok_or_else(|| EmitError::UnsupportedInstruction("texreg2gb missing dst".into()))?;
             let coord4 = format!("float4(({s}).y, ({s}).z, 0.0, 0.0)", s = srcs[0]);
-            sample_or_compare(ctx, dst.reg.index, &coord4, None)
+            sample_or_compare(ctx, dst.reg.index, &coord4, None, None)
         }
         Opcode::TexReg2Rgb => {
             let dst = inst.dst.as_ref().ok_or_else(|| {
                 EmitError::UnsupportedInstruction("texreg2rgb missing dst".into())
             })?;
             let coord4 = format!("float4(({s}).xyz, 0.0)", s = srcs[0]);
-            sample_or_compare(ctx, dst.reg.index, &coord4, None)
+            sample_or_compare(ctx, dst.reg.index, &coord4, None, None)
         }
         // `texdp3 tN, src` — 3-component dot product, broadcast to all lanes.
         Opcode::TexDp3 => {
@@ -2271,7 +2275,7 @@ fn translate_instruction(
             let coord = register_read_expr(dst.reg, ctx)?;
             let u = format!("dot(({coord}).xyz, ({s}).xyz)", s = srcs[0]);
             let coord4 = format!("float4({u}, 0.0, 0.0, 0.0)");
-            sample_or_compare(ctx, dst.reg.index, &coord4, None)
+            sample_or_compare(ctx, dst.reg.index, &coord4, None, None)
         }
         // `texdepth rN` (ps_1_4) — interpret r.x as z, r.y as w; write fragment
         // depth = z / w. Per the D3D9 `texdepth` reference behavior, the
@@ -3022,14 +3026,15 @@ fn bump_lum_exprs(stage: u16) -> (String, String) {
 /// read as fully occluded.
 ///
 /// `suffix` is the trailing `, level(...)` (texldl) or `, gradientNN(...)`
-/// (texldd) text — `None` for plain `texld`. `sample_compare` accepts the
-/// same `level(...)` / `gradient*(...)` overloads, so the suffix passes
-/// through unchanged.
+/// (texldd) text; `instruction_bias` is the `texldb` coordinate `.w`.
+/// `sample_compare` accepts the explicit-LOD suffixes unchanged, while depth
+/// textures have no mip chain and ignore the instruction bias.
 fn sample_or_compare(
     ctx: &EmitContext,
     sampler_idx: u16,
     coord_expr: &str,
     suffix: Option<&str>,
+    instruction_bias: Option<&str>,
 ) -> String {
     let coord_swizzle = sampler_coord_swizzle(ctx, sampler_idx);
     let suffix_str = suffix.unwrap_or("");
@@ -3074,8 +3079,15 @@ fn sample_or_compare(
         // supplies the LOD outright (D3D9 leaves it unbiased) and MSL accepts
         // exactly one LOD option per call, so a suffixed sample keeps its own;
         // `texldd` folds the shift into its gradients at the call site.
-        let bias = if suffix_str.is_empty() && ctx.has_lod_bias() {
-            format!(", bias(lod_bias[{sampler_idx}].x)")
+        let bias = if suffix_str.is_empty() {
+            match (instruction_bias, ctx.has_lod_bias()) {
+                (Some(instruction), true) => {
+                    format!(", bias({instruction} + lod_bias[{sampler_idx}].x)")
+                }
+                (Some(instruction), false) => format!(", bias({instruction})"),
+                (None, true) => format!(", bias(lod_bias[{sampler_idx}].x)"),
+                (None, false) => String::new(),
+            }
         } else {
             String::new()
         };

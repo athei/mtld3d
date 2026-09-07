@@ -250,10 +250,15 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
                     }
                     _ => None,
                 };
-                // SM2+ `texld` packs its control modifier in the same bits:
-                // `D3DSI_TEXLD_PROJECT` (bit 16) selects `texldp` (divide the
-                // coordinate by `.w` before sampling). Other opcodes leave it 0.
-                let tex_projected = matches!(opcode, Opcode::TexLd) && (token & 0x0001_0000) != 0;
+                // SM2+ `texld` packs its control modifier in bits 16-17:
+                // `D3DSI_TEXLD_PROJECT` selects `texldp` (divide by `.w`) and
+                // `D3DSI_TEXLD_BIAS` selects `texldb` (add `.w` to the sample
+                // LOD bias). Other opcodes leave the control at zero.
+                let tex_control = token & 0x0003_0000;
+                let tex_projected =
+                    major >= 2 && matches!(opcode, Opcode::TexLd) && tex_control == 0x0001_0000;
+                let tex_biased =
+                    major >= 2 && matches!(opcode, Opcode::TexLd) && tex_control == 0x0002_0000;
                 // `D3DSI_COISSUE` (bit 30) marks a ps_1_x co-issued instruction.
                 let coissue = (token & 0x4000_0000) != 0;
                 let mut remaining = token_count;
@@ -301,6 +306,7 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
                 flags.set(InstrFlags::PREDICATED, predicated);
                 flags.set(InstrFlags::TEX_PROJECTED, tex_projected);
                 flags.set(InstrFlags::COISSUE, coissue);
+                flags.set(InstrFlags::TEX_BIASED, tex_biased);
                 let inst = Instruction {
                     opcode,
                     dst,
