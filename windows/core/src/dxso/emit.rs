@@ -1827,11 +1827,18 @@ fn translate_instruction(
         Opcode::Abs => format!("abs({})", srcs[0]),
         // D3D9: pow(base, exp) = base <= 0 ? 0 : pow(base, exp); uses abs(base).
         Opcode::Pow => format!("float4(pow(abs(({}).x), ({}).x))", srcs[0], srcs[1]),
-        // D3D9 ExpP/LogP are the partial-precision twins of Exp/Log
-        // (PS 1.x targets that lacked full fp32 in the ALU). Modern
-        // hardware runs both at full precision, so the lowering is
-        // identical to Exp/Log.
+        // `vs_1_1` expp exposes four distinct results. Partial precision is
+        // allowed for the exponentials, but Metal can provide full precision.
+        Opcode::ExpP if ctx.is_vertex() && ctx.is_sm1() => {
+            let scalar = format!("({}).x", srcs[0]);
+            format!(
+                "float4(exp2(floor({scalar})), {scalar} - floor({scalar}), \
+                 exp2({scalar}), 1.0)"
+            )
+        }
+        // SM2+ expp is the partial-precision twin of exp and broadcasts 2^x.
         Opcode::Exp | Opcode::ExpP => format!("float4(exp2(({}).x))", srcs[0]),
+        // Modern hardware runs the partial-precision logp at full precision.
         Opcode::Log | Opcode::LogP => format!("float4(log2(abs(({}).x)))", srcs[0]),
         Opcode::Crs => format!("float4(cross(({}).xyz, ({}).xyz), 0.0)", srcs[0], srcs[1]),
         Opcode::Sgn => format!("sign({})", srcs[0]),
