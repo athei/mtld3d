@@ -30,7 +30,7 @@ use mtld3d_core::{
     page_box::PageBox,
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
-        LastBoundCache, Pass, PassState, StencilClearOutcome, StencilLoad,
+        LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
         StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
@@ -888,6 +888,9 @@ pub struct FrameEncoder {
     /// the previous draw in the same Metal render encoder. Reset on every
     /// new-pass entry from `begin_render_pass_if_needed`.
     last_bound: LastBoundCache,
+    /// Immutable VS/PS snapshots, valid only within their owning frame and encoder.
+    vs_bound_constants: SnapshotBytesCache<ScratchSlice>,
+    ps_bound_constants: SnapshotBytesCache<ScratchSlice>,
     /// Per-frame scratch arena for API→encoder copies.
     ///
     /// Shader constants and `DrawPrimitiveUP` inline vertices. A chunked
@@ -1562,6 +1565,8 @@ impl FrameEncoder {
         Self {
             pass_state: PassState::new(),
             last_bound: LastBoundCache::new(),
+            vs_bound_constants: SnapshotBytesCache::new(),
+            ps_bound_constants: SnapshotBytesCache::new(),
             scratch: ScratchArena::new(),
             frame_blit_commands: Vec::new(),
             flags: if config.shader_cache_enable {
@@ -2333,6 +2338,7 @@ impl FrameEncoder {
     }
 
     fn begin_frame(&mut self, frame: &FrameData) {
+        self.reset_bound_constants();
         self.scratch.clear();
         // Cached const-slice pointers alias the previous frame's
         // arena which is about to be cleared / reused. Drop them so
@@ -2457,7 +2463,7 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        let caches = self.cache_sizes(&payload.scratch);
+        let caches = self.cache_sizes(payload);
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
         // One getrusage unix_call per 5 s window, only when the summary is
         // both enabled and about to emit; every other frame passes None.
@@ -2485,10 +2491,10 @@ impl FrameEncoder {
     /// Cache-length snapshot handed to `EncoderPerfState::log_frame_summary`.
     ///
     /// Walks every cache `HashMap` exactly once; cheap even at debug
-    /// log levels because `HashMap::len()` is O(1). `scratch` is passed in
-    /// (the just-submitted payload's filled arena) since `self.scratch` is
-    /// already the clean arena swapped in for the next frame.
-    fn cache_sizes(&self, scratch: &ScratchArena) -> CacheSizes {
+    /// log levels because `HashMap::len()` is O(1). The submitted payload owns
+    /// this frame's passes and filled scratch arena; the live encoder already
+    /// holds the clean state for the next frame.
+    fn cache_sizes(&self, payload: &FramePayload) -> CacheSizes {
         CacheSizes {
             textures: self.texture_cache.len(),
             pipelines: self.pipeline_cache.len(),
@@ -2496,10 +2502,10 @@ impl FrameEncoder {
             programs: self.program_cache.len(),
             libs: self.lib_cache.len(),
             depth_states: self.depth_stencil_cache.len(),
-            scratch_small_blocks: scratch.small_chunk_count(),
-            scratch_oversized_blocks: scratch.oversized_chunk_count(),
-            scratch_bytes: scratch.capacity_bytes(),
-            cmd_vec_capacity_bytes: self.pass_state.cmd_vec_capacity_bytes(),
+            scratch_small_blocks: payload.scratch.small_chunk_count(),
+            scratch_oversized_blocks: payload.scratch.oversized_chunk_count(),
+            scratch_bytes: payload.scratch.capacity_bytes(),
+            cmd_vec_capacity_bytes: PassState::cmd_vec_capacity_bytes(&payload.passes),
             pending_blit_retention_depth: self.pending_blit_retention.len(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
@@ -4043,11 +4049,25 @@ impl FrameEncoder {
     /// Flush `last_bound` for an encoder known to have just opened.
     fn reset_last_bound_for_fresh_encoder(&mut self) {
         self.last_bound.reset();
+        self.reset_bound_constants();
         // Keep the debug-build emitted-command shadow in lockstep with the
         // cache so the in-sync assertion shares the same fresh-encoder
         // baseline (no bindings yet).
         #[cfg(debug_assertions)]
         self.pass_state.debug_reset_emitted();
+    }
+
+    fn reset_bound_constants(&mut self) {
+        self.vs_bound_constants.reset();
+        self.ps_bound_constants.reset();
+    }
+
+    pub fn vs_constants_changed(&mut self, snapshot: ScratchSlice) -> bool {
+        self.vs_bound_constants.changed(snapshot)
+    }
+
+    pub fn ps_constants_changed(&mut self, snapshot: ScratchSlice) -> bool {
+        self.ps_bound_constants.changed(snapshot)
     }
 
     /// Debug-build invariant on the per-draw dedup cache (`last_bound`).
@@ -8143,15 +8163,43 @@ impl FrameEncoder {
     /// been given a `coherent_seq` pointer or hasn't submitted any frame —
     /// both states arrive together in `begin_frame`.
     fn wait_for_gpu_idle(&self) {
-        if self.coherent_seq_ptr == 0 || self.current_submit_seq == 0 {
+        self.wait_for_gpu_retire(self.current_submit_seq);
+    }
+
+    /// Block until `coherent_seq >= target_seq`.
+    ///
+    /// A target of 0 names no frame, and a target the encoder never
+    /// submitted is answered by the atomic alone on the unix side, so
+    /// neither waits.
+    fn wait_for_gpu_retire(&self, target_seq: u64) {
+        if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;
         }
         let mut params = WaitForGpuRetireParams {
-            target_seq: self.current_submit_seq,
+            target_seq,
             coherent_seq_ptr: self.coherent_seq_ptr,
             failed_submit_seq_ptr: self.failed_seq_ptr,
         };
         let _ = unix_call(&mut params);
+    }
+
+    /// Hold a copy out of a resolve target until the resolving command buffer has completed.
+    ///
+    /// A no-op unless the device answered `RESOLVE_NEEDS_RETIRE`. There, a
+    /// copy that reads a multisample resolve target from a later command
+    /// buffer can see the content the target held before the resolve, so
+    /// the copy waits for every command buffer submitted so far. The ops of
+    /// a frame run before that frame is submitted, so the last submitted
+    /// command buffer is the one before `current_submit_seq`; the submit
+    /// thread is drained first so that buffer is committed and registered
+    /// for the wait. A resolve recorded in the frame being built is ordered
+    /// by the pass list itself, through `note_msaa_read`.
+    pub fn wait_for_resolve_retire(&mut self) {
+        if !self.gpu_caps.resolve_needs_retire() {
+            return;
+        }
+        self.drain_submit_thread();
+        self.wait_for_gpu_retire(self.current_submit_seq.saturating_sub(1));
     }
 }
 
@@ -9398,6 +9446,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // one is submitted. Every move here is an O(1) `Vec`/arena header swap;
     // the heap behind `scratch` / `frame_blit_commands` is untouched, so
     // the raw pointers built into `params` below stay valid.
+    // Binding tokens can alias either arena carried by this submission. Forget
+    // them before either arena leaves the encoder's ownership.
+    enc.reset_bound_constants();
     let mut payload = enc.acquire_clean_payload();
     core::mem::swap(&mut payload.scratch, &mut enc.scratch);
     core::mem::swap(

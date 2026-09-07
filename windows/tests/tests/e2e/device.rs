@@ -11,8 +11,8 @@ use std::sync::{
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, destroy_window,
-    enumerate_display_sizes, window_rect,
+    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
+    destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -881,6 +881,33 @@ fn reset_clears_scene_state() {
         D3DERR_INVALIDCALL,
         "EndScene after Reset must be INVALIDCALL"
     );
+}
+
+#[test]
+fn reset_flips_the_presentation_interval() {
+    let h = Harness::new();
+    assert_eq!(
+        h.present(),
+        D3D_OK,
+        "a present at the interval the device was created with"
+    );
+    // A Reset queues the new pacing for the frames that follow it, and the
+    // presents after each one carry it to the layer, which re-derives the
+    // present throttle off the panel's cadence and back onto it. Several
+    // presents rather than one, so the frame that carries the pacing is sent
+    // and the device outlives the re-derivation it queues.
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to IMMEDIATE");
+    for _ in 0..8 {
+        assert_eq!(h.present(), D3D_OK, "a present of the free run");
+    }
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
+    for _ in 0..8 {
+        assert_eq!(h.present(), D3D_OK, "a present at the display rate");
+    }
 }
 
 /// A full-target quad whose texture coordinates address a cube's +X face.
@@ -1802,7 +1829,7 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
     let done = Barrier::new(WINDOWED_WORKERS + 1);
 
     std::thread::scope(|scope| {
-        let fullscreen = scope.spawn(|| {
+        let fullscreen = spawn_scoped(scope, || {
             let h = {
                 let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                 Harness::new()
@@ -1817,7 +1844,7 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
         });
         let windowed: Vec<_> = (0..WINDOWED_WORKERS)
             .map(|_| {
-                scope.spawn(|| {
+                spawn_scoped(scope, || {
                     let (h, second, ours) = {
                         let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
                         let h = Harness::new();
@@ -1952,28 +1979,27 @@ fn releasing_a_fullscreen_device_ignores_a_resize_during_the_release() {
     // The stand-in for the window manager: a size the back buffer does not
     // have, sent from another thread so it queues until the release pumps.
     let hwnd = h.hwnd();
-    let armed = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let sender = {
-        let armed = std::sync::Arc::clone(&armed);
-        std::thread::spawn(move || {
+    let armed = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let sender = spawn_scoped(scope, || {
             armed.wait();
             let _ = mtld3d_tests::send_message(hwnd, WM_SIZE, 0, (0x1C8 << 16) | 0x258);
-        })
-    };
-    armed.wait();
-    // Long enough for the sender to reach its `SendMessage` and block there;
-    // a message that arrives after the release is pumped harmlessly below.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        armed.wait();
+        // Long enough for the sender to reach its `SendMessage` and block there;
+        // a message that arrives after the release is pumped harmlessly below.
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-    assert_eq!(
-        h.release_device(),
-        0,
-        "the harness held the only device reference"
-    );
-    assert!(h.pump(), "no WM_QUIT expected");
-    sender
-        .join()
-        .expect("the sender thread ends once its message is answered");
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the harness held the only device reference"
+        );
+        assert!(h.pump(), "no WM_QUIT expected");
+        sender
+            .join()
+            .expect("the sender thread ends once its message is answered");
+    });
     let rect = h.window_rect();
     assert!(
         rect.right - rect.left > 0 && rect.bottom - rect.top > 0,
@@ -2346,6 +2372,89 @@ fn wm_setcursor_forwarded_to_game_while_cursor_hidden() {
         h.thread_cursor(),
         class_arrow,
         "hidden again: WM_SETCURSOR forwarded to the class cursor",
+    );
+}
+
+/// Releasing the device destroys every HCURSOR it built.
+///
+/// `SetCursorProperties` builds one Win32 cursor per distinct bitmap and
+/// keeps every one of them for the device's lifetime, so a game that cycles
+/// through pointers hands the device a growing set of handles. They are the
+/// device's alone and go with it. The handle that is the thread's cursor at
+/// release is replaced by the window's class cursor first: user32 frees a
+/// cursor even while it is current, and the thread would otherwise keep a
+/// destroyed handle as its cursor.
+#[test]
+fn device_release_destroys_the_cursors_it_built() {
+    const WM_SETCURSOR: u32 = 0x0020;
+    /// `WM_MOUSEMOVE` as the trigger message in `WM_SETCURSOR`'s lparam.
+    const WM_MOUSEMOVE_LP: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    const SIDE: usize = 32;
+    let h = Harness::new();
+    let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
+
+    // Hidden, the message is forwarded and the class cursor is what applies.
+    h.set_thread_cursor(0);
+    h.send_window_message(WM_SETCURSOR, h.hwnd(), lp_client_move);
+    let class_arrow = h.thread_cursor();
+    assert_ne!(class_arrow, 0, "the window class carries a cursor");
+
+    let mut built = Vec::new();
+    for fill in [0xFF00_0000_u32, 0xFFFF_0000, 0xFF00_FF00] {
+        let bitmap = h.create_offscreen_plain_surface(
+            u32::try_from(SIDE).expect("cursor side fits u32"),
+            u32::try_from(SIDE).expect("cursor side fits u32"),
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SCRATCH,
+        );
+        {
+            let mut locked = bitmap.lock_rect(0);
+            locked.write_u32_rect(SIDE, SIDE, &[fill; SIDE * SIDE]);
+        }
+        assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+        assert_eq!(
+            h.show_cursor(true),
+            i32::from(!built.is_empty()),
+            "ShowCursor(TRUE) reports the previous visibility",
+        );
+        let handle = h.thread_cursor();
+        assert_ne!(handle, 0, "ShowCursor(TRUE) must realize an HCURSOR");
+        assert_ne!(
+            handle, class_arrow,
+            "the device cursor is not the class cursor"
+        );
+        assert!(
+            !built.contains(&handle),
+            "a distinct bitmap builds a distinct cursor: {handle:#x} again",
+        );
+        assert!(
+            cursor_is_live(handle),
+            "the realized handle is a live cursor"
+        );
+        built.push(handle);
+    }
+    assert_eq!(
+        h.release_device(),
+        0,
+        "the harness held the only device reference"
+    );
+
+    for handle in &built {
+        assert!(
+            !cursor_is_live(*handle),
+            "cursor {handle:#x} outlived the device that built it",
+        );
+    }
+    assert!(
+        !built.contains(&h.thread_cursor()),
+        "the thread cursor must not be a destroyed handle: {:#x}",
+        h.thread_cursor(),
+    );
+    assert_eq!(
+        h.thread_cursor(),
+        class_arrow,
+        "the window's class cursor replaces the device's on the thread",
     );
 }
 

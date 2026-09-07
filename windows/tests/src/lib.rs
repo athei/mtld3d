@@ -20,6 +20,7 @@ mod win32;
 pub use harness::{
     DrawIndexedUpParams, Harness, HarnessConfig, config_var, render_scale_is_identity,
 };
+pub use in_flight::spawn_scoped;
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
 pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
@@ -32,6 +33,6 @@ pub use vertex::{
 };
 pub use win32::{
     Rect, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle,
-    create_window, destroy_window, enumerate_display_sizes, send_message, set_window_pos,
-    window_rect,
+    create_window, cursor_is_live, destroy_window, enumerate_display_sizes, send_message,
+    set_window_pos, window_rect,
 };

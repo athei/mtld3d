@@ -2605,7 +2605,12 @@ impl DeviceInner {
         if status != 0 || bb_params.texture_handle.is_null() {
             error!(
                 target: LOG_TARGET,
-                "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) — device unusable",
+                "apply_auto_resize: CreateBackbuffer failed (0x{status:08X}) for \
+                 {new_width}x{new_height} (render {}x{}) samples={} fmt={}; device unusable",
+                bb_params.width,
+                bb_params.height,
+                bb_params.sample_count,
+                self.present_params.back_buffer_format,
             );
             self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
@@ -3480,6 +3485,9 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // Restore the game's original window proc *before* freeing DeviceInner;
         // the subclass's global back-pointer becomes dangling once we drop.
         device_inner.cursor().uninstall_subclass();
+        // The HCURSORs the device built die with it, now that no message can
+        // realize one of them again.
+        device_inner.cursor_mut().destroy_handles();
 
         // Release bound surfaces + buffers + textures (if any) before teardown.
         device_inner.bound_rt_mut().teardown();
@@ -4301,7 +4309,17 @@ fn reset_recreate_resources(
     };
     let status = unix_call(&mut bb_params);
     if status != 0 || bb_params.texture_handle.is_null() {
-        error!(target: LOG_TARGET, "Reset: CreateBackbuffer failed (0x{status:08X}) — device unusable");
+        error!(
+            target: LOG_TARGET,
+            "Reset: CreateBackbuffer failed (0x{status:08X}) for {}x{} (render {}x{}) samples={} \
+             fmt={}; device unusable",
+            pp.back_buffer_width,
+            pp.back_buffer_height,
+            bb_params.width,
+            bb_params.height,
+            bb_params.sample_count,
+            pp.back_buffer_format,
+        );
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
@@ -7414,6 +7432,12 @@ fn emit_stretch_rect_blit(
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
+    // A source with a multisampled companion is a resolve target, and a
+    // resolve the last submission stored into it must have completed before
+    // this copy reads it on a device that does not order that itself.
+    if !src_info.msaa.is_null() {
+        enc.wait_for_resolve_retire();
+    }
     let dst_handle = match &dst_info.kind {
         StretchKind::Texture(info) => enc.get_or_create_texture(info),
         StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),

@@ -81,12 +81,19 @@ pub extern "C" fn write_log_handler(args: *mut c_void) -> i32 {
 ///
 /// The lines logged since `InitLogger` wait in the file sink's backlog for
 /// this, so the PE side sends it before it starts its own log thread. The
-/// file itself appears with the first line written after this.
+/// file itself appears with the first line written after this. The thunk
+/// also carries `debug.mainThreadChecker`, acted on here because this is the
+/// first thunk that runs with the configuration resolved.
 pub extern "C" fn open_log_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut OpenLogParams.
     let Some(params) = (unsafe { InPtrMut::<OpenLogParams>::opt(args) }) else {
         return -1;
     };
+    // Ahead of the location checks: the checker gates AppKit use for the
+    // rest of the process whether or not this process gets a log file.
+    if params.main_thread_checker != 0 {
+        crate::main_thread_checker::load();
+    }
     if params.dir_ptr == 0 || params.dir_len == 0 || params.stem_ptr == 0 {
         // The PE side found no usable location; its warn said why.
         crate::log_file::fall_back_to_stderr();
@@ -383,6 +390,7 @@ pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
 pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut CreateBackbufferParams.
     let Some(mut params) = (unsafe { InPtrMut::<CreateBackbufferParams>::opt(args) }) else {
+        error!(target: LOG_TARGET, "CreateBackbuffer: null params pointer");
         return -1;
     };
     let params: &mut CreateBackbufferParams = &mut params;
@@ -393,7 +401,11 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         params.width,
         params.height,
     ) else {
-        error!(target: LOG_TARGET, "failed to create backbuffer");
+        error!(
+            target: LOG_TARGET,
+            "failed to create {}x{} backbuffer (samples={})",
+            params.width, params.height, params.sample_count
+        );
         return STATUS_UNSUCCESSFUL;
     };
     let msaa = metal::create_msaa_companion(
@@ -407,8 +419,15 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     if params.sample_count > 1 && msaa.is_none() {
         error!(
             target: LOG_TARGET,
-            "failed to create {}x multisampled backbuffer companion", params.sample_count
+            "failed to create the {}x multisampled companion of the {}x{} backbuffer; the \
+             single-sample texture is released again",
+            params.sample_count, params.width, params.height
         );
+        // Both handles are minted and neither has been handed back, so this
+        // side owns their only copies; the view goes first, since it holds a
+        // retain on its base.
+        metal::destroy_texture(srgb_handle);
+        metal::destroy_texture(handle.raw());
         return STATUS_UNSUCCESSFUL;
     }
     params.texture_handle = handle;
@@ -673,8 +692,14 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     if params.sample_count > 1 && msaa.is_none() {
         error!(
             target: LOG_TARGET,
-            "failed to create {}x multisampled color target companion", params.sample_count
+            "failed to create the {}x multisampled companion of the {}x{} {:?} color target; \
+             the single-sample texture is released again",
+            params.sample_count, params.width, params.height, params.pixel_format
         );
+        // Same ownership as the back buffer's companion failure above: both
+        // minted handles are still this side's only copies.
+        metal::destroy_texture(srgb_handle);
+        metal::destroy_texture(handle.raw());
         return STATUS_UNSUCCESSFUL;
     }
     params.texture_handle = handle;

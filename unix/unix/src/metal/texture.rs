@@ -67,14 +67,22 @@ pub fn create_backbuffer(
     // process. `MAX_TEXTURE_DIM` is the Metal 2D limit on the supported GPUs.
     const MAX_TEXTURE_DIM: u32 = 16384;
     if width == 0 || height == 0 || width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM {
+        log::error!(
+            target: crate::LOG_TARGET,
+            "create_backbuffer: {width}x{height} is outside the 1..={MAX_TEXTURE_DIM} Metal \
+             accepts per dimension; refused",
+        );
         return None;
     }
-    let device = device_handle.into_retained()?;
+    let Some(device) = device_handle.into_retained() else {
+        log::error!(target: crate::LOG_TARGET, "create_backbuffer: null device handle");
+        return None;
+    };
     let texture = create_color_texture(
         &device,
         width,
         height,
-        MTLPixelFormat::BGRA8Unorm,
+        PixelFormat::Bgra8Unorm,
         "mtld3d-backbuffer",
     )?;
     clear_texture_black(queue_handle, &texture);
@@ -127,7 +135,7 @@ fn texture_usage(
     usage
 }
 
-/// The sRGB twin view of a colour texture, or 0 when the format has no twin.
+/// The sRGB twin view of a colour texture, or 0 when it has none.
 ///
 /// The base texture's usage allows the view (see [`texture_usage`]), and the
 /// view inherits that usage, which keeps a render target's twin
@@ -135,6 +143,12 @@ fn texture_usage(
 /// handle is handed out with, so the two views differ only in transfer
 /// function; a render target is always handed out unswizzled, since Metal
 /// forbids rendering through a channel swizzle.
+///
+/// 0 means either that the format has no sRGB counterpart or that Metal
+/// declined the view. The PE side treats both alike: a target without a twin
+/// has `D3DRS_SRGBWRITEENABLE` applied in the pixel shader, ahead of the
+/// blender, so the second case is a fidelity loss, not a failure, and is
+/// warned about once here.
 fn srgb_twin_view(
     texture: &ProtocolObject<dyn MTLTexture>,
     format: PixelFormat,
@@ -157,11 +171,18 @@ fn srgb_twin_view(
             swizzle,
         )
     };
-    view.map_or(0, |view| {
-        let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
-        view.setLabel(Some(&srgb_label));
-        mint(view)
-    })
+    let Some(view) = view else {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{label}: Metal declined the {srgb_format:?} view of a {format:?} texture; \
+             D3DRS_SRGBWRITEENABLE on this target encodes in the pixel shader, before the \
+             blender",
+        );
+        return 0;
+    };
+    let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
+    view.setLabel(Some(&srgb_label));
+    mint(view)
 }
 
 /// Clear a freshly created render target to opaque black.
@@ -270,13 +291,8 @@ pub fn create_color_target(
     pixel_format: PixelFormat,
 ) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
     let device = device_handle.into_retained()?;
-    let texture = create_color_texture(
-        &device,
-        width,
-        height,
-        mtl_pixel_format(pixel_format),
-        "mtld3d-color-target",
-    )?;
+    let texture =
+        create_color_texture(&device, width, height, pixel_format, "mtld3d-color-target")?;
     let srgb_handle = srgb_twin_view(
         &texture,
         pixel_format,
@@ -313,7 +329,7 @@ pub fn create_upscale_target(
         device,
         width,
         height,
-        mtl_pixel_format(pixel_format),
+        pixel_format,
         "mtld3d-upscale-scratch",
     )?;
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
@@ -333,14 +349,14 @@ fn create_color_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     width: u32,
     height: u32,
-    mtl_format: objc2_metal::MTLPixelFormat,
+    pixel_format: PixelFormat,
     label: &str,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     // SAFETY: objc2 typed binding; class-method constructor on
     // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
     let desc = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            mtl_format,
+            mtl_pixel_format(pixel_format),
             width as usize,
             height as usize,
             false,
@@ -349,10 +365,43 @@ fn create_color_texture(
     desc.setUsage(texture_usage(device, true, true));
     desc.setStorageMode(MTLStorageMode::Private);
 
-    let texture = device.newTextureWithDescriptor(&desc)?;
+    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+        log_texture_refused(device, &desc, pixel_format, label);
+        return None;
+    };
     let label = objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&label));
     Some(texture)
+}
+
+/// Report a texture descriptor the device returned nil for.
+///
+/// `newTextureWithDescriptor:` gives no reason, so the line carries both
+/// sides of the refusal: the descriptor as it was submitted, and the device's
+/// identity and memory figures. Together they separate a request the layer
+/// got wrong from a sane one the device could not serve, which is the
+/// difference between a bug here and an exhausted or paravirtualized GPU.
+fn log_texture_refused(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &MTLTextureDescriptor,
+    pixel_format: PixelFormat,
+    label: &str,
+) {
+    log::error!(
+        target: crate::LOG_TARGET,
+        "{label}: newTextureWithDescriptor returned nil for {}x{} {pixel_format:?} samples={} \
+         usage={:#x} storage={} on '{}' (allocated {} B, recommended working set {} B, unified \
+         memory: {})",
+        desc.width(),
+        desc.height(),
+        desc.sampleCount(),
+        desc.usage().0,
+        desc.storageMode().0,
+        device.name(),
+        device.currentAllocatedSize(),
+        device.recommendedMaxWorkingSetSize(),
+        device.hasUnifiedMemory(),
+    );
 }
 
 /// Creates the multisampled companion of a single-sample render target.
@@ -384,7 +433,10 @@ pub fn create_msaa_companion(
     if sample_count <= 1 {
         return None;
     }
-    let device = device_handle.into_retained()?;
+    let Some(device) = device_handle.into_retained() else {
+        log::error!(target: crate::LOG_TARGET, "{label}: null device handle");
+        return None;
+    };
     let mtl_format = mtl_pixel_format(pixel_format);
     // SAFETY: objc2 typed binding; class-method constructor on
     // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
@@ -403,7 +455,10 @@ pub fn create_msaa_companion(
     desc.setUsage(texture_usage(&device, true, true));
     desc.setStorageMode(MTLStorageMode::Private);
 
-    let texture = device.newTextureWithDescriptor(&desc)?;
+    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+        log_texture_refused(&device, &desc, pixel_format, label);
+        return None;
+    };
     let ns_label = objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&ns_label));
     let srgb_handle = srgb_twin_view(&texture, pixel_format, 1, 1, IDENTITY_SWIZZLE, label);

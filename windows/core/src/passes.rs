@@ -153,12 +153,6 @@ pub const LAST_BOUND_MAX_STAGES: usize = 16;
 /// Vertex texture fetch slots (`vs_3_0` s0..s3, `D3DVERTEXTEXTURESAMPLER0..3`).
 pub const VERTEX_SAMPLER_SLOTS: usize = 4;
 
-/// Cap on `command_vec_pool` size.
-///
-/// A 5-pass frame is the typical shape; 16 absorbs every realistic
-/// pass-count spike without parking unused capacity forever.
-const MAX_CMD_VEC_POOL: usize = 16;
-
 /// Cascade-summary probe target.
 ///
 /// Used both to gate the per-frame summary log line at submit time AND
@@ -1339,25 +1333,21 @@ pub struct PassState {
     /// Distinct from `submit_seq` (encoder-thread): incremented in
     /// `reset_frame`.
     frame_seq: u64,
-    /// Running per-frame total of bytes Metal will memcpy as a result of `Vec` doublings.
+    /// Per-frame estimate of command-vector growth copy bytes.
     ///
-    /// The doublings are `Vec<Command>::push` growing `Pass::commands`.
-    /// Incremented in `emit_command` when `len == capacity` before push (the
-    /// doubling is about to fire); the increment is the *old* capacity in
-    /// bytes, which is exactly what `realloc` has to copy from the old buffer
-    /// to the new one. Drained by `take_cmd_vec_realloc_bytes` once per frame
-    /// and rolled into the perf summary as `cmd_realloc`. Reset in
-    /// `reset_frame` as a safety net for the case where the drain is somehow
-    /// skipped.
+    /// Adds the old capacity in bytes whenever `emit_command` grows a full
+    /// vector. The allocator may extend a buffer in place, so this is potential
+    /// copy volume, not measured memory traffic. Initial allocations of 64
+    /// commands are excluded. Drained by `take_cmd_vec_realloc_bytes` once per
+    /// submission and reset by `reset_frame` as a safety net.
     cmd_vec_realloc_bytes: u64,
     /// Free-list of `Vec<Command>`s recycled across frames.
     ///
-    /// `reset_frame` drains each retired `Pass`'s `commands` into the pool
-    /// with capacity preserved; the next frame's `ensure_pass_open` pops one
-    /// instead of freshly `Vec::with_capacity(64)`. Once warmed, the pool's
-    /// Vecs converge on the steady-state high-water capacity per pass and no
-    /// further `Vec::push` doublings fire. Capped at `MAX_CMD_VEC_POOL` (~16
-    /// entries) so a one-off heavy frame can't grow the pool unboundedly.
+    /// Retired batches return in reverse pass order so the next frame pops
+    /// capacities in its original pass order. Every allocated vector is kept:
+    /// the pool grows with maximum concurrent demand, including detached submit
+    /// payloads, and retains that command capacity until device teardown.
+    /// Stable pass workloads stop allocating once their vectors have warmed.
     command_vec_pool: Vec<Vec<Command>>,
 
     /// Index one past the last texture-upload pass inserted this frame.
@@ -1448,7 +1438,7 @@ impl PassState {
             frame_cascade_samples: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             frame_seq: 0,
             cmd_vec_realloc_bytes: 0,
-            command_vec_pool: Vec::with_capacity(MAX_CMD_VEC_POOL),
+            command_vec_pool: Vec::new(),
             upload_pass_end: 0,
             drawn_ranges: DrawnRangeTracker::new(),
             #[cfg(debug_assertions)]
@@ -1490,23 +1480,10 @@ impl PassState {
             render_scale,
             continues_frame,
         } = reset;
-        // Recycle each retired pass's `commands` Vec back into the pool
-        // (capacity preserved, length zeroed). Once warm, the pool's
-        // Vecs carry the steady-state high-water capacity and the next
-        // frame's `ensure_pass_open` reuses them — eliminating the
-        // `Vec::with_capacity(64)` → many doublings cycle that the
-        // `cmd_realloc` perf row measures. Cap so a one-off frame with
-        // many passes (rare) can't park unused capacity forever.
-        for pass in self.passes.drain(..) {
-            if self.command_vec_pool.len() >= MAX_CMD_VEC_POOL {
-                break;
-            }
-            let mut cmds = pass.commands;
-            cmds.clear();
-            self.command_vec_pool.push(cmds);
+        // Reverse retirement keeps the first pass's capacity on top of the LIFO pool.
+        for pass in self.passes.drain(..).rev() {
+            recycle_command_vec(&mut self.command_vec_pool, pass.commands);
         }
-        // Belt-and-braces in case the break-on-cap fired mid-drain.
-        self.passes.clear();
         self.upload_pass_end = 0;
         self.current_pass_closed = true;
         // No pass open → no viewport emitted yet; the next pass's open
@@ -1636,20 +1613,12 @@ impl PassState {
 
     /// Drain finished passes' `commands` vecs back into the recycle pool.
     ///
-    /// Capacity preserved, length zeroed, capped at `MAX_CMD_VEC_POOL`. The
-    /// counterpart to [`Self::take_finished_passes`]: once the submit stage is
-    /// done reading a taken pass list, this returns its command vecs so the
-    /// next frame's `ensure_pass_open` reuses them instead of freshly
-    /// allocating. `drain(..)` always empties `passes` (retaining its
-    /// capacity); the cap only bounds how many vecs the pool parks.
+    /// The submit stage must have finished reading the taken passes. Draining
+    /// in reverse order restores their capacities to the LIFO pool in next-use
+    /// order. The pass list retains its own capacity and becomes empty.
     pub fn recycle_passes(&mut self, passes: &mut Vec<Pass>) {
-        for pass in passes.drain(..) {
-            if self.command_vec_pool.len() >= MAX_CMD_VEC_POOL {
-                continue;
-            }
-            let mut cmds = pass.commands;
-            cmds.clear();
-            self.command_vec_pool.push(cmds);
+        for pass in passes.drain(..).rev() {
+            recycle_command_vec(&mut self.command_vec_pool, pass.commands);
         }
     }
 
@@ -2523,11 +2492,8 @@ impl PassState {
             {
                 pass.has_counting_visibility = true;
             }
-            // Detect Vec::push doubling: the realloc memcpys
-            // `capacity * size_of::<Command>()` bytes from the old
-            // buffer to the new one. The running total is the churn
-            // figure the perf summary reports as `cmd_realloc`; once
-            // `command_vec_pool` is warm it settles at zero.
+            // Count old capacity at growth as potential copy volume. An
+            // allocator may grow in place; this does not measure actual copies.
             if pass.commands.len() == pass.commands.capacity() {
                 let bytes = pass
                     .commands
@@ -2561,27 +2527,27 @@ impl PassState {
         self.debug_emitted = DebugBoundShadow::default();
     }
 
-    /// Drain and return the running per-frame total of bytes Metal will memcpy.
+    /// Drain the command-vector growth copy estimate for this submission.
     ///
-    /// The bytes are the memcpy cost of `Pass::commands` `Vec` doublings.
-    /// Called once per frame from the encoder's `log_perf_summary`. Zeroes the
-    /// field so the next frame starts fresh.
+    /// Sums old capacity bytes at growth, excluding initial allocations and
+    /// without distinguishing in-place growth from copies. Called by the
+    /// encoder's `log_perf_summary`; zeroes the counter for the next submission.
     pub const fn take_cmd_vec_realloc_bytes(&mut self) -> u64 {
         let bytes = self.cmd_vec_realloc_bytes;
         self.cmd_vec_realloc_bytes = 0;
         bytes
     }
 
-    /// Sum `Vec::capacity() * size_of::<Command>()` across every pass's command buffer.
+    /// Sum command-vector capacity bytes in the submitted pass list.
     ///
-    /// Summed at end-of-frame. The pool recycles these vectors across frames
-    /// so capacity is the resident-memory footprint, not a per-frame
-    /// allocation cost. Paired with `take_cmd_vec_realloc_bytes` so the diag
-    /// row can show steady-state size alongside growth churn.
+    /// Counts only the supplied payload's passes, excluding idle pooled vectors
+    /// and other outstanding payloads. Call after detaching the passes from this
+    /// state. This is reused capacity, not allocation volume; potential growth copies are
+    /// tracked separately by [`Self::take_cmd_vec_realloc_bytes`].
     #[must_use]
-    pub fn cmd_vec_capacity_bytes(&self) -> u64 {
+    pub fn cmd_vec_capacity_bytes(passes: &[Pass]) -> u64 {
         let elem = core::mem::size_of::<Command>() as u64;
-        self.passes
+        passes
             .iter()
             .map(|p| p.commands.capacity() as u64 * elem)
             .sum()
@@ -4163,7 +4129,7 @@ impl PassState {
             return;
         }
         let before = self.passes.len();
-        self.passes.retain(|p| {
+        self.passes.retain_mut(|p| {
             let has_draw = p.commands.iter().any(|c| {
                 c.cmd == CommandType::DrawPrimitives as u32
                     || c.cmd == CommandType::DrawIndexedPrimitives as u32
@@ -4183,7 +4149,11 @@ impl PassState {
             let depth_writes = !p.depth_texture.is_null()
                 && (matches!(p.depth_store, StoreAction::Store)
                     || !p.depth_resolve_texture.is_null());
-            color_writes || depth_writes
+            let keep = color_writes || depth_writes;
+            if !keep {
+                recycle_command_vec(&mut self.command_vec_pool, core::mem::take(&mut p.commands));
+            }
+            keep
         });
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             let dropped = before - self.passes.len();
@@ -4290,7 +4260,8 @@ impl PassState {
                         "pass-coalesce drop idx={i} (clear-only) → fold into idx={t} color={target_color:#x} depth={target_depth:#x}",
                     );
                 }
-                self.passes.remove(i);
+                let retired = self.passes.remove(i);
+                recycle_command_vec(&mut self.command_vec_pool, retired.commands);
                 // Don't increment i — what was at i+1 is now at i.
             } else {
                 i += 1;
@@ -4991,6 +4962,54 @@ pub enum VertexBufferBind {
     ReusedHandle,
 }
 
+/// Last-bound immutable byte snapshot for one encoder slot.
+///
+/// Retains the latest token instead of copying its bytes. Tokens must return
+/// the same immutable slice for their entire cached lifetime. Arena-backed
+/// tokens must be reset before their arena is cleared, reused or transferred
+/// to another owner. A fresh render encoder also requires a reset.
+pub struct SnapshotBytesCache<T: AsRef<[u8]>> {
+    snapshot: Option<T>,
+}
+
+impl<T: AsRef<[u8]>> SnapshotBytesCache<T> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { snapshot: None }
+    }
+
+    /// Forget the token before its backing storage can be retired or reused.
+    pub fn reset(&mut self) {
+        self.snapshot = None;
+    }
+
+    /// Record a nonempty snapshot and report whether its binding changed.
+    ///
+    /// Equal pointers and lengths identify an unchanged immutable snapshot.
+    /// Distinct snapshots compare bytewise, preserving NaN payloads and signed
+    /// zero. Even an equal snapshot replaces the token so subsequent draws can
+    /// use its identity. Empty snapshots leave the existing binding untouched.
+    #[inline]
+    pub fn changed(&mut self, snapshot: T) -> bool {
+        let bytes = snapshot.as_ref();
+        if bytes.is_empty() {
+            return false;
+        }
+        let changed = self.snapshot.as_ref().is_none_or(|previous| {
+            let previous = previous.as_ref();
+            !(core::ptr::eq(previous, bytes) || previous == bytes)
+        });
+        self.snapshot = Some(snapshot);
+        changed
+    }
+}
+
+impl<T: AsRef<[u8]>> Default for SnapshotBytesCache<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-render-pass last-bound state cache.
 ///
 /// Skips redundant `setFragmentSamplerState` / `setFragmentTexture` /
@@ -5017,8 +5036,6 @@ pub struct LastBoundCache {
     depth_stencil: u64,
     stencil_reference: u32,
     cull_mode: Option<CullMode>,
-    /// VS float constant slot — programmable / FF vertex constant buffer.
-    vs_constants: Vec<u8>,
     /// VS pos-fixup slot — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
     ///
     /// Re-bound only when the viewport dims change (rare), so the per-draw
@@ -5030,8 +5047,6 @@ pub struct LastBoundCache {
     /// changes, so the per-draw cost is a length-then-memcmp against
     /// `vs_draw::VS_DRAW_BYTES`.
     vs_draw: Vec<u8>,
-    /// PS slot 15 — programmable / FF pixel constant buffer.
-    ps_constants: Vec<u8>,
     /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
     ps_alpha_ref: Vec<u8>,
     /// PS slot 13 — fog colour vec4, when fog is enabled.
@@ -5092,10 +5107,8 @@ impl LastBoundCache {
             depth_stencil: 0,
             stencil_reference: 0,
             cull_mode: None,
-            vs_constants: Vec::new(),
             vs_pos_fixup: Vec::new(),
             vs_draw: Vec::new(),
-            ps_constants: Vec::new(),
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
@@ -5123,10 +5136,8 @@ impl LastBoundCache {
         self.depth_stencil = 0;
         self.stencil_reference = 0;
         self.cull_mode = None;
-        self.vs_constants.clear();
         self.vs_pos_fixup.clear();
         self.vs_draw.clear();
-        self.ps_constants.clear();
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
@@ -5313,11 +5324,6 @@ impl LastBoundCache {
     }
 
     #[inline]
-    pub fn vs_constants_changed(&mut self, bytes: &[u8]) -> bool {
-        update_inline_bytes(&mut self.vs_constants, bytes)
-    }
-
-    #[inline]
     pub fn vs_pos_fixup_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_pos_fixup, bytes)
     }
@@ -5325,11 +5331,6 @@ impl LastBoundCache {
     #[inline]
     pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_draw, bytes)
-    }
-
-    #[inline]
-    pub fn ps_constants_changed(&mut self, bytes: &[u8]) -> bool {
-        update_inline_bytes(&mut self.ps_constants, bytes)
     }
 
     #[inline]
@@ -5573,6 +5574,15 @@ impl LastBoundCache {
                 "fragment-sampler[{stage}] cache desync (cache vs encoder-emitted)"
             );
         }
+    }
+}
+
+/// Return allocated command storage after its consumer has finished.
+fn recycle_command_vec(pool: &mut Vec<Vec<Command>>, mut commands: Vec<Command>) {
+    // Synthetic blit-only passes have no command allocation to retain.
+    if commands.capacity() != 0 {
+        commands.clear();
+        pool.push(commands);
     }
 }
 

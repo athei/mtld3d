@@ -10,8 +10,10 @@
 //! What they pin is that two records coexist and are torn down one at a
 //! time, that each record seeds and carries its own derived state, that the
 //! present-geometry streaks are independent, that nothing is written into a
-//! sink once its record is unregistered, and that a view address handed out
-//! again names a new record rather than the old one.
+//! sink once its record is unregistered, that a view address handed out
+//! again names a new record rather than the old one, and that a Reset's
+//! re-pacing makes one record's reconciliation due at once, defers to a
+//! refresh already in flight, and leaves the other records' cadence alone.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -386,4 +388,88 @@ fn a_reregistered_view_address_is_a_new_record() {
     );
     assert!(unregister(VIEW).is_some());
     assert!(find(VIEW).is_none());
+}
+
+#[test]
+fn a_reset_makes_the_refresh_due_at_once() {
+    const VIEW: usize = 0xB_0000;
+
+    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    assert!(
+        att.begin_headroom_refresh(),
+        "the first present queues the attach-time refresh"
+    );
+    att.end_headroom_refresh();
+    assert!(
+        !att.begin_headroom_refresh(),
+        "one present in, the next poll is an interval away"
+    );
+    assert!(
+        att.request_refresh(),
+        "a Reset with no refresh in flight queues one now"
+    );
+    att.end_headroom_refresh();
+    assert!(
+        !att.begin_headroom_refresh(),
+        "the Reset's refresh was the one refresh; the interval restarted with it"
+    );
+
+    unregister(VIEW);
+}
+
+#[test]
+fn a_reset_during_a_refresh_in_flight_defers_to_the_next_present() {
+    const VIEW: usize = 0xC_0000;
+
+    let att = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 1, None));
+    assert!(att.begin_headroom_refresh(), "the poll queued a refresh");
+    assert!(
+        !att.request_refresh(),
+        "the Reset finds it in flight and queues nothing"
+    );
+    att.end_headroom_refresh();
+    assert!(
+        att.begin_headroom_refresh(),
+        "the next present queues another, which reads the pacing the Reset latched"
+    );
+
+    unregister(VIEW);
+}
+
+#[test]
+fn a_reset_repaces_one_record_only() {
+    const VIEW_A: usize = 0xD_0000;
+    const VIEW_B: usize = 0xD_1000;
+
+    let a = register(VIEW_A, VIEW_A + 8, &latches(AttachFlags::empty(), 1, None));
+    let b = register(VIEW_B, VIEW_B + 8, &latches(AttachFlags::empty(), 1, None));
+    // Both records are past their attach-time refresh.
+    assert!(a.begin_headroom_refresh());
+    a.end_headroom_refresh();
+    assert!(b.begin_headroom_refresh());
+    b.end_headroom_refresh();
+
+    let immediate = pack_pacing(&PresentPacing {
+        vsync_requested: false,
+        max_fps: 0,
+    });
+    a.set_pacing_bits(immediate);
+    assert!(a.request_refresh(), "A's Reset queues A's refresh");
+    assert_eq!(a.pacing_bits(), immediate);
+    assert_eq!(
+        b.pacing_bits(),
+        pack_pacing(&PresentPacing {
+            vsync_requested: true,
+            max_fps: 60,
+        }),
+        "B keeps the pacing its own attach latched"
+    );
+    assert!(
+        !b.begin_headroom_refresh(),
+        "B's next present is not due: A's Reset left B's interval alone"
+    );
+    a.end_headroom_refresh();
+
+    unregister(VIEW_A);
+    unregister(VIEW_B);
 }

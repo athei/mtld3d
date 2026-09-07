@@ -923,11 +923,16 @@ The paravirtual device hands a later encoder of the same command buffer the
 content the resolve target held before the resolve (measured in the
 workflow's probe job, with and without an encoder in between); Apple GPUs
 see the resolve. The draws are therefore tested against the target's clear
-rather than the resolved scene. A device fault in Metal's ordering guarantee
-that no layer-side change short of a submit per resolve would mask, so
-`expected`; a real Intel/AMD Mac is expected to read zero here. 17330 reads
-its full count on one run and zero on the next, since the resolve sometimes
-lands before the load after all; `flaky`, pinned at the higher count.
+rather than the resolved scene. A device fault in Metal's ordering
+guarantee, and a submit boundary alone does not mask it either: a copy in
+the next command buffer can still read the pre-resolve content. The layer
+therefore waits for the resolving command buffer to complete before it
+copies out of a resolve target on this device (`RESOLVE_NEEDS_RETIRE` in
+`DeviceCapsFlags`), the wait a readback pays anyway; these two sites read
+through a draw, not a copy, so they stay `expected`, and a real Intel/AMD
+Mac is expected to read zero here. 17330 reads its full count on one run
+and zero on the next, since the resolve sometimes lands before the load
+after all; `flaky`, pinned at the higher count.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected

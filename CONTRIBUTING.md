@@ -109,7 +109,12 @@ and the only one of a death the layer's crash handler ended: its fatal banner,
 registers and stack go there and never to stderr. The runner moves that log
 to `<binary>-<pid>.layer-log` beside the stderr, because the layer keeps only
 its ten newest logs and the next run would remove it, and quotes it in the
-same note from the banner on when there is one.
+same note from the banner on when there is one. Every test process runs
+under Apple's Main Thread Checker (`debug.mainThreadChecker` in the suite's
+config, `docs/ARCHITECTURE.md` says how), so a kept `.stderr` that carries a
+`Main Thread Checker: UI API called on a background thread:` line names the
+AppKit call the layer made off the main thread and the thread that made it;
+that call is the failure, whatever the process printed after it.
 
 In CI every end-to-end leg uploads all three kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
@@ -120,7 +125,12 @@ while its sibling legs are green, re-run the failed jobs first (`gh run rerun
 <run-id> --failed`, which lands on a fresh machine) and read the command
 buffer errors in the artifact's log, since a hosted runner's GPU can fail that
 way with no hang line in the job log and nothing else tells it from a
-regression.
+regression. A `CreateBackbuffer` failure on the Intel image is read the same
+way: its unix line names the request and the device, and a sane request (the
+window's size, `BGRA8Unorm`, a sample count the device answered for) that
+`newTextureWithDescriptor` refused on that image's GPU, the paravirtual
+`AppleParavirtGPUMetal`, is the same runner fault, so re-run the failed jobs.
+A line naming a zero dimension or a null handle is the layer's own bug.
 
 Two things are worth knowing when a test process looks wrong. `d3d9.dll`
 terminates the process from its `DLL_PROCESS_DETACH` once a device exists

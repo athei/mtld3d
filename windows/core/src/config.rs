@@ -42,6 +42,14 @@ pub struct Mtld3dConfig {
     /// Surfaces unimplemented paths via `log_once_warn!`. Default:
     /// `false`. File key: `debug.capsAll`.
     pub caps_all: bool,
+    /// Load Apple's Main Thread Checker into the process at the first `Direct3DCreate9`.
+    ///
+    /// The checker swizzles `AppKit` so a UI call off the main thread is
+    /// reported on stderr, or ends the process there when its own
+    /// `MTC_CRASH_ON_REPORT` variable is set. The test suite turns it on;
+    /// a game never needs it. Default: `false`. File key:
+    /// `debug.mainThreadChecker`.
+    pub main_thread_checker: bool,
     /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
     ///
     /// Treats the device as lacking the native packed 16-bit pixel
@@ -314,6 +322,7 @@ impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
             caps_all: false,
+            main_thread_checker: false,
             expand_packed16: false,
             deny_float32_filtering: false,
             managed_memory: false,
@@ -423,6 +432,10 @@ fn apply_line(cfg: &mut Mtld3dConfig, raw: &str, source: &str, lineno: Option<us
 /// logged too).
 pub fn log_options(cfg: &Mtld3dConfig) {
     info!(target: crate::LOG_TARGET, "config: debug.capsAll = {}", cfg.caps_all);
+    info!(
+        target: crate::LOG_TARGET,
+        "config: debug.mainThreadChecker = {}", cfg.main_thread_checker
+    );
     info!(
         target: crate::LOG_TARGET,
         "config: intel.expandPacked16 = {}", cfg.expand_packed16
@@ -541,6 +554,9 @@ const fn cursor_software_label(p: SoftwareCursorPolicy) -> &'static str {
 fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
     match key {
         "debug.capsAll" => assign_bool(source, key, value, &mut cfg.caps_all),
+        "debug.mainThreadChecker" => {
+            assign_bool(source, key, value, &mut cfg.main_thread_checker);
+        }
         "intel.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
         "intel.denyFloat32Filtering" => {
             assign_bool(source, key, value, &mut cfg.deny_float32_filtering);

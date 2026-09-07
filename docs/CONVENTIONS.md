@@ -18,11 +18,13 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | `pub(crate)` = 0 | §No `pub(crate)` |
 | `extern "stdcall"` = 0 | §`extern "system"` everywhere |
 | `msg_send!` / `class!` / `sel!` = 0 | §No raw `msg_send!` |
+| `MainThreadMarker::new_unchecked` = 0 | §AppKit work runs on the main thread |
 | `HashMap` / `HashSet` = 0 (maps are `FxHashMap` / `FxHashSet`) | §FxHash for maps, xxh3 for content |
 | `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
 | `mod.rs` files = 0 | §Module style |
 | Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
 | Every end-to-end test file (`windows/tests/tests/*.rs` and `tests/e2e/*.rs`, `main.rs` aside) has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
+| Raw thread spawns (`.spawn(`, `.spawn_scoped(`, `thread::spawn(`, `thread::Builder`) = 0 under `windows/tests/tests/e2e/` | §Every end-to-end test names itself |
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
 | Release hygiene (see below) | §Release hygiene |
 
@@ -125,6 +127,14 @@ Watch relative paths on the way out: `include_str!` resolves against the contain
 `windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the three files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `snmalloc_drift.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
 
 The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
+
+## Every end-to-end test names itself
+
+A thread an end-to-end test spawns is created through `mtld3d_tests::spawn_scoped`, never through `Scope::spawn`, `thread::spawn` or a `thread::Builder` of its own. The helper names the worker after the thread that spawns it, which libtest named after the test, so a worker of a worker is named after the test too.
+
+The tests of the `e2e` binary share one Wine process, and the harness's panic hook ends that process at the first failed assertion. What the runner then has to go on is the `thread '<name>' panicked at` line the default hook printed and the `[e2e] running <name>` line each thread wrote when it created its device. Both carry the thread's name. An unnamed worker prints `thread '<unnamed>'` and announces nothing, so a failure on it names no test, and the runner has to run every test that was in flight again, one at a time, to find which one it was. A worker carrying its test's name fails as that test, and the run costs one extra process instead of a serial round.
+
+`make audit` bans `.spawn(`, `.spawn_scoped(`, `thread::spawn(` and `thread::Builder` in `windows/tests/tests/e2e/*.rs`. The harness under `windows/tests/src` is where the one `Builder::spawn_scoped` call lives, outside the banned directory.
 
 ## No `pub(crate)` — use module hierarchy
 
@@ -393,11 +403,19 @@ How to apply:
 - Feature dependencies are not transitive: enabling `NSView` requires `NSResponder`; methods returning `CGFloat`/`NSRect` need the `objc2-core-foundation` feature on `objc2-app-kit`. The compile error names the missing item; the crate's `Cargo.toml` `[features]` section names the gate.
 - `*mut c_void` from FFI → `Retained::retain(ptr.cast::<TypedClass>())`, then call typed methods. Pattern used throughout `macdrv.rs`.
 - Protocol inheritance (e.g. handing a `CAMetalDrawable` to `MTLCommandBuffer::presentDrawable`) uses `ProtocolObject::from_ref(&*sub_obj)` — sound because the sub-protocol trait extends the super-protocol trait. Type inference at the call site picks the target protocol.
-- `MainThreadOnly` classes (`NSScreen` / `NSView` / `NSWindow` / most of AppKit): mtld3d runs the API thread off the AppKit main thread, so class methods that require `MainThreadMarker` need `unsafe { MainThreadMarker::new_unchecked() }` with a SAFETY comment naming the read-only property being queried.
+- `MainThreadOnly` classes (`NSScreen` / `NSView` / `NSWindow` / most of AppKit) are reached from the main thread alone, through the two dispatchers; §"AppKit work runs on the main thread" has the rule and the marker it takes.
 
 Hard rule: no new `msg_send!`, `class!`, or `sel!` callsites — they're a grep away from being banned mechanically. If a binding is genuinely missing from objc2 framework crates, declare it locally via `objc2::extern_class!` / `extern_methods!` (the same macros the framework crates use) so the surface stays typed.
 
 This is one instance of the general rule in §"Unsafe is a last resort": prefer typed safe wrappers over raw unsafe. `msg_send!` is unsafe surface that already has typed alternatives.
+
+## AppKit work runs on the main thread
+
+Every `AppKit` object the layer touches (a view, its window, the screen under it, `NSApp`, the notification center and the observers it hands back) is created, read and released on the main thread, and so is the Core Animation layer configuration that has to land in a main-thread `CATransaction`. The API, encoder and submit threads never reach one directly: main-thread-only work is dispatched through `run_on_main_thread_sync` or `run_on_main_thread_async` in `unix/unix/src/metal/macdrv.rs`, the only two doors, and the dispatched closure runs in an autorelease pool of its own, so what it autoreleases drains when it returns rather than in whatever pool the main thread's caller holds open. A thread that another thread may be waiting on takes the asynchronous door: winemac's main thread waits on Wine threads in a run-loop mode that does not drain the main queue, and the thread it waits on can be the API thread blocked on the encoder, so a synchronous hop from the encoder thread closes a cycle.
+
+Inside the dispatch, the marker is the checked `MainThreadMarker::new().expect("<function> runs on the main thread")`. The check is one `pthread_main_np` call on a path that is already a main-queue block, and an off-main use aborts with a named site instead of corrupting `AppKit`'s per-thread state. `unsafe { MainThreadMarker::new_unchecked() }` is banned by `make audit`; a property documented as readable from any thread is no exception, because the walk to the object that has the property is the part that is not.
+
+A view or a layer is resurrected from the address an attachment record holds in exactly one place: the registry helpers `retain_view` and `retain_layer` in `metal/macdrv/attachment.rs`, which check the record is still live under the registry lock and take a `MainThreadMarker`, so the contract is type-enforced where the address is turned back into an object. A new reader of a record's view or layer goes through them.
 
 ## Doc comments
 

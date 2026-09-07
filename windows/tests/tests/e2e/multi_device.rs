@@ -15,7 +15,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use mtld3d_tests::{Harness, HarnessConfig, SharedDevice, SharedQuery, assert_pixel_eq};
+use mtld3d_tests::{
+    Harness, HarnessConfig, SharedDevice, SharedQuery, assert_pixel_eq, spawn_scoped,
+};
 use mtld3d_types::{
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
     D3DISSUE_END, D3DQUERYTYPE_OCCLUSION,
@@ -155,12 +157,12 @@ fn two_devices_on_two_threads_wait_for_their_own_frames() {
     let finished = AtomicU32::new(0);
 
     std::thread::scope(|scope| {
-        let first_worker = scope.spawn(|| {
+        let first_worker = spawn_scoped(scope, || {
             let results = present_and_flush(&first_shared, &first_shared_query, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             results
         });
-        let second_worker = scope.spawn(|| {
+        let second_worker = spawn_scoped(scope, || {
             let results = present_and_flush(&second_shared, &second_shared_query, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             results
@@ -269,12 +271,12 @@ fn two_scaled_devices_on_two_threads_read_back_their_own_pixels() {
     let finished = AtomicU32::new(0);
 
     std::thread::scope(|scope| {
-        let first_worker = scope.spawn(|| {
+        let first_worker = spawn_scoped(scope, || {
             let results = readback_own_colour(&first_shared, RED, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             results
         });
-        let second_worker = scope.spawn(|| {
+        let second_worker = spawn_scoped(scope, || {
             let results = readback_own_colour(&second_shared, GREEN, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             results

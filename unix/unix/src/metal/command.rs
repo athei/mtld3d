@@ -394,6 +394,13 @@ pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
 
     // Present: blit backbuffer → drawable
     if !params.present_layer.is_null() {
+        // The layer is retained from its raw address without the registry's
+        // liveness check because the view that owns it is released only by
+        // `release_metal_view`, from `DestroyCommandQueue` and
+        // `DetachMetalLayer`, and both of their PE callers first drain the
+        // submit thread and wait for GPU idle, so no present is in flight
+        // while the address goes stale. The registry check exists for the
+        // main-thread observers, which nobody drains.
         mtld3d_shared::crumb!("submit:layerret", params.present_layer.raw());
         let Some(layer) =
             crate::metal::handle::IntoRetainedLayer::into_retained(params.present_layer)

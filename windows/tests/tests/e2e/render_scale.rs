@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, PosColorVertex, RhwVertex, SharedDevice, TexturedVertex,
-    assert_pixel_eq,
+    assert_pixel_eq, spawn_scoped,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DCMP_LESSEQUAL,
@@ -1223,12 +1223,12 @@ fn two_devices_at_different_scales_read_their_own_vpos() {
     let identity_shared = identity.shared();
     let finished = AtomicU32::new(0);
     std::thread::scope(|scope| {
-        let half_worker = scope.spawn(|| {
+        let half_worker = spawn_scoped(scope, || {
             let outcome = probe_own_quadrants(&half_shared, &quad, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             outcome
         });
-        let identity_worker = scope.spawn(|| {
+        let identity_worker = spawn_scoped(scope, || {
             let outcome = probe_own_quadrants(&identity_shared, &quad, FRAMES);
             finished.fetch_add(1, Ordering::AcqRel);
             outcome
