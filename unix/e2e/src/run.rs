@@ -185,10 +185,9 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let (status, hung) = if reported_gpu_hang {
-        let status = child
-            .wait()
-            .map_err(|e| format!("wait on {} after GPU hang failed: {e}", exe.display()))?;
+    let (status, hung) = if reported_gpu_hang || timed_out {
+        let status = wait_killed(&mut child)
+            .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
         (status, false)
     } else {
         match wait_bounded(&mut child, timeout, &gpu_hang) {
@@ -196,15 +195,13 @@ pub fn run(
             Wait::GpuHang => {
                 kill_group(&child);
                 reported_gpu_hang = true;
-                let status = child
-                    .wait()
-                    .map_err(|e| format!("wait on {} after GPU hang failed: {e}", exe.display()))?;
+                let status = wait_killed(&mut child)
+                    .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
                 (status, false)
             }
             Wait::TimedOut => {
                 kill_group(&child);
-                let status = child
-                    .wait()
+                let status = wait_killed(&mut child)
                     .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?;
                 (status, true)
             }
@@ -265,6 +262,16 @@ fn drain_stderr(chunks: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Stderr {
             }
         }
     }
+}
+
+/// Reap a killed child and stop descendants its group signal missed.
+fn wait_killed(child: &mut Child) -> std::io::Result<ExitStatus> {
+    let status = child.wait()?;
+    // A group signal visits a snapshot: a child forked while it is sent
+    // can miss it and keep the pipes open. Reaping the leader ensures its
+    // in-flight fork has finished before the group is signalled again.
+    kill_group(child);
+    Ok(status)
 }
 
 /// The result of waiting for a process after its stdout closed.
