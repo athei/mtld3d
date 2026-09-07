@@ -77,6 +77,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
+    fn GetLastError() -> u32;
 }
 
 // Safe wrappers around the Win32 calls used by this module — each Win32
@@ -185,6 +186,16 @@ fn delete_object(obj: *mut c_void) -> i32 {
     // SAFETY: DeleteObject accepts null + any GDI object handle; returns 0
     // on failure (caller logs).
     unsafe { DeleteObject(obj) }
+}
+
+/// The calling thread's Win32 last-error code.
+///
+/// Read right after the call that failed: every Win32 call, `DeleteObject`
+/// included, may overwrite it.
+fn last_error() -> u32 {
+    // SAFETY: GetLastError reads the calling thread's own error slot and
+    // takes no arguments.
+    unsafe { GetLastError() }
 }
 
 fn create_bitmap_packed(
@@ -1653,9 +1664,11 @@ fn create_cursor_from_bits(
         mask.as_ptr().cast::<c_void>(),
     );
     if color_bitmap.is_null() || mask_bitmap.is_null() {
+        let err = last_error();
         error!(
             target: LOG_TARGET,
-            "{what}: CreateBitmap failed (color={color_bitmap:p} mask={mask_bitmap:p}) {width}x{height}",
+            "{what}: CreateBitmap failed (color={color_bitmap:p} mask={mask_bitmap:p}) \
+             {width}x{height}, GetLastError={err:#x}",
         );
         if !color_bitmap.is_null() {
             delete_object(color_bitmap);
@@ -1673,11 +1686,15 @@ fn create_cursor_from_bits(
         hbm_color: color_bitmap,
     };
     let cursor = create_icon_indirect(&info);
+    let err = last_error();
     // CreateIconIndirect copies the bitmaps; we own the originals.
     delete_object(color_bitmap);
     delete_object(mask_bitmap);
     if cursor.is_null() {
-        error!(target: LOG_TARGET, "{what}: CreateIconIndirect returned null ({width}x{height})");
+        error!(
+            target: LOG_TARGET,
+            "{what}: CreateIconIndirect returned null ({width}x{height}, GetLastError={err:#x})"
+        );
         None
     } else {
         Some(cursor)
