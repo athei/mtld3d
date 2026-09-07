@@ -19,15 +19,32 @@
 //! smallest registered seq at or past the target on the waiting device, and never with
 //! another device's entry, however the seqs of the two interleave.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
-use mtld3d_shared::mtl::{BlockLayout, PixelFormat};
-use objc2_metal::MTLPixelFormat;
+use mtld3d_shared::{
+    MetalHandle, SubmitFrameParams,
+    mtl::{BlockLayout, PixelFormat},
+};
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLPixelFormat, MTLSharedEvent,
+};
 
 use super::{
-    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PresentGeometry, PresentRoute,
-    SETTLED_PRESENTS, copy_buffer_to_texture_reject, copy_texture_reject,
-    copy_texture_to_buffer_reject, first_pending, geometry_settled, present_route,
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
+    PresentGeometry, PresentRoute, SETTLED_PRESENTS, copy_buffer_to_texture_reject,
+    copy_texture_reject, copy_texture_to_buffer_reject, first_pending, geometry_settled,
+    present_route, submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -48,11 +65,26 @@ fn a_wait_answers_with_its_own_devices_next_seq() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(first_pending(&map, DEVICE_A, 5), Some(&15));
-    assert_eq!(first_pending(&map, DEVICE_A, 6), Some(&17));
-    assert_eq!(first_pending(&map, DEVICE_A, 7), Some(&17));
-    assert_eq!(first_pending(&map, DEVICE_A, 8), None);
-    assert_eq!(first_pending(&map, DEVICE_B, 6), Some(&26));
+    assert_eq!(
+        first_pending(&map, DEVICE_A, 5).map(|(_, value)| value),
+        Some(&15)
+    );
+    assert_eq!(
+        first_pending(&map, DEVICE_A, 6).map(|(_, value)| value),
+        Some(&17)
+    );
+    assert_eq!(
+        first_pending(&map, DEVICE_A, 7).map(|(_, value)| value),
+        Some(&17)
+    );
+    assert_eq!(
+        first_pending(&map, DEVICE_A, 8).map(|(_, value)| value),
+        Some(&17)
+    );
+    assert_eq!(
+        first_pending(&map, DEVICE_B, 6).map(|(_, value)| value),
+        Some(&26)
+    );
 }
 
 /// Another device's entries never answer a wait, whatever seqs it holds.
@@ -61,8 +93,14 @@ fn another_devices_entries_never_answer_a_wait() {
     let map: BTreeMap<(u64, u64), u32> = (1..=10).map(|seq| ((DEVICE_B, seq), 20)).collect();
     assert_eq!(first_pending(&map, DEVICE_A, 1), None);
     assert_eq!(first_pending(&map, DEVICE_A, 0), None);
-    assert_eq!(first_pending(&map, DEVICE_B, 3), Some(&20));
-    assert_eq!(first_pending(&map, DEVICE_B, 11), None);
+    assert_eq!(
+        first_pending(&map, DEVICE_B, 3).map(|(_, value)| value),
+        Some(&20)
+    );
+    assert_eq!(
+        first_pending(&map, DEVICE_B, 11).map(|(_, value)| value),
+        Some(&20)
+    );
 }
 
 /// Matching extents take the blit whether or not `MetalFX` exists.
@@ -638,4 +676,192 @@ fn a_readback_reports_the_ends_the_other_way_round() {
         ),
         Some(CopyRejectReason::DestinationBufferTooShort)
     );
+}
+
+/// A missing final sequence still waits for earlier committed GPU work.
+#[test]
+fn missing_final_submit_waits_for_earlier_work() {
+    let queue = test_queue();
+    let event = queue.device().newSharedEvent().expect("shared event");
+    let cb = queue.commandBuffer().expect("command buffer");
+    cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+    let coherent = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let counter = atomic_address(&coherent);
+    PENDING_CMDBUFS
+        .lock()
+        .unwrap()
+        .insert((counter, 1), PendingCmdBuf(cb.clone()));
+    cb.commit();
+    let (done, watchdog) = release_event_after_wait(event);
+    wait_for_gpu_retire(2, counter, atomic_address(&failed));
+    let status_at_return = cb.status();
+    let retired_at_return = coherent.load(Ordering::Acquire);
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    cb.waitUntilCompleted();
+    PENDING_CMDBUFS.lock().unwrap().remove(&(counter, 1));
+    assert_eq!(status_at_return, MTLCommandBufferStatus::Completed);
+    assert_eq!(
+        retired_at_return, 1,
+        "the missing sequence was not submitted"
+    );
+}
+
+/// Both failure positions protect committed work and publish failure before retirement.
+#[test]
+fn cpu_submit_failure_drains_draw_and_upload_handlers() {
+    cpu_submit_failure_drain(false);
+}
+
+#[test]
+fn cpu_submit_failure_after_upload_commit_drains_handlers() {
+    cpu_submit_failure_drain(true);
+}
+
+fn cpu_submit_failure_drain(upload_committed: bool) {
+    let queue = test_queue();
+    let event = queue.device().newSharedEvent().expect("shared event");
+    let cb = queue.commandBuffer().expect("command buffer");
+    if !upload_committed {
+        cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+    }
+    let coherent = AtomicU64::new(0);
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let draw_counter = atomic_address(&coherent);
+    let upload_counter = atomic_address(&upload);
+    let handler_done = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&handler_done);
+    let handler = block2::RcBlock::new(
+        move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            handler_flag.store(true, Ordering::Release);
+        },
+    );
+    // SAFETY: Metal retains the block, whose only capture owns its atomic.
+    unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
+    PENDING_CMDBUFS
+        .lock()
+        .unwrap()
+        .insert((draw_counter, 1), PendingCmdBuf(cb.clone()));
+    cb.commit();
+    if upload_committed {
+        cb.waitUntilCompleted();
+    }
+    // In the upload case only the upload is parked. Waiting for the older
+    // draw alone cannot satisfy the lifetime assertion.
+    let upload_gate = queue.commandBuffer().expect("upload gate");
+    if upload_committed {
+        upload_gate.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+    }
+    upload_gate.commit();
+    let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+    let (done, watchdog) = release_event_after_wait(event);
+    let mut committed_upload = None;
+    let success = submit_frame_with(&mut params, |params| {
+        if upload_committed {
+            assert!(submit_upload_cmd_buf(
+                &queue,
+                &[],
+                false,
+                params.submit_seq,
+                upload_counter,
+                params.failed_submit_seq_ptr
+            ));
+            // The upload at seq 2 is parked behind its own gate. Register
+            // a draw at the same seq to prove the counter identities do not collide.
+            PENDING_CMDBUFS
+                .lock()
+                .unwrap()
+                .insert((draw_counter, 2), PendingCmdBuf(cb.clone()));
+            let pending = PENDING_CMDBUFS.lock().unwrap();
+            assert!(pending.contains_key(&(draw_counter, 2)));
+            committed_upload = pending.get(&(upload_counter, 2)).map(|cb| cb.0.clone());
+            drop(pending);
+            assert!(committed_upload.is_some());
+        }
+        false
+    });
+    let upload_status_at_return = committed_upload.as_ref().map(|cb| cb.status());
+    let status_at_return = cb.status();
+    let handler_at_return = handler_done.load(Ordering::Acquire);
+    let counters_at_return = (
+        coherent.load(Ordering::Acquire),
+        upload.load(Ordering::Acquire),
+        failed.load(Ordering::Acquire),
+    );
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    cb.waitUntilCompleted();
+    // Cleanup precedes assertions so the pre-fix reproduction frees no live sink.
+    let pending_upload = PENDING_CMDBUFS
+        .lock()
+        .unwrap()
+        .get(&(upload_counter, 2))
+        .map(|cb| cb.0.clone());
+    if let Some(upload_cb) = pending_upload {
+        upload_cb.waitUntilCompleted();
+    }
+    upload_gate.waitUntilCompleted();
+    PENDING_CMDBUFS
+        .lock()
+        .unwrap()
+        .retain(|&(counter, _), _| counter != draw_counter && counter != upload_counter);
+    assert!(!success);
+    assert_eq!(status_at_return, MTLCommandBufferStatus::Completed);
+    assert!(handler_at_return, "callback sinks must be unused on return");
+    if upload_committed {
+        assert_eq!(
+            upload_status_at_return,
+            Some(MTLCommandBufferStatus::Completed)
+        );
+    }
+    assert_eq!(counters_at_return, (2, 2, 2));
+}
+
+fn test_queue() -> Retained<ProtocolObject<dyn MTLCommandQueue>> {
+    let device = MTLCreateSystemDefaultDevice().expect("Metal device");
+    device.newCommandQueue().expect("command queue")
+}
+
+fn atomic_address(value: &AtomicU64) -> u64 {
+    core::ptr::from_ref(value) as u64
+}
+
+fn test_submit_params(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    coherent: &AtomicU64,
+    upload: &AtomicU64,
+    failed: &AtomicU64,
+) -> SubmitFrameParams {
+    SubmitFrameParams {
+        // SAFETY: the caller's retained queue stays alive throughout the submission.
+        queue_handle: unsafe { MetalHandle::new(core::ptr::from_ref(queue) as u64) },
+        blit_commands_ptr: 0,
+        blit_command_count: 0,
+        blit_commands_need_encoder: 0,
+        passes_ptr: 0,
+        pass_count: 0,
+        pad1: 0,
+        present_layer: MetalHandle::NULL,
+        present_texture: MetalHandle::NULL,
+        submit_seq: 2,
+        coherent_seq_ptr: atomic_address(coherent),
+        upload_coherent_seq_ptr: atomic_address(upload),
+        failed_submit_seq_ptr: atomic_address(failed),
+        drawable_wait_ns: 0,
+        present_view: MetalHandle::NULL,
+    }
+}
+
+/// The watchdog also releases immediately when a broken wait returns early.
+fn release_event_after_wait(
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (done, waiting) = mpsc::channel();
+    let watchdog = thread::spawn(move || {
+        let _ = waiting.recv_timeout(Duration::from_millis(100));
+        event.setSignaledValue(1);
+    });
+    (done, watchdog)
 }

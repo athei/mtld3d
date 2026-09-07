@@ -7998,7 +7998,25 @@ impl FrameEncoder {
         //    Texture-kind retention entries merge into the `textures`
         //    Vec collected from the live cache above.
         mtld3d_shared::crumb!("phase:SdDrain");
-        let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
+        let mut held = self.drain_retention_and_wait(&mut buffers, &mut textures);
+        // Shutdown has no future frame to replay uploads into. Reset keeps
+        // these queues because its resource caches survive, and a failed
+        // final flush still owes their copies at the next begin_frame.
+        for entry in self.pending_stage_uploads.drain_all() {
+            let retry = entry.into_payload();
+            if !retry.transient.is_null() {
+                buffers.push(retry.transient.raw());
+            }
+            self.perf.bump_vbib_retained_sub(retry.page_box.len());
+            self.sub_retained_bytes(retry.page_box.len());
+            held.pageboxes.push(retry.page_box);
+        }
+        // Texture jobs own only a clone of the texture's staging Arc; park
+        // it with the other staging keepalives so it outlives the bulk
+        // destroy of the `MTLBuffer`s that wrap those pages.
+        for entry in self.pending_texture_uploads.drain_all() {
+            held.staging_arcs.push(entry.into_payload().arc);
+        }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,
         //    which reference libraries — destroy leaf-first.
@@ -8108,25 +8126,6 @@ impl FrameEncoder {
         textures: &mut Vec<u64>,
     ) -> HeldBackings {
         let mut held = HeldBackings::default();
-        // Un-acknowledged uploads go the same way as retention: the GPU is
-        // about to be idle, so there is nothing left to replay into. Their
-        // bytes leave the shared retention total here, which is the only
-        // place besides `settle_stage_uploads` that subtracts them.
-        for entry in self.pending_stage_uploads.drain_all() {
-            let retry = entry.into_payload();
-            if !retry.transient.is_null() {
-                buffers.push(retry.transient.raw());
-            }
-            self.perf.bump_vbib_retained_sub(retry.page_box.len());
-            self.sub_retained_bytes(retry.page_box.len());
-            held.pageboxes.push(retry.page_box);
-        }
-        // Texture jobs own only a clone of the texture's staging Arc; park
-        // it with the other staging keepalives so it outlives the bulk
-        // destroy of the `MTLBuffer`s that wrap those pages.
-        for entry in self.pending_texture_uploads.drain_all() {
-            held.staging_arcs.push(entry.into_payload().arc);
-        }
         while let Some(entry) = self.pending_resource_retention.pop_front() {
             if entry.handle != 0 {
                 match entry.kind {
