@@ -10272,7 +10272,7 @@ fn draw_bound_triangle_fan(
     D3D_OK
 }
 
-/// Read a released index buffer's contents back out of its device buffer.
+/// Complete an index buffer's CPU mirror from its device buffer.
 ///
 /// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` index buffer keeps no CPU copy of
 /// its bytes, and Metal has no triangle-fan primitive, so the rewrite below
@@ -10287,7 +10287,14 @@ fn draw_bound_triangle_fan(
 fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer9) -> bool {
     // SAFETY: `ib` is non-null and points to a live `Direct3DIndexBuffer9`
     // whose bound-slot reference keeps it alive for this call.
-    let inner = unsafe { &*ib }.inner();
+    let inner = unsafe { &mut *ib }.inner_mut();
+    // A fan can be drawn before Unlock. Its readback must follow the mapped
+    // range's upload, just as it follows every already-queued Unlock upload.
+    inner.flush_staged_if_mapped(dev);
+    // A whole-buffer mapped write already completes the CPU mirror.
+    if !inner.backing_needs_readback() {
+        return true;
+    }
     let buffer_id = inner.buffer_id();
     let mut page_box = PageBox::new_zeroed(inner.length() as usize);
     let dst_ptr = page_box.as_mut_ptr() as u64;
@@ -10315,7 +10322,7 @@ fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer
         );
         return false;
     }
-    // SAFETY: `ib` stays live for this call (see above), and the read
+    // SAFETY: `ib` stays live for this call (see above), and the mutable
     // reference taken at the top of this function has been dropped.
     unsafe { &mut *ib }.inner_mut().adopt_device_copy(page_box);
     true
@@ -10326,9 +10333,9 @@ fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer
 /// Reads the application's indices straight from the buffer's CPU-side backing,
 /// which is current under both map modes (the `Direct` box is the GPU memory
 /// itself, the `Staged` box is the copy every Lock writes). A buffer that
-/// released its copy has it read back off the GPU first. `None`, with a warn,
-/// when nothing is bound, the format is unknown, the readback fails, or the
-/// draw reads past the buffer.
+/// released or partially restored its copy has it read back off the GPU first.
+/// `None`, with a warn, when nothing is bound, the format is unknown, the
+/// readback fails, or the draw reads past the buffer.
 fn bound_index_fan(
     dev: &mut DeviceInner,
     start_index: u32,
@@ -10343,11 +10350,11 @@ fn bound_index_fan(
         );
         return None;
     }
-    let (format, released) = {
+    let (format, needs_readback) = {
         // SAFETY: `ptr` is non-null (checked above) and points to a live
         // `Direct3DIndexBuffer9` whose refcount keeps it alive while bound.
         let inner = unsafe { &*ptr }.inner();
-        (inner.format(), inner.backing_is_released())
+        (inner.format(), inner.backing_needs_readback())
     };
     let index_size: u64 = match format {
         D3DFMT_INDEX16 => 2,
@@ -10361,7 +10368,7 @@ fn bound_index_fan(
             return None;
         }
     };
-    if released && !materialise_index_backing(dev, ptr) {
+    if needs_readback && !materialise_index_backing(dev, ptr) {
         return None;
     }
     // SAFETY: `ptr` is non-null (checked above) and points to a live

@@ -284,16 +284,30 @@ impl BufferBacking {
     /// The bytes come from the device buffer, so the backing mirrors it
     /// again rather than holding only what is written next. Pins the
     /// backing: the read that produced these bytes is a GPU stall, and a
-    /// buffer pays it once.
+    /// buffer pays it once. An existing partial allocation is filled in place
+    /// so an outstanding lock pointer stays valid. The copy must include all
+    /// writes queued before the readback, including any still-mapped range.
+    ///
+    /// # Panics
+    /// Panics if a partial backing and the device copy differ in padded length.
     pub fn adopt_device_copy(&mut self, page_box: PageBox) {
-        if self.page_box.is_some() {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "adopt_device_copy: the buffer already holds a backing, dropping the read-back copy");
-            return;
+        match self.state {
+            BackingState::Mirrors => {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "adopt_device_copy: the buffer already holds a complete backing, dropping the read-back copy");
+                return;
+            }
+            BackingState::Partial => {
+                // A lock may still point into these pages. Uploads snapshot
+                // their ranges into separate allocations before readback.
+                self.as_mut_slice().copy_from_slice(page_box.as_slice());
+            }
+            BackingState::Released => {
+                self.padded_len = page_box.len();
+                charge(self.class, self.padded_len);
+                self.page_box = Some(page_box);
+            }
         }
-        self.padded_len = page_box.len();
-        charge(self.class, self.padded_len);
-        self.page_box = Some(page_box);
         self.state = BackingState::Mirrors;
         self.pinned = true;
     }

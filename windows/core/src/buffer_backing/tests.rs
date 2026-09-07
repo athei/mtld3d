@@ -251,3 +251,25 @@ fn a_pinned_backing_keeps_the_pin_across_an_upload() {
     b.note_upload(0, SMALL);
     assert!(b.is_pinned());
 }
+
+#[test]
+fn a_read_back_copy_completes_partial_backing_without_moving_a_live_lock() {
+    let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
+    drop(b.release());
+    b.restore(PageBox::new_zeroed(SMALL as usize));
+    b.as_mut_slice()[16..32].fill(7);
+    b.note_upload(16, 32);
+    let address = b.ptr();
+    let generation = b.generation();
+    let mut device_copy = PageBox::new_zeroed(SMALL as usize);
+    device_copy.as_mut_slice().fill(3);
+    device_copy.as_mut_slice()[16..32].fill(7);
+    b.adopt_device_copy(device_copy);
+    assert_eq!(b.state(), BackingState::Mirrors);
+    assert!(b.is_pinned());
+    assert_eq!(b.ptr(), address, "an outstanding lock keeps its pointer");
+    assert_eq!(b.generation(), generation);
+    assert!(b.as_slice()[..16].iter().all(|&byte| byte == 3));
+    assert!(b.as_slice()[16..32].iter().all(|&byte| byte == 7));
+    assert!(b.as_slice()[32..].iter().all(|&byte| byte == 3));
+}

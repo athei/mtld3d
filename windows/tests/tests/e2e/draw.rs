@@ -5,10 +5,10 @@
 
 use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex};
 use mtld3d_types::{
-    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW,
-    D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST,
-    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING,
-    D3DUSAGE_WRITEONLY,
+    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFVF_DIFFUSE, D3DFVF_XYZ,
+    D3DFVF_XYZRHW, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP,
+    D3DPT_POINTLIST, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE,
+    D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
 };
 
 const MAGENTA: u32 = 0xFFFF_00FF;
@@ -458,6 +458,109 @@ fn indexed_triangle_fan_draws_after_its_index_buffer_released_its_backing() {
         BLACK,
         "the first fan is not drawn by the second draw"
     );
+}
+
+#[test]
+fn indexed_triangle_fan_materialises_partial_index_backing() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for format in [D3DFMT_INDEX16, D3DFMT_INDEX32] {
+        let mut verts = Vec::from(fan_diamond());
+        verts.extend_from_slice(&small_left_diamond());
+        let stride =
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+        let vb = h.create_vertex_buffer(stride * 8, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+        vb.lock(0, 0, 0).write(&verts);
+        assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0);
+        let index_size = if format == D3DFMT_INDEX16 { 2 } else { 4 };
+        let ib = h.create_index_buffer(index_size * 8, D3DUSAGE_WRITEONLY, format, D3DPOOL_DEFAULT);
+        if format == D3DFMT_INDEX16 {
+            ib.lock(0, 0, 0).write(&[0_u16, 1, 2, 3, 0, 0, 0, 0]);
+            ib.lock(index_size * 4, index_size * 2, 0)
+                .write(&[4_u16, 5]);
+            ib.lock(index_size * 6, index_size * 2, 0)
+                .write(&[6_u16, 7]);
+        } else {
+            ib.lock(0, 0, 0).write(&[0_u32, 1, 2, 3, 0, 0, 0, 0]);
+            ib.lock(index_size * 4, index_size * 2, 0)
+                .write(&[4_u32, 5]);
+            ib.lock(index_size * 6, index_size * 2, 0)
+                .write(&[6_u32, 7]);
+        }
+        assert_eq!(h.set_indices(&ib), 0);
+        // No draw or readback precedes the partial writes: the first fan
+        // needs the untouched device bytes, the second the queued uploads.
+        for (start, pixel, color) in [(0, 320, GREEN), (4, 160, MAGENTA)] {
+            h.render_once(BLACK, |d| {
+                assert_eq!(
+                    d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, start, 2),
+                    0
+                );
+            });
+            assert_eq!(
+                h.read_pixel(pixel, 240),
+                color,
+                "format {format}, start {start}"
+            );
+            assert_eq!(h.read_pixel(10, 10), BLACK);
+        }
+    }
+}
+
+#[test]
+fn indexed_triangle_fan_materialises_partial_backing_during_a_lock() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = Vec::from(fan_diamond());
+    verts.extend_from_slice(&small_left_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(stride * 8, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0);
+    for partial in [true, false] {
+        let ib = h.create_index_buffer(16, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        ib.lock(0, 0, 0).write(&[0_u16, 1, 2, 3, 0, 0, 0, 0]);
+        assert_eq!(h.set_indices(&ib), 0);
+        let mut locked = if partial {
+            ib.lock(8, 8, 0)
+        } else {
+            ib.lock(0, 0, 0)
+        };
+        if partial {
+            locked.write(&[4_u16, 5, 6, 7]);
+        } else {
+            locked.write(&[0_u16, 1, 2, 3, 4, 5, 6, 7]);
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(160, 240),
+            MAGENTA,
+            "the mapped write reaches the fan"
+        );
+        // The lock pointer must still name the installed backing after readback.
+        if partial {
+            locked.write(&[0_u16, 1, 2, 3]);
+        } else {
+            locked.write(&[0_u16, 1, 2, 3, 0, 1, 2, 3]);
+        }
+        drop(locked);
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "the same lock stays writable after the draw"
+        );
+    }
 }
 
 #[test]
