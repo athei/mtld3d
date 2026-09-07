@@ -250,6 +250,49 @@ jobs:
             ${{ runner.temp }}/*.layer-log
           retention-days: 14
           if-no-files-found: ignore
+      # The job budget is twenty minutes. Include five minutes of bounded
+      # pre-job context without changing the test command or its result.
+      - name: Collect e2e system log
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          output="$RUNNER_TEMP/e2e-system"
+          mkdir -p "$output"
+          interval_end=$(date +%s)
+          interval_start=$((interval_end - 25 * 60))
+          predicate='process == "kernel" OR process == "WindowServer" OR subsystem CONTAINS[c] "GPU" OR subsystem CONTAINS[c] "IOAccel" OR subsystem CONTAINS[c] "IOSurface" OR subsystem CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "GPU" OR senderImagePath CONTAINS[c] "IOAccel" OR senderImagePath CONTAINS[c] "IOSurface" OR senderImagePath CONTAINS[c] "AppleParavirt"'
+          {
+            printf 'interval_start_epoch=%s\n' "$interval_start"
+            printf 'interval_end_epoch=%s\n' "$interval_end"
+            printf 'timezone=UTC\n'
+            printf 'predicate=%s\n' "$predicate"
+            printf 'state=started\n'
+          } > "$output/collection-status.txt"
+          set +e
+          sudo -n /usr/bin/log show \
+            --start "@$interval_start" \
+            --end "@$interval_end" \
+            --style compact \
+            --timezone UTC \
+            --info \
+            --debug \
+            --predicate "$predicate" \
+            > "$output/system.log" \
+            2> "$output/collection.stderr"
+          collector_status=$?
+          {
+            printf 'exit_code=%s\n' "$collector_status"
+            printf 'state=completed\n'
+          } >> "$output/collection-status.txt"
+          exit "$collector_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-system-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
+          path: ${{ runner.temp }}/e2e-system
+          retention-days: 14
+          if-no-files-found: warn
 
   # Wine's own d3d9_test.exe against our staged builtin, per-site counts diffed
   # against unix/conformance/baseline.txt. One arch per runner process, and not
