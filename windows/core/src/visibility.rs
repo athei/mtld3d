@@ -62,6 +62,12 @@ pub enum QueryStatus {
 /// Held by `Arc` so the encoder-side pending list can keep the core alive
 /// past the COM wrapper's refcount reaching zero.
 pub struct VisibilityQueryCore {
+    /// Identity of the most recent BEGIN processed by the encoder.
+    ///
+    /// Even at one billion BEGINs per second, a `u64` lasts more than 584
+    /// years. Overflow panics instead of recycling an identity that an older
+    /// pending segment could still carry.
+    issue_generation: AtomicU64,
     /// Frame submit-seq at `Issue(BEGIN)`.
     ///
     /// Only valid once `status` leaves `NeverIssued`.
@@ -123,6 +129,7 @@ impl VisibilityQueryCore {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            issue_generation: AtomicU64::new(0),
             seq_begin: AtomicU64::new(0),
             seq_end: AtomicU64::new(0),
             offset_begin: AtomicU32::new(0),
@@ -152,6 +159,11 @@ impl VisibilityQueryCore {
     /// Metal encoder will write to. Moves the query from
     /// `NeverIssued`/`Issued` back into `Pending` — a second Issue on the
     /// same wrapper reuses the core.
+    ///
+    /// # Panics
+    ///
+    /// Panics after `u64::MAX` brackets rather than recycling an issue
+    /// generation that a pending segment could still carry.
     pub fn begin(
         &self,
         seq: u64,
@@ -160,6 +172,11 @@ impl VisibilityQueryCore {
         render: (u32, u32),
         draws_seen: u64,
     ) {
+        self.issue_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("visibility query issue generation exhausted");
         self.seq_begin.store(seq, Ordering::Release);
         self.offset_begin.store(offset, Ordering::Release);
         self.logical_area.store(area(logical), Ordering::Release);
@@ -274,6 +291,11 @@ impl VisibilityQueryCore {
     /// this query yet.
     pub fn seq_end_loaded(&self) -> u64 {
         self.seq_end.load(Ordering::Acquire)
+    }
+
+    /// Identity of the bracket whose BEGIN the encoder processed most recently.
+    fn issue_generation(&self) -> u64 {
+        self.issue_generation.load(Ordering::Acquire)
     }
 
     /// Fold one retired segment's sample count into the span's running total.
@@ -552,6 +574,7 @@ impl VisibilityBufferPool {
 struct PendingSegment {
     submit_seq: u64,
     core: Arc<VisibilityQueryCore>,
+    issue_generation: u64,
     span: (u32, u32),
     /// Whether this segment carries the query's `Issue(END)`.
     ///
@@ -752,9 +775,11 @@ impl VisibilityQueryState {
         span: (u32, u32),
         closes_span: bool,
     ) {
+        let issue_generation = core.issue_generation();
         self.pending.push_back(PendingSegment {
             submit_seq,
             core,
+            issue_generation,
             span,
             closes_span,
         });
@@ -772,6 +797,7 @@ impl VisibilityQueryState {
             self.pending.push_back(PendingSegment {
                 submit_seq,
                 core: core.clone(),
+                issue_generation: core.issue_generation(),
                 span: (core.offset_begin(), end),
                 closes_span: false,
             });
@@ -825,8 +851,11 @@ impl VisibilityQueryState {
     /// since a frame that reserved no slot for the query reserved no buffer
     /// either. A non-empty span whose buffer cannot be found (retired and
     /// evicted before intake ran, which the normal flow never produces)
-    /// leaves the whole span uncounted. Retired buffers whose seq has been
-    /// reached then move into the free list so the next frame can reuse them.
+    /// leaves the whole span uncounted. A segment from a bracket abandoned by
+    /// a later BEGIN is skipped instead of being folded into that replacement
+    /// bracket. Its retired buffer still moves through the normal release path
+    /// once its seq has been reached, so abandoning a bracket changes no
+    /// storage lifetime.
     ///
     /// Each retired buffer's `PageBox` points at PE-allocated Shared storage
     /// wrapped by Metal. Once `coherent_seq >= release_seq` the GPU is done
@@ -849,6 +878,9 @@ impl VisibilityQueryState {
                 continue;
             }
             let entry = self.pending.remove(i).expect("bound-checked");
+            if entry.issue_generation != entry.core.issue_generation() {
+                continue;
+            }
             let (begin, end) = entry.span;
             let sum = if begin >= end {
                 0

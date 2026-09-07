@@ -7,7 +7,8 @@
 //! over-cap retire hands the evicted entry back. The segment cases pin what a span that
 //! outlives its submit does: it is cut at the boundary, reopened in the continuation, and
 //! the two sums add up, while a span that lost its slots reads `u32::MAX` unless it held
-//! no draw, where zero is exact.
+//! no draw, where zero is exact. Reissuing before intake discards the pending segments of
+//! the abandoned bracket while keeping the replacement bracket's result.
 
 use mtld3d_shared::MetalHandle;
 
@@ -287,6 +288,65 @@ fn state_intake_adds_a_split_span_up_across_its_two_frames() {
     state.intake_completed(2);
     assert_eq!(core.status(), QueryStatus::Issued);
     assert_eq!(core.get_u32(), 1_000);
+}
+
+#[test]
+fn state_reissue_before_intake_discards_the_abandoned_span() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+    let mut buffer = dummy_buf(1);
+    write_slot(&mut buffer, 0, 100);
+    write_slot(&mut buffer, 1, 7);
+    state.pool.retire(buffer);
+
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    core.end(1, 1);
+    state.push_pending(1, core.clone(), (0, 1), true);
+
+    // Reissuing before the first segment retires abandons that bracket. Both
+    // segments still share the frame's visibility buffer, but only the second
+    // bracket belongs to the result the application asked for most recently.
+    core.begin(1, 1, (640, 480), (640, 480), 1);
+    core.end(1, 2);
+    state.push_pending(1, core.clone(), (1, 2), true);
+
+    state.intake_completed(1);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(core.get_u32(), 7);
+}
+
+#[test]
+fn state_reissue_waits_for_the_replacement_segments_sequence() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let core = VisibilityQueryCore::new();
+
+    let mut abandoned = dummy_buf(1);
+    write_slot(&mut abandoned, 0, 100);
+    state.pool.retire(abandoned);
+    core.begin(1, 0, (640, 480), (640, 480), 0);
+    core.end(1, 1);
+    state.push_pending(1, core.clone(), (0, 1), true);
+
+    let mut replacement = dummy_buf(2);
+    write_slot(&mut replacement, 0, 7);
+    state.pool.retire(replacement);
+    core.begin(2, 0, (640, 480), (640, 480), 1);
+    core.end(2, 2);
+    state.push_pending(2, core.clone(), (0, 1), true);
+
+    state.intake_completed(1);
+    assert_eq!(
+        core.status(),
+        QueryStatus::Pending,
+        "the abandoned result does not complete the replacement bracket"
+    );
+    assert_eq!(state.pending.len(), 1);
+
+    state.intake_completed(2);
+    assert_eq!(core.status(), QueryStatus::Issued);
+    assert_eq!(core.get_u32(), 7);
 }
 
 #[test]
