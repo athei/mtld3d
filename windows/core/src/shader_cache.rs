@@ -277,7 +277,10 @@ use crate::shader_compile_stats::CompileBucket;
 /// bound to a volume or cube texture emits `texture3d<float>` /
 /// `texturecube<float>` and a `.xyz` coordinate whatever its `dcl_<dim>` said,
 /// which is new MSL and a new programmable-VS disk-key input.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 67;
+///
+/// `68` preserves the `texldb` instruction control and adds the coordinate's
+/// `.w` to any sampler-state bias in the emitted programmable pixel shader.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 68;
 
 /// File magic.
 ///

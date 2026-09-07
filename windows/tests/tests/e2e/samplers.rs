@@ -334,6 +334,22 @@ const PS_SAMPLE_TEXTURE: [u32; 15] = [
     0x0000_FFFF,                                        // end
 ];
 
+/// `ps_3_0` sampling with the instruction bias supplied in `c0.x`.
+///
+/// The texture coordinate and its derivatives stay unchanged while
+/// `mov r1.w, c0.x` varies the `.w` consumed by `texldb`.
+#[rustfmt::skip]
+const PS_SAMPLE_TEXTURE_BIASED: [u32; 21] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0200_0001, 0x800F_0001, 0x90E4_0000,              // mov r1, v0
+    0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
+    0x0302_0042, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldb r0, r1, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
 /// Base dimension of the mip-tinted texture, and the pixel span it is drawn at.
 const MIP_TEX_DIM: u32 = 64;
 
@@ -512,5 +528,31 @@ fn mipmap_lod_bias_shifts_a_programmable_shader_sample() {
         biased, MIP_TINTS[3],
         "a +3 bias samples three levels coarser"
     );
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldb_adds_instruction_and_sampler_biases() {
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    let ps = h.create_pixel_shader(&PS_SAMPLE_TEXTURE_BIASED);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0]),
+        0,
+        "instruction bias 0"
+    );
+    assert_eq!(sample_at_bias(&h, 0.0), MIP_TINTS[0], "0 + 0 selects mip 0");
+
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[2.0, 0.0, 0.0, 0.0]),
+        0,
+        "instruction bias 2"
+    );
+    assert_eq!(sample_at_bias(&h, 0.0), MIP_TINTS[2], "2 + 0 selects mip 2");
+    assert_eq!(sample_at_bias(&h, 1.0), MIP_TINTS[3], "2 + 1 selects mip 3");
+
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
 }
