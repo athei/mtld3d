@@ -670,13 +670,11 @@ bitflags! {
         ///
         /// Set for a colour texture whose pixels are draw output rather than
         /// upload: nothing else ever writes it, so whatever a draw leaves
-        /// untouched is what the application reads. A fresh `MTLTexture`
-        /// carries whatever its memory last held, while D3D9 hands out a
-        /// surface whose pixels are defined, and applications rely on that:
-        /// a `Present` before the first draw, a scene transition through a
-        /// `Reset`, an effect target composited in full but only ever drawn
-        /// into in part. Without this, such a target is sampled and
-        /// presented carrying another resource's content.
+        /// untouched is what the application reads. D3D9 leaves initial
+        /// contents undefined, but some applications rely on zeroed render
+        /// targets. Clear colour targets at creation so untouched pixels read
+        /// as black: an effect target composited in full but only ever drawn
+        /// into in part must not carry another resource's content.
         const CLEAR_ON_CREATE = 1 << 3;
     }
 }

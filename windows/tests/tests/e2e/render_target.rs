@@ -5059,8 +5059,8 @@ fn a_fresh_render_target_starts_black() {
     // Painting targets and releasing them first gives the allocator blocks
     // with known contents to hand back, which makes an undefined target
     // read as the previous one's magenta rather than as black. It makes the
-    // difference likely to show, not certain: what proves the test bites is
-    // that it fails with the create flag forced off.
+    // difference likely to show, not certain: allocator reuse is not part of
+    // the contract this test checks.
     const EDGE: u32 = 256;
     let h = Harness::new();
     for _ in 0..4 {
@@ -5137,6 +5137,55 @@ fn a_fresh_render_target_texture_starts_black() {
             vec![FRESH],
             "level {level} of a freshly created render-target texture is zeroed",
         );
+    }
+}
+
+#[test]
+fn a_fresh_render_target_cube_starts_black_on_every_face_and_mip() {
+    const EDGE: u32 = 64;
+    const LEVELS: u32 = 3;
+    let h = Harness::new();
+    // Seed released cube allocations at the same shape as the fresh target.
+    // Read each fill back before release so the GPU has written every face
+    // and mip. Reuse is optional, but any reused pixels must be cleared.
+    for _ in 0..4 {
+        let painted = h.create_cube_texture_owned(
+            EDGE,
+            LEVELS,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        for face in 0..6 {
+            for level in 0..LEVELS {
+                let surface = painted.surface(face, level);
+                assert_eq!(h.color_fill_hr(&surface, MAGENTA), D3D_OK);
+                assert_eq!(
+                    surface_colors(&h, &surface),
+                    vec![MAGENTA],
+                    "seed face {face}, level {level}",
+                );
+            }
+        }
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_cube_texture_owned(
+        EDGE,
+        LEVELS,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    for face in 0..6 {
+        for level in 0..LEVELS {
+            assert_eq!(
+                surface_colors(&h, &fresh.surface(face, level)),
+                vec![FRESH],
+                "fresh face {face}, level {level} is transparent black over its whole extent",
+            );
+        }
     }
 }
 
