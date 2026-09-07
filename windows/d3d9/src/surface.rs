@@ -16,13 +16,12 @@ use mtld3d_types::{
     D3DFMT_X8R8G8B8, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
     D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DRECT, D3DRTYPE_SURFACE, D3DSURFACE_DESC,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET, Guid, IDirect3DSurface9Vtbl,
-    IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE, LOG_TARGET, com_ref::ComUnknown,
-    device::DeviceInner, encoder::ResampledUpload, null_out, private_data::PrivateDataStore,
-    texture::Direct3DTexture9, unix_call::unix_call,
+    D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, com_ref::ComUnknown, device::DeviceInner,
+    encoder::ResampledUpload, null_out, private_data::PrivateDataStore, texture::Direct3DTexture9,
+    unix_call::unix_call,
 };
 
 static DIRECT3D_SURFACE9_VTBL: IDirect3DSurface9Vtbl = IDirect3DSurface9Vtbl {
@@ -1161,11 +1160,11 @@ struct SurfaceInner {
     /// `Backbuffer`/`DepthStencil` for the device's implicit (device-owned)
     /// surfaces — see [`ImplicitKind`].
     implicit_kind: ImplicitKind,
-    /// The COM object `GetContainer` hands back (`AddRef`'d).
+    /// The implicit COM object `GetContainer` queries.
     ///
     /// The implicit swapchain for an implicit `Backbuffer`, the device wrapper
-    /// for an implicit `DepthStencil`. `0` for ordinary surfaces
-    /// (`GetContainer` → INVALIDCALL).
+    /// for an implicit `DepthStencil`. Ordinary texture levels query
+    /// `parent_texture`; standalone surfaces query their creating device.
     container: u64,
     /// Resource-wide `LockRect`/`GetDC` state for this surface alone (see [`DcLockState`]).
     ///
@@ -2003,7 +2002,7 @@ extern "system" fn surface_get_type(this: *mut c_void) -> u32 {
 
 // ── IDirect3DSurface9 ──
 
-/// Minimal `IUnknown` layout for `AddRef`'ing a surface's container.
+/// Minimal `IUnknown` layout for querying a surface's container.
 ///
 /// The container (the implicit swapchain or the device) is reached without
 /// naming its full vtable type — every d3d9 wrapper is `repr(C)` with
@@ -2015,9 +2014,9 @@ struct ContainerIUnknown {
 }
 #[repr(C)]
 struct ContainerIUnknownVtbl {
-    _query_interface: extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
-    add_ref: extern "system" fn(*mut c_void) -> u32,
-    _release: extern "system" fn(*mut c_void) -> u32,
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    _add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    _release: unsafe extern "system" fn(*mut c_void) -> u32,
 }
 
 extern "system" fn surface_get_container(
@@ -2035,65 +2034,35 @@ extern "system" fn surface_get_container(
         null_out(container);
         return D3DERR_INVALIDCALL;
     };
-    // A texture-level surface (from `GetSurfaceLevel`) reports its parent
-    // texture as the container. `GetContainer` is `QueryInterface` against
-    // that container, so it answers the texture's own interface IIDs and
-    // returns `E_NOINTERFACE` for anything else (notably IID_IDirect3DSurface9
-    // — a surface is not its own container). The internal texture behind an
-    // *owned* surface (offscreen-plain DEFAULT) is private and not reported.
     let inner = obj.inner();
-    if !inner.parent_texture.is_null() && !inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE) {
-        // SAFETY: `riid` is a *const Guid per the QueryInterface ABI.
-        let matches_texture = (unsafe { InPtr::<Guid>::opt(riid.cast()) }).is_some_and(|g| {
-            let g = *g;
-            g == IID_IUNKNOWN
-                || g == IID_IDIRECT3DRESOURCE9
-                || g == IID_IDIRECT3DBASETEXTURE9
-                || if inner.cube_face == u32::MAX {
-                    g == IID_IDIRECT3DTEXTURE9
-                } else {
-                    g == mtld3d_types::IID_IDIRECT3DCUBETEXTURE9
-                }
-        });
-        if !matches_texture {
-            null_out(container);
-            return E_NOINTERFACE;
-        }
-        let parent_ptr = inner.parent_texture.cast::<c_void>();
-        // SAFETY: `parent_texture` is the live texture wrapper that owns this
-        // level surface; its vtable's 2nd entry is `AddRef`.
-        let unk = unsafe { &*(parent_ptr.cast::<ContainerIUnknown>()) };
-        // SAFETY: `unk.vtbl` is the texture wrapper's `'static` vtable.
-        let vtbl = unsafe { &*unk.vtbl };
-        (vtbl.add_ref)(parent_ptr);
-        // SAFETY: `container` is non-null (checked) and a writable out-pointer.
-        unsafe { *container = parent_ptr };
-        return D3D_OK;
-    }
-    let container_ptr = inner.container as *mut c_void;
+    let container_ptr = if !inner.parent_texture.is_null()
+        && !inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
+    {
+        // A texture-level surface reports the texture that owns the level.
+        inner.parent_texture.cast::<c_void>()
+    } else if inner.container != 0 {
+        // An implicit backbuffer names its swapchain; an implicit depth surface
+        // names its device.
+        inner.container as *mut c_void
+    } else {
+        // A standalone surface reports the device that created it. The private
+        // backing texture of a DEFAULT offscreen-plain surface is not exposed.
+        inner.device_wrapper()
+    };
     if container_ptr.is_null() {
-        // Ordinary surfaces (texture-backed / standalone / system-memory) carry
-        // no container. Only the device's implicit surfaces report one (the
-        // implicit swapchain for the backbuffer, the device for depth-stencil).
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "IDirect3DSurface9::GetContainer on a surface with no container → INVALIDCALL");
         null_out(container);
         return D3DERR_INVALIDCALL;
     }
-    // `GetContainer` returns an owned reference. We return the stored container
-    // regardless of `riid` (the implicit swapchain answers IID_IDirect3DSwapChain9,
-    // the device answers IID_IDirect3DDevice9 — the only riids the callers use)
-    // and AddRef it via the shared IUnknown prologue.
-    // SAFETY: `container_ptr` is the live swapchain/device wrapper stamped at the
-    // implicit surface's creation; its vtable's 2nd entry is `AddRef`.
+    // SAFETY: `container_ptr` is the live texture, swapchain, or device selected
+    // above; every wrapper begins with its IUnknown vtable.
     let unk = unsafe { &*(container_ptr.cast::<ContainerIUnknown>()) };
     // SAFETY: `unk.vtbl` is the container wrapper's `'static` vtable.
     let vtbl = unsafe { &*unk.vtbl };
-    (vtbl.add_ref)(container_ptr);
-    // SAFETY: `container` is non-null (checked above) and per the D3D9 ABI points
-    // to a writable out-pointer slot owned by the caller.
-    unsafe { *container = container_ptr };
-    D3D_OK
+    // SAFETY: the selected container is live, `riid` is the caller's read-only
+    // GUID, and `container` is non-null and writable per the vtable ABI.
+    unsafe { (vtbl.query_interface)(container_ptr, riid, container) }
 }
 
 extern "system" fn surface_get_desc(this: *mut c_void, desc: *mut D3DSURFACE_DESC) -> i32 {

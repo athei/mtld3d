@@ -8,18 +8,25 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC,
-    D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl,
-    IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl,
-    IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
-    IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl,
-    IDirect3DVolumeTexture9Vtbl,
+    D3D_OK, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC,
+    D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
+    IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
+    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
 };
 
 use crate::{
     check::{expect_created, expect_ok},
     vtbl::deref_vtbl,
 };
+
+#[repr(C)]
+struct IUnknownHeadVtbl {
+    _query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
 
 // ── Private data ──
 
@@ -792,6 +799,38 @@ impl Surface<'_> {
     fn vtbl(&self) -> &'static IDirect3DSurface9Vtbl {
         // SAFETY: `self.ptr` is a live surface for the wrapper's lifetime.
         unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(self.ptr) }
+    }
+
+    /// `GetContainer(iid)`, with any returned reference released before return.
+    ///
+    /// Returns the `HRESULT`, the interface pointer as an identity token, and
+    /// its public refcount while the reference from `GetContainer` was held.
+    /// A failed call returns a null pointer and zero count.
+    ///
+    /// # Panics
+    /// Panics if a successful call leaves the output slot untouched.
+    #[must_use]
+    pub fn get_container(&self, iid: &Guid) -> (i32, *mut c_void, u32) {
+        let sentinel = core::ptr::without_provenance_mut(0xdead_beef);
+        let mut out: *mut c_void = sentinel;
+        // SAFETY: vtable thunk; `iid` is read-only and `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_container)(self.ptr, iid, &raw mut out) };
+        if hr != D3D_OK || out.is_null() {
+            return (hr, out, 0);
+        }
+        assert_ne!(
+            out, sentinel,
+            "successful GetContainer left output untouched"
+        );
+        // SAFETY: a successful `GetContainer` returns a live COM interface.
+        let vtbl = unsafe { deref_vtbl::<IUnknownHeadVtbl>(out) };
+        // SAFETY: `out` remains live through its `GetContainer` reference.
+        unsafe { (vtbl.add_ref)(out) };
+        // SAFETY: balances the probe `AddRef`; the `GetContainer` reference remains.
+        let held_refcount = unsafe { (vtbl.release)(out) };
+        // SAFETY: releases the reference returned by `GetContainer`.
+        unsafe { (vtbl.release)(out) };
+        (hr, out, held_refcount)
     }
 
     /// Lock the whole surface. The returned guard unlocks on drop.

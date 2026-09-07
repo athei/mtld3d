@@ -14,7 +14,8 @@ use mtld3d_types::{
     D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
     D3DSAMP_MIPFILTER, D3DSBT_ALL, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
-    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IUNKNOWN,
+    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9, IID_IDIRECT3DTEXTURE9,
+    IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -265,6 +266,111 @@ fn query_interface_identity_on_factory() {
     assert_eq!(hr, E_NOINTERFACE, "the factory is not a device");
     assert!(!same, "nothing is handed out on a miss");
     assert_eq!(held, 1, "a miss leaves the refcount alone");
+}
+
+/// A surface queries its texture, swapchain, or device container for the requested interface.
+///
+/// The returned interface is the actual container, carries exactly one owned
+/// reference, and an unsupported IID returns `E_NOINTERFACE` with a null output.
+#[test]
+fn surface_get_container_queries_the_actual_container() {
+    let h = Harness::new();
+
+    let texture = h.create_texture(8, 8, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let level = texture.surface_level(0);
+    let texture_base = texture.refcount();
+    let (hr, container, held_refcount) = level.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(hr, D3D_OK, "texture-level GetContainer(Texture9)");
+    assert_eq!(container, texture.as_ptr(), "texture container identity");
+    assert_eq!(held_refcount, texture_base + 1, "texture container AddRef");
+    assert_eq!(
+        texture.refcount(),
+        texture_base,
+        "texture container Release"
+    );
+    let (hr, container, held_refcount) = level.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, E_NOINTERFACE, "texture-level container is not a device");
+    assert!(
+        container.is_null(),
+        "unsupported texture container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported texture container IID has no reference"
+    );
+    assert_eq!(
+        texture.refcount(),
+        texture_base,
+        "unsupported IID leaves texture count alone"
+    );
+
+    let render_target = h.create_render_target(8, 8, D3DFMT_A8R8G8B8);
+    let device_base = h.device_refcount();
+    let (hr, container, held_refcount) = render_target.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, D3D_OK, "standalone render-target GetContainer(Device9)");
+    assert_eq!(
+        container,
+        h.device(),
+        "standalone render-target container identity"
+    );
+    assert_eq!(held_refcount, device_base + 1, "device container AddRef");
+    assert_eq!(h.device_refcount(), device_base, "device container Release");
+    let (hr, container, held_refcount) = render_target.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(
+        hr, E_NOINTERFACE,
+        "standalone render target is not a texture"
+    );
+    assert!(
+        container.is_null(),
+        "unsupported device container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported device container IID has no reference"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "unsupported IID leaves device count alone"
+    );
+
+    let backbuffer = h.back_buffer(0);
+    let device_base = h.device_refcount();
+    let (hr, unknown, held_refcount) = backbuffer.get_container(&IID_IUNKNOWN);
+    assert_eq!(hr, D3D_OK, "backbuffer GetContainer(IUnknown)");
+    assert_eq!(
+        held_refcount, 1,
+        "implicit swapchain starts at refcount zero"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "IUnknown container reference is balanced"
+    );
+    let (hr, swapchain, held_refcount) = backbuffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(hr, D3D_OK, "backbuffer GetContainer(SwapChain9)");
+    assert_eq!(swapchain, unknown, "backbuffer container identity");
+    assert_eq!(held_refcount, 1, "swapchain container AddRef");
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "swapchain container Release"
+    );
+    let (hr, container, held_refcount) = backbuffer.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(hr, E_NOINTERFACE, "backbuffer container is not a texture");
+    assert!(
+        container.is_null(),
+        "unsupported swapchain container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported swapchain container IID has no reference"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "unsupported IID leaves swapchain count alone"
+    );
 }
 
 /// `GetDevice` names the device that created the resource, in every pool.
