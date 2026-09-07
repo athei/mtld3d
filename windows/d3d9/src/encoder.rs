@@ -1113,7 +1113,8 @@ pub struct FrameEncoder {
     /// sibling of the emitted handle is recorded here. Consumed at submit
     /// time by `PassState::strip_color_from_no_color_draw_passes` (Rule H)
     /// to retroactively rewrite the pass's `SetRenderPipelineState`
-    /// commands. Process-lifetime (the `pipeline_cache` itself is
+    /// commands, and queried by later draws before rebuilding a known
+    /// sibling. Process-lifetime (the `pipeline_cache` itself is
     /// process-lifetime, so the handles never dangle); no per-frame clear.
     no_color_pipeline_alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Single-entry "L0" memo in front of `pipeline_cache`.
@@ -5736,12 +5737,12 @@ impl FrameEncoder {
         // previous one returns the cached handle without rebuilding the
         // `PipelineKey` (its D3D→Metal translations) or probing
         // `pipeline_cache`. It also skips the no-color twin's second resolve
-        // below: a hit means the populating miss already ran it, and
-        // `no_color_pipeline_alt` is process-lifetime, so the side-map entry
-        // is still present. Only successful resolves are memoised, so a
-        // failing snapshot still flows through the unchanged path (and keeps
-        // its existing per-draw error/retry behaviour). The `match` copies
-        // the handle out so the memo borrow ends before the `&mut perf` bump.
+        // below. A successful sibling mapping is process-lifetime; after a
+        // failed sibling build, the next L0 miss retries it. Only successful
+        // primary resolves are memoised, so a failing snapshot still flows
+        // through the unchanged path (and keeps its existing per-draw
+        // error/retry behaviour). The `match` copies the handle out so the
+        // memo borrow ends before the `&mut perf` bump.
         let memo_hit = match &self.last_pipeline_memo {
             Some((prev, handle)) if *prev == *snapshot => Some(*handle),
             _ => None,
@@ -5754,13 +5755,19 @@ impl FrameEncoder {
         // Dual-build for zero-mask draws: build the matching no-color
         // variant up-front so pass-finalisation (Rule H) can swap to it
         // retroactively if every draw in the pass had `mask == 0`.
-        // Building both is cheap — cache hit on the second call after
-        // the first frame; CreateRenderPipeline thunk on cold-miss.
-        if !with_color.is_null() && snapshot.writes_no_color() && snapshot.has_color_output() {
+        // A successful sibling mapping stays valid as long as the pipeline
+        // cache, so an L0 miss can reuse it without rebuilding the alternate
+        // snapshot and key. A failed sibling build leaves no mapping and is
+        // retried on the next L0 miss.
+        if !with_color.is_null()
+            && snapshot.writes_no_color()
+            && snapshot.has_color_output()
+            && !self.no_color_pipeline_alt.contains_key(&with_color.raw())
+        {
             // No-color twin: same identity except the attach flag (and no
             // render targets 1..3, which Rule H strips together with target
             // 0). Explicit `.clone()` because PipelineSnapshot is no longer
-            // Copy; fires once per unique pipeline (cache hit thereafter).
+            // Copy; fires on L0 misses until the sibling builds successfully.
             let mut alt = snapshot.clone();
             alt.attach
                 .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
