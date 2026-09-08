@@ -329,9 +329,10 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Headline: **0 `real` · 124 `expected` ·
-4 `caps` · 22 `ceiling` · 3 `flaky` · 0 `untriaged`** unique sites; all 24
-Apple-family subtest-legs `crash=0`. (2026-09-05: the two answers a device
+re-checked before retagging. Current classifications: 0 `real`, 133
+`expected`, 4 `caps`, 24 `ceiling`, 4 `flaky`, 0 `untriaged` unique sites.
+The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+(2026-09-05: the two answers a device
 without the packed 16-bit formats derives from its render-target answer,
 `CheckDeviceType` for a 16-bit back buffer and the `AUTOGENMIPMAP` probe, were
 made to follow it, so device.c:3626 and device.c:7927 dropped off the Intel
@@ -517,7 +518,7 @@ baseline.
 ### device.c/test_wndproc
 Sites: 4207=expected 4212=expected 4214=expected 4219=expected
 Sites: 4223=expected 4248=expected 4257=expected 4293=expected
-Sites: 4298=expected 4302=expected 4319=expected 4340=expected 4420=expected
+Sites: 4298=expected 4302=expected 4319=ceiling 4340=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
 Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=expected 4475=flaky
 Sites: 4480=flaky
@@ -537,6 +538,19 @@ device that is never lost gives the app no reason to `Reset`.
 Caveat on 4219: it fails because OUR cursor wndproc subclass replaced the
 device window's proc — a deliberate, load-bearing hook we keep (cursor
 realization), not a missing feature.
+
+4319 checks the hidden-device-window focus-loss message sequence immediately
+after `SetForegroundWindow(GetDesktopWindow())`: `WM_DISPLAYCHANGE` on the
+device window, then `WM_ACTIVATEAPP(FALSE)` on the focus window. It runs once
+with ordinary creation flags and once with `D3DCREATE_NOWINDOWCHANGES`, so
+the assertion can fail at most twice. An unchanged i686 build read one
+failure and then two; a clean control also read two. Both count-two raw
+captures lack the focus window's `WM_ACTIVATEAPP(FALSE)` in both iterations.
+The count-one run has no raw capture, so which iteration differed and why
+remain unknown. `ceiling` retains the pin of two while tolerating lower
+message-observation counts; unlike `flaky`, it still rejects counts above
+the pin. This changes no focus or activation behavior and does not establish
+that the message contract is fixed.
 
 4257/4298/4424/4487 are the kept device-loss divergence, not an unwritten
 stub: no exclusive mode is ever taken, so nothing is ever lost, and
