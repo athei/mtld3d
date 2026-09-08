@@ -32,6 +32,60 @@ const PS_BC: [u32; 5] = [
     0x0000_FFFF,
 ];
 
+/// `ps_3_0`: mixed-lane `p0` masks a full `mov` independently per component.
+const PS_PREDICATED_COMPONENTS: [u32; 43] = [
+    0xFFFF_0300,
+    // def c0, 0, 1, 0, 1
+    0x0500_0051,
+    0xA00F_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    // def c1, 0.5, 0.5, 0.5, 0.5
+    0x0500_0051,
+    0xA00F_0001,
+    0x3F00_0000,
+    0x3F00_0000,
+    0x3F00_0000,
+    0x3F00_0000,
+    // def c2, 1, 1, 1, 1
+    0x0500_0051,
+    0xA00F_0002,
+    0x3F80_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    // def c3, 0, 0, 0, 0
+    0x0500_0051,
+    0xA00F_0003,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    // mov r0, c3; mov r1, c0
+    0x0200_0001,
+    0x800F_0000,
+    0xA0E4_0003,
+    0x0200_0001,
+    0x800F_0001,
+    0xA0E4_0000,
+    // setp_lt p0, r1, c1
+    0x0304_005E,
+    0xB00F_1000,
+    0x80E4_0001,
+    0xA0E4_0001,
+    // (p0) mov r0, c2; mov oC0, r0
+    0x1300_0001,
+    0x800F_0000,
+    0xB0E4_1000,
+    0xA0E4_0002,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0000,
+    0x0000_FFFF,
+];
+
 /// `vs_1_1`: `def c0, 1, 0, 0, 0; dcl_position v0; mov oPos, v0;`
 ///
 /// SM1 carries no instruction-length field, so a walker that reads one steps
@@ -117,6 +171,32 @@ fn user_shader_constant_drives_color() {
         h.read_pixel(320, 280),
         0xFF00_FF00,
         "constant green via user shader"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn sm3_predication_preserves_false_destination_components() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_PREDICATED_COMPONENTS);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0x00FF_00FF,
+        "false p0.yw components must preserve the zero destination lanes"
     );
 
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");

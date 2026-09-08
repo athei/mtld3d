@@ -2114,7 +2114,7 @@ fn translate_instruction(
             let v = format!("{by} + {m01} * ({bump}).x + {m11} * ({bump}).y");
             let coord4 = format!("float4({u}, {v}, 0.0, 0.0)");
             let sampled = sample_or_compare(ctx, n, &coord4, None, None);
-            store_dst(out, *dst, &sampled, ctx);
+            store_dst(out, *dst, &sampled, ctx, None);
             if matches!(inst.opcode, Opcode::TexBemL) {
                 let target = register_write_target(dst.reg, ctx);
                 let (lscale, loffset) = bump_lum_exprs(n);
@@ -2441,18 +2441,10 @@ fn translate_instruction(
             write_address_register(out, dst, &expr, /* use_floor */ true);
             return Ok(());
         }
-        // Predicated execution: wrap the dst write in a conditional
-        // gated by the predicate operand the parser split off. The
-        // gate uses the operand's swizzle to pick a p0 lane and its
-        // SrcModifier::Not to negate. Unpredicated → straight write.
-        if let Some(pred) = &inst.predicate {
-            let gate = predicate_gate_expr(pred);
-            let _ = writeln!(out, "    if ({gate}) {{");
-            store_dst(out, dst, &expr, ctx);
-            w(out, "    }\n");
-        } else {
-            store_dst(out, dst, &expr, ctx);
-        }
+        // Predicated execution keeps each destination component whose
+        // corresponding swizzled predicate component is false. The destination
+        // write mask narrows both the value and predicate vectors together.
+        store_dst(out, dst, &expr, ctx, inst.predicate.as_ref());
     }
     Ok(())
 }
@@ -2498,31 +2490,6 @@ fn expand_subroutine(out: &mut String, label: u32, ctx: &EmitContext) -> Result<
     }
     ctx.expansion_stack.borrow_mut().pop();
     Ok(())
-}
-
-/// Build the Boolean MSL expression that gates a predicated instruction.
-///
-/// The predicate operand carries a swizzle picking which p0 lane is the gate,
-/// and a `Not` modifier inverts the test. `any(p0)` is the fallback for an
-/// `xyzw` swizzle.
-fn predicate_gate_expr(pred: &SrcOperand) -> String {
-    let swiz = pred.swizzle.0;
-    let comp = b"xyzw"[swiz[0] as usize] as char;
-    // SM3 typically replicates a single component (e.g. .xxxx); if all
-    // four lanes are identical, use the scalar lane directly. Otherwise
-    // collapse to `any(p0)` — the D3D9 spec says lanes act
-    // independently, but the most conservative gate is "any lane true".
-    let scalar = swiz.iter().all(|&c| c == swiz[0]);
-    let base = if scalar {
-        format!("p0.{comp}")
-    } else {
-        "any(p0)".to_string()
-    };
-    if pred.modifier == SrcModifier::Not {
-        format!("!({base})")
-    } else {
-        base
-    }
 }
 
 // ── Matrix multiply ──
@@ -2814,8 +2781,8 @@ fn apply_src_modifier(expr: &str, m: SrcModifier) -> String {
             // component-wise "non-zero → false, zero → true". MSL
             // `bool4(v)` evaluates each lane as non-zero; `!bool4(v)`
             // negates; cast back to float4 keeps downstream `.xyzw`
-            // reads typed. Predicate-side Not is handled separately in
-            // `predicate_gate_expr` and never reaches this arm.
+            // reads typed. Instruction predicate operands are handled
+            // separately by `predicate_mask_expr` and never reach this arm.
             format!("float4(!bool4({expr}))")
         }
     }
@@ -2843,7 +2810,13 @@ fn write_address_register(out: &mut String, dst: DstOperand, value: &str, use_fl
     }
 }
 
-fn store_dst(out: &mut String, dst: DstOperand, value: &str, ctx: &EmitContext) {
+fn store_dst(
+    out: &mut String,
+    dst: DstOperand,
+    value: &str,
+    ctx: &EmitContext,
+    predicate: Option<&SrcOperand>,
+) {
     let target = register_write_target(dst.reg, ctx);
     // PS 1.x result shift modifier (`_x2`/`_x4`/`_x8`, `_d2`/`_d4`/`_d8`):
     // multiply the result by 2^shift_scale, applied before `_sat`. The field
@@ -2863,11 +2836,45 @@ fn store_dst(out: &mut String, dst: DstOperand, value: &str, ctx: &EmitContext) 
     };
 
     let mask = dst.write_mask;
-    if mask == WriteMask::ALL {
-        let _ = writeln!(out, "    {target} = {value};");
+    let (target, value) = if mask == WriteMask::ALL {
+        (target, value)
     } else {
         let chars = write_mask_chars(mask);
-        let _ = writeln!(out, "    {target}.{chars} = ({value}).{chars};");
+        (format!("{target}.{chars}"), format!("({value}).{chars}"))
+    };
+    if let Some(pred) = predicate {
+        let predicate = predicate_mask_expr(pred, mask);
+        let _ = writeln!(
+            out,
+            "    {target} = select({target}, {value}, {predicate});"
+        );
+    } else {
+        let _ = writeln!(out, "    {target} = {value};");
+    }
+}
+
+/// Build the Boolean vector controlling a predicated destination store.
+///
+/// The destination write mask selects the predicate swizzle components that
+/// correspond to the components being stored. A replicate swizzle repeats its
+/// selected lane, while `Not` inverts each selected component independently.
+fn predicate_mask_expr(pred: &SrcOperand, mask: WriteMask) -> String {
+    let mut chars = String::new();
+    for component in 0..4 {
+        if mask.covers(component) {
+            let selected = pred.swizzle.0[component as usize];
+            chars.push(b"xyzw"[selected as usize] as char);
+        }
+    }
+    let base = if chars == "xyzw" {
+        "p0".to_string()
+    } else {
+        format!("p0.{chars}")
+    };
+    if pred.modifier == SrcModifier::Not {
+        format!("!({base})")
+    } else {
+        base
     }
 }
 

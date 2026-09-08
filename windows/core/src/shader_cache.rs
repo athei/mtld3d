@@ -283,7 +283,10 @@ use crate::shader_compile_stats::CompileBucket;
 ///
 /// `69` lets predicate-based flow control read `p0` through the ordinary
 /// source path and emits `breakp` from that source, changing programmable MSL.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 69;
+///
+/// `70` preserves each arithmetic destination component whose corresponding
+/// SM3 predicate component is false, changing programmable shader MSL.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 70;
 
 /// File magic.
 ///
