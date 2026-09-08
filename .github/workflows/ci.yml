@@ -27,6 +27,10 @@ on:
           whitespace-separated patterns (e.g. `stencil msaa::`).
         type: string
         default: ''
+      e2e_log:
+        description: The RUST_LOG filter for end-to-end processes (empty keeps the default).
+        type: string
+        default: ''
       conformance_repeat:
         description: >-
           Run one conformance subtest this many times on every conformance
@@ -235,6 +239,7 @@ jobs:
       - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
         env:
           E2E_FILTER: ${{ inputs.e2e_filter }}
+          RUST_LOG: ${{ inputs.e2e_log }}
           LOG_DIR: ${{ runner.temp }}
       # `always()`, as for the conformance output below: a diverging leg is
       # the one whose logs are worth reading, and a leg cut off by its budget

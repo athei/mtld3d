@@ -1,0 +1,212 @@
+use std::fmt::Write;
+
+use log::{Level, debug, log_enabled};
+use objc2::{
+    ProtocolType,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_foundation::{NSArray, NSError, NSString};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
+    MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
+    MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice,
+};
+
+const LOG_TARGET: &str = "mtld3d::unix::command";
+
+pub fn command_buffer(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    let descriptor = diagnostic_descriptor(log_enabled!(target: LOG_TARGET, Level::Debug));
+    descriptor.map_or_else(
+        || queue.commandBuffer(),
+        |descriptor| queue.commandBufferWithDescriptor(&descriptor),
+    )
+}
+
+pub fn completion(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    status: MTLCommandBufferStatus,
+    seq: Option<u64>,
+    site: &str,
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    let label = cb.label().map(|s| s.to_string());
+    let queue = cb.commandQueue();
+    let device = cb.device();
+    debug!(
+        target: LOG_TARGET,
+        "command-buffer buffer={cb:p} queue={:p} device={:p} registry_id={:#x} \
+         device_name={:?} role={} seq={} site={site:?} status={}({}) \
+         error_options={:#x} retained_references={} label={} queue_label={}",
+        Retained::as_ptr(&queue),
+        Retained::as_ptr(&device),
+        device.registryID(),
+        device.name().to_string(),
+        buffer_role(label.as_deref()),
+        sequence(seq),
+        status.0,
+        status_name(status),
+        cb.errorOptions().0,
+        cb.retainedReferences(),
+        optional_string(label.as_deref()),
+        optional_string(queue.label().map(|s| s.to_string()).as_deref()),
+    );
+}
+
+/// Follows the completion envelope with details from the same error the caller handles.
+pub fn failure(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    seq: Option<u64>,
+    site: &str,
+    error: Option<&NSError>,
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    debug!(
+        target: LOG_TARGET,
+        "command-buffer-error buffer={cb:p} seq={} site={site:?} {}",
+        sequence(seq),
+        error_details(error),
+    );
+}
+
+fn diagnostic_descriptor(enabled: bool) -> Option<Retained<MTLCommandBufferDescriptor>> {
+    enabled.then(|| {
+        let descriptor = MTLCommandBufferDescriptor::new();
+        descriptor.setRetainedReferences(true);
+        descriptor.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+        descriptor
+    })
+}
+
+fn sequence(seq: Option<u64>) -> String {
+    seq.map_or_else(|| "unavailable".to_owned(), |seq| format!("{seq:#x}"))
+}
+
+fn optional_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "missing".to_owned(), |value| format!("{value:?}"))
+}
+
+fn buffer_role(label: Option<&str>) -> &'static str {
+    match label {
+        Some(label) if label.starts_with("mtld3d-frame-") => "frame",
+        Some(label) if label.starts_with("mtld3d-upload-") => "upload",
+        Some("mtld3d-readback") => "readback",
+        // Labels belong to the constructors; do not guess an unknown buffer's role.
+        _ => "unknown",
+    }
+}
+
+const fn status_name(status: MTLCommandBufferStatus) -> &'static str {
+    match status {
+        MTLCommandBufferStatus::NotEnqueued => "NotEnqueued",
+        MTLCommandBufferStatus::Enqueued => "Enqueued",
+        MTLCommandBufferStatus::Committed => "Committed",
+        MTLCommandBufferStatus::Scheduled => "Scheduled",
+        MTLCommandBufferStatus::Completed => "Completed",
+        MTLCommandBufferStatus::Error => "Error",
+        // The numeric status is printed beside this name for future SDK values.
+        _ => "unrecognized",
+    }
+}
+
+const fn encoder_state_name(state: MTLCommandEncoderErrorState) -> &'static str {
+    match state {
+        MTLCommandEncoderErrorState::Unknown => "Unknown",
+        MTLCommandEncoderErrorState::Completed => "Completed",
+        MTLCommandEncoderErrorState::Affected => "Affected",
+        MTLCommandEncoderErrorState::Pending => "Pending",
+        MTLCommandEncoderErrorState::Faulted => "Faulted",
+        // Preserve future values without folding them into Metal's Unknown state.
+        _ => "unrecognized",
+    }
+}
+
+fn error_details(error: Option<&NSError>) -> String {
+    let Some(error) = error else {
+        return "error=missing encoder_info=unavailable".to_owned();
+    };
+    let mut output = format!(
+        "error=present domain={:?} code={} description={:?}",
+        error.domain().to_string(),
+        error.code(),
+        error.localizedDescription().to_string(),
+    );
+    // SAFETY: Metal exports this immutable Foundation string on every supported macOS.
+    let key = unsafe { MTLCommandBufferEncoderInfoErrorKey };
+    let payload = error.userInfo().objectForKey(key);
+    append_encoder_info(&mut output, payload.as_deref());
+    output
+}
+
+fn append_encoder_info(output: &mut String, payload: Option<&AnyObject>) {
+    let Some(payload) = payload else {
+        output.push_str(" encoder_info=missing-key");
+        return;
+    };
+    let Some(encoders) = payload.downcast_ref::<NSArray<AnyObject>>() else {
+        output.push_str(" encoder_info=malformed-non-array");
+        return;
+    };
+    if encoders.is_empty() {
+        output.push_str(" encoder_info=empty");
+        return;
+    }
+    write!(
+        output,
+        " encoder_info=present encoder_count={}",
+        encoders.len()
+    )
+    .expect("writing to a String cannot fail");
+    let Some(protocol) = <dyn MTLCommandBufferEncoderInfo>::protocol() else {
+        output.push_str(" encoders=unavailable-protocol");
+        return;
+    };
+    for (index, object) in encoders.iter().enumerate() {
+        write!(output, " encoder[{index}]={{").expect("writing to a String cannot fail");
+        if !object.class().conforms_to(protocol) {
+            output.push_str("malformed-nonconforming}");
+            continue;
+        }
+        // SAFETY: the erased array yielded a retained live object, and its runtime class
+        // conforms to MTLCommandBufferEncoderInfo as checked above. The protocol has no
+        // extra Rust invariants; the cast transfers this retain without changing lifetime.
+        let encoder = unsafe {
+            Retained::cast_unchecked::<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>(object)
+        };
+        let state = encoder.errorState();
+        write!(
+            output,
+            "label={:?} state={}({}) signposts=",
+            encoder.label().to_string(),
+            state.0,
+            encoder_state_name(state),
+        )
+        .expect("writing to a String cannot fail");
+        append_signposts(output, &encoder.debugSignposts());
+        output.push('}');
+    }
+}
+
+fn append_signposts(output: &mut String, signposts: &NSArray<NSString>) {
+    if signposts.is_empty() {
+        output.push_str("empty");
+        return;
+    }
+    output.push('[');
+    for (index, signpost) in signposts.iter().enumerate() {
+        if index != 0 {
+            output.push_str(", ");
+        }
+        write!(output, "{:?}", signpost.to_string()).expect("writing to a String cannot fail");
+    }
+    output.push(']');
+}
+
+#[cfg(test)]
+mod tests;

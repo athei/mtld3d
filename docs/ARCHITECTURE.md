@@ -201,11 +201,56 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::perf`            | 5-second averaged performance summary (`PERF=1` builds only)             |
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
 | `mtld3d::unix`            | Metal-side `.so`                                                         |
+| `mtld3d::unix::command`   | command-buffer completion records and encoder error details (debug)      |
 | `mtld3d::unix::cursor`    | software cursor overlay window: sprite renders, show/hide, layer mode    |
 | `mtld3d::unix::present`   | presented-cadence probe, one row per frame (trace)                       |
 | `mtld3d::unix::depth`     | comparison-sampler creation, the unix mirror of `d3d9::depth` (trace)    |
 
 Each cdylib initializes the logger independently and idempotently; `mtld3d.so` has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger` thunk from its init path. Every line goes to the process's log file, `<exe>-<pid>.log` under `mtld3d-logs` beside the executable (`log.dir` moves it), never to the standard streams: a game a launcher spawned has no usable ones. `<pid>` is the macOS process id, so a launch never overwrites the log of the one before it; the directory keeps the ten newest logs and the ten newest traces, and the file appears with the first line written, so a process that logs nothing leaves nothing behind.
+
+### Command-buffer completion and encoder errors
+
+`RUST_LOG=mtld3d=warn,mtld3d::unix::command=debug` enables
+`EncoderExecutionStatus` collection for frame, upload and synchronous readback
+command buffers. These buffers keep retained resource references in both modes;
+with the target disabled, creation uses the ordinary `commandBuffer()` path.
+Collection can add CPU, GPU and memory overhead, and logging every completion
+can be verbose. Use a bounded workload when gathering diagnostics.
+
+The existing frame/upload callbacks, retirement waits, CPU submission cleanup
+and readback wait log `command-buffer` records with the actual buffer, queue
+and device addresses, device registry ID and name, labels, role, sequence where
+known, observation site, numeric/named status and error options. Roles come from
+the constructor-owned labels; an unrecognized or missing label reports `unknown`.
+Readback sequences are `unavailable`. One buffer can appear at several sites,
+so correlate the addresses and site with the sequence and log order. Addresses
+can be reused after release. No new wait or callback is added. Only a recorded
+`Completed` status establishes successful completion of that observed buffer;
+absence of an error record does not.
+
+On failure, the following `command-buffer-error` record names the same buffer,
+sequence and site and includes the signed `NSError` code, domain and description.
+It checks the encoder-info array and each element's protocol conformance before
+printing labels, numeric/named states and signposts in recorded order. Variable
+strings are quoted and escaped to keep each record on one line. Missing errors,
+missing keys, malformed payloads, empty arrays and unavailable protocol metadata
+remain distinct. The typed encoder-info protocol promises nonnull labels and
+signpost arrays; an empty signpost array is reported as `empty`, never as success.
+No per-draw signposts are inserted, so existing labels can be all the driver has.
+`Unknown`, `Completed`, `Affected`, `Pending` and `Faulted` remain distinct:
+`Affected` does not establish that the encoder caused the error, and an encoder's
+`Completed` state does not make the whole buffer successful.
+
+Creation-time texture clears, cursor-overlay buffers and the empty teardown
+fence are outside this target's construction and observation scope. A clean
+local run validates construction and completion on that device; it does not
+demonstrate a real error payload or establish another GPU's fault attribution.
+
+For a bounded manual CI run, set `e2e_filter` to
+`msaa::depth_test_holds_on_a_multisampled_target` and `e2e_log` to
+`mtld3d=warn,mtld3d::unix::command=debug` in the workflow dispatch form. The
+existing e2e steps pass `e2e_log` as `RUST_LOG` and retain their process logs in
+the e2e artifacts. An empty input preserves the ordinary logging default.
 
 ### F12: three-frame dump and GPU capture
 

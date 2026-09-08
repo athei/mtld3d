@@ -40,6 +40,8 @@ use crate::{
     metal::{handle::IntoRetained, macdrv::attachment, null_texture, texture::mtl_pixel_format},
 };
 
+mod diagnostics;
+
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
 ///
 /// Apple does not categorically mark its APIs thread-safe. The operations
@@ -237,7 +239,12 @@ pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64, failed_submit
     // Record the abort before the retirement bump: both stores are
     // `Release`, so a PE-side `Acquire` load of `coherent_seq` that sees
     // this seq is guaranteed to see the failure too.
-    if let Some((code, desc)) = record_failed_submit(&cmdbuf, retired_seq, failed_submit_seq_ptr) {
+    if let Some((code, desc)) = record_failed_submit(
+        &cmdbuf,
+        retired_seq,
+        failed_submit_seq_ptr,
+        "retirement-wait",
+    ) {
         mtld3d_shared::crumb!("gpuretirecberr", target_seq);
         mtld3d_shared::log_once_warn_by!(
             target: LOG_TARGET,
@@ -260,8 +267,11 @@ fn record_failed_submit(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     seq: u64,
     failed_submit_seq_ptr: u64,
+    site: &str,
 ) -> Option<(u64, String)> {
-    if cb.status() != MTLCommandBufferStatus::Error {
+    let status = cb.status();
+    diagnostics::completion(cb, status, Some(seq), site);
+    if status != MTLCommandBufferStatus::Error {
         return None;
     }
     if failed_submit_seq_ptr != 0 {
@@ -272,7 +282,9 @@ fn record_failed_submit(
         let atomic = unsafe { &*(failed_submit_seq_ptr as *const AtomicU64) };
         atomic.fetch_max(seq, Ordering::Release);
     }
-    Some(command_buffer_error(cb.error().as_deref()))
+    let error = cb.error();
+    diagnostics::failure(cb, Some(seq), site, error.as_deref());
+    Some(command_buffer_error(error.as_deref()))
 }
 
 /// Preserve the driver description shared by frame and readback failure diagnostics.
@@ -355,7 +367,7 @@ fn retire_failed_submit(params: &SubmitFrameParams) {
             // This waits for completion handlers too, protecting the PE sink
             // atomics as well as the backing pages read by the GPU.
             cb.waitUntilCompleted();
-            let _ = record_failed_submit(&cb, key.1, params.failed_submit_seq_ptr);
+            let _ = record_failed_submit(&cb, key.1, params.failed_submit_seq_ptr, "cpu-cleanup");
             let _ = PENDING_CMDBUFS.lock().unwrap().remove(&key);
         }
     }
@@ -386,7 +398,7 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     };
 
     mtld3d_shared::crumb!("submit:cmdbuf");
-    let Some(cmd_buf) = queue.commandBuffer() else {
+    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
         error!(target: LOG_TARGET, "submit_frame: commandBuffer() returned nil");
         return false;
     };
@@ -725,7 +737,9 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
                 // both stores are `Release`, so a PE-side `Acquire` load of
                 // `coherent_seq` that observes this seq observes the failure
                 // too, and the upload recovery never reads a stale "clean".
-                if let Some((code, desc)) = record_failed_submit(cb, seq, failed_seq_ptr) {
+                if let Some((code, desc)) =
+                    record_failed_submit(cb, seq, failed_seq_ptr, "frame-callback")
+                {
                     mtld3d_shared::crumb!("submit:cberr", seq);
                     mtld3d_shared::log_once_warn_by!(
                         target: LOG_TARGET,
@@ -788,7 +802,7 @@ fn submit_upload_cmd_buf(
     let submit_seq = params.submit_seq;
     let upload_coherent_seq_ptr = params.upload_coherent_seq_ptr;
     mtld3d_shared::crumb!("submit:upcmdbuf");
-    let Some(upload_cb) = queue.commandBuffer() else {
+    let Some(upload_cb) = diagnostics::command_buffer(queue) else {
         error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
         return false;
     };
@@ -830,7 +844,9 @@ fn submit_upload_cmd_buf(
                 // SAFETY: Metal invokes the block with the completed command
                 // buffer; the pointer is valid for the handler's duration.
                 let cb = unsafe { cb_ptr.as_ref() };
-                if let Some((code, desc)) = record_failed_submit(cb, seq, failed_seq_ptr) {
+                if let Some((code, desc)) =
+                    record_failed_submit(cb, seq, failed_seq_ptr, "upload-callback")
+                {
                     mtld3d_shared::crumb!("submit:upcberr", seq);
                     mtld3d_shared::log_once_warn_by!(
                         target: LOG_TARGET,
@@ -3176,7 +3192,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         dst_buffer.setLabel(Some(&label));
     }
 
-    let Some(cmd_buf) = queue.commandBuffer() else {
+    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: commandBuffer() nil");
         return false;
     };
@@ -3288,8 +3304,14 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     blit.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
+    let status = cmd_buf.status();
+    diagnostics::completion(&cmd_buf, status, None, "readback-wait");
     // The wrapper owns no pages; the caller keeps the destination allocation.
-    readback_completed(cmd_buf.status(), || cmd_buf.error())
+    readback_completed(status, || {
+        let error = cmd_buf.error();
+        diagnostics::failure(&cmd_buf, None, "readback-wait", error.as_deref());
+        error
+    })
 }
 
 /// Accept a readback only after Metal reports successful completion.
