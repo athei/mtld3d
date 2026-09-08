@@ -9,17 +9,17 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
-    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_UYVY,
-    D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
-    D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8,
+    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -1602,6 +1602,115 @@ fn color_fill_of_offscreen_plain_packs_the_destination_format() {
             bytes[(32 * pitch + 32) as usize],
             expected,
             "{name} takes the channel it stores",
+        );
+    }
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_cpu_written_source_full() {
+    check_cpu_stretch_rect_source(false, false);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_cpu_written_source_partial() {
+    check_cpu_stretch_rect_source(false, true);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_gpu_written_source_full() {
+    check_cpu_stretch_rect_source(true, false);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_gpu_written_source_partial() {
+    check_cpu_stretch_rect_source(true, true);
+}
+
+fn check_cpu_stretch_rect_source(gpu_written: bool, partial: bool) {
+    const WIDTH: usize = 4;
+    const HEIGHT: usize = 3;
+    const PIXELS: [u32; WIDTH * HEIGHT] = [
+        0x8010_20f0,
+        0x9040_50c0,
+        0xa070_8090,
+        0xb0a0_b060,
+        0xc030_40e0,
+        0xd060_70b0,
+        0xe090_a080,
+        0xf0c0_d050,
+        0x9050_60d0,
+        0xa080_90a0,
+        0xb0b0_c070,
+        0xc0e0_f040,
+    ];
+    let h = Harness::new();
+    let source = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let writer = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let destination = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8B8G8R8, D3DPOOL_DEFAULT);
+    let mirror = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    writer.lock_rect(0).write_u32_rect(WIDTH, HEIGHT, &PIXELS);
+
+    source
+        .lock_rect(0)
+        .write_u32_rect(WIDTH, HEIGHT, &[RED; WIDTH * HEIGHT]);
+    destination
+        .lock_rect(0)
+        .write_u32_rect(WIDTH, HEIGHT, &[GREEN; WIDTH * HEIGHT]);
+    if gpu_written {
+        assert_eq!(h.stretch_rect(&writer, &source, D3DTEXF_NONE), D3D_OK);
+    } else {
+        source.lock_rect(0).write_u32_rect(WIDTH, HEIGHT, &PIXELS);
+    }
+    // No source map may occur between its GPU write and the CPU conversion.
+    // BGRA8 and RGBA8 stay distinct on every device, so the offscreen pair
+    // takes the same CPU conversion path under either packed-format policy.
+    let result = if partial {
+        h.stretch_rect_rects(
+            &source,
+            (1, 1, 3, 3),
+            &destination,
+            (2, 0, 4, 2),
+            D3DTEXF_NONE,
+        )
+    } else {
+        h.stretch_rect(&source, &destination, D3DTEXF_NONE)
+    };
+    assert_eq!(
+        result, D3D_OK,
+        "convert source, gpu_written={gpu_written}, partial={partial}"
+    );
+    {
+        let locked = destination.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let pixels = locked.as_u32(pitch * HEIGHT);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let input = if !partial {
+                    PIXELS[y * WIDTH + x]
+                } else if x >= 2 && y < 2 {
+                    PIXELS[(y + 1) * WIDTH + x - 1]
+                } else {
+                    GREEN
+                };
+                let [blue, green, red, alpha] = input.to_le_bytes();
+                let expected = u32::from_le_bytes([red, green, blue, alpha]);
+                assert_eq!(
+                    pixels[y * pitch + x],
+                    expected,
+                    "destination ({x}, {y}), gpu_written={gpu_written}, partial={partial}"
+                );
+            }
+        }
+    }
+    assert_eq!(h.stretch_rect(&source, &mirror, D3DTEXF_NONE), D3D_OK);
+    let locked = mirror.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let pixels = locked.as_u32(pitch * HEIGHT);
+    for y in 0..HEIGHT {
+        assert_eq!(
+            &pixels[y * pitch..y * pitch + WIDTH],
+            &PIXELS[y * WIDTH..(y + 1) * WIDTH],
+            "source row {y} after conversion, gpu_written={gpu_written}, partial={partial}"
         );
     }
 }

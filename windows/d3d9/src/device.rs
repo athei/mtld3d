@@ -7227,9 +7227,15 @@ fn convert_stretch_dst_staging(
         );
         return D3D_OK;
     }
-    // SAFETY: non-null (checked) and a live `Direct3DTexture9` kept alive by
-    // the source surface's reference.
-    let src_tex = unsafe { &*src_parent };
+    // SAFETY: non-null (checked), distinct from `dst_parent`, and a live
+    // `Direct3DTexture9` kept alive by the source surface's reference.
+    let src_tex = unsafe { &mut *src_parent };
+    if !src_tex.inner_mut().materialize_subresource_for_cpu_read(
+        src_info.slice.unwrap_or(0),
+        src_info.mip_level as usize,
+    ) {
+        return D3DERR_INVALIDCALL;
+    }
     // SAFETY: non-null (checked), distinct from `src_parent`, and a live
     // `Direct3DTexture9` kept alive by the destination surface's reference.
     let dst_tex = unsafe { &mut *dst_parent };
