@@ -280,7 +280,10 @@ use crate::shader_compile_stats::CompileBucket;
 ///
 /// `68` preserves the `texldb` instruction control and adds the coordinate's
 /// `.w` to any sampler-state bias in the emitted programmable pixel shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 68;
+///
+/// `69` lets predicate-based flow control read `p0` through the ordinary
+/// source path and emits `breakp` from that source, changing programmable MSL.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 69;
 
 /// File magic.
 ///
