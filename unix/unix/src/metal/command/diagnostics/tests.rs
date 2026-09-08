@@ -9,7 +9,7 @@ use objc2_metal::{
 
 use super::{
     append_signposts, buffer_role, diagnostic_descriptor, encoder_state_name, error_details,
-    optional_string, sequence, status_name,
+    metadata_string, optional_string, sequence, status_name,
 };
 
 define_class!(
@@ -49,6 +49,129 @@ impl CommandEncoderInfoFixture {
         #[unsafe(method_family = new)]
         fn new() -> Retained<Self>;
     );
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements. This fixture has no ivars or Drop.
+    #[unsafe(super = NSObject)]
+    struct NilSignpostsEncoderInfoFixture;
+
+    // SAFETY: NSObject supplies the NSObjectProtocol methods.
+    unsafe impl NSObjectProtocol for NilSignpostsEncoderInfoFixture {}
+
+    // SAFETY: the methods use the protocol's Objective-C ABI. The object return is
+    // deliberately nullable to model missing metadata; no invalid Retained is created.
+    unsafe impl MTLCommandBufferEncoderInfo for NilSignpostsEncoderInfoFixture {
+        #[unsafe(method_id(label))]
+        fn label(&self) -> Retained<NSString> {
+            NSString::from_str("init-clear")
+        }
+
+        #[unsafe(method_id(debugSignposts))]
+        fn debug_signposts(&self) -> Option<Retained<NSArray<NSString>>> {
+            None
+        }
+
+        #[unsafe(method(errorState))]
+        fn error_state(&self) -> MTLCommandEncoderErrorState {
+            MTLCommandEncoderErrorState::Faulted
+        }
+    }
+);
+
+impl NilSignpostsEncoderInfoFixture {
+    extern_methods!(
+        // SAFETY: NSObject's inherited new initializes this subclass, which has no ivars.
+        #[unsafe(method(new))]
+        #[unsafe(method_family = new)]
+        fn new() -> Retained<Self>;
+    );
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements. This fixture has no ivars or Drop.
+    #[unsafe(super = NSObject)]
+    struct MissingLabelEncoderInfoFixture;
+
+    // SAFETY: NSObject supplies the NSObjectProtocol methods.
+    unsafe impl NSObjectProtocol for MissingLabelEncoderInfoFixture {}
+
+    // SAFETY: the methods use the protocol's Objective-C ABI. Object metadata is
+    // deliberately incomplete and consumed only through checked, nullable KVC reads.
+    unsafe impl MTLCommandBufferEncoderInfo for MissingLabelEncoderInfoFixture {
+        #[unsafe(method_id(label))]
+        fn label(&self) -> Option<Retained<NSString>> {
+            None
+        }
+
+        #[unsafe(method_id(debugSignposts))]
+        fn debug_signposts(&self) -> Retained<NSArray<AnyObject>> {
+            NSArray::from_slice(&[
+                NSString::from_str("before\nmarker").as_ref(),
+                NSObject::new().as_ref(),
+                NSString::from_str("after\"marker").as_ref(),
+            ])
+        }
+
+        #[unsafe(method(errorState))]
+        fn error_state(&self) -> MTLCommandEncoderErrorState {
+            MTLCommandEncoderErrorState::Pending
+        }
+    }
+);
+
+impl MissingLabelEncoderInfoFixture {
+    extern_methods!(
+        // SAFETY: NSObject's inherited new initializes this subclass, which has no ivars.
+        #[unsafe(method(new))]
+        #[unsafe(method_family = new)]
+        fn new() -> Retained<Self>;
+    );
+}
+
+#[test]
+fn nil_signposts_preserve_primary_error_and_encoder_state() {
+    let encoder = NilSignpostsEncoderInfoFixture::new();
+    let payload = NSArray::<AnyObject>::from_slice(&[encoder.as_ref()]);
+    let details = error_details(Some(&fixture_error(Some(payload.as_ref()))));
+    assert_eq!(
+        details,
+        "error=present domain=\"fixture\\n\\\"domain\" code=-9 \
+         description=\"driver\\n\\\"detail\\\\\" encoder_info=present encoder_count=1 \
+         encoder[0]={label=\"init-clear\" state=4(Faulted) signposts=missing}",
+    );
+}
+
+#[test]
+fn nil_label_and_malformed_signpost_preserve_available_metadata() {
+    let encoder = MissingLabelEncoderInfoFixture::new();
+    let payload = NSArray::<AnyObject>::from_slice(&[encoder.as_ref()]);
+    let details = error_details(Some(&fixture_error(Some(payload.as_ref()))));
+    assert_eq!(
+        details,
+        "error=present domain=\"fixture\\n\\\"domain\" code=-9 \
+         description=\"driver\\n\\\"detail\\\\\" encoder_info=present encoder_count=1 \
+         encoder[0]={label=missing state=3(Pending) \
+         signposts=[\"before\\nmarker\", malformed-non-string, \"after\\\"marker\"]}",
+    );
+}
+
+#[test]
+fn metadata_class_checks_distinguish_missing_and_malformed_values() {
+    assert_eq!(metadata_string(None), "missing");
+    assert_eq!(
+        metadata_string(Some(NSObject::new().as_ref())),
+        "malformed-non-string",
+    );
+    let mut missing = String::new();
+    append_signposts(&mut missing, None);
+    assert_eq!(missing, "missing");
+    let mut malformed = String::new();
+    append_signposts(
+        &mut malformed,
+        Some(NSString::from_str("not an array").as_ref()),
+    );
+    assert_eq!(malformed, "malformed-non-array");
 }
 
 #[test]
@@ -112,7 +235,7 @@ fn encoder_payload_checks_array_class_and_protocol_per_element() {
 #[test]
 fn empty_signposts_do_not_claim_success() {
     let mut output = String::new();
-    append_signposts(&mut output, &NSArray::new());
+    append_signposts(&mut output, Some(NSArray::<AnyObject>::new().as_ref()));
     assert_eq!(output, "empty");
 }
 
