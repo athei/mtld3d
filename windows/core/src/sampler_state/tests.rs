@@ -9,6 +9,7 @@
 use mtld3d_types::{D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_NONE};
 
 use super::*;
+use crate::passes::LastBoundCache;
 
 fn base() -> SamplerSnapshot {
     SamplerSnapshot {
@@ -191,6 +192,68 @@ fn lod_bias_bytes_carry_the_bias_and_its_exponent() {
     // An unbiased slot must leave the sample unshifted: bias 0, scale 1.
     assert_eq!(row(0, 0).to_bits(), 0.0_f32.to_bits());
     assert_eq!(row(0, 1).to_bits(), 1.0_f32.to_bits());
+}
+
+#[test]
+fn lod_bias_table_cache_rebuilds_only_for_new_input_bits() {
+    let mut cache = LodBiasTableCache::new();
+    let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
+    biases[3] = -0.75;
+
+    assert!(cache.update(&biases), "first table is built");
+    assert_eq!(cache.bytes(), &build_lod_bias_bytes(&biases));
+    assert!(!cache.update(&biases), "identical inputs reuse the table");
+
+    biases[3] = 0.0;
+    biases[7] = -0.75;
+    assert!(
+        cache.update(&biases),
+        "a sampled-slot transition rebuilds the effective table"
+    );
+    assert_eq!(cache.bytes(), &build_lod_bias_bytes(&biases));
+}
+
+#[test]
+fn lod_bias_table_cache_keys_signed_zero_and_nan_by_bits() {
+    let mut cache = LodBiasTableCache::new();
+    let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
+    assert!(cache.update(&biases));
+
+    biases[2] = -0.0;
+    assert!(cache.update(&biases), "signed zero changes the bias lane");
+    assert!(!cache.update(&biases));
+
+    biases[2] = f32::from_bits(0x7FC0_0001);
+    assert!(
+        cache.update(&biases),
+        "NaN input payload participates in identity"
+    );
+    assert!(!cache.update(&biases));
+    biases[2] = f32::from_bits(0x7FC0_0002);
+    assert!(cache.update(&biases), "a different NaN payload rebuilds");
+}
+
+#[test]
+fn lod_bias_table_cache_is_independent_of_pass_bindings() {
+    let mut table = LodBiasTableCache::new();
+    let mut bound = LastBoundCache::new();
+    let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
+    biases[0] = -0.75;
+
+    assert!(table.update(&biases));
+    assert!(bound.ps_lod_bias_changed(table.bytes()));
+    assert!(!table.update(&biases));
+    assert!(!bound.ps_lod_bias_changed(table.bytes()));
+
+    bound.reset();
+    assert!(
+        !table.update(&biases),
+        "a new pass reuses the derived table"
+    );
+    assert!(
+        bound.ps_lod_bias_changed(table.bytes()),
+        "a new pass still binds the table"
+    );
 }
 
 #[test]

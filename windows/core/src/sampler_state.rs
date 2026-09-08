@@ -109,6 +109,53 @@ pub struct SamplerSnapshot {
     pub flags: SamplerFlags,
 }
 
+/// Cached fragment LOD-bias uniform derived from effective per-slot inputs.
+///
+/// Input identity uses raw `f32` bits so signed zero and NaN payload changes
+/// are not hidden by float equality. This cache describes only the derived
+/// bytes; the render encoder's last-bound cache independently decides whether
+/// those bytes need binding in the current pass.
+pub struct LodBiasTableCache {
+    input_bits: Option<[u32; LOD_BIAS_SLOTS]>,
+    bytes: [u8; LOD_BIAS_BYTES],
+}
+
+impl LodBiasTableCache {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            input_bits: None,
+            bytes: [0; LOD_BIAS_BYTES],
+        }
+    }
+
+    /// Rebuild the table when any effective input bit pattern changed.
+    ///
+    /// Returns whether the cached bytes were rebuilt.
+    #[must_use]
+    pub fn update(&mut self, biases: &[f32; LOD_BIAS_SLOTS]) -> bool {
+        let input_bits = biases.map(f32::to_bits);
+        if self.input_bits == Some(input_bits) {
+            return false;
+        }
+        self.bytes = build_lod_bias_bytes(biases);
+        self.input_bits = Some(input_bits);
+        true
+    }
+
+    /// The table derived by the latest [`Self::update`] call.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; LOD_BIAS_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Default for LodBiasTableCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Packed-bits sampler cache key.
 ///
 /// Layout (u64 low-to-high):

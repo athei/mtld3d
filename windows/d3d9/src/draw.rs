@@ -2162,17 +2162,13 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // Per-slot LOD bias. Bound only for a draw whose shader declares the
     // uniform; the binding then persists on the encoder, so a later biased
     // draw carrying the same table skips the re-bind.
-    if any_lod_bias {
-        let bias_bytes = mtld3d_core::sampler_state::build_lod_bias_bytes(&lod_bias);
-        if enc.last_bound().ps_lod_bias_changed(&bias_bytes) {
-            let ptr = enc.alloc_scratch(&bias_bytes);
-            enc.emit_command(Command::set_fragment_bytes_at(
-                ptr,
-                u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)
-                    .expect("LOD bias uniform is 256 bytes"),
-                PS_LOD_BIAS_SLOT,
-            ));
-        }
+    if any_lod_bias && let Some(ptr) = enc.alloc_lod_bias_if_changed(&lod_bias) {
+        enc.emit_command(Command::set_fragment_bytes_at(
+            ptr,
+            u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)
+                .expect("LOD bias uniform is 256 bytes"),
+            PS_LOD_BIAS_SLOT,
+        ));
     }
     // The render scale behind a scaled `vPos` read. Bound only for a draw
     // whose shader took the variant, from the bytes that decided the flag;
