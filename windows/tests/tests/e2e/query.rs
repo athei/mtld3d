@@ -126,6 +126,43 @@ fn occlusion_query_counts_visible_pixels() {
 }
 
 #[test]
+fn status_only_occlusion_poll_reports_readiness_and_flushes() {
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the counted draw");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+
+    let status_only = q.status(0);
+    let (buffered, _) = q.data_u32(0);
+    assert_eq!(status_only, 1, "status-only poll before submission");
+    assert_eq!(status_only, buffered, "both poll forms report readiness");
+
+    assert_eq!(
+        q.status(D3DGETDATA_FLUSH),
+        0,
+        "status-only FLUSH submits the pending query"
+    );
+    let (ready, count) = q.data_u32(0);
+    assert_eq!(ready, 0, "the submitted query is ready");
+    assert_full_frames(
+        count,
+        1,
+        dims,
+        "the query made ready by the status-only FLUSH",
+    );
+}
+
+#[test]
 fn occlusion_query_counts_nothing_for_a_depth_occluded_draw() {
     // What a title acts on is the *visible* sample count: a draw whose every
     // sample fails the depth test contributes nothing, which is the whole
