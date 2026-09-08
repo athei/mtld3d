@@ -424,6 +424,8 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         unsafe {
             let _ = libc::write(crate::log_file::raw_fd(), b.as_ptr().cast::<c_void>(), p);
         }
+        #[cfg(target_arch = "x86_64")]
+        report_nonvolatile_registers(ctx);
         let ret = caller_pc(ctx, sp);
         if ret != 0 {
             let mut rb = [0u8; 192];
@@ -893,6 +895,63 @@ const CALLER_LABEL: &[u8] = b"caller(ret@rsp)=";
 #[cfg(target_arch = "aarch64")]
 const CALLER_LABEL: &[u8] = b"caller(lr)=";
 
+/// Retain architectural nonvolatile registers and flags from the faulting context.
+///
+/// Darwin places the 64-bit thread state after its 16-byte exception state.
+/// The libc fields mirror that SDK layout, including the 64-bit RFLAGS slot.
+/// A separate line fits all seven full-width values and its newline in the
+/// existing 192-byte buffer without crowding out the argument or stack fields.
+#[cfg(target_arch = "x86_64")]
+fn report_nonvolatile_registers(ctx: *mut c_void) {
+    const REGISTERS: [(&[u8], usize); 7] = [
+        (
+            b"rbx=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbx),
+        ),
+        (
+            b" rbp=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbp),
+        ),
+        (
+            b" r12=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r12),
+        ),
+        (
+            b" r13=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r13),
+        ),
+        (
+            b" r14=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r14),
+        ),
+        (
+            b" r15=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__r15),
+        ),
+        (
+            b" rflags=",
+            mem::offset_of!(libc::__darwin_mcontext64, __ss.__rflags),
+        ),
+    ];
+
+    let mut buf = [0u8; 192];
+    let mut pos = 0;
+    push(&mut buf, &mut pos, b"[mtld3d::unix] ");
+    for (label, offset) in REGISTERS {
+        push(&mut buf, &mut pos, label);
+        push_hex(&mut buf, &mut pos, mcontext_u64(ctx, offset));
+    }
+    push(&mut buf, &mut pos, b"\n");
+    // SAFETY: write(2) is async-signal-safe; the buffer holds pos initialized bytes.
+    unsafe {
+        let _ = libc::write(
+            crate::log_file::raw_fd(),
+            buf.as_ptr().cast::<c_void>(),
+            pos,
+        );
+    }
+}
+
 /// The return address of the frame that faulted, or 0 if it can't be read.
 ///
 /// `x86_64` `CALL` pushes it, so for a jump-through-garbage fault (which faults
@@ -914,8 +973,7 @@ const fn caller_pc(ctx: *mut c_void, _sp: u64) -> u64 {
 
 /// The faulting program counter from a signal `ucontext`, or 0 if it can't be read.
 ///
-/// `uc_mcontext` is a pointer to an opaque `__darwin_mcontext64` (the `libc`
-/// crate exposes it only as padding), sitting at byte offset 0x30 in
+/// `uc_mcontext` is a pointer to `__darwin_mcontext64`, sitting at byte offset 0x30 in
 /// `ucontext_t` (same on both macOS arches). The PC offset *within* the
 /// `mcontext` is arch-specific: `x86_64` `__rip` follows the 16-byte exception
 /// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte

@@ -142,14 +142,86 @@ fn fault_report_decodes_registers() {
     let caller_label = std::str::from_utf8(super::CALLER_LABEL).expect("ascii label");
     assert!(report.contains(arg0_label), "{report}");
     assert!(report.contains(caller_label), "{report}");
+    #[cfg(target_arch = "x86_64")]
+    for label in [
+        " rbx=", " rbp=", " r12=", " r13=", " r14=", " r15=", " rflags=",
+    ] {
+        assert!(value_after(label).starts_with("0x"), "{report}");
+    }
     #[cfg(target_arch = "aarch64")]
     {
+        assert!(!report.contains(" rflags="), "{report}");
         assert_eq!(
             value_after(arg0_label),
             format!("0x{BAD_ADDR:016x}"),
             "{report}"
         );
         assert_ne!(value_after(caller_label), zero, "{report}");
+    }
+}
+
+/// Typed Darwin fields must survive the terminal report at their full width.
+///
+/// Distinct sentinels catch swapped offsets; all-one values pin the longest
+/// line including its newline. The synthetic context is read only by the
+/// handler, never restored as executable machine state.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn nonvolatile_registers_preserve_context() {
+    if let Ok(mode) = std::env::var(SELFTEST_ENV) {
+        // SAFETY: Darwin's machine context contains only integer state.
+        let mut registers: libc::__darwin_mcontext64 = unsafe { core::mem::zeroed() };
+        let sentinel = |value| if mode == "max" { u64::MAX } else { value };
+        registers.__ss.__rbx = sentinel(0x8123_4567_89ab_cdef);
+        registers.__ss.__rbp = sentinel(0x9234_5678_9abc_def0);
+        registers.__ss.__r12 = sentinel(0xa345_6789_abcd_ef01);
+        registers.__ss.__r13 = sentinel(0xb456_789a_bcde_f012);
+        registers.__ss.__r14 = sentinel(0xc567_89ab_cdef_0123);
+        registers.__ss.__r15 = sentinel(0xd678_9abc_def0_1234);
+        registers.__ss.__rflags = sentinel(0xe789_abcd_ef01_2345);
+        // SAFETY: ucontext contains integers and nullable raw pointers.
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        context.uc_mcontext = &raw mut registers;
+        context.uc_mcsize = core::mem::size_of_val(&registers);
+        super::handler(libc::SIGABRT, ptr::null_mut(), (&raw mut context).cast());
+        unreachable!("the terminal handler must end the child");
+    }
+
+    for (mode, expected) in [
+        (
+            "sentinels",
+            concat!(
+                "[mtld3d::unix] rbx=0x8123456789abcdef rbp=0x923456789abcdef0",
+                " r12=0xa3456789abcdef01 r13=0xb456789abcdef012",
+                " r14=0xc56789abcdef0123 r15=0xd6789abcdef01234",
+                " rflags=0xe789abcdef012345\n",
+            ),
+        ),
+        (
+            "max",
+            concat!(
+                "[mtld3d::unix] rbx=0xffffffffffffffff rbp=0xffffffffffffffff",
+                " r12=0xffffffffffffffff r13=0xffffffffffffffff",
+                " r14=0xffffffffffffffff r15=0xffffffffffffffff",
+                " rflags=0xffffffffffffffff\n",
+            ),
+        ),
+    ] {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "crash::tests::nonvolatile_registers_preserve_context",
+                "--nocapture",
+            ])
+            .env(SELFTEST_ENV, mode)
+            .output()
+            .expect("re-exec the test binary");
+        let report = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{report}");
+        assert!(report.contains("FATAL: SIGABRT"), "{report}");
+        assert!(report.contains(expected), "{mode}: {report}");
+        assert_eq!(expected.len(), 179);
+        assert_eq!(report.matches(" rflags=").count(), 1, "{report}");
     }
 }
 
@@ -183,6 +255,7 @@ fn foreign_fault_is_named_then_forwarded() {
 
     assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
     assert!(!report.contains("FATAL"), "{report}");
+    assert!(!report.contains(" rflags="), "{report}");
     let line = report
         .lines()
         .find(|l| l.contains("fault outside mtld3d.so"))
@@ -274,6 +347,8 @@ fn foreign_fault_without_a_teb_is_reported_not_forwarded() {
     assert!(foreign < fatal, "{report}");
     assert!(report.contains("has no Wine TEB"), "{report}");
     assert!(report.contains("native backtrace:"), "{report}");
+    #[cfg(target_arch = "x86_64")]
+    assert!(report.contains(" rflags=0x"), "{report}");
 }
 
 /// A trap instruction in our own code is fatal and named like a fault.
