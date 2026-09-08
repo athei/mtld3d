@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -403,6 +403,55 @@ fn assert_reaped(pid: u32) {
     }
 }
 
+fn wait_for_waitable_fixture(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match observe_fixture(pid) {
+            Ok(info) if info.si_pid == 0 => {}
+            Ok(info) => {
+                assert_eq!(info.si_pid.unsigned_abs(), pid);
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("observe finite child: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "finite fixture child {pid} did not become waitable"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn create_fixture_phase(path: &Path, contents: &str) {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create fixture phase");
+    file.write_all(contents.as_bytes())
+        .expect("write fixture phase");
+}
+
+fn wait_for_fixture_phase(path: &Path, expected: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) if contents == expected => return,
+            Ok(contents) if contents.is_empty() => {}
+            Ok(contents) => panic!("unexpected fixture phase {contents:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read fixture phase: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture phase {} did not arrive",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn observe_fixture(pid: u32) -> std::io::Result<libc::siginfo_t> {
     // SAFETY: siginfo_t contains integers and raw pointers, all valid when zeroed.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -457,7 +506,7 @@ fn fatal_cleanup_fixture() {
             "select undef,undef,undef,$ARGV[1]; open my $f, '>', $ARGV[0] or die $!; print $f qq($$ ),getppid(); close $f;",
         ])
         .arg(adoption)
-        .arg(if mode.starts_with("reap-") { "0.02" } else { "3" })
+        .arg(if mode.starts_with("reap-") { "0.2" } else { "3" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -466,6 +515,16 @@ fn fatal_cleanup_fixture() {
         .expect("spawn finite owned child");
     fs::write(Path::new(&directory).join("pid"), child.id().to_string()).expect("record child");
     let mut group = ProcessGroup::new(child);
+    if mode.starts_with("reap-") {
+        let pid = group.child.as_ref().expect("owned child").id();
+        wait_for_waitable_fixture(pid, Duration::from_secs(3));
+        create_fixture_phase(&Path::new(&directory).join("ready"), "waitable");
+        wait_for_fixture_phase(
+            &Path::new(&directory).join("go"),
+            "start cleanup",
+            Duration::from_secs(3),
+        );
+    }
     group.cleanup_deadline = Some(Instant::now() + Duration::from_millis(100));
     group.faults.signal = Some(libc::EPERM);
     match mode.as_str() {
@@ -484,13 +543,15 @@ fn fatal_cleanup_fixture() {
             drop(group);
         }
         "reap-error" | "reap-interrupt" => {
-            group.wait_killed().expect("observe finite child");
-            group.faults.reap = Some(if mode == "reap-error" {
-                libc::EIO
+            let (errno, fault_name) = if mode == "reap-error" {
+                (libc::EIO, "EIO")
             } else {
-                libc::EINTR
-            });
+                (libc::EINTR, "EINTR")
+            };
+            group.faults.reap = Some(errno);
             assert_waitable(group.child.as_ref().expect("owned child").id());
+            create_fixture_phase(&Path::new(&directory).join("fault"), fault_name);
+            eprintln!("[fixture] consuming reap fault armed: {fault_name}");
             let error = group.reap().expect_err("injected consuming wait failure");
             panic!("reap returned after failed cleanup: {error}");
         }
@@ -543,7 +604,7 @@ fn reader_spawn_failure_keeps_a_live_child_owned_until_fatal_exit() {
 fn check_fatal_cleanup(mode: &str) {
     let path = script(&format!("fatal-{mode}"), "");
     let directory = path.parent().expect("fixture directory");
-    for name in ["pid", "adoption"] {
+    for name in ["pid", "adoption", "ready", "go", "fault"] {
         match fs::remove_file(directory.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -564,16 +625,50 @@ fn check_fatal_cleanup(mode: &str) {
         .process_group(0)
         .spawn()
         .expect("spawn fixture runner");
-    let status = loop {
-        if let Some(status) = fixture.try_wait().expect("poll fixture runner") {
-            break status;
+    let mut setup_elapsed = None;
+    let mut cleanup_started = None;
+    let mut status = None;
+    if mode.starts_with("reap-") {
+        let ready = directory.join("ready");
+        let setup_deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match fs::read_to_string(&ready) {
+                Ok(contents) if contents == "waitable" => {
+                    setup_elapsed = Some(started.elapsed());
+                    cleanup_started = Some(Instant::now());
+                    create_fixture_phase(&directory.join("go"), "start cleanup");
+                    break;
+                }
+                Ok(contents) if contents.is_empty() => {}
+                Ok(contents) => panic!("unexpected fixture readiness {contents:?}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read fixture readiness: {error}"),
+            }
+            if let Some(exit) = fixture.try_wait().expect("poll fixture setup") {
+                status = Some(exit);
+                break;
+            }
+            if Instant::now() >= setup_deadline {
+                fixture.kill().expect("stop fixture missing setup phase");
+                status = Some(fixture.wait().expect("reap fixture missing setup phase"));
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        if started.elapsed() > Duration::from_secs(6) {
-            fixture.kill().expect("stop owned fixture runner");
-            break fixture.wait().expect("reap owned fixture runner");
+    }
+    let status = status.unwrap_or_else(|| {
+        loop {
+            if let Some(status) = fixture.try_wait().expect("poll fixture runner") {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(6) {
+                fixture.kill().expect("stop owned fixture runner");
+                break fixture.wait().expect("reap owned fixture runner");
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
-    };
+    });
+    let cleanup_elapsed = cleanup_started.map(|cleanup| cleanup.elapsed());
     let elapsed = started.elapsed();
     let mut stderr = String::new();
     fixture
@@ -601,18 +696,61 @@ fn check_fatal_cleanup(mode: &str) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+    // SAFETY: signal zero queries group existence without signalling a member.
+    assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "fixture group remains");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
     let adoption = fs::read_to_string(directory.join("adoption")).expect("child adoption report");
     eprintln!("{mode}: runner {status} after {elapsed:?}; child {pid} and group retired");
     assert_eq!(status.code(), Some(2), "{mode}: {status}; {stderr}");
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "{mode}: took {elapsed:?}; {stderr}"
-    );
     assert!(
         stderr.contains(&format!("fatal cleanup for process {pid}")),
         "{stderr}"
     );
     assert!(stderr.contains("a survivor may remain"), "{stderr}");
+    if mode.starts_with("reap-") {
+        let setup_elapsed = setup_elapsed.expect("fixture reached waitable setup phase");
+        let cleanup_elapsed = cleanup_elapsed.expect("fixture entered cleanup phase");
+        assert!(
+            setup_elapsed < Duration::from_secs(6),
+            "{mode}: setup took {setup_elapsed:?}; {stderr}"
+        );
+        assert!(
+            setup_elapsed > Duration::from_millis(100),
+            "{mode}: setup did not exceed cleanup budget: {setup_elapsed:?}"
+        );
+        assert!(
+            cleanup_elapsed < Duration::from_secs(1),
+            "{mode}: cleanup took {cleanup_elapsed:?}; {stderr}"
+        );
+        let expected_fault = if mode == "reap-error" { "EIO" } else { "EINTR" };
+        assert_eq!(
+            fs::read_to_string(directory.join("fault")).expect("intended reap fault phase"),
+            expected_fault
+        );
+        assert!(
+            stderr.contains(&format!(
+                "[fixture] consuming reap fault armed: {expected_fault}"
+            )),
+            "{stderr}"
+        );
+        let expected_failure = if mode == "reap-error" {
+            format!("fatal cleanup for process {pid}: Input/output error")
+        } else {
+            format!("fatal cleanup for process {pid}: process cleanup deadline expired")
+        };
+        assert!(stderr.contains(&expected_failure), "{stderr}");
+        eprintln!(
+            "{mode}: setup {setup_elapsed:?}; cleanup {cleanup_elapsed:?}; fault {expected_fault}"
+        );
+    } else {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "{mode}: took {elapsed:?}; {stderr}"
+        );
+    }
     if !mode.starts_with("reap-") {
         assert_eq!(
             adoption,
@@ -630,12 +768,6 @@ fn check_fatal_cleanup(mode: &str) {
     if mode == "wait" || mode == "reap-error" {
         assert!(stderr.contains("Input/output error"), "{stderr}");
     }
-    // SAFETY: signal zero queries group existence without signalling a member.
-    assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "fixture group remains");
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
-    );
     eprintln!("{mode}: infrastructure exit in {elapsed:?}; child {pid} and group retired");
 }
 
