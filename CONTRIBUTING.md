@@ -116,6 +116,16 @@ config, `docs/ARCHITECTURE.md` says how), so a kept `.stderr` that carries a
 AppKit call the layer made off the main thread and the thread that made it;
 that call is the failure, whatever the process printed after it.
 
+Process cleanup has one two-second budget from the first termination or cleanup
+attempt, including signal-error retries and the final reap. The leader stays
+unreaped until the last group signal. If cleanup cannot establish exit and reap,
+the runner reports the unresolved PID and exits immediately with infrastructure
+code 2. A survivor may still be running: macOS adopts the remaining children and
+owns their eventual reap. No background thread survives the runner to do that
+work. This bounds the runner's wait/retry loops, subject to scheduling, syscalls
+and diagnostic output; the kernel can also delay process exit while closing
+file descriptors. No further binary runs after this failure.
+
 An explicit driver GPU-hang report ends the leg with exit code 3 and no
 verdict, even under `FAIL_FAST=0` or when the process itself exits cleanly.
 The runner watches stderr while the process runs, checks the layer log before

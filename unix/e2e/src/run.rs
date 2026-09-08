@@ -89,6 +89,9 @@ const GPU_HANG_MARKERS: [&str; 2] = [
 /// How often the bounded wait for the process's exit looks again.
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
+/// One budget for termination, exit observation and final reap.
+const CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
 /// How long EPERM may wait for an owned group leader to become waitable.
 const SIGNAL_EXIT_GRACE: Duration = Duration::from_secs(1);
 
@@ -133,27 +136,45 @@ pub fn run(
         .spawn()
         .map_err(|e| format!("failed to spawn {} {}: {e}", wine.display(), exe.display()))?;
 
-    let mut group = ProcessGroup { child: Some(child) };
+    collect(ProcessGroup::new(child), timeout, on_line, |reader| {
+        thread::Builder::new().spawn(reader)
+    })
+}
+
+/// Collect one owned process, retaining cleanup ownership if a reader cannot start.
+fn collect(
+    mut group: ProcessGroup,
+    timeout: Duration,
+    on_line: &mut dyn FnMut(&str),
+    mut spawn_reader: impl FnMut(Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+) -> Result<Exit, String> {
     let child = group.child.as_mut().expect("just spawned group leader");
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("stdout not piped")?;
     let stderr = child.stderr.take().ok_or("stderr not piped")?;
     let (lines, received) = mpsc::channel::<String>();
     // Neither reader is joined: each ends when its pipe does, and a pipe a
-    // killed process tree held open ends with the kill.
-    thread::spawn(move || {
+    // killed process tree held open ends with the kill. Fatal cleanup ends
+    // the entire runner, including readers blocked on a surviving child.
+    spawn_reader(Box::new(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if lines.send(line).is_err() {
                 break;
             }
         }
-    });
+    }))
+    .map_err(|e| {
+        let message = format!("start stdout reader for {pid} failed: {e}");
+        // Cleanup can terminate this CLI before the error reaches main.
+        eprintln!("[e2e] {message}");
+        message
+    })?;
     // stderr comes over in chunks so that what the process wrote before it
     // died is in hand the moment it is gone; the sender dropping is the EOF.
     let gpu_hang = Arc::new(AtomicBool::new(false));
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
     let stderr_gpu_hang = Arc::clone(&gpu_hang);
-    thread::spawn(move || {
+    spawn_reader(Box::new(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = Vec::new();
         while let Ok(1..) = reader.read_until(b'\n', &mut line) {
@@ -164,7 +185,13 @@ pub fn run(
                 break;
             }
         }
-    });
+    }))
+    .map_err(|e| {
+        let message = format!("start stderr reader for {pid} failed: {e}");
+        // Cleanup can terminate this CLI before the error reaches main.
+        eprintln!("[e2e] {message}");
+        message
+    })?;
 
     let mut timed_out = false;
     let mut reported_gpu_hang = false;
@@ -173,7 +200,7 @@ pub fn run(
         if gpu_hang.load(Ordering::Relaxed) {
             group
                 .kill()
-                .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+                .map_err(|e| format!("stop {pid} failed: {e}"))?;
             reported_gpu_hang = true;
             break;
         }
@@ -181,7 +208,7 @@ pub fn run(
         if since_line >= timeout {
             group
                 .kill()
-                .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+                .map_err(|e| format!("stop {pid} failed: {e}"))?;
             timed_out = true;
             break;
         }
@@ -200,49 +227,52 @@ pub fn run(
     let hung = if reported_gpu_hang || timed_out {
         group
             .wait_killed()
-            .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
+            .map_err(|e| format!("wait on {pid} after stop failed: {e}"))?;
         false
     } else {
         match wait_bounded(&mut group, timeout, &gpu_hang)
-            .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?
+            .map_err(|e| format!("wait on {pid} failed: {e}"))?
         {
             Wait::Exited => false,
             Wait::GpuHang => {
                 group
                     .kill()
-                    .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+                    .map_err(|e| format!("stop {pid} failed: {e}"))?;
                 reported_gpu_hang = true;
                 group
                     .wait_killed()
-                    .map_err(|e| format!("wait on {} after stop failed: {e}", exe.display()))?;
+                    .map_err(|e| format!("wait on {pid} after stop failed: {e}"))?;
                 false
             }
             Wait::TimedOut => {
                 group
                     .kill()
-                    .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+                    .map_err(|e| format!("stop {pid} failed: {e}"))?;
                 group
                     .wait_killed()
-                    .map_err(|e| format!("wait on {} failed: {e}", exe.display()))?;
+                    .map_err(|e| format!("wait on {pid} failed: {e}"))?;
                 true
             }
         }
     };
-    let mut stderr = drain_stderr(&stderr_rx, STDERR_GRACE);
+    let stderr_grace = group.cleanup_deadline.map_or(STDERR_GRACE, |deadline| {
+        STDERR_GRACE.min(deadline.saturating_duration_since(Instant::now()))
+    });
+    let mut stderr = drain_stderr(&stderr_rx, stderr_grace);
     if !stderr.complete {
         // Something the kill did not reach still holds the pipe: a process
         // that put itself in another group. Say so, and try the kill once
         // more for whatever did land in the group since.
         group
             .kill()
-            .map_err(|e| format!("stop {} failed: {e}", exe.display()))?;
+            .map_err(|e| format!("stop {pid} failed: {e}"))?;
         stderr.text.push_str(
             "[e2e] stderr not collected in full: the process tree held it open past the end\n",
         );
     }
     let status = group
         .reap()
-        .map_err(|e| format!("reap {} failed: {e}", exe.display()))?;
+        .map_err(|e| format!("reap {pid} failed: {e}"))?;
     let stderr = stderr.text;
     let kind = if timed_out {
         ExitKind::TimedOut(timeout)
@@ -268,11 +298,18 @@ struct Stderr {
     complete: bool,
 }
 
-/// Collect stderr chunks until the pipe closes or `grace` passes without one.
+/// Collect stderr chunks until the pipe closes or the total `grace` expires.
 fn drain_stderr(chunks: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Stderr {
     let mut buf = Vec::new();
+    let deadline = Instant::now() + grace;
     loop {
-        match chunks.recv_timeout(grace) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let next = if remaining.is_zero() {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            chunks.recv_timeout(remaining)
+        };
+        match next {
             Ok(chunk) => buf.extend_from_slice(&chunk),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Stderr {
@@ -297,65 +334,153 @@ fn drain_stderr(chunks: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Stderr {
 /// that reservation. ECHILD revokes ownership instead of trusting a numeric ID.
 struct ProcessGroup {
     child: Option<Child>,
+    cleanup_deadline: Option<Instant>,
+    #[cfg(test)]
+    faults: tests::Faults,
 }
 
 impl ProcessGroup {
+    const fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            cleanup_deadline: None,
+            #[cfg(test)]
+            faults: tests::Faults::new(),
+        }
+    }
+
+    /// Start the budget once, including retries made by Drop after an error.
+    fn cleanup_deadline(&mut self) -> Instant {
+        *self
+            .cleanup_deadline
+            .get_or_insert_with(|| Instant::now() + CLEANUP_GRACE)
+    }
+
     /// Observe exit without releasing the leader's PID or group membership.
     fn observe_exit(&mut self, options: libc::c_int) -> std::io::Result<bool> {
         let child = self
             .child
             .as_ref()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
-        loop {
-            // SAFETY: siginfo_t contains integers and raw pointers, valid when zeroed.
-            // macOS leaves it untouched for WNOHANG when the child is still running.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: info is writable and P_PID selects this owner's direct child.
-            // WNOWAIT observes exit without consuming the child's waitable status.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    child.id(),
-                    &raw mut info,
-                    libc::WEXITED | libc::WNOWAIT | options,
-                )
-            };
-            if result == 0 {
-                return Ok(info.si_pid != 0);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.raw_os_error() == Some(libc::ECHILD) {
-                self.child.take();
-            }
-            return Err(error);
+        // SAFETY: siginfo_t contains integers and raw pointers, valid when zeroed.
+        // macOS leaves it untouched for WNOHANG when the child is still running.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: info is writable and P_PID selects this owner's direct child.
+        // WNOWAIT observes exit without consuming the child's waitable status.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT | options,
+            )
+        };
+        #[cfg(test)]
+        if self.faults.wait_interruptions > 0 {
+            self.faults.wait_interruptions -= 1;
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
         }
+        #[cfg(test)]
+        let result = if self.faults.wait.is_some() {
+            -1
+        } else {
+            result
+        };
+        if result == 0 {
+            return Ok(info.si_pid != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        #[cfg(test)]
+        let error = self
+            .faults
+            .wait
+            .map_or(error, std::io::Error::from_raw_os_error);
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            self.child.take();
+        }
+        Err(error)
     }
 
     /// Verify that the leader is still ours before signalling its group.
     fn kill(&mut self) -> std::io::Result<()> {
-        self.observe_exit(libc::WNOHANG)?;
+        let deadline = self.cleanup_deadline();
+        loop {
+            match self.observe_exit(libc::WNOHANG) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    cleanup_pause(deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         self.signal_group()
     }
 
     /// Stop descendants a group signal's fork snapshot may have missed.
     fn wait_killed(&mut self) -> std::io::Result<()> {
-        self.observe_exit(0)?;
+        let deadline = self.cleanup_deadline();
+        loop {
+            match self.observe_exit(libc::WNOHANG) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            cleanup_pause(deadline)?;
+        }
         // The leader has exited, so its in-flight fork has finished. WNOWAIT
         // retains its group identity through this second signal and stderr drain.
         self.signal_group()
     }
 
-    /// Release the reserved identity, consuming the ability to signal the group.
+    /// Send the final group signal before consuming the reserved identity.
     fn reap(mut self) -> std::io::Result<ExitStatus> {
-        let result = self
+        let deadline = self.cleanup_deadline();
+        self.wait_killed()?;
+        loop {
+            match self.try_reap() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            cleanup_pause(deadline)?;
+        }
+    }
+
+    /// A nonblocking consuming wait; no group signal may follow success or ECHILD.
+    fn try_reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let child = self
             .child
-            .as_mut()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?
-            .wait();
-        if result.is_ok()
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+        let pid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
+        #[cfg(test)]
+        let injected = if self.faults.reap_interruptions > 0 {
+            self.faults.reap_interruptions -= 1;
+            Some(libc::EINTR)
+        } else {
+            self.faults.reap
+        };
+        #[cfg(not(test))]
+        let injected = None;
+        let result = injected.map_or_else(
+            || {
+                let mut status = 0;
+                // SAFETY: status is writable and pid selects only this owner's child.
+                // WNOHANG prevents blocking. EINTR returns to the bounded caller.
+                let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+                if waited == pid {
+                    Ok(Some(ExitStatus::from_raw(status)))
+                } else if waited == 0 {
+                    Ok(None)
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            },
+            |errno| Err(std::io::Error::from_raw_os_error(errno)),
+        );
+        if matches!(result, Ok(Some(_)))
             || result
                 .as_ref()
                 .is_err_and(|e| e.raw_os_error() == Some(libc::ECHILD))
@@ -374,13 +499,28 @@ impl ProcessGroup {
         let pid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
         // SAFETY: the child spawned as its own group leader and remains unreaped,
         // so its PID reserves this group's identity until the consuming reap.
+        #[cfg(not(test))]
         let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        #[cfg(test)]
+        let result = if self.faults.signal.is_some() {
+            -1
+        } else {
+            // SAFETY: the same owned, unreaped leader reserves this group.
+            unsafe { libc::kill(-pid, libc::SIGKILL) }
+        };
         if result == 0 {
             return Ok(());
         }
-        resolve_group_signal_error(std::io::Error::last_os_error(), SIGNAL_EXIT_GRACE, || {
-            self.observe_exit(libc::WNOHANG)
-        })
+        let error = std::io::Error::last_os_error();
+        #[cfg(test)]
+        let error = self
+            .faults
+            .signal
+            .map_or(error, std::io::Error::from_raw_os_error);
+        let grace = self.cleanup_deadline.map_or(SIGNAL_EXIT_GRACE, |deadline| {
+            SIGNAL_EXIT_GRACE.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        resolve_group_signal_error(error, grace, || self.observe_exit(libc::WNOHANG))
     }
 }
 
@@ -389,25 +529,75 @@ impl Drop for ProcessGroup {
         if self.child.is_none() {
             return;
         }
+        let deadline = self.cleanup_deadline();
         if let Err(error) = self.observe_exit(libc::WNOHANG) {
             eprintln!("[e2e] observe process during cleanup failed: {error}");
         }
-        // ECHILD means another waiter consumed the identity. Never signal it.
         if self.child.is_none() {
             return;
         }
         if let Err(error) = self.signal_group() {
             eprintln!("[e2e] stop process group during cleanup failed: {error}");
         }
-        if let Err(error) = self.wait_killed() {
-            eprintln!("[e2e] wait for stopped process during cleanup failed: {error}");
-        }
-        if let Some(mut child) = self.child.take()
-            && let Err(error) = child.wait()
-        {
-            eprintln!("[e2e] reap process during cleanup failed: {error}");
+        loop {
+            if self.child.is_none() {
+                return;
+            }
+            match self.wait_killed().and_then(|()| self.try_reap()) {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("[e2e] wait/reap process during cleanup failed: {error}");
+                    if self.child.is_none() {
+                        return;
+                    }
+                    // Retain ownership on genuine errors. Retrying the same
+                    // failed syscall cannot extend the cleanup budget.
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        self.fatal_cleanup(&error);
+                    }
+                }
+            }
+            if let Err(error) = cleanup_pause(deadline) {
+                self.fatal_cleanup(&error);
+            }
         }
     }
+}
+
+impl ProcessGroup {
+    /// End this CLI while the OS can still adopt its unresolved direct child.
+    fn fatal_cleanup(&self, error: &std::io::Error) -> ! {
+        let pid = self
+            .child
+            .as_ref()
+            .expect("unresolved child stays owned")
+            .id();
+        eprintln!(
+            "[e2e] fatal cleanup for process {pid}: {error}; exit/reap not established; \
+             a survivor may remain; exiting runner with code 2, macOS will adopt and eventually reap it"
+        );
+        // SAFETY: this is the CLI's terminal infrastructure failure. _exit ends
+        // every reader thread without destructors or atexit handlers. The kernel
+        // reparents any remaining children; it does not promise to kill them.
+        unsafe { libc::_exit(2) }
+    }
+}
+
+fn cleanup_timeout() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "process cleanup deadline expired",
+    )
+}
+
+fn cleanup_pause(deadline: Instant) -> std::io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(cleanup_timeout());
+    }
+    thread::sleep(EXIT_POLL.min(remaining));
+    Ok(())
 }
 
 /// Resolve a group signal error without consuming the leader's waitable status.
@@ -428,8 +618,11 @@ fn resolve_group_signal_error(
     // an open stderr pipe still reports a survivor.
     let deadline = Instant::now() + grace;
     loop {
-        if observe_exit()? {
-            return Ok(());
+        match observe_exit() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(wait_error) if wait_error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(wait_error) => return Err(wait_error),
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -454,8 +647,11 @@ fn wait_bounded(
 ) -> std::io::Result<Wait> {
     let deadline = Instant::now() + timeout;
     loop {
-        if group.observe_exit(libc::WNOHANG)? {
-            return Ok(Wait::Exited);
+        match group.observe_exit(libc::WNOHANG) {
+            Ok(true) => return Ok(Wait::Exited),
+            Ok(false) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
         if gpu_hang.load(Ordering::Relaxed) {
             return Ok(Wait::GpuHang);
@@ -463,7 +659,7 @@ fn wait_bounded(
         if Instant::now() >= deadline {
             return Ok(Wait::TimedOut);
         }
-        thread::sleep(EXIT_POLL);
+        thread::sleep(EXIT_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
