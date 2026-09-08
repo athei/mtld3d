@@ -15,6 +15,7 @@ use mtld3d_shared::{
     mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
+use objc2_core_foundation::kCFRunLoopCommonModes;
 
 use crate::{LOG_TARGET, metal, metal::handle::IntoRetained};
 
@@ -128,6 +129,22 @@ fn log_identity() {
     let id = id.as_deref().unwrap_or("no-image-id");
     let build = identity::BUILD;
     info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized");
+    let Some(image) = core_foundation_image() else {
+        warn!(target: LOG_TARGET, "CoreFoundation image identity unavailable");
+        return;
+    };
+    let base = image.base();
+    let uuid = image.uuid().unwrap_or("unavailable");
+    match image.path() {
+        Some(path) => info!(target: LOG_TARGET,
+            "CoreFoundation path=\"{}\" base={base:#x} uuid={uuid}",
+            path.display().to_string().escape_debug()),
+        None => warn!(target: LOG_TARGET,
+            "CoreFoundation path=unavailable base={base:#x} uuid={uuid}"),
+    }
+    if image.uuid().is_none() {
+        warn!(target: LOG_TARGET, "CoreFoundation image UUID unavailable");
+    }
 }
 
 pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
@@ -944,3 +961,17 @@ pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
     }
     STATUS_SUCCESS
 }
+
+/// Resolve the public export's storage, without following a CF object pointer.
+fn core_foundation_image() -> Option<identity::LoadedImage> {
+    // The address of the exported variable belongs to CoreFoundation. Reading
+    // its value instead would follow a CF object, and a Rust wrapper function
+    // would identify the image the wrapper was linked into.
+    let symbol = (&raw const kCFRunLoopCommonModes).cast();
+    // SAFETY: CoreFoundation is a linked dependency and stays mapped throughout
+    // this call, including the immutable Mach-O header and load commands.
+    unsafe { identity::LoadedImage::for_symbol(symbol) }
+}
+
+#[cfg(test)]
+mod tests;
