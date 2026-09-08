@@ -417,8 +417,12 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     else {
         error!(
             target: LOG_TARGET,
-            "failed to create {}x{} backbuffer (samples={})",
-            params.width, params.height, params.sample_count
+            "failed to create {}x{} backbuffer (samples={}) device={:#x} queue={:#x}",
+            params.width,
+            params.height,
+            params.sample_count,
+            params.device_handle.raw(),
+            params.queue_handle.raw(),
         );
         return STATUS_UNSUCCESSFUL;
     };
@@ -434,8 +438,12 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         error!(
             target: LOG_TARGET,
             "failed to create the {}x multisampled companion of the {}x{} backbuffer; the \
-             single-sample texture is released again",
-            params.sample_count, params.width, params.height
+             single-sample texture is released again; device={:#x} queue={:#x}",
+            params.sample_count,
+            params.width,
+            params.height,
+            params.device_handle.raw(),
+            params.queue_handle.raw(),
         );
         // Both handles are minted and neither has been handed back, so this
         // side owns their only copies; the view goes first, since it holds a
@@ -463,8 +471,9 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     // window drag. The CreateDevice + AttachMetalLayer info
     // lines already cover the boot-time milestone.
     debug!(
-        target: LOG_TARGET,
-        "created backbuffer {}x{} samples={}: texture {:#x} srgb {:#x} msaa {:#x} msaa_srgb {:#x}",
+        target: "mtld3d::unix::command",
+        "created backbuffer {}x{} samples={}: texture {:#x} srgb {:#x} msaa {:#x} \
+         msaa_srgb {:#x} device={:#x} queue={:#x}",
         params.width,
         params.height,
         params.sample_count,
@@ -472,6 +481,8 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         params.srgb_texture_handle.raw(),
         params.msaa_texture_handle.raw(),
         params.msaa_srgb_texture_handle.raw(),
+        params.device_handle.raw(),
+        params.queue_handle.raw(),
     );
     STATUS_SUCCESS
 }

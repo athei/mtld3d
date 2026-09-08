@@ -201,7 +201,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::perf`            | 5-second averaged performance summary (`PERF=1` builds only)             |
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
 | `mtld3d::unix`            | Metal-side `.so`                                                         |
-| `mtld3d::unix::command`   | command-buffer completion records and encoder error details (debug)      |
+| `mtld3d::unix::command`   | command-buffer completion/error and backbuffer allocation/view records (debug) |
 | `mtld3d::unix::cursor`    | software cursor overlay window: sprite renders, show/hide, layer mode    |
 | `mtld3d::unix::present`   | presented-cadence probe, one row per frame (trace)                       |
 | `mtld3d::unix::depth`     | comparison-sampler creation, the unix mirror of `d3d9::depth` (trace)    |
@@ -219,22 +219,28 @@ build stamp; the allocating loader query never runs from a signal handler.
 ### Command-buffer completion and encoder errors
 
 `RUST_LOG=mtld3d=warn,mtld3d::unix::command=debug` enables
-`EncoderExecutionStatus` collection for frame, upload and synchronous readback
-command buffers. These buffers keep retained resource references in both modes;
-with the target disabled, creation uses the ordinary `commandBuffer()` path.
+`EncoderExecutionStatus` collection for frame, upload, synchronous readback and
+creation-time texture-clear command buffers. These buffers keep retained
+resource references in both modes; with the target disabled, creation uses
+the ordinary `commandBuffer()` path.
 Collection can add CPU, GPU and memory overhead, and logging every completion
 can be verbose. Use a bounded workload when gathering diagnostics.
 
-The existing frame/upload callbacks, retirement waits, CPU submission cleanup
-and readback wait log `command-buffer` records with the actual buffer, queue
-and device addresses, device registry ID and name, labels, role, sequence where
-known, observation site, numeric/named status and error options. Roles come from
+The frame/upload callbacks, retirement waits, CPU submission cleanup,
+readback wait and diagnostic-only initialization callback log `command-buffer`
+records with the actual buffer, queue and device addresses, device registry
+ID and name, labels, role, sequence where known, observation site,
+numeric/named status and error options. Roles come from
 the constructor-owned labels; an unrecognized or missing label reports `unknown`.
-Readback sequences are `unavailable`. One buffer can appear at several sites,
-so correlate the addresses and site with the sequence and log order. Addresses
-can be reused after release. No new wait or callback is added. Only a recorded
-`Completed` status establishes successful completion of that observed buffer;
-absence of an error record does not.
+Readback and initialization sequences are `unavailable`. Initialization uses
+the exact `mtld3d-init-clear` label and `initialization-callback` observation
+site. One buffer can appear at several sites, so correlate the addresses and
+site with the sequence and log order. Addresses can be reused after release,
+and log order is not a causal order across queues.
+No new wait is added. The initialization callback adds scheduling and logging
+work only with diagnostics enabled, so captures can alter failure frequency.
+Only a recorded `Completed` status establishes successful completion of that
+observed buffer; absence of an error record does not.
 
 On failure, the following `command-buffer-error` record names the same buffer,
 sequence and site and includes the signed `NSError` code, domain and description.
@@ -249,10 +255,33 @@ No per-draw signposts are inserted, so existing labels can be all the driver has
 `Affected` does not establish that the encoder caused the error, and an encoder's
 `Completed` state does not make the whole buffer successful.
 
-Creation-time texture clears, cursor-overlay buffers and the empty teardown
-fence are outside this target's construction and observation scope. A clean
-local run validates construction and completion on that device; it does not
-demonstrate a real error payload or establish another GPU's fault attribution.
+The initialization callback captures no resource, PE memory or caller borrow.
+Its executable lifetime depends on the D3D loading contract: `CreateDevice`
+sets the used latch before a clear can be submitted, and D3D DLL detach then
+self-terminates before Wine unloads its statically imported shim and Unix
+image. Native unit clients compile this code into their test executable.
+This is not a general contract for a client that directly loads and unloads
+the shim or Unix image. A change allowing surviving D3D unload after
+`CreateDevice` must revisit the callback. Process exit can end callbacks
+before they log; the shutdown fence does not prove all earlier callbacks
+finished, and missing records remain unobserved completions.
+
+The target also records each successful backbuffer's base and optional view
+and MSAA handles with its request device and queue. Each refused sRGB view
+records the live base texture and device identities, actual base label,
+dimensions, format, usage, type, mip and array sizes, and requested view
+format, type, ranges and swizzle. Extra view queries run only in the enabled
+refusal branch. The ordinary allocation errors carry the live allocation
+device and registry ID; backbuffer failures carry the request device and
+queue handles. Join these records within the process and creation interval:
+addresses can be reused, and system driver errors without texture handles
+cannot be matched one-to-one by timing alone. A refused optional view does
+not establish a failed base allocation or memory exhaustion.
+
+Cursor-overlay buffers and the empty teardown fence are outside this
+target's construction and observation scope. A clean local run validates
+construction and completion on that device; it does not demonstrate a real
+error payload or establish another GPU's fault attribution.
 
 For a bounded manual CI run, set `e2e_filter` to
 `msaa::depth_test_holds_on_a_multisampled_target` and `e2e_log` to
