@@ -248,8 +248,11 @@ It checks the encoder-info array and each element's protocol conformance before
 printing labels, numeric/named states and signposts in recorded order. Variable
 strings are quoted and escaped to keep each record on one line. Missing errors,
 missing keys, malformed payloads, empty arrays and unavailable protocol metadata
-remain distinct. The typed encoder-info protocol promises nonnull labels and
-signpost arrays; an empty signpost array is reported as `empty`, never as success.
+remain distinct. Encoder labels and signpost arrays are read through Foundation's
+nullable key-value getter after checking `NSObject` inheritance. Nil metadata is
+reported as `missing`, an empty signpost array as `empty`, and wrong value or
+element classes as malformed. A conforming encoder outside `NSObject` retains
+its state with object metadata reported as `unavailable-non-nsobject`.
 No per-draw signposts are inserted, so existing labels can be all the driver has.
 `Unknown`, `Completed`, `Affected`, `Pending` and `Faulted` remain distinct:
 `Affected` does not establish that the encoder caused the error, and an encoder's

@@ -7,7 +7,7 @@ use objc2::{
     rc::{Retained, autoreleasepool},
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_foundation::{NSArray, NSError, NSString};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectNSKeyValueCoding, NSString, ns_string};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
     MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
@@ -371,20 +371,51 @@ fn append_encoder_info(output: &mut String, payload: Option<&AnyObject>) {
             Retained::cast_unchecked::<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>(object)
         };
         let state = encoder.errorState();
+        // The protocol's object getters can return nil despite their nonnull bindings.
+        // NSObject's typed KVC getter preserves nil and calls these declared accessors.
+        let metadata = AsRef::<AnyObject>::as_ref(&*encoder).downcast_ref::<NSObject>();
+        let label = metadata.map_or_else(
+            || "unavailable-non-nsobject".to_owned(),
+            |object| metadata_string(object.valueForKey(ns_string!("label")).as_deref()),
+        );
         write!(
             output,
-            "label={:?} state={}({}) signposts=",
-            encoder.label().to_string(),
+            "label={label} state={}({}) signposts=",
             state.0,
             encoder_state_name(state),
         )
         .expect("writing to a String cannot fail");
-        append_signposts(output, &encoder.debugSignposts());
+        if let Some(object) = metadata {
+            append_signposts(
+                output,
+                object.valueForKey(ns_string!("debugSignposts")).as_deref(),
+            );
+        } else {
+            output.push_str("unavailable-non-nsobject");
+        }
         output.push('}');
     }
 }
 
-fn append_signposts(output: &mut String, signposts: &NSArray<NSString>) {
+fn metadata_string(value: Option<&AnyObject>) -> String {
+    let Some(value) = value else {
+        return optional_string(None);
+    };
+    value.downcast_ref::<NSString>().map_or_else(
+        || "malformed-non-string".to_owned(),
+        |value| optional_string(Some(&value.to_string())),
+    )
+}
+
+fn append_signposts(output: &mut String, signposts: Option<&AnyObject>) {
+    let Some(signposts) = signposts else {
+        output.push_str("missing");
+        return;
+    };
+    let Some(signposts) = signposts.downcast_ref::<NSArray<AnyObject>>() else {
+        output.push_str("malformed-non-array");
+        return;
+    };
     if signposts.is_empty() {
         output.push_str("empty");
         return;
@@ -394,7 +425,7 @@ fn append_signposts(output: &mut String, signposts: &NSArray<NSString>) {
         if index != 0 {
             output.push_str(", ");
         }
-        write!(output, "{:?}", signpost.to_string()).expect("writing to a String cannot fail");
+        output.push_str(&metadata_string(Some(&signpost)));
     }
     output.push(']');
 }
