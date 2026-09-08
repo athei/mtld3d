@@ -591,10 +591,9 @@ impl StateBlockType {
 
     /// Whether a block of this type captures/restores sampler state `ty` (`D3DSAMP_*`).
     ///
-    /// `Vertex` covers only `DMAPOFFSET` (vertex-sampler displacement, the sole
-    /// sampler state in the D3D9 `D3DSBT_VERTEXSTATE` set; the vertex-sampler
-    /// register range 256+ is not modelled, so this is a no-op for the colour
-    /// samplers 0-15). `Pixel` covers the colour sampler states.
+    /// `Vertex` covers only `DMAPOFFSET`, the sole sampler state in the D3D9
+    /// `D3DSBT_VERTEXSTATE` set. `Pixel` covers the colour sampler states. The
+    /// same membership applies to fragment and vertex sampler rows.
     #[must_use]
     pub const fn includes_sampler_state(self, ty: u32) -> bool {
         match self {
