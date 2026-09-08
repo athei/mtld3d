@@ -208,6 +208,14 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 
 Each cdylib initializes the logger independently and idempotently; `mtld3d.so` has no owning entry point, so `d3d9.dll` dispatches a one-shot `InitLogger` thunk from its init path. Every line goes to the process's log file, `<exe>-<pid>.log` under `mtld3d-logs` beside the executable (`log.dir` moves it), never to the standard streams: a game a launcher spawned has no usable ones. `<pid>` is the macOS process id, so a launch never overwrites the log of the one before it; the directory keeps the ten newest logs and the ten newest traces, and the file appears with the first line written, so a process that logs nothing leaves nothing behind.
 
+The Unix initialization also records CoreFoundation's loaded path, Mach-O
+header address and UUID at `info` level under `mtld3d::unix`. It resolves the
+address of the linked `kCFRunLoopCommonModes` export without reading a CF
+object. This identifies the framework actually mapped in that process,
+including an image in the dyld shared cache. Missing path or UUID information
+is explicit. The record uses the same startup backlog and process log as the
+build stamp; the allocating loader query never runs from a signal handler.
+
 ### Command-buffer completion and encoder errors
 
 `RUST_LOG=mtld3d=warn,mtld3d::unix::command=debug` enables

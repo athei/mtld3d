@@ -26,6 +26,8 @@
 /// manifest version (`v0.2.0`) when built outside a git checkout.
 pub const BUILD: &str = env!("MTLD3D_BUILD");
 
+#[cfg(unix)]
+pub use platform::LoadedImage;
 pub use platform::image_id;
 #[cfg(target_family = "windows")]
 pub use platform::version_blob;
@@ -414,13 +416,98 @@ mod platform {
 #[cfg(unix)]
 mod platform {
     use core::{ffi::c_void, fmt::Write as _};
+    use std::{
+        ffi::CStr,
+        os::unix::ffi::OsStrExt,
+        path::{Path, PathBuf},
+    };
 
     /// `LC_UUID`, the load command carrying the linker's image UUID.
     const LC_UUID: u32 = 0x1b;
+    /// Native-endian 64-bit Mach-O magic, for both supported Unix architectures.
+    const MACH_MAGIC_64: u32 = 0xfeed_facf;
     /// Size of a `mach_header_64`, after which the load commands start.
     const MACH_HEADER_64_SIZE: usize = 32;
     /// Offset of `ncmds` within a `mach_header_64`.
     const NCMDS: usize = 16;
+    /// Offset of `sizeofcmds` within a `mach_header_64`.
+    const SIZEOFCMDS: usize = 20;
+    /// The `cmd` and `cmdsize` words every load command starts with.
+    const LOAD_COMMAND_SIZE: usize = 8;
+    /// Load commands in 64-bit Mach-O images are aligned to eight bytes.
+    const LOAD_COMMAND_ALIGNMENT: usize = 8;
+    /// An `LC_UUID` command's header and sixteen UUID bytes.
+    const UUID_COMMAND_SIZE: usize = 24;
+
+    /// An owned identity snapshot of the image containing a linked symbol.
+    ///
+    /// No loader-owned pointer escapes construction. The numeric base is for
+    /// diagnostics, not a handle that keeps the image mapped.
+    pub struct LoadedImage {
+        path: Option<PathBuf>,
+        base: usize,
+        uuid: Option<String>,
+    }
+
+    impl LoadedImage {
+        /// Identify a loaded image through one of its linked symbols.
+        ///
+        /// Returns `None` when dyld cannot resolve the symbol's image. A missing
+        /// path or UUID stays absent independently. This allocates and queries
+        /// the loader, so it must not run in a signal handler.
+        ///
+        /// # Safety
+        ///
+        /// `symbol` must point into a dyld-loaded 64-bit Mach-O image that stays
+        /// loaded throughout this call. Its header and declared load-command
+        /// region must remain readable and unmodified throughout the call.
+        #[must_use]
+        pub unsafe fn for_symbol(symbol: *const c_void) -> Option<Self> {
+            let mut info = libc::Dl_info {
+                dli_fname: core::ptr::null(),
+                dli_fbase: core::ptr::null_mut(),
+                dli_sname: core::ptr::null(),
+                dli_saddr: core::ptr::null_mut(),
+            };
+            // SAFETY: `symbol` belongs to a live image per the contract; `info`
+            // is a live output buffer. dladdr does not retain either pointer.
+            let found = unsafe { libc::dladdr(symbol, &raw mut info) };
+            if found == 0 || info.dli_fbase.is_null() {
+                return None;
+            }
+            let path = if info.dli_fname.is_null() {
+                None
+            } else {
+                // SAFETY: dyld supplies a NUL-terminated image name, and the
+                // image remains loaded while this owned copy is made.
+                let name = unsafe { CStr::from_ptr(info.dli_fname) };
+                Some(PathBuf::from(std::ffi::OsStr::from_bytes(name.to_bytes())))
+            };
+            let base = info.dli_fbase as usize;
+            // SAFETY: dladdr returned this loaded image's header; the caller
+            // keeps its header and load commands readable throughout the call.
+            let uuid = unsafe { loaded_uuid(base) };
+            Some(Self { path, base, uuid })
+        }
+
+        /// The loader's image path, when available.
+        #[must_use]
+        pub fn path(&self) -> Option<&Path> {
+            self.path.as_deref()
+        }
+
+        /// The loaded Mach-O header's address, for relative crash offsets.
+        #[must_use]
+        pub const fn base(&self) -> usize {
+            self.base
+        }
+
+        /// The linker's UUID, absent for missing or malformed load commands.
+        #[must_use]
+        pub fn uuid(&self) -> Option<&str> {
+            self.uuid.as_deref()
+        }
+    }
 
     /// This image's Mach-O `LC_UUID`, read from its own load commands.
     ///
@@ -429,51 +516,67 @@ mod platform {
     /// `None` if the image carries no `LC_UUID`.
     #[must_use]
     pub fn image_id() -> Option<String> {
-        let base = image_base()?;
-        // SAFETY: `base` is this image's mach_header, so `ncmds` is the dword
-        // at `+16`.
-        let ncmds = unsafe { read_u32(base + NCMDS) };
-        let mut cmd = base + MACH_HEADER_64_SIZE;
-        for _ in 0..ncmds {
-            // SAFETY: `cmd` walks the load-command chain of a mapped image,
-            // bounded by the header's own `ncmds`; `cmd` is the first dword.
-            let kind = unsafe { read_u32(cmd) };
-            // SAFETY: `cmdsize` is the second dword of the same command.
-            let size = unsafe { read_u32(cmd + 4) } as usize;
-            if size == 0 {
-                return None;
-            }
-            if kind == LC_UUID {
-                // SAFETY: an `LC_UUID` command carries its 16 raw bytes right
-                // after the `cmd`/`cmdsize` pair.
-                let uuid = unsafe { read_bytes(cmd + 8) };
-                return Some(format_uuid(&uuid));
-            }
-            cmd += size;
-        }
-        None
+        let symbol = (image_id as *const ()).cast();
+        // SAFETY: our own code's image stays loaded while executing this call.
+        unsafe { LoadedImage::for_symbol(symbol) }?.uuid
     }
 
-    /// Load base of the image this code was linked into.
+    /// Read the UUID from a dyld-loaded image's mapped headers.
     ///
-    /// Asking `dladdr` about one of our own functions is what makes this the
-    /// *containing* image rather than the main executable, which matters
-    /// because we are loaded as a library beside the Wine host.
-    fn image_base() -> Option<usize> {
-        let mut info = libc::Dl_info {
-            dli_fname: core::ptr::null(),
-            dli_fbase: core::ptr::null_mut(),
-            dli_sname: core::ptr::null(),
-            dli_saddr: core::ptr::null_mut(),
-        };
-        let probe: *const c_void = (image_base as *const ()).cast();
-        // SAFETY: `probe` is a function pointer into this image and `info` is a
-        // live `Dl_info`; `dladdr` only writes through the latter.
-        let found = unsafe { libc::dladdr(probe, &raw mut info) };
-        if found == 0 || info.dli_fbase.is_null() {
+    /// # Safety
+    ///
+    /// `base` must address a readable, immutable 64-bit Mach-O header followed
+    /// by its declared load-command region, kept mapped throughout the call.
+    unsafe fn loaded_uuid(base: usize) -> Option<String> {
+        // SAFETY: the caller guarantees the complete fixed header is readable.
+        let header = unsafe { core::slice::from_raw_parts(base as *const u8, MACH_HEADER_64_SIZE) };
+        let size = command_extent(header)?;
+        base.checked_add(size)?;
+        isize::try_from(size).ok()?;
+        // SAFETY: the caller guarantees the declared command region is mapped;
+        // its length and address do not overflow, and the mapping is immutable.
+        let image = unsafe { core::slice::from_raw_parts(base as *const u8, size) };
+        mach_uuid(image).map(|uuid| format_uuid(&uuid))
+    }
+
+    /// Bound the command region by a native 64-bit Mach-O header.
+    fn command_extent(header: &[u8]) -> Option<usize> {
+        if header.len() < MACH_HEADER_64_SIZE || read_u32(header, 0)? != MACH_MAGIC_64 {
             return None;
         }
-        Some(info.dli_fbase as usize)
+        MACH_HEADER_64_SIZE.checked_add(usize::try_from(read_u32(header, SIZEOFCMDS)?).ok()?)
+    }
+
+    /// Parse only complete commands inside the header's declared byte extent.
+    fn mach_uuid(image: &[u8]) -> Option<[u8; 16]> {
+        let end = command_extent(image)?;
+        let mut commands = image.get(MACH_HEADER_64_SIZE..end)?;
+        let count = usize::try_from(read_u32(image, NCMDS)?).ok()?;
+        if count > commands.len() / LOAD_COMMAND_SIZE {
+            return None;
+        }
+        let mut uuid = None;
+        for _ in 0..count {
+            let kind = read_u32(commands, 0)?;
+            let size = usize::try_from(read_u32(commands, 4)?).ok()?;
+            if size < LOAD_COMMAND_SIZE || !size.is_multiple_of(LOAD_COMMAND_ALIGNMENT) {
+                return None;
+            }
+            let command = commands.get(..size)?;
+            if kind == LC_UUID {
+                uuid = Some(
+                    command
+                        .get(LOAD_COMMAND_SIZE..UUID_COMMAND_SIZE)?
+                        .try_into()
+                        .ok()?,
+                );
+            }
+            commands = commands.get(size..)?;
+        }
+        if !commands.is_empty() {
+            return None;
+        }
+        uuid
     }
 
     /// Format a 16-byte Mach-O UUID in the canonical 8-4-4-4-12 form.
@@ -491,23 +594,13 @@ mod platform {
         out
     }
 
-    /// Read a `u32` at `addr` without assuming alignment.
-    ///
-    /// # Safety
-    ///
-    /// `addr` must point at four readable bytes.
-    const unsafe fn read_u32(addr: usize) -> u32 {
-        // SAFETY: per the contract, four readable bytes live at `addr`.
-        unsafe { (addr as *const u32).read_unaligned() }
+    /// Read a native-endian header word without assuming alignment.
+    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_ne_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
     }
 
-    /// Read 16 bytes at `addr` without assuming alignment.
-    ///
-    /// # Safety
-    ///
-    /// `addr` must point at sixteen readable bytes.
-    const unsafe fn read_bytes(addr: usize) -> [u8; 16] {
-        // SAFETY: per the contract, sixteen readable bytes live at `addr`.
-        unsafe { (addr as *const [u8; 16]).read_unaligned() }
-    }
+    #[cfg(test)]
+    mod tests;
 }
