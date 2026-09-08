@@ -19,13 +19,13 @@ use super::{BlitSite, CopyBufferEndpoint, CopyEndpoint, CopyRegion};
 
 const LOG_TARGET: &str = "mtld3d::unix::command";
 
-pub struct TextureCopy<'a> {
-    pub texture: &'a ProtocolObject<dyn MTLTexture>,
-    pub endpoint: &'a CopyEndpoint,
-    pub slice: usize,
+pub(super) struct TextureCopy<'a> {
+    pub(super) texture: &'a ProtocolObject<dyn MTLTexture>,
+    pub(super) endpoint: &'a CopyEndpoint,
+    pub(super) slice: usize,
 }
 
-pub fn render_pass(
+pub(super) fn render_pass(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     descriptor: &MTLRenderPassDescriptor,
     pass_index: usize,
@@ -65,7 +65,7 @@ pub fn render_pass(
     );
 }
 
-pub fn texture_copy(
+pub(super) fn texture_copy(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     site: BlitSite,
     index: usize,
@@ -90,7 +90,7 @@ pub fn texture_copy(
     );
 }
 
-pub fn readback(
+pub(super) fn readback(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     source: &TextureCopy<'_>,
     buffer: &ProtocolObject<dyn MTLBuffer>,
