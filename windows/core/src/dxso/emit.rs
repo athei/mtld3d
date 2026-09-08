@@ -2492,31 +2492,6 @@ fn expand_subroutine(out: &mut String, label: u32, ctx: &EmitContext) -> Result<
     Ok(())
 }
 
-/// Build the Boolean MSL expression that gates a predicated instruction.
-///
-/// The predicate operand carries a swizzle picking which p0 lane is the gate,
-/// and a `Not` modifier inverts the test. `any(p0)` is the fallback for an
-/// `xyzw` swizzle.
-fn predicate_gate_expr(pred: &SrcOperand) -> String {
-    let swiz = pred.swizzle.0;
-    let comp = b"xyzw"[swiz[0] as usize] as char;
-    // SM3 typically replicates a single component (e.g. .xxxx); if all
-    // four lanes are identical, use the scalar lane directly. Otherwise
-    // collapse to `any(p0)` — the D3D9 spec says lanes act
-    // independently, but the most conservative gate is "any lane true".
-    let scalar = swiz.iter().all(|&c| c == swiz[0]);
-    let base = if scalar {
-        format!("p0.{comp}")
-    } else {
-        "any(p0)".to_string()
-    };
-    if pred.modifier == SrcModifier::Not {
-        format!("!({base})")
-    } else {
-        base
-    }
-}
-
 // ── Matrix multiply ──
 // m*x* dst, s0, c_base: expands to `rows` dot products across `cols`-wide
 // vectors. `mat_start` is the first matrix row; subsequent rows are at
@@ -2806,8 +2781,8 @@ fn apply_src_modifier(expr: &str, m: SrcModifier) -> String {
             // component-wise "non-zero → false, zero → true". MSL
             // `bool4(v)` evaluates each lane as non-zero; `!bool4(v)`
             // negates; cast back to float4 keeps downstream `.xyzw`
-            // reads typed. Predicate-side Not is handled separately in
-            // `predicate_gate_expr` and never reaches this arm.
+            // reads typed. Instruction predicate operands are handled
+            // separately by `predicate_mask_expr` and never reach this arm.
             format!("float4(!bool4({expr}))")
         }
     }
