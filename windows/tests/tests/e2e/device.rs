@@ -2034,6 +2034,13 @@ fn retarget_and_check_messages(
         }
 
         let _ = mtld3d_tests::send_message(target, WM_SIZE, 0, client_size_lparam(width, height));
+        let hr = h.test_cooperative_level();
+        if hr != D3D_OK {
+            return Err(format!(
+                "round {round}: WM_SIZE {width}x{height} on device window {target:#x} left the \
+                 device unavailable: TestCooperativeLevel returned 0x{hr:08X}"
+            ));
+        }
         let (hr, bb) = h.back_buffer(0).desc();
         if hr != D3D_OK {
             return Err(format!(
