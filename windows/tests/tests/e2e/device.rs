@@ -2135,6 +2135,64 @@ fn cycle_fullscreen(
     Ok(trips)
 }
 
+fn concurrent_retarget_failures(
+    windowed: &[Result<u32, String>],
+    fullscreen: &Result<u32, String>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (index, outcome) in windowed.iter().enumerate() {
+        match outcome {
+            Ok(rounds) if *rounds < RETARGET_ROUNDS => failures.push(format!(
+                "windowed device {index} ran {rounds} rounds, fewer than {RETARGET_ROUNDS}"
+            )),
+            Err(failure) => failures.push(format!("windowed device {index}: {failure}")),
+            Ok(_) => {}
+        }
+    }
+    match fullscreen {
+        Ok(trips) if *trips < FULLSCREEN_TRIPS => failures.push(format!(
+            "the fullscreen device made {trips} round trips, fewer than the {FULLSCREEN_TRIPS} \
+             the windowed rounds overlap with"
+        )),
+        Err(failure) => failures.push(format!("fullscreen device: {failure}")),
+        Ok(_) => {}
+    }
+    failures
+}
+
+#[test]
+fn concurrent_retarget_outcomes_report_every_returned_failure() {
+    let windowed = [
+        Err("the fullscreen worker stopped after 2 of 8 round trips".to_owned()),
+        Ok(RETARGET_ROUNDS - 1),
+        Ok(RETARGET_ROUNDS),
+    ];
+    let fullscreen = Err("round trip 2: fullscreen Reset failed: 0xC0000001".to_owned());
+
+    assert_eq!(
+        concurrent_retarget_failures(&windowed, &fullscreen),
+        [
+            "windowed device 0: the fullscreen worker stopped after 2 of 8 round trips",
+            "windowed device 1 ran 15 rounds, fewer than 16",
+            "fullscreen device: round trip 2: fullscreen Reset failed: 0xC0000001",
+        ],
+    );
+    assert_eq!(
+        concurrent_retarget_failures(&[Ok(RETARGET_ROUNDS)], &Ok(FULLSCREEN_TRIPS - 1)),
+        [
+            "the fullscreen device made 7 round trips, fewer than the 8 the windowed rounds overlap with"
+        ],
+    );
+    assert!(
+        concurrent_retarget_failures(
+            &[Ok(RETARGET_ROUNDS), Ok(RETARGET_ROUNDS + 1)],
+            &Ok(FULLSCREEN_TRIPS + 1),
+        )
+        .is_empty(),
+        "workers at or above their bounds have no failures",
+    );
+}
+
 /// Retargets on several threads keep their messages while another device moves its window.
 ///
 /// Three threads each own a windowed device and a second window and move the
@@ -2268,24 +2326,16 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
         drop(ready_sender);
         drop(started_sender);
 
-        for (index, worker) in windowed.into_iter().enumerate() {
-            let rounds = worker
-                .join()
-                .expect("a windowed worker panicked")
-                .unwrap_or_else(|failure| panic!("windowed device {index}: {failure}"));
-            assert!(
-                rounds >= RETARGET_ROUNDS,
-                "windowed device {index} ran {rounds} rounds, fewer than {RETARGET_ROUNDS}",
-            );
-        }
-        let trips = fullscreen
-            .join()
-            .expect("the fullscreen worker panicked")
-            .unwrap_or_else(|failure| panic!("fullscreen device: {failure}"));
+        let windowed_outcomes: Vec<_> = windowed
+            .into_iter()
+            .map(|worker| worker.join().expect("a windowed worker panicked"))
+            .collect();
+        let fullscreen_outcome = fullscreen.join().expect("the fullscreen worker panicked");
+        let failures = concurrent_retarget_failures(&windowed_outcomes, &fullscreen_outcome);
         assert!(
-            trips >= FULLSCREEN_TRIPS,
-            "the fullscreen device made {trips} round trips, fewer than the {FULLSCREEN_TRIPS} \
-             the windowed rounds overlap with",
+            failures.is_empty(),
+            "concurrent retarget worker failures:\n{}",
+            failures.join("\n"),
         );
     });
 }
