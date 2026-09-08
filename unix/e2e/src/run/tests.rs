@@ -220,6 +220,18 @@ fn observing_a_clean_exit_keeps_the_leader_waitable() {
             .expect("observe exit again")
     );
     assert_waitable(pid);
+    super::resolve_group_signal_error(
+        std::io::Error::from_raw_os_error(libc::EPERM),
+        Duration::ZERO,
+        || group.observe_exit(libc::WNOHANG),
+    )
+    .expect("EPERM accepts an already waitable leader");
+    group
+        .wait_killed()
+        .expect("signal after observing clean exit");
+    assert_waitable(pid);
+    group.kill().expect("final signal before reap");
+    assert_waitable(pid);
     let status = group.reap().expect("reap group leader");
     assert_eq!(status.code(), Some(7));
     assert_reaped(pid);
@@ -264,12 +276,19 @@ fn losing_the_waitable_child_disables_group_signals() {
     // Model an external waiter consuming the child, without reusing any ID.
     child.wait().expect("external reap");
     let mut group = ProcessGroup { child: Some(child) };
-    let error = group
-        .kill()
-        .expect_err("must not signal after external reap");
+    let error = super::resolve_group_signal_error(
+        std::io::Error::from_raw_os_error(libc::EPERM),
+        Duration::from_mins(1),
+        || group.observe_exit(libc::WNOHANG),
+    )
+    .expect_err("EPERM observation must revoke ownership after external reap");
     assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     assert!(group.child.is_none());
     let error = group.kill().expect_err("ownership stays revoked");
+    assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+    let error = group
+        .signal_group()
+        .expect_err("no signal without ownership");
     assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
 }
 
@@ -301,6 +320,75 @@ fn an_unexpected_wait_error_retains_ownership_for_cleanup() {
     assert!(group.child.is_some());
     drop(group);
     assert_reaped(pid);
+}
+
+#[test]
+fn a_group_permission_error_waits_for_delayed_exit_observation() {
+    let mut observations = [false, false, true].into_iter();
+    super::resolve_group_signal_error(
+        std::io::Error::from_raw_os_error(libc::EPERM),
+        Duration::from_mins(1),
+        || Ok(observations.next().expect("stop observing once exited")),
+    )
+    .expect("an exiting leader becomes waitable after EPERM");
+    assert_eq!(observations.next(), None);
+}
+
+#[test]
+fn a_group_permission_error_survives_the_exit_observation_deadline() {
+    let mut observations = 0;
+    let error = super::resolve_group_signal_error(
+        std::io::Error::from_raw_os_error(libc::EPERM),
+        Duration::ZERO,
+        || {
+            observations += 1;
+            Ok(false)
+        },
+    )
+    .expect_err("a still-running leader does not excuse EPERM");
+    assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    assert_eq!(observations, 1);
+}
+
+#[test]
+fn a_group_permission_error_propagates_wait_errors_without_retrying() {
+    for errno in [libc::ECHILD, libc::EIO] {
+        let mut observations = 0;
+        let error = super::resolve_group_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            Duration::from_mins(1),
+            || {
+                observations += 1;
+                if observations == 1 {
+                    Ok(false)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                }
+            },
+        )
+        .expect_err("wait errors must propagate");
+        assert_eq!(error.raw_os_error(), Some(errno));
+        assert_eq!(observations, 2);
+    }
+}
+
+#[test]
+fn other_group_signal_errors_do_not_observe_exit() {
+    for errno in [libc::EINVAL, libc::EACCES, libc::EINTR] {
+        let error = super::resolve_group_signal_error(
+            std::io::Error::from_raw_os_error(errno),
+            Duration::from_mins(1),
+            || panic!("only EPERM needs exit observation"),
+        )
+        .expect_err("unrelated signal errors must propagate immediately");
+        assert_eq!(error.raw_os_error(), Some(errno));
+    }
+    super::resolve_group_signal_error(
+        std::io::Error::from_raw_os_error(libc::ESRCH),
+        Duration::from_mins(1),
+        || panic!("an absent group needs no exit observation"),
+    )
+    .expect("ESRCH still accepts an absent group");
 }
 
 fn assert_waitable(pid: u32) {

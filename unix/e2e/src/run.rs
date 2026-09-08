@@ -89,6 +89,12 @@ const GPU_HANG_MARKERS: [&str; 2] = [
 /// How often the bounded wait for the process's exit looks again.
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
+/// How long EPERM may wait for an owned group leader to become waitable.
+const SIGNAL_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// How often an EPERM exit observation retries during its grace.
+const SIGNAL_EXIT_POLL: Duration = Duration::from_millis(1);
+
 /// How long stderr may stay open after the process has ended.
 ///
 /// A pipe every holder has died on closes within milliseconds of the kill;
@@ -372,17 +378,9 @@ impl ProcessGroup {
         if result == 0 {
             return Ok(());
         }
-        let error = std::io::Error::last_os_error();
-        // macOS skips zombies when signalling a group and returns EPERM when
-        // no live member could be signalled. The retained zombie alone therefore
-        // produces EPERM too. This does not prove every descendant exited;
-        // an open stderr pipe still reports a survivor.
-        if error.raw_os_error() == Some(libc::ESRCH)
-            || (error.raw_os_error() == Some(libc::EPERM) && self.observe_exit(libc::WNOHANG)?)
-        {
-            return Ok(());
-        }
-        Err(error)
+        resolve_group_signal_error(std::io::Error::last_os_error(), SIGNAL_EXIT_GRACE, || {
+            self.observe_exit(libc::WNOHANG)
+        })
     }
 }
 
@@ -409,6 +407,35 @@ impl Drop for ProcessGroup {
         {
             eprintln!("[e2e] reap process during cleanup failed: {error}");
         }
+    }
+}
+
+/// Resolve a group signal error without consuming the leader's waitable status.
+fn resolve_group_signal_error(
+    error: std::io::Error,
+    grace: Duration,
+    mut observe_exit: impl FnMut() -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    if error.raw_os_error() != Some(libc::EPERM) {
+        return Err(error);
+    }
+    // macOS can stop finding an exiting group member before waitid reports
+    // its exit, and skips retained zombies too. Accept EPERM only after exit
+    // is observed without reaping. This does not prove descendants exited;
+    // an open stderr pipe still reports a survivor.
+    let deadline = Instant::now() + grace;
+    loop {
+        if observe_exit()? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(error);
+        }
+        thread::sleep(SIGNAL_EXIT_POLL.min(remaining));
     }
 }
 
