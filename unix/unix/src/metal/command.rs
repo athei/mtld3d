@@ -40,7 +40,7 @@ use crate::{
     metal::{handle::IntoRetained, macdrv::attachment, null_texture, texture::mtl_pixel_format},
 };
 
-mod diagnostics;
+pub mod diagnostics;
 
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
 ///

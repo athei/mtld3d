@@ -155,6 +155,8 @@ fn optional_identity_fields_preserve_missing_and_escape_present_strings() {
     assert_eq!(buffer_role(Some("mtld3d-frame-0x1")), "frame");
     assert_eq!(buffer_role(Some("mtld3d-upload-0x1")), "upload");
     assert_eq!(buffer_role(Some("mtld3d-readback")), "readback");
+    assert_eq!(buffer_role(Some("mtld3d-init-clear")), "initialization");
+    assert_eq!(buffer_role(Some("mtld3d-init-clear-extra")), "unknown");
     assert_eq!(buffer_role(Some("unexpected")), "unknown");
     assert_eq!(buffer_role(None), "unknown");
 }

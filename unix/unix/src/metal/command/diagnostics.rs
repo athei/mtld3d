@@ -1,9 +1,10 @@
 use std::fmt::Write;
 
+use block2::RcBlock;
 use log::{Level, debug, log_enabled};
 use objc2::{
     ProtocolType,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_foundation::{NSArray, NSError, NSString};
@@ -23,6 +24,37 @@ pub fn command_buffer(
         || queue.commandBuffer(),
         |descriptor| queue.commandBufferWithDescriptor(&descriptor),
     )
+}
+
+/// Observe a creation-time clear without publishing a frame retirement sequence.
+pub fn observe_initialization(cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    let handler = RcBlock::new(
+        |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            autoreleasepool(|_| {
+                // SAFETY: Metal supplies the completed buffer, valid for this invocation.
+                // No reference to it escapes the callback.
+                let cb = unsafe { cb_ptr.as_ref() };
+                let status = cb.status();
+                completion(cb, status, None, "initialization-callback");
+                if status == MTLCommandBufferStatus::Error {
+                    failure(cb, None, "initialization-callback", cb.error().as_deref());
+                }
+            });
+        },
+    );
+    // Executable lifetime is separate from the block's captures: D3D CreateDevice sets
+    // USED before any clear, so d3d9 detach self-terminates before Wine can unload its
+    // statically imported shim and this Unix image. Native unit clients compile this
+    // code into their test executable. Surviving direct-shim unload has no such contract.
+    // Revisit this observer if D3D unload after CreateDevice can leave the process alive.
+    // Process exit may end a callback before it logs; no completion is inferred then.
+    // SAFETY: the live buffer has not been committed. Metal copies the valid block at
+    // registration, so our handle may drop. The block captures nothing, uses only the
+    // invocation's live argument and thread-safe diagnostics, and creates its own pool.
+    unsafe { cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
 }
 
 pub fn completion(
@@ -97,6 +129,7 @@ fn buffer_role(label: Option<&str>) -> &'static str {
         Some(label) if label.starts_with("mtld3d-frame-") => "frame",
         Some(label) if label.starts_with("mtld3d-upload-") => "upload",
         Some("mtld3d-readback") => "readback",
+        Some("mtld3d-init-clear") => "initialization",
         // Labels belong to the constructors; do not guess an unknown buffer's role.
         _ => "unknown",
     }

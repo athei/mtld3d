@@ -9,14 +9,17 @@ use mtld3d_shared::{
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat,
-    MTLRenderPassDescriptor, MTLResource, MTLStencilDescriptor, MTLStencilOperation,
-    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle,
-    MTLTextureSwizzleChannels, MTLTextureType, MTLTextureUsage,
+    MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
+    MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor,
+    MTLResource, MTLStencilDescriptor, MTLStencilOperation, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+    MTLTextureUsage,
 };
 
-use crate::metal::handle::{IntoRetained, ReleaseRetain};
+use crate::metal::{
+    command::diagnostics,
+    handle::{IntoRetained, ReleaseRetain},
+};
 
 /// The texture handles this side has minted and not yet destroyed.
 ///
@@ -165,6 +168,35 @@ fn srgb_twin_view(
         )
     };
     let Some(view) = view else {
+        if log::log_enabled!(target: "mtld3d::unix::command", log::Level::Debug) {
+            let device = texture.device();
+            log::debug!(
+                target: "mtld3d::unix::command",
+                "texture-view-refused base={texture:p} device={:p} registry_id={:#x} \
+                 label={:?} width={} height={} depth={} samples={} pixel_format={} \
+                 usage={:#x} texture_type={} mip_levels={} array_length={} \
+                 view_pixel_format={} view_texture_type={} view_levels=0..{levels} \
+                 view_slices=0..{slices} view_swizzle=({},{},{},{})",
+                Retained::as_ptr(&device),
+                device.registryID(),
+                texture.label().map(|label| label.to_string()),
+                texture.width(),
+                texture.height(),
+                texture.depth(),
+                texture.sampleCount(),
+                texture.pixelFormat().0,
+                texture.usage().0,
+                texture.textureType().0,
+                texture.mipmapLevelCount(),
+                texture.arrayLength(),
+                mtl_pixel_format(srgb_format).0,
+                texture.textureType().0,
+                swizzle.red.0,
+                swizzle.green.0,
+                swizzle.blue.0,
+                swizzle.alpha.0,
+            );
+        }
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "{label}: Metal declined the {srgb_format:?} view of a {format:?} texture; \
@@ -235,7 +267,7 @@ pub fn clear_new_color_textures(
         );
         return;
     };
-    let Some(cmd_buf) = queue.commandBuffer() else {
+    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "clear_new_color_textures: commandBuffer() returned nil for the creation-time \
@@ -248,6 +280,7 @@ pub fn clear_new_color_textures(
     for texture in &textures {
         clear_one_texture(&cmd_buf, texture, clear_color);
     }
+    diagnostics::observe_initialization(&cmd_buf);
     cmd_buf.commit();
 }
 
@@ -465,7 +498,7 @@ fn log_texture_refused(
         target: crate::LOG_TARGET,
         "{label}: newTextureWithDescriptor returned nil for {}x{} {pixel_format:?} samples={} \
          usage={:#x} storage={} on '{}' (allocated {} B, recommended working set {} B, unified \
-         memory: {})",
+         memory: {}) device={device:p} registry_id={:#x}",
         desc.width(),
         desc.height(),
         desc.sampleCount(),
@@ -475,6 +508,7 @@ fn log_texture_refused(
         device.currentAllocatedSize(),
         device.recommendedMaxWorkingSetSize(),
         device.hasUnifiedMemory(),
+        device.registryID(),
     );
 }
 
