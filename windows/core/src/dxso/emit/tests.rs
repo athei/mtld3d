@@ -421,6 +421,129 @@ fn mova_respects_write_mask() {
 }
 
 #[test]
+fn predicated_mova_preserves_false_address_components() {
+    // vs_3_0 {
+    //   dcl_position v0; dcl_position o0;
+    //   def c0, 0, 1, 0, 1; def c1, 0.5, 0.5, 0.5, 0.5;
+    //   def c2, 2, 2, 2, 2; def c3, 9, 9, 9, 9;
+    //   setp_lt p0, c0, c1; mova a0, c2; (p0) mova a0, c3;
+    //   mov o0, v0;
+    // }
+    let setp_lt_token = u32::from(OP_SETP) | ((4u32) << 16) | (3u32 << 24);
+    let predicated_mova_token = u32::from(OP_MOVA) | (1u32 << 28) | (3u32 << 24);
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 0, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 1, 0xF, false),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        f32::to_bits(0.5),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 2, 0xF, false),
+        f32::to_bits(2.0),
+        f32::to_bits(2.0),
+        f32::to_bits(2.0),
+        f32::to_bits(2.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 3, 0xF, false),
+        f32::to_bits(9.0),
+        f32::to_bits(9.0),
+        f32::to_bits(9.0),
+        f32::to_bits(9.0),
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOVA, 2),
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        predicated_mova_token,
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 3, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    assert_eq!(bc.len(), 46, "keep the issue proof's exact bytecode words");
+    assert!(
+        vs.instructions[2].predicate.is_some(),
+        "parser must preserve the mova predicate operand"
+    );
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("a = select(a, int4(round(c3)), p0);"),
+        "predicated mova must retain a0.yw when p0.yw is false:\n{vs_msl}"
+    );
+    metal_compile_or_fail(&vs_msl);
+}
+
+#[test]
+fn predicated_mova_maps_replicated_negated_partial_masks() {
+    // vs_3_0 {
+    //   dcl_position v0; dcl_position o0; setp_lt p0, c0, c1;
+    //   mova a0, c2; (p0.zzzz) mova a0.yw, c3;
+    //   (!p0) mova a0.xz, c0; mov o0, v0;
+    // }
+    let setp_lt_token = u32::from(OP_SETP) | ((4u32) << 16) | (3u32 << 24);
+    let predicated_mova_token = u32::from(OP_MOVA) | (1u32 << 28) | (3u32 << 24);
+    let bc = vec![
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOVA, 2),
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        src_token(TYPE_CONST, 2, SWIZ_IDENTITY, 0),
+        predicated_mova_token,
+        dst_token(TYPE_ADDR, 0, 0b1010, false),
+        src_token(TYPE_PREDICATE, 0, 0xAA /* .zzzz */, 0),
+        src_token(TYPE_CONST, 3, SWIZ_IDENTITY, 0),
+        predicated_mova_token,
+        dst_token(TYPE_ADDR, 0, 0b0101, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_IDENTITY, 13 /* logical NOT */),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_OUTPUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    assert!(
+        vs_msl.contains("a.yw = select(a.yw, (int4(round(vs_c[3]))).yw, p0.zz);"),
+        "replicate predicate must cover only address components in the write mask:\n{vs_msl}"
+    );
+    assert!(
+        vs_msl.contains("a.xz = select(a.xz, (int4(round(vs_c[0]))).xz, !(p0.xz));"),
+        "predicate NOT must invert each address component in the write mask:\n{vs_msl}"
+    );
+    metal_compile_or_fail(&vs_msl);
+}
+
+#[test]
 fn reading_addr_register_casts_to_float4() {
     // vs_2_0 { dcl_position v0; mova a0, v0; mov r0, a0; mov oPos, v0; }
     let bc = vec![

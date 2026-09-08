@@ -292,7 +292,10 @@ use crate::shader_compile_stats::CompileBucket;
 ///
 /// `72` applies sampler operand swizzles to programmable texture sample results,
 /// changing the MSL of every shader that uses a non-identity sampler swizzle.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 72;
+///
+/// `73` applies componentwise predicate selection to `mova` writes of the
+/// integer address register, changing programmable vertex shader MSL.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 73;
 
 /// File magic.
 ///

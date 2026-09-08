@@ -2434,7 +2434,13 @@ fn translate_instruction(
                     "MovA without dst".to_string(),
                 ));
             };
-            write_address_register(out, dst, &srcs[0], /* use_floor */ false);
+            write_address_register(
+                out,
+                dst,
+                &srcs[0],
+                /* use_floor */ false,
+                inst.predicate.as_ref(),
+            );
             return Ok(());
         }
         op => return Err(EmitError::UnsupportedInstruction(format!("{op:?}"))),
@@ -2446,7 +2452,7 @@ fn translate_instruction(
         // `RegKind::Addr` through the int4 `a` register, bypassing the
         // float `store_dst` path the same way the `MovA` arm does.
         if dst.reg.kind == RegKind::Addr && ctx.is_vertex() {
-            write_address_register(out, dst, &expr, /* use_floor */ true);
+            write_address_register(out, dst, &expr, /* use_floor */ true, None);
             return Ok(());
         }
         // Predicated execution keeps each destination component whose
@@ -2800,21 +2806,38 @@ fn apply_src_modifier(expr: &str, m: SrcModifier) -> String {
 
 /// Write the VS int4 address register `a`.
 ///
-/// Rounds each component to the nearest integer per the D3D9 spec. Shared by
-/// `mova` (SM2+) and a plain `mov a0, …` (`vs_1_1`, which predates `mova`).
-/// Bypasses `store_dst`'s `saturate()` / float-swizzle path — neither makes
-/// sense for the int4 `a`.
-fn write_address_register(out: &mut String, dst: DstOperand, value: &str, use_floor: bool) {
+/// Rounds and conditionally writes each selected address-register component.
+///
+/// Shared by `mova` (SM2+) and a plain `mov a0, …` (`vs_1_1`, which predates
+/// `mova`). Bypasses `store_dst`'s `saturate()` / float-swizzle path because
+/// neither applies to the int4 `a`.
+fn write_address_register(
+    out: &mut String,
+    dst: DstOperand,
+    value: &str,
+    use_floor: bool,
+    predicate: Option<&SrcOperand>,
+) {
     // D3D9: `mova` (SM2+) rounds the float to the nearest integer; a plain
     // `mov` to the address register (vs_1_1, which has no `mova`) FLOORS it
     // (mova -2.4 → -2, but mov -2.4 → -3).
     let conv = if use_floor { "floor" } else { "round" };
     let rounded = format!("int4({conv}({value}))");
-    if dst.write_mask == WriteMask::ALL {
-        let _ = writeln!(out, "    a = {rounded};");
+    let mask = dst.write_mask;
+    let (target, value) = if mask == WriteMask::ALL {
+        ("a".to_string(), rounded)
     } else {
-        let chars = write_mask_chars(dst.write_mask);
-        let _ = writeln!(out, "    a.{chars} = ({rounded}).{chars};");
+        let chars = write_mask_chars(mask);
+        (format!("a.{chars}"), format!("({rounded}).{chars}"))
+    };
+    if let Some(pred) = predicate {
+        let predicate = predicate_mask_expr(pred, mask);
+        let _ = writeln!(
+            out,
+            "    {target} = select({target}, {value}, {predicate});"
+        );
+    } else {
+        let _ = writeln!(out, "    {target} = {value};");
     }
 }
 
