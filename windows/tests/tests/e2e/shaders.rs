@@ -1,4 +1,4 @@
-//! Programmable pipeline: hand-assembled `vs_2_0` / `ps_2_0`.
+//! Programmable pipeline: hand-assembled `vs_1_1`, `vs_2_0`, and `ps_2_0`.
 //!
 //! Bound and driven with a pixel-shader constant, verified by the rendered
 //! colour.
@@ -112,6 +112,27 @@ const VS1_DEF_BC: [u32; 14] = [
     0x0000_FFFF,
 ];
 
+/// `vs_1_1`: `expp r0.y, c0.y; mov oPos, v0; mov oD0, r0.yyyy;`
+///
+/// Only the fractional result reaches the pixel shader. The partial destination
+/// mask and non-x replicate source also pin the operand plumbing around `expp`.
+const VS1_EXPP_FRACTION: [u32; 14] = [
+    0xFFFE_0101,
+    0x0000_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0000_004E,
+    0x8002_0000,
+    0xA055_0000,
+    0x0000_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0000_0001,
+    0xD00F_0000,
+    0x8055_0000,
+    0x0000_FFFF,
+];
+
 const fn centered_triangle() -> [PosVertex; 3] {
     [
         PosVertex {
@@ -198,6 +219,36 @@ fn sm3_predication_preserves_false_destination_components() {
         0x00FF_00FF,
         "false p0.yw components must preserve the zero destination lanes"
     );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn vs_1_1_expp_exposes_the_fractional_component() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS1_EXPP_FRACTION);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (input, expected, what) in [
+        (1.5, 0x8080_8080, "positive fraction"),
+        (-1.5, 0x8080_8080, "negative fraction"),
+        (2.0, 0x0000_0000, "integer"),
+    ] {
+        assert_eq!(
+            h.set_vertex_shader_constant_f(0, &[13.0, input, 17.0, 19.0]),
+            0,
+            "SetVSConstF"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
 
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");

@@ -286,7 +286,10 @@ use crate::shader_compile_stats::CompileBucket;
 ///
 /// `70` preserves each arithmetic destination component whose corresponding
 /// SM3 predicate component is false, changing programmable shader MSL.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 70;
+///
+/// `71` gives `vs_1_1` `expp` its four distinct result components instead of
+/// broadcasting `exp2(src)` into every lane, changing MSL for those shaders.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 71;
 
 /// File magic.
 ///

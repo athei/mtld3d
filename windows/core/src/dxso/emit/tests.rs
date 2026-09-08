@@ -1374,6 +1374,57 @@ fn expp_logp_lower_to_full_precision_builtins() {
 }
 
 #[test]
+fn expp_vs_1_1_emits_legacy_four_component_result() {
+    // Exact little-endian words from issue #486:
+    // vs_1_1 { expp r0, c0.x; mov oPos, c1; mov oD0, r0; }
+    let bc = [
+        0xFFFE_0101,
+        0x0000_004E,
+        0x800F_0000,
+        0xA000_0000,
+        0x0000_0001,
+        0xC00F_0000,
+        0xA0E4_0001,
+        0x0000_0001,
+        0xD00F_0000,
+        0x80E4_0000,
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("vs_1_1 parse");
+    let msl = emit_vs_programmable(&vs).expect("emit vs_1_1");
+    metal_compile_or_fail(&msl);
+    assert!(
+        msl.contains(
+            "float4(exp2(floor(((vs_c[0]).xxxx).x)), ((vs_c[0]).xxxx).x - \
+             floor(((vs_c[0]).xxxx).x), exp2(((vs_c[0]).xxxx).x), 1.0)"
+        ),
+        "vs_1_1 expp must keep its four distinct result components:\n{msl}"
+    );
+
+    // A source modifier and non-x replicate swizzle are applied before the
+    // operation, while the common destination store keeps a partial mask.
+    let masked_bc = [
+        0xFFFE_0101,
+        0x0000_004E,
+        dst_token(TYPE_TEMP, 0, 0b0110, false),
+        src_token(TYPE_CONST, 3, 0xFF, 1), // -c3.wwww
+        0x0000_0001,
+        0xC00F_0000,
+        0xA0E4_0001,
+        END_TOKEN,
+    ];
+    let masked_vs = parse(&masked_bc).expect("masked vs_1_1 parse");
+    let masked_msl = emit_vs_programmable(&masked_vs).expect("emit masked vs_1_1");
+    assert!(
+        masked_msl.contains("r[0].yz =")
+            && masked_msl.contains("-(vs_c[3]).wwww")
+            && masked_msl.contains("floor("),
+        "vs_1_1 expp lost a source modifier, replicate swizzle, or destination mask:\n{masked_msl}"
+    );
+    metal_compile_or_fail(&masked_msl);
+}
+
+#[test]
 fn texldl_emits_sample_with_explicit_lod() {
     // ps_3_0 { dcl_2d s0; dcl t0; texldl r0, t0, s0; mov oC0, r0; }
     // texldl carries the LOD in coord.w.
