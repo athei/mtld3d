@@ -4000,6 +4000,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     } else {
         pp.device_window
     };
+    let retargeted = target_window != dev.window();
     if !resolve_reset_window_mode(dev, target_window, &mut pp) {
         warn!(
             target: LOG_TARGET,
@@ -4045,7 +4046,12 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // A `Reset` may name another `hDeviceWindow`. The presentation surface
     // and the window subclass both live on the window the device attached, so
     // they move across before anything is recreated against the new one.
-    if target_window != dev.window() {
+    if retargeted {
+        // A pending change not yet stamped onto a frame would otherwise ride
+        // the old-layer continuation built by the retarget flush, then reach
+        // the encoder after that layer's attachment record is retired. The
+        // fresh attach below receives this Reset's pacing directly.
+        dev.pending_display_sync_enabled = None;
         retarget_device_window(dev, &pp, target_window);
     }
 
@@ -4069,8 +4075,8 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // already matched the back-buffer to the new client size (or the game
         // Reset with identical dims). Re-issuing the recreate cycle would be a
         // wasteful no-op — up to ~tens of ms per Reset depending on GPU
-        // workload depth. State-defaults + reseed + display-sync queue below
-        // still run unconditionally (`Reset` always clobbers state per spec).
+        // workload depth. State-defaults + reseed still run unconditionally
+        // (`Reset` always clobbers state per spec).
         // The implicit depth-stencil is still reconciled, since the
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
@@ -4122,10 +4128,11 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     dev.reset_to_defaults();
     dev.flags.remove(DeviceFlags::NOT_RESET);
 
-    // 9. Defer the PresentationInterval change to the next frame's first
-    //    `nextDrawable`. Mutating `displaySyncEnabled` synchronously here
-    //    races the encoder's in-flight submission.
-    if !dev.layer_handle.is_null() {
+    // 9. On the existing attachment, defer the PresentationInterval change
+    //    to a later frame's first `nextDrawable`. Mutating the attachment
+    //    synchronously here races the encoder's in-flight submission. A
+    //    retarget's fresh attach already latched these presentation params.
+    if !retargeted && !dev.layer_handle.is_null() {
         dev.queue_display_sync_change(resolve_display_sync(pp.presentation_interval));
     }
 
@@ -4256,8 +4263,8 @@ fn retarget_device_window(
 /// new dimensions, push the new pixel size to `CAMetalLayer`, and
 /// recreate both textures. Returns the D3D9 HRESULT to bubble back to
 /// the caller on failure; `Ok(())` on success. State defaults + reseed +
-/// display-sync queue (steps 7-9) remain in the parent because they run
-/// unconditionally per spec.
+/// display-sync handling (steps 7-9) remains in the parent because the final
+/// pacing step depends on whether this Reset attached a fresh layer.
 fn reset_recreate_resources(
     dev: &mut DeviceInner,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
