@@ -283,6 +283,29 @@ target's construction and observation scope. A clean local run validates
 construction and completion on that device; it does not demonstrate a real
 error payload or establish another GPU's fault attribution.
 
+The same debug target records synchronous encoding metadata. `render-pass`
+reads the assembled descriptor just before render-encoder creation: four color
+slots, depth and stencil, their actual texture and resolve bindings, subresources,
+load/store/clear values and resolve filters. `commands` counts the existing
+command list, including state setters; it is not a draw count. `texture-copy`
+records accepted texture-to-texture endpoints, slices and validated region.
+`readback-copy` records the final selected source after any readback resolve or
+fallback, the actual destination Metal buffer, PE destination address/length,
+and encoded offset, row pitch and image pitch. Image pitch counts block rows
+for compressed textures. The existing `readback-wait` record supplies completion.
+Texture extents in these records are base-level extents; `level` selects the mip.
+
+These records include command-buffer pointer, label and queue, plus pass or
+blit site, so a producer attachment can be followed through copies into a
+readback destination. All additional property queries and formatting are behind
+the debug filter. They establish encoding inputs, not pixel correctness or
+successful encoder creation. The attachment count is fixed, but label lengths
+and the number of passes and copies determine output volume. Measure lines and
+bytes on the focused test before enabling this target for a full-suite capture.
+Join within a process and ordered resource lifetime: pointers and per-device
+sequences can be reused, and successful full-suite logs lack direct test identity.
+No pixel contents are read by these records.
+
 For a bounded manual CI run, set `e2e_filter` to
 `msaa::depth_test_holds_on_a_multisampled_target` and `e2e_log` to
 `mtld3d=warn,mtld3d::unix::command=debug` in the workflow dispatch form. The
