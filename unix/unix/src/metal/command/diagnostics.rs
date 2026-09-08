@@ -9,12 +9,170 @@ use objc2::{
 };
 use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
     MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
-    MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice,
+    MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice, MTLRenderPassAttachmentDescriptor,
+    MTLRenderPassDescriptor, MTLResource, MTLTexture,
 };
 
+use super::{BlitSite, CopyBufferEndpoint, CopyEndpoint, CopyRegion};
+
 const LOG_TARGET: &str = "mtld3d::unix::command";
+
+pub struct TextureCopy<'a> {
+    pub texture: &'a ProtocolObject<dyn MTLTexture>,
+    pub endpoint: &'a CopyEndpoint,
+    pub slice: usize,
+}
+
+pub fn render_pass(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    descriptor: &MTLRenderPassDescriptor,
+    pass_index: usize,
+    command_count: u32,
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    let mut attachments = String::new();
+    let colors = descriptor.colorAttachments();
+    for index in 0..4 {
+        // SAFETY: the four supported color slots are within Metal's attachment array.
+        let color = unsafe { colors.objectAtIndexedSubscript(index) };
+        write!(
+            attachments,
+            " color[{index}]={{{} clear={:?}}}",
+            attachment_details(&color),
+            color.clearColor(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let depth = descriptor.depthAttachment();
+    let stencil = descriptor.stencilAttachment();
+    debug!(
+        target: LOG_TARGET,
+        "render-pass {} site=pass{pass_index} commands={command_count}{} \
+         depth={{{} clear={} resolve_filter={:?}}} \
+         stencil={{{} clear={} resolve_filter={:?}}}",
+        buffer_identity(cb),
+        attachments,
+        attachment_details(&depth),
+        depth.clearDepth(),
+        depth.depthResolveFilter(),
+        attachment_details(&stencil),
+        stencil.clearStencil(),
+        stencil.stencilResolveFilter(),
+    );
+}
+
+pub fn texture_copy(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    site: BlitSite,
+    index: usize,
+    source: &TextureCopy<'_>,
+    destination: &TextureCopy<'_>,
+    region: &CopyRegion,
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    debug!(
+        target: LOG_TARGET,
+        "texture-copy {} site={site}/{index} src={{{} {} slice={} z=0}} \
+         dst={{{} {} slice={} z=0}} region={region}",
+        buffer_identity(cb),
+        texture_identity(source.texture),
+        source.endpoint,
+        source.slice,
+        texture_identity(destination.texture),
+        destination.endpoint,
+        destination.slice,
+    );
+}
+
+pub fn readback(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    source: &TextureCopy<'_>,
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+    destination: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    pe_destination: (u64, u64),
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    debug!(
+        target: LOG_TARGET,
+        "readback-copy {} site=readback-blit src={{{} {} slice={} z=0}} \
+         dst={{buffer={buffer:p} label={} storage={:?} {destination}}} \
+         pe_destination={:#x} pe_length={} region={region}",
+        buffer_identity(cb),
+        texture_identity(source.texture),
+        source.endpoint,
+        source.slice,
+        optional_string(buffer.label().map(|s| s.to_string()).as_deref()),
+        buffer.storageMode(),
+        pe_destination.0,
+        pe_destination.1,
+    );
+}
+
+fn buffer_identity(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
+    format!(
+        "buffer={cb:p} label={} queue={:p}",
+        optional_string(cb.label().map(|s| s.to_string()).as_deref()),
+        Retained::as_ptr(&cb.commandQueue()),
+    )
+}
+
+fn texture_identity(texture: &ProtocolObject<dyn MTLTexture>) -> String {
+    format!(
+        "texture={texture:p} label={} storage={:?} usage={:#x} type={:?} array_length={}",
+        optional_string(texture.label().map(|s| s.to_string()).as_deref()),
+        texture.storageMode(),
+        texture.usage().0,
+        texture.textureType(),
+        texture.arrayLength(),
+    )
+}
+
+fn attachment_texture(texture: Option<&ProtocolObject<dyn MTLTexture>>, level: usize) -> String {
+    let Some(texture) = texture else {
+        return "missing".to_owned();
+    };
+    let endpoint = CopyEndpoint {
+        pixel_format: texture.pixelFormat(),
+        sample_count: texture.sampleCount(),
+        width: texture.width(),
+        height: texture.height(),
+        depth: texture.depth(),
+        level,
+        levels: texture.mipmapLevelCount(),
+        origin_x: 0,
+        origin_y: 0,
+    };
+    format!("{} {endpoint}", texture_identity(texture))
+}
+
+fn attachment_details(attachment: &MTLRenderPassAttachmentDescriptor) -> String {
+    format!(
+        "texture={{{}}} level={} slice={} plane={} resolve={{{}}} \
+         resolve_level={} resolve_slice={} resolve_plane={} load={:?} store={:?}",
+        attachment_texture(attachment.texture().as_deref(), attachment.level()),
+        attachment.level(),
+        attachment.slice(),
+        attachment.depthPlane(),
+        attachment_texture(
+            attachment.resolveTexture().as_deref(),
+            attachment.resolveLevel(),
+        ),
+        attachment.resolveLevel(),
+        attachment.resolveSlice(),
+        attachment.resolveDepthPlane(),
+        attachment.loadAction(),
+        attachment.storeAction(),
+    )
+}
 
 pub fn command_buffer(
     queue: &ProtocolObject<dyn MTLCommandQueue>,

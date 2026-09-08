@@ -2034,6 +2034,26 @@ fn encode_leading_blits(
                     );
                     continue;
                 }
+                diagnostics::texture_copy(
+                    cmd_buf,
+                    site,
+                    i,
+                    &diagnostics::TextureCopy {
+                        texture: &src,
+                        endpoint: &src_endpoint,
+                        slice: cmd.src_slice as usize,
+                    },
+                    &diagnostics::TextureCopy {
+                        texture: &dst,
+                        endpoint: &dst_endpoint,
+                        slice: cmd.dst_slice as usize,
+                    },
+                    &CopyRegion {
+                        width: region_w as usize,
+                        height: region_h as usize,
+                        depth: region_depth as usize,
+                    },
+                );
                 mtld3d_shared::crumb!("blit:tex2tex", cmd.src_handle, cmd.dst_handle);
                 // SAFETY: objc2 typed binding; `src`/`dst` are retained Metal
                 // textures live for the call; the region fits both live mip
@@ -2388,6 +2408,7 @@ fn encode_pass(
         }
     }
 
+    diagnostics::render_pass(cmd_buf, &rp_desc, pass_idx, pass.command_count);
     mtld3d_shared::crumb!("pass:rendenc", pass_idx as u64);
     let Some(encoder) = cmd_buf.renderCommandEncoderWithDescriptor(&rp_desc) else {
         error!(
@@ -3275,6 +3296,21 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // format, where the block height is 1.
     let bytes_per_image =
         mtld3d_shared::blit_geometry::bytes_per_image(bytes_per_row, height, block_height) as usize;
+    diagnostics::readback(
+        &cmd_buf,
+        &diagnostics::TextureCopy {
+            texture,
+            endpoint: &src_endpoint,
+            slice: slice as usize,
+        },
+        &dst_buffer,
+        &CopyBufferEndpoint {
+            bytes_per_image,
+            ..destination
+        },
+        &region,
+        (dst_ptr, dst_len),
+    );
     // SAFETY: objc2 typed binding; `texture`/`dst_buffer` are retained Metal
     // objects live for the call; the geometry cleared
     // `copy_texture_to_buffer_reject` above.
