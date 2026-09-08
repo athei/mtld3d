@@ -35,6 +35,8 @@ const VS3_HEADER: u32 = 0xFFFE_0300;
 const PS3_HEADER: u32 = 0xFFFF_0300;
 const END_TOKEN: u32 = 0x0000_FFFF;
 const SWIZ_IDENTITY: u8 = 0xE4;
+const SWIZ_BGRA: u8 = 0xC6;
+const SWIZ_BBBB: u8 = 0xAA;
 
 const TYPE_TEMP: u32 = 0;
 const TYPE_INPUT: u32 = 1;
@@ -4477,6 +4479,127 @@ fn ps3_sampling_program(op: u16, extra_srcs: &[u32]) -> Vec<u32> {
         END_TOKEN,
     ]);
     bc
+}
+
+/// A `ps_3_0` sample whose sampler result swaps red and blue.
+fn ps3_sampler_swizzle_program(op: u16, control: u32, extra_srcs: &[u32]) -> Vec<u32> {
+    let mut bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        0x9000_0000,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 0, 0xF, false),
+        f32::to_bits(0.25),
+        f32::to_bits(0.5),
+        f32::to_bits(0.75),
+        f32::to_bits(1.0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 1, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 2, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(
+            op,
+            u32::try_from(3 + extra_srcs.len()).expect("operand count fits u32"),
+        ) | control,
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_BGRA, 0),
+    ];
+    bc.extend_from_slice(extra_srcs);
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    bc
+}
+
+#[test]
+fn ps3_sampling_forms_apply_sampler_result_swizzles() {
+    const OP_TEXLD: u16 = 66;
+    const TEXLD_PROJECT: u32 = 1 << 16;
+    const TEXLD_BIAS: u32 = 2 << 16;
+    let gradients = [
+        src_token(TYPE_TEMP, 1, SWIZ_IDENTITY, 0),
+        src_token(TYPE_TEMP, 2, SWIZ_IDENTITY, 0),
+    ];
+    for (name, op, control, extra_srcs) in [
+        ("texld", OP_TEXLD, 0, &[][..]),
+        ("texldb", OP_TEXLD, TEXLD_BIAS, &[][..]),
+        ("texldp", OP_TEXLD, TEXLD_PROJECT, &[][..]),
+        ("texldl", OP_TEXLDL, 0, &[][..]),
+        ("texldd", OP_TEXLDD, 0, &gradients[..]),
+    ] {
+        let ps = parse(&ps3_sampler_swizzle_program(op, control, extra_srcs))
+            .unwrap_or_else(|err| panic!("parse {name}: {err:?}"));
+        let msl = emit_ps_programmable(&ps, VariantKey::default())
+            .unwrap_or_else(|err| panic!("emit {name}: {err:?}"));
+        assert!(
+            msl.contains(")).zyxw"),
+            "{name} must apply the sampler's .bgra result swizzle after sampling:\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
+}
+
+#[test]
+fn sampler_result_swizzle_precedes_saturate_mask_and_predication() {
+    const OP_TEXLD: u16 = 66;
+    let setp_lt_token = u32::from(OP_SETP) | (4 << 16) | (3 << 24);
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        0x9000_0000,
+        dst_token(10 /* TYPE_SAMPLER */, 0, 0xF, false),
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 0, 0xF, false),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        f32::to_bits(0.0),
+        f32::to_bits(1.0),
+        opcode_token(OP_DEF, 5),
+        dst_token(TYPE_CONST, 1, 0xF, false),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        f32::to_bits(1.0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        setp_lt_token,
+        dst_token(TYPE_PREDICATE, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_TEXLD, 4) | (1 << 28),
+        dst_token(TYPE_TEMP, 0, 0xA, true),
+        src_token(TYPE_PREDICATE, 0, SWIZ_XXXX, 0),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(10 /* TYPE_SAMPLER */, 0, SWIZ_BBBB, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        msl.contains(
+            "r[0].yw = select(r[0].yw, \
+             (saturate((s0.sample(samp0, (in.texcoord0).xy)).zzzz)).yw, p0.xx);"
+        ),
+        "the component predicate must select the sampled, swizzled, saturated, and masked value:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
 }
 
 fn lod_bias_variant() -> VariantKey {

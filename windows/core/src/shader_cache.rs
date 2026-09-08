@@ -289,7 +289,10 @@ use crate::shader_compile_stats::CompileBucket;
 ///
 /// `71` gives `vs_1_1` `expp` its four distinct result components instead of
 /// broadcasting `exp2(src)` into every lane, changing MSL for those shaders.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 71;
+///
+/// `72` applies sampler operand swizzles to programmable texture sample results,
+/// changing the MSL of every shader that uses a non-identity sampler swizzle.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 72;
 
 /// File magic.
 ///

@@ -1982,7 +1982,7 @@ fn translate_instruction(
             // register ref. The coord swizzle depends on the dimensionality of
             // the texture bound to the slot: 2D → `.xy` (float2), Cube/3D →
             // `.xyz` (float3, both a 3D coord and a cube direction vector).
-            let sampler_idx = inst.srcs[1].reg.index;
+            let sampler = &inst.srcs[1];
             // `texldp` (D3DSI_TEXLD_PROJECT) divides the coordinate by its `.w`
             // before sampling. The divisor is always `.w` for SM2+ (unlike the
             // fixed-function projective divide whose divisor depends on the
@@ -1998,21 +1998,22 @@ fn translate_instruction(
                 .flags
                 .contains(InstrFlags::TEX_BIASED)
                 .then(|| format!("({}).w", srcs[0]));
-            sample_or_compare(ctx, sampler_idx, &coord, None, instruction_bias.as_deref())
+            sample_with_result_swizzle(ctx, sampler, &coord, None, instruction_bias.as_deref())
         }
         // SM3 texldl — sample with explicit LOD in coord.w.
         // `s.sample(samp, coord, level(lod))` is the MSL form.
         Opcode::TexLdL => {
-            let sampler_idx = inst.srcs[1].reg.index;
+            let sampler = &inst.srcs[1];
             let suffix = format!(", level(({coord}).w)", coord = srcs[0]);
-            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix), None)
+            sample_with_result_swizzle(ctx, sampler, &srcs[0], Some(&suffix), None)
         }
         // SM3 texldd — sample with explicit gradients in srcs[2]/srcs[3].
         // 2D samplers use `gradient2d(ddx.xy, ddy.xy)`. The swizzle
         // helper picks `.xy` for 2D and `.xyz` for 3D / cube — Metal
         // has matching `gradientcube` / `gradient3d` overloads.
         Opcode::TexLdD => {
-            let sampler_idx = inst.srcs[1].reg.index;
+            let sampler = &inst.srcs[1];
+            let sampler_idx = sampler.reg.index;
             // A sampler LOD bias shifts the selected mip by `bias`, and the
             // LOD a gradient sample computes is the log2 of the derivative
             // magnitude, so scaling both derivatives by `exp2(bias)` shifts it
@@ -2041,7 +2042,7 @@ fn translate_instruction(
                 ),
             };
             let suffix = format!(", {gradient}");
-            sample_or_compare(ctx, sampler_idx, &srcs[0], Some(&suffix), None)
+            sample_with_result_swizzle(ctx, sampler, &srcs[0], Some(&suffix), None)
         }
         Opcode::TexKill => {
             // D3D9 texkill encodes its single operand in DST-form (write
@@ -3110,6 +3111,23 @@ fn sample_or_compare(
             "s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).{coord_swizzle}{suffix_str}{bias})"
         )
     }
+}
+
+/// Sample a programmable SM2+ texture and apply the sampler operand's result swizzle.
+///
+/// D3D9 applies this swizzle after lookup and before destination saturation and
+/// masking. `translate_instruction` passes this expression to `store_dst`, so
+/// those later operations retain their required order.
+fn sample_with_result_swizzle(
+    ctx: &EmitContext,
+    sampler: &SrcOperand,
+    coord_expr: &str,
+    suffix: Option<&str>,
+    instruction_bias: Option<&str>,
+) -> String {
+    let texture_result =
+        sample_or_compare(ctx, sampler.reg.index, coord_expr, suffix, instruction_bias);
+    apply_swizzle(&texture_result, sampler.swizzle)
 }
 
 fn write_mask_chars(m: WriteMask) -> String {
