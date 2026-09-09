@@ -67,7 +67,7 @@ impl DeviceInner {
             resident_default_dynamic: 0,
             resident_other: 0,
         };
-        for &t in live.iter() {
+        for &t in live.values() {
             // SAFETY: the registry holds every live texture until its
             // release deregisters it under the same lock.
             let ti = unsafe { &*t };
