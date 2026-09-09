@@ -303,12 +303,12 @@ extern "system" fn query_get_data(
         return D3D_OK;
     }
     let device_inner_ptr = inner.device_inner;
-    let dump_event = |msg: &str| {
+    let dump_event = |msg: &dyn Fn() -> String| {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
         // live `DeviceInner` and is kept alive by the device.
         let dev = unsafe { &*device_inner_ptr };
         if dev.frame_dump_active() {
-            dev.frame_dump_event(msg);
+            dev.frame_dump_event(&msg());
         }
     };
     let wanted = inner.data_size.min(size) as usize;
@@ -331,9 +331,7 @@ extern "system" fn query_get_data(
                 // the FLUSH stub below and the exhaustion path in `visibility`,
                 // so a missing query never makes a title cull geometry it would
                 // otherwise draw (lens flares, occlusion-gated effects).
-                dump_event(&format!(
-                    "Query({this:?}) GetData → no slot, stub fully-visible"
-                ));
+                dump_event(&|| format!("Query({this:?}) GetData → no slot, stub fully-visible"));
                 if has_output {
                     // SAFETY: `data` is non-null with >= `size` writable bytes per
                     // the ABI and `size >= 1`; `write_occlusion` writes `min(size, 8)`.
@@ -374,10 +372,12 @@ extern "system" fn query_get_data(
                             // the real count finalizes naturally on
                             // the next `begin_frame` intake if the
                             // game ever reads via `flags = 0`.
-                            dump_event(&format!(
-                                "Query({this:?}) GetData(FLUSH) → stub fully-visible \
+                            dump_event(&|| {
+                                format!(
+                                    "Query({this:?}) GetData(FLUSH) → stub fully-visible \
                                  (query.flushImmediate)"
-                            ));
+                                )
+                            });
                             if has_output {
                                 // SAFETY: as above, non-null `data`, `size >= 1`.
                                 unsafe { write_occlusion(data, size, u64::from(u32::MAX)) };
@@ -419,10 +419,12 @@ extern "system" fn query_get_data(
                                 dev.encoder_intake_visibility_for(core.seq_end_loaded());
                             }
                             if core.status() == QueryStatus::Issued {
-                                dump_event(&format!(
-                                    "Query({this:?}) GetData(FLUSH) → flushed, count {}",
-                                    core.get_u64()
-                                ));
+                                dump_event(&|| {
+                                    format!(
+                                        "Query({this:?}) GetData(FLUSH) → flushed, count {}",
+                                        core.get_u64()
+                                    )
+                                });
                                 if has_output {
                                     // SAFETY: as above, non-null `data`, `size >= 1`.
                                     unsafe { write_occlusion(data, size, core.get_u64()) };
@@ -431,16 +433,13 @@ extern "system" fn query_get_data(
                             }
                         }
                     }
-                    dump_event(&format!("Query({this:?}) GetData → S_FALSE, pending"));
+                    dump_event(&|| format!("Query({this:?}) GetData → S_FALSE, pending"));
                     // S_FALSE (0x1) — still not ready; caller will
                     // retry.
                     1
                 }
                 QueryStatus::Issued => {
-                    dump_event(&format!(
-                        "Query({this:?}) GetData → count {}",
-                        core.get_u64()
-                    ));
+                    dump_event(&|| format!("Query({this:?}) GetData → count {}", core.get_u64()));
                     if has_output {
                         // SAFETY: as above, non-null `data`, `size >= 1`.
                         unsafe { write_occlusion(data, size, core.get_u64()) };
