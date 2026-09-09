@@ -1260,6 +1260,58 @@ fn release_uploaded_staging(h: &Harness) {
     assert_eq!(h.present(), 0, "the Present that releases uploaded staging");
 }
 
+/// Upload answers ignore released textures and preserve writes made after the upload.
+///
+/// Readback retires every upload without a Present, leaving their answers
+/// queued together. Half the textures are freed before that queue is drained;
+/// the survivors and newly allocated textures hold bytes the GPU has not seen.
+#[test]
+fn upload_answers_skip_released_textures_and_keep_new_writes() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let mut uploaded = Vec::new();
+    for _ in 0..8 {
+        let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        tex.lock_rect(0, 0).write_u32(&[RED; 16]);
+        let quad = bind_for_quadrant_draws(&h, &tex);
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        assert_eq!(h.end_scene(), 0);
+        assert_pixel_eq(h.read_pixel(320, 240), RED, "the upload reached the GPU");
+        uploaded.push(tex);
+    }
+    assert_eq!(h.clear_texture(0), 0);
+    uploaded.truncate(4);
+    for tex in &uploaded {
+        tex.lock_rect(0, 0).write_u32(&[GREEN; 16]);
+    }
+    let fresh: Vec<_> = (0..4)
+        .map(|_| {
+            let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+            tex.lock_rect(0, 0).write_u32(&[BLUE; 16]);
+            tex
+        })
+        .collect();
+
+    release_uploaded_staging(&h);
+    for tex in &uploaded {
+        assert_pixel_eq(
+            sample_center(&h, tex).to_pixel(),
+            GREEN,
+            "an earlier upload answer keeps a later write",
+        );
+    }
+    for tex in &fresh {
+        assert_pixel_eq(
+            sample_center(&h, tex).to_pixel(),
+            BLUE,
+            "a released texture's answer cannot consume a new texture's staging",
+        );
+    }
+}
+
 /// A default-pool texture the game cannot lock takes a second `UpdateTexture`.
 ///
 /// Its staging goes away once the first upload has been emitted (the GPU holds

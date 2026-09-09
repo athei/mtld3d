@@ -662,7 +662,9 @@ pub struct DeviceInner {
     /// Live `IDirect3DTexture9` objects.
     ///
     /// Populated in `texture_create` after `Box::into_raw`; entries removed in
-    /// `texture_release`'s rc→0 path before the inner Box is dropped. Walked
+    /// `texture_release`'s rc→0 path before the inner Box is dropped, or when
+    /// a texture migrates to another device. Keyed by the immutable texture
+    /// id so upload answers resolve only the textures they name. Walked
     /// by `evict_managed_resources` to mark per-mip `dirty` flags so the next
     /// bind replays the staging upload — the spec contract for
     /// `IDirect3DDevice9::EvictManagedResources` is "evict from VRAM, runtime
@@ -670,7 +672,7 @@ pub struct DeviceInner {
     /// that re-upload trigger. Mutex contention is zero in steady state:
     /// create, release and Evict run one at a time, on the API thread or
     /// serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`.
-    live_textures: Mutex<Vec<*mut TextureInner>>,
+    live_textures: Mutex<rustc_hash::FxHashMap<TextureId, *mut TextureInner>>,
     /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
@@ -1902,7 +1904,7 @@ impl DeviceInner {
         self.live_textures
             .lock()
             .expect("live_textures mutex poisoned")
-            .push(ti);
+            .insert(tex.texture_id(), ti);
     }
 
     /// Charge a standalone `D3DPOOL_DEFAULT` surface against the VRAM total.
@@ -1972,19 +1974,17 @@ impl DeviceInner {
     /// `texture::rehydrate_for_device` for the device a texture migrates off,
     /// which is the only other way an entry stops belonging here.
     pub fn deregister_texture(&self, ti: *mut TextureInner) {
+        // SAFETY: deregistration runs before the live inner Box is freed or
+        // transferred to another device; its texture id never changes.
+        let tex = unsafe { &*ti };
         let mut live = self
             .live_textures
             .lock()
             .expect("live_textures mutex poisoned");
-        if let Some(pos) = live.iter().position(|&p| p == ti) {
-            live.swap_remove(pos);
-            // Release the registry lock before the VRAM accounting below — it
-            // touches only the atomic, not the texture list.
+        if live.remove(&tex.texture_id()).is_some() {
+            // Release the registry lock before the VRAM accounting below;
+            // it touches only the atomic, not the texture registry.
             drop(live);
-            // SAFETY: `ti` is still a live `TextureInner` (deregister runs
-            // before the Box is freed); only subtract once, gated on the
-            // registry having actually held it.
-            let tex = unsafe { &*ti };
             if tex.is_default_pool() {
                 self.vram_bytes_used
                     .fetch_sub(tex.allocated_bytes(), Ordering::AcqRel);
@@ -2006,7 +2006,9 @@ impl DeviceInner {
             .live_textures
             .lock()
             .expect("live_textures mutex poisoned")
-            .clone();
+            .values()
+            .copied()
+            .collect();
         let mut to_evict: Vec<TextureId> = Vec::new();
         for ti_ptr in live {
             // SAFETY: `ti_ptr` is a snapshot from `live_textures`; entries
@@ -2057,35 +2059,19 @@ impl DeviceInner {
         if declined.is_empty() && released.is_empty() {
             return;
         }
-        let wanted: rustc_hash::FxHashSet<TextureId> = declined
-            .iter()
-            .map(|entry| entry.subresource.texture_id)
-            .chain(released.iter().map(|ack| ack.subresource.texture_id))
-            .collect();
-        let live: Vec<*mut TextureInner> = self
+        let live = self
             .live_textures
             .lock()
-            .expect("live_textures mutex poisoned")
-            .clone();
-        // Only the textures an answer names go in the map: a drain runs on
-        // every frame that uploads a static texture, and a game holds far
-        // more textures than one frame uploads.
-        let by_id: rustc_hash::FxHashMap<TextureId, *mut TextureInner> = live
-            .into_iter()
-            .filter_map(|ptr| {
-                // SAFETY: `ptr` is a snapshot from `live_textures`; entries
-                // are removed before the `TextureInner` Box is freed, and
-                // nothing frees one while the API thread runs this.
-                let id = unsafe { &*ptr }.texture_id();
-                wanted.contains(&id).then_some((id, ptr))
-            })
-            .collect();
+            .expect("live_textures mutex poisoned");
         let mut restored = 0u32;
         for entry in &declined {
-            let Some(&ptr) = by_id.get(&entry.subresource.texture_id) else {
+            let Some(&ptr) = live.get(&entry.subresource.texture_id) else {
+                // Released or migrated textures no longer belong to this device.
                 continue;
             };
-            // SAFETY: same contract as the map build above.
+            // SAFETY: release and migration remove entries under this registry
+            // lock before freeing or transferring the inner. API calls are
+            // serialized, and redirtying does not re-enter the registry.
             let ti = unsafe { &mut *ptr };
             crate::texture::redirty_declined_upload(
                 ti,
@@ -2096,13 +2082,16 @@ impl DeviceInner {
             restored += 1;
         }
         for ack in &released {
-            let Some(&ptr) = by_id.get(&ack.subresource.texture_id) else {
+            let Some(&ptr) = live.get(&ack.subresource.texture_id) else {
+                // Released or migrated textures no longer belong to this device.
                 continue;
             };
-            // SAFETY: same contract as the map build above.
+            // SAFETY: the registry lock keeps the inner live, API calls are
+            // serialized, and staging release does not re-enter the registry.
             let ti = unsafe { &mut *ptr };
             crate::texture::release_emitted_staging(ti, ack.level as usize, ack.generation);
         }
+        drop(live);
         if !declined.is_empty() {
             mtld3d_shared::log_once_info!(
                 target: TEX_TRACE_TARGET,
@@ -2829,7 +2818,7 @@ impl Direct3DDevice9 {
             last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
-            live_textures: Mutex::new(Vec::new()),
+            live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: CurrentSnapshot::EMPTY,
@@ -3429,7 +3418,7 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
                 .live_textures
                 .lock()
                 .expect("live_textures mutex poisoned");
-            for &ti_ptr in live.iter() {
+            for &ti_ptr in live.values() {
                 // SAFETY: entries in `live_textures` are removed on
                 // `TextureInner` drop, so the pointer is live for the
                 // duration of this loop iteration.
