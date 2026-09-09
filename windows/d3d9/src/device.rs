@@ -3522,8 +3522,6 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // Locked has been released.
         device_inner.shutdown();
 
-        drop(device_inner);
-
         if !backbuffer_msaa_handle.is_null() {
             let handles = [backbuffer_msaa_handle.raw()];
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
@@ -3536,6 +3534,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             unix_call(&mut destroy);
         }
         unix_call(&mut params);
+
+        // Native observers may write the cursor state's boxed display sinks
+        // until the destroy thunk unregisters the attachment under its lock.
+        // Keep their backing alive until that thunk has returned.
+        drop(device_inner);
 
         // Intentionally LEAK the small wrapper shell (vtbl ptr + refcount +
         // inner ptr — ~24 bytes) instead of freeing it. The heavy state
