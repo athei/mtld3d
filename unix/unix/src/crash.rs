@@ -46,6 +46,15 @@
 //! thread without one is reported in full here and ends the process, so the
 //! report leads with the fault that caused it.
 //!
+//! A trap `CoreFoundation` raises itself (`SIGILL` on a deliberate `ud2`, the
+//! way the framework halts on a run-loop timer it refuses to reschedule) names
+//! its condition in a string and nothing else, while the object it was checking
+//! is in `rbx`. The terminal report of such a trap therefore adds the first
+//! words of that object, each copied by the kernel rather than dereferenced and
+//! annotated with the image and symbol `dladdr` resolves it to, so the object's
+//! class, callout and context read as their owners without the handler assuming
+//! any layout.
+//!
 //! `RUST_BACKTRACE=1` is also set here (if unset) so the default Rust
 //! panic hook prints message + backtrace before `abort()` flows through
 //! to the SIGABRT branch.
@@ -426,6 +435,8 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         }
         #[cfg(target_arch = "x86_64")]
         report_nonvolatile_registers(ctx);
+        #[cfg(target_arch = "x86_64")]
+        report_trap_object(signo, ctx);
         let ret = caller_pc(ctx, sp);
         if ret != 0 {
             let mut rb = [0u8; 192];
@@ -744,46 +755,66 @@ fn our_frames_on_stack(sp: u64, words: usize) {
 
 /// Copy a stack word without dereferencing the faulting stack.
 ///
-/// The Mach call copies into fixed local storage and returns an error for an
-/// unreadable source, including a mapping whose protection changes during the
-/// copy. Only a complete copy is used. No allocation or logger lock is needed;
-/// a failed read writes directly to the crash descriptor and ends that scan.
+/// The address is `sp` plus four bytes per slot, the step that tolerates a
+/// 32-bit guest stack's alignment. Only a complete copy is used; a failed
+/// read writes directly to the crash descriptor and ends that scan.
 fn stack_word<const N: usize>(sp: u64, slot: usize) -> Option<[u8; N]> {
     const UNREADABLE: &[u8] = b"[mtld3d::unix] stack read unavailable, stopping scan\n";
 
     let address = slot
         .checked_mul(4)
-        .and_then(|offset| sp.checked_add(offset as u64))
-        .filter(|address| address.checked_add(N as u64).is_some());
-    if let Some(address) = address {
-        let mut bytes = [0u8; N];
-        let mut copied = 0;
-        // SAFETY: reads libSystem's task port for this process.
-        let task = unsafe { mach_task_self_ };
-        // SAFETY: the kernel validates the source address. The destination
-        // holds N writable bytes, and `copied` is a live size out-parameter.
-        let status = unsafe {
-            mach_vm_read_overwrite(
-                task,
-                address,
-                N as u64,
-                bytes.as_mut_ptr() as usize as u64,
-                &raw mut copied,
-            )
-        };
-        if status == libc::KERN_SUCCESS && copied == N as u64 {
-            return Some(bytes);
+        .and_then(|offset| sp.checked_add(offset as u64));
+    let word = address.and_then(copy_word::<N>);
+    if word.is_none() {
+        // SAFETY: write(2) is async-signal-safe; the bytes have static storage.
+        unsafe {
+            let _ = libc::write(
+                crate::log_file::raw_fd(),
+                UNREADABLE.as_ptr().cast::<c_void>(),
+                UNREADABLE.len(),
+            );
         }
     }
-    // SAFETY: write(2) is async-signal-safe; the bytes have static storage.
-    unsafe {
-        let _ = libc::write(
-            crate::log_file::raw_fd(),
-            UNREADABLE.as_ptr().cast::<c_void>(),
-            UNREADABLE.len(),
-        );
-    }
-    None
+    word
+}
+
+/// Copy the `index`th `N`-byte word of the object at `base`, without dereferencing it.
+///
+/// The object's words are consecutive, so the address is `base` plus `N`
+/// bytes per index. `None` for an address that overflows or that the kernel
+/// declines to copy; the caller decides what a failed read ends.
+#[cfg(target_arch = "x86_64")]
+fn object_word<const N: usize>(base: u64, index: usize) -> Option<[u8; N]> {
+    index
+        .checked_mul(N)
+        .and_then(|offset| base.checked_add(offset as u64))
+        .and_then(copy_word::<N>)
+}
+
+/// Copy `N` bytes at `address` into local storage through the kernel.
+///
+/// The Mach call reports an unreadable source, including a mapping whose
+/// protection changes during the copy, instead of faulting the caller; a
+/// mapping probe could not promise that. Only a complete copy is returned.
+/// No allocation and no lock, so a signal handler may ask.
+fn copy_word<const N: usize>(address: u64) -> Option<[u8; N]> {
+    address.checked_add(N as u64)?;
+    let mut bytes = [0u8; N];
+    let mut copied = 0;
+    // SAFETY: reads libSystem's task port for this process.
+    let task = unsafe { mach_task_self_ };
+    // SAFETY: the kernel validates the source address. The destination
+    // holds N writable bytes, and `copied` is a live size out-parameter.
+    let status = unsafe {
+        mach_vm_read_overwrite(
+            task,
+            address,
+            N as u64,
+            bytes.as_mut_ptr() as usize as u64,
+            &raw mut copied,
+        )
+    };
+    (status == libc::KERN_SUCCESS && copied == N as u64).then_some(bytes)
 }
 
 /// What dyld knows about `addr`: its image, and the nearest symbol below it.
@@ -815,8 +846,6 @@ fn dladdr_image(addr: u64) -> Option<*const core::ffi::c_char> {
 fn dladdr_is_ours(addr: u64) -> bool {
     /// Scanned for in the image path, without allocating.
     const NEEDLE: &[u8] = b"mtld3d";
-    /// Bound on the path scan, so a corrupt `dli_fname` can't spin.
-    const PATH_MAX_SCAN: usize = 4096;
 
     let Some(path) = dladdr_image(addr) else {
         return false;
@@ -844,6 +873,166 @@ fn dladdr_is_ours(addr: u64) -> bool {
         idx += 1;
     }
     false
+}
+
+/// Bound on every scan of an image path, so a corrupt `dli_fname` can't spin.
+const PATH_MAX_SCAN: usize = 4096;
+
+/// Length of the NUL-terminated image path dyld owns, bounded by [`PATH_MAX_SCAN`].
+#[cfg(target_arch = "x86_64")]
+fn image_path_len(path: *const core::ffi::c_char) -> usize {
+    let mut len = 0usize;
+    while len < PATH_MAX_SCAN && image_path_byte(path, len) != 0 {
+        len += 1;
+    }
+    len
+}
+
+/// One byte of the NUL-terminated image path dyld owns.
+///
+/// Callers stay within the length [`image_path_len`] measured, or stop at
+/// the first zero this returns.
+#[cfg(target_arch = "x86_64")]
+const fn image_path_byte(path: *const core::ffi::c_char, index: usize) -> u8 {
+    // SAFETY: an offset within a NUL-terminated C string owned by dyld, which
+    // the caller bounds by its measured length or by the NUL itself.
+    let at = unsafe { path.cast::<u8>().add(index) };
+    // SAFETY: as above; reads one byte of that string.
+    unsafe { at.read() }
+}
+
+/// True when the image path dyld owns ends in `suffix`.
+#[cfg(target_arch = "x86_64")]
+fn image_path_ends_with(path: *const core::ffi::c_char, suffix: &[u8]) -> bool {
+    let len = image_path_len(path);
+    if len < suffix.len() {
+        return false;
+    }
+    let start = len - suffix.len();
+    suffix
+        .iter()
+        .enumerate()
+        .all(|(i, &byte)| image_path_byte(path, start + i) == byte)
+}
+
+/// Append the last component of the image path dyld owns, at most 32 bytes of it.
+#[cfg(target_arch = "x86_64")]
+fn push_image_basename(buf: &mut [u8; 192], pos: &mut usize, path: *const core::ffi::c_char) {
+    /// The longest basename a line carries; keeps the whole line in its buffer.
+    const BASENAME_MAX: usize = 32;
+
+    let len = image_path_len(path);
+    let mut start = 0usize;
+    for index in 0..len {
+        if image_path_byte(path, index) == b'/' {
+            start = index + 1;
+        }
+    }
+    let mut name = [0u8; BASENAME_MAX];
+    let take = (len - start).min(BASENAME_MAX);
+    for (i, slot) in name.iter_mut().enumerate().take(take) {
+        *slot = image_path_byte(path, start + i);
+    }
+    push(buf, pos, &name[..take]);
+}
+
+/// Words copied out of the object a `CoreFoundation` trap holds in `rbx`.
+///
+/// Enough to cover a run-loop timer in every layout the framework has had:
+/// the runtime base, the lock, the run loop and mode pointers, the fire date,
+/// the interval, the tolerance, the fire ticks, the order, the callout and
+/// the context. Fixed, so the dump's length is too.
+#[cfg(target_arch = "x86_64")]
+const TRAP_OBJECT_WORDS: usize = 24;
+
+/// Dump the object a `CoreFoundation` trap holds in `rbx`, without touching it.
+///
+/// A framework trap (`SIGILL` on a deliberate `ud2`) names its condition in a
+/// string and nothing else, while the object it was checking is in `rbx`,
+/// which the trapping function keeps live across the cold call. Each word of
+/// that object is copied by the kernel into local storage, printed as hex at
+/// its offset, and followed by the image and symbol `dladdr` resolves it to,
+/// so a class pointer, a callout or a context reads as its owner while the
+/// handler assumes nothing about the layout. Only a `SIGILL` whose PC lies in
+/// `CoreFoundation` qualifies: a trap in our own code has its own report, and
+/// a memory fault's `rbx` is arbitrary. The first unreadable word ends the
+/// dump, and nothing here dereferences the object or calls into the framework.
+#[cfg(target_arch = "x86_64")]
+fn report_trap_object(signo: c_int, ctx: *mut c_void) {
+    /// The image whose traps carry their object in `rbx`.
+    const IMAGE_SUFFIX: &[u8] = b"/CoreFoundation";
+    const HDR: &[u8] = b"[mtld3d::unix] CoreFoundation trap object words at rbx:\n";
+    const UNREADABLE: &[u8] = b"[mtld3d::unix] trap object read unavailable, stopping dump\n";
+    /// The longest symbol name a word's line carries.
+    const SYMBOL_MAX: usize = 64;
+
+    if signo != libc::SIGILL {
+        return;
+    }
+    let Some(trap) = dladdr_info(fault_pc(ctx)) else {
+        return;
+    };
+    if !image_path_ends_with(trap.dli_fname, IMAGE_SUFFIX) {
+        return;
+    }
+    let base = mcontext_u64(ctx, mem::offset_of!(libc::__darwin_mcontext64, __ss.__rbx));
+    if base == 0 {
+        return;
+    }
+    let fd = crate::log_file::raw_fd();
+    // SAFETY: write(2) is async-signal-safe; the bytes have static storage.
+    unsafe {
+        let _ = libc::write(fd, HDR.as_ptr().cast::<c_void>(), HDR.len());
+    }
+    for index in 0..TRAP_OBJECT_WORDS {
+        let Some(bytes) = object_word::<8>(base, index) else {
+            // SAFETY: as above.
+            unsafe {
+                let _ = libc::write(fd, UNREADABLE.as_ptr().cast::<c_void>(), UNREADABLE.len());
+            }
+            return;
+        };
+        let word = u64::from_ne_bytes(bytes);
+        let mut b = [0u8; 192];
+        let mut p = 0;
+        push(&mut b, &mut p, b"  +");
+        push_hex(&mut b, &mut p, (index * 8) as u64);
+        push(&mut b, &mut p, b" ");
+        push_hex(&mut b, &mut p, word);
+        if word >= 0x1000
+            && let Some(target) = dladdr_info(word)
+        {
+            push(&mut b, &mut p, b" ");
+            push_image_basename(&mut b, &mut p, target.dli_fname);
+            push(&mut b, &mut p, b"+");
+            push_hex(
+                &mut b,
+                &mut p,
+                word.wrapping_sub(target.dli_fbase as usize as u64),
+            );
+            if !target.dli_sname.is_null() {
+                // SAFETY: `dli_sname` is the NUL-terminated symbol name dyld
+                // owns; `strlen` is async-signal-safe.
+                let name_len = unsafe { libc::strlen(target.dli_sname) };
+                // SAFETY: `name_len` bytes at `dli_sname` are the name just measured.
+                let name =
+                    unsafe { core::slice::from_raw_parts(target.dli_sname.cast::<u8>(), name_len) };
+                push(&mut b, &mut p, b" ");
+                push(&mut b, &mut p, &name[..name_len.min(SYMBOL_MAX)]);
+                push(&mut b, &mut p, b"+");
+                push_hex(
+                    &mut b,
+                    &mut p,
+                    word.wrapping_sub(target.dli_saddr as usize as u64),
+                );
+            }
+        }
+        push(&mut b, &mut p, b"\n");
+        // SAFETY: write(2) is async-signal-safe; the buffer holds p initialized bytes.
+        unsafe {
+            let _ = libc::write(fd, b.as_ptr().cast::<c_void>(), p);
+        }
+    }
 }
 
 /// Capacity of the frame buffer handed to `backtrace`.
