@@ -520,7 +520,10 @@ pub extern "C" fn create_render_pipeline_handler(args: *mut c_void) -> i32 {
         }
     };
 
-    if let Some(handle) = metal::create_render_pipeline(params, attrs, layouts) {
+    let mut timings = mtld3d_shared::perf::PipelineTimings::new();
+    let result = metal::create_render_pipeline(params, attrs, layouts, &mut timings);
+    params.timings = timings;
+    if let Some(handle) = result {
         params.pipeline_handle = handle;
         STATUS_SUCCESS
     } else {
@@ -584,6 +587,7 @@ pub extern "C" fn compile_shader_library_handler(args: *mut c_void) -> i32 {
         return -1;
     };
 
+    params.timings = mtld3d_shared::perf::ShaderTimings::new();
     if params.msl_ptr == 0 || params.msl_len == 0 {
         warn!(target: LOG_TARGET, "CompileShaderLibrary: empty source");
         return STATUS_UNSUCCESSFUL;
@@ -613,7 +617,14 @@ pub extern "C" fn compile_shader_library_handler(args: *mut c_void) -> i32 {
         return STATUS_UNSUCCESSFUL;
     };
 
-    match metal::compile_shader_library(params.device_handle, src, params.stage_tag, entry) {
+    let result = metal::compile_shader_library(
+        params.device_handle,
+        src,
+        params.stage_tag,
+        entry,
+        &mut params.timings,
+    );
+    match result {
         Some((lib, func)) => {
             params.library_handle = lib;
             params.fn_handle = func;

@@ -339,15 +339,57 @@ Counter aggregation — mixing these up misreads the log:
 
 No ANSI colour anywhere: every line goes to the process's log file, and `env_logger` is told so (`WriteStyle::Never`) rather than left to auto-detect a terminal, which under Wine would be wrong in both directions.
 
+### Shader and pipeline attribution
+
+The same PERF summary appends cold-work accounting from
+`windows/core/src/perf/compilation.rs`. VS and PS library misses include MSL
+emission, native preparation, Metal library compilation, entry-point lookup,
+and cache compression/write. Primary and no-color sibling PSO misses include
+native descriptor preparation and the synchronous Metal PSO build. Draw-path
+depth-state misses are separate. Cache hits do not count as creation attempts;
+a source-index miss that finds an already-prewarmed library is still a hit.
+
+Rows report total duration, ms/frame, peak summed duration on one encoder
+submission, attempts (`calls`), and failures. Successful calls are attempts
+minus failures. Nested rows overlap their parent totals and must not be added
+to them. Resolve and pipeline remainders subtract measured children on each
+submission before taking a window maximum. They include cache lookup,
+bookkeeping, thunk overhead, and telemetry overhead; they are not a separate
+Metal compilation phase.
+
+Each five-second window retains at most five individual operations taking at
+least 2 ms. Parent totals do not compete with their children for these slots.
+Owned metadata is captured only for a retained operation and formatted with
+the summary: device, encoder submission sequence, shader disk identities, and
+for PSOs the vertex declaration/layout, attachments, sample count, blend/write
+state, and sibling flag. `encoder_ops_same_submission` belongs to that same
+submission. It does not correlate the operation with an unrelated API or
+presentation peak. Pipeline builds already run on the encoder thread; a long
+build there can delay encoding and eventually backpressure the API thread.
+
+Native phase durations cross the PE/Unix boundary as nanoseconds in fixed
+`repr(C)` output fields, including on failure. Unreached or disabled phases
+are zero. `NanosSetTimer` measures each duration in its owning runtime; raw PE
+and native ticks are never subtracted. The fields retain the same layout
+without PERF, while collection and slow-event storage compile out. Shader
+prewarm transfers its private measurements with its existing one-shot payload
+and logs startup totals separately from gameplay frames. This instrumentation
+does not change compilation scheduling, cache contents, or prewarming policy.
+
 ### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
 
 Time measurements that flow into the perf summary go through one of:
 
 - `ApiTimer` — D3D9 vtable entry brackets, accumulates into `api_cycles_by_category[Category]`.
 - `CycleAddTimer` — sub-scope inside an outer `ApiTimer`, accumulates into a `*mut u64` field (e.g. `query_wait_cycles`).
+- `NanosSetTimer`: elapsed wall time in nanoseconds for native thunk outputs and cold compilation phases.
 - `CycleSetTimer` — once-per-frame measurement that overwrites a `*mut u64` field (e.g. `present_block_cycles`, `op_cycles`, `submit_cycles`, `drawable_wait_tsc`).
 
-All three gate on a static `PERF_TRACKING_ENABLED: AtomicBool` latched once at logger init from `log_enabled!(target: "mtld3d::perf", Level::Info)`. When perf isn't being reported the helpers cost ~1 ns per call (one `Relaxed` atomic load + branch); when it is, the cached load avoids the per-call env_logger filter walk — the level chosen for the latch (Info) is paid once at init, not per call. On a non-`PERF` build the helpers compile to nothing (`cfg(perf_tracking)`).
+All four read `PERF_TRACKING_ENABLED`, a static `AtomicBool` latched once at
+logger initialization from `log_enabled!(target: "mtld3d::perf", Level::Info)`.
+A disabled helper reads no clock. The cached gate avoids a filter lookup on
+every measurement. On a non-PERF build, the helpers compile to nothing
+(`cfg(perf_tracking)`).
 
 The summary itself emits at `info!` on the same target, so the user-facing switch on a `PERF=1` build is a single `RUST_LOG=mtld3d::perf=info` for both the cycle accounting and the rendered grid.
 

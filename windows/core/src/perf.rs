@@ -60,6 +60,8 @@ use super::passes::Pass;
 #[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
 
+pub mod compilation;
+
 /// Window length for the averaged `mtld3d::perf=debug` summary.
 ///
 /// The per-pass / present-texture / per-pair detail rides on a separate
@@ -1710,6 +1712,7 @@ pub struct FrameSummaryContext {
 /// is compile-time-elided.
 #[cfg(perf_tracking)]
 pub struct EncoderPerfState {
+    compilation: compilation::CompilationPerf,
     /// Rolling aggregator for the 5-second `info!` summary.
     perf_window: PerfWindow,
 
@@ -1773,6 +1776,7 @@ impl EncoderPerfState {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            compilation: compilation::CompilationPerf::new(),
             perf_window: PerfWindow::new(),
             counters: FrameCounters::new(),
             timing: FrameTiming::new(),
@@ -2096,6 +2100,11 @@ impl EncoderPerfState {
             enc_cyc: enc_cycles,
             submit_status,
         };
+        self.compilation.finish_frame(
+            compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
+            compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
+            compilation::cycles_to_ns(self.enc.op_cycles),
+        );
         self.perf_window.accumulate(&sample);
 
         let window_cycles = rdtsc().saturating_sub(self.perf_window.started_tsc);
@@ -2119,7 +2128,9 @@ impl EncoderPerfState {
 
         if want_stats {
             let window_secs = cycles_to_ms(window_cycles) / 1e3;
-            let rendered = Summary::render(&self.perf_window, caches, window_secs);
+            let mut rendered = Summary::render(&self.perf_window, caches, window_secs);
+            self.compilation
+                .append_window(&mut rendered, self.perf_window.frames);
             info!(target: LOG_TARGET, "{rendered}");
         }
 
@@ -2223,14 +2234,18 @@ impl EncoderPerfState {
 /// ZST twin of [`EncoderPerfState`] for `cfg(not(perf_tracking))`.
 #[cfg(not(perf_tracking))]
 #[derive(Default)]
-pub struct EncoderPerfState;
+pub struct EncoderPerfState {
+    compilation: compilation::CompilationPerf,
+}
 
 #[cfg(not(perf_tracking))]
 impl EncoderPerfState {
     #[must_use]
     #[inline]
     pub const fn new() -> Self {
-        Self
+        Self {
+            compilation: compilation::CompilationPerf::new(),
+        }
     }
 
     #[inline]
@@ -2397,6 +2412,12 @@ struct FrameSample {
     /// Encoder-thread CPU = `op_cycles + submit_cycles`.
     enc_cyc: u64,
     submit_status: i32,
+}
+
+impl EncoderPerfState {
+    pub const fn compilation_mut(&mut self) -> &mut compilation::CompilationPerf {
+        &mut self.compilation
+    }
 }
 
 /// One windowed metric: a running window **sum** and a per-frame **peak**.

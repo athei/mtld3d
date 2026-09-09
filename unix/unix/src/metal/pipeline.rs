@@ -27,7 +27,10 @@ pub fn create_render_pipeline(
     params: &CreateRenderPipelineParams,
     vertex_attrs: &[VertexAttrDesc],
     vertex_layouts: &[VertexBufferLayoutDesc],
+    timings: &mut mtld3d_shared::perf::PipelineTimings,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
+    *timings = mtld3d_shared::perf::PipelineTimings::new();
+    let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
     let device = params.device_handle.into_retained()?;
     let vertex_function = params.vs_fn_handle.into_retained()?;
     let fragment_function = params.ps_fn_handle.into_retained()?;
@@ -166,7 +169,11 @@ pub fn create_render_pipeline(
         }
     }
 
-    let pipeline = match device.newRenderPipelineStateWithDescriptor_error(&desc) {
+    drop(preparation);
+    let build = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.build_ns);
+    let result = device.newRenderPipelineStateWithDescriptor_error(&desc);
+    drop(build);
+    let pipeline = match result {
         Ok(pso) => pso,
         Err(e) => {
             error!(target: LOG_TARGET, "pipeline creation failed: {e}");

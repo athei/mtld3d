@@ -31,6 +31,58 @@ use log::{Level, log_enabled};
 #[cfg(perf_tracking)]
 use crate::tsc::rdtsc;
 
+/// Native shader compilation durations returned to the caller in nanoseconds.
+///
+/// Fixed layout in both PERF and non-PERF builds; zero means unmeasured.
+#[repr(C)]
+pub struct ShaderTimings {
+    pub preparation_ns: u64,
+    pub library_ns: u64,
+    pub function_ns: u64,
+}
+
+impl ShaderTimings {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            library_ns: 0,
+            function_ns: 0,
+        }
+    }
+}
+
+impl Default for ShaderTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Native pipeline creation durations returned in nanoseconds.
+///
+/// Preparation excludes the synchronous Metal pipeline build.
+#[repr(C)]
+pub struct PipelineTimings {
+    pub preparation_ns: u64,
+    pub build_ns: u64,
+}
+
+impl PipelineTimings {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            build_ns: 0,
+        }
+    }
+}
+
+impl Default for PipelineTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cached `log_enabled!(target: "mtld3d::perf", Level::Info)` result.
 ///
 /// Latched once at logger init via `init_tracking_enabled`. Read on the
@@ -245,8 +297,8 @@ impl Drop for CycleAddTimer {
 /// [`crate::tsc::ns_to_cycles`].
 ///
 /// Same null-check plus perf-enabled gate as [`CycleSetTimer`]; the clock reads
-/// cost more than `rdtsc`, which is why this is for once-per-frame brackets
-/// (today: the `nextDrawable` wait) rather than hot-path measurements.
+/// cost more than `rdtsc`, so use this for once-per-frame waits and cold
+/// shader/pipeline builds, not per-draw cache hits.
 #[cfg(perf_tracking)]
 pub struct NanosSetTimer {
     /// `None` when the gate is off, so a disabled timer reads no clock at all.

@@ -476,6 +476,7 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
             }
         }),
         pipeline_handle: MetalHandle::NULL,
+        timings: mtld3d_shared::perf::PipelineTimings::new(),
     }
 }
 

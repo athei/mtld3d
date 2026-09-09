@@ -33,6 +33,13 @@ const _: () = {
         b: u64,
     }
     // 8 (not 4) ⇒ repr(C) u64 is 8-aligned on this target.
+    // Duration outputs have identical offsets in i686 PE and 64-bit Unix,
+    // independent of cfg(perf_tracking). Every Windows check compiles these.
+    assert!(core::mem::offset_of!(CompileShaderLibraryParams, timings) == 56);
+    assert!(core::mem::size_of::<CompileShaderLibraryParams>() == 80);
+    assert!(core::mem::offset_of!(CreateRenderPipelineParams, timings) == 192);
+    assert!(core::mem::size_of::<CreateRenderPipelineParams>() == 208);
+
     assert!(core::mem::offset_of!(U64After4, b) == 8);
     // A real wire struct whose `u64 id` sits after device_handle(8) + three
     // 4-byte fields: offset 24 ⇒ u64 8-aligned; would be 20 if 4-aligned.
@@ -531,6 +538,7 @@ pub struct CreateRenderPipelineParams {
     pub sample_count: u32, // in
     pub extra: [ExtraColorAttachmentParams; 3], // in: colorAttachments[1..=3]
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
+    pub timings: super::perf::PipelineTimings, // out: nanoseconds, zero when PERF is disabled
 }
 
 /// One extra colour attachment (`colorAttachments[1..=3]`) of a render pipeline.
@@ -686,6 +694,7 @@ pub struct CompileShaderLibraryParams {
     pub pad0: u32,                                   // align next u64
     pub library_handle: MetalHandle<MTLLibraryKind>, // out
     pub fn_handle: MetalHandle<MTLFunctionKind>,     // out
+    pub timings: super::perf::ShaderTimings,         // out: nanoseconds, zero when PERF is disabled
 }
 
 impl Thunk for CompileShaderLibraryParams {
