@@ -394,7 +394,12 @@ fn pipeline_cache_replays_after_process_restart() {
     let child = dir.join(CHILD_NAME);
     std::fs::copy(&exe, &child).expect("copy replay executable");
     let cache = dir.join("mtld3d_shaders.bin");
-    for warm in [false, true] {
+    for phase in 0..4 {
+        let warm = phase != 0;
+        let regenerate = phase == 2;
+        if regenerate {
+            stale_cache_emitter(&cache);
+        }
         let output = std::process::Command::new(&child)
             .args([
                 "--exact",
@@ -418,22 +423,57 @@ fn pipeline_cache_replays_after_process_restart() {
         let log = std::fs::read_to_string(&entries[0]).expect("read replay log");
         assert_eq!(
             log.matches("encoder: live CreateRenderPipeline").count(),
-            if warm { 0 } else { 6 },
+            if regenerate {
+                3
+            } else if warm {
+                0
+            } else {
+                6
+            },
             "known PSO calls move from first use to startup: {log}"
         );
         if warm {
             assert!(
-                log.contains("pre-warmed 6 render pipelines, 2 no-color mappings"),
+                log.contains(if regenerate {
+                    "pre-warmed 3 render pipelines, 1 no-color mappings"
+                } else {
+                    "pre-warmed 6 render pipelines, 2 no-color mappings"
+                }),
                 "all PSOs and the sibling mapping were built at startup: {log}"
             );
             assert!(
-                log.contains("shaders:    4 pre-warmed"),
+                log.contains(if regenerate {
+                    "shaders:    2 pre-warmed"
+                } else {
+                    "shaders:    4 pre-warmed"
+                }),
                 "all four libraries prewarmed: {log}"
             );
-            assert!(
-                !log.contains("── VS MSL") && !log.contains("── PS MSL"),
-                "no live shader emission: {log}"
-            );
+            if regenerate {
+                assert!(
+                    log.contains("regenerated MSL for 2 retained DXSO variants"),
+                    "DXSO regenerated at startup: {log}"
+                );
+                assert_eq!(
+                    log.matches("── VS MSL prog").count(),
+                    0,
+                    "no live programmable VS emission: {log}"
+                );
+                assert_eq!(
+                    log.matches("── PS MSL prog").count(),
+                    0,
+                    "no live programmable PS emission: {log}"
+                );
+            } else {
+                assert!(
+                    !log.contains("── VS MSL") && !log.contains("── PS MSL"),
+                    "no live shader emission: {log}"
+                );
+                assert!(
+                    !log.contains("regenerated MSL"),
+                    "current MSL was reused: {log}"
+                );
+            }
         }
         let mtld3d_core::shader_cache::CacheLoad::Current(records) =
             mtld3d_core::shader_cache::load(&cache).expect("load replay cache")
@@ -442,7 +482,7 @@ fn pipeline_cache_replays_after_process_restart() {
         };
         assert_eq!(records.shaders.len(), 4);
         assert_eq!(records.pipelines.len(), 6);
-        if warm {
+        if warm && !regenerate {
             assert!(
                 !records.needs_compaction,
                 "warm draws appended no shader or pipeline records"
@@ -451,6 +491,46 @@ fn pipeline_cache_replays_after_process_restart() {
         std::fs::remove_file(&entries[0]).expect("remove checked replay log");
     }
     std::fs::remove_dir_all(&dir).expect("remove private replay directory");
+}
+
+// Simulate another emitter without a second build. Poisoned MSL makes accidental reuse fail.
+fn stale_cache_emitter(path: &std::path::Path) {
+    use std::hash::Hasher as _;
+
+    use mtld3d_core::shader_cache::{self, CHUNK_HEADER_LEN, CacheLoad, HEADER_LEN};
+
+    let CacheLoad::Current(mut records) = shader_cache::load(path).expect("load current cache")
+    else {
+        panic!("cache is current before emitter change");
+    };
+    let mut bytes = Vec::new();
+    shader_cache::write_header(&mut bytes);
+    assert_eq!(bytes.len(), HEADER_LEN);
+    for entry in &mut records.shaders {
+        entry.msl = "invalid obsolete MSL".into();
+        let mut chunk = Vec::new();
+        shader_cache::write_record(&mut chunk, entry);
+        let mut body = zstd::decode_all(&chunk[CHUNK_HEADER_LEN..]).expect("decode shader record");
+        body[0] ^= 1;
+        let frame = zstd::encode_all(body.as_slice(), 3).expect("encode stale shader");
+        chunk.truncate(CHUNK_HEADER_LEN);
+        chunk[12..16].copy_from_slice(
+            &u32::try_from(frame.len())
+                .expect("frame length")
+                .to_le_bytes(),
+        );
+        let mut hash = xxhash_rust::xxh3::Xxh3::new();
+        hash.write(&chunk[..16]);
+        hash.write(&frame);
+        chunk[16..24].copy_from_slice(&hash.finish().to_le_bytes());
+        chunk.extend_from_slice(&frame);
+        bytes.extend_from_slice(&chunk);
+    }
+    for recipe in &records.pipelines {
+        shader_cache::write_pipeline_record(&mut bytes, recipe);
+    }
+    // Both child processes have exited; this private cache has no active writer.
+    std::fs::write(path, bytes).expect("replace private cache with old-emitter records");
 }
 
 fn render_pipeline_cache_workload() {

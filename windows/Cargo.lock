@@ -332,6 +332,8 @@ dependencies = [
  "mtld3d-core",
  "mtld3d-types",
  "snmalloc-rs",
+ "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

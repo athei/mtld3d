@@ -12300,8 +12300,8 @@ extern "system" fn device_create_vertex_shader(
     // without a trip to the encoder thread.
     let input_semantics = extract_input_semantics(&program);
     // The parsed program moves into an op bound for the encoder's program
-    // cache; the token stream itself moves into the wrapper, which answers
-    // `GetFunction` from it.
+    // cache; both it and the wrapper share the tokens used by `GetFunction`.
+    let bytecode = program.bytecode().clone();
     obj.inner().push_op(Box::new(move |enc| {
         enc.register_program(shader_id, program);
     }));
@@ -12311,7 +12311,7 @@ extern "system" fn device_create_vertex_shader(
         max_const_used,
         const_usage,
         input_semantics,
-        bytecode.into_boxed_slice(),
+        bytecode,
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
@@ -12898,6 +12898,7 @@ extern "system" fn device_create_pixel_shader(
         program.uses_dynamic_bool_constants(),
     );
     let color_out_mask = program.color_out_mask();
+    let bytecode = program.bytecode().clone();
     obj.inner().push_op(Box::new(move |enc| {
         enc.register_program(shader_id, program);
     }));
@@ -12907,7 +12908,7 @@ extern "system" fn device_create_pixel_shader(
         max_const_used,
         usage,
         color_out_mask,
-        bytecode.into_boxed_slice(),
+        bytecode,
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
     // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.

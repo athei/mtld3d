@@ -8,6 +8,9 @@
 use core::ptr::NonNull;
 
 use log::{Level, log_enabled};
+pub use mtld3d_core::shader_cache::{
+    ps_source_disk_key_programmable, vs_source_disk_key_programmable,
+};
 use mtld3d_core::{
     convert::{
         DecalHeuristicInputs, IMPLICIT_DECAL_BIAS_RAW, IMPLICIT_DECAL_SLOPE_SCALE,
@@ -767,41 +770,8 @@ const fn null_texture_kind(ty: TextureType) -> NullTextureKind {
     }
 }
 
-/// Single source of truth for the VS programmable `disk_key`.
-///
-/// The provided-input mask IS folded in: a shader reading an unprovided
-/// input emits different MSL (the input becomes `float4(0)` and `VertexIn`
-/// drops the attribute), so each `(vs_id, mask)` compiles a distinct
-/// `MTLLibrary`. So is the user clip plane count: it sizes the
-/// `[[clip_distance]]` output and the distances the epilogue computes. So is
-/// the vertex-fetch sampler kind mask: it types the `[[texture(n)]]` arguments
-/// and picks the sample coordinate swizzle. Variant bits still don't change VS
-/// MSL, so they are intentionally left out.
-pub fn vs_source_disk_key_programmable(
-    vs_id: ProgramId,
-    provided_input_mask: u16,
-    clip_plane_count: u8,
-    sampler_kinds: VsSamplerKinds,
-) -> u64 {
-    shader_cache::ff_key_hash(&(
-        vs_id.raw(),
-        provided_input_mask,
-        clip_plane_count,
-        sampler_kinds,
-    ))
-}
-
 pub fn vs_source_disk_key_ff(ff: &FfVsKey) -> u64 {
     shader_cache::ff_key_hash(ff)
-}
-
-/// Single source of truth for the PS `disk_key`.
-///
-/// Variant bits ARE folded in: PS variants (alpha-test mode, fog mode)
-/// produce different MSL, so each `(source, variant)` compiles to a
-/// distinct `MTLLibrary`.
-pub fn ps_source_disk_key_programmable(ps_id: ProgramId, variant: VariantKey) -> u64 {
-    shader_cache::ff_key_hash(&(ps_id.raw(), variant))
 }
 
 pub fn ps_source_disk_key_ff(ff: &FfPsKey, variant: VariantKey) -> u64 {

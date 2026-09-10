@@ -275,6 +275,8 @@ pub struct Instruction {
 
 #[derive(Debug)]
 pub struct DxsoProgram {
+    /// Original tokens shared with `GetFunction` and persistent cache recipes.
+    pub(super) bytecode: std::sync::Arc<[u32]>,
     pub shader_type: ShaderType,
     pub major: u8,
     pub minor: u8,
@@ -292,6 +294,11 @@ pub struct DxsoProgram {
 }
 
 impl DxsoProgram {
+    #[must_use]
+    pub const fn bytecode(&self) -> &std::sync::Arc<[u32]> {
+        &self.bytecode
+    }
+
     /// Whether a pixel shader declares an input register with a usage the D3D9 validator forbids.
     ///
     /// The only forbidden case is `dcl_position0 v#`: the rasterizer position

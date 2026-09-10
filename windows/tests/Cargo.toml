@@ -24,6 +24,8 @@ mtld3d-types = { workspace = true }
 # check cannot live in `mtld3d-core`'s host tests. `mtld3d-core` comes along for
 # `SNMALLOC_LOCAL_CACHE_BYTES` so the threshold is not written down twice.
 [dev-dependencies]
+zstd = { workspace = true }
+xxhash-rust = { workspace = true }
 mtld3d-core = { workspace = true }
 snmalloc-rs = { workspace = true }
 

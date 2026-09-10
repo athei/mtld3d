@@ -4,7 +4,7 @@
 //! The startup prewarm thread recreates the recorded objects and atomically
 //! compacts the file into one *Bundle* chunk when needed.
 //!
-//! ## File layout (v18)
+//! ## File layout (v19)
 //!
 //! ```text
 //! [file header  16B]  MTLD3DSH | format u32 LE | shader/translation schema u32 LE
@@ -19,7 +19,9 @@
 //! ```
 //!
 //! * `kind` ∈ `0..=7` (`CachedKind`) → **Single** chunk. Frame decompresses to
-//!   one UTF-8 MSL string. `key` is the `disk_key`.
+//!   an emitter fingerprint (u64 LE), a source-present byte, optional DXSO
+//!   and specialization inputs, then UTF-8 MSL. `key` is the `disk_key`.
+//!   Stale programmable MSL is regenerated; stale source-less records are dropped.
 //! * `kind == RECORD_KIND_PIPELINE` (`0xFE`) → **Single** pipeline recipe.
 //!   The recipe contains stable shader references and explicit logical fields,
 //!   never runtime handles or Rust struct memory.
@@ -56,7 +58,7 @@ use mtld3d_shared::{
     mtl::{PixelFormat, VertexFormat, VertexStepFunction},
 };
 use mtld3d_types::MAX_STREAMS;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
@@ -67,7 +69,9 @@ use crate::{
     shader_compile_stats::CompileBucket,
 };
 
-/// Bumped for shader emission, shader keys, or pipeline-translation semantics.
+mod source;
+
+/// Bumped for incompatible shader keys or pipeline-translation semantics.
 ///
 /// A cache file with a different schema is wiped and rebuilt from scratch.
 /// Pipeline recipes share this schema because unchanged recipe bytes can
@@ -308,12 +312,15 @@ use crate::{
 /// integer address register, changing programmable vertex shader MSL.
 pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 73;
 
+/// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
+pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
+
 /// On-disk container format.
 ///
 /// Separate from [`SHADER_CACHE_SCHEMA_VERSION`] so a translation change can
 /// invalidate shader and pipeline identities without pretending the binary
 /// framing changed.
-pub const CACHE_FORMAT_VERSION: u32 = 18;
+pub const CACHE_FORMAT_VERSION: u32 = 19;
 
 /// File magic.
 ///
@@ -465,11 +472,106 @@ impl CachedKind {
     }
 }
 
+pub use source::{ShaderSource, ps_source_disk_key_programmable, vs_source_disk_key_programmable};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
     pub kind: CachedKind,
     pub key: u64,
     pub msl: String,
+    source: Option<ShaderSource>,
+    emitter_version: u64,
+}
+
+impl CacheEntry {
+    #[must_use]
+    pub const fn new(
+        kind: CachedKind,
+        key: u64,
+        msl: String,
+        source: Option<ShaderSource>,
+    ) -> Self {
+        Self {
+            kind,
+            key,
+            msl,
+            source,
+            emitter_version: SHADER_EMITTER_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub const fn needs_regeneration(&self) -> bool {
+        self.emitter_version != SHADER_EMITTER_VERSION
+    }
+
+    /// Replace stale MSL from retained programmable inputs before compilation.
+    ///
+    /// Returns whether the entry changed and needs persisting. A failed regeneration
+    /// leaves its source and old fingerprint intact so the next launch can retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic for missing DXSO or a parser/emitter failure.
+    pub fn refresh_msl(&mut self) -> Result<bool, String> {
+        if !self.needs_regeneration() {
+            return Ok(false);
+        }
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("stale shader has no retained DXSO")?;
+        let msl = source.emit(&self.kind.entry_name(self.key))?;
+        self.msl = msl;
+        self.emitter_version = SHADER_EMITTER_VERSION;
+        Ok(true)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.emitter_version.to_le_bytes());
+        out.push(u8::from(self.source.is_some()));
+        if let Some(source) = &self.source {
+            source.encode(out);
+        }
+        out.extend_from_slice(self.msl.as_bytes());
+    }
+
+    fn decode(kind: CachedKind, key: u64, bytes: &[u8]) -> Option<Self> {
+        let entry = Self::decode_body(kind, key, bytes);
+        if entry.is_none() {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "shader_cache: discarded malformed shader source record"
+            );
+        }
+        entry
+    }
+
+    fn decode_body(kind: CachedKind, key: u64, bytes: &[u8]) -> Option<Self> {
+        let mut reader = RecipeReader::new(bytes);
+        let emitter_version = reader.u64()?;
+        let source = match reader.u8()? {
+            0 => None,
+            1 if kind.is_programmable() => {
+                let source = ShaderSource::decode(kind, &mut reader)?;
+                if source.disk_key() != key {
+                    return None;
+                }
+                Some(source)
+            }
+            _ => return None,
+        };
+        let msl = std::str::from_utf8(reader.take(bytes.len() - reader.offset)?)
+            .ok()?
+            .to_owned();
+        Some(Self {
+            kind,
+            key,
+            msl,
+            source,
+            emitter_version,
+        })
+    }
 }
 
 /// The two independent versions carried by the cache header.
@@ -860,7 +962,7 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
     let mut single_count: usize = 0;
     let mut bundle_count: usize = 0;
     let mut other_chunk = false;
-    let mut seen_shaders: FxHashSet<ShaderRecordRef> = FxHashSet::default();
+    let mut seen_shaders = FxHashMap::default();
     let mut seen_pipelines: FxHashSet<u64> = FxHashSet::default();
     let mut duplicates = false;
 
@@ -942,16 +1044,16 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
         } else if let Some(kind) = CachedKind::from_byte(kind_byte) {
             single_count += 1;
             match zstd::decode_all(frame) {
-                Ok(payload) => match String::from_utf8(payload) {
-                    Ok(msl) => push_record(
-                        PlainRecord::Shader(CacheEntry { kind, key, msl }),
+                Ok(payload) => match CacheEntry::decode(kind, key, &payload) {
+                    Some(entry) => push_record(
+                        PlainRecord::Shader(entry),
                         &mut shaders,
                         &mut pipelines,
                         &mut seen_shaders,
                         &mut seen_pipelines,
                         &mut duplicates,
                     ),
-                    Err(_) => other_chunk = true,
+                    None => other_chunk = true,
                 },
                 Err(_) => other_chunk = true,
             }
@@ -1001,7 +1103,7 @@ pub fn write_header(buf: &mut Vec<u8>) {
 
 /// Serialise one Single chunk into `buf`.
 ///
-/// Compresses the MSL bytes at `ZSTD_APPEND_LEVEL` and stamps the
+/// Compresses MSL and retained source at `ZSTD_APPEND_LEVEL` and stamps the
 /// chunk header with an xxh3 over `header_first_16_bytes ++ frame_bytes`.
 /// Caller issues a single `write_all` against the open file so the chunk
 /// either lands whole or the trailing torn portion gets dropped on next
@@ -1014,8 +1116,10 @@ pub fn write_header(buf: &mut Vec<u8>) {
 /// an error (effectively impossible for an `&[u8]` source). Real shader
 /// frames are kilobytes, so unreachable in practice.
 pub fn write_record(buf: &mut Vec<u8>, entry: &CacheEntry) {
-    let frame = zstd::encode_all(entry.msl.as_bytes(), ZSTD_APPEND_LEVEL)
-        .expect("zstd encode_all of in-memory MSL bytes");
+    let mut payload = Vec::new();
+    entry.encode(&mut payload);
+    let frame = zstd::encode_all(payload.as_slice(), ZSTD_APPEND_LEVEL)
+        .expect("zstd encode_all of in-memory shader record");
     push_chunk(buf, entry.kind as u8, entry.key, &frame);
 }
 
@@ -1354,18 +1458,19 @@ fn chunk_xxh3(header16: &[u8; 16], frame: &[u8]) -> u64 {
     h.finish()
 }
 
-// Serialise one v15-style plain record (16-byte header + raw MSL bytes)
+// Serialise one plain record (16-byte header + encoded shader body)
 // into `buf`. Used only as a Bundle chunk's decompressed payload — the
 // per-record checksum is intentionally absent there, since the outer
 // chunk's xxh3 + the zstd frame integrity already cover every byte.
 fn write_plain_record(buf: &mut Vec<u8>, entry: &CacheEntry) {
-    let msl_bytes = entry.msl.as_bytes();
-    let msl_len = u32::try_from(msl_bytes.len()).expect("MSL > 4 GiB");
+    let mut body = Vec::new();
+    entry.encode(&mut body);
+    let body_len = u32::try_from(body.len()).expect("shader record > 4 GiB");
     buf.push(entry.kind as u8);
     buf.extend_from_slice(&[0u8; 3]);
     buf.extend_from_slice(&entry.key.to_le_bytes());
-    buf.extend_from_slice(&msl_len.to_le_bytes());
-    buf.extend_from_slice(msl_bytes);
+    buf.extend_from_slice(&body_len.to_le_bytes());
+    buf.extend_from_slice(&body);
 }
 
 fn write_plain_pipeline_record(buf: &mut Vec<u8>, recipe: &PipelineRecipe) {
@@ -1393,17 +1498,31 @@ fn push_record(
     record: PlainRecord,
     shaders: &mut Vec<CacheEntry>,
     pipelines: &mut Vec<PipelineRecipe>,
-    seen_shaders: &mut FxHashSet<ShaderRecordRef>,
+    seen_shaders: &mut FxHashMap<ShaderRecordRef, usize>,
     seen_pipelines: &mut FxHashSet<u64>,
     duplicates: &mut bool,
 ) {
     match record {
         PlainRecord::Shader(entry) => {
-            let reference = ShaderRecordRef::new(entry.kind, entry.key);
-            if seen_shaders.insert(reference) {
-                shaders.push(entry);
-            } else {
+            if entry.needs_regeneration() && entry.source.is_none() {
+                mtld3d_shared::log_once_info!(
+                    target: crate::LOG_TARGET,
+                    "shader_cache: discarded stale MSL without retained DXSO"
+                );
                 *duplicates = true;
+                return;
+            }
+            let reference = ShaderRecordRef::new(entry.kind, entry.key);
+            if let Some(&index) = seen_shaders.get(&reference) {
+                *duplicates = true;
+                // A refreshed append wins over an older emitter, in either record order.
+                let old = &mut shaders[index];
+                if !entry.needs_regeneration() && old.needs_regeneration() {
+                    *old = entry;
+                }
+            } else {
+                seen_shaders.insert(reference, shaders.len());
+                shaders.push(entry);
             }
         }
         PlainRecord::Pipeline(recipe) => {
@@ -1445,13 +1564,9 @@ fn parse_plain_records(bytes: &[u8]) -> PlainRecords {
                 _ => malformed = true,
             }
         } else if let Some(kind) = CachedKind::from_byte(kind_byte) {
-            match std::str::from_utf8(body) {
-                Ok(msl) => records.push(PlainRecord::Shader(CacheEntry {
-                    kind,
-                    key,
-                    msl: msl.to_owned(),
-                })),
-                Err(_) => malformed = true,
+            match CacheEntry::decode(kind, key, body) {
+                Some(entry) => records.push(PlainRecord::Shader(entry)),
+                None => malformed = true,
             }
         } else {
             malformed = true;

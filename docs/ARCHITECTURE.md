@@ -380,8 +380,15 @@ the deduplicated shader libraries and recorded render pipelines. The encoder
 installs their device-local handles and no-color sibling mappings before it
 accepts gameplay submissions. The prewarm thread logs startup
 compilation totals separately, plus elapsed startup time including cache I/O
-and compaction. Shader sources and pipeline recipes share the translation
-schema, while the container format has its own version. A stable sidecar lock
+and compaction. Shader identities and pipeline recipes share the translation
+schema, while the container format has its own version. Each shader record also
+carries a source-derived MSL emitter fingerprint. Programmable records retain
+DXSO and the complete VS/PS specialization inputs; prewarm reparses them and
+regenerates stale MSL before compiling libraries and dependent pipelines.
+Regenerated records are appended before compaction and take precedence over
+stale duplicates. Failed regeneration keeps the source for a later retry.
+Fixed-function records have no retained source, so stale entries and their
+dependent pipeline recipes are discarded. A stable sidecar lock
 serializes reads, append operations and compaction; startup removes unreadable
 tails under that lock before another process can append behind them.
 Explicit `PERF=0` also overrides an inherited `MTLD3D_PERF` environment variable.
