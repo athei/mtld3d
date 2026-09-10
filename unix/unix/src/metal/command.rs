@@ -1113,8 +1113,8 @@ fn clear_drawable(
 pub fn clear_cursor_drawable(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     drawable: &ProtocolObject<dyn MTLTexture>,
-) {
-    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear");
+) -> bool {
+    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear")
 }
 
 /// One empty render pass that clears `texture` to black at `alpha`.
@@ -1123,7 +1123,7 @@ fn clear_texture(
     texture: &ProtocolObject<dyn MTLTexture>,
     alpha: f64,
     label: &str,
-) {
+) -> bool {
     let pass_desc = MTLRenderPassDescriptor::new();
     // SAFETY: `colorAttachments()` returns a non-null descriptor array;
     // subscript 0 is always valid.
@@ -1137,11 +1137,14 @@ fn clear_texture(
         alpha,
     });
     color0.setStoreAction(MTLStoreAction::Store);
-    if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
-        let label = objc2_foundation::NSString::from_str(label);
-        enc.setLabel(Some(&label));
-        enc.endEncoding();
-    }
+    let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "{label}: clear encoder allocation failed");
+        return false;
+    };
+    let label = objc2_foundation::NSString::from_str(label);
+    enc.setLabel(Some(&label));
+    enc.endEncoding();
+    true
 }
 
 /// HDR present of a `render.scale`-d frame: tone-map at render size, then upscale.

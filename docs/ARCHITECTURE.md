@@ -109,13 +109,84 @@ The process-lifetime observers walk the records rather than a latch: the occlusi
 
 ## The cursor overlay window
 
-With `cursor.software` resolved on (the default under HDR), the game's cursor is not a hardware cursor. The PE side keeps a blank HCURSOR realized over the client area and sends the cursor's sprite and visibility through `SetCursorOverlay` from the API thread on every `SetCursorProperties` and `ShowCursor`, pixels attached only for a sprite hash the unix side has not seen. The unix side (`metal/macdrv/cursor_overlay.rs`) stores that state under a mutex, queues at most one apply on the main queue, and does every `AppKit`, Core Animation and Metal operation of the overlay on the main thread: a borderless, click-through `NSWindow` one level above the window of the attachment the last `SetCursorOverlay` named (the overlay is one per process and follows the device that last spoke, since `SetCursorProperties` and `ShowCursor` are per-device calls) hosting a `CAMetalLayer` in that layer's format and colorspace, the sprite rendered into it through the present shaders' cursor variants only when the sprite, the layer mode or the EDR headroom changed, show and hide as a sprite or a transparent clear presented to the same layer (removing a surface from above the game layer is free, adding one back costs the game a late present).
+With `cursor.software` resolved on (the default under HDR), the PE side keeps a
+blank HCURSOR realized over the client area. `SetCursorProperties`, `ShowCursor`
+and retargets reconcile the software sprite and effective visibility, including
+unchanged hashes. Pixels are sent until the Unix side acknowledges the upload;
+a rejected hash-only update gets one full-pixel retry. Both cursor modes validate
+A8R8G8B8 format, dimensions, scaling arithmetic, pointer and row pitch before
+reading the bitmap. The pure validation lives in `mtld3d-core`; the PE wrapper
+balances each successful COM lock with an unlock and preserves the previous
+cursor on rejected input.
 
-Position rides input events: a local `NSEvent` monitor moves the sprite layer on every mouse-moved or dragged event, reading the game window, its level and its client rectangle live rather than from anything latched at attach, so mode-sets, resizes and display moves need no signal from the PE side. The window itself covers the screen the game window is on and is never moved per event: a window frame change makes AppKit re-resolve the cursor for the pointer's location and, with no cursor of ours on offer, set the arrow over the game's blank cursor on every move.
+An identical accepted request preserves pending retries but does not dispatch
+another apply once that state has completed. Native input and display observers
+continue reconciling it. Hidden or inactive periods suspend the capture watchdog
+before querying the pointer or Wine controller; reactivation starts a fresh
+silence interval.
+The overlay still reconciles its layer configuration while hidden or inactive,
+but defers window and pointer geometry queries until it can show a sprite. The
+show resolves current geometry before presenting pixels and position together.
+Hardware-only processes publish cursor visibility without a separate overlay
+dispatch; after any software sprite has been accepted, hardware takeover retains
+the apply needed to clear previous software content, including failed work.
 
-The sprite's position and its pixels land in one frame: the layer presents with the Core Animation transaction (`presentsWithTransaction`), so a hide and the move made with it are one commit and the old sprite is never shown at a new place. The apply and the game's pointer warps have no order on the main thread (the apply is queued on the dispatch main queue, winemac runs `SetCursorPos` through its own request source) and a game warps right after showing or hiding its cursor, so without that the sprite could be seen for a frame at the warped-to position before the transparent present landed. A warp delivers no event, so a run-loop observer ordered ahead of Core Animation's commit reads winemac's last warp time at the end of every main-thread iteration and repositions the sprite in the same commit.
+The Unix cursor mutex publishes the attachment's `Arc` identity, mode, sprite,
+visibility and request revision together. Admission resolves the attachment
+registry while holding that mutex. Unregister releases the registry lock before
+detaching cursor state, and detach compares `Arc` identities, so an old device
+cannot clear a new owner even if its view address was reused. Hardware takeover
+clears the software sprite. Uploaded sprites remain content-addressed and shared
+between devices; a native reconciliation owns one attachment and sprite snapshot
+throughout its work. Metal allocation and pixel upload happen outside the mutex.
 
-Two things the pointer does without telling the process are handled by a pointer watch installed at attach for every device, so it serves the D3D9 hardware cursor too (a cursor the game sets through user32 alone is outside it). While the game shows its cursor (the hardware path reports visibility through the same thunk), every present checks for the pointer moving with no events reaching the process (a system tool such as the screenshot crosshair has it) and hides the sprite for the duration; with the cursor hidden, the application inactive, or while winemac clips the cursor (read from its application controller), the events stay away by design, mouselook included, and no check runs, and a `SetCursorPos` warp the game made through winemac (its time is on the same controller) counts as the pointer's own legitimate move rather than another process's; the first event afterwards sets the flag of every live device (`cursor_kick_ptr` on attach, the kick being idempotent) that the cursor module answers with its null-then-set kick at the next `WM_SETCURSOR` or `ShowCursor(TRUE)`, because such a tool leaves its own cursor behind and Wine re-applies a cursor only on a handle change. Nothing on the submit, encoder or API thread ever waits on that main-thread work.
+There is one stationary, borderless, click-through overlay window, one level above
+the followed game window. Its sprite sublayer mirrors the game layer's actual pixel
+format, colorspace and EDR setting, including handoffs within the same HDR/SDR
+class. A device change rebuilds the command queue and texture cache. Changes to
+sprite geometry, layer configuration, owner or relevant headroom invalidate the
+rendered content. The overlay window covers the followed screen and only changes
+frame when that screen changes; pointer motion changes the sprite layer position.
+Moving the window itself per event would make AppKit resolve the cursor again and
+replace the game's blank cursor with an arrow.
+
+Input is observed by both the local `NSEvent` monitor and the existing main-run-loop
+observer at before-waiting and exit, before Core Animation commits. Wine can consume
+captured mouse events before forwarding to AppKit's `sendEvent`, bypassing the local
+monitor even without `ClipCursor`. Wine's dequeue still updates `currentEvent`, so
+the run-loop observer consumes previously unseen mouse events there. The last event
+is retained and compared by identity: an idle `currentEvent` never refreshes the
+watchdog. Winemac's warp time supplies the moves that generate no event. Input,
+warps, clipping and external-capture decisions all run on main; presents only
+request a coalesced check. An old submit-thread decision cannot relatch capture
+after a new event recovered it.
+
+The pointer watch serves both cursor modes. While the cursor is shown and the
+application active, pointer motion without new events for 60 ms indicates an
+external capture such as the screenshot tool. Clipping and fresh Wine warps count
+as legitimate movement. Hide transitions are remembered even across a coalesced
+hide/show burst. New input clears external capture and requests the existing
+null-then-set kick through live attachment sinks, restoring Wine's native cursor
+after the external tool releases it. The callback that asks for this kick uses
+the attachment registry's lifetime checks.
+
+Pixels and position are presented in one Core Animation transaction:
+`commit`, `waitUntilScheduled`, then `drawable.present`, with
+`presentsWithTransaction` enabled. A transparent clear represents hidden content.
+A refused clear encoder does not count as a successful hide. Submitted content is
+tracked separately from successful completion. Each submission owns an atomic
+completion result and generation; a stale callback only updates its own result,
+never the newer owner's state. Callbacks retain no PE pointers or native UI objects.
+Creation, allocation, encoding and completion failures leave the latest request
+pending for existing event, run-loop or present opportunities. Reentrant callbacks
+cannot settle a newer request, and failures do not start immediate retry loops.
+
+The cursor log targets record rejected uploads, visibility blockers, input routes
+(at trace level), layer configuration, submitted generations, completion and failure
+stages. `scripts/cursor_appkit_probe.swift` verifies the event-routing assumption;
+the visible Wine probe in `windows/tests/examples/cursor_capture.rs` exercises
+`SetCapture` without clipping, loading pauses and hide/show bursts. Its native
+sprite and completion log must be checked separately from the game backbuffer.
 
 ## Raw pointers across the boundary need stable backing
 
@@ -202,7 +273,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
 | `mtld3d::unix`            | Metal-side `.so`                                                         |
 | `mtld3d::unix::command`   | command-buffer completion/error and backbuffer allocation/view records (debug) |
-| `mtld3d::unix::cursor`    | software cursor overlay window: sprite renders, show/hide, layer mode    |
+| `mtld3d::unix::cursor`    | software cursor: input routes, blockers, uploads, submissions and completion    |
 | `mtld3d::unix::present`   | presented-cadence probe, one row per frame (trace)                       |
 | `mtld3d::unix::depth`     | comparison-sampler creation, the unix mirror of `d3d9::depth` (trace)    |
 

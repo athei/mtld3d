@@ -28,7 +28,10 @@ use std::{
 };
 
 use log::{Level, debug, error, info, log_enabled, trace, warn};
-use mtld3d_core::perf::DeviceSubCategory;
+use mtld3d_core::{
+    cursor::{BitmapLayout, reconcile_upload},
+    perf::DeviceSubCategory,
+};
 use mtld3d_shared::{
     InPtr, MetalHandle, SetCursorOverlayParams, mtl::CursorOverlayFlags, mtl_handle::NSViewKind,
 };
@@ -523,6 +526,17 @@ struct CursorSource {
     pixels: Vec<u8>,
 }
 
+impl CursorSource {
+    const fn layout(&self) -> BitmapLayout {
+        BitmapLayout {
+            width: self.width,
+            height: self.height,
+            x_hotspot: self.x_hotspot,
+            y_hotspot: self.y_hotspot,
+        }
+    }
+}
+
 impl CursorState {
     pub fn new(
         hwnd: *mut c_void,
@@ -585,6 +599,12 @@ impl CursorState {
         if scale == previous {
             return;
         }
+        if let Some(source) = &self.source
+            && source.layout().scaled(scale).is_none()
+        {
+            warn!(target: LOG_TARGET, "cursor scale: bitmap or hotspot overflows at {scale}x");
+            return;
+        }
         self.scale = scale;
         info!(
             target: LOG_TARGET,
@@ -628,16 +648,18 @@ impl CursorState {
             return;
         }
         let flags = self.overlay_flags();
-        if self.uploaded.contains(&hash) {
-            send_overlay_state(self.view_handle, hash, flags, None);
-            return;
-        }
         let Some(source) = self.source.as_ref() else {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: no source for sprite retry");
             return;
         };
-        let sprite = upscale_sprite(source, self.scale);
-        if send_overlay_state(self.view_handle, hash, flags, Some(&sprite)) {
+        let accepted = reconcile_upload(self.uploaded.contains(&hash), |with_pixels| {
+            let sprite = with_pixels.then(|| upscale_sprite(source, self.scale));
+            send_overlay_state(self.view_handle, hash, flags, sprite.as_ref())
+        });
+        if accepted {
             self.uploaded.insert(hash);
+        } else {
+            self.uploaded.remove(&hash);
         }
     }
 
@@ -646,11 +668,9 @@ impl CursorState {
     /// Software mode names the sprite too; the hardware path sends visibility
     /// alone, which the unix side's pointer watch needs to know whatever
     /// draws the cursor.
-    fn push_overlay_state(&self) {
+    fn push_overlay_state(&mut self) {
         if self.software() {
-            if self.hash != 0 {
-                send_overlay_state(self.view_handle, self.hash, self.overlay_flags(), None);
-            }
+            self.sync_sprite();
         } else if !self.handle.is_null() {
             // A game that never set a D3D cursor shows none of ours, whatever
             // WM_SIZE pins: nothing for the pointer watch to look after.
@@ -1045,31 +1065,23 @@ pub extern "system" fn device_set_cursor_properties(
     }
     let width = desc.width;
     let height = desc.height;
-    if width == 0 || height == 0 {
-        warn!(
-            target: LOG_TARGET,
-            "reject SetCursorProperties: zero-sized surface ({width}x{height}) → INVALIDCALL",
-        );
-        return D3DERR_INVALIDCALL;
-    }
-    // D3D9 requires cursor dimensions to be powers of two.
-    if !width.is_power_of_two() || !height.is_power_of_two() {
-        warn!(
-            target: LOG_TARGET,
-            "reject SetCursorProperties: non-power-of-2 surface ({width}x{height}) → INVALIDCALL",
-        );
-        return D3DERR_INVALIDCALL;
-    }
-    // D3D9 caps cursor dimensions at the current adapter display mode (the
-    // resolution `GetAdapterDisplayMode` reports right now, which is the
-    // game's mode while a fullscreen device has one set), not the backbuffer
-    // size.
+    let layout = BitmapLayout {
+        width,
+        height,
+        x_hotspot,
+        y_hotspot,
+    };
     let mode = crate::direct3d9::current_adapter_display_mode();
-    let (mode_width, mode_height) = (mode.width, mode.height);
-    if width > mode_width || height > mode_height {
+    if !layout.valid(
+        desc.format,
+        (mode.width, mode.height),
+        dev.cursor_mut().scale,
+    ) {
         warn!(
             target: LOG_TARGET,
-            "reject SetCursorProperties: surface ({width}x{height}) exceeds display mode ({mode_width}x{mode_height}) → INVALIDCALL",
+            "reject SetCursorProperties: invalid format, extent or scaled bitmap/hotspot \
+             (format={} {width}x{height} hotspot={x_hotspot},{y_hotspot})",
+            desc.format,
         );
         return D3DERR_INVALIDCALL;
     }
@@ -1095,7 +1107,12 @@ pub extern "system" fn device_set_cursor_properties(
         return D3DERR_INVALIDCALL;
     }
 
-    let pitch = usize::try_from(locked.pitch).expect("D3D9 LOCKED_RECT.pitch is non-negative");
+    let Some(pitch) = layout.row_pitch(locked.bits as usize, locked.pitch) else {
+        warn!(target: LOG_TARGET, "reject SetCursorProperties: invalid locked pointer or pitch");
+        // SAFETY: this surface was successfully locked above; no pixels were read.
+        unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
+        return D3DERR_INVALIDCALL;
+    };
     let src = locked.bits as *const u8;
     let cur = dev.cursor_mut();
     let hash = hash_cursor(x_hotspot, y_hotspot, width, height, src, pitch, cur.scale);
@@ -1169,9 +1186,7 @@ pub extern "system" fn device_set_cursor_properties(
     // current visibility. The blank Win32 cursor is unchanged by a cursor
     // change and already in place from the last show, so it is realized here
     // only for the first cursor a device sets while already pinned visible.
-    if cur.software() && hash != prev_hash {
-        cur.sync_sprite();
-    }
+    cur.push_overlay_state();
     // Realize only while shown (D3D9 sets the Win32 cursor only when the cursor is visible).
     // While hidden the game owns the win32 cursor — pushing null here clobbers
     // the cursor the game's own wndproc set (WoW's login screen never calls
@@ -1246,6 +1261,7 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
             "ShowCursor(show=0) suppressed by force_visible_after_resize (post-resize hide pre-empted) tid={}",
             current_thread_id(),
         );
+        cur.push_overlay_state();
         return i32::from(prev);
     }
     // D3D9 changes the cursor visibility only once a cursor image has been set
@@ -1625,6 +1641,10 @@ struct SpriteUpload {
 /// cursor is the hardware cursor's sprite drawn by a different compositor.
 fn upscale_sprite(source: &CursorSource, scale: u32) -> SpriteUpload {
     let scale = scale.clamp(1, 8);
+    let scaled = source
+        .layout()
+        .scaled(scale)
+        .expect("validated cursor scale");
     let src_pixels = u8_to_u32_vec(&source.pixels);
     // Same rule as the hardware path: a bitmap with no alpha anywhere is an
     // opaque cursor (there its AND mask keeps every pixel); the overlay
@@ -1649,8 +1669,8 @@ fn upscale_sprite(source: &CursorSource, scale: u32) -> SpriteUpload {
     SpriteUpload {
         width: u32::try_from(sw).expect("upscaled cursor width fits u32"),
         height: u32::try_from(sh).expect("upscaled cursor height fits u32"),
-        x_hotspot: source.x_hotspot * scale,
-        y_hotspot: source.y_hotspot * scale,
+        x_hotspot: scaled.x_hotspot,
+        y_hotspot: scaled.y_hotspot,
         scale,
         pixels: u32_to_u8_vec(&pixels),
     }
@@ -1815,8 +1835,8 @@ fn create_cursor_from_bits(
 ///
 /// # Panics
 ///
-/// Panics if upscaled dimensions exceed `i32::MAX`. Unreachable on Windows
-/// cursors (max 256×256 pre-scale, ≤8× post-scale).
+/// Pixel allocations can fail if the process exhausts memory. Dimension and
+/// hotspot arithmetic are validated before reading the locked surface.
 fn build_hcursor(
     width: u32,
     height: u32,
@@ -1826,9 +1846,19 @@ fn build_hcursor(
     y_hotspot: u32,
     scale: u32,
 ) -> Option<*mut c_void> {
+    let layout = BitmapLayout {
+        width,
+        height,
+        x_hotspot,
+        y_hotspot,
+    };
+    let Some(scaled) = layout.scaled(scale) else {
+        warn!(target: LOG_TARGET, "build_hcursor: bitmap or hotspot scaling overflows");
+        return None;
+    };
     let w = width as usize;
     let h = height as usize;
-    let scale = scale.clamp(1, 8) as usize;
+    let scale = scale as usize;
 
     // Copy the locked surface into a tight w*h BGRA buffer (handles
     // pitch != w*4). The upscalers operate on tight buffers. Use
@@ -1860,8 +1890,7 @@ fn build_hcursor(
     let (sw, sh, pixels, path) = scale_cursor_pixels(scale, w, h, src_pixels);
     let and_mask = derive_and_mask(&pixels, sw, sh, any_alpha);
 
-    let scale_u32 = u32::try_from(scale).expect("scale clamped to ≤8 fits u32");
-    let hotspot = (x_hotspot * scale_u32, y_hotspot * scale_u32);
+    let hotspot = (scaled.x_hotspot, scaled.y_hotspot);
     let cursor = create_cursor_from_bits(sw, sh, &pixels, &and_mask, hotspot, "build_hcursor")?;
     debug!(
         target: LOG_TARGET,

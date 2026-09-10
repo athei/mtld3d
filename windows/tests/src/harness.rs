@@ -25,6 +25,8 @@ use crate::{
     win32,
 };
 
+mod cursor_bitmap;
+
 /// The process environment, which every `Direct3DCreate9` reads.
 ///
 /// Configuration resolves from `MTLD3D_CONFIG` inside that call and belongs
@@ -2478,6 +2480,20 @@ impl Harness {
                 surface.as_ptr(),
             )
         }
+    }
+
+    /// Capture mouse input without changing `ClipCursor`, for the visible cursor probe.
+    ///
+    /// Returns whether this window owns capture after the call.
+    #[must_use]
+    pub fn capture_mouse(&self, captured: bool) -> bool {
+        win32::capture_mouse(self.hwnd(), captured) == self.hwnd()
+    }
+
+    /// Bring this harness's window to the foreground for a visible probe.
+    #[must_use]
+    pub fn foreground(&self) -> bool {
+        win32::foreground_window(self.hwnd())
     }
 
     /// `ShowCursor(show)`.

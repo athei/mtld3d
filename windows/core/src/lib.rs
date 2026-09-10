@@ -18,6 +18,7 @@ pub mod buffer_rename;
 pub mod caps;
 pub mod config;
 pub mod convert;
+pub mod cursor;
 pub mod depth_stencil_state;
 pub mod dirty_range;
 pub mod dirty_rect;
