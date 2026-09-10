@@ -5,11 +5,12 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, PosColorVertex, PosVertex, VolumeVertex};
+use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex};
 use mtld3d_types::{
-    D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
-    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE,
-    D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE,
+    D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DRS_ALPHABLENDENABLE, D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE,
+    D3DRS_ZENABLE,
 };
 
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
@@ -247,7 +248,7 @@ fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
         assert_eq!(
             first.read_pixel(320, 280),
             0xFF00_00FF,
-            "no-color sibling keeps the clear"
+            "zero-mask pipeline keeps the clear"
         );
         assert_eq!(first.clear_vertex_shader(), 0, "unbind VS");
         assert_eq!(first.clear_pixel_shader(), 0, "unbind PS");
@@ -262,8 +263,8 @@ fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
     assert_eq!(first_records.shaders.len(), 2, "one VS and one PS recorded");
     assert_eq!(
         first_records.pipelines.len(),
-        3,
-        "color primary plus zero-mask primary and sibling recorded"
+        2,
+        "color and zero-mask primaries recorded without an attachmentless sibling"
     );
     {
         let h = Harness::with_config("shaderCache.enable=true");
@@ -305,7 +306,7 @@ fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
         assert_eq!(
             h.read_pixel(320, 280),
             0xFF00_00FF,
-            "replayed sibling keeps the clear"
+            "replayed zero-mask pipeline keeps the clear"
         );
         let after_draw = std::fs::read(&cache).expect("read cache after replayed draw");
         assert_eq!(
@@ -346,7 +347,7 @@ fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
         );
         assert_eq!(
             new_records.pipelines.len(),
-            4,
+            3,
             "new state appends one pipeline recipe"
         );
     }
@@ -453,7 +454,11 @@ fn pipeline_cache_replays_after_process_restart() {
 }
 
 fn render_pipeline_cache_workload() {
-    let h = Harness::with_config("shaderCache.enable=true;log.dir=");
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "shaderCache.enable=true;log.dir=",
+        ..HarnessConfig::default()
+    });
     let vs = h.create_vertex_shader(&VS_BC);
     let ps = h.create_pixel_shader(&PS_BC);
     assert_eq!(h.set_vertex_shader(&vs), 0);
@@ -463,6 +468,10 @@ fn render_pipeline_cache_workload() {
     for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
         assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
         h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+                0
+            );
             assert_eq!(
                 device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
                 0
@@ -486,6 +495,10 @@ fn render_pipeline_cache_workload() {
     for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
         assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
         h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+                0
+            );
             assert_eq!(
                 device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &vertices),
                 0

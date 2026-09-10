@@ -251,7 +251,7 @@ fn run(
                 error!(target: LOG_TARGET, "shader_cache: pipeline prewarm failed");
                 continue;
             }
-            if snapshot.writes_no_color() && snapshot.has_color_output() {
+            if snapshot.has_depth() && snapshot.writes_no_color() && snapshot.has_color_output() {
                 primary_candidates.push((snapshot.clone(), pipeline.raw()));
             }
             pipelines.insert(key, pipeline);

@@ -5934,11 +5934,14 @@ impl FrameEncoder {
         // Dual-build for zero-mask draws: build the matching no-color
         // variant up-front so pass-finalisation (Rule H) can swap to it
         // retroactively if every draw in the pass had `mask == 0`.
+        // Rule H keeps color when there is no depth attachment. Its unused
+        // sibling would have no attachments, which Mac2 Metal rejects.
         // A successful sibling mapping stays valid as long as the pipeline
         // cache, so an L0 miss can reuse it without rebuilding the alternate
         // snapshot and key. A failed sibling build leaves no mapping and is
         // retried on the next L0 miss.
         if !with_color.is_null()
+            && snapshot.has_depth()
             && snapshot.writes_no_color()
             && snapshot.has_color_output()
             && !self.no_color_pipeline_alt.contains_key(&with_color.raw())

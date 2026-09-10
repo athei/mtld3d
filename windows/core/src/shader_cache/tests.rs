@@ -156,6 +156,51 @@ fn pipeline_recipe_round_trips_with_stable_shader_refs() {
 }
 
 #[test]
+fn attachmentless_recipes_are_removed_without_losing_valid_records() {
+    let entries = sample_entries();
+    let mut empty = sample_recipe();
+    empty.snapshot.attach = PipelineAttachFlags::empty();
+    empty.snapshot.rs.color_write_mask = 0;
+    let mut depth_only = sample_recipe();
+    depth_only.snapshot.attach = PipelineAttachFlags::HAS_DEPTH;
+    depth_only.snapshot.rs.color_write_mask = 0;
+    let mut extra_only = sample_recipe();
+    extra_only.snapshot.attach = PipelineAttachFlags::empty();
+    extra_only.snapshot.extra.present_mask = 1;
+    let recipes = [sample_recipe(), empty, depth_only, extra_only];
+
+    for bundled in [false, true] {
+        let mut bytes = Vec::new();
+        write_header(&mut bytes);
+        if bundled {
+            write_bundle(&mut bytes, &entries, &recipes);
+        } else {
+            for entry in &entries {
+                write_record(&mut bytes, entry);
+            }
+            for recipe in &recipes {
+                write_pipeline_record(&mut bytes, recipe);
+            }
+        }
+        let records = read_records(&bytes);
+        assert_eq!(records.shaders, entries);
+        assert_eq!(records.pipelines.len(), 3);
+        assert!(records.pipelines[0] == recipes[0]);
+        assert!(records.pipelines[1] == recipes[2]);
+        assert!(records.pipelines[2] == recipes[3]);
+        assert!(records.needs_compaction);
+
+        let mut compacted = Vec::new();
+        write_header(&mut compacted);
+        write_bundle(&mut compacted, &records.shaders, &records.pipelines);
+        let reloaded = read_records(&compacted);
+        assert_eq!(reloaded.shaders, entries);
+        assert!(reloaded.pipelines == records.pipelines);
+        assert!(!reloaded.needs_compaction);
+    }
+}
+
+#[test]
 fn pipeline_recipe_without_both_shader_records_is_dropped() {
     let entries = sample_entries();
     let recipe = sample_recipe();

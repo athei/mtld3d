@@ -715,6 +715,12 @@ impl PipelineRecipe {
     fn is_valid(&self) -> bool {
         self.vs.kind.is_vertex()
             && self.ps.kind.is_pixel()
+            // An attachmentless sibling cannot serve a depth-only pass and
+            // fails pipeline validation on Mac2. Keep useful cache records
+            // while dropping these unused recipes from older writers.
+            && (self.snapshot.has_depth()
+                || self.snapshot.has_color_output()
+                || self.snapshot.extra.present_mask != 0)
             && self.snapshot.sample_count != 0
             && self.snapshot.ps_color_out_mask & !0x0F == 0
             && self.snapshot.rs.color_write_mask & !0x0F == 0
