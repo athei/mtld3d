@@ -1002,3 +1002,41 @@ fn regeneration_failure_preserves_dxso_for_retry() {
     assert!(loaded.shaders[0].refresh_msl().is_err());
     assert_eq!(loaded.shaders[0], before);
 }
+
+#[test]
+fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
+    use crate::dxso::{VariantKey, VsSamplerKinds, parse};
+
+    for (header, kind) in [
+        (0xFFFE_0200, CachedKind::Sm2Vs),
+        (0xFFFF_0200, CachedKind::Sm2Ps),
+    ] {
+        for end in [0x0000_FFFF, 0x0100_FFFF, 0x8000_FFFF] {
+            // Shader creation and parsing identify END by its low opcode bits.
+            let program = parse(&[header, end]).expect("accepted shader bytecode");
+            let source = if kind.is_vertex() {
+                ShaderSource::vertex(&program, 0, 0, VsSamplerKinds::default())
+            } else {
+                ShaderSource::pixel(&program, VariantKey::default())
+            };
+            let key = source.disk_key();
+            let expected = source
+                .emit(&kind.entry_name(key))
+                .expect("emit accepted shader");
+            let mut entry = CacheEntry::new(kind, key, "stale MSL".into(), Some(source));
+            entry.emitter_version ^= 1;
+            let mut records = read_records(&write_file(&[vec![entry]], true));
+            assert_eq!(
+                records.shaders.len(),
+                1,
+                "accepted END {end:#x} must survive caching"
+            );
+            assert!(
+                records.shaders[0]
+                    .refresh_msl()
+                    .expect("regenerate accepted shader")
+            );
+            assert_eq!(records.shaders[0].msl, expected);
+        }
+    }
+}

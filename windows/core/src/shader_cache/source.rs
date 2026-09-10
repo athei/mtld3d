@@ -150,8 +150,8 @@ impl ShaderSource {
             _ => return None,
         };
         let major = u8::try_from((header >> 8) & 0xFF).ok()?;
-        if CachedKind::from_programmable(major, pixel)? != kind
-            || tokens.last() != Some(&0x0000_FFFF)
+        // Match the opcode-only END check used by shader creation and DXSO parsing.
+        if CachedKind::from_programmable(major, pixel)? != kind || tokens.last()? & 0xFFFF != 0xFFFF
         {
             return None;
         }
