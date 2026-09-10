@@ -36,7 +36,7 @@ use mtld3d_core::{
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
         PairShaderId, PairStatsSample, TaskFaults,
-        compilation::{CompilationPerf, Identity as CompileIdentity, Kind as CompileKind},
+        compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
@@ -5946,6 +5946,7 @@ impl FrameEncoder {
         });
         let status = unix_call(&mut params);
         let pipeline = params.pipeline_handle;
+        let timings = params.timings.into_inner();
         drop(total);
         let success = status == 0 && !pipeline.is_null();
         let device = self.device_handle.raw();
@@ -5977,15 +5978,15 @@ impl FrameEncoder {
         );
         perf.record(
             CompileKind::PipelinePreparation,
-            params.timings.preparation_ns,
-            success || params.timings.build_ns != 0,
+            timings.preparation_ns,
+            success || timings.build_ns != 0,
             seq,
             identity,
         );
-        if params.timings.build_ns != 0 {
+        if timings.build_ns != 0 {
             perf.record(
                 CompileKind::PipelineBuild,
-                params.timings.build_ns,
+                timings.build_ns,
                 success,
                 seq,
                 identity,
@@ -8955,8 +8956,6 @@ pub struct EncoderThread {
 /// causing the encoder to compile a shader from scratch that the
 /// prewarm is concurrently compiling from disk.
 struct PrewarmPayload {
-    device: u64,
-    compilation: CompilationPerf,
     entries: Vec<(u64, StageLibHandles)>,
     writes_disabled: bool,
 }
@@ -8973,19 +8972,8 @@ impl PrewarmSender {
     /// Ship pre-warmed handles (empty vec for a cold start) and let the
     /// encoder open the cache for append.
     pub fn send(self, entries: Vec<(u64, StageLibHandles)>) {
-        self.send_measured(entries, CompilationPerf::new(), 0);
-    }
-
-    pub fn send_measured(
-        self,
-        entries: Vec<(u64, StageLibHandles)>,
-        compilation: CompilationPerf,
-        device: u64,
-    ) {
         let _ = self.0.send(PrewarmPayload {
             entries,
-            compilation,
-            device,
             writes_disabled: false,
         });
     }
@@ -9000,8 +8988,6 @@ impl PrewarmSender {
     pub fn send_disabled(self) {
         let _ = self.0.send(PrewarmPayload {
             entries: Vec::new(),
-            device: 0,
-            compilation: CompilationPerf::new(),
             writes_disabled: true,
         });
     }
@@ -9234,10 +9220,10 @@ pub fn compile_stage_library(
         pad0: 0,
         library_handle: MetalHandle::NULL,
         fn_handle: MetalHandle::NULL,
-        timings: ShaderTimings::new(),
+        timings: mtld3d_shared::perf::TimingOutput::new(),
     };
     let status = unix_call(&mut params);
-    *timings = params.timings;
+    *timings = params.timings.into_inner();
     if status != 0 || params.library_handle.is_null() || params.fn_handle.is_null() {
         error!(target: LOG_TARGET, "encoder: CompileShaderLibrary failed (stage={stage_tag:?}, entry={entry})");
         return None;
@@ -9308,8 +9294,7 @@ fn encoder_thread_main(
     // is about to deliver. The Err arm covers a prewarm-thread panic:
     // drop the warm cache, leave writes enabled, fall through so
     // subsequent `Shutdown` can still drain.
-    if let Ok(mut payload) = prewarm_rx.recv() {
-        payload.compilation.log_startup(payload.device);
+    if let Ok(payload) = prewarm_rx.recv() {
         enc.ingest_warm_cache(payload.entries, payload.writes_disabled);
     } else {
         mtld3d_shared::log_once_warn!(

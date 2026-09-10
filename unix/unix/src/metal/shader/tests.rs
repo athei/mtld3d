@@ -5,6 +5,9 @@ use objc2_metal::MTLCreateSystemDefaultDevice;
 use super::{compile_shader_library, destroy_function, destroy_library};
 
 fn poisoned_timings() -> ShaderTimings {
+    if !mtld3d_shared::perf::perf_enabled() {
+        return ShaderTimings::new();
+    }
     ShaderTimings {
         preparation_ns: u64::MAX,
         library_ns: u64::MAX,

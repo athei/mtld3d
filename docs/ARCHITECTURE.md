@@ -370,11 +370,15 @@ build there can delay encoding and eventually backpressure the API thread.
 Native phase durations cross the PE/Unix boundary as nanoseconds in fixed
 `repr(C)` output fields, including on failure. Unreached or disabled phases
 are zero. `NanosSetTimer` measures each duration in its owning runtime; raw PE
-and native ticks are never subtracted. The fields retain the same layout
-without PERF, while collection and slow-event storage compile out. Shader
-prewarm transfers its private measurements with its existing one-shot payload
-and logs startup totals separately from gameplay frames. This instrumentation
-does not change compilation scheduling, cache contents, or prewarming policy.
+and native ticks are never subtracted. The `TimingOutput` wrapper reserves the
+same wire layout without PERF but elides its initialization, writes, and reads.
+PERF callers initialize a zero fallback before crossing the boundary, so mixed
+PERF/native builds are safe.
+Collection and slow-event storage also compile out. The shader prewarm thread
+logs its private startup totals before sending its existing completion payload.
+This instrumentation does not change compilation scheduling, cache contents,
+or prewarming policy. Explicit `PERF=0` also overrides an inherited
+`MTLD3D_PERF` environment variable.
 
 ### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
 

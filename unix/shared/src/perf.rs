@@ -31,9 +31,67 @@ use log::{Level, log_enabled};
 #[cfg(perf_tracking)]
 use crate::tsc::rdtsc;
 
+/// Fixed-layout output storage that performs no initialization without PERF.
+///
+/// The PE caller initializes its fallback before a thunk in a PERF build, so
+/// a native build without PERF can leave the output untouched. A disabled PE
+/// caller never reads the payload, including when the native build writes it.
+/// Only the two scalar timing records use this boundary wrapper.
+#[repr(transparent)]
+pub struct TimingOutput<T>(core::mem::MaybeUninit<T>);
+
+impl<T: Default> TimingOutput<T> {
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self(core::mem::MaybeUninit::new(T::default()))
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(core::mem::MaybeUninit::uninit())
+    }
+
+    /// Publish a native measurement.
+    #[cfg(perf_tracking)]
+    pub const fn write(&mut self, value: T) {
+        self.0.write(value);
+    }
+
+    /// Leave the reserved bytes untouched in a disabled build.
+    #[cfg(not(perf_tracking))]
+    pub fn write(&mut self, value: T) {
+        let _ = (self, value);
+    }
+
+    /// Consume a caller-owned output initialized before the thunk.
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub const fn into_inner(self) -> T {
+        // SAFETY: this runtime's constructor initializes T before crossing
+        // the boundary; native writes only replace it with another valid T.
+        // The field is private, so safe callers cannot bypass initialization.
+        unsafe { self.0.assume_init() }
+    }
+
+    /// Synthesize zero durations without reading the reserved bytes.
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        T::default()
+    }
+}
+
+impl<T: Default> Default for TimingOutput<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Native shader compilation durations returned to the caller in nanoseconds.
 ///
-/// Fixed layout in both PERF and non-PERF builds; zero means unmeasured.
+/// Zero means unmeasured; `TimingOutput` preserves layout in non-PERF builds.
 #[repr(C)]
 pub struct ShaderTimings {
     pub preparation_ns: u64,
@@ -42,6 +100,13 @@ pub struct ShaderTimings {
 }
 
 impl ShaderTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -68,6 +133,13 @@ pub struct PipelineTimings {
 }
 
 impl PipelineTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -349,3 +421,6 @@ impl Drop for NanosSetTimer {
 impl Drop for NanosSetTimer {
     fn drop(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests;

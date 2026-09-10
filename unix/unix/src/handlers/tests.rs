@@ -35,19 +35,21 @@ fn rejected_shader_thunk_clears_timing_outputs() {
         pad0: 0,
         library_handle: mtld3d_shared::MetalHandle::NULL,
         fn_handle: mtld3d_shared::MetalHandle::NULL,
-        timings: mtld3d_shared::perf::ShaderTimings {
-            preparation_ns: u64::MAX,
-            library_ns: u64::MAX,
-            function_ns: u64::MAX,
-        },
+        timings: mtld3d_shared::perf::TimingOutput::new(),
     };
+    params.timings.write(mtld3d_shared::perf::ShaderTimings {
+        preparation_ns: u64::MAX,
+        library_ns: u64::MAX,
+        function_ns: u64::MAX,
+    });
     let result = super::compile_shader_library_handler((&raw mut params).cast());
     assert_ne!(result, 0);
+    let timings = params.timings.into_inner();
     assert_eq!(
         (
-            params.timings.preparation_ns,
-            params.timings.library_ns,
-            params.timings.function_ns
+            timings.preparation_ns,
+            timings.library_ns,
+            timings.function_ns
         ),
         (0, 0, 0)
     );

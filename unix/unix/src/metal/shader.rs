@@ -35,7 +35,7 @@ pub fn compile_shader_library(
     entry: &str,
     timings: &mut mtld3d_shared::perf::ShaderTimings,
 ) -> Option<(MetalHandle<MTLLibraryKind>, MetalHandle<MTLFunctionKind>)> {
-    *timings = mtld3d_shared::perf::ShaderTimings::new();
+    timings.reset();
     let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
     let device = device_handle.into_retained()?;
 

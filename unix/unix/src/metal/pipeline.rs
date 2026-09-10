@@ -29,7 +29,7 @@ pub fn create_render_pipeline(
     vertex_layouts: &[VertexBufferLayoutDesc],
     timings: &mut mtld3d_shared::perf::PipelineTimings,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
-    *timings = mtld3d_shared::perf::PipelineTimings::new();
+    timings.reset();
     let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
     let device = params.device_handle.into_retained()?;
     let vertex_function = params.vs_fn_handle.into_retained()?;

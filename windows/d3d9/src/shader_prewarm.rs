@@ -220,7 +220,8 @@ fn run(
 
     let total: u32 = counts.iter().sum();
     let cached = u32::try_from(warm.len()).unwrap_or(u32::MAX);
-    sender.send_measured(warm, compilation, device_handle.raw());
+    compilation.log_startup(device_handle.raw());
+    sender.send(warm);
     if total > 0 {
         let snap = Snapshot {
             counts,
