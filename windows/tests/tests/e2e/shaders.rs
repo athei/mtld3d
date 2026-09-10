@@ -8,7 +8,8 @@ use core::ffi::c_void;
 use mtld3d_tests::{Harness, PosColorVertex, PosVertex, VolumeVertex};
 use mtld3d_types::{
     D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
-    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DRS_ZENABLE,
+    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE,
+    D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE,
 };
 
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
@@ -196,6 +197,306 @@ fn user_shader_constant_drives_color() {
 
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
+    let cache = std::env::current_exe()
+        .expect("resolve test executable")
+        .parent()
+        .expect("test executable has a parent")
+        .join("mtld3d_shaders.bin");
+    remove_cache_files(&cache);
+
+    let first = Harness::with_config("shaderCache.enable=true");
+    {
+        let vs = first.create_vertex_shader(&VS_BC);
+        let ps = first.create_pixel_shader(&PS_BC);
+        assert_eq!(first.set_vertex_shader(&vs), 0, "SetVertexShader");
+        assert_eq!(first.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_eq!(first.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+        assert_eq!(
+            first.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(red)"
+        );
+        first.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "first-device draw"
+            );
+        });
+        assert_eq!(
+            first.read_pixel(320, 280),
+            0xFFFF_0000,
+            "first-device pixels"
+        );
+        assert_eq!(
+            first.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+            0,
+            "disable color writes"
+        );
+        first.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "first-device no-color draw"
+            );
+        });
+        assert_eq!(
+            first.read_pixel(320, 280),
+            0xFF00_00FF,
+            "no-color sibling keeps the clear"
+        );
+        assert_eq!(first.clear_vertex_shader(), 0, "unbind VS");
+        assert_eq!(first.clear_pixel_shader(), 0, "unbind PS");
+    }
+    assert_eq!(first.release_device(), 0, "release first device");
+
+    let mtld3d_core::shader_cache::CacheLoad::Current(first_records) =
+        mtld3d_core::shader_cache::load(&cache).expect("load cache after first device")
+    else {
+        panic!("first device did not leave a current cache");
+    };
+    assert_eq!(first_records.shaders.len(), 2, "one VS and one PS recorded");
+    assert_eq!(
+        first_records.pipelines.len(),
+        3,
+        "color primary plus zero-mask primary and sibling recorded"
+    );
+    {
+        let h = Harness::with_config("shaderCache.enable=true");
+        let vs = h.create_vertex_shader(&VS_BC);
+        let ps = h.create_pixel_shader(&PS_BC);
+        assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+        assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+        assert_eq!(
+            h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(red)"
+        );
+        // Force the encoder through its startup barrier before taking the
+        // baseline. Prewarm compacts the append-only file before it releases
+        // that barrier, and this readback waits for the encoder to drain.
+        let _ = h.read_pixel(0, 0);
+        let before_draw = std::fs::read(&cache).expect("read compacted prewarm cache");
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "second-device draw"
+            );
+        });
+        assert_eq!(h.read_pixel(320, 280), 0xFFFF_0000, "replayed pixels");
+        assert_eq!(
+            h.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+            0,
+            "disable color writes"
+        );
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "replayed no-color draw"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            0xFF00_00FF,
+            "replayed sibling keeps the clear"
+        );
+        let after_draw = std::fs::read(&cache).expect("read cache after replayed draw");
+        assert_eq!(
+            after_draw, before_draw,
+            "a prewarmed combination appends no shader or PSO record"
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_COLORWRITEENABLE, 0x0F),
+            0,
+            "restore color writes"
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_ALPHABLENDENABLE, 1),
+            0,
+            "enable alpha blending"
+        );
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "new pipeline combination"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            0xFFFF_0000,
+            "new combination keeps cold-path rendering"
+        );
+        let mtld3d_core::shader_cache::CacheLoad::Current(new_records) =
+            mtld3d_core::shader_cache::load(&cache).expect("load cache after new combination")
+        else {
+            panic!("new combination did not leave a current cache");
+        };
+        assert_eq!(
+            new_records.shaders.len(),
+            2,
+            "new state reuses both shaders"
+        );
+        assert_eq!(
+            new_records.pipelines.len(),
+            4,
+            "new state appends one pipeline recipe"
+        );
+    }
+
+    remove_cache_files(&cache);
+}
+
+fn remove_cache_files(cache: &std::path::Path) {
+    remove_cache_file(cache);
+    let mut lock_name = cache.as_os_str().to_owned();
+    lock_name.push(".lock");
+    remove_cache_file(std::path::Path::new(&lock_name));
+}
+
+fn remove_cache_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", path.display()),
+    }
+}
+
+#[test]
+fn pipeline_cache_replays_after_process_restart() {
+    const CHILD_NAME: &str = "pipeline-cache-replay.exe";
+
+    let exe = std::env::current_exe().expect("resolve test executable");
+    if exe.file_name().is_some_and(|name| name == CHILD_NAME) {
+        render_pipeline_cache_workload();
+        return;
+    }
+    let _factory = Harness::factory_only();
+    // Each child resolves the cache beside its own executable. Keep it out
+    // of the parent suite's directory so other devices can run concurrently.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock follows Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "pipeline-cache-replay-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).expect("create private replay directory");
+    let child = dir.join(CHILD_NAME);
+    std::fs::copy(&exe, &child).expect("copy replay executable");
+    let cache = dir.join("mtld3d_shaders.bin");
+    for warm in [false, true] {
+        let output = std::process::Command::new(&child)
+            .args([
+                "--exact",
+                "shaders::pipeline_cache_replays_after_process_restart",
+                "--nocapture",
+            ])
+            .env("RUST_LOG", "mtld3d=debug,mtld3d::dxso=trace")
+            .output()
+            .expect("run replay child");
+        assert!(
+            output.status.success(),
+            "replay child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let logs = dir.join("mtld3d-logs");
+        let entries: Vec<_> = std::fs::read_dir(&logs)
+            .expect("list replay logs")
+            .map(|entry| entry.expect("read replay log entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "one process log per replay");
+        let log = std::fs::read_to_string(&entries[0]).expect("read replay log");
+        assert_eq!(
+            log.matches("encoder: live CreateRenderPipeline").count(),
+            if warm { 0 } else { 6 },
+            "known PSO calls move from first use to startup: {log}"
+        );
+        if warm {
+            assert!(
+                log.contains("pre-warmed 6 render pipelines, 2 no-color mappings"),
+                "all PSOs and the sibling mapping were built at startup: {log}"
+            );
+            assert!(
+                log.contains("shaders:    4 pre-warmed"),
+                "all four libraries prewarmed: {log}"
+            );
+            assert!(
+                !log.contains("── VS MSL") && !log.contains("── PS MSL"),
+                "no live shader emission: {log}"
+            );
+        }
+        let mtld3d_core::shader_cache::CacheLoad::Current(records) =
+            mtld3d_core::shader_cache::load(&cache).expect("load replay cache")
+        else {
+            panic!("replay did not leave a current cache");
+        };
+        assert_eq!(records.shaders.len(), 4);
+        assert_eq!(records.pipelines.len(), 6);
+        if warm {
+            assert!(
+                !records.needs_compaction,
+                "warm draws appended no shader or pipeline records"
+            );
+        }
+        std::fs::remove_file(&entries[0]).expect("remove checked replay log");
+    }
+    std::fs::remove_dir_all(&dir).expect("remove private replay directory");
+}
+
+fn render_pipeline_cache_workload() {
+    let h = Harness::with_config("shaderCache.enable=true;log.dir=");
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
+    for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0
+            );
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "cold and replayed pixels");
+    }
+    assert_eq!(h.clear_vertex_shader(), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    // An sRGB attachment normalizes the fragment variant on the encoder.
+    // Recipes must reference that effective variant, not the API snapshot.
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0);
+    let vertices = centered_triangle().map(|vertex| PosColorVertex {
+        x: vertex.x,
+        y: vertex.y,
+        z: vertex.z,
+        color: 0xFFFF_0000,
+    });
+    for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &vertices),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            expected,
+            "fixed-function replay pixels"
+        );
+    }
 }
 
 #[test]

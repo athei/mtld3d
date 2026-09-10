@@ -345,7 +345,8 @@ The same PERF summary appends cold-work accounting from
 `windows/core/src/perf/compilation.rs`. VS and PS library misses include MSL
 emission, native preparation, Metal library compilation, entry-point lookup,
 and cache compression/write. Primary and no-color sibling PSO misses include
-native descriptor preparation and the synchronous Metal PSO build. Draw-path
+native descriptor preparation, the synchronous Metal PSO build, and recipe
+compression/write. PSO cache persistence has its own nested row. Draw-path
 depth-state misses are separate. Cache hits do not count as creation attempts;
 a source-index miss that finds an already-prewarmed library is still a hit.
 
@@ -374,11 +375,16 @@ and native ticks are never subtracted. The `TimingOutput` wrapper reserves the
 same wire layout without PERF but elides its initialization, writes, and reads.
 PERF callers initialize a zero fallback before crossing the boundary, so mixed
 PERF/native builds are safe.
-Collection and slow-event storage also compile out. The shader prewarm thread
-logs its private startup totals before sending its existing completion payload.
-This instrumentation does not change compilation scheduling, cache contents,
-or prewarming policy. Explicit `PERF=0` also overrides an inherited
-`MTLD3D_PERF` environment variable.
+Collection and slow-event storage also compile out. The prewarm thread recreates
+the deduplicated shader libraries and recorded render pipelines. The encoder
+installs their device-local handles and no-color sibling mappings before it
+accepts gameplay submissions. The prewarm thread logs startup
+compilation totals separately, plus elapsed startup time including cache I/O
+and compaction. Shader sources and pipeline recipes share the translation
+schema, while the container format has its own version. A stable sidecar lock
+serializes reads, append operations and compaction; startup removes unreadable
+tails under that lock before another process can append behind them.
+Explicit `PERF=0` also overrides an inherited `MTLD3D_PERF` environment variable.
 
 ### Don't hand-roll `rdtsc()` brackets — use `perf::ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
 

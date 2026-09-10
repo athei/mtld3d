@@ -1,15 +1,12 @@
-//! Shader-cache pre-warm thread.
+//! Shader and render-pipeline cache prewarm thread.
 //!
 //! Spawned once at `CreateDevice`, reads `<host-exe-dir>/mtld3d_shaders.bin`,
-//! calls `CompileShaderLibrary` for every cached MSL entry, and ships the
-//! resulting `MTLLibrary` handles to the encoder over a dedicated one-shot
-//! `PrewarmSender` channel. Fires after the encoder thread is up; the
-//! encoder blocks on that channel before draining any `EncoderMessage`, so
-//! live miss-compiles can never race the prewarm and duplicate work that's
-//! about to land in `lib_cache`.
+//! recreates every valid shader library and render pipeline, and ships the
+//! resulting device-local handles to the encoder over a dedicated one-shot
+//! `PrewarmSender` channel. The encoder blocks on that channel before draining
+//! any `EncoderMessage`, so live miss-compiles cannot duplicate prewarm work.
 
 use std::{
-    fs,
     path::Path,
     sync::{
         Arc,
@@ -19,17 +16,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::info;
+use log::{error, info};
 use mtld3d_core::{
-    shader_cache::{self, CacheEntry, CachedKind, SHADER_CACHE_SCHEMA_VERSION},
+    perf::{
+        PairShaderId,
+        compilation::{Identity as CompileIdentity, Kind as CompileKind},
+    },
+    pipeline_state::{self, PipelineBuildInputs},
+    shader_cache::{self, CacheLoad, CachedKind, ShaderRecordRef},
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
 };
-use mtld3d_shared::{MetalHandle, mtl::StageTag, mtl_handle::MTLDeviceKind};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use mtld3d_shared::{
+    MetalHandle,
+    mtl::StageTag,
+    mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
+    perf::NanosSetTimer,
+};
+use rustc_hash::FxHashMap;
 
 use crate::{
     LOG_TARGET,
-    encoder::{PrewarmSender, StageLibHandles, compile_stage_library, shader_cache_path},
+    encoder::{PrewarmSender, WarmCache, compile_stage_library, shader_cache_path},
+    unix_call::unix_call,
 };
 
 /// Lifetime handle for the prewarm thread.
@@ -47,8 +55,8 @@ impl PrewarmHandle {
     /// Set the stop flag and wait for the prewarm thread to finish.
     ///
     /// The prewarm loop checks the flag between compiles, so the wait
-    /// is bounded by one in-flight `compile_stage_library`
-    /// (~tens-to-hundreds of ms). Idempotent.
+    /// does not start another shader or pipeline compile after cancellation.
+    /// An in-flight Metal call or cache operation must still finish. Idempotent.
     pub fn cancel_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(j) = self.join.take() {
@@ -103,94 +111,56 @@ fn run(
             target: LOG_TARGET,
             "shader_cache: shaderCache.enable = false, skipping pre-warm"
         );
-        sender.send(Vec::new());
+        sender.send(WarmCache::empty());
         return;
     }
+    let started = Instant::now();
 
     let Some(path) = shader_cache_path() else {
-        sender.send(Vec::new());
+        sender.send(WarmCache::empty());
         return;
     };
 
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Cold start — no file yet.
-            sender.send(Vec::new());
+    let records = match shader_cache::load(&path) {
+        Ok(CacheLoad::Missing) => {
+            sender.send(WarmCache::empty());
             return;
         }
-        Err(e) => {
-            // File exists but we couldn't read it (permission, I/O, …).
-            // Don't attempt `remove_file` — whatever blocked the read
-            // likely blocks the delete too, and a half-failed wipe
-            // leaves the encoder appending past foreign content.
-            // Disable cache writes for the session instead so the
-            // existing file stays untouched.
+        Ok(CacheLoad::InvalidatedVersion(header)) => {
             info!(
                 target: LOG_TARGET,
-                "shader_cache: read mtld3d_shaders.bin failed → cache disabled: {e}"
+                "shader_cache: cache format {} / shader schema {} is stale, wiped mtld3d_shaders.bin",
+                header.format_version,
+                header.shader_schema_version,
+            );
+            sender.send(WarmCache::empty());
+            return;
+        }
+        Ok(CacheLoad::InvalidatedWrongMagic) => {
+            info!(
+                target: LOG_TARGET,
+                "shader_cache: wrong magic in mtld3d_shaders.bin, wiped"
+            );
+            sender.send(WarmCache::empty());
+            return;
+        }
+        Ok(CacheLoad::Current(records)) => records,
+        Err(e) => {
+            info!(
+                target: LOG_TARGET,
+                "shader_cache: read mtld3d_shaders.bin failed, cache disabled: {e}"
             );
             sender.send_disabled();
             return;
         }
     };
 
-    match shader_cache::read_header(&bytes) {
-        Ok(schema) if schema == SHADER_CACHE_SCHEMA_VERSION => {}
-        Ok(other) => {
-            // Schema bump → wipe and rebuild from scratch.
-            let _ = fs::remove_file(&path);
-            info!(
-                target: LOG_TARGET,
-                "shader_cache: schema {other} != current {SHADER_CACHE_SCHEMA_VERSION}, wiped mtld3d_shaders.bin"
-            );
-            sender.send(Vec::new());
-            return;
-        }
-        Err(_) => {
-            // Foreign magic at our path. Wipe so the encoder doesn't
-            // later append fresh chunks past the foreign content (the
-            // file's `open_or_create_cache_file` only writes a header
-            // when the file is absent).
-            let _ = fs::remove_file(&path);
-            info!(
-                target: LOG_TARGET,
-                "shader_cache: wrong magic in mtld3d_shaders.bin, wiped"
-            );
-            sender.send(Vec::new());
-            return;
-        }
-    }
-
-    let (entries, needs_compaction) = shader_cache::read_records(&bytes);
-
-    // Dedup by `disk_key` up front so both the compile loop and the
-    // compaction rewrite consume one canonical sequence — without this
-    // we'd pay `newLibraryWithSource:` cost N times for a key that
-    // appeared in both the bundle and a later append.
-    let mut deduped: Vec<CacheEntry> = Vec::with_capacity(entries.len());
-    let mut seen = FxHashSet::with_capacity_and_hasher(entries.len(), FxBuildHasher);
-    for entry in entries {
-        if seen.insert(entry.key) {
-            deduped.push(entry);
-        }
-    }
-
-    // Atomic rewrite into one dense Bundle chunk if the file isn't
-    // already in that shape. Must complete before `sender.send` because
-    // the encoder opens the file for append only after the prewarm
-    // payload arrives — the rename therefore always lands before any
-    // new append-handle is opened against this path.
-    if needs_compaction && !deduped.is_empty() {
-        rewrite_as_bundle(&path, &deduped);
-    }
-
     let mut compilation = mtld3d_core::perf::compilation::CompilationPerf::new();
-    let mut warm: Vec<(u64, StageLibHandles)> = Vec::with_capacity(deduped.len());
+    let mut libraries = FxHashMap::default();
     let mut counts = [0u32; 4];
     let mut duration_ns = [0u64; 4];
 
-    for entry in &deduped {
+    for entry in &records.shaders {
         if stop.load(Ordering::Acquire) {
             break;
         }
@@ -213,15 +183,99 @@ fn run(
         };
         let idx = bucket_index(entry.kind.compile_bucket());
         counts[idx] += 1;
-        // u128 nanos → u64: saturates at ~584 years; pre-warm batch fits easily.
         duration_ns[idx] += u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        warm.push((entry.key, handles));
+        libraries.insert(ShaderRecordRef::new(entry.kind, entry.key), handles);
     }
 
     let total: u32 = counts.iter().sum();
-    let cached = u32::try_from(warm.len()).unwrap_or(u32::MAX);
+    let cached = u32::try_from(libraries.len()).unwrap_or(u32::MAX);
+    let mut pipelines: FxHashMap<
+        mtld3d_core::pipeline_state::PipelineKey,
+        MetalHandle<MTLRenderPipelineStateKind>,
+    > = FxHashMap::default();
+    let mut primary_candidates = Vec::new();
+
+    if !stop.load(Ordering::Acquire) {
+        for recipe in &records.pipelines {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(vs) = libraries.get(&recipe.vs()) else {
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: recipe.disk_key(),
+                    "shader_cache: pipeline recipe skipped after VS prewarm failure"
+                );
+                continue;
+            };
+            let Some(ps) = libraries.get(&recipe.ps()) else {
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: recipe.disk_key(),
+                    "shader_cache: pipeline recipe skipped after PS prewarm failure"
+                );
+                continue;
+            };
+            let snapshot = recipe.resolve(vs.func, ps.func);
+            let key = pipeline_state::key_from_snapshot(&snapshot);
+            if pipelines.contains_key(&key) {
+                continue;
+            }
+            let mut total_ns = 0;
+            let timer = NanosSetTimer::start(&raw mut total_ns);
+            let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(&snapshot);
+            let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+                snapshot: &snapshot,
+                vertex_attrs: recipe.vertex_attrs(),
+                vertex_layouts: &vertex_layouts,
+                device_handle,
+            });
+            let status = unix_call(&mut params);
+            let pipeline = params.pipeline_handle;
+            let timings = params.timings.into_inner();
+            drop(timer);
+            let success = status == 0 && !pipeline.is_null();
+            record_pipeline(
+                &mut compilation,
+                &PipelineMeasurement {
+                    device: device_handle,
+                    vs: recipe.vs(),
+                    ps: recipe.ps(),
+                    snapshot: &snapshot,
+                    total_ns,
+                    timings: &timings,
+                    success,
+                },
+            );
+            if !success {
+                error!(target: LOG_TARGET, "shader_cache: pipeline prewarm failed");
+                continue;
+            }
+            if snapshot.writes_no_color() && snapshot.has_color_output() {
+                primary_candidates.push((snapshot.clone(), pipeline.raw()));
+            }
+            pipelines.insert(key, pipeline);
+        }
+    }
+
+    let mut no_color_siblings = Vec::new();
+    for (mut snapshot, primary) in primary_candidates {
+        snapshot
+            .attach
+            .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
+        snapshot.extra = mtld3d_core::pipeline_state::ExtraColorAttachments::NONE;
+        let key = pipeline_state::key_from_snapshot(&snapshot);
+        if let Some(&sibling) = pipelines.get(&key) {
+            no_color_siblings.push((primary, sibling));
+        }
+    }
+
+    if records.needs_compaction && !stop.load(Ordering::Acquire) {
+        rewrite_as_bundle(&path);
+    }
+
+    let pipeline_count = pipelines.len();
     compilation.log_startup(device_handle.raw());
-    sender.send(warm);
     if total > 0 {
         let snap = Snapshot {
             counts,
@@ -229,26 +283,95 @@ fn run(
         };
         info!(target: LOG_TARGET, "{}", format_summary(&snap, "pre-warmed", cached));
     }
+    info!(
+        target: LOG_TARGET,
+        "shader_cache: pre-warmed {pipeline_count} render pipelines, {} no-color mappings; \
+         startup {:.3}s, cancelled={}",
+        no_color_siblings.len(),
+        started.elapsed().as_secs_f64(),
+        stop.load(Ordering::Acquire),
+    );
+    sender.send(WarmCache {
+        libraries: libraries.into_iter().collect(),
+        pipelines: pipelines.into_iter().collect(),
+        no_color_siblings,
+    });
 }
 
-/// Replace `path` with a fresh file containing one Bundle chunk holding every entry.
+/// Replace `path` with one Bundle containing the latest valid records.
 ///
-/// `shader_cache::replace_with_bundle` owns the write, which goes through a
-/// temporary and a rename. Best-effort: any I/O failure logs once and leaves
-/// the original file untouched (worst case is a missed size optimisation;
-/// the next launch tries again).
-fn rewrite_as_bundle(path: &Path, entries: &[CacheEntry]) {
-    match shader_cache::replace_with_bundle(path, entries) {
-        Ok(len) => info!(
+/// `shader_cache::compact` rereads while holding the sidecar lock and renames a
+/// temporary into place. Best-effort: any I/O failure logs once and leaves the
+/// original file untouched. The next launch tries again.
+fn rewrite_as_bundle(path: &Path) {
+    match shader_cache::compact(path) {
+        Ok(Some((records, len))) => info!(
             target: LOG_TARGET,
-            "shader_cache: compacted {} entries into one Bundle ({len} bytes)",
-            entries.len()
+            "shader_cache: compacted {records} records into one Bundle ({len} bytes)"
         ),
+        Ok(None) => {}
         Err(e) => mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "shader_cache: compaction of {} failed → leaving original: {e}",
             path.display()
         ),
+    }
+}
+
+struct PipelineMeasurement<'a> {
+    device: MetalHandle<MTLDeviceKind>,
+    vs: ShaderRecordRef,
+    ps: ShaderRecordRef,
+    snapshot: &'a mtld3d_core::pipeline_state::PipelineSnapshot,
+    total_ns: u64,
+    timings: &'a mtld3d_shared::perf::PipelineTimings,
+    success: bool,
+}
+
+fn record_pipeline(
+    compilation: &mut mtld3d_core::perf::compilation::CompilationPerf,
+    measurement: &PipelineMeasurement<'_>,
+) {
+    let sibling = !measurement.snapshot.has_color_output();
+    let identity = || CompileIdentity::Pipeline {
+        device: measurement.device.raw(),
+        vs: PairShaderId {
+            is_programmable: measurement.vs.kind().is_programmable(),
+            hash: measurement.vs.key(),
+        },
+        ps: PairShaderId {
+            is_programmable: measurement.ps.kind().is_programmable(),
+            hash: measurement.ps.key(),
+        },
+        snapshot: Box::new(measurement.snapshot.clone()),
+        sibling,
+    };
+    compilation.record(
+        if sibling {
+            CompileKind::Sibling
+        } else {
+            CompileKind::Pipeline
+        },
+        measurement.total_ns,
+        measurement.success,
+        0,
+        identity,
+    );
+    compilation.record(
+        CompileKind::PipelinePreparation,
+        measurement.timings.preparation_ns,
+        measurement.success || measurement.timings.build_ns != 0,
+        0,
+        identity,
+    );
+    if measurement.timings.build_ns != 0 {
+        compilation.record(
+            CompileKind::PipelineBuild,
+            measurement.timings.build_ns,
+            measurement.success,
+            0,
+            identity,
+        );
     }
 }
 

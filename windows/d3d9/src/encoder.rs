@@ -1,7 +1,5 @@
 use std::{
     collections::{VecDeque, hash_map::Entry},
-    fs::File,
-    io::Write as _,
     path::PathBuf,
     sync::{
         Arc,
@@ -43,7 +41,7 @@ use mtld3d_core::{
     render_scale::RenderScale,
     sampler_state,
     scratch::ScratchArena,
-    shader_cache::{self, CachedKind},
+    shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
     shader_compile_stats::{self, BurstTracker, CompileBucket},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
@@ -1156,7 +1154,7 @@ pub struct FrameEncoder {
     /// per-draw lookup path — that goes through the source-keyed indices
     /// below; `lib_cache` is now the warm-load landing zone + disk-write
     /// index, consulted only on an index miss (≈ once per shader).
-    lib_cache: FxHashMap<u64, StageLibHandles>,
+    lib_cache: FxHashMap<ShaderRecordRef, StageLibHandles>,
     /// Per-draw shader-library lookup, keyed on the shader-identity struct.
     ///
     /// `FxHash` + exact `Eq`, probed by borrow — no per-draw content hash,
@@ -1213,9 +1211,9 @@ pub struct FrameEncoder {
     ///
     /// `None` until the pre-warm thread signals readiness via the
     /// dedicated prewarm channel (or the disk cache is permanently
-    /// disabled). After that, every cache-miss compile in
-    /// `resolve_*_library` appends one record.
-    cache_writer: Option<File>,
+    /// disabled). After that, shader and pipeline cache misses append their
+    /// successful compiles.
+    cache_writer: Option<shader_cache::CacheWriter>,
     /// Debounce state for the live `shaders: N compiled in Tms (…)` burst log.
     ///
     /// Polled once per frame from `run_frame`; emits when
@@ -5254,7 +5252,7 @@ impl FrameEncoder {
         )
     }
 
-    /// Absorb the pre-warm thread's compiled MSL → `MTLLibrary` handles into `lib_cache`.
+    /// Absorb all objects produced before the prewarm barrier.
     ///
     /// Each entry serves subsequent live miss lookups keyed by the same
     /// `disk_key`. Called once from `encoder_thread_main` after the
@@ -5263,13 +5261,15 @@ impl FrameEncoder {
     /// miss-compiles to append records to `mtld3d_shaders.bin` — unless
     /// `writes_disabled` is set, in which case `cache_disabled` latches so
     /// the rest of the session skips the open/append entirely.
-    pub fn ingest_warm_cache(
-        &mut self,
-        entries: Vec<(u64, StageLibHandles)>,
-        writes_disabled: bool,
-    ) {
-        for (key, handles) in entries {
-            self.lib_cache.insert(key, handles);
+    pub fn ingest_warm_cache(&mut self, warm: WarmCache, writes_disabled: bool) {
+        for (reference, handles) in warm.libraries {
+            self.lib_cache.insert(reference, handles);
+        }
+        for (key, handle) in warm.pipelines {
+            self.pipeline_cache.insert(key, handle);
+        }
+        for (primary, sibling) in warm.no_color_siblings {
+            self.no_color_pipeline_alt.insert(primary, sibling);
         }
         self.flags.insert(FrameEncoderFlags::CACHE_READY);
         if writes_disabled {
@@ -5330,24 +5330,49 @@ impl FrameEncoder {
                 }
             }
         }
-        // Upper bound: chunk header + uncompressed MSL. The actual
-        // frame written is zstd-compressed and therefore smaller, but
-        // this avoids any reallocation on the hot path.
-        let mut buf = Vec::with_capacity(shader_cache::CHUNK_HEADER_LEN + msl.len());
-        shader_cache::write_record(
-            &mut buf,
-            &shader_cache::CacheEntry {
-                kind,
-                key,
-                msl: msl.to_owned(),
-            },
-        );
-        if let Some(file) = self.cache_writer.as_mut()
-            && let Err(e) = file.write_all(&buf)
+        let entry = shader_cache::CacheEntry {
+            kind,
+            key,
+            msl: msl.to_owned(),
+        };
+        if let Some(writer) = &self.cache_writer
+            && let Err(e) = writer.append_shader(&entry)
         {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "shader_cache: write mtld3d_shaders.bin failed → cache disabled: {e}"
+            );
+            self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
+            self.cache_writer = None;
+        }
+    }
+
+    /// Append one successfully-created pipeline recipe to the cache.
+    fn cache_write_pipeline(&mut self, recipe: &PipelineRecipe) {
+        if self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
+            || !self.flags.contains(FrameEncoderFlags::CACHE_READY)
+        {
+            return;
+        }
+        if self.cache_writer.is_none() {
+            match open_or_create_cache_file() {
+                Ok(writer) => self.cache_writer = Some(writer),
+                Err(e) => {
+                    mtld3d_shared::log_once_warn!(
+                        target: LOG_TARGET,
+                        "shader_cache: open mtld3d_shaders.bin failed, cache disabled: {e}"
+                    );
+                    self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
+                    return;
+                }
+            }
+        }
+        if let Some(writer) = &self.cache_writer
+            && let Err(e) = writer.append_pipeline(recipe)
+        {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "shader_cache: write pipeline recipe failed, cache disabled: {e}"
             );
             self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
             self.cache_writer = None;
@@ -5421,7 +5446,20 @@ impl FrameEncoder {
     /// to it.
     fn resolve_vs_library_cold(&mut self, source: &VsSource) -> Option<StageLibHandles> {
         let disk_key = source.disk_key();
-        if let Some(&handles) = self.lib_cache.get(&disk_key) {
+        let kind = match source {
+            VsSource::Programmable { vs_id, .. } => {
+                let major = self
+                    .program_cache
+                    .get(vs_id)
+                    .map_or(0, |program| program.major);
+                CachedKind::from_programmable(major, false)
+            }
+            VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
+        };
+        let reference = kind.map(|kind| ShaderRecordRef::new(kind, disk_key));
+        if let Some(reference) = reference
+            && let Some(&handles) = self.lib_cache.get(&reference)
+        {
             return Some(handles);
         }
         let mut total_ns = 0;
@@ -5430,13 +5468,6 @@ impl FrameEncoder {
         let mut timings = ShaderTimings::new();
         let total_timer = NanosSetTimer::start(&raw mut total_ns);
         let result = (|| {
-            let kind = match source {
-                VsSource::Programmable { vs_id, .. } => {
-                    let major = self.program_cache.get(vs_id).map_or(0, |p| p.major);
-                    CachedKind::from_programmable(major, false)
-                }
-                VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
-            };
             let entry_name = vs_entry_name(source, &self.program_cache, disk_key);
             let started = Instant::now();
             let emission = NanosSetTimer::start(&raw mut emit_ns);
@@ -5499,7 +5530,9 @@ impl FrameEncoder {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
                 self.cache_write_record(kind, disk_key, &msl);
             }
-            self.lib_cache.insert(disk_key, handles);
+            if let Some(reference) = reference {
+                self.lib_cache.insert(reference, handles);
+            }
             Some(handles)
         })();
         drop(total_timer);
@@ -5590,7 +5623,20 @@ impl FrameEncoder {
         variant: VariantKey,
     ) -> Option<StageLibHandles> {
         let disk_key = source.disk_key(variant);
-        if let Some(&handles) = self.lib_cache.get(&disk_key) {
+        let kind = match source {
+            PsSource::Programmable { ps_id, .. } => {
+                let major = self
+                    .program_cache
+                    .get(ps_id)
+                    .map_or(0, |program| program.major);
+                CachedKind::from_programmable(major, true)
+            }
+            PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
+        };
+        let reference = kind.map(|kind| ShaderRecordRef::new(kind, disk_key));
+        if let Some(reference) = reference
+            && let Some(&handles) = self.lib_cache.get(&reference)
+        {
             return Some(handles);
         }
         let mut total_ns = 0;
@@ -5599,13 +5645,6 @@ impl FrameEncoder {
         let mut timings = ShaderTimings::new();
         let total_timer = NanosSetTimer::start(&raw mut total_ns);
         let result = (|| {
-            let kind = match source {
-                PsSource::Programmable { ps_id, .. } => {
-                    let major = self.program_cache.get(ps_id).map_or(0, |p| p.major);
-                    CachedKind::from_programmable(major, true)
-                }
-                PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
-            };
             let entry_name = ps_entry_name(source, &self.program_cache, disk_key);
             let started = Instant::now();
             let emission = NanosSetTimer::start(&raw mut emit_ns);
@@ -5652,7 +5691,9 @@ impl FrameEncoder {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
                 self.cache_write_record(kind, disk_key, &msl);
             }
-            self.lib_cache.insert(disk_key, handles);
+            if let Some(reference) = reference {
+                self.lib_cache.insert(reference, handles);
+            }
             Some(handles)
         })();
         drop(total_timer);
@@ -5947,8 +5988,30 @@ impl FrameEncoder {
         let status = unix_call(&mut params);
         let pipeline = params.pipeline_handle;
         let timings = params.timings.into_inner();
-        drop(total);
+        debug!(
+            target: LOG_TARGET,
+            "encoder: live CreateRenderPipeline status={status:#x} sibling={sibling}"
+        );
         let success = status == 0 && !pipeline.is_null();
+        let mut persist_ns = 0;
+        if success
+            && self.flags.contains(FrameEncoderFlags::CACHE_READY)
+            && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
+        {
+            let persist = NanosSetTimer::start(&raw mut persist_ns);
+            if let Some((vs, ps)) = self.pipeline_shader_refs(shaders) {
+                let recipe = PipelineRecipe::from_snapshot(vs, ps, snapshot, vertex_attrs);
+                self.cache_write_pipeline(&recipe);
+            } else {
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: snapshot.vdecl_hash,
+                    "shader_cache: pipeline has an unsupported shader reference, recipe skipped"
+                );
+            }
+            drop(persist);
+        }
+        drop(total);
         let device = self.device_handle.raw();
         let identity = || CompileIdentity::Pipeline {
             device,
@@ -5992,12 +6055,45 @@ impl FrameEncoder {
                 identity,
             );
         }
+        if persist_ns != 0 {
+            perf.record(
+                CompileKind::PipelineCacheWrite,
+                persist_ns,
+                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
+                seq,
+                identity,
+            );
+        }
         if status != 0 || pipeline.is_null() {
             error!(target: LOG_TARGET, "encoder: CreateRenderPipeline failed");
             return MetalHandle::NULL;
         }
         self.pipeline_cache.insert(key, pipeline);
         pipeline
+    }
+
+    fn pipeline_shader_refs(
+        &self,
+        shaders: &ShaderRef<'_>,
+    ) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
+        let vs_kind = match shaders.vs {
+            VsSource::FixedFunction { .. } => CachedKind::FfVs,
+            VsSource::Programmable { vs_id, .. } => {
+                let major = self.program_cache.get(vs_id)?.major;
+                CachedKind::from_programmable(major, false)?
+            }
+        };
+        let ps_kind = match shaders.ps {
+            PsSource::FixedFunction { .. } => CachedKind::FfPs,
+            PsSource::Programmable { ps_id, .. } => {
+                let major = self.program_cache.get(ps_id)?.major;
+                CachedKind::from_programmable(major, true)?
+            }
+        };
+        Some((
+            ShaderRecordRef::new(vs_kind, shaders.vs.disk_key()),
+            ShaderRecordRef::new(ps_kind, shaders.ps.disk_key(shaders.variant)),
+        ))
     }
 
     /// Look up the Metal texture handle for a previously-warmed-up `TextureId`.
@@ -8956,8 +9052,26 @@ pub struct EncoderThread {
 /// causing the encoder to compile a shader from scratch that the
 /// prewarm is concurrently compiling from disk.
 struct PrewarmPayload {
-    entries: Vec<(u64, StageLibHandles)>,
+    warm: WarmCache,
     writes_disabled: bool,
+}
+
+/// Device-local objects created from the persistent cache before frame intake.
+pub struct WarmCache {
+    pub libraries: Vec<(ShaderRecordRef, StageLibHandles)>,
+    pub pipelines: Vec<(PipelineKey, MetalHandle<MTLRenderPipelineStateKind>)>,
+    pub no_color_siblings: Vec<(u64, MetalHandle<MTLRenderPipelineStateKind>)>,
+}
+
+impl WarmCache {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            libraries: Vec::new(),
+            pipelines: Vec::new(),
+            no_color_siblings: Vec::new(),
+        }
+    }
 }
 
 /// One-shot sender used by the shader pre-warm thread.
@@ -8971,9 +9085,9 @@ impl PrewarmSender {
     ///
     /// Ship pre-warmed handles (empty vec for a cold start) and let the
     /// encoder open the cache for append.
-    pub fn send(self, entries: Vec<(u64, StageLibHandles)>) {
+    pub fn send(self, warm: WarmCache) {
         let _ = self.0.send(PrewarmPayload {
-            entries,
+            warm,
             writes_disabled: false,
         });
     }
@@ -8987,7 +9101,7 @@ impl PrewarmSender {
     /// stay off for the rest of the session.
     pub fn send_disabled(self) {
         let _ = self.0.send(PrewarmPayload {
-            entries: Vec::new(),
+            warm: WarmCache::empty(),
             writes_disabled: true,
         });
     }
@@ -9295,13 +9409,13 @@ fn encoder_thread_main(
     // drop the warm cache, leave writes enabled, fall through so
     // subsequent `Shutdown` can still drain.
     if let Ok(payload) = prewarm_rx.recv() {
-        enc.ingest_warm_cache(payload.entries, payload.writes_disabled);
+        enc.ingest_warm_cache(payload.warm, payload.writes_disabled);
     } else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "shader_cache: pre-warm channel closed without payload → starting cold"
         );
-        enc.ingest_warm_cache(Vec::new(), false);
+        enc.ingest_warm_cache(WarmCache::empty(), false);
     }
 
     loop {
@@ -10200,11 +10314,10 @@ pub fn shader_cache_path() -> Option<PathBuf> {
 /// Caller invokes lazily on first miss-compile, after the pre-warm thread
 /// has already validated the file's schema, so a non-empty file we
 /// encounter here is guaranteed to already start with a valid header.
-/// `shader_cache::open_for_append` owns the creation, so two encoders
-/// arriving at a cold cache together still produce one header.
-fn open_or_create_cache_file() -> std::io::Result<File> {
+/// `CacheWriter` serialises appends and compaction through a stable sidecar.
+fn open_or_create_cache_file() -> std::io::Result<shader_cache::CacheWriter> {
     let Some(path) = shader_cache_path() else {
         return Err(std::io::Error::other("shader_cache_path unavailable"));
     };
-    shader_cache::open_for_append(&path)
+    shader_cache::CacheWriter::open(&path)
 }

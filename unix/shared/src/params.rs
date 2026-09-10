@@ -481,7 +481,7 @@ impl Thunk for CreateBackbufferParams {
 ///
 /// Packed as an array pointed to by `CreateRenderPipelineParams::vertex_attrs_ptr`.
 #[repr(C, align(4))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VertexAttrDesc {
     pub attr_index: u32,      // in: Metal attribute slot ([[attribute(N)]])
     pub buffer_index: u32,    // in: Metal buffer slot
