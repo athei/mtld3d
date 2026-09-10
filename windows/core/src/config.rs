@@ -6,6 +6,8 @@
 //! this module is host-testable through `cargo test -p mtld3d-core
 //! --target x86_64-apple-darwin`.
 
+use core::time::Duration;
+
 use log::info;
 use mtld3d_shared::{
     log_once_warn,
@@ -234,6 +236,18 @@ pub struct Mtld3dConfig {
     /// otherwise-unthrottled free-run. `0` = uncapped. Default: `0`.
     /// File key: `present.maxFps`.
     pub present_max_fps: u32,
+    /// How many frames the API thread may run ahead of the submit thread.
+    ///
+    /// `1` (the default) lets `Present` return once the frame is queued for
+    /// the encoder, so encoding, submission and the drawable wait overlap the
+    /// game's next frame. `0` makes `Present` wait until the frame's
+    /// `SubmitFrame` has returned, drawable wait included: nothing is then
+    /// queued behind the display when the game asks for a synchronous
+    /// read-back (a back-buffer `LockRect`, `GetRenderTargetData`), so that
+    /// read-back waits for pending GPU work rather than for drawables. Costs
+    /// the overlap, which on Apple silicon is well under a millisecond per
+    /// frame. File key: `present.renderAhead`.
+    pub present_render_ahead: u8,
     /// Render resolution as a percentage of the reported back buffer, `MetalFX`-upscaled.
     ///
     /// `100` (the default) renders at the size the game sees, which is an
@@ -318,6 +332,46 @@ impl CursorScale {
     }
 }
 
+impl Mtld3dConfig {
+    /// The vsync request and frame-rate cap the unix side throttles presents by.
+    ///
+    /// Under `present.renderAhead = 0` the API thread paces itself (see
+    /// [`Self::present_pace_period`]), so the unix side must not hold drawables to
+    /// a cadence of its own: both go out as off, whatever the game or
+    /// `present.maxFps` asked for. Otherwise the request and the cap pass through.
+    #[must_use]
+    pub const fn unix_present_pacing(&self, display_sync_requested: bool) -> (bool, u32) {
+        if self.present_render_ahead == 0 {
+            (false, 0)
+        } else {
+            (display_sync_requested, self.present_max_fps)
+        }
+    }
+
+    /// The period the API thread paces `Present` to under `present.renderAhead = 0`.
+    ///
+    /// Mirrors the throttle the unix side applies otherwise: a vsync request paces
+    /// to the panel's maximum rate (`panel_hz`, as the display sinks last published
+    /// it, `0` = unknown), `present.maxFps` caps that, and the lower rate wins.
+    /// `None` when nothing paces: render-ahead is on, the game asked for vsync off
+    /// with no cap set, or the panel rate is unknown with no cap set. The API
+    /// thread then free-runs.
+    #[must_use]
+    pub fn present_pace_period(&self, panel_hz: u32, vsync_requested: bool) -> Option<Duration> {
+        if self.present_render_ahead != 0 {
+            return None;
+        }
+        let panel = if vsync_requested { panel_hz } else { 0 };
+        let rate = match (panel, self.present_max_fps) {
+            (0, 0) => return None,
+            (0, cap) => cap,
+            (hz, 0) => hz,
+            (hz, cap) => hz.min(cap),
+        };
+        Some(Duration::from_secs_f64(1.0 / f64::from(rate)))
+    }
+}
+
 impl Default for Mtld3dConfig {
     fn default() -> Self {
         Self {
@@ -349,6 +403,7 @@ impl Default for Mtld3dConfig {
             },
             pagebox_pool_cap_bytes: DEFAULT_PAGEBOX_POOL_CAP_BYTES,
             present_max_fps: 0,
+            present_render_ahead: 1,
             render_scale_percent: 100,
             render_lod_bias: true,
             adapter_spoof: AdapterSpoof::None,
@@ -514,6 +569,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: present.renderAhead = {}", cfg.present_render_ahead
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: render.scale = {}",
         f64::from(cfg.render_scale_percent) / 100.0
     );
@@ -586,6 +645,9 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
             assign_cap_mb(source, key, value, &mut cfg.pagebox_pool_cap_bytes);
         }
         "present.maxFps" => assign_max_fps(source, value, &mut cfg.present_max_fps),
+        "present.renderAhead" => {
+            assign_render_ahead(source, value, &mut cfg.present_render_ahead);
+        }
         "render.scale" => assign_render_scale(source, value, &mut cfg.render_scale_percent),
         "render.lodBias" => assign_bool(source, key, value, &mut cfg.render_lod_bias),
         "adapter.spoof" => assign_adapter_spoof(source, value, &mut cfg.adapter_spoof),
@@ -679,6 +741,19 @@ fn assign_max_fps(source: &str, value: &str, slot: &mut u32) {
         log_once_warn!(
             target: crate::LOG_TARGET,
             "{source}: 'present.maxFps = {value}' is not a non-negative integer (Hz) → kept {kept}",
+            kept = *slot
+        );
+    }
+}
+
+fn assign_render_ahead(source: &str, value: &str, slot: &mut u8) {
+    // Only the two depths the pipeline implements: overlap on, or off.
+    if let Ok(frames @ (0 | 1)) = value.parse::<u8>() {
+        *slot = frames;
+    } else {
+        log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{source}: 'present.renderAhead = {value}' is not 0 or 1 (frames) → kept {kept}",
             kept = *slot
         );
     }

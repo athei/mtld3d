@@ -6,13 +6,14 @@
 //! already carries (`SubmitFrame`, `DestroyCommandQueue`, `SetCursorOverlay`).
 //! Everything the display decides for that window lives on the record:
 //! whether the layer carries the HDR configuration, the live EDR headroom,
-//! the present throttle, the window's occlusion, the backing scale published
-//! to the PE side and the present-geometry streak. Several devices attached
+//! the present throttle, the window's occlusion, the backing scale and the
+//! panel's refresh rate published to the PE side and the present-geometry
+//! streak. Several devices attached
 //! at once each own their record, and one device's teardown touches only its
 //! own.
 //!
 //! Liveness. A record is live exactly while it is in [`ATTACHMENTS`]. The
-//! `view` and `layer` addresses and the two PE-side sink addresses a record
+//! `view` and `layer` addresses and the three PE-side sink addresses a record
 //! holds are valid only while it is live: `DestroyCommandQueue` unregisters
 //! the record before it releases the view, and the PE side drops the box
 //! behind the sinks after that thunk returns. So every dereference of one of
@@ -88,6 +89,8 @@ pub struct AttachLatches {
     pub backing_scale_sink: usize,
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
+    /// Address of the PE-side `AtomicU32` the panel's maximum refresh rate goes to, `0` = none.
+    pub panel_hz_sink: usize,
 }
 
 /// The display state of one attached metal view.
@@ -105,6 +108,8 @@ pub struct Attachment {
     backing_scale_sink: usize,
     /// See [`AttachLatches::cursor_kick_sink`].
     cursor_kick_sink: usize,
+    /// See [`AttachLatches::panel_hz_sink`].
+    panel_hz_sink: usize,
     flags: AttachFlags,
     color_space: ColorSpacePolicy,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
@@ -185,6 +190,7 @@ impl Attachment {
             layer,
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
+            panel_hz_sink: latches.panel_hz_sink,
             flags: latches.flags,
             color_space: latches.color_space,
             window: AtomicUsize::new(0),
@@ -490,6 +496,22 @@ pub fn publish_backing_scale(att: &Arc<Attachment>, scale: u32) {
     // in both images.
     let sink = unsafe { &*(att.backing_scale_sink as *const AtomicU32) };
     sink.store(scale, Ordering::Relaxed);
+}
+
+/// Publish the panel's maximum refresh rate into the record's PE-side sink, while live.
+///
+/// Same contract and ordering as [`publish_backing_scale`]: the PE side reads
+/// the word once per present to pace itself under `present.renderAhead = 0`.
+pub fn publish_panel_hz(att: &Arc<Attachment>, hz: u32) {
+    let map = lock();
+    if att.panel_hz_sink == 0 || !is_live(&map, att) {
+        return;
+    }
+    // SAFETY: as in `publish_backing_scale`: the PE side keeps an `AtomicU32` at
+    // this address until after the teardown thunk that unregisters this record
+    // has returned, and the record is live under the registry lock.
+    let sink = unsafe { &*(att.panel_hz_sink as *const AtomicU32) };
+    sink.store(hz, Ordering::Relaxed);
 }
 
 /// Ask every live device to re-apply its cursor through Wine.

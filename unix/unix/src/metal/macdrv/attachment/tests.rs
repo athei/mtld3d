@@ -50,6 +50,7 @@ fn latches(
         backing_scale,
         backing_scale_sink,
         cursor_kick_sink,
+        panel_hz_sink: 0,
     }
 }
 
@@ -192,6 +193,7 @@ fn each_record_seeds_its_own_defaults() {
             backing_scale: 2,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            panel_hz_sink: 0,
         },
     );
     assert_eq!(

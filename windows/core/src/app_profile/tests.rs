@@ -64,7 +64,10 @@ fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answer() {
         let profile = lookup(&id).expect("the wow profile matches");
         assert_eq!(profile.name(), "wow");
         assert!(!parse(None, "", None).query_flush_immediate);
-        assert!(parse(Some(profile), "", None).query_flush_immediate);
+        assert_eq!(parse(None, "", None).present_render_ahead, 1);
+        let profiled = parse(Some(profile), "", None);
+        assert!(profiled.query_flush_immediate);
+        assert_eq!(profiled.present_render_ahead, 0);
     }
     let nameless = AppIdentity::new("WoW.exe".to_owned(), None);
     assert!(lookup(&nameless).is_none());

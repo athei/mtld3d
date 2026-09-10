@@ -45,6 +45,7 @@ use mtld3d_core::{
     shader_compile_stats::{self, BurstTracker, CompileBucket},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
+    submit_gate::SubmitGate,
     upload_pass::UploadDecode,
     upload_recovery::{UploadFate, UploadRecoveryQueue},
     upload_redirty::{EmittedUpload, RedirtyEntry, RedirtyQueue, RedirtySubresource},
@@ -747,10 +748,12 @@ struct ReturnedPayload {
 fn submit_thread_main(
     work_rx: &mpsc::Receiver<SubmitPacket>,
     return_tx: &mpsc::Sender<ReturnedPayload>,
+    submitted: &SubmitGate,
 ) {
     mtld3d_shared::crumb::init();
     while let Ok(packet) = work_rx.recv() {
         mtld3d_shared::crumb!("phase:SubmitExec");
+        let seq = packet.params.submit_seq;
         let SubmitPacket {
             params,
             payload,
@@ -764,6 +767,7 @@ fn submit_thread_main(
         // The replay copied every `FrameData::scratch`-resident byte into
         // the command buffer at encode time, so the frame can drop now.
         drop(frame);
+        submitted.publish(seq);
         if return_tx
             .send(ReturnedPayload {
                 payload,
@@ -875,6 +879,8 @@ impl PsSamplerDecls {
 }
 
 pub struct FrameEncoder {
+    /// Highest seq whose `SubmitFrame` has returned, shared with the API thread's `Present`.
+    submitted: Arc<SubmitGate>,
     /// Pass-management state (passes, pending clears, current attachments).
     ///
     /// See `mtld3d_core::passes::PassState`.
@@ -1545,7 +1551,7 @@ pub struct RetiredColorTarget {
 }
 
 impl FrameEncoder {
-    fn new(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>) -> Self {
+    fn new(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>, submitted: Arc<SubmitGate>) -> Self {
         // Spawn the dedicated submit thread. It issues the `SubmitFrame`
         // thunk for `Async` frames so the unix command-walk + present
         // overlaps the encoder's next build. The work channel is cap-1 so
@@ -1558,11 +1564,13 @@ impl FrameEncoder {
         // thread it is never joined — Wine can report STATUS_INVALID_HANDLE
         // for the Win32 handle on long sessions — and it exits on its own
         // when the work channel closes at teardown.
+        let gate = Arc::clone(&submitted);
         thread::Builder::new()
             .name("mtld3d-submit".into())
-            .spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx))
+            .spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx, &gate))
             .expect("mtld3d: failed to spawn submit thread");
         Self {
+            submitted,
             pass_state: PassState::new(),
             last_bound: LastBoundCache::new(),
             lod_bias_table: sampler_state::LodBiasTableCache::new(),
@@ -8748,6 +8756,10 @@ impl FrameData {
 
 pub struct EncoderThread {
     sender: mpsc::SyncSender<EncoderMessage>,
+    /// Highest seq whose `SubmitFrame` has returned.
+    ///
+    /// `Present` waits on it under `present.renderAhead = 0`.
+    submitted: Arc<SubmitGate>,
     prewarm_tx: mpsc::SyncSender<PrewarmPayload>,
     handle: Option<thread::JoinHandle<()>>,
     /// The device capabilities the encoder was spawned with.
@@ -8809,12 +8821,15 @@ impl EncoderThread {
     pub fn spawn(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(1);
         let (prewarm_tx, prewarm_rx) = mpsc::sync_channel::<PrewarmPayload>(1);
+        let submitted = Arc::new(SubmitGate::new());
+        let gate = Arc::clone(&submitted);
         let handle = thread::Builder::new()
             .name("mtld3d-encoder".into())
-            .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps, config))
+            .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps, config, gate))
             .expect("mtld3d: failed to spawn encoder thread");
         Self {
             sender,
+            submitted,
             prewarm_tx,
             handle: Some(handle),
             gpu_caps,
@@ -8829,6 +8844,15 @@ impl EncoderThread {
 
     pub fn send_frame(&self, frame: FrameData) {
         let _ = self.sender.send(EncoderMessage::Frame(Box::new(frame)));
+    }
+
+    /// Block until the frame `seq` has been submitted, drawable wait included.
+    ///
+    /// `false` when `timeout` passes first, which only happens when the submit
+    /// thread is gone or a frame was dropped before reaching it.
+    #[must_use]
+    pub fn wait_submitted(&self, seq: u64, timeout: Duration) -> bool {
+        self.submitted.wait_for(seq, timeout)
     }
 
     /// Submit the passed frame synchronously.
@@ -9070,6 +9094,7 @@ fn encoder_thread_main(
     prewarm_rx: &mpsc::Receiver<PrewarmPayload>,
     gpu_caps: GpuCaps,
     config: Arc<Mtld3dConfig>,
+    submitted: Arc<SubmitGate>,
 ) {
     let apple = GpuCaps::apple_silicon_default();
     if !gpu_caps.unified_memory
@@ -9088,7 +9113,7 @@ fn encoder_thread_main(
             cfg.linear_align256,
         );
     }
-    let mut enc = FrameEncoder::new(gpu_caps, config);
+    let mut enc = FrameEncoder::new(gpu_caps, config, submitted);
     let mut frame_counter: u64 = 0;
     // Idempotent — also called from `lib.rs::init_logger` during
     // DllMain so the file is already mapped by the time we get here.
@@ -9249,10 +9274,11 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
     if let Some(enabled) = frame.apply_display_sync_enabled.take()
         && !frame.layer_handle.is_null()
     {
+        let (display_sync, max_fps) = enc.config().unix_present_pacing(enabled);
         let mut params = SetDisplaySyncEnabledParams {
             layer_handle: frame.layer_handle,
-            display_sync_enabled: u32::from(enabled),
-            max_fps: enc.config().present_max_fps,
+            display_sync_enabled: u32::from(display_sync),
+            max_fps,
         };
         unix_call(&mut params);
     }
@@ -9417,6 +9443,7 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
         (payload, status)
     };
     enc.last_submit_status = status;
+    enc.submitted.publish(frame.submit_seq);
     if status != 0 {
         error!(
             target: LOG_TARGET,

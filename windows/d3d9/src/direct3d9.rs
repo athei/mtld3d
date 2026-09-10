@@ -1674,7 +1674,8 @@ pub fn attach_metal_layer(
     cfg: &Mtld3dConfig,
     sinks: &crate::cursor::DisplaySinks,
 ) -> AttachMetalLayerParams {
-    let display_sync_enabled = crate::device::resolve_display_sync(pp.presentation_interval);
+    let display_sync_requested = crate::device::resolve_display_sync(pp.presentation_interval);
+    let (display_sync_enabled, max_fps) = cfg.unix_present_pacing(display_sync_requested);
     let mut layer_params = AttachMetalLayerParams {
         hwnd,
         device_handle,
@@ -1686,12 +1687,13 @@ pub fn attach_metal_layer(
         display_sync_enabled: u32::from(display_sync_enabled),
         hdr_enable: u32::from(cfg.hdr_enable),
         color_space: cfg.color_space,
-        max_fps: cfg.present_max_fps,
+        max_fps,
         metalfx_available: 0,
         backing_scale_ptr: sinks.backing_scale_ptr(),
         software_cursor: cfg.cursor_software,
         software_cursor_active: 0,
         cursor_kick_ptr: sinks.cursor_kick_ptr(),
+        panel_hz_ptr: sinks.panel_hz_ptr(),
     };
     if hwnd != 0 {
         unix_call(&mut layer_params);

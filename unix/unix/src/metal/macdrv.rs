@@ -558,9 +558,13 @@ fn layer_contents_scale(layer: *mut c_void) -> f64 {
 /// screen reports nothing usable (older macOS, a virtualised display), which
 /// [`min_present_duration`] reads as "no vsync throttle".
 fn screen_max_hz(screen: &objc2_app_kit::NSScreen) -> f64 {
+    f64::from(screen_max_hz_u32(screen))
+}
+
+/// [`screen_max_hz`] as the integer the PE-side pacing sink carries.
+fn screen_max_hz_u32(screen: &objc2_app_kit::NSScreen) -> u32 {
     let clamped = screen.maximumFramesPerSecond().clamp(0, 1000);
-    let as_u32 = u32::try_from(clamped).expect("clamped above to [0, 1000]");
-    f64::from(as_u32)
+    u32::try_from(clamped).expect("clamped above to [0, 1000]")
 }
 
 /// Everything the PE side's `AttachMetalLayer` request carries in.
@@ -589,6 +593,8 @@ pub struct LayerAttachRequest {
     pub backing_scale_sink_ptr: u64,
     /// Where a cursor re-apply request is written on the PE side, `0` = nowhere.
     pub cursor_kick_sink_ptr: u64,
+    /// Address of the PE-side `AtomicU32` the panel's maximum refresh rate is published into.
+    pub panel_hz_sink_ptr: u64,
     /// `cursor.software`, resolved here against the layer mode attach picks.
     pub software_cursor: SoftwareCursorPolicy,
 }
@@ -695,6 +701,8 @@ struct DisplayHint {
     /// virtualised display). Drives the present-throttle duration computed
     /// at attach.
     panel_max_hz: f64,
+    /// [`screen_max_hz`] as the integer published to the PE-side pacing sink.
+    panel_hz: u32,
 }
 
 type GetWinDataFn = unsafe extern "C" fn(*mut c_void) -> *mut MacdrvWinData;
@@ -843,6 +851,7 @@ pub fn attach_metal_layer(
         color_space,
         backing_scale_sink_ptr,
         cursor_kick_sink_ptr,
+        panel_hz_sink_ptr,
         software_cursor,
     } = request;
     if hwnd == 0 || device_handle.is_null() {
@@ -924,9 +933,12 @@ pub fn attach_metal_layer(
                         .expect("PE wire pointer fits host address space (unix is 64-bit)"),
                     cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
                         .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+                    panel_hz_sink: usize::try_from(panel_hz_sink_ptr)
+                        .expect("PE wire pointer fits host address space (unix is 64-bit)"),
                 },
             );
             attachment::publish_backing_scale(&att, backing_scale);
+            attachment::publish_panel_hz(&att, hint.panel_hz);
             // The software cursor rides the same decision: the overlay window
             // is a compositing cost an EDR layer already pays.
             let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
@@ -1280,6 +1292,7 @@ fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> Display
     // The panel ceiling drives the present-throttle duration computed at
     // attach; a display move re-derives it from the same helper.
     let panel_max_hz = screen.as_deref().map_or(0.0_f64, screen_max_hz);
+    let panel_hz = screen.as_deref().map_or(0, screen_max_hz_u32);
     let mut colorspace_flags = ColorspaceFlags::empty();
     colorspace_flags.set(ColorspaceFlags::IS_HDR, colorspace_is_hdr);
     colorspace_flags.set(ColorspaceFlags::IS_WIDE_GAMUT, colorspace_is_wide_gamut);
@@ -1290,6 +1303,7 @@ fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> Display
         screen_profile_name,
         colorspace_flags,
         panel_max_hz,
+        panel_hz,
     }
 }
 
@@ -1877,10 +1891,11 @@ fn follow_screen_layer_mode(
 /// at attach and at every Reset.
 ///
 /// A session that stays on one display derives the duration it already has,
-/// and nothing is stored or logged.
+/// and nothing but the panel rate's sink word is stored or logged.
 fn follow_screen_present_throttle(att: &Arc<Attachment>, screen: &objc2_app_kit::NSScreen) {
     let pacing = unpack_pacing(att.pacing_bits());
     let panel_max_hz = screen_max_hz(screen);
+    attachment::publish_panel_hz(att, screen_max_hz_u32(screen));
     let applied = att.min_present_duration_sec();
     let Some(seconds) = min_present_duration_change(applied, panel_max_hz, &pacing) else {
         return;

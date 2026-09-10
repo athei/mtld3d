@@ -345,6 +345,8 @@ pub struct DisplaySinks {
     /// `WM_SETCURSOR` or `ShowCursor(TRUE)` and answers it with the
     /// null-then-set kick.
     cursor_kick: AtomicU32,
+    /// The panel's maximum refresh rate in Hz as the unix side last published; `0` until known.
+    panel_hz: AtomicU32,
 }
 
 impl DisplaySinks {
@@ -352,6 +354,7 @@ impl DisplaySinks {
         Self {
             backing_scale: AtomicU32::new(0),
             cursor_kick: AtomicU32::new(0),
+            panel_hz: AtomicU32::new(0),
         }
     }
 
@@ -363,6 +366,16 @@ impl DisplaySinks {
     /// The address `AttachMetalLayerParams::cursor_kick_ptr` carries.
     pub fn cursor_kick_ptr(&self) -> u64 {
         (&raw const self.cursor_kick) as u64
+    }
+
+    /// The address `AttachMetalLayerParams::panel_hz_ptr` carries.
+    pub fn panel_hz_ptr(&self) -> u64 {
+        (&raw const self.panel_hz) as u64
+    }
+
+    /// The panel's maximum refresh rate as last published, `0` before attach published one.
+    pub fn display_panel_hz(&self) -> u32 {
+        self.panel_hz.load(Ordering::Relaxed)
     }
 
     /// Wine's retina factor as last published, or `None` before attach published one.

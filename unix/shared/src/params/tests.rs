@@ -37,7 +37,7 @@ fn attach_metal_layer_layout() {
     // = 16 + 8 + 16 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 8 = 88 (the 4-byte
     // fields pair up on both sides of each u64, so nothing needs a pad).
     assert_eq!(core::mem::align_of::<AttachMetalLayerParams>(), 8);
-    assert_eq!(core::mem::size_of::<AttachMetalLayerParams>(), 88);
+    assert_eq!(core::mem::size_of::<AttachMetalLayerParams>(), 96);
 }
 
 #[test]

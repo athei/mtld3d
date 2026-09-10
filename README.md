@@ -52,9 +52,11 @@ can also be set at launch through the `MTLD3D_CONFIG` environment variable,
 which wins over the file. Keys worth knowing by name: `render.scale` renders
 at a fraction of the presented size and lets MetalFX upscale (with
 `render.lodBias` keeping texture detail at the presented size), `present.maxFps`
-caps the frame rate, and `color.hdr.enable` and `cursor.software` govern the
-HDR present path and the cursor overlay that comes with it, both on by default
-on a display with EDR headroom.
+caps the frame rate, `present.renderAhead` trades the frame of render-ahead for
+synchronous back-buffer read-backs that cost milliseconds instead of display
+intervals, and `color.hdr.enable` and `cursor.software` govern the HDR present
+path and the cursor overlay that comes with it, both on by default on a display
+with EDR headroom.
 
 Below the file and the environment sits a third layer. A few games need
 options nobody should have to discover, so mtld3d ships profiles for them,

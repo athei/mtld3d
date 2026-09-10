@@ -45,7 +45,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
-    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
+    assert!(core::mem::size_of::<AttachMetalLayerParams>() == 96);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
@@ -247,6 +247,14 @@ pub struct AttachMetalLayerParams {
     /// and the pointer's return concerns each of them. Same backing contract
     /// as `backing_scale_ptr`. `0` disables it.
     pub cursor_kick_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
+    /// Address of a PE-side `AtomicU32` that receives the panel's maximum refresh rate in Hz.
+    ///
+    /// Written at attach and again whenever the display-follow reconciliation
+    /// finds the window on another panel, so the API thread's own pacing under
+    /// `present.renderAhead = 0` follows the display the way the present
+    /// throttle does. The value is `0` where the screen reports nothing usable.
+    /// Same backing contract as `backing_scale_ptr`; `0` as an address disables it.
+    pub panel_hz_ptr: u64, // in: *const AtomicU32 (device-owned box, stable address)
 }
 
 impl Thunk for AttachMetalLayerParams {

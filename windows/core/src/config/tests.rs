@@ -114,6 +114,75 @@ fn present_max_fps_garbage_keeps_default() {
 }
 
 #[test]
+fn present_render_ahead_zero_parses() {
+    let cfg = parse(None, "present.renderAhead = 0\n", None);
+    assert_eq!(cfg.present_render_ahead, 0);
+}
+
+#[test]
+fn present_render_ahead_defaults_to_one_frame() {
+    let cfg = parse(None, "present.maxFps = 0\n", None);
+    assert_eq!(cfg.present_render_ahead, 1);
+}
+
+#[test]
+fn unix_present_pacing_passes_through_with_render_ahead() {
+    let cfg = parse(None, "present.maxFps = 90\n", None);
+    assert_eq!(cfg.unix_present_pacing(true), (true, 90));
+    assert_eq!(cfg.unix_present_pacing(false), (false, 90));
+}
+
+#[test]
+fn unix_present_pacing_is_off_under_zero_render_ahead() {
+    let cfg = parse(None, "present.renderAhead = 0\npresent.maxFps = 90\n", None);
+    assert_eq!(cfg.unix_present_pacing(true), (false, 0));
+}
+
+#[test]
+fn present_pace_period_is_off_with_render_ahead() {
+    let cfg = parse(None, "present.maxFps = 120\n", None);
+    assert_eq!(cfg.present_pace_period(120, true), None);
+}
+
+#[test]
+fn present_pace_period_follows_the_panel_under_vsync() {
+    let cfg = parse(None, "present.renderAhead = 0\n", None);
+    let period = cfg
+        .present_pace_period(144, true)
+        .expect("paced to the panel");
+    assert!((period.as_secs_f64() - 1.0 / 144.0).abs() < 1e-9);
+    assert_eq!(cfg.present_pace_period(0, true), None);
+    assert_eq!(cfg.present_pace_period(144, false), None);
+}
+
+#[test]
+fn present_pace_period_takes_the_lower_of_panel_and_cap() {
+    let cfg = parse(None, "present.renderAhead = 0\npresent.maxFps = 60\n", None);
+    let capped = cfg.present_pace_period(120, true).expect("capped");
+    assert!((capped.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
+    let cap_alone = cfg.present_pace_period(120, false).expect("cap alone");
+    assert!((cap_alone.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
+    let panel_lower = parse(
+        None,
+        "present.renderAhead = 0\npresent.maxFps = 240\n",
+        None,
+    )
+    .present_pace_period(120, true)
+    .expect("panel lower than cap");
+    assert!((panel_lower.as_secs_f64() - 1.0 / 120.0).abs() < 1e-9);
+}
+
+#[test]
+fn present_render_ahead_out_of_range_keeps_default() {
+    let cfg = parse(
+        None,
+        "present.renderAhead = 2\npresent.renderAhead = deep\n",
+        None,
+    );
+    assert_eq!(cfg.present_render_ahead, 1);
+}
+
+#[test]
 fn render_scale_float_becomes_a_percentage() {
     assert_eq!(
         parse(None, "render.scale = 0.5\n", None).render_scale_percent,

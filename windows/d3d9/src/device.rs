@@ -1,7 +1,10 @@
 use core::{ffi::c_void, mem::MaybeUninit, ops::DerefMut, ptr::NonNull};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use log::{debug, error, info, trace, warn};
@@ -30,6 +33,7 @@ use mtld3d_core::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
     },
+    present_pacer::PresentPacer,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
@@ -310,8 +314,20 @@ bitflags::bitflags! {
         /// already captured and is about to release, so the resize path
         /// checks this and stands down.
         const RELEASING = 1 << 3;
+        /// Whether the game's `PresentationInterval` asks for vsync, as created or last `Reset`.
+        ///
+        /// Read by the `present.renderAhead = 0` pacing, which follows the panel
+        /// only under a vsync request and free-runs otherwise.
+        const VSYNC_REQUESTED = 1 << 4;
     }
 }
+
+/// How long `Present` waits for its own frame's submit under `present.renderAhead = 0`.
+///
+/// A bound, not a budget: a healthy frame is submitted within one display
+/// interval, and the only way to reach this is a submit thread that has gone
+/// away or a frame that never reached it, both of which must not hang the game.
+const RENDER_AHEAD_WAIT_MS: u64 = 250;
 
 pub struct DeviceInner {
     // Metal handles / presentation.
@@ -734,6 +750,8 @@ pub struct DeviceInner {
     /// post-burst frames never pay a realloc. Monotonically grows;
     /// memory cost = peak × `size_of::<Op>()`.
     peak_ops_count: usize,
+    /// The `present.renderAhead = 0` cadence: next deadline and last reported decision.
+    pacer: PresentPacer,
 }
 
 /// Per-RS-index dirty mask.
@@ -1815,8 +1833,78 @@ impl DeviceInner {
         // when it drops at end of scope.
         let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         self.encoder.send_frame(frame);
+        // Zero render-ahead: hold the API thread until this frame's `SubmitFrame`
+        // has returned, drawable wait included, so a mid-frame read-back in the
+        // next frame finds nothing queued behind the display. Counted as the
+        // present stall it is.
+        if self.config.present_render_ahead == 0
+            && !self
+                .encoder
+                .wait_submitted(seq, Duration::from_millis(RENDER_AHEAD_WAIT_MS))
+        {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present.renderAhead=0: frame seq={seq} was not submitted within \
+                 {RENDER_AHEAD_WAIT_MS} ms; continuing without the wait"
+            );
+        }
+        if self.config.present_render_ahead == 0 {
+            let panel_hz = self.cursor.sinks().display_panel_hz();
+            let vsync_requested = self.flags.contains(DeviceFlags::VSYNC_REQUESTED);
+            let period = self.config.present_pace_period(panel_hz, vsync_requested);
+            self.log_pace_change(period, panel_hz);
+            if let Some(period) = period {
+                self.pace_present(period);
+            }
+        }
         self.frame_dump_present(crate::capture::take_request(), seq);
         self.mem_watch_present();
+    }
+
+    /// Log the pacing decision when it changes: at the first frame, a display move, a `Reset`.
+    fn log_pace_change(&mut self, period: Option<Duration>, panel_hz: u32) {
+        if !self.pacer.report_changed(period) {
+            return;
+        }
+        let vsync_requested = self.flags.contains(DeviceFlags::VSYNC_REQUESTED);
+        match period.map(|p| 1.0 / p.as_secs_f64()) {
+            Some(hz) => info!(
+                target: LOG_TARGET,
+                "present: renderAhead=0, pacing Present at {hz:.2} Hz (panel {panel_hz} Hz, \
+                 cap {} Hz, vsync requested {})",
+                self.config.present_max_fps,
+                vsync_requested,
+            ),
+            None => info!(
+                target: LOG_TARGET,
+                "present: renderAhead=0, free-running (panel {panel_hz} Hz, cap {} Hz, vsync \
+                 requested {})",
+                self.config.present_max_fps,
+                vsync_requested,
+            ),
+        }
+    }
+
+    /// Hold `Present` to `period`, the pacing that replaces the drawable throttle.
+    ///
+    /// Under `present.renderAhead = 0` the unix side presents free-running, so the
+    /// cadence has to come from here. Sleeps to within a millisecond of the
+    /// deadline and spins the rest, because the scheduler's granularity is coarser
+    /// than the slack a 120 Hz frame leaves. A frame that overran restarts the
+    /// cadence from now rather than catching up, so one long frame costs one.
+    fn pace_present(&mut self, period: Duration) {
+        let now = Instant::now();
+        let Some(deadline) = self.pacer.deadline(now, period) else {
+            return;
+        };
+        if let Some(coarse) = (deadline - now).checked_sub(Duration::from_millis(1))
+            && !coarse.is_zero()
+        {
+            std::thread::sleep(coarse);
+        }
+        while Instant::now() < deadline {
+            core::hint::spin_loop();
+        }
     }
 
     pub fn perf_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
@@ -2382,8 +2470,9 @@ impl DeviceInner {
     /// Drained by `fresh_frame`. Spec-compliant timing — a synchronous
     /// layer-property write from the API thread races the encoder's
     /// in-flight submission.
-    pub const fn queue_display_sync_change(&mut self, enabled: bool) {
+    pub fn queue_display_sync_change(&mut self, enabled: bool) {
         self.pending_display_sync_enabled = Some(enabled);
+        self.flags.set(DeviceFlags::VSYNC_REQUESTED, enabled);
     }
 
     /// Drive the encoder thread to run `reset_cleanup`.
@@ -2753,7 +2842,11 @@ impl Direct3DDevice9 {
             backbuffer_sample_count: info.backbuffer_sample_count,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
-            flags: DeviceFlags::empty(),
+            flags: if resolve_display_sync(info.present_params.presentation_interval) {
+                DeviceFlags::VSYNC_REQUESTED
+            } else {
+                DeviceFlags::empty()
+            },
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
@@ -2827,6 +2920,7 @@ impl Direct3DDevice9 {
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
             peak_ops_count: 0,
+            pacer: PresentPacer::new(),
         }));
         Self {
             vtbl: &raw const DIRECT3D_DEVICE9_VTBL,

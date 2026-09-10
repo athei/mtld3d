@@ -65,13 +65,23 @@ static PROFILES: &[AppProfile] = &[
     // spec-correct wait only costs them seconds per load; the immediate answer
     // keeps that time and changes nothing they render. The sun and moon lens
     // flares read their queries without FLUSH and still get the real counts.
+    //
+    // Every newly targeted unit renders its portrait into the back buffer and
+    // reads the whole buffer back through a READONLY `LockRect`. That read-back
+    // has to drain whatever runs ahead of it, and with the drawable throttle
+    // pacing a render-ahead pipeline the drain is three to four display
+    // intervals: a 47 ms frame at 120 Hz, measured, on every new target. With
+    // no render-ahead the same read-back costs the pending GPU work and the
+    // copy, 12 to 20 ms frames, and the frame rate is unchanged because the
+    // encode and submit stages this gives up overlap for take well under a
+    // millisecond a frame.
     AppProfile {
         name: "wow",
         exe: "WoW.exe",
         company: Some("Blizzard Entertainment"),
         product: Some("World of Warcraft"),
         original_filename: None,
-        settings: "query.flushImmediate=true",
+        settings: "query.flushImmediate=true;present.renderAhead=0",
     },
 ];
 

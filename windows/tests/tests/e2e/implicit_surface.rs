@@ -238,3 +238,34 @@ fn implicit_depth_stencil_is_cached() {
         "GetDepthStencilSurface must return the one cached implicit surface"
     );
 }
+
+#[test]
+fn back_buffer_read_back_under_zero_render_ahead_shows_the_frame_in_progress() {
+    // `present.renderAhead = 0` makes `Present` wait for its own frame's submit,
+    // so a read-back in the next frame meets an empty pipeline and waits only
+    // for pending GPU work. What it reads has to be this frame's draws over the
+    // presented frame, and again after the next `Present` has waited.
+    const FIRST: u32 = 0xFF80_2010;
+    const SECOND: u32 = 0xFF10_60C0;
+    let h = Harness::with_config("present.renderAhead=0");
+    assert_eq!(h.clear_target(FIRST), 0, "clear the first frame");
+    assert_eq!(h.present(), D3D_OK, "present the first frame");
+    assert_eq!(h.clear_target(SECOND), 0, "clear the second frame");
+    let backbuffer = h.back_buffer(0);
+    {
+        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.as_u32(1)[0],
+            SECOND,
+            "the read-back shows the frame in progress, not the presented one"
+        );
+    }
+    assert_eq!(h.present(), D3D_OK, "present the second frame");
+    assert_eq!(h.clear_target(FIRST), 0, "clear the third frame");
+    let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+    assert_eq!(
+        locked.as_u32(1)[0],
+        FIRST,
+        "the read-back after a paced Present shows the third frame"
+    );
+}
