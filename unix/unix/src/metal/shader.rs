@@ -12,6 +12,9 @@ use crate::{
     metal::handle::{IntoRetained, ReleaseRetain},
 };
 
+#[cfg(test)]
+mod tests;
+
 /// Compile MSL source text into a library and resolve a single entry point.
 ///
 /// `entry` is the function name to look up via `newFunctionWithName:` and
@@ -30,7 +33,10 @@ pub fn compile_shader_library(
     msl: &str,
     stage_tag: StageTag,
     entry: &str,
+    timings: &mut mtld3d_shared::perf::ShaderTimings,
 ) -> Option<(MetalHandle<MTLLibraryKind>, MetalHandle<MTLFunctionKind>)> {
+    timings.reset();
+    let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
     let device = device_handle.into_retained()?;
 
     let source = objc2_foundation::NSString::from_str(msl);
@@ -58,7 +64,11 @@ pub fn compile_shader_library(
         StageTag::Vertex => options.setMathMode(MTLMathMode::Safe),
         StageTag::Fragment => options.setMathMode(MTLMathMode::Fast),
     }
-    let library = match device.newLibraryWithSource_options_error(&source, Some(&options)) {
+    drop(preparation);
+    let compile = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.library_ns);
+    let compiled = device.newLibraryWithSource_options_error(&source, Some(&options));
+    drop(compile);
+    let library = match compiled {
         Ok(lib) => lib,
         Err(e) => {
             error!(target: LOG_TARGET, "shader compilation failed: {e}");
@@ -66,6 +76,7 @@ pub fn compile_shader_library(
         }
     };
 
+    let function = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.function_ns);
     let name = objc2_foundation::NSString::from_str(entry);
     // `setLabel` makes the per-shader entry name surface in Xcode views
     // that show the library/object identity rather than the function-source
@@ -73,7 +84,9 @@ pub fn compile_shader_library(
     // the resource browser. Same string as the function name keeps
     // captures self-consistent across all Xcode tabs.
     library.setLabel(Some(&name));
-    let func = library.newFunctionWithName(&name)?;
+    let resolved = library.newFunctionWithName(&name);
+    drop(function);
+    let func = resolved?;
 
     // SAFETY: `Retained::into_raw` transfers the canonical retain into the
     // typed library handle.

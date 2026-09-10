@@ -103,6 +103,8 @@ endif
 ifeq ($(PERF),1)
 export MTLD3D_PERF := 1
 $(info ==> PERF=1: cfg(perf_tracking) compile-time perf telemetry enabled)
+else ifeq ($(PERF),0)
+export MTLD3D_PERF := 0
 endif
 
 # Frame pointers are opt-in: the toolchain default decides for a normal build,

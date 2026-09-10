@@ -1682,7 +1682,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         ps_color_out_mask,
         sample_count: enc.current_color_sample_count(),
     };
-    let pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref);
+    let pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
     if pipeline == 0 {
         // Pipeline build failed — e.g. a vertex-declaration/shader attribute
         // mismatch (a shader reads `v0` the bound decl never supplies) or a
@@ -1701,7 +1701,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let snapshot = render_state
             .depth_stencil_state
             .gated_on_stencil_attachment(has_stencil);
-        enc.get_or_create_depth_stencil(&snapshot)
+        enc.get_or_create_depth_stencil(&snapshot, true)
     } else {
         0
     };

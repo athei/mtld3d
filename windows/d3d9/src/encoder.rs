@@ -35,7 +35,9 @@ use mtld3d_core::{
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
-        PairShaderId, PairStatsSample, TaskFaults, perf_enabled,
+        PairShaderId, PairStatsSample, TaskFaults,
+        compilation::{Identity as CompileIdentity, Kind as CompileKind},
+        perf_enabled,
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
     render_scale::RenderScale,
@@ -69,6 +71,7 @@ use mtld3d_shared::{
         MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLSamplerStateKind,
         MTLTextureKind, NSViewKind,
     },
+    perf::{NanosSetTimer, ShaderTimings},
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
@@ -4467,7 +4470,7 @@ impl FrameEncoder {
         // below is actually emitted (the clear-quad cross-pass rule).
         self.reset_last_bound_for_fresh_encoder();
 
-        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert(), false);
         if self.last_bound.pipeline_changed(pipeline) {
             self.pass_state
                 .emit_command(Command::set_render_pipeline_state(pipeline));
@@ -4710,7 +4713,7 @@ impl FrameEncoder {
             }
             return;
         }
-        let depth_state = self.get_or_create_depth_stencil(&snapshot);
+        let depth_state = self.get_or_create_depth_stencil(&snapshot, false);
         // `Clear`'s Z is a raw depth value: D3D9's `MinZ`/`MaxZ` scale a
         // transformed vertex's z, not a clear. The quad writes its value as
         // the vertex's clip-space z, so Metal's viewport depth transform would
@@ -4833,7 +4836,7 @@ impl FrameEncoder {
         // Color clear doesn't write depth: bind a no-write depth-stencil
         // state so a transient color clear over an in-use depth
         // attachment doesn't perturb depth values.
-        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert());
+        let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert(), false);
         // Color: write rgba as float4 via setFragmentBytes. The caller
         // (`device_clear` → `clear_color`/`clear_color_rects`) passes each
         // channel as f32 BITS, exactly like the folded load-action clear
@@ -5137,15 +5140,39 @@ impl FrameEncoder {
     // ── D3D9→Metal translation + caching (runs on encoder thread) ──
 
     /// Look up or create an `MTLDepthStencilState` for the given D3D9 state.
-    pub fn get_or_create_depth_stencil(&mut self, snapshot: &DepthStencilSnapshot) -> u64 {
+    pub fn get_or_create_depth_stencil(
+        &mut self,
+        snapshot: &DepthStencilSnapshot,
+        draw_phase: bool,
+    ) -> u64 {
         let key = key_from_snapshot(snapshot);
         if let Some(&handle) = self.depth_stencil_cache.get(&key) {
             return handle.raw();
         }
 
+        let mut ns = 0;
+        let timer = NanosSetTimer::start(if draw_phase {
+            &raw mut ns
+        } else {
+            core::ptr::null_mut()
+        });
         let mut params = params_from_snapshot(snapshot, key, self.device_handle);
         let status = unix_call(&mut params);
         let state = params.state_handle;
+        drop(timer);
+        if draw_phase {
+            let device = self.device_handle.raw();
+            self.perf.compilation_mut().record(
+                CompileKind::Depth,
+                ns,
+                status == 0 && !state.is_null(),
+                self.current_submit_seq,
+                || CompileIdentity::Depth {
+                    device,
+                    key: key.raw(),
+                },
+            );
+        }
         if status != 0 || state.is_null() {
             error!(target: LOG_TARGET, "encoder: CreateDepthStencilState failed");
             return 0;
@@ -5397,66 +5424,121 @@ impl FrameEncoder {
         if let Some(&handles) = self.lib_cache.get(&disk_key) {
             return Some(handles);
         }
-        let kind = match source {
-            VsSource::Programmable { vs_id, .. } => {
-                let major = self.program_cache.get(vs_id).map_or(0, |p| p.major);
-                CachedKind::from_programmable(major, false)
-            }
-            VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
-        };
-        let entry_name = vs_entry_name(source, &self.program_cache, disk_key);
-        let started = Instant::now();
-        let (msl, bucket) = match source {
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => {
-                let Some(program) = self.program_cache.get(vs_id) else {
-                    error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
-                    return None;
-                };
-                let bucket = CompileBucket::from_sm_major(program.major);
-                let msl = match emit_vs_programmable_named(
-                    program,
-                    &entry_name,
-                    *provided_input_mask,
-                    *clip_plane_count,
-                    *sampler_kinds,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
+        let mut total_ns = 0;
+        let mut emit_ns = 0;
+        let mut persist_ns = 0;
+        let mut timings = ShaderTimings::new();
+        let total_timer = NanosSetTimer::start(&raw mut total_ns);
+        let result = (|| {
+            let kind = match source {
+                VsSource::Programmable { vs_id, .. } => {
+                    let major = self.program_cache.get(vs_id).map_or(0, |p| p.major);
+                    CachedKind::from_programmable(major, false)
+                }
+                VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
+            };
+            let entry_name = vs_entry_name(source, &self.program_cache, disk_key);
+            let started = Instant::now();
+            let emission = NanosSetTimer::start(&raw mut emit_ns);
+            let (msl, bucket) = match source {
+                VsSource::Programmable {
+                    vs_id,
+                    provided_input_mask,
+                    clip_plane_count,
+                    sampler_kinds,
+                    ..
+                } => {
+                    let Some(program) = self.program_cache.get(vs_id) else {
+                        error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
                         return None;
-                    }
-                };
-                (msl, bucket)
+                    };
+                    let bucket = CompileBucket::from_sm_major(program.major);
+                    let msl = match emit_vs_programmable_named(
+                        program,
+                        &entry_name,
+                        *provided_input_mask,
+                        *clip_plane_count,
+                        *sampler_kinds,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
+                            return None;
+                        }
+                    };
+                    (msl, bucket)
+                }
+                VsSource::FixedFunction { key, .. } => {
+                    mtld3d_shared::crumb!(
+                        "ffvs:emit",
+                        self.current_submit_seq,
+                        u64::from(key.tex_coord_count),
+                    );
+                    (emit_vs_ff_named(key, &entry_name), Some(CompileBucket::Ff))
+                }
+            };
+            drop(emission);
+            if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
+                let tag = shader_source_tag_vs(source);
+                trace!(target: MSL_TRACE_TARGET, "── VS MSL {tag} ──\n{msl}\n── /VS MSL {tag} ──");
             }
-            VsSource::FixedFunction { key, .. } => {
-                mtld3d_shared::crumb!(
-                    "ffvs:emit",
-                    self.current_submit_seq,
-                    u64::from(key.tex_coord_count),
-                );
-                (emit_vs_ff_named(key, &entry_name), Some(CompileBucket::Ff))
+            let handles = compile_stage_library(
+                self.device_handle,
+                StageTag::Vertex,
+                &msl,
+                &entry_name,
+                &mut timings,
+            )?;
+            if let Some(b) = bucket {
+                shader_compile_stats::record(b, started.elapsed());
             }
+            if let Some(kind) = kind
+                && self.flags.contains(FrameEncoderFlags::CACHE_READY)
+                && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
+            {
+                let _persist = NanosSetTimer::start(&raw mut persist_ns);
+                self.cache_write_record(kind, disk_key, &msl);
+            }
+            self.lib_cache.insert(disk_key, handles);
+            Some(handles)
+        })();
+        drop(total_timer);
+        let device = self.device_handle.raw();
+        let seq = self.current_submit_seq;
+        let identity = || CompileIdentity::Shader {
+            device,
+            stage: "VS",
+            shader: PairShaderId {
+                is_programmable: matches!(source, VsSource::Programmable { .. }),
+                hash: disk_key,
+            },
         };
-        if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
-            let tag = shader_source_tag_vs(source);
-            trace!(target: MSL_TRACE_TARGET, "── VS MSL {tag} ──\n{msl}\n── /VS MSL {tag} ──");
+        let perf = self.perf.compilation_mut();
+        perf.record(
+            CompileKind::ShaderVs,
+            total_ns,
+            result.is_some(),
+            seq,
+            identity,
+        );
+        perf.record(
+            CompileKind::EmitVs,
+            emit_ns,
+            timings.preparation_ns != 0 || result.is_some(),
+            seq,
+            identity,
+        );
+        perf.shader_parts(&timings, result.is_some(), seq, identity);
+        if persist_ns != 0 {
+            perf.record(
+                CompileKind::CacheWrite,
+                persist_ns,
+                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
+                seq,
+                identity,
+            );
         }
-        let handles =
-            compile_stage_library(self.device_handle, StageTag::Vertex, &msl, &entry_name)?;
-        if let Some(b) = bucket {
-            shader_compile_stats::record(b, started.elapsed());
-        }
-        if let Some(kind) = kind {
-            self.cache_write_record(kind, disk_key, &msl);
-        }
-        self.lib_cache.insert(disk_key, handles);
-        Some(handles)
+        result
     }
 
     /// Resolve the PS library for a draw.
@@ -5511,50 +5593,105 @@ impl FrameEncoder {
         if let Some(&handles) = self.lib_cache.get(&disk_key) {
             return Some(handles);
         }
-        let kind = match source {
-            PsSource::Programmable { ps_id, .. } => {
-                let major = self.program_cache.get(ps_id).map_or(0, |p| p.major);
-                CachedKind::from_programmable(major, true)
-            }
-            PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
-        };
-        let entry_name = ps_entry_name(source, &self.program_cache, disk_key);
-        let started = Instant::now();
-        let (msl, bucket) = match source {
-            PsSource::Programmable { ps_id, .. } => {
-                let Some(program) = self.program_cache.get(ps_id) else {
-                    error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
-                    return None;
-                };
-                let bucket = CompileBucket::from_sm_major(program.major);
-                let msl = match emit_ps_programmable_named(program, variant, &entry_name) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(target: LOG_TARGET, "emit_ps_programmable failed: {e:?}");
+        let mut total_ns = 0;
+        let mut emit_ns = 0;
+        let mut persist_ns = 0;
+        let mut timings = ShaderTimings::new();
+        let total_timer = NanosSetTimer::start(&raw mut total_ns);
+        let result = (|| {
+            let kind = match source {
+                PsSource::Programmable { ps_id, .. } => {
+                    let major = self.program_cache.get(ps_id).map_or(0, |p| p.major);
+                    CachedKind::from_programmable(major, true)
+                }
+                PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
+            };
+            let entry_name = ps_entry_name(source, &self.program_cache, disk_key);
+            let started = Instant::now();
+            let emission = NanosSetTimer::start(&raw mut emit_ns);
+            let (msl, bucket) = match source {
+                PsSource::Programmable { ps_id, .. } => {
+                    let Some(program) = self.program_cache.get(ps_id) else {
+                        error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
                         return None;
-                    }
-                };
-                (msl, bucket)
+                    };
+                    let bucket = CompileBucket::from_sm_major(program.major);
+                    let msl = match emit_ps_programmable_named(program, variant, &entry_name) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(target: LOG_TARGET, "emit_ps_programmable failed: {e:?}");
+                            return None;
+                        }
+                    };
+                    (msl, bucket)
+                }
+                PsSource::FixedFunction { key, .. } => (
+                    emit_ps_ff_named(key, variant, &entry_name),
+                    Some(CompileBucket::Ff),
+                ),
+            };
+            drop(emission);
+            if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
+                let tag = shader_source_tag_ps(source, variant);
+                trace!(target: MSL_TRACE_TARGET, "── PS MSL {tag} ──\n{msl}\n── /PS MSL {tag} ──");
             }
-            PsSource::FixedFunction { key, .. } => (
-                emit_ps_ff_named(key, variant, &entry_name),
-                Some(CompileBucket::Ff),
-            ),
+            let handles = compile_stage_library(
+                self.device_handle,
+                StageTag::Fragment,
+                &msl,
+                &entry_name,
+                &mut timings,
+            )?;
+            if let Some(b) = bucket {
+                shader_compile_stats::record(b, started.elapsed());
+            }
+            if let Some(kind) = kind
+                && self.flags.contains(FrameEncoderFlags::CACHE_READY)
+                && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
+            {
+                let _persist = NanosSetTimer::start(&raw mut persist_ns);
+                self.cache_write_record(kind, disk_key, &msl);
+            }
+            self.lib_cache.insert(disk_key, handles);
+            Some(handles)
+        })();
+        drop(total_timer);
+        let device = self.device_handle.raw();
+        let seq = self.current_submit_seq;
+        let identity = || CompileIdentity::Shader {
+            device,
+            stage: "PS",
+            shader: PairShaderId {
+                is_programmable: matches!(source, PsSource::Programmable { .. }),
+                hash: disk_key,
+            },
         };
-        if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
-            let tag = shader_source_tag_ps(source, variant);
-            trace!(target: MSL_TRACE_TARGET, "── PS MSL {tag} ──\n{msl}\n── /PS MSL {tag} ──");
+        let perf = self.perf.compilation_mut();
+        perf.record(
+            CompileKind::ShaderPs,
+            total_ns,
+            result.is_some(),
+            seq,
+            identity,
+        );
+        perf.record(
+            CompileKind::EmitPs,
+            emit_ns,
+            timings.preparation_ns != 0 || result.is_some(),
+            seq,
+            identity,
+        );
+        perf.shader_parts(&timings, result.is_some(), seq, identity);
+        if persist_ns != 0 {
+            perf.record(
+                CompileKind::CacheWrite,
+                persist_ns,
+                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
+                seq,
+                identity,
+            );
         }
-        let handles =
-            compile_stage_library(self.device_handle, StageTag::Fragment, &msl, &entry_name)?;
-        if let Some(b) = bucket {
-            shader_compile_stats::record(b, started.elapsed());
-        }
-        if let Some(kind) = kind {
-            self.cache_write_record(kind, disk_key, &msl);
-        }
-        self.lib_cache.insert(disk_key, handles);
-        Some(handles)
+        result
     }
 
     /// One-shot `debug!` per unique `(rt_handle, vs_key, ps_key)` seen by `emit_draw`.
@@ -5731,6 +5868,7 @@ impl FrameEncoder {
         &mut self,
         snapshot: &PipelineSnapshot,
         vertex_attrs: &[VertexAttrDesc],
+        shaders: &ShaderRef<'_>,
     ) -> u64 {
         self.perf.bump_pipeline_memo_call();
         // L0 memo: a draw whose pipeline snapshot is identical to the
@@ -5751,7 +5889,7 @@ impl FrameEncoder {
             self.perf.bump_pipeline_memo_hit();
             return handle;
         }
-        let with_color = self.resolve_pipeline(snapshot, vertex_attrs);
+        let with_color = self.resolve_pipeline(snapshot, vertex_attrs, shaders, false);
         // Dual-build for zero-mask draws: build the matching no-color
         // variant up-front so pass-finalisation (Rule H) can swap to it
         // retroactively if every draw in the pass had `mask == 0`.
@@ -5772,7 +5910,7 @@ impl FrameEncoder {
             alt.attach
                 .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
             alt.extra = mtld3d_core::pipeline_state::ExtraColorAttachments::NONE;
-            let no_color = self.resolve_pipeline(&alt, vertex_attrs);
+            let no_color = self.resolve_pipeline(&alt, vertex_attrs, shaders, true);
             if !no_color.is_null() {
                 self.no_color_pipeline_alt
                     .insert(with_color.raw(), no_color);
@@ -5788,11 +5926,15 @@ impl FrameEncoder {
         &mut self,
         snapshot: &PipelineSnapshot,
         vertex_attrs: &[VertexAttrDesc],
+        shaders: &ShaderRef<'_>,
+        sibling: bool,
     ) -> MetalHandle<MTLRenderPipelineStateKind> {
         let key = pipeline_state::key_from_snapshot(snapshot);
         if let Some(&handle) = self.pipeline_cache.get(&key) {
             return handle;
         }
+        let mut total_ns = 0;
+        let total = NanosSetTimer::start(&raw mut total_ns);
         // One wire layout per used stream; lives on this frame until the
         // synchronous thunk below has read it.
         let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
@@ -5804,6 +5946,52 @@ impl FrameEncoder {
         });
         let status = unix_call(&mut params);
         let pipeline = params.pipeline_handle;
+        let timings = params.timings.into_inner();
+        drop(total);
+        let success = status == 0 && !pipeline.is_null();
+        let device = self.device_handle.raw();
+        let identity = || CompileIdentity::Pipeline {
+            device,
+            vs: PairShaderId {
+                is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
+                hash: shaders.vs.disk_key(),
+            },
+            ps: PairShaderId {
+                is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
+                hash: shaders.ps.disk_key(shaders.variant),
+            },
+            snapshot: Box::new(snapshot.clone()),
+            sibling,
+        };
+        let perf = self.perf.compilation_mut();
+        let seq = self.current_submit_seq;
+        perf.record(
+            if sibling {
+                CompileKind::Sibling
+            } else {
+                CompileKind::Pipeline
+            },
+            total_ns,
+            success,
+            seq,
+            identity,
+        );
+        perf.record(
+            CompileKind::PipelinePreparation,
+            timings.preparation_ns,
+            success || timings.build_ns != 0,
+            seq,
+            identity,
+        );
+        if timings.build_ns != 0 {
+            perf.record(
+                CompileKind::PipelineBuild,
+                timings.build_ns,
+                success,
+                seq,
+                identity,
+            );
+        }
         if status != 0 || pipeline.is_null() {
             error!(target: LOG_TARGET, "encoder: CreateRenderPipeline failed");
             return MetalHandle::NULL;
@@ -7327,7 +7515,7 @@ impl FrameEncoder {
         let depth = job.depth.max(1);
         let emit = UploadPassInputs {
             pipeline,
-            depth_state: self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert()),
+            depth_state: self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert(), false),
             staging_buffer_handle,
             texture_handle,
             format: job.info.pixel_format,
@@ -9020,6 +9208,7 @@ pub fn compile_stage_library(
     stage_tag: StageTag,
     msl: &str,
     entry: &str,
+    timings: &mut ShaderTimings,
 ) -> Option<StageLibHandles> {
     let mut params = CompileShaderLibraryParams {
         device_handle,
@@ -9031,8 +9220,10 @@ pub fn compile_stage_library(
         pad0: 0,
         library_handle: MetalHandle::NULL,
         fn_handle: MetalHandle::NULL,
+        timings: mtld3d_shared::perf::TimingOutput::new(),
     };
     let status = unix_call(&mut params);
+    *timings = params.timings.into_inner();
     if status != 0 || params.library_handle.is_null() || params.fn_handle.is_null() {
         error!(target: LOG_TARGET, "encoder: CompileShaderLibrary failed (stage={stage_tag:?}, entry={entry})");
         return None;

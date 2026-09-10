@@ -22,3 +22,35 @@ fn core_foundation_identity_names_the_framework() {
     );
     println!("caller base={:#x} uuid={}", own.base(), own.uuid().unwrap());
 }
+
+#[test]
+fn rejected_shader_thunk_clears_timing_outputs() {
+    let mut params = mtld3d_shared::CompileShaderLibraryParams {
+        device_handle: mtld3d_shared::MetalHandle::NULL,
+        msl_ptr: 0,
+        msl_len: 0,
+        stage_tag: mtld3d_shared::mtl::StageTag::Vertex,
+        entry_ptr: 0,
+        entry_len: 0,
+        pad0: 0,
+        library_handle: mtld3d_shared::MetalHandle::NULL,
+        fn_handle: mtld3d_shared::MetalHandle::NULL,
+        timings: mtld3d_shared::perf::TimingOutput::new(),
+    };
+    params.timings.write(mtld3d_shared::perf::ShaderTimings {
+        preparation_ns: u64::MAX,
+        library_ns: u64::MAX,
+        function_ns: u64::MAX,
+    });
+    let result = super::compile_shader_library_handler((&raw mut params).cast());
+    assert_ne!(result, 0);
+    let timings = params.timings.into_inner();
+    assert_eq!(
+        (
+            timings.preparation_ns,
+            timings.library_ns,
+            timings.function_ns
+        ),
+        (0, 0, 0)
+    );
+}

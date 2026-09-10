@@ -31,6 +31,130 @@ use log::{Level, log_enabled};
 #[cfg(perf_tracking)]
 use crate::tsc::rdtsc;
 
+/// Fixed-layout output storage that performs no initialization without PERF.
+///
+/// The PE caller initializes its fallback before a thunk in a PERF build, so
+/// a native build without PERF can leave the output untouched. A disabled PE
+/// caller never reads the payload, including when the native build writes it.
+/// Only the two scalar timing records use this boundary wrapper.
+#[repr(transparent)]
+pub struct TimingOutput<T>(core::mem::MaybeUninit<T>);
+
+impl<T: Default> TimingOutput<T> {
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self(core::mem::MaybeUninit::new(T::default()))
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(core::mem::MaybeUninit::uninit())
+    }
+
+    /// Publish a native measurement.
+    #[cfg(perf_tracking)]
+    pub const fn write(&mut self, value: T) {
+        self.0.write(value);
+    }
+
+    /// Leave the reserved bytes untouched in a disabled build.
+    #[cfg(not(perf_tracking))]
+    pub fn write(&mut self, value: T) {
+        let _ = (self, value);
+    }
+
+    /// Consume a caller-owned output initialized before the thunk.
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub const fn into_inner(self) -> T {
+        // SAFETY: this runtime's constructor initializes T before crossing
+        // the boundary; native writes only replace it with another valid T.
+        // The field is private, so safe callers cannot bypass initialization.
+        unsafe { self.0.assume_init() }
+    }
+
+    /// Synthesize zero durations without reading the reserved bytes.
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        T::default()
+    }
+}
+
+impl<T: Default> Default for TimingOutput<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Native shader compilation durations returned to the caller in nanoseconds.
+///
+/// Zero means unmeasured; `TimingOutput` preserves layout in non-PERF builds.
+#[repr(C)]
+pub struct ShaderTimings {
+    pub preparation_ns: u64,
+    pub library_ns: u64,
+    pub function_ns: u64,
+}
+
+impl ShaderTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            library_ns: 0,
+            function_ns: 0,
+        }
+    }
+}
+
+impl Default for ShaderTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Native pipeline creation durations returned in nanoseconds.
+///
+/// Preparation excludes the synchronous Metal pipeline build.
+#[repr(C)]
+pub struct PipelineTimings {
+    pub preparation_ns: u64,
+    pub build_ns: u64,
+}
+
+impl PipelineTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            build_ns: 0,
+        }
+    }
+}
+
+impl Default for PipelineTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cached `log_enabled!(target: "mtld3d::perf", Level::Info)` result.
 ///
 /// Latched once at logger init via `init_tracking_enabled`. Read on the
@@ -245,8 +369,8 @@ impl Drop for CycleAddTimer {
 /// [`crate::tsc::ns_to_cycles`].
 ///
 /// Same null-check plus perf-enabled gate as [`CycleSetTimer`]; the clock reads
-/// cost more than `rdtsc`, which is why this is for once-per-frame brackets
-/// (today: the `nextDrawable` wait) rather than hot-path measurements.
+/// cost more than `rdtsc`, so use this for once-per-frame waits and cold
+/// shader/pipeline builds, not per-draw cache hits.
 #[cfg(perf_tracking)]
 pub struct NanosSetTimer {
     /// `None` when the gate is off, so a disabled timer reads no clock at all.
@@ -297,3 +421,6 @@ impl Drop for NanosSetTimer {
 impl Drop for NanosSetTimer {
     fn drop(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests;

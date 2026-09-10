@@ -185,6 +185,7 @@ fn run(
         rewrite_as_bundle(&path, &deduped);
     }
 
+    let mut compilation = mtld3d_core::perf::compilation::CompilationPerf::new();
     let mut warm: Vec<(u64, StageLibHandles)> = Vec::with_capacity(deduped.len());
     let mut counts = [0u32; 4];
     let mut duration_ns = [0u64; 4];
@@ -196,11 +197,20 @@ fn run(
         let stage = stage_for_kind(entry.kind);
         let entry_name = entry.kind.entry_name(entry.key);
         let started = Instant::now();
-        let Some(handles) = compile_stage_library(device_handle, stage, &entry.msl, &entry_name)
-        else {
+        let mut timings = mtld3d_shared::perf::ShaderTimings::new();
+        let handles =
+            compile_stage_library(device_handle, stage, &entry.msl, &entry_name, &mut timings);
+        let elapsed = started.elapsed();
+        compilation.shader_parts(&timings, handles.is_some(), 0, || {
+            mtld3d_core::perf::compilation::Identity::Prewarm {
+                device: device_handle.raw(),
+                kind: entry.kind,
+                key: entry.key,
+            }
+        });
+        let Some(handles) = handles else {
             continue;
         };
-        let elapsed = started.elapsed();
         let idx = bucket_index(entry.kind.compile_bucket());
         counts[idx] += 1;
         // u128 nanos → u64: saturates at ~584 years; pre-warm batch fits easily.
@@ -210,6 +220,7 @@ fn run(
 
     let total: u32 = counts.iter().sum();
     let cached = u32::try_from(warm.len()).unwrap_or(u32::MAX);
+    compilation.log_startup(device_handle.raw());
     sender.send(warm);
     if total > 0 {
         let snap = Snapshot {
