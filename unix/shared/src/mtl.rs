@@ -814,7 +814,8 @@ bitflags! {
         /// Visibility only, from the hardware cursor path: no sprite, `hash` is 0.
         ///
         /// The unix side's pointer watch needs to know when the game shows
-        /// its cursor whatever draws it; the overlay itself is left alone.
+        /// its cursor whatever draws it. This attachment takes ownership and
+        /// clears the previous software sprite, so both paths cannot stay visible.
         const HARDWARE = 1 << 1;
     }
 }

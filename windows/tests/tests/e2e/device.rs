@@ -3017,6 +3017,57 @@ fn a_device_keeps_the_configuration_of_the_interface_that_created_it() {
 }
 
 #[test]
+fn cursor_rejects_invalid_bitmaps_without_replacing_the_previous_cursor() {
+    for config in [
+        "cursor.software=false;cursor.scale=2",
+        "cursor.software=true;cursor.scale=2",
+    ] {
+        let h = Harness::with_config(config);
+        let bitmap = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        bitmap
+            .lock_rect(0)
+            .write_u32_rect(32, 32, &[0xFFFF_8040; 32 * 32]);
+        assert_eq!(h.set_cursor_properties_hr(2, 3, &bitmap), D3D_OK);
+        assert_eq!(h.show_cursor(true), 0);
+        let previous = h.thread_cursor();
+        assert_ne!(previous, 0);
+        for format in [D3DFMT_R5G6B5, D3DFMT_L8, D3DFMT_X8R8G8B8] {
+            let invalid = h.create_offscreen_plain_surface(128, 128, format, D3DPOOL_SCRATCH);
+            assert_eq!(
+                h.set_cursor_properties_hr(0, 0, &invalid),
+                D3DERR_INVALIDCALL
+            );
+            assert_eq!(h.thread_cursor(), previous, "{config}: format {format}");
+            assert_eq!(h.show_cursor(true), 1, "rejection preserves visibility");
+        }
+        for (pitch, null_bits) in [(-128, false), (0, false), (64, false), (128, true)] {
+            assert_eq!(
+                h.cursor_with_invalid_layout(&bitmap, pitch, null_bits),
+                (D3DERR_INVALIDCALL, 1, 1)
+            );
+            assert_eq!(h.thread_cursor(), previous, "{config}: invalid lock layout");
+        }
+        assert_eq!(
+            h.set_cursor_properties_hr(u32::MAX, 0, &bitmap),
+            D3DERR_INVALIDCALL
+        );
+        assert_eq!(
+            h.thread_cursor(),
+            previous,
+            "hotspot scaling rejection preserves cursor"
+        );
+        assert_eq!(
+            h.set_cursor_properties_hr(2, 3, &bitmap),
+            D3D_OK,
+            "successful locks were balanced"
+        );
+        assert_eq!(h.show_cursor(false), 1);
+        assert_eq!(h.show_cursor(true), 0);
+        assert_eq!(h.thread_cursor(), previous);
+    }
+}
+
+#[test]
 fn software_cursor_never_pushes_a_null_thread_cursor() {
     // With the software cursor on, the overlay window draws the cursor and the
     // Win32 cursor is a blank HCURSOR that is never taken away: a show pushes

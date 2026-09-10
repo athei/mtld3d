@@ -40,6 +40,10 @@ unsafe extern "system" {
     fn LoadCursorA(instance: usize, cursor_name: *const c_char) -> usize;
     fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetCursor() -> usize;
+    fn SetCapture(hwnd: usize) -> usize;
+    fn ReleaseCapture() -> i32;
+    fn GetCapture() -> usize;
+    fn SetForegroundWindow(hwnd: usize) -> i32;
     fn SetCursor(cursor: usize) -> usize;
     fn GetIconInfo(icon: usize, info: *mut ICONINFO) -> i32;
     fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
@@ -633,4 +637,27 @@ pub const fn zeroed_msg() -> Msg {
         pt_x: 0,
         pt_y: 0,
     }
+}
+
+/// Capture mouse input without clipping it, or release this thread's capture.
+///
+/// Returns the window owning capture after the call, so a probe can verify setup.
+#[must_use]
+pub fn capture_mouse(hwnd: usize, captured: bool) -> usize {
+    if captured {
+        // SAFETY: the harness owns this live window on the calling thread.
+        unsafe { SetCapture(hwnd) };
+    } else {
+        // SAFETY: releases only the calling thread's mouse capture.
+        unsafe { ReleaseCapture() };
+    }
+    // SAFETY: reads the calling thread's capture owner, without dereferencing it.
+    unsafe { GetCapture() }
+}
+
+/// Bring a visible probe window to the foreground.
+#[must_use]
+pub fn foreground_window(hwnd: usize) -> bool {
+    // SAFETY: the harness owns the live window handle.
+    unsafe { SetForegroundWindow(hwnd) != 0 }
 }

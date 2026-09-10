@@ -292,15 +292,17 @@ pub extern "C" fn set_cursor_overlay_handler(args: *mut c_void) -> i32 {
     let pixels = if params.pixels_ptr == 0 {
         None
     } else {
-        let expected = u64::from(params.width) * u64::from(params.height) * 4;
+        let expected = u64::from(params.width)
+            .checked_mul(u64::from(params.height))
+            .and_then(|pixels| pixels.checked_mul(4));
         if params.width == 0
             || params.height == 0
-            || u64::from(params.pixels_len) != expected
+            || Some(u64::from(params.pixels_len)) != expected
             || !(1..=8).contains(&params.scale)
         {
             warn!(
                 target: LOG_TARGET,
-                "SetCursorOverlay: rejected sprite {}x{} scale={} len={} (expected {expected} bytes)",
+                "SetCursorOverlay: rejected sprite {}x{} scale={} len={} (expected {expected:?} bytes)",
                 params.width, params.height, params.scale, params.pixels_len,
             );
             return STATUS_UNSUCCESSFUL;

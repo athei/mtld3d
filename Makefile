@@ -803,10 +803,11 @@ E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(
 # targets are the only ones with an executable. The JSON is held until Cargo
 # succeeds, so a partial artifact list from a failed build never reaches a
 # consumer. A glob over `deps/` would also pick up the stale hashes of earlier
-# builds. Expanded inside a recipe, where the `$$(...)` is the shell's. From a
-# stage the binaries are the staged ones.
+# builds. --tests excludes examples, including the visible cursor probe, which
+# are not libtest executables. Expanded inside a recipe, where the `$$(...)` is
+# the shell's. From a stage the binaries are the staged ones.
 define E2E_EXES_BUILD
-cd windows && cargo +$(RUST_STABLE) test --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics
+cd windows && cargo +$(RUST_STABLE) test --tests --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics
 endef
 define E2E_EXES
 $$(output=$$(mktemp "$${TMPDIR:-/tmp}/mtld3d-e2e-exes.XXXXXX") || exit; \
