@@ -273,7 +273,7 @@ impl CompilationPerf {
             if metric.calls != 0 {
                 let _ = writeln!(
                     output,
-                    "  {label}: {:.3} ms total, {} calls, {} failed",
+                    "  {label:<20} {:>9.3} ms total  calls={:<5} failed={}",
                     ms(metric.ns),
                     metric.calls,
                     metric.failures
@@ -291,7 +291,7 @@ impl CompilationPerf {
         for (label, metric) in Kind::LABELS.iter().zip(&self.window) {
             let _ = writeln!(
                 output,
-                "  {label:<20} {:>7.3} ms/frame  peak/frame {:>7.3} ms  total {:>9.3} ms  calls={} failed={}",
+                "  {label:<20} {:>7.3} ms/frame  peak/frame {:>7.3} ms  total {:>9.3} ms  calls={:<5} failed={}",
                 ms(metric.ns) / f64::from(frames),
                 ms(metric.peak_ns),
                 ms(metric.ns),

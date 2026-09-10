@@ -30,7 +30,7 @@ fn peaks_are_per_frame_and_residuals_use_the_same_frame() {
     assert!(perf.frame.iter().all(|metric| metric.calls == 0));
     let mut output = String::new();
     perf.append_window(&mut output, 2);
-    assert!(output.contains("calls=3 failed=1"));
+    assert!(output.contains("calls=3     failed=1"));
     assert!(output.contains("encoder_ops_same_submission=30.000ms"));
     assert!(output.contains("device=0x7"));
     assert!(perf.slow.is_empty());
