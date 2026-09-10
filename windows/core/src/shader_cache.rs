@@ -1,17 +1,13 @@
-//! On-disk shader cache: append-only binary file `mtld3d_shaders.bin` next to the host EXE.
+//! On-disk shader and render-pipeline cache in `mtld3d_shaders.bin` next to the host EXE.
 //!
-//! Each successful MSL compile appends one *Single* chunk (per-frame zstd at
-//! `ZSTD_APPEND_LEVEL`) onto the file. The startup pre-warm thread reads
-//! every chunk, pre-compiles the MSL via the existing `CompileShaderLibrary`
-//! thunk, and — if the file is not already a single dense *Bundle* — rewrites
-//! it atomically as one Bundle chunk so cross-shader redundancy is captured
-//! (zstd at `ZSTD_BUNDLE_LEVEL`). Session appends after that bundle land as
-//! Single chunks at the tail and fold back into the bundle on the next launch.
+//! Each successful MSL or render-pipeline compile appends one *Single* chunk.
+//! The startup prewarm thread recreates the recorded objects and atomically
+//! compacts the file into one *Bundle* chunk when needed.
 //!
-//! ## File layout (v17)
+//! ## File layout (v18)
 //!
 //! ```text
-//! [file header  16B]  MTLD3DSH | schema u32 LE | _pad 4B
+//! [file header  16B]  MTLD3DSH | format u32 LE | shader/translation schema u32 LE
 //! [chunk]*
 //! ```
 //!
@@ -24,17 +20,20 @@
 //!
 //! * `kind` ∈ `0..=7` (`CachedKind`) → **Single** chunk. Frame decompresses to
 //!   one UTF-8 MSL string. `key` is the `disk_key`.
+//! * `kind == RECORD_KIND_PIPELINE` (`0xFE`) → **Single** pipeline recipe.
+//!   The recipe contains stable shader references and explicit logical fields,
+//!   never runtime handles or Rust struct memory.
 //! * `kind == RECORD_KIND_BUNDLE` (`0xFF`) → **Bundle** chunk. Frame
-//!   decompresses to a concatenation of *plain* records using the v15 layout
-//!   (`[1B kind|3B _pad|8B key|4B msl_len][raw MSL]`, repeated). No inner
+//!   decompresses to a concatenation of plain records
+//!   (`[1B kind|3B _pad|8B key|4B body_len][body]`, repeated). No inner
 //!   checksum: the whole bundle frame is covered by the outer chunk's xxh3.
 //! * `xxh3` = `xxh3_64` over `chunk_header[0..16] ++ frame_bytes`. Computed
-//!   once at write, verified on read. Mismatch ⇒ skip the chunk via
-//!   `frame_len`. This is the sole integrity mechanism: it already covers the
+//!   once at write, verified on read. Mismatch stops parsing because the
+//!   length may be corrupt. This mechanism already covers the
 //!   frame body, so zstd's own per-frame checksum is left off as redundant.
 //!
 //! Robustness comes from the plaintext `frame_len` prefix plus the xxh3:
-//! torn writes (frame runs past EOF) ⇒ `break`; xxh3 mismatch ⇒ skip;
+//! torn writes (frame runs past EOF) ⇒ `break`; xxh3 mismatch ⇒ `break`;
 //! decompress failure or bad UTF-8 ⇒ skip; unknown `kind` ⇒ skip via
 //! `frame_len` (forward-compat hook); a file header found where a chunk
 //! header belongs ⇒ skip its 16 bytes.
@@ -52,15 +51,27 @@ use std::{
     time::Duration,
 };
 
+use mtld3d_shared::{
+    MetalHandle, VertexAttrDesc,
+    mtl::{PixelFormat, VertexFormat, VertexStepFunction},
+};
+use mtld3d_types::MAX_STREAMS;
 use rustc_hash::FxHashSet;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::shader_compile_stats::CompileBucket;
+use crate::{
+    pipeline_state::{
+        ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineRsFlags,
+        PipelineSnapshot, StreamLayout,
+    },
+    shader_compile_stats::CompileBucket,
+};
 
-/// Bumped on any of: DXSO emitter changes, FF emitter changes, hash function, on-disk format.
+/// Bumped for shader emission, shader keys, or pipeline-translation semantics.
 ///
-/// A cache file with a different schema is wiped and rebuilt from
-/// scratch.
+/// A cache file with a different schema is wiped and rebuilt from scratch.
+/// Pipeline recipes share this schema because unchanged recipe bytes can
+/// describe different Metal state after a translation-rule change.
 ///
 /// `14` adds `VariantKey::depth_sampler_mask` to the PS variant tuple
 /// (sampleable shadow-map support). Pre-existing PS records hash with
@@ -297,13 +308,20 @@ use crate::shader_compile_stats::CompileBucket;
 /// integer address register, changing programmable vertex shader MSL.
 pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 73;
 
+/// On-disk container format.
+///
+/// Separate from [`SHADER_CACHE_SCHEMA_VERSION`] so a translation change can
+/// invalidate shader and pipeline identities without pretending the binary
+/// framing changed.
+pub const CACHE_FORMAT_VERSION: u32 = 18;
+
 /// File magic.
 ///
 /// ASCII `MTLD3DSH`. Recognises *our* file vs. unrelated content under
 /// the same name.
 pub const SHADER_CACHE_MAGIC: [u8; 8] = *b"MTLD3DSH";
 
-/// Bytes of `magic | schema | _pad`.
+/// Bytes of `magic | format version | shader schema version`.
 pub const HEADER_LEN: usize = 16;
 
 /// Bytes of `kind | _pad | key | frame_len | xxh3` before the variable zstd frame body.
@@ -313,7 +331,7 @@ pub const HEADER_LEN: usize = 16;
 /// the trailing 8 bytes hold the per-chunk xxh3 checksum added in v17.
 pub const CHUNK_HEADER_LEN: usize = 24;
 
-/// Bytes of `kind | _pad | key | msl_len` before the raw MSL bytes of an **inner plain record**.
+/// Bytes of `kind | _pad | key | body_len` before an inner plain-record body.
 ///
 /// Such records live inside a Bundle chunk's decompressed payload. Same
 /// layout as v16's whole-file record header — no checksum, since the
@@ -326,7 +344,10 @@ pub const RECORD_HEADER_LEN: usize = 16;
 /// enum range so it round-trips cleanly through `from_byte`.
 pub const RECORD_KIND_BUNDLE: u8 = 0xFF;
 
-/// zstd level for per-shader appends (Single chunks).
+/// Chunk-kind discriminator for a render-pipeline recipe.
+pub const RECORD_KIND_PIPELINE: u8 = 0xFE;
+
+/// zstd level for append records (Single chunks).
 ///
 /// Runs on the encoder thread, which is on the hot path: keep it cheap.
 /// The weak per-frame ratio is fine because Single chunks fold into a
@@ -344,7 +365,7 @@ const ZSTD_BUNDLE_LEVEL: i32 = 19;
 /// Discriminants are wire bytes: never reorder without bumping
 /// `SHADER_CACHE_SCHEMA_VERSION`.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CachedKind {
     FfVs = 0,
     FfPs = 1,
@@ -388,6 +409,21 @@ impl CachedKind {
             Self::Sm2Vs | Self::Sm2Ps => CompileBucket::Sm2,
             Self::Sm3Vs | Self::Sm3Ps => CompileBucket::Sm3,
         }
+    }
+
+    #[must_use]
+    pub const fn is_vertex(self) -> bool {
+        matches!(self, Self::FfVs | Self::Sm1Vs | Self::Sm2Vs | Self::Sm3Vs)
+    }
+
+    #[must_use]
+    pub const fn is_pixel(self) -> bool {
+        matches!(self, Self::FfPs | Self::Sm1Ps | Self::Sm2Ps | Self::Sm3Ps)
+    }
+
+    #[must_use]
+    pub const fn is_programmable(self) -> bool {
+        !matches!(self, Self::FfVs | Self::FfPs)
     }
 
     /// Programmable: derive the kind from `(sm_major, is_pixel_shader)`.
@@ -436,6 +472,321 @@ pub struct CacheEntry {
     pub msl: String,
 }
 
+/// The two independent versions carried by the cache header.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CacheHeader {
+    pub format_version: u32,
+    pub shader_schema_version: u32,
+}
+
+impl CacheHeader {
+    pub const CURRENT: Self = Self {
+        format_version: CACHE_FORMAT_VERSION,
+        shader_schema_version: SHADER_CACHE_SCHEMA_VERSION,
+    };
+}
+
+/// Stable reference from a pipeline recipe to one shader source record.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShaderRecordRef {
+    kind: CachedKind,
+    key: u64,
+}
+
+impl ShaderRecordRef {
+    #[must_use]
+    pub const fn new(kind: CachedKind, key: u64) -> Self {
+        Self { kind, key }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> CachedKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn key(self) -> u64 {
+        self.key
+    }
+}
+
+/// Persistent description of one successfully-created render pipeline.
+///
+/// The stored snapshot always has null function handles. [`Self::resolve`]
+/// installs functions compiled for the current Metal device before the
+/// ordinary pipeline-state builder consumes it.
+#[derive(PartialEq, Eq)]
+pub struct PipelineRecipe {
+    vs: ShaderRecordRef,
+    ps: ShaderRecordRef,
+    snapshot: PipelineSnapshot,
+    vertex_attrs: Vec<VertexAttrDesc>,
+}
+
+impl PipelineRecipe {
+    /// Capture one live pipeline without retaining either runtime function handle.
+    #[must_use]
+    pub fn from_snapshot(
+        vs: ShaderRecordRef,
+        ps: ShaderRecordRef,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+    ) -> Self {
+        let mut stored = snapshot.clone();
+        stored.vs_fn = MetalHandle::NULL;
+        stored.ps_fn = MetalHandle::NULL;
+        stored.sample_count = stored.sample_count.max(1);
+        stored.extra.has_alpha_mask &= stored.extra.present_mask;
+        for index in 0..stored.extra.formats.len() {
+            if !stored.extra.is_present(index) {
+                stored.extra.formats[index] = ExtraColorAttachments::NONE.formats[index];
+            }
+        }
+        Self {
+            vs,
+            ps,
+            snapshot: stored,
+            vertex_attrs: vertex_attrs.to_vec(),
+        }
+    }
+
+    #[must_use]
+    pub const fn vs(&self) -> ShaderRecordRef {
+        self.vs
+    }
+
+    #[must_use]
+    pub const fn ps(&self) -> ShaderRecordRef {
+        self.ps
+    }
+
+    #[must_use]
+    pub fn vertex_attrs(&self) -> &[VertexAttrDesc] {
+        &self.vertex_attrs
+    }
+
+    /// Recreate the runtime snapshot using functions owned by the current device.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        vs_fn: MetalHandle<mtld3d_shared::mtl_handle::MTLFunctionKind>,
+        ps_fn: MetalHandle<mtld3d_shared::mtl_handle::MTLFunctionKind>,
+    ) -> PipelineSnapshot {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.vs_fn = vs_fn;
+        snapshot.ps_fn = ps_fn;
+        snapshot
+    }
+
+    /// Stable content identity of the explicit recipe encoding.
+    #[must_use]
+    pub fn disk_key(&self) -> u64 {
+        let mut bytes = Vec::new();
+        self.encode(&mut bytes);
+        let mut hash = Xxh3::new();
+        hash.write(&bytes);
+        hash.finish()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.vs.kind as u8);
+        out.push(self.ps.kind as u8);
+        out.push(self.snapshot.attach.bits());
+        out.push(self.snapshot.rs.flags.bits());
+        out.extend_from_slice(&self.vs.key.to_le_bytes());
+        out.extend_from_slice(&self.ps.key.to_le_bytes());
+        out.extend_from_slice(&self.snapshot.vdecl_hash.to_le_bytes());
+        out.extend_from_slice(&(self.snapshot.color_format as u16).to_le_bytes());
+        out.push(self.snapshot.sample_count);
+        out.push(self.snapshot.ps_color_out_mask);
+        out.push(self.snapshot.extra.present_mask);
+        out.push(self.snapshot.extra.has_alpha_mask);
+        out.extend_from_slice(&[
+            self.snapshot.rs.src_blend,
+            self.snapshot.rs.dst_blend,
+            self.snapshot.rs.blend_op,
+            self.snapshot.rs.src_blend_alpha,
+            self.snapshot.rs.dst_blend_alpha,
+            self.snapshot.rs.blend_op_alpha,
+            self.snapshot.rs.color_write_mask,
+        ]);
+        out.extend_from_slice(&self.snapshot.rs.color_write_mask_ext);
+        for format in self.snapshot.extra.formats {
+            out.extend_from_slice(&(format as u16).to_le_bytes());
+        }
+        for layout in self.snapshot.stream_layouts {
+            out.extend_from_slice(&layout.stride.to_le_bytes());
+            out.push(layout.step as u8);
+            out.extend_from_slice(&layout.step_rate.to_le_bytes());
+        }
+        let attr_count =
+            u8::try_from(self.vertex_attrs.len()).expect("D3D9 vertex attribute count fits u8");
+        out.push(attr_count);
+        for attr in &self.vertex_attrs {
+            out.push(u8::try_from(attr.attr_index).expect("D3D9 attribute index fits u8"));
+            out.push(u8::try_from(attr.buffer_index).expect("D3D9 buffer index fits u8"));
+            out.extend_from_slice(
+                &u16::try_from(attr.offset)
+                    .expect("D3D9 vertex attribute offset fits u16")
+                    .to_le_bytes(),
+            );
+            out.push(attr.format as u8);
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut reader = RecipeReader::new(bytes);
+        let vs_kind = CachedKind::from_byte(reader.u8()?)?;
+        let ps_kind = CachedKind::from_byte(reader.u8()?)?;
+        let attach = PipelineAttachFlags::from_bits(reader.u8()?)?;
+        let rs_flags = PipelineRsFlags::from_bits(reader.u8()?)?;
+        let vs = ShaderRecordRef::new(vs_kind, reader.u64()?);
+        let ps = ShaderRecordRef::new(ps_kind, reader.u64()?);
+        let vdecl_hash = reader.u64()?;
+        let color_format = PixelFormat::from_repr(u32::from(reader.u16()?))?;
+        let sample_count = reader.u8()?;
+        let ps_color_out_mask = reader.u8()?;
+        let extra_present_mask = reader.u8()?;
+        let extra_has_alpha_mask = reader.u8()?;
+        let rs = PipelineRsBits {
+            flags: rs_flags,
+            src_blend: reader.u8()?,
+            dst_blend: reader.u8()?,
+            blend_op: reader.u8()?,
+            src_blend_alpha: reader.u8()?,
+            dst_blend_alpha: reader.u8()?,
+            blend_op_alpha: reader.u8()?,
+            color_write_mask: reader.u8()?,
+            color_write_mask_ext: [reader.u8()?, reader.u8()?, reader.u8()?],
+        };
+        let extra = ExtraColorAttachments {
+            formats: [
+                PixelFormat::from_repr(u32::from(reader.u16()?))?,
+                PixelFormat::from_repr(u32::from(reader.u16()?))?,
+                PixelFormat::from_repr(u32::from(reader.u16()?))?,
+            ],
+            present_mask: extra_present_mask,
+            has_alpha_mask: extra_has_alpha_mask,
+        };
+        let mut stream_layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+        for layout in &mut stream_layouts {
+            *layout = StreamLayout {
+                stride: reader.u32()?,
+                step: VertexStepFunction::from_repr(u32::from(reader.u8()?))?,
+                step_rate: reader.u32()?,
+            };
+        }
+        let attr_count = usize::from(reader.u8()?);
+        if attr_count > MAX_STREAMS as usize {
+            return None;
+        }
+        let mut vertex_attrs = Vec::with_capacity(attr_count);
+        for _ in 0..attr_count {
+            vertex_attrs.push(VertexAttrDesc {
+                attr_index: u32::from(reader.u8()?),
+                buffer_index: u32::from(reader.u8()?),
+                offset: u32::from(reader.u16()?),
+                format: VertexFormat::from_repr(u32::from(reader.u8()?))?,
+            });
+        }
+        if !reader.is_empty() {
+            return None;
+        }
+        let recipe = Self {
+            vs,
+            ps,
+            snapshot: PipelineSnapshot {
+                vs_fn: MetalHandle::NULL,
+                ps_fn: MetalHandle::NULL,
+                vdecl_hash,
+                stream_layouts,
+                color_format,
+                attach,
+                rs,
+                extra,
+                ps_color_out_mask,
+                sample_count,
+            },
+            vertex_attrs,
+        };
+        recipe.is_valid().then_some(recipe)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.vs.kind.is_vertex()
+            && self.ps.kind.is_pixel()
+            && self.snapshot.sample_count != 0
+            && self.snapshot.ps_color_out_mask & !0x0F == 0
+            && self.snapshot.rs.color_write_mask & !0x0F == 0
+            && self
+                .snapshot
+                .rs
+                .color_write_mask_ext
+                .iter()
+                .all(|mask| mask & !0x0F == 0)
+            && self.snapshot.extra.present_mask & !0x07 == 0
+            && self.snapshot.extra.has_alpha_mask & !self.snapshot.extra.present_mask == 0
+            && self
+                .snapshot
+                .stream_layouts
+                .iter()
+                .all(|layout| layout.stride != 0 || *layout == StreamLayout::UNUSED)
+            && self.vertex_attrs.iter().all(|attr| {
+                attr.attr_index < MAX_STREAMS
+                    && attr.buffer_index < MAX_STREAMS
+                    && attr.format != VertexFormat::Invalid
+                    && self.snapshot.stream_layouts[attr.buffer_index as usize].is_used()
+            })
+    }
+}
+
+struct RecipeReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RecipeReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let value = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(value)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+/// Parsed and deduplicated cache contents.
+pub struct CacheRecords {
+    pub shaders: Vec<CacheEntry>,
+    pub pipelines: Vec<PipelineRecipe>,
+    pub needs_compaction: bool,
+    /// End of the last complete, checksum-verified chunk.
+    valid_len: usize,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CacheReadError {
     /// Buffer too short or magic mismatch — almost certainly not our file.
@@ -444,10 +795,7 @@ pub enum CacheReadError {
     WrongMagic,
 }
 
-/// Validate the 16-byte file header and return its schema field.
-///
-/// Caller compares against `SHADER_CACHE_SCHEMA_VERSION` and decides between
-/// proceeding to `read_records` (match) or wiping the file (mismatch).
+/// Validate the 16-byte file header and return both version fields.
 ///
 /// # Errors
 ///
@@ -458,31 +806,32 @@ pub enum CacheReadError {
 ///
 /// Panics if the slice indexing internally yields an unexpected length —
 /// guarded by the header-length check above, so unreachable in practice.
-pub fn read_header(bytes: &[u8]) -> Result<u32, CacheReadError> {
+pub fn read_header(bytes: &[u8]) -> Result<CacheHeader, CacheReadError> {
     if bytes.len() < HEADER_LEN || bytes[..8] != SHADER_CACHE_MAGIC {
         return Err(CacheReadError::WrongMagic);
     }
-    let schema = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    Ok(schema)
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let shader_schema_version = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    Ok(CacheHeader {
+        format_version,
+        shader_schema_version,
+    })
 }
 
 /// Walk chunks starting after the 16-byte file header.
 ///
 /// Decompresses each zstd frame and verifies its xxh3.
 ///
-/// Returns `(entries, needs_compaction)`:
-/// * `entries` — every successfully-parsed `CacheEntry`, in file order.
-///   Duplicate `key`s appear in order; the caller dedupes.
-/// * `needs_compaction` — `false` only when the file is exactly one
+/// Returns deduplicated shader records and pipeline recipes. Recipes whose
+/// shader references are absent are discarded.
+///
+/// `needs_compaction` is `false` only when the file is exactly one
 ///   well-formed Bundle chunk with no inner duplicates and reached EOF
 ///   cleanly. `true` whenever anything else was observed: any Single
 ///   chunks, more than one Bundle, a torn / corrupt / unknown-kind chunk,
 ///   a stray file header mid-file, trailing partial-header garbage, or
-///   duplicate keys. The pre-warm thread uses this to decide whether to
+///   duplicate or dangling records. The prewarm thread uses this to decide whether to
 ///   rewrite the file as a single dense Bundle.
-///
-/// Empty input (parsed zero entries) always returns
-/// `needs_compaction = false` — there is nothing to compact.
 ///
 /// # Panics
 ///
@@ -490,16 +839,23 @@ pub fn read_header(bytes: &[u8]) -> Result<u32, CacheReadError> {
 /// guarded by the per-chunk-length checks above, so unreachable on a
 /// well-formed file.
 #[must_use]
-pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
-    let mut out = Vec::new();
+pub fn read_records(bytes: &[u8]) -> CacheRecords {
+    let mut shaders = Vec::new();
+    let mut pipelines = Vec::new();
     if bytes.len() < HEADER_LEN {
-        return (out, false);
+        return CacheRecords {
+            shaders,
+            pipelines,
+            needs_compaction: false,
+            valid_len: 0,
+        };
     }
     let mut off = HEADER_LEN;
     let mut single_count: usize = 0;
     let mut bundle_count: usize = 0;
     let mut other_chunk = false;
-    let mut seen_keys: FxHashSet<u64> = FxHashSet::default();
+    let mut seen_shaders: FxHashSet<ShaderRecordRef> = FxHashSet::default();
+    let mut seen_pipelines: FxHashSet<u64> = FxHashSet::default();
     let mut duplicates = false;
 
     while off + CHUNK_HEADER_LEN <= bytes.len() {
@@ -546,25 +902,49 @@ pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
             bundle_count += 1;
             match zstd::decode_all(frame) {
                 Ok(plain) => {
-                    for entry in parse_plain_records(&plain) {
-                        if !seen_keys.insert(entry.key) {
-                            duplicates = true;
-                        }
-                        out.push(entry);
+                    let parsed = parse_plain_records(&plain);
+                    other_chunk |= parsed.malformed;
+                    for record in parsed.records {
+                        push_record(
+                            record,
+                            &mut shaders,
+                            &mut pipelines,
+                            &mut seen_shaders,
+                            &mut seen_pipelines,
+                            &mut duplicates,
+                        );
                     }
                 }
+                Err(_) => other_chunk = true,
+            }
+        } else if kind_byte == RECORD_KIND_PIPELINE {
+            single_count += 1;
+            match zstd::decode_all(frame) {
+                Ok(payload) => match PipelineRecipe::decode(&payload) {
+                    Some(recipe) if recipe.disk_key() == key => push_record(
+                        PlainRecord::Pipeline(Box::new(recipe)),
+                        &mut shaders,
+                        &mut pipelines,
+                        &mut seen_shaders,
+                        &mut seen_pipelines,
+                        &mut duplicates,
+                    ),
+                    _ => other_chunk = true,
+                },
                 Err(_) => other_chunk = true,
             }
         } else if let Some(kind) = CachedKind::from_byte(kind_byte) {
             single_count += 1;
             match zstd::decode_all(frame) {
                 Ok(payload) => match String::from_utf8(payload) {
-                    Ok(msl) => {
-                        if !seen_keys.insert(key) {
-                            duplicates = true;
-                        }
-                        out.push(CacheEntry { kind, key, msl });
-                    }
+                    Ok(msl) => push_record(
+                        PlainRecord::Shader(CacheEntry { kind, key, msl }),
+                        &mut shaders,
+                        &mut pipelines,
+                        &mut seen_shaders,
+                        &mut seen_pipelines,
+                        &mut duplicates,
+                    ),
                     Err(_) => other_chunk = true,
                 },
                 Err(_) => other_chunk = true,
@@ -581,20 +961,27 @@ pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
     // that warrants a rewrite.
     let trailing_garbage = off < bytes.len();
 
-    let needs_compaction = if out.is_empty() {
-        // Nothing to compact regardless of what was in the file; the
-        // caller will just leave it alone or treat it as cold-start.
-        false
-    } else {
-        let already_optimal = bundle_count == 1
-            && single_count == 0
-            && !other_chunk
-            && !duplicates
-            && !trailing_garbage;
-        !already_optimal
-    };
+    let shader_refs: FxHashSet<ShaderRecordRef> = shaders
+        .iter()
+        .map(|entry| ShaderRecordRef::new(entry.kind, entry.key))
+        .collect();
+    let before = pipelines.len();
+    pipelines
+        .retain(|recipe| shader_refs.contains(&recipe.vs()) && shader_refs.contains(&recipe.ps()));
+    let dangling = pipelines.len() != before;
 
-    (out, needs_compaction)
+    let already_optimal = bundle_count == 1
+        && single_count == 0
+        && !other_chunk
+        && !duplicates
+        && !dangling
+        && !trailing_garbage;
+    CacheRecords {
+        shaders,
+        pipelines,
+        needs_compaction: !already_optimal,
+        valid_len: off,
+    }
 }
 
 /// Emit the 16-byte file header into `buf`.
@@ -602,8 +989,8 @@ pub fn read_records(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
 /// Caller writes the buffer to the freshly-created file.
 pub fn write_header(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&SHADER_CACHE_MAGIC);
+    buf.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&SHADER_CACHE_SCHEMA_VERSION.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 4]);
 }
 
 /// Serialise one Single chunk into `buf`.
@@ -626,6 +1013,20 @@ pub fn write_record(buf: &mut Vec<u8>, entry: &CacheEntry) {
     push_chunk(buf, entry.kind as u8, entry.key, &frame);
 }
 
+/// Serialise one pipeline-recipe Single chunk into `buf`.
+///
+/// # Panics
+///
+/// Panics if the encoded frame exceeds 4 GiB or if zstd fails to encode
+/// the in-memory recipe.
+pub fn write_pipeline_record(buf: &mut Vec<u8>, recipe: &PipelineRecipe) {
+    let mut payload = Vec::new();
+    recipe.encode(&mut payload);
+    let frame = zstd::encode_all(payload.as_slice(), ZSTD_APPEND_LEVEL)
+        .expect("zstd encode_all of in-memory pipeline recipe");
+    push_chunk(buf, RECORD_KIND_PIPELINE, recipe.disk_key(), &frame);
+}
+
 /// Serialise one Bundle chunk containing every entry into `buf`.
 ///
 /// The entries are written into a scratch plain-record blob (no
@@ -638,98 +1039,246 @@ pub fn write_record(buf: &mut Vec<u8>, entry: &CacheEntry) {
 /// Panics if the compressed frame exceeds 4 GiB or if any entry's MSL
 /// exceeds 4 GiB, or if zstd's in-memory `encode_all` returns an error
 /// (effectively impossible). Real bundles are hundreds of KB at most.
-pub fn write_bundle(buf: &mut Vec<u8>, entries: &[CacheEntry]) {
+pub fn write_bundle(buf: &mut Vec<u8>, shaders: &[CacheEntry], pipelines: &[PipelineRecipe]) {
     let mut plain = Vec::new();
-    for entry in entries {
+    for entry in shaders {
         write_plain_record(&mut plain, entry);
+    }
+    for recipe in pipelines {
+        write_plain_pipeline_record(&mut plain, recipe);
     }
     let frame = zstd::encode_all(plain.as_slice(), ZSTD_BUNDLE_LEVEL)
         .expect("zstd encode_all of in-memory plain-record blob");
     push_chunk(buf, RECORD_KIND_BUNDLE, 0, &frame);
 }
 
-/// Open the cache file at `path` for append, creating it with its header when absent.
-///
-/// Creation goes through `create_new`, so when several writers reach a cold
-/// cache together the file system elects exactly one of them: that writer
-/// emits the 16-byte header, and every other one opens the file it finds and
-/// appends its chunks behind that header. Exactly one header therefore
-/// reaches the file however many writers race for it.
-///
-/// # Errors
-///
-/// Any I/O error from the create, from the header write, or from the append
-/// open taken when the file already exists.
-pub fn open_for_append(path: &Path) -> std::io::Result<File> {
-    use std::io::Write as _;
+/// Result of opening and validating the cache under its sidecar lock.
+pub enum CacheLoad {
+    Missing,
+    Current(CacheRecords),
+    InvalidatedVersion(CacheHeader),
+    InvalidatedWrongMagic,
+}
 
-    match OpenOptions::new().append(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            let mut header = Vec::with_capacity(HEADER_LEN);
-            write_header(&mut header);
-            file.write_all(&header)?;
-            Ok(file)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = OpenOptions::new().append(true).open(path)?;
-            await_header(&file);
-            Ok(file)
-        }
-        Err(e) => Err(e),
+/// A process-safe append endpoint for shader and pipeline records.
+///
+/// Each append locks a stable sidecar and reopens the data path. Reopening is
+/// required because a concurrent compactor can atomically replace the data
+/// file while this value remains alive.
+pub struct CacheWriter {
+    path: PathBuf,
+}
+
+impl CacheWriter {
+    /// Open the stable sidecar lock for `path`.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error opening or creating the sidecar.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        drop(open_lock(path)?);
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    /// Append one shader record as one locked write.
+    ///
+    /// # Errors
+    ///
+    /// Any locking, validation, open, or write error.
+    pub fn append_shader(&self, entry: &CacheEntry) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(CHUNK_HEADER_LEN + entry.msl.len());
+        write_record(&mut buf, entry);
+        self.append_bytes(&buf)
+    }
+
+    /// Append one pipeline recipe as one locked write.
+    ///
+    /// # Errors
+    ///
+    /// Any locking, validation, open, or write error.
+    pub fn append_pipeline(&self, recipe: &PipelineRecipe) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        write_pipeline_record(&mut buf, recipe);
+        self.append_bytes(&buf)
+    }
+
+    fn append_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let lock = open_lock(&self.path)?;
+        lock_exclusive(&lock)?;
+        let result = (|| {
+            let mut file = open_data_for_append(&self.path)?;
+            std::io::Write::write_all(&mut file, bytes)
+        })();
+        drop(lock);
+        result
     }
 }
 
-/// Attempts `await_header` makes before it gives up on the header appearing.
+/// Read and validate a cache while excluding appenders and compactors.
 ///
-/// The elected writer's create and its header write are consecutive, so one
-/// attempt is the normal case; the bound is what keeps a file left empty by a
-/// killed process from stalling a caller.
-const HEADER_WAIT_ATTEMPTS: u32 = 25;
+/// A wrong header is removed and an unreadable tail is truncated before the
+/// lock is released. Concurrent writers can then append while this device
+/// prewarms without placing records after a tail the parser cannot traverse.
+///
+/// # Errors
+///
+/// Any sidecar, lock, read, truncate, or remove error.
+pub fn load(path: &Path) -> std::io::Result<CacheLoad> {
+    let lock = open_lock(path)?;
+    lock_exclusive(&lock)?;
+    let result = (|| {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CacheLoad::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        match read_header(&bytes) {
+            Ok(header) if header == CacheHeader::CURRENT => {
+                let records = read_records(&bytes);
+                if records.valid_len < bytes.len() {
+                    let len = u64::try_from(records.valid_len)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    OpenOptions::new().write(true).open(path)?.set_len(len)?;
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "shader_cache: discarded unreadable cache tail before reopening for writes"
+                    );
+                }
+                Ok(CacheLoad::Current(records))
+            }
+            Ok(header) => {
+                fs::remove_file(path)?;
+                Ok(CacheLoad::InvalidatedVersion(header))
+            }
+            Err(CacheReadError::WrongMagic) => {
+                fs::remove_file(path)?;
+                Ok(CacheLoad::InvalidatedWrongMagic)
+            }
+        }
+    })();
+    drop(lock);
+    result
+}
 
-/// Interval between `await_header` attempts.
-const HEADER_WAIT_INTERVAL: Duration = Duration::from_micros(200);
+/// Rewrite the latest cache contents into one Bundle while holding the sidecar lock.
+///
+/// The function rereads after taking the lock, so records appended since a
+/// prewarm read are included rather than lost across the atomic rename.
+///
+/// Returns `(record_count, byte_count)` when a rewrite occurred.
+///
+/// # Errors
+///
+/// Any sidecar, lock, read, write, or rename error.
+pub fn compact(path: &Path) -> std::io::Result<Option<(usize, usize)>> {
+    let lock = open_lock(path)?;
+    lock_exclusive(&lock)?;
+    let result = (|| {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let header = read_header(&bytes)
+            .map_err(|_| std::io::Error::other("cache magic changed before compaction"))?;
+        if header != CacheHeader::CURRENT {
+            return Err(std::io::Error::other(
+                "cache version changed before compaction",
+            ));
+        }
+        let records = read_records(&bytes);
+        if !records.needs_compaction {
+            return Ok(None);
+        }
+        let mut buf = Vec::new();
+        write_header(&mut buf);
+        write_bundle(&mut buf, &records.shaders, &records.pipelines);
 
-// Wait for the electing writer's header before appending behind it. A writer
-// that finds the file already there has to leave the first 16 bytes to
-// whoever created it, or its chunk would land at the offset the reader skips
-// as the header.
-fn await_header(file: &File) {
-    for _ in 0..HEADER_WAIT_ATTEMPTS {
-        if file
-            .metadata()
-            .is_ok_and(|m| m.len() >= u64::try_from(HEADER_LEN).unwrap_or(u64::MAX))
+        let tmp = temp_sibling(path);
+        fs::write(&tmp, &buf)?;
+        if let Err(error) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok(Some((
+            records.shaders.len() + records.pipelines.len(),
+            buf.len(),
+        )))
+    })();
+    drop(lock);
+    result
+}
+
+fn open_lock(path: &Path) -> std::io::Result<File> {
+    let path = lock_path(path);
+    loop {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
         {
-            return;
+            Ok(lock) => return Ok(lock),
+            Err(error) if is_lock_contention(&error) => {
+                thread::sleep(Duration::from_micros(200));
+            }
+            Err(error) => return Err(error),
         }
-        thread::sleep(HEADER_WAIT_INTERVAL);
     }
 }
 
-/// Replace the file at `path` with a header plus one Bundle chunk holding `entries`.
-///
-/// The bytes go to a temporary beside `path` and the temporary is renamed
-/// over it, so a reader observes either the previous file or the whole new
-/// one. The temporary's name carries the process id and a per-call counter,
-/// so two writers compacting at once cannot interleave into one scratch file.
-///
-/// Returns the number of bytes written.
-///
-/// # Errors
-///
-/// Any I/O error from the temporary write or from the rename; the temporary
-/// is removed when the rename fails.
-pub fn replace_with_bundle(path: &Path, entries: &[CacheEntry]) -> std::io::Result<usize> {
-    let mut buf = Vec::new();
-    write_header(&mut buf);
-    write_bundle(&mut buf, entries);
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
 
-    let tmp = temp_sibling(path);
-    fs::write(&tmp, &buf)?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
+fn lock_exclusive(lock: &File) -> std::io::Result<()> {
+    loop {
+        match lock.lock() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_lock_contention(&error) => {
+                // Wine can return ERROR_LOCK_VIOLATION from a blocking
+                // LockFileEx call. Treat it as contention and retry.
+                thread::sleep(Duration::from_micros(200));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(buf.len())
+}
+
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (cfg!(windows) && error.raw_os_error() == Some(33))
+}
+
+fn open_data_for_append(path: &Path) -> std::io::Result<File> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)?;
+    if file.metadata()?.len() == 0 {
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        write_header(&mut header);
+        file.write_all(&header)?;
+        return Ok(file);
+    }
+    file.rewind()?;
+    let mut header_bytes = [0u8; HEADER_LEN];
+    file.read_exact(&mut header_bytes)?;
+    if read_header(&header_bytes).is_ok_and(|header| header == CacheHeader::CURRENT) {
+        Ok(file)
+    } else {
+        Err(std::io::Error::other("cache header changed before append"))
+    }
 }
 
 // Name a scratch file beside `path`, unique to this process and this call.
@@ -813,39 +1362,98 @@ fn write_plain_record(buf: &mut Vec<u8>, entry: &CacheEntry) {
     buf.extend_from_slice(msl_bytes);
 }
 
+fn write_plain_pipeline_record(buf: &mut Vec<u8>, recipe: &PipelineRecipe) {
+    let mut body = Vec::new();
+    recipe.encode(&mut body);
+    let body_len = u32::try_from(body.len()).expect("pipeline recipe > 4 GiB");
+    buf.push(RECORD_KIND_PIPELINE);
+    buf.extend_from_slice(&[0u8; 3]);
+    buf.extend_from_slice(&recipe.disk_key().to_le_bytes());
+    buf.extend_from_slice(&body_len.to_le_bytes());
+    buf.extend_from_slice(&body);
+}
+
+enum PlainRecord {
+    Shader(CacheEntry),
+    Pipeline(Box<PipelineRecipe>),
+}
+
+struct PlainRecords {
+    records: Vec<PlainRecord>,
+    malformed: bool,
+}
+
+fn push_record(
+    record: PlainRecord,
+    shaders: &mut Vec<CacheEntry>,
+    pipelines: &mut Vec<PipelineRecipe>,
+    seen_shaders: &mut FxHashSet<ShaderRecordRef>,
+    seen_pipelines: &mut FxHashSet<u64>,
+    duplicates: &mut bool,
+) {
+    match record {
+        PlainRecord::Shader(entry) => {
+            let reference = ShaderRecordRef::new(entry.kind, entry.key);
+            if seen_shaders.insert(reference) {
+                shaders.push(entry);
+            } else {
+                *duplicates = true;
+            }
+        }
+        PlainRecord::Pipeline(recipe) => {
+            if seen_pipelines.insert(recipe.disk_key()) {
+                pipelines.push(*recipe);
+            } else {
+                *duplicates = true;
+            }
+        }
+    }
+}
+
 // Parse a Bundle chunk's decompressed plain-record payload. Same
 // torn-record / unknown-kind / bad-UTF-8 skip discipline as the outer
 // chunk parser, applied to the v15 inner layout.
-fn parse_plain_records(bytes: &[u8]) -> Vec<CacheEntry> {
-    let mut out = Vec::new();
+fn parse_plain_records(bytes: &[u8]) -> PlainRecords {
+    let mut records = Vec::new();
     let mut off = 0usize;
+    let mut malformed = false;
     while off + RECORD_HEADER_LEN <= bytes.len() {
         let kind_byte = bytes[off];
         let key = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap());
-        let msl_len = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap()) as usize;
+        let body_len = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap()) as usize;
         let body_start = off + RECORD_HEADER_LEN;
-        let Some(body_end) = body_start.checked_add(msl_len) else {
+        let Some(body_end) = body_start.checked_add(body_len) else {
+            malformed = true;
             break;
         };
         if body_end > bytes.len() {
+            malformed = true;
             break;
         }
-        let Some(kind) = CachedKind::from_byte(kind_byte) else {
-            off = body_end;
-            continue;
-        };
-        let Ok(msl) = std::str::from_utf8(&bytes[body_start..body_end]) else {
-            off = body_end;
-            continue;
-        };
-        out.push(CacheEntry {
-            kind,
-            key,
-            msl: msl.to_owned(),
-        });
+        let body = &bytes[body_start..body_end];
+        if kind_byte == RECORD_KIND_PIPELINE {
+            match PipelineRecipe::decode(body) {
+                Some(recipe) if recipe.disk_key() == key => {
+                    records.push(PlainRecord::Pipeline(Box::new(recipe)));
+                }
+                _ => malformed = true,
+            }
+        } else if let Some(kind) = CachedKind::from_byte(kind_byte) {
+            match std::str::from_utf8(body) {
+                Ok(msl) => records.push(PlainRecord::Shader(CacheEntry {
+                    kind,
+                    key,
+                    msl: msl.to_owned(),
+                })),
+                Err(_) => malformed = true,
+            }
+        } else {
+            malformed = true;
+        }
         off = body_end;
     }
-    out
+    malformed |= off != bytes.len();
+    PlainRecords { records, malformed }
 }
 
 #[cfg(test)]

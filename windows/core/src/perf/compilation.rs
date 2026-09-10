@@ -31,6 +31,7 @@ pub enum Kind {
     Sibling,
     PipelinePreparation,
     PipelineBuild,
+    PipelineCacheWrite,
     Depth,
     ResolveOther,
     PipelineOther,
@@ -52,6 +53,7 @@ impl Kind {
         "PSO sibling total",
         "  PSO setup",
         "  Metal PSO build",
+        "  PSO cache persist",
         "depth state build",
         "resolve remainder",
         "pipeline remainder",
@@ -267,7 +269,7 @@ impl CompilationPerf {
         }
         self.window = std::mem::take(&mut self.frame);
         let mut output = format!(
-            "shader prewarm PERF device={device:#x} (startup totals; outside gameplay windows)\n"
+            "cache prewarm PERF device={device:#x} (startup totals; outside gameplay windows)\n"
         );
         for (label, metric) in Kind::LABELS.iter().zip(&self.window) {
             if metric.calls != 0 {

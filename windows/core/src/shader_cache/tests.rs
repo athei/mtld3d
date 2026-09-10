@@ -17,7 +17,7 @@ fn write_file(entries_per_chunk: &[Vec<CacheEntry>], bundle_last: bool) -> Vec<u
     for (i, group) in entries_per_chunk.iter().enumerate() {
         let as_bundle = bundle_last && i == last_idx;
         if as_bundle {
-            write_bundle(&mut buf, group);
+            write_bundle(&mut buf, group, &[]);
         } else {
             for entry in group {
                 write_record(&mut buf, entry);
@@ -52,10 +52,14 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 
 /// Append one record to the cache file at `path`, creating the file when absent.
 fn append_one(path: &std::path::Path, entry: &CacheEntry) {
-    let mut file = open_for_append(path).expect("open cache file");
-    let mut buf = Vec::new();
-    write_record(&mut buf, entry);
-    std::io::Write::write_all(&mut file, &buf).expect("append record");
+    let writer = CacheWriter::open(path).expect("open cache writer");
+    writer.append_shader(entry).expect("append record");
+}
+
+fn read_shaders(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
+    let records = read_records(bytes);
+    assert!(records.pipelines.is_empty());
+    (records.shaders, records.needs_compaction)
 }
 
 fn sample_entries() -> Vec<CacheEntry> {
@@ -78,12 +82,48 @@ fn sample_entries() -> Vec<CacheEntry> {
     ]
 }
 
+fn sample_recipe() -> PipelineRecipe {
+    let entries = sample_entries();
+    let mut stream_layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+    stream_layouts[0] = StreamLayout {
+        stride: 12,
+        step: VertexStepFunction::PerVertex,
+        step_rate: 1,
+    };
+    let snapshot = PipelineSnapshot {
+        vs_fn: MetalHandle::NULL,
+        ps_fn: MetalHandle::NULL,
+        vdecl_hash: 0x1234,
+        stream_layouts,
+        color_format: PixelFormat::Bgra8Unorm,
+        attach: PipelineAttachFlags::HAS_COLOR_OUTPUT | PipelineAttachFlags::COLOR_HAS_ALPHA,
+        rs: PipelineRsBits {
+            color_write_mask: 0x0F,
+            ..PipelineRsBits::default()
+        },
+        extra: ExtraColorAttachments::NONE,
+        ps_color_out_mask: 1,
+        sample_count: 1,
+    };
+    PipelineRecipe::from_snapshot(
+        ShaderRecordRef::new(entries[0].kind, entries[0].key),
+        ShaderRecordRef::new(entries[2].kind, entries[2].key),
+        &snapshot,
+        &[VertexAttrDesc {
+            attr_index: 0,
+            buffer_index: 0,
+            offset: 0,
+            format: VertexFormat::Float3,
+        }],
+    )
+}
+
 #[test]
 fn single_chunk_round_trip() {
     let entries = sample_entries();
     let buf = write_file(std::slice::from_ref(&entries), false);
-    assert_eq!(read_header(&buf), Ok(SHADER_CACHE_SCHEMA_VERSION));
-    let (read, needs_compaction) = read_records(&buf);
+    assert_eq!(read_header(&buf), Ok(CacheHeader::CURRENT));
+    let (read, needs_compaction) = read_shaders(&buf);
     assert_eq!(read, entries);
     // Singles only, no Bundle ⇒ compact next launch.
     assert!(needs_compaction);
@@ -93,13 +133,174 @@ fn single_chunk_round_trip() {
 fn bundle_chunk_round_trip_is_optimal() {
     let entries = sample_entries();
     let buf = write_file(std::slice::from_ref(&entries), true);
-    assert_eq!(read_header(&buf), Ok(SHADER_CACHE_SCHEMA_VERSION));
-    let (read, needs_compaction) = read_records(&buf);
+    assert_eq!(read_header(&buf), Ok(CacheHeader::CURRENT));
+    let (read, needs_compaction) = read_shaders(&buf);
     assert_eq!(read, entries);
     // Exactly one Bundle, no dupes, EOF clean ⇒ optimal.
     assert!(!needs_compaction);
     // First chunk byte after the file header is the Bundle discriminator.
     assert_eq!(buf[HEADER_LEN], RECORD_KIND_BUNDLE);
+}
+
+#[test]
+fn pipeline_recipe_round_trips_with_stable_shader_refs() {
+    let entries = sample_entries();
+    let recipe = sample_recipe();
+    let mut buf = Vec::new();
+    write_header(&mut buf);
+    write_bundle(&mut buf, &entries, std::slice::from_ref(&recipe));
+    let records = read_records(&buf);
+    assert_eq!(records.shaders, entries);
+    assert!(records.pipelines == vec![recipe]);
+    assert!(!records.needs_compaction);
+}
+
+#[test]
+fn pipeline_recipe_without_both_shader_records_is_dropped() {
+    let entries = sample_entries();
+    let recipe = sample_recipe();
+    let mut buf = Vec::new();
+    write_header(&mut buf);
+    write_bundle(&mut buf, &entries[..1], std::slice::from_ref(&recipe));
+    let records = read_records(&buf);
+    assert!(records.pipelines.is_empty());
+    assert!(records.needs_compaction);
+}
+
+#[test]
+fn load_repairs_a_torn_tail_before_another_writer_appends() {
+    let dir = scratch_dir("load-repair");
+    let path = dir.join("mtld3d_shaders.bin");
+    let entries = sample_entries();
+    let mut bytes = write_file(std::slice::from_ref(&entries), false);
+    bytes.truncate(bytes.len() - 5);
+    std::fs::write(&path, bytes).expect("write torn cache");
+
+    let CacheLoad::Current(records) = load(&path).expect("load torn cache") else {
+        panic!("torn cache lost its valid header");
+    };
+    assert_eq!(records.shaders, entries[..2]);
+    // A live encoder can write while another device compiles its startup
+    // snapshot. Its records must remain reachable by the later compactor.
+    append_one(&path, &entries[2]);
+    compact(&path).expect("compact repaired cache");
+    let records = read_records(&std::fs::read(&path).expect("read repaired cache"));
+    assert_eq!(records.shaders, entries);
+    assert!(!records.needs_compaction);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn recipes_preserve_instancing_constant_streams_mrt_and_siblings() {
+    let mut recipe = sample_recipe();
+    recipe.snapshot.stream_layouts[0].step = VertexStepFunction::Constant;
+    recipe.snapshot.stream_layouts[0].step_rate = 0;
+    recipe.snapshot.stream_layouts[15] = StreamLayout {
+        stride: 32,
+        step: VertexStepFunction::PerInstance,
+        step_rate: 7,
+    };
+    recipe.vertex_attrs.push(VertexAttrDesc {
+        attr_index: 15,
+        buffer_index: 15,
+        offset: 16,
+        format: VertexFormat::Float4,
+    });
+    recipe.snapshot.sample_count = 4;
+    recipe
+        .snapshot
+        .attach
+        .insert(PipelineAttachFlags::HAS_DEPTH | PipelineAttachFlags::HAS_STENCIL);
+    recipe.snapshot.extra = ExtraColorAttachments {
+        formats: [
+            PixelFormat::Rgba16Float,
+            PixelFormat::Bgra8Unorm,
+            PixelFormat::R32Float,
+        ],
+        present_mask: 0b101,
+        has_alpha_mask: 0b001,
+    };
+    recipe.snapshot.ps_color_out_mask = 0b1011;
+    recipe.snapshot.rs.flags = PipelineRsFlags::all();
+    recipe.snapshot.rs.src_blend_alpha = 5;
+    recipe.snapshot.rs.dst_blend_alpha = 6;
+    recipe.snapshot.rs.blend_op_alpha = 3;
+    recipe.snapshot.rs.color_write_mask = 0;
+    recipe.snapshot.rs.color_write_mask_ext = [0; 3];
+    let mut sibling_snapshot = recipe.snapshot.clone();
+    sibling_snapshot
+        .attach
+        .remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+    sibling_snapshot.extra = ExtraColorAttachments::NONE;
+    let sibling = PipelineRecipe::from_snapshot(
+        recipe.vs,
+        recipe.ps,
+        &sibling_snapshot,
+        recipe.vertex_attrs(),
+    );
+
+    let mut bytes = Vec::new();
+    write_header(&mut bytes);
+    let recipes = [recipe, sibling];
+    write_bundle(&mut bytes, &sample_entries(), &recipes);
+    let records = read_records(&bytes);
+    assert!(records.pipelines == recipes);
+    assert!(!records.needs_compaction);
+}
+
+#[test]
+fn duplicate_recipes_share_shader_records_after_compaction() {
+    let dir = scratch_dir("recipe-dedup");
+    let path = dir.join("mtld3d_shaders.bin");
+    let entries = sample_entries();
+    let writer = CacheWriter::open(&path).expect("open writer");
+    for entry in &entries {
+        writer.append_shader(entry).expect("append shader");
+        writer
+            .append_shader(entry)
+            .expect("append duplicate shader");
+    }
+    let first = sample_recipe();
+    let mut second = sample_recipe();
+    second
+        .snapshot
+        .rs
+        .flags
+        .insert(PipelineRsFlags::BLEND_ENABLE);
+    for recipe in [&first, &second, &first] {
+        writer.append_pipeline(recipe).expect("append recipe");
+    }
+    compact(&path).expect("compact recipes");
+    let records = read_records(&std::fs::read(&path).expect("read compacted recipes"));
+    assert_eq!(records.shaders, entries);
+    assert!(records.pipelines == [first, second]);
+    assert!(!records.needs_compaction);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn malformed_pipeline_payloads_are_rejected_with_valid_checksums() {
+    let mut valid = Vec::new();
+    sample_recipe().encode(&mut valid);
+    for length in 0..valid.len() {
+        assert!(PipelineRecipe::decode(&valid[..length]).is_none());
+    }
+    for (offset, value) in [(0, CachedKind::FfPs as u8), (2, 0x80), (30, 0), (31, 0x80)] {
+        let mut invalid = valid.clone();
+        invalid[offset] = value;
+        let frame = zstd::encode_all(invalid.as_slice(), ZSTD_APPEND_LEVEL)
+            .expect("compress invalid recipe");
+        let mut bytes = write_file(&[sample_entries()], false);
+        push_chunk(
+            &mut bytes,
+            RECORD_KIND_PIPELINE,
+            sample_recipe().disk_key(),
+            &frame,
+        );
+        let records = read_records(&bytes);
+        assert!(records.pipelines.is_empty());
+        assert!(records.needs_compaction);
+    }
 }
 
 #[test]
@@ -112,11 +313,11 @@ fn mixed_bundle_plus_singles_round_trip() {
     }];
     let mut buf = Vec::new();
     write_header(&mut buf);
-    write_bundle(&mut buf, &bundle_entries);
+    write_bundle(&mut buf, &bundle_entries, &[]);
     for e in &later_appends {
         write_record(&mut buf, e);
     }
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     let mut expected = bundle_entries.clone();
     expected.extend(later_appends);
     assert_eq!(read, expected);
@@ -130,7 +331,7 @@ fn torn_trailing_chunk_dropped_and_flags_compaction() {
     let mut buf = write_file(std::slice::from_ref(&entries), false);
     // Truncate mid-frame of the final chunk.
     buf.truncate(buf.len() - 5);
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     // Dropped the torn last chunk.
     assert_eq!(read.len(), entries.len() - 1);
     assert!(needs_compaction);
@@ -172,7 +373,7 @@ fn corrupt_chunk_header_caught_by_xxh3() {
             msl: "ok after — forfeit on corruption-stop".into(),
         },
     );
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     // Only the chunk before the corruption survives. The corrupt
     // chunk and everything after it are dropped; compaction rewrites
     // a clean file so the trailing chunk recompiles next launch.
@@ -205,7 +406,7 @@ fn corrupt_frame_body_caught_and_skipped() {
     // Scramble a byte inside the second chunk's compressed frame
     // (past the 24-byte chunk header).
     buf[bad_start + CHUNK_HEADER_LEN + 2] ^= 0xFF;
-    let (read, _) = read_records(&buf);
+    let (read, _) = read_shaders(&buf);
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].key, 0x1111);
 }
@@ -246,7 +447,7 @@ fn unknown_chunk_kind_skipped_via_frame_len() {
             msl: "after weird".into(),
         },
     );
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].key, 0x4321);
     assert!(needs_compaction);
@@ -261,21 +462,19 @@ fn duplicate_keys_flag_compaction() {
     };
     let mut buf = Vec::new();
     write_header(&mut buf);
-    write_bundle(&mut buf, &[dup.clone(), dup]);
-    let (read, needs_compaction) = read_records(&buf);
-    // Both entries are read; the dedupe is the caller's job.
-    assert_eq!(read.len(), 2);
+    write_bundle(&mut buf, &[dup.clone(), dup], &[]);
+    let (read, needs_compaction) = read_shaders(&buf);
+    assert_eq!(read.len(), 1);
     assert!(needs_compaction);
 }
 
 #[test]
-fn empty_file_with_just_header_is_not_compacted() {
+fn empty_file_with_just_header_is_compacted() {
     let mut buf = Vec::new();
     write_header(&mut buf);
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     assert!(read.is_empty());
-    // Nothing to compact ⇒ pre-warm leaves the file alone.
-    assert!(!needs_compaction);
+    assert!(needs_compaction);
 }
 
 #[test]
@@ -291,12 +490,18 @@ fn read_header_rejects_short_input() {
 }
 
 #[test]
-fn read_header_returns_schema_for_caller_comparison() {
+fn read_header_returns_both_versions() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SHADER_CACHE_MAGIC);
     buf.extend_from_slice(&99u32.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 4]);
-    assert_eq!(read_header(&buf), Ok(99));
+    buf.extend_from_slice(&100u32.to_le_bytes());
+    assert_eq!(
+        read_header(&buf),
+        Ok(CacheHeader {
+            format_version: 99,
+            shader_schema_version: 100,
+        })
+    );
 }
 
 #[test]
@@ -349,7 +554,7 @@ fn stray_file_header_mid_file_is_skipped() {
     // A second creation's header, landing where a chunk header belongs.
     write_header(&mut buf);
     write_record(&mut buf, &entries[1]);
-    let (read, needs_compaction) = read_records(&buf);
+    let (read, needs_compaction) = read_shaders(&buf);
     assert_eq!(read, vec![entries[0].clone(), entries[1].clone()]);
     // The stray header is a reason to rewrite the file dense.
     assert!(needs_compaction);
@@ -365,8 +570,8 @@ fn open_for_append_writes_one_header_across_writers() {
     }
     let bytes = std::fs::read(&path).expect("read cache file");
     assert_eq!(magic_count(&bytes), 1);
-    assert_eq!(read_header(&bytes), Ok(SHADER_CACHE_SCHEMA_VERSION));
-    let (read, _) = read_records(&bytes);
+    assert_eq!(read_header(&bytes), Ok(CacheHeader::CURRENT));
+    let (read, _) = read_shaders(&bytes);
     assert_eq!(read, entries);
     std::fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
@@ -400,29 +605,136 @@ fn concurrent_open_for_append_writes_one_header() {
     });
     let bytes = std::fs::read(&path).expect("read cache file");
     assert_eq!(magic_count(&bytes), 1);
-    assert_eq!(read_header(&bytes), Ok(SHADER_CACHE_SCHEMA_VERSION));
-    let (read, _) = read_records(&bytes);
+    assert_eq!(read_header(&bytes), Ok(CacheHeader::CURRENT));
+    let (read, _) = read_shaders(&bytes);
     assert_eq!(read.len(), WRITERS);
     std::fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
 
 #[test]
-fn replace_with_bundle_renames_one_dense_file_into_place() {
+fn compact_renames_one_dense_file_into_place() {
     let dir = scratch_dir("bundle");
     let path = dir.join("mtld3d_shaders.bin");
     let entries = sample_entries();
     for entry in &entries {
         append_one(&path, entry);
     }
-    let len = replace_with_bundle(&path, &entries).expect("replace with bundle");
+    let (_, len) = compact(&path)
+        .expect("compact cache")
+        .expect("cache needed compaction");
     let bytes = std::fs::read(&path).expect("read cache file");
     assert_eq!(bytes.len(), len);
     assert_eq!(magic_count(&bytes), 1);
-    let (read, needs_compaction) = read_records(&bytes);
+    let (read, needs_compaction) = read_shaders(&bytes);
     assert_eq!(read, entries);
     assert!(!needs_compaction);
     // The temporary is renamed rather than left beside the cache file.
     let leftovers = std::fs::read_dir(&dir).expect("list scratch dir").count();
-    assert_eq!(leftovers, 1);
+    assert_eq!(leftovers, 2);
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn append_and_compaction_race_does_not_lose_records() {
+    const ROUNDS: u64 = 16;
+
+    let dir = scratch_dir("compact-race");
+    let path = dir.join("mtld3d_shaders.bin");
+    append_one(&path, &sample_entries()[0]);
+    for round in 0..ROUNDS {
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let cache_path = path.as_path();
+            let barrier = &start;
+            scope.spawn(move || {
+                barrier.wait();
+                compact(cache_path).expect("compact raced cache");
+            });
+            scope.spawn(move || {
+                barrier.wait();
+                append_one(
+                    cache_path,
+                    &CacheEntry {
+                        kind: CachedKind::Sm2Ps,
+                        key: round + 1,
+                        msl: format!("fragment float4 ps{round}() {{ return 1; }}"),
+                    },
+                );
+            });
+        });
+    }
+    let bytes = std::fs::read(&path).expect("read raced cache");
+    let records = read_records(&bytes);
+    assert_eq!(
+        records.shaders.len(),
+        usize::try_from(ROUNDS).expect("round count fits usize") + 1
+    );
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn concurrent_loaders_and_writers_observe_valid_records() {
+    const WRITERS: u64 = 2;
+    const ROUNDS: u64 = 32;
+
+    let dir = scratch_dir("load-write-race");
+    let path = dir.join("mtld3d_shaders.bin");
+    append_one(&path, &sample_entries()[0]);
+    let start = std::sync::Barrier::new(usize::try_from(WRITERS).expect("writer count fits") + 1);
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let cache_path = path.as_path();
+            let barrier = &start;
+            scope.spawn(move || {
+                barrier.wait();
+                for round in 0..ROUNDS {
+                    append_one(
+                        cache_path,
+                        &CacheEntry {
+                            kind: CachedKind::Sm3Ps,
+                            key: 0x10_0000 + writer * ROUNDS + round,
+                            msl: format!("fragment float4 ps{writer}_{round}() {{ return 1; }}"),
+                        },
+                    );
+                }
+            });
+        }
+        let cache_path = path.as_path();
+        let barrier = &start;
+        scope.spawn(move || {
+            barrier.wait();
+            for _ in 0..ROUNDS {
+                let CacheLoad::Current(records) = load(cache_path).expect("load raced cache")
+                else {
+                    panic!("raced cache stopped being current");
+                };
+                assert!(!records.shaders.is_empty());
+            }
+        });
+    });
+    let CacheLoad::Current(records) = load(&path).expect("load completed cache") else {
+        panic!("completed cache stopped being current");
+    };
+    assert_eq!(
+        records.shaders.len(),
+        usize::try_from(WRITERS * ROUNDS + 1).expect("record count fits")
+    );
+    std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn load_invalidates_stale_versions_under_lock() {
+    let dir = scratch_dir("stale");
+    let path = dir.join("mtld3d_shaders.bin");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&SHADER_CACHE_MAGIC);
+    bytes.extend_from_slice(&(CACHE_FORMAT_VERSION - 1).to_le_bytes());
+    bytes.extend_from_slice(&SHADER_CACHE_SCHEMA_VERSION.to_le_bytes());
+    std::fs::write(&path, bytes).expect("write stale cache");
+    assert!(matches!(
+        load(&path).expect("load stale cache"),
+        CacheLoad::InvalidatedVersion(_)
+    ));
+    assert!(!path.exists());
     std::fs::remove_dir_all(&dir).expect("remove scratch dir");
 }

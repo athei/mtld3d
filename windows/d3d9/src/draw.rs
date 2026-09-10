@@ -1617,7 +1617,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         return;
     };
     drop(t_lookup);
-    let shaders = ShaderRef { vs, ps, variant };
+    let shaders = ShaderRef {
+        vs,
+        ps,
+        variant: ps_variant,
+    };
     enc.maybe_log_pass_shader(shaders, stage_bindings);
     // One vertex buffer layout per stream the declaration reads: stride and
     // step function from the binding (a zero stride is one constant element,
