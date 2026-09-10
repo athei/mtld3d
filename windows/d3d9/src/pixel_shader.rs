@@ -33,7 +33,7 @@ impl Direct3DPixelShader9 {
         max_const_used: u32,
         flags: PsUsage,
         color_out_mask: u8,
-        bytecode: Box<[u32]>,
+        bytecode: std::sync::Arc<[u32]>,
     ) -> Self {
         let inner = Box::into_raw(Box::new(PixelShaderInner {
             device_inner,
@@ -126,7 +126,7 @@ struct PixelShaderInner {
     ///
     /// Kept verbatim so `GetFunction` can hand it back. Nothing else reads
     /// it: the translation works from the parsed `DxsoProgram`.
-    bytecode: Box<[u32]>,
+    bytecode: std::sync::Arc<[u32]>,
 }
 
 #[inline]

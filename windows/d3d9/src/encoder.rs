@@ -5311,7 +5311,7 @@ impl FrameEncoder {
     ///
     /// Best-effort: any I/O failure latches `cache_disabled` so the rest of
     /// the session stops trying.
-    fn cache_write_record(&mut self, kind: CachedKind, key: u64, msl: &str) {
+    fn cache_write_record(&mut self, entry: &shader_cache::CacheEntry) {
         if self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
             || !self.flags.contains(FrameEncoderFlags::CACHE_READY)
         {
@@ -5330,13 +5330,8 @@ impl FrameEncoder {
                 }
             }
         }
-        let entry = shader_cache::CacheEntry {
-            kind,
-            key,
-            msl: msl.to_owned(),
-        };
         if let Some(writer) = &self.cache_writer
-            && let Err(e) = writer.append_shader(&entry)
+            && let Err(e) = writer.append_shader(entry)
         {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -5528,7 +5523,26 @@ impl FrameEncoder {
                 && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
             {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
-                self.cache_write_record(kind, disk_key, &msl);
+                let retained = match source {
+                    VsSource::Programmable {
+                        vs_id,
+                        provided_input_mask,
+                        clip_plane_count,
+                        sampler_kinds,
+                        ..
+                    } => self.program_cache.get(vs_id).map(|program| {
+                        shader_cache::ShaderSource::vertex(
+                            program,
+                            *provided_input_mask,
+                            *clip_plane_count,
+                            *sampler_kinds,
+                        )
+                    }),
+                    VsSource::FixedFunction { .. } => None,
+                };
+                self.cache_write_record(&shader_cache::CacheEntry::new(
+                    kind, disk_key, msl, retained,
+                ));
             }
             if let Some(reference) = reference {
                 self.lib_cache.insert(reference, handles);
@@ -5689,7 +5703,16 @@ impl FrameEncoder {
                 && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
             {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
-                self.cache_write_record(kind, disk_key, &msl);
+                let retained = match source {
+                    PsSource::Programmable { ps_id, .. } => self
+                        .program_cache
+                        .get(ps_id)
+                        .map(|program| shader_cache::ShaderSource::pixel(program, variant)),
+                    PsSource::FixedFunction { .. } => None,
+                };
+                self.cache_write_record(&shader_cache::CacheEntry::new(
+                    kind, disk_key, msl, retained,
+                ));
             }
             if let Some(reference) = reference {
                 self.lib_cache.insert(reference, handles);

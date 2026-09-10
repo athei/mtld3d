@@ -38,7 +38,7 @@ impl Direct3DVertexShader9 {
         max_const_used: u32,
         flags: VsConstUsage,
         input_semantics: Vec<InputSemantic>,
-        bytecode: Box<[u32]>,
+        bytecode: std::sync::Arc<[u32]>,
     ) -> Self {
         let inner = Box::into_raw(Box::new(VertexShaderInner {
             device_inner,
@@ -141,7 +141,7 @@ struct VertexShaderInner {
     ///
     /// Kept verbatim so `GetFunction` can hand it back. Nothing else reads
     /// it: the translation works from the parsed `DxsoProgram`.
-    bytecode: Box<[u32]>,
+    bytecode: std::sync::Arc<[u32]>,
 }
 
 #[inline]

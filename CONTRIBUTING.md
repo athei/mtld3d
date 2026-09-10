@@ -250,8 +250,12 @@ Each of these rots silently when it is left for later:
 - A new render-state, texture-stage-state or sampler-state consumer moves its
   slot to consumed in the matching classifier, and flips the matching caps bit.
   The classifier warnings are only useful while every warning is a real gap.
-- A change to shader emission bumps the shader-cache schema version. An unchanged
-  cache key serves stale MSL, and the result looks like a rendering bug.
+- Shader emission has a source-derived fingerprint (`windows/core/build.rs`).
+  Changes under `dxso/` and to its shared MSL inputs invalidate MSL automatically;
+  extend the source list when adding an emission dependency outside those paths.
+  Bump the shader-cache schema for incompatible shader keys or pipeline-translation
+  semantics, and the container version for binary-format changes. Programmable
+  DXSO survives emitter changes; fixed-function entries rebuild on first use.
 - A new config key ships with its dispatch arm, its unit test, and its entry in
   the `mtld3d.conf` sample with the default and a short why.
 - A new built-in app profile ships with the rationale for every key it sets as

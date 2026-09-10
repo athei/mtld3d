@@ -65,16 +65,22 @@ fn read_shaders(bytes: &[u8]) -> (Vec<CacheEntry>, bool) {
 fn sample_entries() -> Vec<CacheEntry> {
     vec![
         CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm3Vs,
             key: 0xDEAD_BEEF_CAFE_BABE,
             msl: "vertex VsOut vs(Inputs in [[stage_in]]) { /* … */ }".into(),
         },
         CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::FfPs,
             key: 0,
             msl: String::new(),
         },
         CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm2Ps,
             key: 0x0102_0304_0506_0708,
             msl: "fragment float4 ps() { return float4(1); }".into(),
@@ -352,6 +358,8 @@ fn malformed_pipeline_payloads_are_rejected_with_valid_checksums() {
 fn mixed_bundle_plus_singles_round_trip() {
     let bundle_entries = sample_entries();
     let later_appends = vec![CacheEntry {
+        source: None,
+        emitter_version: SHADER_EMITTER_VERSION,
         kind: CachedKind::Sm3Ps,
         key: 0xAAAA_BBBB_CCCC_DDDD,
         msl: "fragment float4 ps_later() { return float4(0,1,0,1); }".into(),
@@ -389,6 +397,8 @@ fn corrupt_chunk_header_caught_by_xxh3() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm2Vs,
             key: 0xAABB,
             msl: "ok before".into(),
@@ -398,6 +408,8 @@ fn corrupt_chunk_header_caught_by_xxh3() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm2Ps,
             key: 0xCCDD,
             msl: "corrupted in header below".into(),
@@ -413,6 +425,8 @@ fn corrupt_chunk_header_caught_by_xxh3() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm3Ps,
             key: 0xEEFF,
             msl: "ok after — forfeit on corruption-stop".into(),
@@ -434,6 +448,8 @@ fn corrupt_frame_body_caught_and_skipped() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm2Vs,
             key: 0x1111,
             msl: "good".into(),
@@ -443,6 +459,8 @@ fn corrupt_frame_body_caught_and_skipped() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm2Ps,
             key: 0x2222,
             msl: "frame body will be scrambled".into(),
@@ -469,6 +487,8 @@ fn unknown_chunk_kind_skipped_via_frame_len() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::FfVs,
             key: 0x9999,
             msl: "irrelevant".into(),
@@ -487,6 +507,8 @@ fn unknown_chunk_kind_skipped_via_frame_len() {
     write_record(
         &mut buf,
         &CacheEntry {
+            source: None,
+            emitter_version: SHADER_EMITTER_VERSION,
             kind: CachedKind::Sm3Ps,
             key: 0x4321,
             msl: "after weird".into(),
@@ -501,6 +523,8 @@ fn unknown_chunk_kind_skipped_via_frame_len() {
 #[test]
 fn duplicate_keys_flag_compaction() {
     let dup = CacheEntry {
+        source: None,
+        emitter_version: SHADER_EMITTER_VERSION,
         kind: CachedKind::Sm3Vs,
         key: 0x5555,
         msl: "first copy".into(),
@@ -640,6 +664,8 @@ fn concurrent_open_for_append_writes_one_header() {
                 append_one(
                     path,
                     &CacheEntry {
+                        source: None,
+                        emitter_version: SHADER_EMITTER_VERSION,
                         kind: CachedKind::Sm2Ps,
                         key,
                         msl: format!("fragment float4 ps{key}() {{ return float4({key}); }}"),
@@ -700,6 +726,8 @@ fn append_and_compaction_race_does_not_lose_records() {
                 append_one(
                     cache_path,
                     &CacheEntry {
+                        source: None,
+                        emitter_version: SHADER_EMITTER_VERSION,
                         kind: CachedKind::Sm2Ps,
                         key: round + 1,
                         msl: format!("fragment float4 ps{round}() {{ return 1; }}"),
@@ -736,6 +764,8 @@ fn concurrent_loaders_and_writers_observe_valid_records() {
                     append_one(
                         cache_path,
                         &CacheEntry {
+                            source: None,
+                            emitter_version: SHADER_EMITTER_VERSION,
                             kind: CachedKind::Sm3Ps,
                             key: 0x10_0000 + writer * ROUNDS + round,
                             msl: format!("fragment float4 ps{writer}_{round}() {{ return 1; }}"),
@@ -782,4 +812,193 @@ fn load_invalidates_stale_versions_under_lock() {
     ));
     assert!(!path.exists());
     std::fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+fn programmable_entry(kind: CachedKind) -> CacheEntry {
+    use crate::dxso::{VariantFlags, VariantKey, VsSamplerKinds, parse};
+
+    let major = match kind {
+        CachedKind::Sm1Vs | CachedKind::Sm1Ps => 1,
+        CachedKind::Sm2Vs | CachedKind::Sm2Ps => 2,
+        CachedKind::Sm3Vs | CachedKind::Sm3Ps => 3,
+        CachedKind::FfVs | CachedKind::FfPs => panic!("programmable fixture only"),
+    };
+    let header = if kind.is_vertex() {
+        0xFFFE_0000
+    } else {
+        0xFFFF_0000
+    };
+    let minor = u32::from(major == 1);
+    let program = parse(&[header | (major << 8) | minor, 0x0000_FFFF]).expect("parse DXSO");
+    let source = if kind.is_vertex() {
+        ShaderSource::vertex(
+            &program,
+            0xA55A,
+            3,
+            VsSamplerKinds {
+                volume_mask: 1,
+                cube_mask: 2,
+            },
+        )
+    } else {
+        ShaderSource::pixel(
+            &program,
+            VariantKey {
+                alpha_func: 5,
+                fog_mode: 4,
+                fog_table_mode: 3,
+                depth_sampler_mask: 0x1234,
+                depth_fetch_mask: 0x0034,
+                volume_sampler_mask: 0x4000,
+                cube_sampler_mask: 0x8000,
+                tt_projected_mask: 0x85,
+                color_out_mask: 0x0F,
+                sample_mask: 0x5A,
+                flags: VariantFlags::all(),
+            },
+        )
+    };
+    let key = source.disk_key();
+    let msl = source.emit(&kind.entry_name(key)).expect("emit fixture");
+    CacheEntry::new(kind, key, msl, Some(source))
+}
+
+#[test]
+fn emitter_change_retains_and_rebuilds_every_programmable_stage_and_model() {
+    for kind in [
+        CachedKind::Sm1Vs,
+        CachedKind::Sm1Ps,
+        CachedKind::Sm2Vs,
+        CachedKind::Sm2Ps,
+        CachedKind::Sm3Vs,
+        CachedKind::Sm3Ps,
+    ] {
+        let expected = programmable_entry(kind);
+        let mut stale = expected.clone();
+        stale.emitter_version ^= 1;
+        stale.msl = "obsolete MSL must never compile".into();
+        for bundle in [false, true] {
+            let bytes = write_file(&[vec![stale.clone()]], bundle);
+            let mut records = read_records(&bytes);
+            assert_eq!(records.shaders.len(), 1);
+            let entry = &mut records.shaders[0];
+            assert_eq!(entry.source, expected.source, "all emission inputs survive");
+            assert!(entry.refresh_msl().expect("rebuild stale MSL"));
+            assert_eq!(*entry, expected, "same specialization, name, and key");
+            assert!(!entry.refresh_msl().expect("current MSL reuses its source"));
+        }
+    }
+}
+
+#[test]
+fn emitter_change_discards_ff_and_only_its_dependent_pipelines() {
+    let vs = programmable_entry(CachedKind::Sm3Vs);
+    let ps = programmable_entry(CachedKind::Sm3Ps);
+    let mut programmable = sample_recipe();
+    programmable.vs = ShaderRecordRef::new(vs.kind, vs.key);
+    programmable.ps = ShaderRecordRef::new(ps.kind, ps.key);
+    let mut mixed = sample_recipe();
+    mixed.vs = programmable.vs;
+    mixed.ps = ShaderRecordRef::new(CachedKind::FfPs, 42);
+    let mut entries = vec![
+        vs,
+        ps,
+        CacheEntry::new(CachedKind::FfPs, 42, "old FF".into(), None),
+    ];
+    for entry in &mut entries {
+        entry.emitter_version ^= 1;
+    }
+    let mut bytes = Vec::new();
+    write_header(&mut bytes);
+    write_bundle(&mut bytes, &entries, &[programmable, mixed]);
+    let records = read_records(&bytes);
+    assert_eq!(records.shaders.len(), 2);
+    assert_eq!(records.pipelines.len(), 1);
+    assert!(records.pipelines[0].ps.kind.is_programmable());
+    assert!(records.needs_compaction);
+}
+
+#[test]
+fn refreshed_msl_wins_in_either_order_and_compaction_preserves_concurrent_appends() {
+    let dir = scratch_dir("emitter-refresh");
+    let path = dir.join("mtld3d_shaders.bin");
+    let expected = programmable_entry(CachedKind::Sm3Vs);
+    let mut stale = expected.clone();
+    stale.emitter_version ^= 1;
+    stale.msl = "stale".into();
+    for current_first in [false, true] {
+        let entries = if current_first {
+            vec![expected.clone(), stale.clone()]
+        } else {
+            vec![stale.clone(), expected.clone()]
+        };
+        let bytes = write_file(&[entries], false);
+        assert_eq!(
+            read_records(&bytes).shaders.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+    }
+    append_one(&path, &stale);
+    let CacheLoad::Current(mut loaded) = load(&path).expect("load old emitter") else {
+        panic!("emitter changes do not invalidate the file");
+    };
+    assert!(loaded.shaders[0].refresh_msl().expect("refresh"));
+    let other = programmable_entry(CachedKind::Sm2Ps);
+    append_one(&path, &other);
+    append_one(&path, &loaded.shaders[0]);
+    // An older build may append after the refreshed record, too.
+    append_one(&path, &stale);
+    compact(&path)
+        .expect("compact merged file")
+        .expect("rewrite needed");
+    let CacheLoad::Current(loaded) = load(&path).expect("reload") else {
+        panic!("current file");
+    };
+    assert_eq!(loaded.shaders, [expected, other]);
+    assert!(!loaded.needs_compaction);
+    std::fs::remove_dir_all(dir).expect("remove fixture");
+}
+
+#[test]
+fn malformed_source_and_wrong_identity_are_rejected() {
+    let entry = programmable_entry(CachedKind::Sm3Vs);
+    let mut body = Vec::new();
+    entry.encode(&mut body);
+    assert!(CacheEntry::decode(entry.kind, entry.key ^ 1, &body).is_none());
+    assert!(CacheEntry::decode(CachedKind::Sm3Ps, entry.key, &body).is_none());
+    assert!(CacheEntry::decode(CachedKind::FfVs, entry.key, &body).is_none());
+    // Header + presence + VS specialization + DXSO count cannot be torn.
+    for length in 0..26 {
+        assert!(CacheEntry::decode(entry.kind, entry.key, &body[..length]).is_none());
+    }
+    // A forged token count cannot allocate past the encoded body.
+    body[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(CacheEntry::decode(entry.kind, entry.key, &body).is_none());
+}
+
+#[test]
+fn regeneration_failure_preserves_dxso_for_retry() {
+    let mut entry = programmable_entry(CachedKind::Sm3Vs);
+    // A framed record can contain DXSO a newer parser refuses.
+    let tokens = [0xFFFE_0300, 0x0000_DEAD, 0x0000_FFFF];
+    let mut body = Vec::new();
+    entry.emitter_version ^= 1;
+    entry.encode(&mut body);
+    body[14..18].copy_from_slice(&3u32.to_le_bytes());
+    body.splice(22..22, 0x0000_DEADu32.to_le_bytes());
+    let key = vs_source_disk_key_programmable(
+        crate::ids::ProgramId::from_tokens(&tokens),
+        0xA55A,
+        3,
+        crate::dxso::VsSamplerKinds {
+            volume_mask: 1,
+            cube_mask: 2,
+        },
+    );
+    let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");
+    let before = entry.clone();
+    let bytes = write_file(&[vec![entry]], true);
+    let mut loaded = read_records(&bytes);
+    assert!(loaded.shaders[0].refresh_msl().is_err());
+    assert_eq!(loaded.shaders[0], before);
 }

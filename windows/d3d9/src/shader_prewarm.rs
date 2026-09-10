@@ -121,7 +121,7 @@ fn run(
         return;
     };
 
-    let records = match shader_cache::load(&path) {
+    let mut records = match shader_cache::load(&path) {
         Ok(CacheLoad::Missing) => {
             sender.send(WarmCache::empty());
             return;
@@ -160,9 +160,33 @@ fn run(
     let mut counts = [0u32; 4];
     let mut duration_ns = [0u64; 4];
 
-    for entry in &records.shaders {
+    let mut refreshed = 0u32;
+    for entry in &mut records.shaders {
         if stop.load(Ordering::Acquire) {
             break;
+        }
+        match entry.refresh_msl() {
+            Ok(true) => {
+                refreshed += 1;
+                records.needs_compaction = true;
+                if let Err(error) = shader_cache::CacheWriter::open(&path)
+                    .and_then(|writer| writer.append_shader(entry))
+                {
+                    mtld3d_shared::log_once_warn!(
+                        target: LOG_TARGET,
+                        "shader_cache: persisting regenerated MSL failed: {error}"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: entry.key,
+                    "shader_cache: regenerating {:?} {:#x} failed: {error}", entry.kind, entry.key
+                );
+                continue;
+            }
         }
         let stage = stage_for_kind(entry.kind);
         let entry_name = entry.kind.entry_name(entry.key);
@@ -187,6 +211,9 @@ fn run(
         libraries.insert(ShaderRecordRef::new(entry.kind, entry.key), handles);
     }
 
+    if refreshed != 0 {
+        info!(target: LOG_TARGET, "shader_cache: regenerated MSL for {refreshed} retained DXSO variants");
+    }
     let total: u32 = counts.iter().sum();
     let cached = u32::try_from(libraries.len()).unwrap_or(u32::MAX);
     let mut pipelines: FxHashMap<

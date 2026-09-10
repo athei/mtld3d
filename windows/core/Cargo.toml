@@ -17,6 +17,9 @@ strum = { workspace = true, features = ["derive"] }
 xxhash-rust = { workspace = true }
 zstd = { workspace = true }
 
+[build-dependencies]
+xxhash-rust = { workspace = true }
+
 # Used by the `dxso::emit_tests` MSL-compile checks (`metal_compile_or_fail`)
 # to compile every emitted shader through
 # `MTLDevice::newLibraryWithSource_options_error`. Same crates the

@@ -327,6 +327,7 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
     }
 
     Ok(DxsoProgram {
+        bytecode: bytecode.into(),
         shader_type,
         major,
         minor,
