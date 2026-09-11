@@ -161,6 +161,16 @@ warps, clipping and external-capture decisions all run on main; presents only
 request a coalesced check. An old submit-thread decision cannot relatch capture
 after a new event recovered it.
 
+Before the first native mouse event, Wine may have accepted the Win32 blank
+cursor without delivering it to macdrv: the server has not yet associated the
+stationary pointer with a Wine window. The overlay owns a one-pixel native blank
+for startup and application activation, which can also leave macOS displaying the
+previous application's cursor until motion resumes. A native activation generation
+is consumed only when the overlay is visible over the active game's client area.
+Ordinary mouse input and hide/show cycles leave native updates to Wine, so clicks
+do not resubmit a native image. This does not move the pointer, synthesize input,
+or change cursor hide counts.
+
 The pointer watch serves both cursor modes. While the cursor is shown and the
 application active, pointer motion without new events for 60 ms indicates an
 external capture such as the screenshot tool. Clipping and fresh Wine warps count
@@ -191,6 +201,10 @@ stages. `scripts/cursor_appkit_probe.swift` verifies the event-routing assumptio
 `scripts/cursor_transaction_probe.swift <output-directory>` captures native window
 pixels and asserts the final visibility after coalesced clear/show bursts; the
 output directory must already exist and screen recording access must be available.
+`scripts/cursor_startup_probe.swift <app> <output-directory> <x> <y>` starts a
+closed app with a stationary pointer and captures the system cursor as well as
+the rendered scene before and after the first movement. The capture with the
+system cursor excluded distinguishes a native arrow from the software sprite.
 The visible Wine probe in `windows/tests/examples/cursor_capture.rs` exercises
 `SetCapture` without clipping, loading pauses and hide/show bursts. Its native
 sprite and completion log must be checked separately from the game backbuffer.

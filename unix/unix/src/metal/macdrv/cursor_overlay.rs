@@ -86,15 +86,15 @@ use block2::RcBlock;
 use log::{debug, info};
 use mtld3d_shared::{SetCursorOverlayParams, mtl::CursorOverlayFlags};
 use objc2::{
-    MainThreadMarker, MainThreadOnly, Message, extern_class, extern_methods,
+    AnyThread, MainThreadMarker, MainThreadOnly, Message, extern_class, extern_methods,
     rc::{Retained, autoreleasepool},
     runtime::{AnyClass, NSObject, ProtocolObject},
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
-    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
-    NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSBitmapImageRep, NSColor,
+    NSCursor, NSDeviceRGBColorSpace, NSEvent, NSEventMask, NSImage, NSScreen, NSView, NSWindow,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CGPoint, CGRect, CGSize, kCFRunLoopCommonModes,
@@ -306,6 +306,8 @@ struct PointerObservation {
 struct PointerWatch {
     event: Option<Retained<NSEvent>>,
     input: InputState,
+    /// Native cursor ownership changes on activation, independently of mouse input.
+    activation: u64,
 }
 
 /// Request one coalesced main-thread check from the submit thread.
@@ -860,6 +862,10 @@ impl ContentState {
 /// The overlay window and everything rendered into it. **Main thread only.**
 struct Overlay {
     window: Retained<NSWindow>,
+    /// Native blank selected on startup and application activation.
+    native_cursor: Retained<NSCursor>,
+    /// Last activation whose native cursor was realized over the game.
+    cursor_activation: Option<u64>,
     /// The sprite: a sublayer of the window's content layer, moved per event.
     layer: Retained<CAMetalLayer>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -877,8 +883,9 @@ impl Overlay {
     /// Create the window, its layer and the input hooks. **Main thread only.**
     ///
     /// `None` when there is no attachment to borrow a layer's device from or
-    /// Metal refuses a command queue; the next apply tries again.
+    /// native cursor or Metal queue allocation fails; the next apply tries again.
     fn create(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> Option<Self> {
+        let native_cursor = native_blank_cursor(mtm)?;
         let Some(game_layer) = wanted
             .owner
             .as_ref()
@@ -996,6 +1003,8 @@ impl Overlay {
         );
         Some(Self {
             window,
+            native_cursor,
+            cursor_activation: None,
             layer,
             queue,
             textures: FxHashMap::default(),
@@ -1291,11 +1300,65 @@ impl Overlay {
     }
 
     fn update_visibility(&mut self, inputs: VisibilityInputs) {
+        if overlay_visible(inputs) {
+            let activation = POINTER_WATCH.with_borrow(|watch| watch.activation);
+            if self.cursor_activation != Some(activation) {
+                self.native_cursor.set();
+                self.cursor_activation = Some(activation);
+                debug!(target: LOG_TARGET, "cursor: native blank applied for activation={activation}");
+            }
+        }
         if self.visibility != Some(inputs) {
             debug!(target: LOG_TARGET, "cursor: visibility inputs={inputs:?}");
             self.visibility = Some(inputs);
         }
     }
+}
+
+/// A native blank for startup and activation without pointer motion.
+///
+/// Win32 may already hold our blank HCURSOR while Wine has no cursor window to
+/// notify or macOS still displays the previous application's image. Select this
+/// transparent image once per activation when the overlay can be shown. Ordinary
+/// mouse input and hide/show cycles then leave native cursor handling to Wine,
+/// without changing the system cursor's hide count or synthesizing mouse input.
+fn native_blank_cursor(_mtm: MainThreadMarker) -> Option<Retained<NSCursor>> {
+    // SAFETY: immutable AppKit constant, initialized before the main thread starts.
+    let color_space = unsafe { NSDeviceRGBColorSpace };
+    // SAFETY: null planes asks AppKit to allocate storage for one RGBA pixel.
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            core::ptr::null_mut(),
+            1,
+            1,
+            8,
+            4,
+            true,
+            false,
+            color_space,
+            4,
+            32,
+        )
+    };
+    let Some(bitmap) = bitmap else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: native blank allocation failed");
+        return None;
+    };
+    bitmap.setColor_atX_y(&NSColor::clearColor(), 0, 0);
+    let image = NSImage::initWithSize(
+        NSImage::alloc(),
+        CGSize {
+            width: 1.0,
+            height: 1.0,
+        },
+    );
+    image.addRepresentation(&bitmap);
+    Some(NSCursor::initWithImage_hotSpot(
+        NSCursor::alloc(),
+        &image,
+        CGPoint { x: 0.0, y: 0.0 },
+    ))
 }
 
 /// Encoded native work, with no references to caller-owned pixels or PE state.
@@ -1561,9 +1624,13 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
     for name in names {
         let block = RcBlock::new(|_: NonNull<NSNotification>| {
             autoreleasepool(|_| {
-                let _mtm = MainThreadMarker::new()
+                let mtm = MainThreadMarker::new()
                     .expect("cursor activation observer runs on the main thread");
+                let active = NSApplication::sharedApplication(mtm).isActive();
                 let recovered = POINTER_WATCH.with_borrow_mut(|watch| {
+                    if active {
+                        watch.activation = watch.activation.wrapping_add(1);
+                    }
                     watch
                         .input
                         .note_position(NSEvent::mouseLocation(), now_ns());
