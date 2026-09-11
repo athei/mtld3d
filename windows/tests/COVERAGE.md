@@ -180,6 +180,7 @@ configuration overrides. Record those results and the loaded binary stamps
 separately from any live WoW validation.
 
 `examples/native_cursor.rs` is a visible probe for games with no D3D cursor image.
+Pass `--swapchain` to exercise games that bypass the device Present entry point.
 It starts with Win32 `ShowCursor(FALSE)`, restores the native arrow, hides with
 `SetCursor(NULL)`, then restores the arrow again. Capture the stationary pointer
 and focus returns during both hidden phases; no native arrow should appear there.

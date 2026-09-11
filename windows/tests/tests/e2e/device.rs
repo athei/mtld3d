@@ -3145,7 +3145,7 @@ fn software_cursor_release_preserves_a_hidden_native_cursor() {
 fn software_cursor_presents_with_the_sprite_shown() {
     // The overlay path end to end inside the harness: a sprite upload, a
     // main-thread window creation, a sprite render, and show/hide/show across
-    // presents. Nothing of it may disturb the frame, and a cursor change
+    // device and swap-chain presents. Nothing may disturb the frame, and a cursor change
     // (second bitmap) ships a second sprite.
     let h = software_cursor_harness();
 
@@ -3169,7 +3169,7 @@ fn software_cursor_presents_with_the_sprite_shown() {
     assert_eq!(h.show_cursor(true), 0);
     for _ in 0..20 {
         assert_eq!(h.clear(D3DCLEAR_TARGET, 0xFF40_C020, 1.0, 0), D3D_OK);
-        assert_eq!(h.present(), D3D_OK);
+        assert_eq!(h.present_swapchain(), D3D_OK);
     }
     assert_eq!(
         h.read_pixel(5, 5) & 0x00FF_FFFF,

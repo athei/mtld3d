@@ -1806,6 +1806,12 @@ impl DeviceInner {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
+        // Games can present exclusively through IDirect3DSwapChain9. Cursor
+        // scale, native visibility and diagnostics must follow that path too.
+        let cursor_scale = self.config().cursor_scale;
+        self.cursor_mut().follow_published_scale(cursor_scale);
+        self.cursor_mut().sync_native_visibility();
+        self.cursor_mut().note_present();
         self.apply_upload_answers();
         let (frame, seq) = self.stamp_and_swap(new_frame, false);
 
@@ -4465,14 +4471,6 @@ extern "system" fn device_present(
     }
 
     mtld3d_shared::crumb!("d3d9:present");
-    // The unix side republishes the backing scale whenever the window's
-    // display changes it, so the cursor upscale follows the window between
-    // displays. One relaxed load and a compare on an unchanged value, which
-    // is every frame that stays put.
-    let cursor_scale = dev.config().cursor_scale;
-    dev.cursor_mut().follow_published_scale(cursor_scale);
-    dev.cursor_mut().sync_native_visibility();
-    dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);
 

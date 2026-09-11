@@ -165,8 +165,9 @@ after a new event recovered it.
 Before the first native mouse event, Wine may have accepted a Win32 cursor
 without delivering it to macdrv: the server has not yet associated the stationary
 pointer with a Wine window. AppKit can also replace the native image during focus
-or window changes while Wine still records it as hidden. Each Present queries
-`GetCursorInfo` only for the device's foreground HWND. A changed native hide is
+or window changes while Wine still records it as hidden. Both device and swap-chain
+Present paths query `GetCursorInfo` in their shared frame submission code, only for
+the device's foreground HWND. A changed native hide is
 published through `CursorOverlayFlags::NATIVE_HIDDEN`, including when a game draws
 its own cursor and never supplies a D3D cursor surface. This adds no cursor image
 or Metal window for such a game.
