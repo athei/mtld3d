@@ -4471,6 +4471,7 @@ extern "system" fn device_present(
     // is every frame that stays put.
     let cursor_scale = dev.config().cursor_scale;
     dev.cursor_mut().follow_published_scale(cursor_scale);
+    dev.cursor_mut().sync_native_visibility();
     dev.cursor_mut().note_present();
     let fresh = dev.fresh_frame();
     dev.present(fresh);

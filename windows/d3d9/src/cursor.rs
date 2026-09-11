@@ -36,7 +36,8 @@ use mtld3d_shared::{
     InPtr, MetalHandle, SetCursorOverlayParams, mtl::CursorOverlayFlags, mtl_handle::NSViewKind,
 };
 use mtld3d_types::{
-    D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO, IDirect3DSurface9Vtbl, POINT,
+    CURSOR_SHOWING, CURSORINFO, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO,
+    IDirect3DSurface9Vtbl, POINT,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use xxhash_rust::xxh3::Xxh3;
@@ -76,6 +77,8 @@ unsafe extern "system" {
     fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
     fn PostMessageW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> i32;
     fn GetCursor() -> *mut c_void;
+    fn GetCursorInfo(info: *mut CURSORINFO) -> i32;
+    fn GetForegroundWindow() -> *mut c_void;
     fn DestroyCursor(cursor: *mut c_void) -> i32;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
 }
@@ -419,6 +422,8 @@ bitflags::bitflags! {
         /// HCURSOR, and every cursor change and show/hide also goes out
         /// through `SetCursorOverlay`.
         const SOFTWARE = 1 << 3;
+        /// Latest foreground Win32 cursor state, independent of the D3D cursor image.
+        const NATIVE_HIDDEN = 1 << 4;
     }
 }
 
@@ -669,11 +674,11 @@ impl CursorState {
     /// alone, which the unix side's pointer watch needs to know whatever
     /// draws the cursor.
     fn push_overlay_state(&mut self) {
-        if self.software() {
+        if self.software() && self.source.is_some() {
             self.sync_sprite();
-        } else if !self.handle.is_null() {
-            // A game that never set a D3D cursor shows none of ours, whatever
-            // WM_SIZE pins: nothing for the pointer watch to look after.
+        } else {
+            // Native visibility also belongs to games that draw their own cursor
+            // and never supply a D3D sprite.
             send_overlay_state(
                 self.view_handle,
                 0,
@@ -685,10 +690,42 @@ impl CursorState {
 
     /// The flags word `SetCursorOverlay` carries: the *effective* visibility.
     const fn overlay_flags(&self) -> CursorOverlayFlags {
-        if self.effective_visible() {
+        let mut flags = if self.effective_visible() && !self.handle.is_null() {
             CursorOverlayFlags::VISIBLE
         } else {
             CursorOverlayFlags::empty()
+        };
+        if self.flags.contains(CursorFlags::NATIVE_HIDDEN) {
+            flags = flags.union(CursorOverlayFlags::NATIVE_HIDDEN);
+        }
+        flags
+    }
+
+    /// Publish the foreground window's native hide, even without a D3D cursor surface.
+    pub fn sync_native_visibility(&mut self) {
+        // SAFETY: GetForegroundWindow takes no arguments and returns an opaque HWND.
+        let foreground = unsafe { GetForegroundWindow() };
+        let hidden = if !self.hwnd.is_null() && foreground == self.hwnd {
+            let mut info = CURSORINFO {
+                cb_size: u32::try_from(core::mem::size_of::<CURSORINFO>())
+                    .expect("CURSORINFO size fits u32"),
+                flags: 0,
+                cursor: null_mut(),
+                screen_pos: POINT { x: 0, y: 0 },
+            };
+            // SAFETY: initialized ABI-sized output with cb_size set as user32 requires.
+            if unsafe { GetCursorInfo(&raw mut info) } == 0 {
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET, "GetCursorInfo failed; native visibility unchanged");
+                return;
+            }
+            info.flags & CURSOR_SHOWING == 0 || info.cursor.is_null()
+        } else {
+            false
+        };
+        if hidden != self.flags.contains(CursorFlags::NATIVE_HIDDEN) {
+            self.flags.set(CursorFlags::NATIVE_HIDDEN, hidden);
+            debug!(target: LOG_TARGET, "native cursor hidden={hidden} hwnd={:p}", self.hwnd);
+            self.push_overlay_state();
         }
     }
 
@@ -934,11 +971,12 @@ impl CursorState {
     /// device's alone: `CreateIconIndirect` copies the bitmaps, and user32
     /// frees a cursor even while it is the thread's current one, which
     /// would leave the thread pointing at a freed handle. So when the thread
-    /// cursor is one of ours the window's class cursor goes back first, the
-    /// pointer the window shows once the device no longer answers
-    /// `WM_SETCURSOR`, and the system arrow when the class has none or the
-    /// window is already gone. Once the restore has happened every refused
-    /// `DestroyCursor` is a real failure, and is reported as one.
+    /// cursor is one of ours, replace it before freeing it. A hidden software
+    /// cursor leaves its blank handle selected, so replace that with null to
+    /// preserve the hide. Otherwise restore the window's class cursor, or the
+    /// system arrow when the class has none or the window is already gone.
+    /// Once the replacement has happened every refused `DestroyCursor` is a
+    /// real failure, and is reported as one.
     pub fn destroy_handles(&mut self) {
         let mut handles: Vec<*mut c_void> = self.cache.drain().map(|(_, h)| h).collect();
         let current = core::mem::replace(&mut self.handle, null_mut());
@@ -950,12 +988,15 @@ impl CursorState {
         }
         let thread_cursor = get_cursor();
         let restored = if handles.contains(&thread_cursor) {
+            let preserve_hide = self.software() && !self.effective_visible();
             let mut replacement = if self.hwnd.is_null() {
                 null_mut()
             } else {
                 class_cursor(self.hwnd)
             };
-            if replacement.is_null() {
+            if preserve_hide {
+                replacement = null_mut();
+            } else if replacement.is_null() {
                 replacement = load_arrow_cursor();
             }
             set_cursor(replacement);

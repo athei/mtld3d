@@ -127,9 +127,10 @@ silence interval.
 The overlay still reconciles its layer configuration while hidden or inactive,
 but defers window and pointer geometry queries until it can show a sprite. The
 show resolves current geometry before presenting pixels and position together.
-Hardware-only processes publish cursor visibility without a separate overlay
-dispatch; after any software sprite has been accepted, hardware takeover retains
-the apply needed to clear previous software content, including failed work.
+Hardware-only processes publish cursor visibility without creating an overlay;
+a native hide still wakes the main-thread pointer watch. After any software sprite
+has been accepted, hardware takeover retains the apply needed to clear previous
+software content, including failed work.
 
 The Unix cursor mutex publishes the attachment's `Arc` identity, mode, sprite,
 visibility and request revision together. Admission resolves the attachment
@@ -161,15 +162,25 @@ warps, clipping and external-capture decisions all run on main; presents only
 request a coalesced check. An old submit-thread decision cannot relatch capture
 after a new event recovered it.
 
-Before the first native mouse event, Wine may have accepted the Win32 blank
-cursor without delivering it to macdrv: the server has not yet associated the
-stationary pointer with a Wine window. The overlay owns a one-pixel native blank
-for startup and application activation, which can also leave macOS displaying the
-previous application's cursor until motion resumes. A native activation generation
-is consumed only when the overlay is visible over the active game's client area.
-Ordinary mouse input and hide/show cycles leave native updates to Wine, so clicks
-do not resubmit a native image. This does not move the pointer, synthesize input,
-or change cursor hide counts.
+Before the first native mouse event, Wine may have accepted a Win32 cursor
+without delivering it to macdrv: the server has not yet associated the stationary
+pointer with a Wine window. AppKit can also replace the native image during focus
+or window changes while Wine still records it as hidden. Each Present queries
+`GetCursorInfo` only for the device's foreground HWND. A changed native hide is
+published through `CursorOverlayFlags::NATIVE_HIDDEN`, including when a game draws
+its own cursor and never supplies a D3D cursor surface. This adds no cursor image
+or Metal window for such a game.
+
+The main-thread pointer watch owns one native blank image. It selects that image
+when the software overlay is visible or Win32 requests a native hide, only over
+the active, unobscured game client area and outside external captures. It compares
+the current native cursor by identity so an unchanged blank needs no setter call,
+while an AppKit replacement is repaired at the next reconciliation. This does not
+move the pointer, synthesize input, or change cursor hide counts. A Win32 show
+restores the displaced native image only while our blank remains current, leaving
+a newer Wine cursor untouched. Device release
+replaces an owned hidden blank HCURSOR with null before freeing it; visible
+cursors still restore the window's class cursor.
 
 The pointer watch serves both cursor modes. While the cursor is shown and the
 application active, pointer motion without new events for 60 ms indicates an

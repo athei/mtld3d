@@ -309,6 +309,10 @@ struct PointerWatch {
     input: InputState,
     /// Native cursor ownership changes on activation, independently of mouse input.
     activation: u64,
+    /// Shared native blank, also used when the game never supplies a D3D cursor image.
+    native_cursor: Option<Retained<NSCursor>>,
+    /// Image displaced by our blank, restored only while that blank is still current.
+    native_restore: Option<Retained<NSCursor>>,
 }
 
 /// Request one coalesced main-thread check from the submit thread.
@@ -319,7 +323,10 @@ pub fn poll_capture_from_present() {
     let check = {
         let shared = lock_shared();
         shared.pending
-            || (shared.owner.is_some() && shared.flags.contains(CursorOverlayFlags::VISIBLE))
+            || (shared.owner.is_some()
+                && shared
+                    .flags
+                    .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN))
     };
     if check {
         queue_apply();
@@ -427,15 +434,19 @@ impl Shared {
                 })
             });
         }
+        let native_was_hidden = self.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN);
         self.owner = Some(owner);
         self.hash = hash;
         self.flags = params.flags;
         self.revision += 1;
         // Until a software sprite has been accepted, no overlay can exist.
-        // Hardware visibility is already published for the main-thread watch;
-        // it needs no separate UI wakeup. Once software has been used, retain
-        // the apply so hardware takeover clears any sprite or failed draw.
-        self.pending = !hardware || !self.sprites.is_empty();
+        // A native hide needs a UI wakeup even without a D3D sprite. Visible
+        // hardware cursors need only the main-thread watch. Once software has
+        // been used, retain the apply so hardware takeover clears its content.
+        self.pending = !hardware
+            || native_was_hidden
+            || params.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+            || !self.sprites.is_empty();
         true
     }
 
@@ -710,6 +721,7 @@ fn apply_on_main_inner() {
     install_pointer_watch(mtm);
     observe_current_event(mtm);
     let captured = reconcile_pointer(mtm, &wanted);
+    reconcile_native_cursor(mtm, &wanted, captured);
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             mtld3d_shared::log_once_warn!(
@@ -767,7 +779,9 @@ fn observe_current_event(mtm: MainThreadMarker) {
 }
 
 fn reconcile_pointer(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> bool {
-    if !wanted.flags.contains(CursorOverlayFlags::VISIBLE)
+    if !wanted
+        .flags
+        .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN)
         || !NSApplication::sharedApplication(mtm).isActive()
     {
         if POINTER_WATCH.with_borrow_mut(|watch| watch.input.suspend()) {
@@ -862,10 +876,6 @@ impl ContentState {
 /// The overlay window and everything rendered into it. **Main thread only.**
 struct Overlay {
     window: Retained<NSWindow>,
-    /// Native blank selected on startup and application activation.
-    native_cursor: Retained<NSCursor>,
-    /// Last activation whose native cursor was realized over the game.
-    cursor_activation: Option<u64>,
     /// The sprite: a sublayer of the window's content layer, moved per event.
     layer: Retained<CAMetalLayer>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -889,9 +899,8 @@ impl Overlay {
     /// Create the window, its layer and the input hooks. **Main thread only.**
     ///
     /// `None` when there is no attachment to borrow a layer's device from or
-    /// native cursor or Metal queue allocation fails; the next apply tries again.
+    /// Metal queue allocation fails; the next apply tries again.
     fn create(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> Option<Self> {
-        let native_cursor = native_blank_cursor(mtm)?;
         let transparent = image::transparent()?;
         let Some(game_layer) = wanted
             .owner
@@ -998,8 +1007,6 @@ impl Overlay {
         );
         Some(Self {
             window,
-            native_cursor,
-            cursor_activation: None,
             layer,
             queue,
             textures: FxHashMap::default(),
@@ -1228,7 +1235,7 @@ impl Overlay {
             // Transparent content has no position to follow. Avoid window,
             // screen and pointer queries until a sprite can be shown again;
             // that apply resolves its pixels and position in one transaction.
-            self.update_visibility(inputs);
+            self.update_visibility(inputs, mtm);
             self.ensure_content(Content::Transparent, None);
             return;
         }
@@ -1265,7 +1272,7 @@ impl Overlay {
         );
         inputs.set(VisibilityInputs::OCCLUDED, att.window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
-        self.update_visibility(inputs);
+        self.update_visibility(inputs, mtm);
         let shown = overlay_visible(inputs);
         let Some(sprite) = wanted.sprite.as_deref() else {
             self.ensure_content(Content::Transparent, None);
@@ -1311,14 +1318,9 @@ impl Overlay {
         }
     }
 
-    fn update_visibility(&mut self, inputs: VisibilityInputs) {
+    fn update_visibility(&mut self, inputs: VisibilityInputs, mtm: MainThreadMarker) {
         if overlay_visible(inputs) {
-            let activation = POINTER_WATCH.with_borrow(|watch| watch.activation);
-            if self.cursor_activation != Some(activation) {
-                self.native_cursor.set();
-                self.cursor_activation = Some(activation);
-                debug!(target: LOG_TARGET, "cursor: native blank applied for activation={activation}");
-            }
+            select_native_blank(mtm);
         }
         if self.visibility != Some(inputs) {
             debug!(target: LOG_TARGET, "cursor: visibility inputs={inputs:?}");
@@ -1327,13 +1329,81 @@ impl Overlay {
     }
 }
 
+/// Honor Win32's native hide only over the active device's unobscured client area.
+fn reconcile_native_cursor(mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) {
+    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+        && (wanted.flags.contains(CursorOverlayFlags::HARDWARE)
+            || !wanted.flags.contains(CursorOverlayFlags::VISIBLE))
+        && wanted.owner.is_some()
+    {
+        restore_native_cursor(mtm);
+    }
+    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+        || captured
+        || !NSApplication::sharedApplication(mtm).isActive()
+    {
+        // Wine and the foreground application own visible or externally captured cursors.
+        return;
+    }
+    let Some(att) = wanted.owner.as_ref() else {
+        // A detached device cannot own the native cursor.
+        return;
+    };
+    let Some((view, window)) = attachment::retain_view(att, mtm)
+        .and_then(|view| view.window().map(|window| (view, window)))
+    else {
+        // Native teardown can retire the view before the queued apply reaches main.
+        return;
+    };
+    let mouse = NSEvent::mouseLocation();
+    let client = window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
+    if !att.window_occluded()
+        && !window.isMiniaturized()
+        && rect_contains(client, mouse)
+        && window_under_pointer(mouse, mtm) == window.windowNumber()
+    {
+        select_native_blank(mtm);
+    }
+}
+
+/// Reassert the native image if `AppKit` replaced it while Win32 still requests a hide.
+fn select_native_blank(mtm: MainThreadMarker) {
+    POINTER_WATCH.with_borrow_mut(|watch| {
+        if watch.native_cursor.is_none() {
+            watch.native_cursor = native_blank_cursor(mtm);
+        }
+        let current = NSCursor::currentCursor();
+        if let Some(cursor) = watch.native_cursor.as_ref()
+            && !core::ptr::eq(&raw const *current, &raw const **cursor)
+        {
+            watch.native_restore = Some(current);
+            cursor.set();
+            debug!(target: LOG_TARGET, "cursor: native blank applied for activation={}", watch.activation);
+        }
+    });
+}
+
+/// Give back the image we displaced without overwriting a newer Wine cursor.
+fn restore_native_cursor(mtm: MainThreadMarker) {
+    POINTER_WATCH.with_borrow_mut(|watch| {
+        if let Some(previous) = watch.native_restore.take()
+            && NSApplication::sharedApplication(mtm).isActive()
+            && watch.native_cursor.as_ref().is_some_and(|blank| {
+                core::ptr::eq(&raw const *NSCursor::currentCursor(), &raw const **blank)
+            })
+        {
+            previous.set();
+            debug!(target: LOG_TARGET, "cursor: native image restored after Win32 show");
+        }
+    });
+}
+
 /// A native blank for startup and activation without pointer motion.
 ///
 /// Win32 may already hold our blank HCURSOR while Wine has no cursor window to
 /// notify or macOS still displays the previous application's image. Select this
-/// transparent image once per activation when the overlay can be shown. Ordinary
-/// mouse input and hide/show cycles then leave native cursor handling to Wine,
-/// without changing the system cursor's hide count or synthesizing mouse input.
+/// transparent image when the overlay can be shown or Win32 requests a native
+/// hide. Replacing an image changes no hide count and synthesizes no mouse input.
 fn native_blank_cursor(_mtm: MainThreadMarker) -> Option<Retained<NSCursor>> {
     // SAFETY: immutable AppKit constant, initialized before the main thread starts.
     let color_space = unsafe { NSDeviceRGBColorSpace };

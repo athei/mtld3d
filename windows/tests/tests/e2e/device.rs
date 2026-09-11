@@ -3117,6 +3117,31 @@ fn software_cursor_never_pushes_a_null_thread_cursor() {
 }
 
 #[test]
+fn software_cursor_release_preserves_a_hidden_native_cursor() {
+    let h = software_cursor_harness();
+    let bitmap = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    assert_eq!(h.set_cursor_properties_hr(0, 0, &bitmap), D3D_OK);
+    drop(bitmap);
+
+    assert_eq!(h.show_cursor(true), 0);
+    let blank = h.thread_cursor();
+    assert_ne!(blank, 0, "the visible overlay owns a blank native cursor");
+    assert_eq!(h.show_cursor(false), 1);
+    assert_eq!(h.thread_cursor(), blank, "hiding keeps the blank selected");
+
+    // A game can hide the D3D cursor and release its device before switching
+    // to a cursor drawn into the back buffer. Releasing the blank handle must
+    // preserve that hide instead of selecting the window's class arrow.
+    assert_eq!(h.release_device(), 0);
+    assert!(!cursor_is_live(blank), "the device's blank cursor is freed");
+    assert_eq!(
+        h.thread_cursor(),
+        0,
+        "release must preserve the native hide"
+    );
+}
+
+#[test]
 fn software_cursor_presents_with_the_sprite_shown() {
     // The overlay path end to end inside the harness: a sprite upload, a
     // main-thread window creation, a sprite render, and show/hide/show across
