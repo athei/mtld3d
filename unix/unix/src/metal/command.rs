@@ -687,6 +687,9 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
             // production rates display at their actual rate. `0.0` means
             // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
             let drawable_obj = ProtocolObject::from_ref(&*drawable);
+            if let Some(att) = attachment.as_ref() {
+                super::macdrv::observe_game_present(att, &drawable);
+            }
             let min_duration = attachment
                 .as_ref()
                 .map_or(0.0, |att| att.min_present_duration_sec());

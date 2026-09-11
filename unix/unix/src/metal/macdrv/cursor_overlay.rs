@@ -114,7 +114,7 @@ use rustc_hash::FxHashMap;
 use super::{
     LayerMode,
     attachment::{self, Attachment},
-    run_on_main_thread_async,
+    run_on_main_thread_async, run_on_main_thread_sync,
 };
 use crate::metal::{command, device::cpu_written_texture_storage, present};
 
@@ -619,13 +619,62 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
 /// Another device's teardown leaves the overlay where it is. The uploaded
 /// sprites stay: they are content-addressed, so a second device's uploaded
 /// set may name an entry the first one sent, and its next call would name a
-/// sprite the unix side no longer held. The window and its observers stay
-/// for the process lifetime like the other `AppKit` observers.
+/// sprite the unix side no longer held. Input observers stay for the process
+/// lifetime; the cursor surface retires before the followed game surface so
+/// Metal cannot promote the surviving cursor to its main timing layer.
 pub fn detach(retired: &Arc<Attachment>) {
     let changed = lock_shared().detach(retired);
     if changed {
+        let retired = Arc::clone(retired);
+        run_on_main_thread_sync(move || {
+            let mtm = MainThreadMarker::new().expect("cursor detach runs on the main thread");
+            OVERLAY.with_borrow_mut(|slot| {
+                if slot
+                    .as_ref()
+                    .is_some_and(|overlay| same_owner(overlay.owner.as_ref(), Some(&retired)))
+                    && let Some(overlay) = slot.take()
+                {
+                    overlay.retire(mtm);
+                }
+            });
+        });
         queue_apply();
     }
+}
+
+/// Let the game reach the display before introducing a second presenting surface.
+///
+/// A HUD-disabled cursor layer can still become Metal's main timing layer when
+/// it presents first. A zero presented time denotes a drawable that did not
+/// reach the display and must leave the observation armed for the next frame.
+pub fn observe_game_present(att: &Arc<Attachment>, drawable: &ProtocolObject<dyn CAMetalDrawable>) {
+    if !att.needs_first_display() {
+        // Startup observation has already queued or published its result.
+        return;
+    }
+    let att = Arc::clone(att);
+    let handler = RcBlock::new(move |ptr: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+        // SAFETY: Metal supplies the drawable for the duration of this callback.
+        let drawable = unsafe { ptr.as_ref() };
+        if super::host_seconds_to_ns(drawable.presentedTime()) == 0 || !att.queue_first_display() {
+            // Discarded frame or another displayed frame already queued publication.
+            return;
+        }
+        let att = Arc::clone(&att);
+        run_on_main_thread_async(move || {
+            let mtm = MainThreadMarker::new().expect("first display runs on the main thread");
+            if attachment::retain_layer(&att, mtm).is_none() {
+                mtld3d_shared::log_once_info!(target: LOG_TARGET, "cursor: first display arrived after attachment retirement");
+                return;
+            }
+            att.publish_first_display();
+            debug!(target: LOG_TARGET, "cursor: game reached display view={:#x}; overlay may present", att.view());
+            queue_apply();
+        });
+    });
+    // SAFETY: Metal copies the callback. It owns only an Arc to the attachment
+    // record and validates liveness on main before accessing native objects.
+    unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
 }
 
 /// Observe input now; reconcile pixels and position at the run-loop commit. Main thread only.
@@ -722,6 +771,12 @@ fn apply_on_main_inner() {
             if wanted.sprite.is_none() {
                 // Hardware-only or detached: no overlay needs creating.
                 lock_shared().applied(wanted.revision, true);
+                return;
+            }
+            if !wanted.owner.as_ref().is_some_and(|att| att.has_displayed()) {
+                // The displayed-drawable callback will wake the observer. The
+                // request remains pending while the game has no on-screen frame.
+                mtld3d_shared::log_once_info!(target: LOG_TARGET, "cursor: overlay waits for the game's first displayed frame");
                 return;
             }
             *slot = Overlay::create(mtm, &wanted);
@@ -880,6 +935,14 @@ struct Overlay {
 }
 
 impl Overlay {
+    /// Remove the cursor surface before its followed game surface is released.
+    fn retire(self, _mtm: MainThreadMarker) {
+        self.layer.removeFromSuperlayer();
+        self.window.orderOut(None);
+        self.window.close();
+        debug!(target: LOG_TARGET, "cursor: retired overlay with its game attachment");
+    }
+
     /// Create the window, its layer and the input hooks. **Main thread only.**
     ///
     /// `None` when there is no attachment to borrow a layer's device from or

@@ -29,7 +29,7 @@
 //! the registry lock sits at the bottom of every order. It is not taken
 //! anywhere else.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
@@ -97,6 +97,10 @@ pub struct AttachLatches {
 /// presenting thread reads per present. See the module doc for which of
 /// them may be dereferenced, and where.
 pub struct Attachment {
+    /// First displayed frame: 0 waiting, 1 main-thread publication queued, 2 ready.
+    ///
+    /// A cursor surface must not become the process's first presenting Metal layer.
+    first_display: AtomicU8,
     /// Raw `NSView*`, the registry key.
     view: usize,
     /// Raw `CAMetalLayer*` of that view.
@@ -198,6 +202,7 @@ impl Attachment {
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
+            first_display: AtomicU8::new(0),
         }
     }
 
@@ -205,6 +210,27 @@ impl Attachment {
     #[must_use]
     pub const fn view(&self) -> usize {
         self.view
+    }
+
+    /// Observe drawables until an actual display queues the one publication.
+    pub fn needs_first_display(&self) -> bool {
+        self.first_display.load(Ordering::Acquire) == 0
+    }
+
+    /// Only one displayed drawable may queue main-thread publication.
+    pub fn queue_first_display(&self) -> bool {
+        self.first_display
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn publish_first_display(&self) {
+        self.first_display.store(2, Ordering::Release);
+    }
+
+    /// Main has accepted the first display while this attachment was still live.
+    pub fn has_displayed(&self) -> bool {
+        self.first_display.load(Ordering::Acquire) == 2
     }
 
     /// The raw `CAMetalLayer*` address; compared, never dereferenced here.
