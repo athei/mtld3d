@@ -253,9 +253,7 @@ extern "system" fn swapchain_present(
     if dev.needs_reset() {
         return D3DERR_DEVICENOTRESET;
     }
-    let fresh = dev.fresh_frame();
-    dev.present(fresh);
-    D3D_OK
+    dev.present()
 }
 
 extern "system" fn swapchain_get_front_buffer_data(
