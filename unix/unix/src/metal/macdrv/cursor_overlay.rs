@@ -19,14 +19,13 @@
 //! hiding the cursor while a button is held would pay that on every click.
 //!
 //! Threads. The thunk runs on the API thread and only writes [`SHARED`] and
-//! queues one main-thread apply, coalesced through [`APPLY_PENDING`] so a burst
-//! of clicks is one apply of the latest state. Everything that touches
-//! `AppKit`, Core Animation or the overlay's Metal objects runs on the main
-//! thread: the apply, the mouse-move monitor that repositions the sprite, the
-//! activation observers, and the display reconciliation that re-renders the
-//! sprite when the layer mode or the EDR headroom moved. Those objects live in
-//! a main-thread `thread_local`, which is what makes the split sound without a
-//! lock around `Retained` handles.
+//! queues one main-thread wakeup, coalesced through [`APPLY_PENDING`]. The
+//! pre-commit run-loop observer applies the latest state once per transaction.
+//! Everything that touches `AppKit`, Core Animation or the overlay's Metal objects
+//! runs on the main thread: input observations, activation notifications, and
+//! the observer that reconciles position, visibility, layer mode and EDR headroom.
+//! Those objects live in a main-thread `thread_local`, which makes the split
+//! sound without a lock around `Retained` handles.
 //!
 //! Nothing about the game window is latched: the game `NSWindow`, its level,
 //! its client rectangle and its screen are read when the sprite can be shown,
@@ -627,9 +626,11 @@ pub fn detach(retired: &Arc<Attachment>) {
     }
 }
 
-/// Reconcile the latest request with input, attachment and display state. Main thread only.
+/// Observe input now; reconcile pixels and position at the run-loop commit. Main thread only.
 pub fn reconcile_on_main() {
-    apply_on_main_inner();
+    let mtm = MainThreadMarker::new().expect("reconcile_on_main runs on the main thread");
+    install_pointer_watch(mtm);
+    observe_current_event(mtm);
 }
 
 fn lock_shared() -> MutexGuard<'static, Shared> {
@@ -647,7 +648,7 @@ fn queue_apply() {
     }
 }
 
-/// The queued apply: creates the overlay on first use. **Main thread only.**
+/// Wake the input watch; the pre-commit observer applies the latest state. Main thread only.
 fn apply_on_main() {
     APPLY_PENDING.store(false, Ordering::Release);
     let queued_ns = APPLY_QUEUED_NS.load(Ordering::Relaxed);
@@ -657,7 +658,7 @@ fn apply_on_main() {
         .saturating_sub(u128::from(queued_ns))
         / 1_000;
     debug!(target: LOG_TARGET, "cursor: apply ran {waited_us} us after it was queued");
-    apply_on_main_inner();
+    reconcile_on_main();
 }
 
 /// One owned snapshot used throughout a native reconciliation.
@@ -689,6 +690,11 @@ thread_local! {
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
 }
 
+/// Present at most one cursor drawable before each Core Animation commit.
+///
+/// Multiple presents to one layer in an implicit transaction can display its
+/// first drawable while later GPU completions report success. Input, activation
+/// and queued requests therefore converge here before any pixels are submitted.
 fn apply_on_main_inner() {
     let mtm = MainThreadMarker::new().expect("apply_on_main_inner runs on the main thread");
     let wanted = {
@@ -1498,7 +1504,6 @@ pub fn install_pointer_watch(mtm: MainThreadMarker) {
                     MainThreadMarker::new().expect("cursor local monitor runs on the main thread");
                 // SAFETY: AppKit passes the live event for this monitor invocation.
                 observe_mouse_event(unsafe { event.as_ref() }, "local", mtm);
-                apply_on_main_inner();
                 event.as_ptr()
             })
         });
@@ -1567,7 +1572,6 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
                 if recovered {
                     attachment::request_cursor_kick_all();
                 }
-                apply_on_main_inner();
             });
         });
         // SAFETY: the notification center copies the block; the token is kept for life.

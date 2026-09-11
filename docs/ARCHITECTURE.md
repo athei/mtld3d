@@ -172,7 +172,11 @@ the attachment registry's lifetime checks.
 
 Pixels and position are presented in one Core Animation transaction:
 `commit`, `waitUntilScheduled`, then `drawable.present`, with
-`presentsWithTransaction` enabled. A transparent clear represents hidden content.
+`presentsWithTransaction` enabled. Only the pre-commit run-loop observer submits
+cursor drawables. Input, activation and queued display updates are reconciled there
+before drawing: multiple presents to one layer in the same implicit transaction
+can leave its first drawable on screen even when later GPU work completed. A
+transparent clear represents hidden content.
 A refused clear encoder does not count as a successful hide. Submitted content is
 tracked separately from successful completion. Each submission owns an atomic
 completion result and generation; a stale callback only updates its own result,
@@ -183,8 +187,11 @@ cannot settle a newer request, and failures do not start immediate retry loops.
 
 The cursor log targets record rejected uploads, visibility blockers, input routes
 (at trace level), layer configuration, submitted generations, completion and failure
-stages. `scripts/cursor_appkit_probe.swift` verifies the event-routing assumption;
-the visible Wine probe in `windows/tests/examples/cursor_capture.rs` exercises
+stages. `scripts/cursor_appkit_probe.swift` verifies the event-routing assumption.
+`scripts/cursor_transaction_probe.swift <output-directory>` captures native window
+pixels and asserts the final visibility after coalesced clear/show bursts; the
+output directory must already exist and screen recording access must be available.
+The visible Wine probe in `windows/tests/examples/cursor_capture.rs` exercises
 `SetCapture` without clipping, loading pauses and hide/show bursts. Its native
 sprite and completion log must be checked separately from the game backbuffer.
 
