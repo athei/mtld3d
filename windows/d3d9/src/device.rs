@@ -1802,7 +1802,7 @@ impl DeviceInner {
     /// `present_block_cycles` (the backpressure wait from the *previous*
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
-    pub fn present(&mut self, new_frame: FrameData) {
+    pub fn present(&mut self) -> i32 {
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
@@ -1812,7 +1812,14 @@ impl DeviceInner {
         self.cursor_mut().follow_published_scale(cursor_scale);
         self.cursor_mut().sync_native_visibility();
         self.cursor_mut().note_present();
+        // Input polling can deliver WM_SIZE and recreate the implicit textures.
+        // Build the continuation only after those callbacks have returned.
+        if self.needs_reset() {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "Present: input processing left the device requiring Reset");
+            return mtld3d_types::D3DERR_DEVICENOTRESET;
+        }
         self.apply_upload_answers();
+        let new_frame = self.fresh_frame();
         let (frame, seq) = self.stamp_and_swap(new_frame, false);
 
         // The block we measure belongs to the frame that will next be
@@ -1823,6 +1830,7 @@ impl DeviceInner {
         self.encoder.send_frame(frame);
         self.frame_dump_present(crate::capture::take_request(), seq);
         self.mem_watch_present();
+        mtld3d_types::D3D_OK
     }
 
     pub fn perf_mut(&mut self) -> impl DerefMut<Target = ApiPerfState> + '_ {
@@ -4471,10 +4479,7 @@ extern "system" fn device_present(
     }
 
     mtld3d_shared::crumb!("d3d9:present");
-    let fresh = dev.fresh_frame();
-    dev.present(fresh);
-
-    0 // S_OK
+    dev.present()
 }
 
 extern "system" fn device_get_back_buffer(
