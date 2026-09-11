@@ -24,7 +24,7 @@ pub mod attachment;
 mod cursor_overlay;
 
 use attachment::{AttachFlags, AttachLatches, Attachment};
-pub use cursor_overlay::{observe_game_present, poll_capture_from_present, set_cursor_overlay};
+pub use cursor_overlay::{poll_capture_from_present, set_cursor_overlay};
 
 /// Retire the attachment record `view_handle` names. **Device teardown only.**
 ///

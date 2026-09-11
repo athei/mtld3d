@@ -180,17 +180,24 @@ null-then-set kick through live attachment sinks, restoring Wine's native cursor
 after the external tool releases it. The callback that asks for this kick uses
 the attachment registry's lifetime checks.
 
-Pixels and position are presented in one Core Animation transaction:
-`commit`, `waitUntilScheduled`, then `drawable.present`, with
-`presentsWithTransaction` enabled. Only the pre-commit run-loop observer submits
-cursor drawables. Input, activation and queued display updates are reconciled there
-before drawing: multiple presents to one layer in the same implicit transaction
-can leave its first drawable on screen even when later GPU work completed. A
-transparent clear represents hidden content.
-A refused clear encoder does not count as a successful hide. Submitted content is
-tracked separately from successful completion. Each submission owns an atomic
-completion result and generation; a stale callback only updates its own result,
-never the newer owner's state. Callbacks retain no PE pointers or native UI objects.
+Changed sprites are rendered offscreen with the cursor tone-map pipeline. GPU
+completion wakes the existing observer; it never waits for scheduling or execution
+on main. The completed, CPU-visible texture is copied to an immutable CGImage.
+Managed textures receive a synchronization blit before that completion. The image
+and current pointer position are assigned in one Core Animation transaction. A
+cached transparent image represents hidden content, and hide/show reuses the last
+completed sprite without another GPU submission.
+
+The cursor's CAMetalLayer hosts images for its macOS 15-compatible HDR controls;
+it never acquires or presents a drawable. This leaves the game as the only drawable
+stream eligible for Metal HUD selection. Disabling the HUD on a cursor drawable
+layer is insufficient: it can still affect the game's HUD scale during device
+recreation. The image-hosting window stays across attachment changes.
+
+Submitted content is tracked separately from successful completion. Each submission
+owns an atomic completion result and generation; a stale callback only updates its
+own result, never the newer owner's state. Callbacks retain no PE pointers or native
+UI objects.
 Creation, allocation, encoding and completion failures leave the latest request
 pending for existing event, run-loop or present opportunities. Reentrant callbacks
 cannot settle a newer request, and failures do not start immediate retry loops.

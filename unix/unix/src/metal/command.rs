@@ -687,9 +687,6 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
             // production rates display at their actual rate. `0.0` means
             // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
             let drawable_obj = ProtocolObject::from_ref(&*drawable);
-            if let Some(att) = attachment.as_ref() {
-                super::macdrv::observe_game_present(att, &drawable);
-            }
             let min_duration = attachment
                 .as_ref()
                 .map_or(0.0, |att| att.min_present_duration_sec());
@@ -1106,18 +1103,6 @@ fn clear_drawable(
     drawable: &ProtocolObject<dyn MTLTexture>,
 ) {
     clear_texture(cmd_buf, drawable, 1.0, "mtld3d-present-clear");
-}
-
-/// Clear the software cursor's drawable to transparent black.
-///
-/// The hidden state of the overlay: the layer keeps a surface in the window's
-/// scene, it just carries nothing, so the compositor's arrangement above the
-/// game layer does not change when the cursor comes back.
-pub fn clear_cursor_drawable(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    drawable: &ProtocolObject<dyn MTLTexture>,
-) -> bool {
-    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear")
 }
 
 /// One empty render pass that clears `texture` to black at `alpha`.

@@ -58,43 +58,6 @@ fn is_same(a: &Arc<Attachment>, b: &Arc<Attachment>) -> bool {
 }
 
 #[test]
-fn first_display_publication_does_not_follow_a_reused_view() {
-    const VIEW: usize = 0xE_0000;
-    let old = register(VIEW, VIEW + 8, &latches(AttachFlags::empty(), 2, None));
-    let barrier = std::sync::Barrier::new(2);
-    let queued = std::thread::scope(|scope| {
-        let first = scope.spawn(|| {
-            barrier.wait();
-            old.queue_first_display()
-        });
-        barrier.wait();
-        let second = old.queue_first_display();
-        usize::from(first.join().unwrap()) + usize::from(second)
-    });
-    assert_eq!(
-        queued, 1,
-        "display callbacks queue only one main-thread job"
-    );
-    assert!(!old.needs_first_display());
-    assert!(
-        !old.has_displayed(),
-        "queuing does not open the cursor gate"
-    );
-    unregister(VIEW);
-    let replacement = register(VIEW, VIEW + 16, &latches(AttachFlags::empty(), 2, None));
-    old.publish_first_display();
-    assert!(
-        !replacement.has_displayed(),
-        "an old callback cannot ready a new view"
-    );
-    assert!(replacement.needs_first_display());
-    assert!(replacement.queue_first_display());
-    replacement.publish_first_display();
-    assert!(replacement.has_displayed());
-    unregister(VIEW);
-}
-
-#[test]
 fn two_attachments_coexist() {
     const VIEW_A: usize = 0x1_0000;
     const VIEW_B: usize = 0x1_1000;

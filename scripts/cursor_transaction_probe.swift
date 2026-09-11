@@ -10,7 +10,6 @@ let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 app.finishLaunching()
 let device = MTLCreateSystemDefaultDevice()!
-let queue = device.makeCommandQueue()!
 let window = NSWindow(
   contentRect: NSRect(x: 100, y: 100, width: 300, height: 300), styleMask: .borderless,
   backing: .buffered, defer: false)
@@ -28,9 +27,6 @@ layer.pixelFormat = .rgba16Float
 layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
 layer.wantsExtendedDynamicRangeContent = true
 layer.isOpaque = false
-layer.framebufferOnly = true
-layer.maximumDrawableCount = 3
-layer.presentsWithTransaction = true
 layer.developerHUDProperties = ["mode": "disabled"]
 layer.actions = [
   "position": NSNull(), "bounds": NSNull(), "contents": NSNull(), "contentsScale": NSNull(),
@@ -38,28 +34,23 @@ layer.actions = [
 layer.anchorPoint = CGPoint(x: 0, y: 0)
 layer.frame = CGRect(x: 50, y: 50, width: 32, height: 32)
 layer.contentsScale = 2
-layer.drawableSize = CGSize(width: 64, height: 64)
 host.addSublayer(layer)
 view.layer = host
 view.wantsLayer = true
 window.contentView = view
 window.orderFrontRegardless()
 func submit(_ alpha: Double) {
-  autoreleasepool {
-    guard let drawable = layer.nextDrawable() else {
-      preconditionFailure("cursor nextDrawable returned nil")
-    }
-    let command = queue.makeCommandBuffer()!
-    let pass = MTLRenderPassDescriptor()
-    pass.colorAttachments[0].texture = drawable.texture
-    pass.colorAttachments[0].loadAction = .clear
-    pass.colorAttachments[0].storeAction = .store
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(alpha, 0, 0, alpha)
-    command.makeRenderCommandEncoder(descriptor: pass)!.endEncoding()
-    command.commit()
-    command.waitUntilScheduled()
-    drawable.present()
-  }
+  let value = Float16(alpha).bitPattern
+  let pixels: [UInt16] = [value, 0, 0, value]
+  let data = pixels.withUnsafeBytes { Data($0) } as CFData
+  let image = CGImage(
+    width: 1, height: 1, bitsPerComponent: 16, bitsPerPixel: 64, bytesPerRow: 8,
+    space: layer.colorspace!,
+    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+      .union(.byteOrder16Little).union(.floatComponents),
+    provider: CGDataProvider(data: data)!, decode: nil, shouldInterpolate: false,
+    intent: .defaultIntent)!
+  layer.contents = image
 }
 var pending: Double?
 func draw(_ alpha: Double) { pending = alpha }
