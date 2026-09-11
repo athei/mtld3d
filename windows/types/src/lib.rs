@@ -10,7 +10,7 @@ mod vertex_buffer;
 mod vertex_decl;
 
 pub use caps::*;
-pub use cursor::{ICONINFO, POINT};
+pub use cursor::{CURSOR_SHOWING, CURSORINFO, ICONINFO, POINT};
 pub use device::*;
 pub use direct3d9::*;
 pub use ff::{

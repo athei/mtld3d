@@ -510,6 +510,33 @@ fn hardware_only_visibility_needs_no_overlay_but_software_handoff_does() {
     super::attachment::unregister(A);
 }
 
+#[test]
+fn native_hide_without_a_sprite_wakes_main_and_retires_with_its_device() {
+    use mtld3d_shared::mtl::CursorOverlayFlags;
+    const A: usize = 0xc6_0000;
+    let owner = attachment(A);
+    let mut shared = super::Shared::default();
+    let mut native = request(0);
+    native.flags = CursorOverlayFlags::HARDWARE | CursorOverlayFlags::NATIVE_HIDDEN;
+    assert!(shared.update(A, &native, None));
+    assert!(
+        shared.pending,
+        "a native hide must wake main without an overlay"
+    );
+    let snapshot = shared.snapshot();
+    assert!(snapshot.sprite.is_none());
+    assert!(snapshot.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN));
+    shared.applied(snapshot.revision, true);
+    assert!(!shared.pending);
+    native.flags = CursorOverlayFlags::HARDWARE;
+    assert!(shared.update(A, &native, None));
+    assert!(shared.pending, "show must release the native blank on main");
+    assert!(shared.detach(&owner));
+    assert!(shared.snapshot().flags.is_empty());
+    assert!(shared.pending, "detach must reconcile the retired owner");
+    super::attachment::unregister(A);
+}
+
 fn content(hash: u64) -> super::Content {
     super::Content::Sprite {
         hash,

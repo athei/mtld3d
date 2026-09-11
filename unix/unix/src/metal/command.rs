@@ -1105,18 +1105,6 @@ fn clear_drawable(
     clear_texture(cmd_buf, drawable, 1.0, "mtld3d-present-clear");
 }
 
-/// Clear the software cursor's drawable to transparent black.
-///
-/// The hidden state of the overlay: the layer keeps a surface in the window's
-/// scene, it just carries nothing, so the compositor's arrangement above the
-/// game layer does not change when the cursor comes back.
-pub fn clear_cursor_drawable(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    drawable: &ProtocolObject<dyn MTLTexture>,
-) -> bool {
-    clear_texture(cmd_buf, drawable, 0.0, "mtld3d-cursor-clear")
-}
-
 /// One empty render pass that clears `texture` to black at `alpha`.
 fn clear_texture(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,

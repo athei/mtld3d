@@ -8,25 +8,24 @@
 //! the frame, so the cursor is as bright as the UI it hovers over.
 //!
 //! The window never moves with the pointer: it covers the whole screen the
-//! game window is on, and the sprite is a `CAMetalLayer` moved inside it. A
+//! game window is on, and the sprite is an image layer moved inside it. A
 //! window frame change makes `AppKit` re-resolve the cursor for the pointer's
 //! location, and with no cursor of our own to offer it lands on the arrow over
 //! the game's blank cursor on every mouse move; a layer moving inside a fixed
 //! window is invisible to that machinery. Show and hide swap the layer's
-//! pixels, a sprite or a transparent clear, so its surface stays in the
+//! pixels, a sprite or a transparent image, so its surface stays in the
 //! window's scene: taking a surface out from above the game layer is free,
 //! putting one back costs the game's next present a refresh, and a game
 //! hiding the cursor while a button is held would pay that on every click.
 //!
 //! Threads. The thunk runs on the API thread and only writes [`SHARED`] and
-//! queues one main-thread apply, coalesced through [`APPLY_PENDING`] so a burst
-//! of clicks is one apply of the latest state. Everything that touches
-//! `AppKit`, Core Animation or the overlay's Metal objects runs on the main
-//! thread: the apply, the mouse-move monitor that repositions the sprite, the
-//! activation observers, and the display reconciliation that re-renders the
-//! sprite when the layer mode or the EDR headroom moved. Those objects live in
-//! a main-thread `thread_local`, which is what makes the split sound without a
-//! lock around `Retained` handles.
+//! queues one main-thread wakeup, coalesced through [`APPLY_PENDING`]. The
+//! pre-commit run-loop observer applies the latest state once per transaction.
+//! Everything that touches `AppKit`, Core Animation or the overlay's Metal objects
+//! runs on the main thread: input observations, activation notifications, and
+//! the observer that reconciles position, visibility, layer mode and EDR headroom.
+//! Those objects live in a main-thread `thread_local`, which makes the split
+//! sound without a lock around `Retained` handles.
 //!
 //! Nothing about the game window is latched: the game `NSWindow`, its level,
 //! its client rectangle and its screen are read when the sprite can be shown,
@@ -39,7 +38,7 @@
 //! game means.
 //!
 //! The sprite's position and its pixels reach the compositor together. The
-//! layer presents with the Core Animation transaction, so a hide and the move
+//! completed image is assigned in the Core Animation transaction, so a hide and the move
 //! made with it land in one frame and the old sprite is never seen at a new
 //! place. That matters because the apply and the game's own pointer warps
 //! reach the main thread through different queues (ours the dispatch main
@@ -87,29 +86,30 @@ use block2::RcBlock;
 use log::{debug, info};
 use mtld3d_shared::{SetCursorOverlayParams, mtl::CursorOverlayFlags};
 use objc2::{
-    MainThreadMarker, MainThreadOnly, Message, extern_class, extern_methods,
+    AnyThread, MainThreadMarker, MainThreadOnly, Message, extern_class, extern_methods,
     rc::{Retained, autoreleasepool},
     runtime::{AnyClass, NSObject, ProtocolObject},
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
-    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
-    NSScreen, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSBitmapImageRep, NSColor,
+    NSCursor, NSDeviceRGBColorSpace, NSEvent, NSEventMask, NSImage, NSScreen, NSView, NSWindow,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
-    CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CGPoint, CGRect, CGSize, kCFRunLoopCommonModes,
+    CFRetained, CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CGPoint, CGRect, CGSize,
+    kCFRunLoopCommonModes,
 };
-use objc2_core_graphics::CGColorSpace;
+use objc2_core_graphics::{CGColorSpace, CGImage};
 use objc2_foundation::{
     NSDictionary, NSInteger, NSNotification, NSNotificationCenter, NSNull, NSString,
 };
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice, MTLDrawable, MTLOrigin,
-    MTLPixelFormat, MTLRegion, MTLResource, MTLSize, MTLTexture, MTLTextureDescriptor,
-    MTLTextureType, MTLTextureUsage,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSize,
+    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
-use objc2_quartz_core::{CAAction, CALayer, CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{CAAction, CALayer, CAMetalLayer};
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -131,10 +131,10 @@ const PARKED: CGPoint = CGPoint {
     y: -100_000.0,
 };
 
-/// What the sprite layer's drawable currently shows.
-#[derive(Debug, PartialEq)]
+/// What the sprite layer's image currently shows.
+#[derive(Clone, Debug, PartialEq)]
 enum Content {
-    /// The submitted drawable is a transparent clear.
+    /// The published image is transparent.
     Transparent,
     /// A sprite, tone-mapped for a layer mode and a headroom.
     Sprite {
@@ -307,6 +307,12 @@ struct PointerObservation {
 struct PointerWatch {
     event: Option<Retained<NSEvent>>,
     input: InputState,
+    /// Native cursor ownership changes on activation, independently of mouse input.
+    activation: u64,
+    /// Shared native blank, also used when the game never supplies a D3D cursor image.
+    native_cursor: Option<Retained<NSCursor>>,
+    /// Image displaced by our blank, restored only while that blank is still current.
+    native_restore: Option<Retained<NSCursor>>,
 }
 
 /// Request one coalesced main-thread check from the submit thread.
@@ -317,7 +323,10 @@ pub fn poll_capture_from_present() {
     let check = {
         let shared = lock_shared();
         shared.pending
-            || (shared.owner.is_some() && shared.flags.contains(CursorOverlayFlags::VISIBLE))
+            || (shared.owner.is_some()
+                && shared
+                    .flags
+                    .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN))
     };
     if check {
         queue_apply();
@@ -425,15 +434,19 @@ impl Shared {
                 })
             });
         }
+        let native_was_hidden = self.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN);
         self.owner = Some(owner);
         self.hash = hash;
         self.flags = params.flags;
         self.revision += 1;
         // Until a software sprite has been accepted, no overlay can exist.
-        // Hardware visibility is already published for the main-thread watch;
-        // it needs no separate UI wakeup. Once software has been used, retain
-        // the apply so hardware takeover clears any sprite or failed draw.
-        self.pending = !hardware || !self.sprites.is_empty();
+        // A native hide needs a UI wakeup even without a D3D sprite. Visible
+        // hardware cursors need only the main-thread watch. Once software has
+        // been used, retain the apply so hardware takeover clears its content.
+        self.pending = !hardware
+            || native_was_hidden
+            || params.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+            || !self.sprites.is_empty();
         true
     }
 
@@ -492,7 +505,7 @@ static APPLY_PENDING: AtomicBool = AtomicBool::new(false);
 static APPLY_QUEUED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The sprite's extent and hotspot in points, the window's coordinate unit.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct SpriteGeometry {
     width: f64,
     height: f64,
@@ -627,9 +640,11 @@ pub fn detach(retired: &Arc<Attachment>) {
     }
 }
 
-/// Reconcile the latest request with input, attachment and display state. Main thread only.
+/// Observe input now; reconcile pixels and position at the run-loop commit. Main thread only.
 pub fn reconcile_on_main() {
-    apply_on_main_inner();
+    let mtm = MainThreadMarker::new().expect("reconcile_on_main runs on the main thread");
+    install_pointer_watch(mtm);
+    observe_current_event(mtm);
 }
 
 fn lock_shared() -> MutexGuard<'static, Shared> {
@@ -647,7 +662,7 @@ fn queue_apply() {
     }
 }
 
-/// The queued apply: creates the overlay on first use. **Main thread only.**
+/// Wake the input watch; the pre-commit observer applies the latest state. Main thread only.
 fn apply_on_main() {
     APPLY_PENDING.store(false, Ordering::Release);
     let queued_ns = APPLY_QUEUED_NS.load(Ordering::Relaxed);
@@ -657,7 +672,7 @@ fn apply_on_main() {
         .saturating_sub(u128::from(queued_ns))
         / 1_000;
     debug!(target: LOG_TARGET, "cursor: apply ran {waited_us} us after it was queued");
-    apply_on_main_inner();
+    reconcile_on_main();
 }
 
 /// One owned snapshot used throughout a native reconciliation.
@@ -689,6 +704,10 @@ thread_local! {
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
 }
 
+/// Reconcile cursor content and position before each Core Animation commit.
+///
+/// Input, activation and GPU completion requests converge here so image and
+/// visibility updates share the latest pointer state.
 fn apply_on_main_inner() {
     let mtm = MainThreadMarker::new().expect("apply_on_main_inner runs on the main thread");
     let wanted = {
@@ -702,6 +721,7 @@ fn apply_on_main_inner() {
     install_pointer_watch(mtm);
     observe_current_event(mtm);
     let captured = reconcile_pointer(mtm, &wanted);
+    reconcile_native_cursor(mtm, &wanted, captured);
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             mtld3d_shared::log_once_warn!(
@@ -759,7 +779,9 @@ fn observe_current_event(mtm: MainThreadMarker) {
 }
 
 fn reconcile_pointer(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> bool {
-    if !wanted.flags.contains(CursorOverlayFlags::VISIBLE)
+    if !wanted
+        .flags
+        .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN)
         || !NSApplication::sharedApplication(mtm).isActive()
     {
         if POINTER_WATCH.with_borrow_mut(|watch| watch.input.suspend()) {
@@ -859,8 +881,14 @@ struct Overlay {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// One `MTLTexture` per sprite hash, uploaded on first render.
     textures: FxHashMap<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
-    /// What the layer's drawable shows right now.
+    /// What has been submitted or published for the current request.
     content: ContentState,
+    /// Offscreen output owned until the corresponding GPU completion is observed.
+    pending: Option<CursorDraw>,
+    /// Last completed sprite, reused across hide/show without another GPU submission.
+    image: Option<(Content, CFRetained<CGImage>)>,
+    /// A transparent image keeps a composited surface present while hidden.
+    transparent: CFRetained<CGImage>,
     /// Identity of the last reconciled attachment, never just its recyclable address.
     owner: Option<Arc<Attachment>>,
     mode: Option<LayerMode>,
@@ -871,8 +899,9 @@ impl Overlay {
     /// Create the window, its layer and the input hooks. **Main thread only.**
     ///
     /// `None` when there is no attachment to borrow a layer's device from or
-    /// Metal refuses a command queue; the next apply tries again.
+    /// Metal queue allocation fails; the next apply tries again.
     fn create(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> Option<Self> {
+        let transparent = image::transparent()?;
         let Some(game_layer) = wanted
             .owner
             .as_ref()
@@ -896,15 +925,8 @@ impl Overlay {
         // The sprite has an alpha channel and the window behind it is clear:
         // the compositor blends the whole window onto the game.
         layer.setOpaque(false);
-        layer.setFramebufferOnly(true);
-        // Allow two visibility flips in flight alongside the compositor's
-        // current drawable. nextDrawable can still wait when all three are busy.
-        layer.setMaximumDrawableCount(3);
-        layer.setAllowsNextDrawableTimeout(true);
-        // The pixels ride the Core Animation transaction that carries the
-        // layer's position, so a hide and the move that goes with it reach
-        // the compositor in one frame; see `Overlay::sync_position`.
-        layer.setPresentsWithTransaction(true);
+        // This layer hosts immutable images and never acquires or presents a
+        // Metal drawable. Keep CAMetalLayer's HDR controls for macOS 15 too.
         // No implicit animation on anything written here: without this, the
         // layer having no delegate, every position or bounds write would ease
         // over Core Animation's default quarter second.
@@ -913,10 +935,6 @@ impl Overlay {
         // Positioned by its bottom-left corner, like the window it lives in.
         layer.setAnchorPoint(CGPoint { x: 0.0, y: 0.0 });
         layer.setPosition(PARKED);
-        layer.setDrawableSize(CGSize {
-            width: 1.0,
-            height: 1.0,
-        });
         layer.setBounds(CGRect {
             origin: CGPoint::default(),
             size: CGSize {
@@ -958,8 +976,7 @@ impl Overlay {
         window.setHasShadow(false);
         window.setAnimationBehavior(NSWindowAnimationBehavior::None);
         // On every Space: the overlay is never ordered in or out, so it must
-        // be wherever the game window is moved to, and a window on no visible
-        // Space would be an uncomposited layer whose presents block.
+        // be wherever the game window is moved to.
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::Transient
@@ -994,6 +1011,9 @@ impl Overlay {
             queue,
             textures: FxHashMap::default(),
             content: ContentState::default(),
+            pending: None,
+            image: None,
+            transparent,
             owner: None,
             mode: None,
             visibility: None,
@@ -1004,6 +1024,7 @@ impl Overlay {
     fn apply(&mut self, mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) -> bool {
         if !same_owner(self.owner.as_ref(), wanted.owner.as_ref()) {
             self.content.invalidate();
+            self.pending = None;
             self.owner = wanted.owner.as_ref().map(Arc::clone);
         }
         if let Some(att) = wanted.owner.as_ref() {
@@ -1037,6 +1058,8 @@ impl Overlay {
             self.layer.setDevice(Some(&device));
             self.textures.clear();
             self.content.invalidate();
+            self.pending = None;
+            self.image = None;
         }
         let mode = if att.hdr_active() {
             LayerMode::Hdr
@@ -1062,57 +1085,65 @@ impl Overlay {
                 .setWantsExtendedDynamicRangeContent(game.wantsExtendedDynamicRangeContent());
             self.mode = Some(mode);
             self.content.invalidate();
+            self.pending = None;
+            self.image = None;
             info!(target: LOG_TARGET, "cursor: layer configured {mode:?} pixelFormat={:?} colorspace={colorspace:?} EDR={}",
                 game.pixelFormat(), game.wantsExtendedDynamicRangeContent());
         }
         true
     }
 
-    /// Schedule the requested pixels, leaving failed attempts pending for an existing opportunity.
+    /// Publish completed pixels and defer GPU work without blocking the main run loop.
     fn ensure_content(&mut self, wanted: Content, sprite: Option<&Sprite>) -> bool {
         let Self {
             layer,
             queue,
             textures,
             content,
+            pending,
+            image,
+            transparent,
             ..
         } = self;
-        content.ensure(wanted, |requested, generation, result| {
-            let draw = match requested {
-                Content::Transparent => Self::present_transparent(layer, queue),
-                Content::Sprite { .. } => sprite.and_then(|sprite| {
-                    Self::render(layer, queue, textures, sprite, requested)
-                }),
+        let scheduled = content.ensure(wanted, |requested, generation, result| {
+            *pending = None;
+            let cached = match requested {
+                Content::Transparent => Some(&**transparent),
+                Content::Sprite { .. } => image.as_ref()
+                    .filter(|(key, _)| key == requested).map(|(_, pixels)| &**pixels),
             };
-            let Some(draw) = draw else {
+            if let Some(pixels) = cached {
+                apply_image(layer, pixels, requested);
+                result.store(COMPLETED, Ordering::Release);
+                return true;
+            }
+            let Some(draw) = sprite.and_then(|sprite| Self::render(layer, queue, textures, sprite, requested)) else {
                 mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: draw preparation failed; latest request remains pending");
                 return false;
             };
-            present_with_transaction(&draw.command, &draw.drawable, generation, result)
-        })
-    }
-
-    /// Encode a transparent drawable. A refused clear is not a hidden cursor.
-    fn present_transparent(
-        layer: &CAMetalLayer,
-        queue: &ProtocolObject<dyn MTLCommandQueue>,
-    ) -> Option<CursorDraw> {
-        let Some(drawable) = layer.nextDrawable() else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: clear nextDrawable returned nil");
-            return None;
-        };
-        let Some(command) = queue.commandBuffer() else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: clear command buffer allocation failed");
-            return None;
-        };
-        command.setLabel(Some(&NSString::from_str("mtld3d-cursor-clear")));
-        if !command::clear_cursor_drawable(&command, &drawable.texture()) {
-            return None;
+            submit_image(&draw.command, generation, result);
+            *pending = Some(draw);
+            true
+        });
+        if !scheduled || !content.completed() {
+            // The completion wakes the existing observer; no GPU wait on main.
+            return false;
         }
-        Some(CursorDraw { command, drawable })
+        if let Some(draw) = pending.take() {
+            let colorspace = layer.colorspace();
+            let Some(pixels) = image::readback(&draw.texture, colorspace.as_deref()) else {
+                content.invalidate();
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: image publication failed; request remains pending");
+                return false;
+            };
+            let requested = content.current().expect("completed content exists");
+            apply_image(layer, &pixels, requested);
+            *image = Some((requested.clone(), pixels));
+        }
+        true
     }
 
-    /// Render sprite `hash` into the overlay's drawable, sized to the sprite.
+    /// Render sprite `hash` offscreen, sized to its source pixels.
     ///
     /// A failed allocation or encode leaves no cached submission, so an existing
     /// input, run-loop or present opportunity retries the latest request.
@@ -1125,7 +1156,7 @@ impl Overlay {
     ) -> Option<CursorDraw> {
         let Content::Sprite {
             hash,
-            geometry,
+            geometry: _,
             mode,
             peak,
         } = content
@@ -1138,22 +1169,20 @@ impl Overlay {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(upload_sprite_texture(&device, *hash, sprite)?),
         };
-        layer.setBounds(CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize {
-                width: geometry.width,
-                height: geometry.height,
-            },
-        });
-        layer.setContentsScale(geometry.scale);
-        layer.setDrawableSize(CGSize {
-            width: geometry.width * geometry.scale,
-            height: geometry.height * geometry.scale,
-        });
-        let Some(drawable) = layer.nextDrawable() else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite nextDrawable returned nil");
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::Type2D);
+        descriptor.setPixelFormat(layer.pixelFormat());
+        // SAFETY: validated sprite dimensions on a fresh offscreen descriptor.
+        unsafe { descriptor.setWidth(sprite.width as usize) };
+        // SAFETY: validated sprite dimensions on a fresh offscreen descriptor.
+        unsafe { descriptor.setHeight(sprite.height as usize) };
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        descriptor.setStorageMode(cpu_written_texture_storage(&device));
+        let Some(output) = device.newTextureWithDescriptor(&descriptor) else {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: offscreen output allocation failed");
             return None;
         };
+        output.setLabel(Some(&NSString::from_str("mtld3d-cursor-image")));
         let Some(command) = queue.commandBuffer() else {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite command buffer allocation failed");
             return None;
@@ -1168,12 +1197,22 @@ impl Overlay {
             LayerMode::Hdr if *peak <= 1.0 => (pipelines.cursor_passthrough, None),
             LayerMode::Hdr => (pipelines.cursor_bt2446, Some(present::hdr_uniforms(*peak))),
         };
-        if !command::encode_cursor_pass(&command, texture, &drawable.texture(), pipeline, uniforms)
-        {
+        if !command::encode_cursor_pass(&command, texture, &output, pipeline, uniforms) {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite encoder allocation failed");
             return None;
         }
-        Some(CursorDraw { command, drawable })
+        if output.storageMode() == MTLStorageMode::Managed {
+            let Some(blit) = command.blitCommandEncoder() else {
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: managed image sync allocation failed");
+                return None;
+            };
+            blit.synchronizeResource(ProtocolObject::from_ref(&*output));
+            blit.endEncoding();
+        }
+        Some(CursorDraw {
+            command,
+            texture: output,
+        })
     }
 
     /// Level, position and content against the pointer and the game window as they are now.
@@ -1196,7 +1235,7 @@ impl Overlay {
             // Transparent content has no position to follow. Avoid window,
             // screen and pointer queries until a sprite can be shown again;
             // that apply resolves its pixels and position in one transaction.
-            self.update_visibility(inputs);
+            self.update_visibility(inputs, mtm);
             self.ensure_content(Content::Transparent, None);
             return;
         }
@@ -1233,7 +1272,7 @@ impl Overlay {
         );
         inputs.set(VisibilityInputs::OCCLUDED, att.window_occluded());
         inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
-        self.update_visibility(inputs);
+        self.update_visibility(inputs, mtm);
         let shown = overlay_visible(inputs);
         let Some(sprite) = wanted.sprite.as_deref() else {
             self.ensure_content(Content::Transparent, None);
@@ -1247,7 +1286,7 @@ impl Overlay {
             let mode = self.mode.unwrap_or(LayerMode::Sdr);
             let peak = att.headroom();
             // Re-render on a sprite or layer-mode change, and on a headroom
-            // move worth it; otherwise the drawable already shows this sprite.
+            // move worth it; otherwise the cached image already shows this sprite.
             let peak = match self.content.current() {
                 Some(Content::Sprite {
                     hash: h,
@@ -1266,14 +1305,9 @@ impl Overlay {
         } else {
             Content::Transparent
         };
-        // Pixels first, the position second, and the position only once the
-        // drawable shows the wanted pixels. Both are part of the run loop
-        // iteration's one transaction (the layer presents with it), so the
-        // compositor sees a hide and the move that comes with it in the same
-        // frame, never the old sprite at the new place; and a hide whose
-        // present found no drawable keeps the old sprite where it is until
-        // the retry, rather than moving it. A show resolves the current pointer
-        // before this write, so hidden or inactive sprites need no position updates.
+        // Publish a completed image before its position, in the same Core
+        // Animation transaction. A pending shape keeps its old pixels and
+        // position until completion; a hide uses the cached transparent image.
         if self.ensure_content(content, Some(sprite))
             && inputs.contains(VisibilityInputs::POINTER_INSIDE)
         {
@@ -1284,7 +1318,10 @@ impl Overlay {
         }
     }
 
-    fn update_visibility(&mut self, inputs: VisibilityInputs) {
+    fn update_visibility(&mut self, inputs: VisibilityInputs, mtm: MainThreadMarker) {
+        if overlay_visible(inputs) {
+            select_native_blank(mtm);
+        }
         if self.visibility != Some(inputs) {
             debug!(target: LOG_TARGET, "cursor: visibility inputs={inputs:?}");
             self.visibility = Some(inputs);
@@ -1292,25 +1329,132 @@ impl Overlay {
     }
 }
 
+/// Honor Win32's native hide only over the active device's unobscured client area.
+fn reconcile_native_cursor(mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) {
+    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+        && (wanted.flags.contains(CursorOverlayFlags::HARDWARE)
+            || !wanted.flags.contains(CursorOverlayFlags::VISIBLE))
+        && wanted.owner.is_some()
+    {
+        restore_native_cursor(mtm);
+    }
+    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+        || captured
+        || !NSApplication::sharedApplication(mtm).isActive()
+    {
+        // Wine and the foreground application own visible or externally captured cursors.
+        return;
+    }
+    let Some(att) = wanted.owner.as_ref() else {
+        // A detached device cannot own the native cursor.
+        return;
+    };
+    let Some((view, window)) = attachment::retain_view(att, mtm)
+        .and_then(|view| view.window().map(|window| (view, window)))
+    else {
+        // Native teardown can retire the view before the queued apply reaches main.
+        return;
+    };
+    let mouse = NSEvent::mouseLocation();
+    let client = window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
+    if !att.window_occluded()
+        && !window.isMiniaturized()
+        && rect_contains(client, mouse)
+        && window_under_pointer(mouse, mtm) == window.windowNumber()
+    {
+        select_native_blank(mtm);
+    }
+}
+
+/// Reassert the native image if `AppKit` replaced it while Win32 still requests a hide.
+fn select_native_blank(mtm: MainThreadMarker) {
+    POINTER_WATCH.with_borrow_mut(|watch| {
+        if watch.native_cursor.is_none() {
+            watch.native_cursor = native_blank_cursor(mtm);
+        }
+        let current = NSCursor::currentCursor();
+        if let Some(cursor) = watch.native_cursor.as_ref()
+            && !core::ptr::eq(&raw const *current, &raw const **cursor)
+        {
+            watch.native_restore = Some(current);
+            cursor.set();
+            debug!(target: LOG_TARGET, "cursor: native blank applied for activation={}", watch.activation);
+        }
+    });
+}
+
+/// Give back the image we displaced without overwriting a newer Wine cursor.
+fn restore_native_cursor(mtm: MainThreadMarker) {
+    POINTER_WATCH.with_borrow_mut(|watch| {
+        if let Some(previous) = watch.native_restore.take()
+            && NSApplication::sharedApplication(mtm).isActive()
+            && watch.native_cursor.as_ref().is_some_and(|blank| {
+                core::ptr::eq(&raw const *NSCursor::currentCursor(), &raw const **blank)
+            })
+        {
+            previous.set();
+            debug!(target: LOG_TARGET, "cursor: native image restored after Win32 show");
+        }
+    });
+}
+
+/// A native blank for startup and activation without pointer motion.
+///
+/// Win32 may already hold our blank HCURSOR while Wine has no cursor window to
+/// notify or macOS still displays the previous application's image. Select this
+/// transparent image when the overlay can be shown or Win32 requests a native
+/// hide. Replacing an image changes no hide count and synthesizes no mouse input.
+fn native_blank_cursor(_mtm: MainThreadMarker) -> Option<Retained<NSCursor>> {
+    // SAFETY: immutable AppKit constant, initialized before the main thread starts.
+    let color_space = unsafe { NSDeviceRGBColorSpace };
+    // SAFETY: null planes asks AppKit to allocate storage for one RGBA pixel.
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            core::ptr::null_mut(),
+            1,
+            1,
+            8,
+            4,
+            true,
+            false,
+            color_space,
+            4,
+            32,
+        )
+    };
+    let Some(bitmap) = bitmap else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: native blank allocation failed");
+        return None;
+    };
+    bitmap.setColor_atX_y(&NSColor::clearColor(), 0, 0);
+    let image = NSImage::initWithSize(
+        NSImage::alloc(),
+        CGSize {
+            width: 1.0,
+            height: 1.0,
+        },
+    );
+    image.addRepresentation(&bitmap);
+    Some(NSCursor::initWithImage_hotSpot(
+        NSCursor::alloc(),
+        &image,
+        CGPoint { x: 0.0, y: 0.0 },
+    ))
+}
+
 /// Encoded native work, with no references to caller-owned pixels or PE state.
 struct CursorDraw {
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
-/// Commit `cmd_buf` and present `drawable` as part of the current Core Animation transaction.
-///
-/// The sequence `presentsWithTransaction` asks for: the command buffer must
-/// be scheduled before the drawable is handed to the transaction, and the
-/// transaction is the run loop iteration's implicit one, committed once the
-/// iteration ends with every layer write made meanwhile. The wait is for
-/// scheduling only, on the main thread, for a pass that draws one sprite.
-fn present_with_transaction(
+/// Complete an offscreen sprite without waiting for scheduling or GPU execution.
+fn submit_image(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    drawable: &ProtocolObject<dyn CAMetalDrawable>,
     generation: u64,
     result: Arc<AtomicU8>,
-) -> bool {
+) {
     let handler = RcBlock::new(move |ptr: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
         autoreleasepool(|_| {
             // SAFETY: Metal supplies a live completed buffer for this invocation.
@@ -1325,6 +1469,7 @@ fn present_with_transaction(
             } else {
                 log::warn!(target: LOG_TARGET, "cursor: completion failed generation={generation} status={:?} error={:?}", buffer.status(), buffer.error());
             }
+            queue_apply();
         });
     });
     // SAFETY: Metal copies the block before commit. It retains only its own result
@@ -1332,13 +1477,21 @@ fn present_with_transaction(
     // As for the present callbacks, device use pins this Unix image until process exit.
     unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
     cmd_buf.commit();
-    cmd_buf.waitUntilScheduled();
-    if cmd_buf.status() == MTLCommandBufferStatus::Error {
-        log::warn!(target: LOG_TARGET, "cursor: scheduling failed generation={generation}");
-        return false;
+}
+
+/// Change image and geometry together in the observer's Core Animation transaction.
+fn apply_image(layer: &CAMetalLayer, pixels: &CGImage, content: &Content) {
+    if let Content::Sprite { geometry, .. } = content {
+        layer.setBounds(CGRect {
+            origin: CGPoint::default(),
+            size: CGSize {
+                width: geometry.width,
+                height: geometry.height,
+            },
+        });
+        layer.setContentsScale(geometry.scale);
     }
-    drawable.present();
-    true
+    image::set_contents(layer, pixels);
 }
 
 /// An actions table that switches implicit animations off for everything the overlay writes.
@@ -1498,7 +1651,6 @@ pub fn install_pointer_watch(mtm: MainThreadMarker) {
                     MainThreadMarker::new().expect("cursor local monitor runs on the main thread");
                 // SAFETY: AppKit passes the live event for this monitor invocation.
                 observe_mouse_event(unsafe { event.as_ref() }, "local", mtm);
-                apply_on_main_inner();
                 event.as_ptr()
             })
         });
@@ -1556,9 +1708,13 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
     for name in names {
         let block = RcBlock::new(|_: NonNull<NSNotification>| {
             autoreleasepool(|_| {
-                let _mtm = MainThreadMarker::new()
+                let mtm = MainThreadMarker::new()
                     .expect("cursor activation observer runs on the main thread");
+                let active = NSApplication::sharedApplication(mtm).isActive();
                 let recovered = POINTER_WATCH.with_borrow_mut(|watch| {
+                    if active {
+                        watch.activation = watch.activation.wrapping_add(1);
+                    }
                     watch
                         .input
                         .note_position(NSEvent::mouseLocation(), now_ns());
@@ -1567,7 +1723,6 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
                 if recovered {
                     attachment::request_cursor_kick_all();
                 }
-                apply_on_main_inner();
             });
         });
         // SAFETY: the notification center copies the block; the token is kept for life.
@@ -1577,6 +1732,8 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
         core::mem::forget(token);
     }
 }
+
+mod image;
 
 #[cfg(test)]
 mod tests;

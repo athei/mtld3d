@@ -817,6 +817,8 @@ bitflags! {
         /// its cursor whatever draws it. This attachment takes ownership and
         /// clears the previous software sprite, so both paths cannot stay visible.
         const HARDWARE = 1 << 1;
+        /// Win32 requests a hidden native cursor, including games drawing their own sprite.
+        const NATIVE_HIDDEN = 1 << 2;
     }
 }
 

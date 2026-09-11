@@ -13,6 +13,18 @@ pub struct POINT {
     pub y: i32,
 }
 
+/// Win32 cursor visibility, handle and screen position from `GetCursorInfo`.
+#[repr(C)]
+pub struct CURSORINFO {
+    pub cb_size: u32,
+    pub flags: u32,
+    pub cursor: *mut c_void,
+    pub screen_pos: POINT,
+}
+
+/// `CURSORINFO::flags`: the native cursor's display count permits showing it.
+pub const CURSOR_SHOWING: u32 = 1;
+
 #[repr(C)]
 pub struct ICONINFO {
     /// `FALSE` = cursor, `TRUE` = icon.

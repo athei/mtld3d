@@ -34,10 +34,14 @@ log = "0.4"
 objc2 = { version = "0.6", features = ["disable-encoding-assertions"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSApplication",
+    "NSBitmapImageRep",
     "NSColor",
     "NSColorSpace",
+    "NSCursor",
     "NSEvent",
     "NSGraphics",
+    "NSImage",
+    "NSImageRep",
     "NSResponder",
     "NSScreen",
     "NSView",

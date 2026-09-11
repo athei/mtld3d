@@ -12,6 +12,7 @@ use mtld3d_types::{
     D3DDEVTYPE_HAL, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT, D3DSDK_VERSION,
     D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
     D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl, IDirect3DDevice9Vtbl,
+    IDirect3DSwapChain9Vtbl,
 };
 
 use crate::{
@@ -685,6 +686,34 @@ impl Harness {
                 core::ptr::null(),
             )
         }
+    }
+
+    /// Present through the implicit swap chain instead of the device entry point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the implicit swap chain cannot be acquired.
+    pub fn present_swapchain(&self) -> i32 {
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device and initialized output for its implicit swap chain.
+        let result = unsafe { (self.dev_vtbl().get_swap_chain)(self.device, 0, &raw mut chain) };
+        expect_ok(result, "GetSwapChain");
+        // SAFETY: successful GetSwapChain returned a live IDirect3DSwapChain9.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(chain) };
+        // SAFETY: live swap chain; null rectangles present the whole back buffer.
+        let result = unsafe {
+            (vtbl.present)(
+                chain,
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+            )
+        };
+        // SAFETY: balances the reference returned by GetSwapChain above.
+        unsafe { (vtbl.release)(chain) };
+        result
     }
 
     /// `Clear` with explicit flags / colour / depth / stencil.
