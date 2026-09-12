@@ -2008,3 +2008,45 @@ fn constant_snapshots_survive_readback_and_fixed_function_transition() {
     assert_eq!(h.read_pixel(320, 264), 0xFF00_FF00, "FF constants");
     assert_eq!(h.read_pixel(480, 264), 0xFF00_00FF, "post-flush update");
 }
+
+/// D3D9 copies the constant array and promises nothing about its alignment.
+///
+/// A title passing a pointer that is not four-byte aligned is inside the
+/// contract, so the register file has to take it and read back the same
+/// values a correctly aligned call would have written.
+#[test]
+fn a_pixel_shader_constant_upload_takes_an_unaligned_pointer() {
+    const START: u32 = 29;
+    const BYTES: usize = size_of::<[f32; 4]>();
+
+    let h = Harness::new();
+    let want = [1.0f32, 2.0, 3.0, 4.0];
+
+    // One register's worth of payload written one byte into an f32-aligned
+    // buffer, so the pointer handed over cannot be aligned for `f32`.
+    let mut buf = [0.0f32; 5];
+    // SAFETY: `buf` is 20 bytes, so byte offset 1 is in range.
+    let dst = unsafe { buf.as_mut_ptr().cast::<u8>().add(1) };
+    // SAFETY: 16 bytes from byte offset 1 stay inside the 20, and the regions
+    // do not overlap.
+    unsafe { core::ptr::copy_nonoverlapping(want.as_ptr().cast::<u8>(), dst, BYTES) };
+    // SAFETY: one byte into a 20-byte buffer, leaving the 16 written above.
+    let unaligned = unsafe { buf.as_ptr().byte_add(1) };
+    assert_ne!(
+        unaligned as usize % align_of::<f32>(),
+        0,
+        "the test needs a pointer that is not aligned for f32",
+    );
+
+    // SAFETY: `unaligned` addresses the 16 bytes written above.
+    let hr = unsafe { h.set_pixel_shader_constant_f_raw(START, unaligned, 1) };
+    assert_eq!(hr, 0, "SetPixelShaderConstantF with an unaligned pointer");
+
+    let (hr, got) = h.get_pixel_shader_constant_f(START, 1);
+    assert_eq!(hr, 0, "GetPixelShaderConstantF");
+    assert_eq!(
+        got.as_slice(),
+        want.as_slice(),
+        "the register file holds what the unaligned call sent",
+    );
+}
