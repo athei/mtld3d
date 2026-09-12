@@ -669,7 +669,7 @@ fn push_thread_name(buf: &mut [u8; 192], pos: &mut usize) {
 /// Scan the raw stack for return addresses into our own dylib and print them.
 ///
 /// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
-/// value that `dladdr` resolves into a module whose path contains `mtld3d`.
+/// value that `dladdr` resolves into a module whose file name is ours.
 /// Caps the printed count so a deep stack can't flood. Stack words are copied
 /// by the kernel into local storage, without dereferencing the faulting stack.
 /// Arch-neutral: a spilled return address is a stack word on both arches, and
@@ -728,7 +728,7 @@ const STACK_SCAN_WORDS: usize = 4096;
 /// Print the return addresses into our own dylib among `words` stack words above `sp`.
 ///
 /// `backtrace_symbols_fd`-prints each value that `dladdr` resolves into a
-/// module whose path contains `mtld3d`, capped so a deep stack can't flood.
+/// module whose file name is ours, capped so a deep stack can't flood.
 /// The 4-byte step tolerates a 32-bit guest stack's alignment; a spilled
 /// return address is a stack word on both arches.
 fn our_frames_on_stack(sp: u64, words: usize) {
@@ -840,47 +840,50 @@ fn dladdr_image(addr: u64) -> Option<*const core::ffi::c_char> {
 
 /// True when `addr` resolves (via `dladdr`) into our own `.so`.
 ///
-/// The match is on a loaded image whose filename contains the bytes `mtld3d`.
+/// The match is on a loaded image whose file name begins with `mtld3d`.
 /// Filters stack garbage and libsystem/Wine/Metal frames down to our own call
 /// chain.
 fn dladdr_is_ours(addr: u64) -> bool {
-    /// Scanned for in the image path, without allocating.
-    const NEEDLE: &[u8] = b"mtld3d";
-
     let Some(path) = dladdr_image(addr) else {
         return false;
     };
-    let path = path.cast::<u8>();
-    let mut idx = 0usize;
-    let mut matched = 0usize;
-    while idx < PATH_MAX_SCAN {
-        // SAFETY: an offset within a NUL-terminated C string owned by dyld,
-        // bounded by the NUL check below.
-        let at = unsafe { path.add(idx) };
-        // SAFETY: as above; reads one byte of that string.
-        let byte = unsafe { at.read() };
-        if byte == 0 {
-            break;
-        }
-        matched = if byte == NEEDLE[matched] {
-            matched + 1
-        } else {
-            usize::from(byte == NEEDLE[0])
-        };
-        if matched == NEEDLE.len() {
-            return true;
-        }
-        idx += 1;
-    }
-    false
+    path_names_our_image(path)
+}
+
+/// Whether the NUL-terminated image path names one of our own images.
+///
+/// The file name decides, not the path. A directory anywhere above the image
+/// can carry our name, and matching the whole path then claims every image
+/// under it: Wine installed beside us is the layout where that matters, where claiming
+/// its `ntdll.so` sends a fault Wine would have turned into a Windows
+/// exception down the terminal path instead of back to it.
+///
+/// Split from [`dladdr_is_ours`] so the suite can pin the rule without a live
+/// `dladdr`.
+fn path_names_our_image(path: *const core::ffi::c_char) -> bool {
+    /// Matched against the image's file name.
+    const NEEDLE: &[u8] = b"mtld3d";
+
+    let len = image_path_len(path);
+    // The file name starts one past the last separator, or at the beginning
+    // when the path carries none.
+    let start = (0..len)
+        .rfind(|&i| image_path_byte(path, i) == b'/')
+        .map_or(0, |i| i + 1);
+    // It has to begin with the needle, so `mtld3d.so` matches and an
+    // unrelated `ntdll.so` under an `mtld3d`-named directory does not.
+    len - start >= NEEDLE.len()
+        && NEEDLE
+            .iter()
+            .enumerate()
+            .all(|(i, &want)| image_path_byte(path, start + i) == want)
 }
 
 /// Bound on every scan of an image path, so a corrupt `dli_fname` can't spin.
 const PATH_MAX_SCAN: usize = 4096;
 
 /// Length of the NUL-terminated image path dyld owns, bounded by [`PATH_MAX_SCAN`].
-#[cfg(target_arch = "x86_64")]
-fn image_path_len(path: *const core::ffi::c_char) -> usize {
+const fn image_path_len(path: *const core::ffi::c_char) -> usize {
     let mut len = 0usize;
     while len < PATH_MAX_SCAN && image_path_byte(path, len) != 0 {
         len += 1;
@@ -892,7 +895,6 @@ fn image_path_len(path: *const core::ffi::c_char) -> usize {
 ///
 /// Callers stay within the length [`image_path_len`] measured, or stop at
 /// the first zero this returns.
-#[cfg(target_arch = "x86_64")]
 const fn image_path_byte(path: *const core::ffi::c_char, index: usize) -> u8 {
     // SAFETY: an offset within a NUL-terminated C string owned by dyld, which
     // the caller bounds by its measured length or by the NUL itself.

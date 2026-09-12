@@ -745,3 +745,38 @@ fn check_stack_boundaries(test: &str, scan: fn(u64)) {
     assert!(!report.contains("FATAL"), "{report}");
     assert!(report.contains("stack read unavailable"), "{report}");
 }
+
+/// The file name decides ownership, not the path.
+///
+/// Wine lives under a directory named after this project in a normal
+/// developer install, and claiming its images sends a fault Wine would have
+/// recovered down the terminal path instead of back to it.
+#[test]
+fn only_the_image_file_name_decides_whether_a_fault_is_ours() {
+    fn names_ours(path: &str) -> bool {
+        let c = std::ffi::CString::new(path).expect("no interior NUL");
+        super::path_names_our_image(c.as_ptr())
+    }
+
+    assert!(names_ours("/opt/mtld3d/lib/wine/x86_64-unix/mtld3d.so"));
+    assert!(names_ours("mtld3d.so"));
+    assert!(
+        !names_ours("/opt/mtld3d-toolchain/components/wine/lib/wine/x86_64-unix/ntdll.so"),
+        "Wine's own image under a directory named for this project is not ours",
+    );
+    assert!(
+        !names_ours("ntdll.so"),
+        "a bare foreign file name is not ours"
+    );
+    assert!(
+        !names_ours("/opt/mtld3d/"),
+        "a trailing separator names no file"
+    );
+    assert!(!names_ours("/usr/lib/system/libsystem_platform.dylib"));
+    assert!(!names_ours("/opt/mtld3d/lib/wine/x86_64-unix/winemetal.so"));
+    assert!(
+        !names_ours("/x/libmtld3d_unix.dylib"),
+        "the file name has to begin with the needle, not merely contain it",
+    );
+    assert!(!names_ours(""));
+}
