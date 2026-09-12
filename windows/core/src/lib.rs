@@ -42,6 +42,7 @@ pub mod pool;
 pub mod present;
 pub mod process_vertices;
 pub mod ps_draw;
+pub mod query_fence;
 pub mod readback;
 pub mod render_scale;
 pub mod sampler_state;

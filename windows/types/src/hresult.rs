@@ -5,6 +5,12 @@
 //! explicit (and clippy stops flagging it as accidental sign loss).
 
 pub const D3D_OK: i32 = 0;
+/// `S_FALSE`: the call succeeded and the answer is "not yet".
+///
+/// `IDirect3DQuery9::GetData` returns it while the query still has work
+/// outstanding, which a caller distinguishes from `D3D_OK` rather than from
+/// a failure: both are success codes.
+pub const S_FALSE: i32 = 1;
 pub const E_FAIL: i32 = 0x8000_4005_u32.cast_signed();
 pub const E_NOINTERFACE: i32 = 0x8000_4002_u32.cast_signed();
 /// `E_NOTIMPL` — "not implemented".
