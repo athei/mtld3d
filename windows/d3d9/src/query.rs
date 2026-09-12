@@ -1,6 +1,9 @@
 //! `IDirect3DQuery9` implementation.
 //!
-//! - `EVENT`: synchronous-at-the-API-boundary ("completed immediately").
+//! - `EVENT`: `Issue(D3DISSUE_END)` stamps the frame being recorded, and
+//!   `GetData` reports completion once the GPU has retired that frame,
+//!   submitting it first while the frame is still open. Applications fence
+//!   their own storage reuse on this answer, so it comes from the GPU.
 //! - `TIMESTAMP`: stub — returns 0 ticks. Not implemented, logs once.
 //! - `OCCLUSION`: real Metal visibility-result query. `Issue(BEGIN/END)`
 //!   pushes closures onto the current frame that bump the encoder's
@@ -10,7 +13,10 @@
 //!   See `mtld3d_core::visibility` for the sum + pool machinery.
 
 use core::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use mtld3d_core::visibility::{QueryStatus, VisibilityQueryCore};
 use mtld3d_shared::{InPtr, OutPtr};
@@ -19,7 +25,7 @@ use mtld3d_types::{
     D3DQUERYTYPE_TIMESTAMP, Guid, IDirect3DQuery9Vtbl,
 };
 
-use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, device::DeviceInner};
+use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, S_FALSE, device::DeviceInner};
 
 pub static DIRECT3D_QUERY9_VTBL: IDirect3DQuery9Vtbl = IDirect3DQuery9Vtbl {
     query_interface: query_query_interface,
@@ -51,6 +57,7 @@ impl Direct3DQuery9 {
             query_type,
             data_size,
             core,
+            end_seq: AtomicU64::new(0),
         }));
         Self {
             vtbl: &raw const DIRECT3D_QUERY9_VTBL,
@@ -92,6 +99,53 @@ struct QueryInner {
     /// `intake_visibility` finalizes it post-GPU. `None` for
     /// EVENT / TIMESTAMP.
     core: Option<Arc<VisibilityQueryCore>>,
+    /// For EVENT queries: the frame seq `Issue(D3DISSUE_END)` recorded.
+    ///
+    /// The query reports completion once the GPU has retired that seq. Zero
+    /// until the first `Issue(END)`; zero reads as complete, because a query
+    /// with nothing outstanding is finished by definition.
+    end_seq: AtomicU64,
+}
+
+/// Whether the GPU has retired the frame an EVENT query was issued in.
+///
+/// An application uses an EVENT query as its own fence for recycling dynamic
+/// buffer storage, so reporting completion before the GPU has retired the
+/// frame tells it that memory a queued draw still reads is free to overwrite.
+///
+/// A query issued in the frame still being recorded can only retire once that
+/// frame reaches the GPU, so it is submitted here whatever the caller passed.
+/// See [`mtld3d_core::query_fence::event_needs_submit`] for why that diverges
+/// from the flag's contract.
+fn event_status(inner: &QueryInner) -> i32 {
+    let end_seq = inner.end_seq.load(Ordering::Acquire);
+    if end_seq == 0 {
+        return D3D_OK;
+    }
+
+    // SAFETY: `inner.device_inner` was stamped at `Self::new` from a live
+    // `DeviceInner` and is kept alive by the device.
+    let dev = unsafe { &mut *inner.device_inner };
+    if mtld3d_core::query_fence::event_completed(
+        end_seq,
+        dev.coherent_seq_arc().load(Ordering::Acquire),
+    ) {
+        return D3D_OK;
+    }
+    if mtld3d_core::query_fence::event_needs_submit(end_seq, dev.current_seq()) {
+        // Bracketed like the occlusion flush below, so a title fencing once
+        // per frame shows its stall under `Query`/`Wait for GPU` rather than
+        // disappearing into the frame time.
+        let _wait = mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().query_wait_cycles_ptr());
+        dev.flush_current_frame_blocking();
+        if mtld3d_core::query_fence::event_completed(
+            end_seq,
+            dev.coherent_seq_arc().load(Ordering::Acquire),
+        ) {
+            return D3D_OK;
+        }
+    }
+    S_FALSE
 }
 
 #[inline]
@@ -222,6 +276,15 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let inner = obj.inner();
+    if inner.query_type == D3DQUERYTYPE_EVENT {
+        if flags & D3DISSUE_END != 0 {
+            // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
+            // live `DeviceInner` and is kept alive by the device.
+            let dev = unsafe { &*inner.device_inner };
+            inner.end_seq.store(dev.current_seq(), Ordering::Release);
+        }
+        return D3D_OK;
+    }
     if inner.query_type != D3DQUERYTYPE_OCCLUSION {
         return D3D_OK;
     }
@@ -299,6 +362,20 @@ extern "system" fn query_get_data(
     };
     let inner = obj.inner();
     let has_output = !data.is_null() && size != 0;
+    if inner.query_type == D3DQUERYTYPE_EVENT {
+        let status = event_status(inner);
+        if has_output {
+            // The BOOL is TRUE only once the GPU has retired the issued
+            // frame. A short read takes the low bytes of it rather than
+            // nothing: the runtime fills what the caller asked for.
+            let signalled = u32::from(status == D3D_OK).to_le_bytes();
+            let n = (size as usize).min(signalled.len());
+            // SAFETY: `has_output` guarantees `data` is non-null with at
+            // least `size` writable bytes, and `n <= size`.
+            unsafe { core::ptr::copy_nonoverlapping(signalled.as_ptr(), data.cast::<u8>(), n) };
+        }
+        return status;
+    }
     if !has_output && inner.query_type != D3DQUERYTYPE_OCCLUSION {
         return D3D_OK;
     }
@@ -313,12 +390,6 @@ extern "system" fn query_get_data(
     };
     let wanted = inner.data_size.min(size) as usize;
     match inner.query_type {
-        D3DQUERYTYPE_EVENT if wanted >= 4 => {
-            // BOOL TRUE = event "completed".
-            // SAFETY: vtable out-param; `data` is the typed out-buffer per ABI.
-            unsafe { OutPtr::write_opt(data.cast::<u32>(), 1) };
-            D3D_OK
-        }
         D3DQUERYTYPE_OCCLUSION => {
             // `wanted` (capped at the advertised DWORD) is wrong here: the
             // runtime backs occlusion with a UINT64 and honors partial
@@ -434,9 +505,8 @@ extern "system" fn query_get_data(
                         }
                     }
                     dump_event(&|| format!("Query({this:?}) GetData → S_FALSE, pending"));
-                    // S_FALSE (0x1) — still not ready; caller will
-                    // retry.
-                    1
+                    // Still not ready; caller will retry.
+                    S_FALSE
                 }
                 QueryStatus::Issued => {
                     dump_event(&|| format!("Query({this:?}) GetData → count {}", core.get_u64()));

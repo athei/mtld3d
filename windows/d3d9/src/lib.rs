@@ -46,7 +46,7 @@ use mtld3d_shared::{InitLoggerParams, identity};
 // `use super::{D3D_OK, …}` path stays valid.
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DERR_NOTFOUND, E_FAIL, E_NOINTERFACE,
-    E_NOTIMPL,
+    E_NOTIMPL, S_FALSE,
 };
 
 use crate::{direct3d9::Direct3D9, unix_call::unix_call};
