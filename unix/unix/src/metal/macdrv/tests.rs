@@ -35,9 +35,15 @@
 //! The other half of that path, what a device's teardown retires and what
 //! it leaves alone for the devices still attached, is the attachment
 //! registry's, and lives in `attachment/tests.rs`.
+//!
+//! `MacdrvFuncs::load` is pinned for the one case a test process can
+//! produce: no `macdrv_functions` table in the symbol space, which is every
+//! process that is not Wine's. The table is the only door, so the load
+//! resolves nothing and the attach above it fails rather than reading a
+//! window record through a layout the process does not have.
 
 use super::{
-    KEPT_METAL_VIEWS, LayerMode, MetalViewPark, PresentPacing, ScreenParamsFilterStep,
+    KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MetalViewPark, PresentPacing, ScreenParamsFilterStep,
     backing_scale_change, backing_scale_from, layer_mode_change, layer_mode_for,
     min_present_duration, min_present_duration_change, pack_pacing, screen_params_filter_step,
     unpack_pacing,
@@ -415,4 +421,12 @@ fn a_full_park_displaces_the_oldest_view() {
         "the next oldest stays"
     );
     assert_eq!(park.take_for(0x99), Some((0x9000, 0x20)));
+}
+
+#[test]
+fn a_process_without_the_macdrv_table_loads_nothing() {
+    assert!(
+        MacdrvFuncs::load().is_none(),
+        "a process with no macdrv_functions table resolves no macdrv entry point",
+    );
 }
