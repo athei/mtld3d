@@ -1594,7 +1594,6 @@ extern "system" fn d3d9_create_device(
             render_scale,
             depth_texture: depth_handle,
             depth_has_stencil: depth_format_has_stencil(pp.auto_depth_stencil_format),
-            apply_display_sync_enabled: None,
         }),
         render_states,
         sampler_states: [mtld3d_types::sampler_state_defaults(); STAGE_COUNT],

@@ -8748,7 +8748,9 @@ pub struct FrameData {
     retained_bytes_ptr: u64,
     /// `Some(v)` if `IDirect3DDevice9::Reset` changed `PresentationInterval` since the last frame.
     ///
-    /// The encoder applies it via `SetDisplaySyncEnabledParams` at the top of
+    /// Put here by `stamp_and_swap` on the frame it hands to the encoder, so
+    /// the Present that follows the Reset is the one that carries it. The
+    /// encoder applies it via `SetDisplaySyncEnabledParams` at the top of
     /// `run_frame` so the new vsync state takes effect on this frame's
     /// `nextDrawable`, matching the spec's "next Present" timing rather than
     /// the previous behaviour of mutating the layer property synchronously
@@ -8832,11 +8834,6 @@ pub struct FrameInit {
     /// That format is `Depth32Float_Stencil8`. Drives the clear-quad
     /// pipelines' depth/stencil attachment formats so they match the pass.
     pub depth_has_stencil: bool,
-    /// `Some(v)` from `device_reset` to defer a `PresentationInterval` change.
-    ///
-    /// The change lands on this frame's first `nextDrawable`. `None` for
-    /// normal frames.
-    pub apply_display_sync_enabled: Option<bool>,
 }
 
 impl FrameData {
@@ -8872,7 +8869,7 @@ impl FrameData {
             upload_coherent_seq_ptr: 0,
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
-            apply_display_sync_enabled: init.apply_display_sync_enabled,
+            apply_display_sync_enabled: None,
             scratch: ScratchArena::new(),
             op_vec_realloc_bytes: 0,
         }
@@ -9016,6 +9013,15 @@ impl FrameData {
     /// churn.
     pub const fn op_vec_capacity_bytes(&self) -> u64 {
         (self.ops.capacity() as u64).saturating_mul(size_of::<Op>() as u64)
+    }
+
+    /// Put a Reset's queued `PresentationInterval` change on this frame.
+    ///
+    /// Called from `stamp_and_swap` for the frame being handed to the
+    /// encoder. `None` is the normal case and leaves the frame carrying
+    /// nothing.
+    pub const fn set_apply_display_sync_enabled(&mut self, enabled: Option<bool>) {
+        self.apply_display_sync_enabled = enabled;
     }
 
     /// Drain the per-frame `Vec<Op>` realloc-byte counter into the caller and zero it.

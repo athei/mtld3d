@@ -621,8 +621,9 @@ pub struct DeviceInner {
     recording_state_block: Option<Box<RecordingStateBlock>>,
     /// `Some(v)` if `IDirect3DDevice9::Reset` changed `PresentationInterval` since the last frame.
     ///
-    /// Consumed by `fresh_frame` and applied by the encoder thread on the next
-    /// frame's first `nextDrawable`, matching the spec's "next Present" timing.
+    /// Consumed by `stamp_and_swap` and applied by the encoder thread on the
+    /// first frame sent after the Reset, before that frame's own
+    /// `nextDrawable`, matching the spec's "next Present" timing.
     pending_display_sync_enabled: Option<bool>,
     /// The colour render-target binding most recently applied via `SetRenderTarget`.
     ///
@@ -1400,10 +1401,10 @@ impl DeviceInner {
     /// Build a fresh `FrameData` matching the device's current backbuffer / queue / layer handles.
     ///
     /// Used to seed the replacement frame when swapping at `Present` or at
-    /// `flush_current_frame_blocking`. Takes `&mut self` because a pending
-    /// `PresentationInterval` change from `device_reset` is consumed here so
-    /// the encoder can apply it on the next frame's first `nextDrawable`.
-    pub const fn fresh_frame(&mut self) -> FrameData {
+    /// `flush_current_frame_blocking`. A pending `PresentationInterval` change
+    /// is not put here but on the frame `stamp_and_swap` hands to the encoder,
+    /// so it rides the next submission rather than the one after it.
+    pub const fn fresh_frame(&self) -> FrameData {
         FrameData::new(&FrameInit {
             device_handle: self.device_handle,
             queue_handle: self.queue_handle,
@@ -1423,7 +1424,6 @@ impl DeviceInner {
             render_scale: self.render_scale,
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
-            apply_display_sync_enabled: self.pending_display_sync_enabled.take(),
         })
     }
 
@@ -1434,6 +1434,11 @@ impl DeviceInner {
     /// `flush_current_frame_blocking`.
     fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> (FrameData, u64) {
         let mut frame = core::mem::replace(&mut self.current_frame, new_frame);
+        // A `PresentationInterval` a Reset changed rides the first frame that
+        // leaves the device after it, which is this one: the encoder applies it
+        // before the frame's own `nextDrawable`. Putting it on the replacement
+        // instead would hold it back until the Present after the next one.
+        frame.set_apply_display_sync_enabled(self.pending_display_sync_enabled.take());
         // An F12 run ends with the frame the closing `Present` submits. A
         // mid-frame flush sends the marked frame out early, so its stop mark
         // moves onto the continuation; the start mark stays with the first
@@ -2393,9 +2398,9 @@ impl DeviceInner {
 
     /// Queue a `PresentationInterval` change for the next frame's first `nextDrawable`.
     ///
-    /// Drained by `fresh_frame`. Spec-compliant timing — a synchronous
-    /// layer-property write from the API thread races the encoder's
-    /// in-flight submission.
+    /// Drained by `stamp_and_swap` onto the frame it hands over, which is the
+    /// spec-compliant timing: a synchronous layer-property write from the API
+    /// thread races the encoder's in-flight submission.
     pub const fn queue_display_sync_change(&mut self, enabled: bool) {
         self.pending_display_sync_enabled = Some(enabled);
     }
@@ -4053,10 +4058,10 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // and the window subclass both live on the window the device attached, so
     // they move across before anything is recreated against the new one.
     if retargeted {
-        // A pending change not yet stamped onto a frame would otherwise ride
-        // the old-layer continuation built by the retarget flush, then reach
-        // the encoder after that layer's attachment record is retired. The
-        // fresh attach below receives this Reset's pacing directly.
+        // A pending change from an earlier Reset would otherwise ride the
+        // frame the retarget flush below sends, which still names the layer
+        // the device is leaving. The fresh attach receives this Reset's
+        // pacing directly.
         dev.pending_display_sync_enabled = None;
         retarget_device_window(dev, &pp, target_window);
     }

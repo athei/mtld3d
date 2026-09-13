@@ -996,31 +996,128 @@ fn reset_clears_scene_state() {
     );
 }
 
+/// The name the workload child of `reset_flips_the_presentation_interval` runs under.
+const PACING_CHILD_NAME: &str = "presentation-interval.exe";
+
 #[test]
 fn reset_flips_the_presentation_interval() {
+    let exe = std::env::current_exe().expect("resolve test executable");
+    if exe
+        .file_name()
+        .is_some_and(|name| name == PACING_CHILD_NAME)
+    {
+        presentation_interval_workload();
+        return;
+    }
+    let _factory = Harness::factory_only();
+    // Which Present carried the pacing is read out of the process log, and
+    // every Reset of every test running beside this one writes a line of its
+    // own into the suite's. The workload therefore runs in a process of its
+    // own, alone in its log directory, so the lines there are its device's.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock follows Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "presentation-interval-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).expect("create private pacing directory");
+    let child = dir.join(PACING_CHILD_NAME);
+    std::fs::copy(&exe, &child).expect("copy pacing workload executable");
+    let output = std::process::Command::new(&child)
+        .args([
+            "--exact",
+            "device::reset_flips_the_presentation_interval",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run pacing workload child");
+    assert!(
+        output.status.success(),
+        "pacing workload child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(&dir).expect("remove private pacing directory");
+}
+
+/// Flip `PresentationInterval` twice, one Present after each Reset.
+///
+/// A Reset queues the new pacing, and the first Present after it is the one
+/// that carries it to the layer, which re-derives the present throttle off
+/// the panel's cadence. Nothing but that Present submits a frame here, so a
+/// pacing that rode the frame after it would leave the log short.
+fn presentation_interval_workload() {
     let h = Harness::new();
     assert_eq!(
         h.present(),
         D3D_OK,
         "a present at the interval the device was created with"
     );
-    // A Reset queues the new pacing for the frames that follow it, and the
-    // presents after each one carry it to the layer, which re-derives the
-    // present throttle off the panel's cadence and back onto it. Several
-    // presents rather than one, so the frame that carries the pacing is sent
-    // and the device outlives the re-derivation it queues.
     let mut pp = windowed_params(h.hwnd(), 640, 480);
     pp.presentation_interval = D3DPRESENT_INTERVAL_IMMEDIATE;
     assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to IMMEDIATE");
-    for _ in 0..8 {
-        assert_eq!(h.present(), D3D_OK, "a present of the free run");
-    }
+    assert_eq!(h.present(), D3D_OK, "the present that carries IMMEDIATE");
+    await_pacing(&["off"]);
     let mut pp = windowed_params(h.hwnd(), 640, 480);
     pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
     assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
-    for _ in 0..8 {
-        assert_eq!(h.present(), D3D_OK, "a present at the display rate");
+    assert_eq!(h.present(), D3D_OK, "the present that carries ONE");
+    await_pacing(&["off", "on"]);
+}
+
+/// Wait until the process log carries exactly `expected`, oldest line first.
+///
+/// The encoder thread is what sends the pacing across, so the line lands a
+/// moment after the Present that carried it returns. Nothing else in the
+/// workload submits a frame, so a run that never reaches `expected` has left
+/// the pacing on a frame that was not sent.
+fn await_pacing(expected: &[&str]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logged = logged_pacing();
+        if logged == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the layer was re-paced {logged:?}, expected {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The vsync state of every re-pacing this process has logged, oldest first.
+///
+/// The log is the one the layer writes beside the executable, which for the
+/// workload child holds its device's lines and nobody else's.
+fn logged_pacing() -> Vec<String> {
+    let exe = std::env::current_exe().expect("resolve test executable");
+    let logs = exe
+        .parent()
+        .expect("the executable sits in a directory")
+        .join("mtld3d-logs");
+    let Ok(entries) = std::fs::read_dir(&logs) else {
+        // The directory appears with the first line the layer writes.
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .map(|entry| entry.expect("read a log directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .collect();
+    assert!(
+        files.len() <= 1,
+        "one process log beside the child: {files:?}"
+    );
+    let Some(log) = files.pop() else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(&log).expect("read the process log");
+    text.lines()
+        .filter_map(|line| line.split_once("re-paced (vsync "))
+        .filter_map(|(_, rest)| rest.split(',').next())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A full-target quad whose texture coordinates address a cube's +X face.
