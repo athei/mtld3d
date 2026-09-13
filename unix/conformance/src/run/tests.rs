@@ -12,7 +12,10 @@
 //! raw log has to end with how the process ended, since a run without the
 //! framework's summary is a crash whose shape only that line tells, and the
 //! process has to be handed a `log.dir` beside its raw output so its log file
-//! reaches whoever reads the raw dir.
+//! reaches whoever reads the raw dir. A process that runs out of its budget
+//! has to be sampled before the kill, with the sample kept beside the raw log
+//! and named on its `TIMED OUT` line: the kill leaves no other account of
+//! where the process was.
 
 use std::{
     fs,
@@ -21,7 +24,7 @@ use std::{
 };
 
 use super::{
-    Launch, is_gpu_hang_line, normalize_numbers, run_subtest, validation_errors,
+    DEFAULT_TIMEOUT, Launch, is_gpu_hang_line, normalize_numbers, run_subtest, validation_errors,
     validation_gate_failed,
 };
 use crate::model::{Arch, Gpu, Leg, Subtest, Variant};
@@ -147,6 +150,7 @@ fn launch(exe: PathBuf) -> Launch {
         exe,
         log: "off".to_owned(),
         raw_dir: None,
+        timeout: DEFAULT_TIMEOUT,
     }
 }
 
@@ -244,6 +248,32 @@ fn a_run_ended_by_a_signal_records_the_number_and_is_a_crash() {
         raw.trim_end()
             .ends_with("[conformance] subtest exited: signal 11"),
         "{raw}"
+    );
+}
+
+#[test]
+fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
+    let exe = script("budget", "echo 'device.c:10: Test failed: x'\nsleep 30\n");
+    let launch = Launch {
+        timeout: Duration::from_secs(1),
+        ..launch_kept(exe)
+    };
+    let dir = launch.raw_dir.clone().expect("kept");
+    let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
+    assert!(run.result.crash, "a process killed at its budget is a hang");
+
+    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    let trailer = raw.trim_end().lines().last().expect("trailer");
+    assert!(
+        trailer.starts_with("[conformance] subtest TIMED OUT after 1s and was killed")
+            && trailer.ends_with("i686-device.sample.txt"),
+        "{trailer}"
+    );
+    let sample = fs::read_to_string(dir.join("i686-device.sample.txt"))
+        .expect("sample kept beside the raw log");
+    assert!(
+        sample.contains("Call graph:"),
+        "the sample holds no stacks of the process: {sample}"
     );
 }
 

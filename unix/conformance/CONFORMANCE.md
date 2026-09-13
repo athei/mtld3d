@@ -71,7 +71,12 @@ a bug), but the leg has to run again for its counts either way.
 A raw log is stdout followed by stderr, and ends with how the process ended:
 `[conformance] subtest exited: code N` or `signal N` (a number, never a name,
 so a fault the process survived cannot read as a crash to the scanner), or the
-`TIMED OUT` line when the runner killed it. A run without the framework's
+`TIMED OUT` line when the runner killed it. A process the runner kills for its
+budget is sampled first (`sample <pid> 2`, every thread's stack), and the
+sample is kept beside the raw log as `<leg>-<subtest>.sample.txt`, named on
+that line; without a raw directory the sample goes to the runner's stderr.
+It is the one account of where a hang was: the raw log of a process parked in
+a syscall ends in that line and nothing else. A run without the framework's
 `tests executed` summary is a crash whatever else it holds, and this line is
 what tells an unhandled Win32 exception (Wine ends the process with the
 exception code, of which unix keeps the low byte: `code 5` is an access

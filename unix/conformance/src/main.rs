@@ -66,6 +66,7 @@ fn real_main() -> Result<ExitCode, String> {
         exe: config.exe,
         log: config.log,
         raw_dir,
+        timeout: run::timeout_from_env(),
     };
     let leg = Leg {
         arch: config.arch,
