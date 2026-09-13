@@ -1389,12 +1389,7 @@ extern "system" fn d3d9_create_device(
             "reject CreateDevice({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
-        destroy_partial_device(
-            &cq_params,
-            MetalHandle::NULL,
-            MetalHandle::NULL,
-            MetalHandle::NULL,
-        );
+        destroy_partial_device(&cq_params, MetalHandle::NULL, None);
         return D3DERR_INVALIDCALL;
     }
 
@@ -1437,12 +1432,7 @@ extern "system" fn d3d9_create_device(
             "reject CreateDevice — zero backbuffer dims (windowed={}, hwnd=0x{hwnd:x})",
             pp.windowed,
         );
-        destroy_partial_device(
-            &cq_params,
-            layer_params.view_handle,
-            MetalHandle::NULL,
-            MetalHandle::NULL,
-        );
+        destroy_partial_device(&cq_params, layer_params.view_handle, None);
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
@@ -1491,12 +1481,7 @@ extern "system" fn d3d9_create_device(
                     "not available on this device"
                 },
             );
-            destroy_partial_device(
-                &cq_params,
-                layer_params.view_handle,
-                MetalHandle::NULL,
-                MetalHandle::NULL,
-            );
+            destroy_partial_device(&cq_params, layer_params.view_handle, None);
             restore_from_fullscreen(fullscreen.as_ref());
             return D3DERR_INVALIDCALL;
         }
@@ -1527,12 +1512,7 @@ extern "system" fn d3d9_create_device(
             bb_params.sample_count,
             pp.back_buffer_format,
         );
-        destroy_partial_device(
-            &cq_params,
-            layer_params.view_handle,
-            MetalHandle::NULL,
-            MetalHandle::NULL,
-        );
+        destroy_partial_device(&cq_params, layer_params.view_handle, None);
         restore_from_fullscreen(fullscreen.as_ref());
         return D3DERR_INVALIDCALL;
     }
@@ -1853,22 +1833,34 @@ fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
 /// Tear down the partial device handles assembled so far.
 ///
 /// Called on any failure between `CreateCommandQueue` and the final
-/// `Box::into_raw`. `view_handle` / `backbuffer_handle` /
-/// `backbuffer_msaa_handle` are `MetalHandle::NULL` when the failure happens
-/// before that object was created.
+/// `Box::into_raw`. `view_handle` is `MetalHandle::NULL` when the failure
+/// happens before the layer is attached, and `backbuffer` is `None` when it
+/// happens before `CreateBackbuffer` answered. Only the base texture has a
+/// slot on the queue-destroy thunk, so the two sRGB twin views and the
+/// multisampled companion leave through a bulk release ahead of it, the twins
+/// first: each holds a retain on the texture released after it.
 fn destroy_partial_device(
     cq: &CreateCommandQueueParams,
     view_handle: MetalHandle<NSViewKind>,
-    backbuffer_handle: MetalHandle<MTLTextureKind>,
-    backbuffer_msaa_handle: MetalHandle<MTLTextureKind>,
+    backbuffer: Option<&CreateBackbufferParams>,
 ) {
-    if !backbuffer_msaa_handle.is_null() {
-        let handles = [backbuffer_msaa_handle.raw()];
+    let implicit_handles: Vec<u64> = backbuffer
+        .into_iter()
+        .flat_map(|bb| {
+            [
+                bb.srgb_texture_handle.raw(),
+                bb.msaa_srgb_texture_handle.raw(),
+                bb.msaa_texture_handle.raw(),
+            ]
+        })
+        .filter(|&handle| handle != 0)
+        .collect();
+    if !implicit_handles.is_empty() {
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
             pad0: 0,
-            handles_ptr: handles.as_ptr() as u64,
-            count: 1,
+            handles_ptr: implicit_handles.as_ptr() as u64,
+            count: u32::try_from(implicit_handles.len()).expect("at most 3 handles"),
             pad1: 0,
         };
         unix_call(&mut destroy);
@@ -1877,7 +1869,7 @@ fn destroy_partial_device(
         device_handle: cq.device_handle,
         queue_handle: cq.queue_handle,
         view_handle,
-        backbuffer_handle,
+        backbuffer_handle: backbuffer.map_or(MetalHandle::NULL, |bb| bb.texture_handle),
         pipeline_handle: MetalHandle::NULL,
         depth_texture_handle: MetalHandle::NULL,
     };
@@ -1905,12 +1897,7 @@ fn create_auto_depth_stencil(
             "auto depth-stencil format {} has no Metal mapping",
             pp.auto_depth_stencil_format
         );
-        destroy_partial_device(
-            cq_params,
-            layer_params.view_handle,
-            bb_params.texture_handle,
-            bb_params.msaa_texture_handle,
-        );
+        destroy_partial_device(cq_params, layer_params.view_handle, Some(bb_params));
         return Err(D3DERR_INVALIDCALL);
     };
     // Sized from the back buffer rather than the present params: the depth
@@ -1929,12 +1916,7 @@ fn create_auto_depth_stencil(
     let status = unix_call(&mut ds_params);
     if status != 0 {
         error!(target: LOG_TARGET, "CreateDepthTexture failed (0x{status:08X})");
-        destroy_partial_device(
-            cq_params,
-            layer_params.view_handle,
-            bb_params.texture_handle,
-            bb_params.msaa_texture_handle,
-        );
+        destroy_partial_device(cq_params, layer_params.view_handle, Some(bb_params));
         return Err(D3DERR_INVALIDCALL);
     }
     info!(

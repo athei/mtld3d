@@ -3477,14 +3477,16 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             pipeline_handle: MetalHandle::NULL, // pipelines managed by encoder cache
             depth_texture_handle: device_inner.depth_stencil_handle,
         };
-        // Neither the back buffer's sRGB twin view nor its multisampled
-        // companion has a slot on the destroy thunk; both go out with the bulk
-        // release, issued below once the encoder shutdown has waited for the
-        // GPU, so a frame the encoder or the submit thread still holds keeps
-        // naming live textures. The twin is listed first: it holds a retain on
-        // the base texture the thunk then releases.
+        // Neither the back buffer's sRGB twin view, nor its multisampled
+        // companion, nor that companion's own twin has a slot on the destroy
+        // thunk; all three go out with the bulk release, issued below once the
+        // encoder shutdown has waited for the GPU, so a frame the encoder or
+        // the submit thread still holds keeps naming live textures. The twins
+        // are listed first: each holds a retain on the texture released after
+        // it.
         let implicit_handles: Vec<u64> = [
             device_inner.backbuffer_srgb_handle.raw(),
+            device_inner.backbuffer_msaa_srgb_handle.raw(),
             device_inner.backbuffer_msaa_handle.raw(),
         ]
         .into_iter()
@@ -3554,7 +3556,7 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
                 pad0: 0,
                 handles_ptr: implicit_handles.as_ptr() as u64,
-                count: u32::try_from(implicit_handles.len()).expect("at most 2 handles"),
+                count: u32::try_from(implicit_handles.len()).expect("at most 3 handles"),
                 pad1: 0,
             };
             unix_call(&mut destroy);
