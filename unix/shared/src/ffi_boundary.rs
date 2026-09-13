@@ -260,9 +260,6 @@ impl<T> DerefMut for VtableThis<'_, T> {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 /// A caller's array as a slice, copied when its pointer is not aligned for `T`.
 ///
 /// A COM in-parameter that the callee copies carries no alignment promise: the
@@ -273,7 +270,13 @@ mod tests;
 ///
 /// # Safety
 ///
-/// `data` is non-null and `count * size_of::<T>()` bytes are readable from it.
+/// `data` must be non-null. It must address `count` initialized, valid `T`
+/// values in one allocation; alignment is not required. The total byte size
+/// must fit in `isize::MAX`, and adding it to `data` must not wrap the address.
+/// The values must remain readable and unmodified for the returned lifetime
+/// `'a`, except through `UnsafeCell`, since the aligned path borrows them.
+/// These requirements also apply to references or other invariants within `T`;
+/// `Copy` alone does not make arbitrary bytes valid values.
 pub unsafe fn slice_from_caller<'a, T: Copy>(data: *const T, count: usize) -> Cow<'a, [T]> {
     if data.is_aligned() {
         // SAFETY: aligned per the branch, and the caller guarantees the extent.
@@ -294,3 +297,6 @@ pub unsafe fn slice_from_caller<'a, T: Copy>(data: *const T, count: usize) -> Co
     unsafe { owned.set_len(count) };
     Cow::Owned(owned)
 }
+
+#[cfg(test)]
+mod tests;

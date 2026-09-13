@@ -2055,3 +2055,130 @@ fn a_pixel_shader_constant_upload_takes_an_unaligned_pointer() {
         "the register file holds what the unaligned call sent",
     );
 }
+
+/// Unaligned integer/boolean uploads consume only the remaining register window.
+#[test]
+fn unaligned_integer_and_boolean_constants_clamp_before_reading() {
+    let h = Harness::new();
+    let setters = [
+        (
+            Harness::set_vertex_shader_constant_i_raw
+                as unsafe fn(&Harness, u32, *const i32, u32) -> i32,
+            Harness::get_vertex_shader_constant_i as fn(&Harness, u32, u32) -> (i32, Vec<i32>),
+            4,
+        ),
+        (
+            Harness::set_pixel_shader_constant_i_raw,
+            Harness::get_pixel_shader_constant_i,
+            4,
+        ),
+        (
+            Harness::set_vertex_shader_constant_b_raw,
+            Harness::get_vertex_shader_constant_b,
+            1,
+        ),
+        (
+            Harness::set_pixel_shader_constant_b_raw,
+            Harness::get_pixel_shader_constant_b,
+            1,
+        ),
+    ];
+    for (set, get, width) in setters {
+        for offset in 1..4 {
+            for recording in [false, true] {
+                let want = [1_i32, -7, i32::MIN, i32::MAX];
+                let mut storage = [0_i32; 5];
+                // SAFETY: offsets 1..=3 leave room for the 16-byte row.
+                let input = unsafe { storage.as_mut_ptr().byte_add(offset) };
+                // SAFETY: the separate destination holds all four initialized words.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        want.as_ptr().cast::<u8>(),
+                        input.cast::<u8>(),
+                        size_of_val(&want),
+                    );
+                }
+                if recording {
+                    assert_eq!(h.begin_state_block(), 0);
+                }
+                // SAFETY: start 15 leaves one register, whose initialized bytes
+                // remain readable and unmodified for the call despite the huge count.
+                assert_eq!(unsafe { set(&h, 15, input, u32::MAX) }, 0);
+                storage.fill(0);
+                if recording {
+                    let block = h.end_state_block();
+                    // SAFETY: the aligned storage contains one zeroed register.
+                    assert_eq!(unsafe { set(&h, 15, storage.as_ptr(), 1) }, 0);
+                    assert_eq!(block.apply(), 0);
+                }
+                let (hr, got) = get(&h, 15, 1);
+                assert_eq!(hr, 0);
+                assert_eq!(got, want[..width], "offset {offset}, recording {recording}");
+            }
+        }
+    }
+}
+
+/// Both float setters and state blocks own the values of an unaligned upload.
+#[test]
+fn unaligned_float_constants_survive_caller_overwrite() {
+    let h = Harness::new();
+    let setters = [
+        (
+            Harness::set_vertex_shader_constant_f_raw
+                as unsafe fn(&Harness, u32, *const f32, u32) -> i32,
+            Harness::get_vertex_shader_constant_f as fn(&Harness, u32, u32) -> (i32, Vec<f32>),
+            254,
+        ),
+        (
+            Harness::set_pixel_shader_constant_f_raw,
+            Harness::get_pixel_shader_constant_f,
+            222,
+        ),
+    ];
+    for (set, get, start) in setters {
+        for offset in 1..4 {
+            for recording in [false, true] {
+                let want = [
+                    1.0_f32,
+                    -0.0,
+                    f32::from_bits(0x7fc0_0123),
+                    f32::INFINITY,
+                    -3.0,
+                    0.0,
+                    f32::NEG_INFINITY,
+                    f32::from_bits(1),
+                ];
+                let mut storage = [0.0_f32; 9];
+                // SAFETY: offsets 1..=3 leave room for the two 16-byte rows.
+                let input = unsafe { storage.as_mut_ptr().byte_add(offset) };
+                // SAFETY: distinct storage has space for all initialized source bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        want.as_ptr().cast::<u8>(),
+                        input.cast::<u8>(),
+                        size_of_val(&want),
+                    );
+                }
+                if recording {
+                    assert_eq!(h.begin_state_block(), 0);
+                }
+                // SAFETY: input holds the initialized two rows through this call.
+                assert_eq!(unsafe { set(&h, start, input, 2) }, 0);
+                storage.fill(0.0);
+                if recording {
+                    let block = h.end_state_block();
+                    // SAFETY: the aligned storage contains two zeroed registers.
+                    assert_eq!(unsafe { set(&h, start, storage.as_ptr(), 2) }, 0);
+                    assert_eq!(block.apply(), 0);
+                }
+                let (hr, got) = get(&h, start, 2);
+                assert_eq!(hr, 0);
+                assert_eq!(
+                    got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    want.map(f32::to_bits)
+                );
+            }
+        }
+    }
+}

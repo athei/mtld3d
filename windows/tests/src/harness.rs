@@ -1701,7 +1701,8 @@ impl Harness {
     ///
     /// # Safety
     ///
-    /// `data` is readable for `count * 4` `f32`s.
+    /// `data` must hold `count * 4` initialized floats in one allocation,
+    /// readable and unmodified throughout the call.
     pub unsafe fn set_pixel_shader_constant_f_raw(
         &self,
         start: u32,
@@ -1710,6 +1711,90 @@ impl Harness {
     ) -> i32 {
         // SAFETY: vtable thunk; the caller guarantees the extent.
         unsafe { (self.dev_vtbl().set_pixel_shader_constant_f)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantF` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// `data` must hold `count * 4` initialized floats in one allocation,
+    /// readable and unmodified throughout the call.
+    pub unsafe fn set_vertex_shader_constant_f_raw(
+        &self,
+        start: u32,
+        data: *const f32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_f)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantI` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start) * 4`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_vertex_shader_constant_i_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_i)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantB` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start)`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_vertex_shader_constant_b_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_b)(self.device, start, data, count) }
+    }
+
+    /// `SetPixelShaderConstantI` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start) * 4`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_pixel_shader_constant_i_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_i)(self.device, start, data, count) }
+    }
+
+    /// `SetPixelShaderConstantB` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start)`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_pixel_shader_constant_b_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_b)(self.device, start, data, count) }
     }
 
     /// `SetVertexShaderConstantI` (each register is 4 ints).
