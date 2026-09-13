@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 version = "0.9.0"
 license = "Zlib"
 description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"

@@ -25,8 +25,8 @@ pub fn build_ps_draw_bytes(scale: RenderScale) -> [u8; PS_DRAW_BYTES] {
     let per_render_pixel = 1.0 / scale.factor();
     let lanes = [per_render_pixel, per_render_pixel, 0.0, 0.0];
     let mut out = [0u8; PS_DRAW_BYTES];
-    for (chunk, lane) in out.chunks_exact_mut(4).zip(lanes) {
-        chunk.copy_from_slice(&lane.to_le_bytes());
+    for (chunk, lane) in out.as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
+        *chunk = lane.to_le_bytes();
     }
     out
 }

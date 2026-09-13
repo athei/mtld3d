@@ -181,7 +181,7 @@ const LUMA_ROUNDING_HALF: u32 = LUMA_WEIGHT_TOTAL / 2;
 /// widened to 8 bits by bit replication. An X format's alpha reads as opaque,
 /// `L8` replicates its luminance across RGB, and `A8` carries no colour, so
 /// its RGB reads as black. `px` is at least `rgb_bpp` long.
-fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
+const fn decode_rgb_pixel(d3d_format: u32, px: &[u8]) -> (u8, u8, u8, u8) {
     match d3d_format {
         D3DFMT_R5G6B5 => {
             let v = u16::from_le_bytes([px[0], px[1]]);

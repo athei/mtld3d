@@ -3,8 +3,8 @@ use crate::render_scale::RenderScale;
 
 fn lanes(bytes: &[u8; PS_DRAW_BYTES]) -> [f32; 4] {
     let mut out = [0.0f32; 4];
-    for (lane, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-        *lane = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (lane, chunk) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *lane = f32::from_le_bytes(*chunk);
     }
     out
 }

@@ -2036,8 +2036,8 @@ fn u32_to_u8_vec(src: &[u32]) -> Vec<u8> {
 /// Inverse of `u32_to_u8_vec` — read 4-byte chunks back into BGRA `u32`s.
 fn u8_to_u32_vec(src: &[u8]) -> Vec<u32> {
     let mut out = Vec::with_capacity(src.len() / 4);
-    for chunk in src.chunks_exact(4) {
-        out.push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in src.as_chunks::<4>().0 {
+        out.push(u32::from_ne_bytes(*chunk));
     }
     out
 }

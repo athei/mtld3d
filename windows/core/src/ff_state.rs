@@ -1638,7 +1638,7 @@ impl FfState {
         // SAFETY: see `build_xyzrhw_row`.
         let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
             unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
-        for (s, chunk) in dst.chunks_exact_mut(4).enumerate() {
+        for (s, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let m_t = Self::transpose(&self.texture_transforms[s]);
             write_matrix_rows(chunk, &m_t);
         }
@@ -1670,7 +1670,7 @@ impl FfState {
         // SAFETY: see `build_xyzrhw_row`.
         let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
             unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
-        for (bone, chunk) in dst.chunks_exact_mut(4).enumerate() {
+        for (bone, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let bone_view_t =
                 Self::transpose(&Self::mat_mul(&self.world_palette[bone], &self.view));
             write_matrix_rows(chunk, &bone_view_t);
@@ -1688,8 +1688,8 @@ impl FfState {
     pub fn build_ps_constants(&self, render_states: &[u32; RENDER_STATE_COUNT]) -> [u8; 16] {
         let tfactor = d3dcolor_to_rgba(render_states[D3DRS_TEXTUREFACTOR as usize]);
         let mut bytes = [0u8; 16];
-        for (chunk, v) in bytes.chunks_exact_mut(4).zip(tfactor) {
-            chunk.copy_from_slice(&v.to_le_bytes());
+        for (chunk, v) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(tfactor) {
+            *chunk = v.to_le_bytes();
         }
         bytes
     }
@@ -1714,17 +1714,17 @@ pub fn build_fog_color_bytes(
         return (bytes, 0);
     }
     let fog_color = d3dcolor_to_rgba(render_states[D3DRS_FOGCOLOR as usize]);
-    for (chunk, v) in bytes.chunks_exact_mut(4).zip(fog_color) {
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for (chunk, v) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(fog_color) {
+        *chunk = v.to_le_bytes();
     }
-    for (chunk, rs) in bytes[16..].chunks_exact_mut(4).zip([
+    for (chunk, rs) in bytes[16..].as_chunks_mut::<4>().0.iter_mut().zip([
         D3DRS_FOGSTART,
         D3DRS_FOGEND,
         D3DRS_FOGDENSITY,
         D3DRS_DEPTHBIAS,
     ]) {
         // Float render states store raw f32 bits in the u32 slot.
-        chunk.copy_from_slice(&render_states[rs as usize].to_le_bytes());
+        *chunk = render_states[rs as usize].to_le_bytes();
     }
     (bytes, 32)
 }
