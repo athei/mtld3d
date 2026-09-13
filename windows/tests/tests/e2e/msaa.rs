@@ -16,9 +16,9 @@ use mtld3d_types::{
     D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
     D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
     D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK, D3DRS_POINTSIZE, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
+    D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK, D3DRS_POINTSIZE, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE,
+    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
 };
 
 /// Edge of the standalone render targets, small enough to keep the readback cheap.
@@ -450,6 +450,82 @@ fn multisampled_back_buffer_presents_a_resolved_edge() {
         count_intermediate(&row) > 0,
         "the presented back buffer carries the resolved edge"
     );
+}
+
+/// A multisampled device released after an sRGB-write present tears down whole.
+///
+/// A multisampled swap chain carries four implicit colour textures: the
+/// single-sampled base, the multisampled companion the passes render into,
+/// and an sRGB twin view of each, which `D3DRS_SRGBWRITEENABLE` makes the
+/// attachments the frame names. Only the base has a slot on the queue-destroy
+/// thunk, so the other three leave through the bulk release the teardown
+/// issues behind the encoder's GPU-idle wait, the twins ahead of the
+/// companion each holds a retain on. Each round takes a device of its own,
+/// presents `D3DRS_SRGBWRITEENABLE` frames through it, reads the resolved
+/// image back and releases the device, so the teardown runs on a swap chain
+/// whose four textures have all been the attachments of a retired frame.
+///
+/// What this pins: the rounds run to completion, every call answers `D3D_OK`,
+/// the resolved edge comes back, the release reaches a zero refcount, and the
+/// process the suite shares is still alive afterwards. What it cannot pin: a
+/// texture the teardown never releases is a leak the process carries
+/// silently, so the destroy of all four is read from the layer's log
+/// (`RUST_LOG=mtld3d=warn,mtld3d::unix=debug` names every handle at its
+/// create and at its bulk destroy), not from an assertion here.
+#[test]
+fn a_multisampled_device_releases_after_an_srgb_write_present() {
+    const ROUNDS: u32 = 6;
+    const FRAMES: u32 = 2;
+
+    for round in 0..ROUNDS {
+        let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
+        let (width_f, height_f) = back_buffer_extent(&h);
+        arm(&h);
+        assert_eq!(
+            h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+            0,
+            "sRGB write on (round {round})"
+        );
+        for frame in 0..FRAMES {
+            // Not `render_once`: each round's window posts `WM_QUIT` to the
+            // thread queue as it is destroyed, which the pump inside it reads
+            // as the end of the run. Nothing here needs a pumped queue.
+            assert_eq!(
+                h.begin_scene(),
+                0,
+                "BeginScene (round {round} frame {frame})"
+            );
+            assert_eq!(
+                h.clear_target(BLACK),
+                0,
+                "Clear (round {round} frame {frame})"
+            );
+            assert_eq!(
+                h.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    1,
+                    &diagonal(width_f, height_f, 0.5, WHITE)
+                ),
+                0,
+                "DrawPrimitiveUP (round {round} frame {frame})",
+            );
+            assert_eq!(h.end_scene(), 0, "EndScene (round {round} frame {frame})");
+            assert_eq!(h.present(), 0, "Present (round {round} frame {frame})");
+        }
+        // The readback retires the frames before the release, so what the
+        // round exercises is the teardown of a multisampled swap chain rather
+        // than the release of a frame still in flight.
+        let row = back_buffer_row(&h);
+        assert!(
+            count_intermediate(&row) > 0,
+            "the presented back buffer carries the resolved edge (round {round})"
+        );
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the device is fully released (round {round})"
+        );
+    }
 }
 
 #[test]
