@@ -27,6 +27,7 @@ use core::{
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
+use std::borrow::Cow;
 
 /// Borrowed input pointer at an FFI entry. Filters null via `opt`.
 ///
@@ -257,6 +258,44 @@ impl<T> DerefMut for VtableThis<'_, T> {
         // SAFETY: invariant carried from construction.
         unsafe { self.0.as_mut() }
     }
+}
+
+/// A caller's array as a slice, copied when its pointer is not aligned for `T`.
+///
+/// A COM in-parameter that the callee copies carries no alignment promise: the
+/// D3D9 runtime takes these arrays by `memcpy`, so a caller handing over a
+/// pointer that is not aligned for `T` is inside the contract while a typed
+/// slice over it is not. Alignment holds for all but the rare call, so the
+/// common path borrows and only the other copies.
+///
+/// # Safety
+///
+/// `data` must be non-null. It must address `count` initialized, valid `T`
+/// values in one allocation; alignment is not required. The total byte size
+/// must fit in `isize::MAX`, and adding it to `data` must not wrap the address.
+/// The values must remain readable and unmodified for the returned lifetime
+/// `'a`, except through `UnsafeCell`, since the aligned path borrows them.
+/// These requirements also apply to references or other invariants within `T`;
+/// `Copy` alone does not make arbitrary bytes valid values.
+pub unsafe fn slice_from_caller<'a, T: Copy>(data: *const T, count: usize) -> Cow<'a, [T]> {
+    if data.is_aligned() {
+        // SAFETY: aligned per the branch, and the caller guarantees the extent.
+        return Cow::Borrowed(unsafe { core::slice::from_raw_parts(data, count) });
+    }
+    let mut owned = Vec::<T>::with_capacity(count);
+    // SAFETY: the regions cannot overlap (one is a fresh allocation), `owned`
+    // has capacity for `count` `T`s, and `copy_nonoverlapping` over bytes has
+    // no alignment requirement on either side.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.cast::<u8>(),
+            owned.as_mut_ptr().cast::<u8>(),
+            count * size_of::<T>(),
+        );
+    }
+    // SAFETY: the copy above initialised `count` elements.
+    unsafe { owned.set_len(count) };
+    Cow::Owned(owned)
 }
 
 #[cfg(test)]

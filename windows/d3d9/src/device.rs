@@ -98,7 +98,10 @@ use super::{
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
     pixel_shader::Direct3DPixelShader9,
-    shader_bindings::{CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT, ShaderBindings},
+    shader_bindings::{
+        BOOL_CONSTANT_COUNT, CONSTANT_ROWS, INT_CONSTANT_ROWS, PS_FLOAT_CONSTANT_LIMIT,
+        ShaderBindings,
+    },
     stage_bindings::{STAGE_COUNT, StageBindings, TextureSwapDelta},
     state_block::{RecordingStateBlock, StateOp},
     surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample, SystemMemoryDst},
@@ -12470,10 +12473,13 @@ extern "system" fn device_set_vertex_shader_constant_f(
     };
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked
-    // above); per the D3D9 ABI the caller guarantees `count * 4` `f32`s
-    // are readable from `constant_data`.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[f32; 4]>(), count as usize) };
+    // above); per the D3D9 ABI the caller guarantees the bounded floats
+    // are initialized and readable without mutation in one allocation for
+    // this call. The byte size fits `isize::MAX`; all `f32` bits are valid.
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[f32; 4]>(), count as usize)
+    };
+    let slice: &[[f32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantF {
             start: start_register,
@@ -12574,10 +12580,16 @@ extern "system" fn device_set_vertex_shader_constant_i(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are readable.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[i32; 4]>(), count as usize) };
+    // The register mirror clamps oversized writes; bound the caller copy
+    // to the same window before an unaligned input can allocate.
+    let count = (count as usize).min(INT_CONSTANT_ROWS.saturating_sub(start_register as usize));
+    // SAFETY: `constant_data` is non-null and `count` is bounded above;
+    // per the D3D9 ABI, the bounded rows are initialized and readable
+    // without mutation in one allocation for this call. The byte size
+    // fits `isize::MAX`, and all `i32` bit patterns are valid.
+    let constants =
+        unsafe { mtld3d_shared::slice_from_caller(constant_data.cast::<[i32; 4]>(), count) };
+    let slice: &[[i32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantI {
             start: start_register,
@@ -12638,9 +12650,15 @@ extern "system" fn device_set_vertex_shader_constant_b(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
-    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are readable.
-    let slice = unsafe { core::slice::from_raw_parts(constant_data, count as usize) };
+    // The register mirror clamps oversized writes; bound the caller copy
+    // to the same window before an unaligned input can allocate.
+    let count = (count as usize).min(BOOL_CONSTANT_COUNT.saturating_sub(start_register as usize));
+    // SAFETY: `constant_data` is non-null and `count` is bounded above;
+    // per the D3D9 ABI, the bounded BOOLs are initialized and readable
+    // without mutation in one allocation for this call. The byte size
+    // fits `isize::MAX`, and all `i32` bit patterns are valid.
+    let constants = unsafe { mtld3d_shared::slice_from_caller(constant_data, count) };
+    let slice = &*constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::VertexShaderConstantB {
             start: start_register,
@@ -13038,10 +13056,13 @@ extern "system" fn device_set_pixel_shader_constant_f(
     };
     let dev = obj.inner();
     // SAFETY: `constant_data` is non-null and `count != 0` (checked
-    // above); per the D3D9 ABI the caller guarantees `count * 4` `f32`s
-    // are readable from `constant_data`.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[f32; 4]>(), count as usize) };
+    // above); per the D3D9 ABI the caller guarantees the bounded floats
+    // are initialized and readable without mutation in one allocation for
+    // this call. The byte size fits `isize::MAX`; all `f32` bits are valid.
+    let constants = unsafe {
+        mtld3d_shared::slice_from_caller(constant_data.cast::<[f32; 4]>(), count as usize)
+    };
+    let slice: &[[f32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantF {
             start: start_register,
@@ -13103,10 +13124,16 @@ extern "system" fn device_set_pixel_shader_constant_i(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
-    // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are readable.
-    let slice =
-        unsafe { core::slice::from_raw_parts(constant_data.cast::<[i32; 4]>(), count as usize) };
+    // The register mirror clamps oversized writes; bound the caller copy
+    // to the same window before an unaligned input can allocate.
+    let count = (count as usize).min(INT_CONSTANT_ROWS.saturating_sub(start_register as usize));
+    // SAFETY: `constant_data` is non-null and `count` is bounded above;
+    // per the D3D9 ABI, the bounded rows are initialized and readable
+    // without mutation in one allocation for this call. The byte size
+    // fits `isize::MAX`, and all `i32` bit patterns are valid.
+    let constants =
+        unsafe { mtld3d_shared::slice_from_caller(constant_data.cast::<[i32; 4]>(), count) };
+    let slice: &[[i32; 4]] = &constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantI {
             start: start_register,
@@ -13164,9 +13191,15 @@ extern "system" fn device_set_pixel_shader_constant_b(
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
-    // per the D3D9 ABI the caller guarantees `count` `BOOL`s are readable.
-    let slice = unsafe { core::slice::from_raw_parts(constant_data, count as usize) };
+    // The register mirror clamps oversized writes; bound the caller copy
+    // to the same window before an unaligned input can allocate.
+    let count = (count as usize).min(BOOL_CONSTANT_COUNT.saturating_sub(start_register as usize));
+    // SAFETY: `constant_data` is non-null and `count` is bounded above;
+    // per the D3D9 ABI, the bounded BOOLs are initialized and readable
+    // without mutation in one allocation for this call. The byte size
+    // fits `isize::MAX`, and all `i32` bit patterns are valid.
+    let constants = unsafe { mtld3d_shared::slice_from_caller(constant_data, count) };
+    let slice = &*constants;
     if let Some(rec) = dev.recording_state_block_mut() {
         rec.record(StateOp::PixelShaderConstantB {
             start: start_register,
