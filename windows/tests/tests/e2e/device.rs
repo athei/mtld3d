@@ -16,7 +16,7 @@ use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
     Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
     WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
-    cursor_mask_bits, destroy_window, enumerate_display_sizes, set_child_config, spawn_scoped,
+    cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child, spawn_scoped,
     window_rect,
 };
 use mtld3d_types::{
@@ -1038,8 +1038,8 @@ fn reset_flips_the_presentation_interval() {
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    set_child_config(&mut command, &format!("log.dir={}", dir.display()));
-    let output = command.output().expect("run pacing workload child");
+    let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
+        .expect("run pacing workload child");
     assert!(
         output.status.success(),
         "pacing workload child failed: {}",
