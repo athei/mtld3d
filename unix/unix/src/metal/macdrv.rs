@@ -1008,9 +1008,11 @@ fn create_metal_view(
 /// The metal view kept for `hwnd`'s previous device, if there is one and its window is still up.
 ///
 /// Taking it goes through none of Wine's calls, so the client surface it
-/// sits in stays the one Wine shows for the window. A kept view whose
-/// window is gone (an orphan, or a window handle reused for a new window)
-/// is released here, and the caller creates a view.
+/// sits in stays the one Wine shows for the window; one Wine hid for a later
+/// surface of the same window is shown again by the first `nextDrawable` of
+/// the kept layer, which Wine reports as that surface's present. A kept view
+/// whose window is gone (an orphan, or a window handle reused for a new
+/// window) is released here, and the caller creates a view.
 fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<(*mut c_void, *mut c_void)> {
     let (view, layer) = PARKED_METAL_VIEW
         .lock()
