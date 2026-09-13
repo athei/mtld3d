@@ -20,7 +20,7 @@ use objc2_metal::{
 
 use crate::{
     LOG_TARGET,
-    metal::{device::cpu_written_texture_storage, handle::IntoRetained},
+    metal::{device::cpu_written_texture_storage, handle::BorrowRetained},
 };
 
 /// Handles to the three opaque-black textures and their default sampler.
@@ -56,19 +56,24 @@ impl NullTextures {
 
 static NULL_TEXTURES: OnceLock<NullTextures> = OnceLock::new();
 
-/// The shared default sampler, retained for the caller.
+/// The shared default sampler, borrowed for as long as the caller needs it.
 ///
 /// What a slot gets when the draw names no usable sampler of its own: the
 /// sampler a null-texture bind installs, and the substitute for a sampler
 /// state the device declined to create. `None` only when the default sampler
-/// itself cannot be created.
+/// itself cannot be created. The signature is safe and the reference
+/// `'static` because this module, not the caller, owns the lifetime: the
+/// retain `create` gave up is never taken back, so the sampler outlives the
+/// process.
 pub fn default_sampler(
     device: &ProtocolObject<dyn MTLDevice>,
-) -> Option<Retained<ProtocolObject<dyn MTLSamplerState>>> {
+) -> Option<&'static ProtocolObject<dyn MTLSamplerState>> {
     let null = ensure(device)?;
     // SAFETY: the handle came from `create`'s `Retained::into_raw`, alive for
     // the process lifetime.
-    unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) }.into_retained()
+    let handle = unsafe { MetalHandle::<MTLSamplerStateKind>::new(null.sampler()) };
+    // SAFETY: that retain is never released, so it outlives every borrow.
+    unsafe { handle.borrow_retained() }
 }
 
 /// Lazily create and cache the opaque-black textures + default sampler.
