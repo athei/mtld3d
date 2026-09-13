@@ -50,14 +50,19 @@
 //! which the layer treats as optional. The layout the table is read
 //! through is pinned beside them, field offset by field offset, since
 //! nothing at run time compares it against the fork's.
+//!
+//! The record that table's `get_win_data` answers with is pinned the same
+//! way. The layer declares the four pointers it reads out of the fork's
+//! `struct d3dmetal_macdrv_win_data` and takes the client view out of the
+//! fourth, so those four offsets are asserted here beside the table's.
 
 use core::ffi::c_void;
 
 use super::{
-    KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MetalViewPark, PresentPacing,
-    ScreenParamsFilterStep, backing_scale_change, backing_scale_from, first_null_required_entry,
-    layer_mode_change, layer_mode_for, min_present_duration, min_present_duration_change,
-    pack_pacing, screen_params_filter_step, unpack_pacing,
+    KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
+    PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
+    first_null_required_entry, layer_mode_change, layer_mode_for, min_present_duration,
+    min_present_duration_change, pack_pacing, screen_params_filter_step, unpack_pacing,
 };
 
 #[test]
@@ -564,4 +569,23 @@ fn the_table_is_read_through_the_layout_the_fork_publishes() {
         72
     );
     assert_eq!(size_of::<MacdrvFunctionsTable>(), 80);
+}
+
+#[test]
+fn the_win_data_record_is_read_through_the_prefix_the_fork_publishes() {
+    // The fork's `struct d3dmetal_macdrv_win_data` opens with four
+    // pointers and carries rects, flags and padding behind them, pinned
+    // there by a `C_ASSERT` that its size is 120 bytes. The layer declares
+    // those four and reads that prefix alone, taking the client view out
+    // of the fourth, so each field has to sit at the offset the fork's
+    // field order gives it and the prefix has to be the four pointers and
+    // nothing else. The record carries no version or size word either, so
+    // nothing at run time can check this; the assertions below are the
+    // check, and they fail here rather than in a game if the declaration
+    // drifts.
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, hwnd), 0);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, cocoa_window), 8);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, cocoa_view), 16);
+    assert_eq!(core::mem::offset_of!(MacdrvWinData, client_cocoa_view), 24);
+    assert_eq!(size_of::<MacdrvWinData>(), 32);
 }
