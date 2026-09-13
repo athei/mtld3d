@@ -10969,10 +10969,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let render_state_value = if dirty.contains(SnapshotDirty::RS) {
         use mtld3d_core::pipeline_state::{PipelineRsBits, PipelineRsFlags};
 
-        // D3D9 enum render-state values are spec-bounded: D3DCMP_* in
-        // 1..=8, D3DBLEND_* in 1..=19, D3DBLENDOP_* in 1..=5,
-        // D3DCULL_* in 1..=3, D3DCOLORWRITEENABLE_* uses 4 bits.
-        let to_u8 = |v: u32| u8::try_from(v).expect("D3D9 enum render-state value ≤ u8::MAX");
+        // `SetRenderState` stores whatever DWORD the game passed, so an
+        // enum state is narrowed through `render_state::enum_value`: the
+        // byte when the value is inside that state's enum space, the D3D9
+        // default when it is not.
+        let enum_rs = |state: u32| mtld3d_core::render_state::enum_value(rs, state);
 
         let mut prs_flags = PipelineRsFlags::empty();
         prs_flags.set(
@@ -10985,17 +10986,17 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         );
         let pipeline_rs = PipelineRsBits {
             flags: prs_flags,
-            src_blend: to_u8(rs[D3DRS_SRCBLEND as usize]),
-            dst_blend: to_u8(rs[D3DRS_DESTBLEND as usize]),
-            blend_op: to_u8(rs[D3DRS_BLENDOP as usize]),
-            src_blend_alpha: to_u8(rs[D3DRS_SRCBLENDALPHA as usize]),
-            dst_blend_alpha: to_u8(rs[D3DRS_DESTBLENDALPHA as usize]),
-            blend_op_alpha: to_u8(rs[D3DRS_BLENDOPALPHA as usize]),
-            color_write_mask: to_u8(rs[D3DRS_COLORWRITEENABLE as usize]),
+            src_blend: enum_rs(D3DRS_SRCBLEND),
+            dst_blend: enum_rs(D3DRS_DESTBLEND),
+            blend_op: enum_rs(D3DRS_BLENDOP),
+            src_blend_alpha: enum_rs(D3DRS_SRCBLENDALPHA),
+            dst_blend_alpha: enum_rs(D3DRS_DESTBLENDALPHA),
+            blend_op_alpha: enum_rs(D3DRS_BLENDOPALPHA),
+            color_write_mask: enum_rs(D3DRS_COLORWRITEENABLE),
             color_write_mask_ext: [
-                to_u8(rs[D3DRS_COLORWRITEENABLE1 as usize]),
-                to_u8(rs[D3DRS_COLORWRITEENABLE2 as usize]),
-                to_u8(rs[D3DRS_COLORWRITEENABLE3 as usize]),
+                enum_rs(D3DRS_COLORWRITEENABLE1),
+                enum_rs(D3DRS_COLORWRITEENABLE2),
+                enum_rs(D3DRS_COLORWRITEENABLE3),
             ],
         };
 
@@ -11043,7 +11044,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             pipeline_rs,
             depth_scissor,
             depth_stencil_state,
-            cull_mode: to_u8(rs[D3DRS_CULLMODE as usize]),
+            cull_mode: enum_rs(D3DRS_CULLMODE),
             scissor_rect,
             blend_factor: rs[D3DRS_BLENDFACTOR as usize],
             depth_bias: rs[D3DRS_DEPTHBIAS as usize],

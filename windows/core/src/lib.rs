@@ -44,6 +44,7 @@ pub mod process_vertices;
 pub mod ps_draw;
 pub mod readback;
 pub mod render_scale;
+pub mod render_state;
 pub mod sampler_state;
 pub mod scratch;
 pub mod shader_cache;

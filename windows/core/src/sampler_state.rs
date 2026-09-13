@@ -47,6 +47,14 @@ pub const LOD_BIAS_SLOTS: usize = 16;
 /// Byte length of the fragment LOD-bias uniform.
 pub const LOD_BIAS_BYTES: usize = LOD_BIAS_SLOTS * 16;
 
+/// Fine-mip clamp `D3DSAMP_MAXMIPLEVEL` is limited to on decode.
+///
+/// D3D9 leaves the state a full DWORD, but the largest surface the API allows
+/// is 16384 wide, so no texture has a level above this and a wider value
+/// selects the same smallest mip that this one does. Limiting it here keeps
+/// the key's 5-bit field and the sampler's `lodMinClamp` reading one value.
+const MAX_MIP_LEVEL: u8 = 15;
+
 /// Magnitude `D3DSAMP_MIPMAPLODBIAS` is clamped to on decode.
 ///
 /// D3D9 leaves the accepted range to the driver. The largest surface the API
@@ -284,11 +292,25 @@ pub const fn key_from_snapshot(s: &SamplerSnapshot) -> SamplerKey {
             | ((s.address_v as u64 & 0xF) << 16)
             | ((s.address_w as u64 & 0xF) << 20)
             | ((s.max_anisotropy as u64 & 0xFF) << 24)
-            | ((s.max_mip_level as u64 & 0x1F) << 32)
+            | ((clamped_max_mip_level(s.max_mip_level) as u64) << 32)
             | ((s.flags.contains(SamplerFlags::IS_COMPARE) as u64) << 37)
             | ((s.flags.contains(SamplerFlags::SRGB_TEXTURE) as u64) << 38)
             | ((border_preset_for_key(s.border_color) as u64 & 0x3) << 39),
     )
+}
+
+/// `D3DSAMP_MAXMIPLEVEL` at the width the key packs and the sampler takes.
+///
+/// `SetSamplerState` stores whatever DWORD the game passed, so the state is
+/// game input; both consumers read it through here, and a value past the
+/// deepest level any D3D9 texture has reads as [`MAX_MIP_LEVEL`].
+const fn clamped_max_mip_level(level: u32) -> u8 {
+    if level > MAX_MIP_LEVEL as u32 {
+        MAX_MIP_LEVEL
+    } else {
+        // Exact: the branch above leaves nothing wider than a byte.
+        level.to_le_bytes()[0]
+    }
 }
 
 /// The border preset the key carries.
@@ -304,20 +326,12 @@ const fn border_preset_for_key(color: u32) -> BorderColor {
 }
 
 /// Translate a snapshot into the wire-format `CreateSamplerStateParams`.
-///
-/// # Panics
-///
-/// Panics if `s.max_mip_level` exceeds `u16::MAX`. Unreachable in practice:
-/// D3D9's max mip count is 14 (a 16384-pixel texture has 15 mip levels).
 #[must_use]
 pub fn params_from_snapshot(
     s: &SamplerSnapshot,
     key: SamplerKey,
     device_handle: MetalHandle<MTLDeviceKind>,
 ) -> CreateSamplerStateParams {
-    // D3DSAMP_MAXMIPLEVEL is a u32 but the spec caps it at the mip count
-    // (≤14 in practice). u16::try_from + f32::from is exact.
-    let max_mip_u16 = u16::try_from(s.max_mip_level).expect("D3D9 mip level ≤ 14 fits u16");
     CreateSamplerStateParams {
         device_handle,
         id: key.raw(),
@@ -328,7 +342,7 @@ pub fn params_from_snapshot(
         address_v: d3d_to_metal_address_mode(s.address_v),
         address_w: d3d_to_metal_address_mode(s.address_w),
         max_anisotropy: s.max_anisotropy.clamp(1, MAX_ANISOTROPY),
-        lod_min_clamp: f32::from(max_mip_u16).to_bits(),
+        lod_min_clamp: f32::from(clamped_max_mip_level(s.max_mip_level)).to_bits(),
         lod_max_clamp: LOD_MAX_CLAMP.to_bits(),
         is_compare: u32::from(s.flags.contains(SamplerFlags::IS_COMPARE)),
         border_color: d3d_border_color_to_metal(s.border_color),

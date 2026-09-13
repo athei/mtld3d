@@ -203,33 +203,32 @@ impl DepthStencilSnapshot {
 
 /// Build a `DepthStencilSnapshot` from the device's render-state array.
 ///
-/// # Panics
-///
-/// Panics if an enum-valued stencil or depth render state holds a value wider
-/// than a byte. The boolean states are read as `!= 0` and never panic.
+/// The enum-valued states come through [`crate::render_state::enum_value`], so
+/// a game value outside a state's enum space reads as that state's D3D9
+/// default rather than as a byte of it.
 #[must_use]
 pub fn snapshot_from_state(rs: &[u32; RENDER_STATE_COUNT]) -> DepthStencilSnapshot {
-    let to_u8 = |v: u32| u8::try_from(v).expect("D3D9 enum render-state value fits u8");
+    let enum_rs = |state: u32| crate::render_state::enum_value(rs, state);
     let front = StencilFaceState {
-        func: to_u8(rs[D3DRS_STENCILFUNC as usize]),
-        fail_op: to_u8(rs[D3DRS_STENCILFAIL as usize]),
-        depth_fail_op: to_u8(rs[D3DRS_STENCILZFAIL as usize]),
-        pass_op: to_u8(rs[D3DRS_STENCILPASS as usize]),
+        func: enum_rs(D3DRS_STENCILFUNC),
+        fail_op: enum_rs(D3DRS_STENCILFAIL),
+        depth_fail_op: enum_rs(D3DRS_STENCILZFAIL),
+        pass_op: enum_rs(D3DRS_STENCILPASS),
     };
     let back = if rs[D3DRS_TWOSIDEDSTENCILMODE as usize] == 0 {
         front
     } else {
         StencilFaceState {
-            func: to_u8(rs[D3DRS_CCW_STENCILFUNC as usize]),
-            fail_op: to_u8(rs[D3DRS_CCW_STENCILFAIL as usize]),
-            depth_fail_op: to_u8(rs[D3DRS_CCW_STENCILZFAIL as usize]),
-            pass_op: to_u8(rs[D3DRS_CCW_STENCILPASS as usize]),
+            func: enum_rs(D3DRS_CCW_STENCILFUNC),
+            fail_op: enum_rs(D3DRS_CCW_STENCILFAIL),
+            depth_fail_op: enum_rs(D3DRS_CCW_STENCILZFAIL),
+            pass_op: enum_rs(D3DRS_CCW_STENCILPASS),
         }
     };
     DepthStencilSnapshot {
         depth_enable: u8::from(rs[D3DRS_ZENABLE as usize] != 0),
         depth_write: u8::from(rs[D3DRS_ZWRITEENABLE as usize] != 0),
-        depth_func: to_u8(rs[D3DRS_ZFUNC as usize]),
+        depth_func: enum_rs(D3DRS_ZFUNC),
         stencil_enable: u8::from(rs[D3DRS_STENCILENABLE as usize] != 0),
         front,
         back,
