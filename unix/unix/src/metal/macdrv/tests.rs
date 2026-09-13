@@ -25,14 +25,22 @@
 //! marked installed, which is what keeps a process whose first `CreateDevice`
 //! beats Wine's application delegate from running unfiltered for its lifetime.
 //!
+//! `MetalViewPark` is the bookkeeping behind keeping a retired device's metal
+//! view for the next device on its window. The tests pin that a window's view
+//! is kept and taken back by that window alone, that a second view for the
+//! same window displaces the first, that views of several windows are kept
+//! beside each other up to the park's size, and that a full park displaces
+//! its oldest view.
+//!
 //! The other half of that path, what a device's teardown retires and what
 //! it leaves alone for the devices still attached, is the attachment
 //! registry's, and lives in `attachment/tests.rs`.
 
 use super::{
-    LayerMode, PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
-    layer_mode_change, layer_mode_for, min_present_duration, min_present_duration_change,
-    pack_pacing, screen_params_filter_step, unpack_pacing,
+    KEPT_METAL_VIEWS, LayerMode, MetalViewPark, PresentPacing, ScreenParamsFilterStep,
+    backing_scale_change, backing_scale_from, layer_mode_change, layer_mode_for,
+    min_present_duration, min_present_duration_change, pack_pacing, screen_params_filter_step,
+    unpack_pacing,
 };
 
 #[test]
@@ -340,4 +348,71 @@ fn an_installed_filter_is_never_installed_twice() {
         screen_params_filter_step(true, false),
         ScreenParamsFilterStep::AlreadyOurs
     );
+}
+
+#[test]
+fn an_empty_park_keeps_the_first_view_and_displaces_nothing() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.take_for(0x40), Some((0x1000, 0x2000)));
+    assert_eq!(
+        park.take_for(0x40),
+        None,
+        "taken once; the slot is empty again"
+    );
+}
+
+#[test]
+fn a_second_view_for_the_same_window_displaces_the_first() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.park(0x40, 0x3000, 0x4000), Some(0x1000));
+    assert_eq!(park.take_for(0x40), Some((0x3000, 0x4000)));
+}
+
+#[test]
+fn parking_the_kept_view_again_displaces_nothing() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.park(0x40, 0x1000, 0x2000), None);
+    assert_eq!(park.take_for(0x40), Some((0x1000, 0x2000)));
+}
+
+/// One kept view per window, as many as the park holds.
+const KEPT: [(u64, usize); KEPT_METAL_VIEWS] = [(1, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x4000)];
+
+#[test]
+fn views_of_other_windows_are_kept_beside_each_other() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    assert_eq!(
+        park.take_for(0x99),
+        None,
+        "no view for a window that had none"
+    );
+    for (window, view) in KEPT.iter().rev() {
+        assert_eq!(
+            park.take_for(*window),
+            Some((*view, 0x20)),
+            "still kept for a device that comes back"
+        );
+    }
+}
+
+#[test]
+fn a_full_park_displaces_the_oldest_view() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    assert_eq!(park.park(0x99, 0x9000, 0x20), Some(0x1000));
+    assert_eq!(park.take_for(1), None, "the oldest went");
+    assert_eq!(
+        park.take_for(2),
+        Some((0x2000, 0x20)),
+        "the next oldest stays"
+    );
+    assert_eq!(park.take_for(0x99), Some((0x9000, 0x20)));
 }

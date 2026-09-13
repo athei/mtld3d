@@ -83,6 +83,8 @@ bitflags::bitflags! {
         const DEVICE_RELEASED = 1 << 0;
         /// The device is fullscreen and the harness holds the session's display mode.
         const HOLDS_DISPLAY_MODE = 1 << 1;
+        /// The device window is another harness's, which destroys it.
+        const BORROWED_WINDOW = 1 << 2;
     }
 }
 
@@ -119,6 +121,11 @@ pub struct HarnessConfig {
     pub multi_sample_type: u32,
     /// `D3DPRESENT_PARAMETERS.MultiSampleQuality`.
     pub multi_sample_quality: u32,
+    /// A window to create the device on instead of one of the harness's own; `0` creates one.
+    ///
+    /// The harness never destroys a window it was given, so the harness that
+    /// owns it outlives this one.
+    pub device_window: usize,
 }
 
 impl Default for HarnessConfig {
@@ -136,6 +143,7 @@ impl Default for HarnessConfig {
             present_flags: 0,
             multi_sample_type: 0,
             multi_sample_quality: 0,
+            device_window: 0,
         }
     }
 }
@@ -368,9 +376,14 @@ impl Harness {
             state |= HarnessState::HOLDS_DISPLAY_MODE;
         }
 
-        let width = i32::try_from(cfg.width).expect("width fits i32");
-        let height = i32::try_from(cfg.height).expect("height fits i32");
-        let hwnd = win32::create_styled_window(width, height, cfg.visible, &cfg.window_style);
+        let hwnd = if cfg.device_window == 0 {
+            let width = i32::try_from(cfg.width).expect("width fits i32");
+            let height = i32::try_from(cfg.height).expect("height fits i32");
+            win32::create_styled_window(width, height, cfg.visible, &cfg.window_style)
+        } else {
+            state |= HarnessState::BORROWED_WINDOW;
+            cfg.device_window
+        };
 
         let mut pp = present_params(cfg, hwnd);
         let mut device: *mut c_void = core::ptr::null_mut();
@@ -2893,7 +2906,7 @@ impl Drop for Harness {
         }
         // SAFETY: vtable thunk; `self.d3d9` is live and released exactly once.
         unsafe { (self.factory_vtbl().release)(self.d3d9) };
-        if self.hwnd != 0 {
+        if self.hwnd != 0 && !self.has(HarnessState::BORROWED_WINDOW) {
             win32::destroy_window(self.hwnd);
         }
         // The device release above put the mode back; only now may another

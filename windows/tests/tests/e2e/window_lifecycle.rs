@@ -22,9 +22,10 @@ const ROUNDS: usize = 25;
 
 /// Each lane creates a device on a window of its own, presents once and releases both, repeatedly.
 ///
-/// The device release retires the layer's metal view on the main thread
-/// before the window goes, and the window's destruction then takes the
-/// driver's own views and the window apart.
+/// The device release keeps the layer's metal view for the window's next
+/// device, so the window's destruction takes the driver's own views and the
+/// window apart under a metal view that is still alive; the kept view is
+/// released, on the main thread, when a later device's view displaces it.
 #[test]
 fn devices_and_windows_come_and_go_on_several_threads_at_once() {
     std::thread::scope(|scope| {
