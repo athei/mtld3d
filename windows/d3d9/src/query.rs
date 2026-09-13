@@ -427,16 +427,18 @@ extern "system" fn query_get_data(
                         // alive by the device.
                         let dev = unsafe { &*device_inner_ptr };
                         if dev.config().query_flush_immediate {
-                            // D3D9-era games use FLUSH-poll as a
-                            // poor-man's GPU fence to compensate for
-                            // 2004-era drivers that lacked resource
-                            // hazard tracking. Metal tracks hazards
-                            // explicitly, so the fence buys nothing
-                            // for correctness — it just throttles
-                            // our API thread (the bottleneck) while
-                            // the GPU (which has headroom) is given
-                            // time it doesn't need. Return a
-                            // permissive stub per the polarity rule
+                            // Returning at once can save API-thread time
+                            // for a game that uses FLUSH polls only to
+                            // throttle submission. It also reports
+                            // completion before the GPU has retired the
+                            // query. Metal's GPU hazard tracking does not
+                            // cover a CPU write through
+                            // `D3DLOCK_NOOVERWRITE` into dynamic-buffer
+                            // pages a queued draw still reads. Enable this
+                            // only after verifying that the title neither
+                            // reads the count nor gates such reuse on the
+                            // query. Return a permissive stub per the
+                            // polarity rule
                             // (`u32::MAX` = "fully visible") so any
                             // unusual reader doesn't cull geometry;
                             // the real count finalizes naturally on

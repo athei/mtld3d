@@ -59,12 +59,14 @@ static PROFILES: &[AppProfile] = &[
         original_filename: Some("Halo2.exe"),
         settings: "buffer.ignoreLockBounds=true",
     },
-    // World of Warcraft, the 1.12 and 3.3.5 clients alike. Both use the
-    // `GetData(D3DGETDATA_FLUSH)` poll loop as a GPU fence after every
-    // loading-screen upload batch and never read the count it returns, so the
-    // spec-correct wait only costs them seconds per load; the immediate answer
-    // keeps that time and changes nothing they render. The sun and moon lens
-    // flares read their queries without FLUSH and still get the real counts.
+    // World of Warcraft, the 1.12 and 3.3.5 clients alike. Both poll
+    // `GetData(D3DGETDATA_FLUSH)` after every loading-screen upload batch but
+    // never read the count, and skipping the spec-correct wait was measured to
+    // save seconds per load. This profile assumes the polls do not gate reuse
+    // of CPU-writable dynamic storage. Metal cannot track a CPU write through
+    // `D3DLOCK_NOOVERWRITE` into pages a queued draw still reads. The sun and
+    // moon lens flares read their queries without FLUSH and still get the real
+    // counts.
     AppProfile {
         name: "wow",
         exe: "WoW.exe",
