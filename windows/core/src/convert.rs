@@ -840,7 +840,8 @@ pub const fn fan_pattern_bytes(primitive_count: u32) -> usize {
 /// [`fan_pattern_bytes`].
 pub fn fill_fan_pattern_u16(out: &mut [u8], primitive_count: u32) {
     let triangles = usize::try_from(primitive_count).unwrap_or(usize::MAX);
-    for (i, tri) in out.chunks_exact_mut(6).take(triangles).enumerate() {
+    let (tris, _) = out.as_chunks_mut::<6>();
+    for (i, tri) in tris.iter_mut().take(triangles).enumerate() {
         // `i + 2 <= FAN_PATTERN_MAX_TRIANGLES + 1 == u16::MAX` whenever the
         // caller respects the pattern limit; clamp rather than wrap past it.
         let second = u16::try_from(i + 1).unwrap_or(u16::MAX);
