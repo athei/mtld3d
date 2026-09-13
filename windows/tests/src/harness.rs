@@ -36,7 +36,9 @@ mod cursor_bitmap;
 /// leaves it in the environment: its creation holds this lock exclusively
 /// while it appends the entries, creates the interface and puts the
 /// variable back, and every other creation, and every read of the
-/// suite-wide value, holds it shared.
+/// suite-wide value, holds it shared. A spawn holds it shared too: the
+/// child's environment block is copied out of this process at the spawn,
+/// which is a read of the variable like any other.
 static ENVIRONMENT: RwLock<()> = RwLock::new(());
 
 /// The environment variable the layer reads its configuration overrides from.
@@ -171,29 +173,55 @@ pub fn config_var() -> Option<String> {
     std::env::var(CONFIG_VAR).ok()
 }
 
-/// Give a child process the suite-wide `MTLD3D_CONFIG` plus `entries`.
+/// Run a child process under the suite-wide `MTLD3D_CONFIG` plus `entries`.
 ///
 /// A test that runs its workload in a private copy of the test executable
 /// spawns it from a thread of a running suite, and a `Command` copies the
-/// environment as it stands at the spawn, under no lock of ours. A harness
+/// whole environment of this process as it stands at the spawn. A harness
 /// creating an interface of its own holds its merged entries in the variable
 /// for the length of that call, so a child spawned inside that window would
-/// run its whole workload under another test's configuration. The value
-/// handed over here is read through [`config_var`], which takes the shared
-/// lock and so cannot see such a window, and it is fixed on the command
-/// rather than read again when the child starts.
+/// run its whole workload under another test's configuration, and the copy
+/// is itself a read of the environment while it is being written. Both are
+/// closed here: the value is read through [`config_var`], which takes the
+/// shared lock, and fixed on the command rather than read again when the
+/// child starts, and the spawn runs under the shared lock too, so no window
+/// is ever open across it.
+///
+/// The lock is held for the spawn and nothing else. `spawn` returns once the
+/// child exists and its environment block has been copied, so the wait for
+/// the child's run happens with the lock released and a harness publishing
+/// entries of its own waits for a spawn rather than for a whole workload.
 ///
 /// `entries` are the child's own `key=value` entries, `;`-separated. They
 /// win over the suite-wide value, because the parser keeps the last entry
 /// for a key. Empty means the suite-wide configuration alone.
-pub fn set_child_config(command: &mut std::process::Command, entries: &str) {
+///
+/// The child gets the pipes and the null standard input that
+/// `Command::output` would have given it, and the caller gets its captured
+/// output.
+///
+/// # Errors
+/// Returns the spawn or wait error, for the caller to name its child in.
+pub fn run_child(
+    command: &mut std::process::Command,
+    entries: &str,
+) -> std::io::Result<std::process::Output> {
     let suite = config_var().unwrap_or_default();
     let config = if entries.is_empty() {
         suite
     } else {
         format!("{suite};{entries}")
     };
-    command.env(CONFIG_VAR, config);
+    command
+        .env(CONFIG_VAR, config)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = {
+        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+        command.spawn()?
+    };
+    child.wait_with_output()
 }
 
 /// True when the suite rasterizes at the resolution D3D9 reports.
@@ -272,8 +300,9 @@ fn create_factory(entries: &str) -> *mut c_void {
         let merged = format!("{};{entries}", previous.as_deref().unwrap_or_default());
         // SAFETY: the exclusive lock above keeps every reader of the variable
         // in this process out until it is put back: interfaces read it only
-        // inside `Direct3DCreate9`, always under the shared lock, and nothing
-        // else in the process reads the environment.
+        // inside `Direct3DCreate9`, always under the shared lock, and the one
+        // other reader, the environment block a child spawn copies, takes the
+        // shared lock across the spawn in `run_child`.
         unsafe { std::env::set_var(CONFIG_VAR, merged) };
         // SAFETY: Win32-style factory entrypoint with no preconditions.
         let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
