@@ -5,9 +5,10 @@ use mtld3d_types::{
     D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
     D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
-    D3DSAMP_MAXANISOTROPY, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS,
-    D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
-    D3DTEXF_LINEAR, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_POINT, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -462,6 +463,48 @@ fn mipmap_lod_bias_shifts_the_sampled_mip() {
     assert_eq!(unbiased, MIP_TINTS[0], "no bias samples the base level");
     assert_eq!(biased, MIP_TINTS[2], "a +2 bias samples two levels coarser");
     assert_ne!(unbiased, biased, "the bias must change the sampled mip");
+}
+
+/// Draw the mip-tinted quad under `level` as the finest mip and read it back.
+fn sample_at_max_mip_level(h: &Harness, level: u32) -> u32 {
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level),
+        0,
+        "SetSamplerState(MAXMIPLEVEL)"
+    );
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_MAXMIPLEVEL),
+        level,
+        "MAXMIPLEVEL round-trip"
+    );
+    let quad = texel_to_pixel_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    h.read_pixel(MIP_TEX_DIM / 2, MIP_TEX_DIM / 2)
+}
+
+#[test]
+fn out_of_range_max_mip_level_samples_the_smallest_level() {
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+
+    // In range: the sampler may pick nothing finer than level 3, so the
+    // one-texel-per-pixel quad reads that level's tint instead of the base.
+    assert_eq!(
+        sample_at_max_mip_level(&h, 3),
+        MIP_TINTS[3],
+        "MAXMIPLEVEL 3 pins the sample to level 3"
+    );
+
+    // `SetSamplerState` takes a DWORD, and a level deeper than any D3D9
+    // texture has selects the smallest one the texture carries.
+    assert_eq!(
+        sample_at_max_mip_level(&h, 0x0001_0000),
+        MIP_TINTS[MIP_TINTS.len() - 1],
+        "an out-of-range MAXMIPLEVEL samples the smallest level"
+    );
 }
 
 #[test]

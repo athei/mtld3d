@@ -24,12 +24,12 @@ use mtld3d_types::{
     D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE,
     D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_POINTSCALEENABLE,
     D3DRS_POINTSPRITEENABLE, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE,
-    D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTOP_DISABLE, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2,
-    D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00,
-    D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
-    D3DTTFF_PROJECTED, RENDER_STATE_COUNT, StateBlockType, TEXTURE_STAGE_STATE_COUNT,
-    texture_stage_state_defaults,
+    D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CONSTANT,
+    D3DTOP_DISABLE, D3DTOP_LERP, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP,
+    D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
+    D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED, RENDER_STATE_COUNT,
+    StateBlockType, TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
 };
 
 use crate::{
@@ -1085,11 +1085,15 @@ impl FfState {
         }
         let mut max_active_stage: Option<u8> = None;
         for (i, stage_state) in self.texture_stage_states.iter().enumerate() {
-            if stage_state[D3DTSS_COLOROP as usize] == D3DTOP_DISABLE {
+            let index = u8::try_from(i).expect("stage index ≤ 7 fits u8");
+            // Through the same narrowing the PS key uses, so a stage whose op
+            // is a garbage write cannot end the chain for one key and not the
+            // other.
+            if u32::from(stage_enum_value(stage_state, index, D3DTSS_COLOROP)) == D3DTOP_DISABLE {
                 break;
             }
             if (bound_texture_mask >> i) & 1 != 0 {
-                max_active_stage = Some(u8::try_from(i).expect("stage index ≤ 7 fits u8"));
+                max_active_stage = Some(index);
             }
         }
         // `.min(8)` is defensive: `ff_vs_layout_from_elements` already
@@ -1163,8 +1167,8 @@ impl FfState {
     ///
     /// # Panics
     ///
-    /// Panics if a D3DTSS COLOROP/ARG/ALPHAOP/ALPHAARG value exceeds `u8::MAX`
-    /// — unreachable, the spec caps each at ≤ 24.
+    /// Panics if a stage index exceeds `u8::MAX` — unreachable, the array
+    /// holds the eight D3D9 stages.
     #[must_use]
     pub fn build_ps_key(
         &self,
@@ -1174,13 +1178,14 @@ impl FfState {
         let mut stages = [FfStage::default(); 8];
         for (i, stage) in stages.iter_mut().enumerate() {
             let s = &self.texture_stage_states[i];
-            let to_u8 = |v: u32| u8::try_from(v).expect("D3DTSS op/arg ≤ 24");
-            stage.color_op = to_u8(s[D3DTSS_COLOROP as usize]);
-            stage.color_arg1 = to_u8(s[D3DTSS_COLORARG1 as usize]);
-            stage.color_arg2 = to_u8(s[D3DTSS_COLORARG2 as usize]);
-            stage.alpha_op = to_u8(s[D3DTSS_ALPHAOP as usize]);
-            stage.alpha_arg1 = to_u8(s[D3DTSS_ALPHAARG1 as usize]);
-            stage.alpha_arg2 = to_u8(s[D3DTSS_ALPHAARG2 as usize]);
+            let index = u8::try_from(i).expect("stage index ≤ 7 fits u8");
+            let to_u8 = |ty: u32| stage_enum_value(s, index, ty);
+            stage.color_op = to_u8(D3DTSS_COLOROP);
+            stage.color_arg1 = to_u8(D3DTSS_COLORARG1);
+            stage.color_arg2 = to_u8(D3DTSS_COLORARG2);
+            stage.alpha_op = to_u8(D3DTSS_ALPHAOP);
+            stage.alpha_arg1 = to_u8(D3DTSS_ALPHAARG1);
+            stage.alpha_arg2 = to_u8(D3DTSS_ALPHAARG2);
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
             // `FfVsKey::tci_modes` + `tci_coord_indices` (one entry per
             // stage). The PS samples `Varyings.texcoord[stage]` 1:1.
@@ -1214,11 +1219,6 @@ impl FfState {
     ///
     /// Callers pass `has_rhw` so XYZRHW pipelines get `fog_mode = 0` (D3D9
     /// bypasses vertex fog for pre-transformed geometry) matching the VS key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `D3DRS_ALPHAFUNC` exceeds `u8::MAX` — unreachable, the spec
-    /// caps it at ≤ 8 (`D3DCMP_ALWAYS`).
     #[must_use]
     pub fn variant_key(
         &self,
@@ -1251,7 +1251,7 @@ impl FfState {
         );
         VariantKey {
             alpha_func: if alpha_test_on {
-                u8::try_from(render_states[D3DRS_ALPHAFUNC as usize]).expect("D3DCMP_* ≤ 8 fits u8")
+                crate::render_state::enum_value(render_states, D3DRS_ALPHAFUNC)
             } else {
                 0
             },
@@ -1783,6 +1783,41 @@ fn build_vs_flags(
         !layout.has_rhw() && render_states[D3DRS_POINTSCALEENABLE as usize] != 0,
     );
     flags
+}
+
+/// A D3DTSS op or argument code, narrowed to the byte an `FfStage` carries.
+///
+/// `SetTextureStageState` stores whatever DWORD the game passed, so these are
+/// game input: an operation outside the `D3DTOP_*` space, or an argument whose
+/// selector names no source, reads as that stage's D3D9 default and surfaces
+/// once. The emitter's own arms still handle the codes that are in the space
+/// but unimplemented.
+fn stage_enum_value(stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT], stage: u8, ty: u32) -> u8 {
+    let value = stage_states[ty as usize];
+    // Exact for every value the spaces below accept: both fit in a byte.
+    let byte = value.to_le_bytes()[0];
+    let fits = u32::from(byte) == value;
+    let in_space = match ty {
+        D3DTSS_COLOROP | D3DTSS_ALPHAOP => fits && (D3DTOP_DISABLE..=D3DTOP_LERP).contains(&value),
+        D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
+            fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT
+        }
+        other => {
+            mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET, key: u64::from(other),
+                "FF: D3DTSS_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
+            );
+            return byte;
+        }
+    };
+    if in_space {
+        return byte;
+    }
+    let default = texture_stage_state_defaults(stage)[ty as usize];
+    mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
+        key: (u64::from(ty) << 8) | u64::from(stage),
+        "FF: stage {stage} D3DTSS_{ty} = {value:#x} outside its value space → reading the D3D9 default {default:#x}"
+    );
+    default.to_le_bytes()[0]
 }
 
 /// Clamp a raw D3DRS_*MATERIALSOURCE value into the [0..2] range.

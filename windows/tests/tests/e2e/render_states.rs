@@ -139,6 +139,98 @@ fn set_get_round_trip() {
     }
 }
 
+/// The render states whose value has to land inside a D3D9 enum space.
+///
+/// `SetRenderState` takes a DWORD, so each of these can be handed a value the
+/// space does not contain; the layer reads the state's spec default instead.
+const ENUM_STATES: [u32; 21] = [
+    mtld3d_types::D3DRS_ZFUNC,
+    mtld3d_types::D3DRS_ALPHAFUNC,
+    D3DRS_STENCILFUNC,
+    mtld3d_types::D3DRS_CCW_STENCILFUNC,
+    D3DRS_SRCBLEND,
+    mtld3d_types::D3DRS_SRCBLENDALPHA,
+    D3DRS_DESTBLEND,
+    mtld3d_types::D3DRS_DESTBLENDALPHA,
+    D3DRS_BLENDOP,
+    mtld3d_types::D3DRS_BLENDOPALPHA,
+    D3DRS_CULLMODE,
+    mtld3d_types::D3DRS_STENCILFAIL,
+    mtld3d_types::D3DRS_STENCILZFAIL,
+    D3DRS_STENCILPASS,
+    mtld3d_types::D3DRS_CCW_STENCILFAIL,
+    mtld3d_types::D3DRS_CCW_STENCILZFAIL,
+    mtld3d_types::D3DRS_CCW_STENCILPASS,
+    D3DRS_COLORWRITEENABLE,
+    mtld3d_types::D3DRS_COLORWRITEENABLE1,
+    mtld3d_types::D3DRS_COLORWRITEENABLE2,
+    mtld3d_types::D3DRS_COLORWRITEENABLE3,
+];
+
+#[test]
+fn out_of_range_enum_states_draw_what_the_defaults_draw() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    // Alpha test on so the fixed-function variant key narrows ALPHAFUNC too;
+    // the default compare passes every fragment either way.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_ALPHATESTENABLE, 1),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_ALPHAREF, 0), 0);
+
+    let spec = render_state_defaults();
+    for state in ENUM_STATES {
+        assert_eq!(
+            h.set_render_state(state, spec[state as usize]),
+            0,
+            "SetRenderState {state} default"
+        );
+    }
+    let quad = fill_quad(WHITE);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "in-range draw"
+        );
+    });
+    let expected = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        expected.r > 200 && expected.g > 200 && expected.b > 200,
+        "white under the defaults, got {expected:?}"
+    );
+
+    // A DWORD no D3D9 enum space contains. The call succeeds (native stores
+    // any DWORD) and reads back verbatim, and the draw that follows is the
+    // one the spec default produces.
+    for state in ENUM_STATES {
+        let poison = 0x0001_0000 | spec[state as usize];
+        assert_eq!(
+            h.set_render_state(state, poison),
+            0,
+            "SetRenderState {state} out of range"
+        );
+        assert_eq!(
+            h.render_state(state),
+            poison,
+            "GetRenderState {state} round-trip"
+        );
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "out-of-range draw"
+        );
+    });
+    assert_eq!(
+        Rgba8::from_pixel(h.read_pixel(320, 240)),
+        expected,
+        "out-of-range enum states drew a different frame"
+    );
+}
+
 #[test]
 fn alpha_blend_src_over_dest() {
     let h = Harness::new();

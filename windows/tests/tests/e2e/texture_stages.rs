@@ -799,6 +799,55 @@ fn colorop_round_trips() {
 }
 
 #[test]
+fn out_of_range_stage_states_read_as_the_stage_defaults() {
+    let h = Harness::new();
+    let red = solid_texture(&h, 0xFFFF_0000);
+    let expected = render_stage(
+        &h,
+        &red,
+        D3DTOP_ADD,
+        D3DTA_TEXTURE,
+        D3DTA_DIFFUSE,
+        0xFF00_FF00,
+    );
+
+    // Stage 1 carries no texture and its spec default op is D3DTOP_DISABLE,
+    // which is what a value no D3DTOP_* names reads as, so the cascade still
+    // ends at stage 0 and the frame is the one above.
+    for state in [
+        D3DTSS_COLOROP,
+        D3DTSS_COLORARG1,
+        D3DTSS_COLORARG2,
+        D3DTSS_ALPHAOP,
+        D3DTSS_ALPHAARG1,
+    ] {
+        assert_eq!(
+            h.set_texture_stage_state(1, state, 0x0001_0000),
+            0,
+            "SetTSS {state} out of range"
+        );
+        assert_eq!(
+            h.texture_stage_state(1, state),
+            0x0001_0000,
+            "GetTSS {state} round-trip"
+        );
+    }
+
+    let px = render_stage(
+        &h,
+        &red,
+        D3DTOP_ADD,
+        D3DTA_TEXTURE,
+        D3DTA_DIFFUSE,
+        0xFF00_FF00,
+    );
+    assert_eq!(
+        px, expected,
+        "out-of-range stage-1 states changed the frame"
+    );
+}
+
+#[test]
 fn modulate_texture_by_diffuse() {
     let h = Harness::new();
     let gray = solid_texture(&h, 0xFF80_8080); // 0.5 per channel
