@@ -1543,6 +1543,17 @@ impl DeviceInner {
         self.encoder.mid_frame_submit(frame);
     }
 
+    /// Queue the current frame without presenting or waiting for its submission to finish.
+    ///
+    /// EVENT queries observe GPU retirement separately. They only need to
+    /// hand off the open frame, with the same bounded channel backpressure
+    /// as Present, while the API starts recording its continuation.
+    pub fn flush_current_frame_async(&mut self) {
+        let fresh = self.fresh_frame();
+        let (frame, _) = self.stamp_and_swap(fresh, true);
+        self.encoder.send_frame(frame);
+    }
+
     /// Push the encoder op that binds `binding` as the depth/stencil attachment.
     ///
     /// Factored out of `device_set_depth_stencil_surface` so

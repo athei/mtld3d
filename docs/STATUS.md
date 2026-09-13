@@ -69,6 +69,8 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   D3D9 rejects. No knob.
 - `GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once
   instead of waiting for the GPU. `query.flushImmediate`, off by default.
+- EVENT query polls queue the open frame even without `D3DGETDATA_FLUSH`,
+  so a caller polling before Present can make progress. No knob.
 - Depth stores are elided where nothing reads the buffer back. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.

@@ -184,6 +184,14 @@ record. A knob, where one makes sense, is named with its default.
   loop only as a GPU fence and never reads the count pays API-thread time for
   nothing; the `wow` profile turns it on. Knob: `query.flushImmediate`,
   default `false`.
+- EVENT query polls queue their open frame even without `D3DGETDATA_FLUSH`.
+  D3D9 permits a poll without the flag to remain pending indefinitely. We
+  make progress for callers that fence storage reuse before Present without
+  setting the flag. The first poll splits the frame and queues its work on
+  the existing bounded encoder channel; later polls only read retirement.
+  There is no synchronous encoder or submit completion wait, but admission
+  can backpressure like Present. Completion still requires GPU retirement.
+  No knob.
 - **Depth stores are elided where nothing reads the buffer back.** Content
   relying on depth surviving a pass it never cleared can read stale depth.
   Preserving it unconditionally costs the optimization on every frame of every

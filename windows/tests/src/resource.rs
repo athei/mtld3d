@@ -1553,6 +1553,20 @@ impl Query<'_> {
         unsafe { (self.vtbl().issue)(self.ptr, flags) }
     }
 
+    /// `GetData` into a caller-sized buffer.
+    ///
+    /// `data_u32` always asks for four bytes, so it cannot see what a short
+    /// or oversized read does to the bytes around the result.
+    ///
+    /// # Panics
+    /// Panics if the buffer length does not fit in a `u32`.
+    #[must_use]
+    pub fn data_bytes(&self, buf: &mut [u8], flags: u32) -> i32 {
+        let size = u32::try_from(buf.len()).expect("query read size fits u32");
+        // SAFETY: vtable thunk; `buf` is writable for `size` bytes.
+        unsafe { (self.vtbl().get_data)(self.ptr, buf.as_mut_ptr().cast::<c_void>(), size, flags) }
+    }
+
     /// Read a 4-byte result. Returns `(hr, value)`.
     #[must_use]
     pub fn data_u32(&self, flags: u32) -> (i32, u32) {

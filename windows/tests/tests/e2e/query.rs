@@ -3,10 +3,26 @@
 use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Query};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPT_TRIANGLELIST,
-    D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION, D3DQUERYTYPE_TIMESTAMP, D3DRS_LIGHTING,
-    D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DLOCK_DISCARD,
+    D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DQUERYTYPE_EVENT,
+    D3DQUERYTYPE_OCCLUSION, D3DQUERYTYPE_TIMESTAMP, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, S_FALSE,
 };
+
+/// Poll an EVENT query without other calls that could submit its work.
+fn wait_for_event(q: &Query<'_>, flags: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (hr, value) = q.data_u32(flags);
+        assert!(hr == 0 || hr == S_FALSE, "GetData reported {hr:#x}");
+        assert_eq!(value, u32::from(hr == 0), "BOOL disagrees with status");
+        if hr == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "EVENT did not retire");
+        std::thread::yield_now();
+    }
+}
 
 /// A full-frame quad in clip space at depth `z`, one solid colour.
 const fn full_frame_quad(z: f32) -> [PosColorVertex; 6] {
@@ -88,10 +104,11 @@ fn event_query_signals() {
         .expect("EVENT query is supported");
     assert_eq!(q.data_size(), 4, "EVENT result is a 4-byte BOOL");
 
-    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
-    let (hr, signalled) = q.data_u32(0);
-    assert_eq!(hr, 0, "GetData");
-    assert_eq!(signalled, 1, "EVENT query reports signalled");
+    assert_eq!(q.status(0), 0, "a query never issued is complete");
+    for flags in [0, D3DGETDATA_FLUSH] {
+        assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+        wait_for_event(&q, flags);
+    }
 }
 
 #[test]
@@ -573,4 +590,146 @@ fn occlusion_count_survives_a_reset_between_begin_and_end() {
         "both halves of the span counted, the second against the target the \
          Reset made (~{expected} samples), got {count}"
     );
+}
+
+/// A short EVENT read fills what was asked for and nothing past it.
+///
+/// D3D9 copies the result into the caller's buffer at the caller's size, so a
+/// two-byte read takes the low half of the BOOL and leaves the rest of the
+/// buffer as the caller left it.
+#[test]
+fn a_short_event_read_leaves_the_bytes_past_it_alone() {
+    let h = Harness::new();
+    let q = h
+        .create_query(D3DQUERYTYPE_EVENT)
+        .expect("EVENT query is supported");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+
+    wait_for_event(&q, D3DGETDATA_FLUSH);
+
+    let mut buf = [0xFFu8; 4];
+    assert_eq!(
+        q.data_bytes(&mut buf[..2], D3DGETDATA_FLUSH),
+        0,
+        "2-byte read"
+    );
+    assert_eq!(
+        u16::from_le_bytes([buf[0], buf[1]]),
+        1,
+        "the low half of the BOOL is the signalled value",
+    );
+    assert_eq!(
+        [buf[2], buf[3]],
+        [0xFF, 0xFF],
+        "bytes past the requested size were modified",
+    );
+}
+
+/// An EVENT query gates reuse of a buffer a queued draw still reads.
+///
+/// This is the fence's whole purpose: a title recycles dynamic vertex storage
+/// behind it, so reporting completion early hands back a range a queued draw
+/// is still reading. The buffer is `D3DPOOL_DEFAULT | D3DUSAGE_DYNAMIC`, whose
+/// pages the GPU reads directly, and the refill takes `D3DLOCK_NOOVERWRITE`,
+/// which writes in place. Answering the poll before the draw retires puts the
+/// second colour under the first draw.
+fn event_gates_buffer_reuse(flags: u32) {
+    const DRAWN: u32 = 0xFF00_FF00;
+    const REFILL: u32 = 0xFFFF_0000;
+    const BACKGROUND: u32 = 0xFF00_00FF;
+
+    let h = Harness::new();
+    let stride = u32::try_from(size_of::<PosColorVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(
+        stride * 6,
+        D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+        D3DFVF_XYZ | D3DFVF_DIFFUSE,
+        D3DPOOL_DEFAULT,
+    );
+    arm_for_counting_draws(&h);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+
+    let quad = |color: u32| {
+        let mut q = FULL_FRAME_QUAD;
+        for v in &mut q {
+            v.color = color;
+        }
+        q
+    };
+    vb.lock(0, 0, D3DLOCK_DISCARD).write(&quad(DRAWN));
+
+    let q = h
+        .create_query(D3DQUERYTYPE_EVENT)
+        .expect("EVENT query is supported");
+    for (drawn, refill) in [(DRAWN, REFILL), (REFILL, DRAWN)] {
+        assert_eq!(h.begin_scene(), 0, "BeginScene");
+        assert_eq!(h.clear_target(BACKGROUND), 0, "Clear");
+        assert_eq!(
+            h.draw_primitive(D3DPT_TRIANGLELIST, 0, 2),
+            0,
+            "the draw whose vertices are about to be overwritten",
+        );
+        assert_eq!(h.end_scene(), 0, "EndScene");
+        assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+
+        // Poll without another API call that could submit the pending draw.
+        // Bounded by wall clock rather than iterations, so a slow GPU cannot fail
+        // it for being slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if q.status(flags) == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the EVENT query never reported completion",
+            );
+            std::thread::yield_now();
+        }
+
+        // The fence said the GPU is done, so this range is the application's again.
+        vb.lock(0, 0, D3DLOCK_NOOVERWRITE).write(&quad(refill));
+
+        assert_eq!(
+            h.read_pixel(320, 240),
+            drawn,
+            "the refill landed under a draw the fence said had finished",
+        );
+    }
+}
+
+#[test]
+fn an_event_query_gates_reuse_of_a_buffer_a_draw_is_reading() {
+    event_gates_buffer_reuse(0);
+}
+
+#[test]
+fn an_event_query_flush_gates_buffer_reuse_without_present() {
+    event_gates_buffer_reuse(D3DGETDATA_FLUSH);
+}
+
+#[test]
+fn event_reissue_and_reset_keep_retirement_order() {
+    let h = Harness::new();
+    let q = h.create_query(D3DQUERYTYPE_EVENT).expect("EVENT supported");
+    assert_eq!(h.clear_target(0xFF00_FF00), 0);
+    assert_eq!(q.issue(D3DISSUE_END), 0);
+    wait_for_event(&q, 0);
+
+    assert_eq!(h.clear_target(0xFFFF_0000), 0);
+    assert_eq!(
+        q.issue(D3DISSUE_END),
+        0,
+        "reissue replaces the completed fence"
+    );
+    wait_for_event(&q, D3DGETDATA_FLUSH);
+    assert_eq!(h.read_pixel(320, 240), 0xFFFF_0000);
+
+    assert_eq!(h.clear_target(0xFF00_00FF), 0);
+    assert_eq!(q.issue(D3DISSUE_END), 0);
+    let (width, height) = h.dims();
+    assert_eq!(h.reset(width / 2, height / 2), 0);
+    assert_eq!(q.status(0), 0, "Reset retired the outstanding issue");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "issue after Reset");
+    wait_for_event(&q, 0);
 }
