@@ -730,10 +730,12 @@ unsafe extern "C" {
 /// Process-wide handle to the dynamic-symbol table, resolved once.
 ///
 /// `libloading::os::unix::Library::this()` mirrors the
-/// `dlopen(NULL, …)` / `RTLD_DEFAULT` symbol space — every macdrv
-/// export we need lives inside Wine's process image and is reachable
-/// from here. On the unix backend the `this()` constructor is safe
-/// (no file is loaded; the handle lives for the process lifetime).
+/// `dlopen(NULL, …)` / `RTLD_DEFAULT` symbol space, which is where the
+/// `macdrv_functions` table Wine publishes is reachable from. That table
+/// is the only macdrv symbol winemac's unix library exports, so it is the
+/// only one this handle is asked for. On the unix backend the `this()`
+/// constructor is safe (no file is loaded; the handle lives for the
+/// process lifetime).
 static MACDRV_LIB: LazyLock<Library> = LazyLock::new(Library::this);
 
 /// Run a closure synchronously on `AppKit`'s main thread (libdispatch's main queue).
@@ -969,19 +971,19 @@ fn create_metal_view(
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
 ) -> Option<(*mut c_void, *mut c_void)> {
-    // SAFETY: `get_win_data` is the dlsym'd wine macdrv export resolved at
-    // load; `hwnd` is the PE-supplied window handle (non-zero per the check
-    // in the caller).
+    // SAFETY: `get_win_data` is the table entry resolved at load; `hwnd` is
+    // the PE-supplied window handle (non-zero per the check in the caller).
     let win_data = unsafe { (funcs.get_win_data)(hwnd as *mut c_void) };
     if win_data.is_null() {
         error!(target: LOG_TARGET, "get_win_data returned null for hwnd 0x{hwnd:x}");
         return None;
     }
-    // SAFETY: `win_data` is non-null per the check above and points to a
-    // wine-macdrv `struct macdrv_win_data` valid until `release_win_data`.
+    // SAFETY: `win_data` is non-null per the check above and points to the
+    // record the table's `get_win_data` returns, valid until
+    // `release_win_data`.
     let client_view = unsafe { (*win_data).client_cocoa_view };
-    // SAFETY: `macdrv_view_create_metal_view` is the dlsym'd wine export;
-    // `client_view` is the Cocoa view we just read from `win_data`.
+    // SAFETY: `macdrv_view_create_metal_view` is the table entry resolved at
+    // load; `client_view` is the Cocoa view we just read from `win_data`.
     let view = unsafe {
         (funcs.macdrv_view_create_metal_view)(client_view, device_handle.raw() as *mut c_void)
     };
@@ -989,8 +991,8 @@ fn create_metal_view(
         error!(target: LOG_TARGET, "macdrv_view_create_metal_view returned null");
         None
     } else {
-        // SAFETY: `macdrv_view_get_metal_layer` is the dlsym'd wine export;
-        // `view` is non-null per the surrounding check.
+        // SAFETY: `macdrv_view_get_metal_layer` is the table entry resolved
+        // at load; `view` is non-null per the surrounding check.
         let layer = unsafe { (funcs.macdrv_view_get_metal_layer)(view) };
         if layer.is_null() {
             error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
@@ -1314,35 +1316,18 @@ impl MetalViewPark {
 
 /// Release a metal view through Wine, which removes it from its window on the main thread.
 fn release_metal_view(view: usize) {
-    // Try struct-based lookup first (newer Wine), fall back to the
-    // individual symbol (older Wine).
-    //
-    // SAFETY: symbols resolved from `Library::this()` live for the process
-    // lifetime. `Symbol<*const T>` derefs to the loaded pointer value;
-    // `Symbol<Fn>` derefs to the loaded fn pointer (Copy).
-    let table_sym = unsafe { MACDRV_LIB.get::<*const MacdrvFunctionsTable>(b"macdrv_functions\0") };
-    let release_fn: Option<ReleaseMetalViewFn> = table_sym.ok().map_or_else(
-        || {
-            // SAFETY: same `Library::get` invariant.
-            let sym = unsafe {
-                MACDRV_LIB.get::<ReleaseMetalViewFn>(b"macdrv_view_release_metal_view\0")
-            }
-            .ok()?;
-            Some(*sym)
-        },
-        |table_sym| {
-            // SAFETY: macdrv_functions is a Wine-published process-lifetime
-            // static; the table outlives the process.
-            let table = unsafe { &**table_sym };
-            // SAFETY: `macdrv_view_release_metal_view` is a fn pointer stored
-            // as *mut c_void per Wine's C ABI.
-            unsafe {
-                core::mem::transmute::<*mut c_void, Option<ReleaseMetalViewFn>>(
-                    table.macdrv_view_release_metal_view,
-                )
-            }
-        },
-    );
+    // A process whose Wine publishes no table never created a view through
+    // one either, and `macdrv_functions` has already said so.
+    let Some(table) = macdrv_functions() else {
+        return;
+    };
+    // SAFETY: `macdrv_view_release_metal_view` is a fn pointer stored as
+    // `*mut c_void` per Wine's C ABI; a null entry reads as `None`.
+    let release_fn = unsafe {
+        core::mem::transmute::<*mut c_void, Option<ReleaseMetalViewFn>>(
+            table.macdrv_view_release_metal_view,
+        )
+    };
     if let Some(release) = release_fn {
         // SAFETY: extern "C" Wine entry point; takes the view pointer by
         // value, and `view` is the address `macdrv_view_create_metal_view`
@@ -1351,6 +1336,13 @@ fn release_metal_view(view: usize) {
     }
 }
 
+/// The window data the table's `get_win_data` hands back, as far as we read it.
+///
+/// This is the record that entry is defined to return, whose third and
+/// fourth fields are the window's own Cocoa view and the client view the
+/// call creates. It is not winemac's internal `struct macdrv_win_data`,
+/// which has the client view third and a rect where the fourth field is
+/// here, and which no Wine exports a way to reach.
 #[repr(C)]
 struct MacdrvWinData {
     hwnd: *mut c_void,
@@ -1381,7 +1373,7 @@ struct MacdrvFuncs {
     release_win_data: ReleaseWinDataFn,
     macdrv_view_create_metal_view: CreateMetalViewFn,
     macdrv_view_get_metal_layer: GetMetalLayerFn,
-    /// `macdrv_get_cocoa_window`, `None` on a Wine that does not export it.
+    /// `macdrv_get_cocoa_window`, `None` when the table's entry is null.
     ///
     /// Answers which Cocoa window an `HWND` has right now, without the client
     /// surface `get_win_data` creates; a kept view is only reused inside that
@@ -1389,76 +1381,61 @@ struct MacdrvFuncs {
     macdrv_get_cocoa_window: Option<GetCocoaWindowFn>,
 }
 
+/// The `macdrv_functions` table, or `None` on a Wine that publishes none.
+///
+/// The table is the whole of the layer's access to winemac: it is the only
+/// macdrv symbol the driver's unix library exports, and its `get_win_data`
+/// is the only one that answers with a [`MacdrvWinData`]. A Wine without it
+/// gives no window a Metal layer, which is what the warning here says.
+fn macdrv_functions() -> Option<&'static MacdrvFunctionsTable> {
+    // SAFETY: `macdrv_functions` is a Wine-published process-lifetime
+    // static; `Symbol<*const T>` derefs to the loaded pointer value.
+    let Ok(table_sym) =
+        (unsafe { MACDRV_LIB.get::<*const MacdrvFunctionsTable>(b"macdrv_functions\0") })
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: this Wine publishes no macdrv_functions table; no window can be given a \
+             Metal layer",
+        );
+        return None;
+    };
+    // SAFETY: Wine guarantees the address is non-null and the table outlives
+    // the process.
+    Some(unsafe { &**table_sym })
+}
+
 impl MacdrvFuncs {
     fn load() -> Option<Self> {
-        // Try struct-based lookup first (newer Wine).
-        if let Ok(table_sym) =
-            // SAFETY: `macdrv_functions` is a Wine-published process-lifetime
-            // static; `Symbol<*const T>` derefs to the loaded pointer value.
-            unsafe { MACDRV_LIB.get::<*const MacdrvFunctionsTable>(b"macdrv_functions\0") }
-        {
-            // SAFETY: Wine guarantees the address is non-null and the table
-            // outlives the process.
-            let table = unsafe { &**table_sym };
-            return Some(Self {
-                // SAFETY: table entry is a fn pointer stored as `*mut c_void`
-                // per Wine's C ABI; transmute reinterprets to the typed fn.
-                get_win_data: unsafe {
-                    core::mem::transmute::<*mut c_void, GetWinDataFn>(table.get_win_data)
-                },
-                // SAFETY: as above.
-                release_win_data: unsafe {
-                    core::mem::transmute::<*mut c_void, ReleaseWinDataFn>(table.release_win_data)
-                },
-                // SAFETY: as above.
-                macdrv_view_create_metal_view: unsafe {
-                    core::mem::transmute::<*mut c_void, CreateMetalViewFn>(
-                        table.macdrv_view_create_metal_view,
-                    )
-                },
-                // SAFETY: as above.
-                macdrv_view_get_metal_layer: unsafe {
-                    core::mem::transmute::<*mut c_void, GetMetalLayerFn>(
-                        table.macdrv_view_get_metal_layer,
-                    )
-                },
-                // SAFETY: as above; a null entry reads as `None`.
-                macdrv_get_cocoa_window: unsafe {
-                    core::mem::transmute::<*mut c_void, Option<GetCocoaWindowFn>>(
-                        table.macdrv_get_cocoa_window,
-                    )
-                },
-            });
-        }
-
-        // Fallback: load individual symbols (older Wine).
-        // SAFETY: `libloading::Library::get::<T>` returns a `Symbol<T>` whose
-        // deref is the loaded fn pointer; `Library::this()` lives for the
-        // process lifetime. Same rationale for the four `MACDRV_LIB.get`
-        // calls below.
-        let get_win_data = unsafe { MACDRV_LIB.get::<GetWinDataFn>(b"get_win_data\0") }.ok()?;
-        // SAFETY: as above.
-        let release_win_data =
-            unsafe { MACDRV_LIB.get::<ReleaseWinDataFn>(b"release_win_data\0") }.ok()?;
-        // SAFETY: as above.
-        let create_view =
-            unsafe { MACDRV_LIB.get::<CreateMetalViewFn>(b"macdrv_view_create_metal_view\0") }
-                .ok()?;
-        // SAFETY: as above.
-        let get_layer =
-            unsafe { MACDRV_LIB.get::<GetMetalLayerFn>(b"macdrv_view_get_metal_layer\0") }.ok()?;
-        // SAFETY: as above; an older Wine may not export it, which only costs
-        // the kept-view reuse.
-        let get_cocoa_window =
-            unsafe { MACDRV_LIB.get::<GetCocoaWindowFn>(b"macdrv_get_cocoa_window\0") }
-                .ok()
-                .map(|sym| *sym);
+        let table = macdrv_functions()?;
         Some(Self {
-            get_win_data: *get_win_data,
-            release_win_data: *release_win_data,
-            macdrv_view_create_metal_view: *create_view,
-            macdrv_view_get_metal_layer: *get_layer,
-            macdrv_get_cocoa_window: get_cocoa_window,
+            // SAFETY: table entry is a fn pointer stored as `*mut c_void`
+            // per Wine's C ABI; transmute reinterprets to the typed fn.
+            get_win_data: unsafe {
+                core::mem::transmute::<*mut c_void, GetWinDataFn>(table.get_win_data)
+            },
+            // SAFETY: as above.
+            release_win_data: unsafe {
+                core::mem::transmute::<*mut c_void, ReleaseWinDataFn>(table.release_win_data)
+            },
+            // SAFETY: as above.
+            macdrv_view_create_metal_view: unsafe {
+                core::mem::transmute::<*mut c_void, CreateMetalViewFn>(
+                    table.macdrv_view_create_metal_view,
+                )
+            },
+            // SAFETY: as above.
+            macdrv_view_get_metal_layer: unsafe {
+                core::mem::transmute::<*mut c_void, GetMetalLayerFn>(
+                    table.macdrv_view_get_metal_layer,
+                )
+            },
+            // SAFETY: as above; a null entry reads as `None`.
+            macdrv_get_cocoa_window: unsafe {
+                core::mem::transmute::<*mut c_void, Option<GetCocoaWindowFn>>(
+                    table.macdrv_get_cocoa_window,
+                )
+            },
         })
     }
 }
