@@ -3469,20 +3469,6 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
                 ti.detach_from_device();
             }
         }
-        // The back buffer's sRGB twin view has no slot on the queue-destroy
-        // thunk, so it goes first; the view holds a retain on the base
-        // texture that thunk then releases.
-        if !device_inner.backbuffer_srgb_handle.is_null() {
-            let handle = device_inner.backbuffer_srgb_handle.raw();
-            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
-                kind: mtld3d_shared::mtl::DestroyKind::Texture,
-                pad0: 0,
-                handles_ptr: (&raw const handle) as u64,
-                count: 1,
-                pad1: 0,
-            };
-            unix_call(&mut destroy);
-        }
         let mut params = DestroyCommandQueueParams {
             device_handle: device_inner.device_handle,
             queue_handle: device_inner.queue_handle,
@@ -3491,10 +3477,19 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             pipeline_handle: MetalHandle::NULL, // pipelines managed by encoder cache
             depth_texture_handle: device_inner.depth_stencil_handle,
         };
-        // The back buffer's multisampled companion has no slot on the destroy
-        // thunk; it goes out with the bulk release, issued below once the
-        // encoder shutdown has waited for the GPU.
-        let backbuffer_msaa_handle = device_inner.backbuffer_msaa_handle;
+        // Neither the back buffer's sRGB twin view nor its multisampled
+        // companion has a slot on the destroy thunk; both go out with the bulk
+        // release, issued below once the encoder shutdown has waited for the
+        // GPU, so a frame the encoder or the submit thread still holds keeps
+        // naming live textures. The twin is listed first: it holds a retain on
+        // the base texture the thunk then releases.
+        let implicit_handles: Vec<u64> = [
+            device_inner.backbuffer_srgb_handle.raw(),
+            device_inner.backbuffer_msaa_handle.raw(),
+        ]
+        .into_iter()
+        .filter(|&handle| handle != 0)
+        .collect();
         let parent = device_inner.direct3d as *mut c_void;
 
         // Hand the window back before the subclass goes: the restore issues a
@@ -3554,13 +3549,12 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // Locked has been released.
         device_inner.shutdown();
 
-        if !backbuffer_msaa_handle.is_null() {
-            let handles = [backbuffer_msaa_handle.raw()];
+        if !implicit_handles.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
                 pad0: 0,
-                handles_ptr: handles.as_ptr() as u64,
-                count: 1,
+                handles_ptr: implicit_handles.as_ptr() as u64,
+                count: u32::try_from(implicit_handles.len()).expect("at most 2 handles"),
                 pad1: 0,
             };
             unix_call(&mut destroy);
