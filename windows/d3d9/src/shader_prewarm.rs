@@ -3,17 +3,16 @@
 //! Spawned once at `CreateDevice`, reads `<host-exe-dir>/mtld3d_shaders.bin`,
 //! recreates every valid shader library and render pipeline, and ships the
 //! resulting device-local handles to the encoder over a dedicated one-shot
-//! `PrewarmSender` channel. The encoder blocks on that channel before draining
+//! completion channel. The encoder blocks on that channel before draining
 //! any `EncoderMessage`, so live miss-compiles cannot duplicate prewarm work.
 
 use std::{
     path::Path,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use log::{error, info};
@@ -25,6 +24,7 @@ use mtld3d_core::{
     pipeline_state::{self, PipelineBuildInputs},
     shader_cache::{self, CacheLoad, CachedKind, ShaderRecordRef},
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
+    shader_prewarm::PrewarmHandle,
 };
 use mtld3d_shared::{
     MetalHandle,
@@ -36,95 +36,43 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     LOG_TARGET,
-    encoder::{PrewarmSender, WarmCache, compile_stage_library, shader_cache_path},
+    encoder::{WarmCache, compile_stage_library, shader_cache_path},
     unix_call::unix_call,
 };
 
-/// Lifetime handle for the prewarm thread.
+/// Start prewarm for one device and return its startup barrier.
 ///
-/// Held by `DeviceInner` and cancelled at `device_release` so a long Metal
-/// `newLibraryWithSource:` in flight can't issue `unix_call`s concurrently
-/// with `shutdown_cleanup` (Metal's device-internal locks would serialise
-/// the two and stretch shutdown into the seconds).
-pub struct PrewarmHandle {
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
-
-impl PrewarmHandle {
-    /// Set the stop flag and wait for the prewarm thread to finish.
-    ///
-    /// The prewarm loop checks the flag between compiles, so the wait
-    /// does not start another shader or pipeline compile after cancellation.
-    /// An in-flight Metal call or cache operation must still finish. Idempotent.
-    pub fn cancel_and_join(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            // Don't call `j.join()`. On long sessions Wine reports
-            // `STATUS_INVALID_HANDLE` for the prewarm thread's Win32
-            // handle (mechanism not yet identified —
-            // `server/thread.c:1141` `wait_on_handles` ->
-            // `get_handle_obj` NULL -> "os error 6"). std's
-            // `JoinHandle::join` panics on `WAIT_FAILED`, and
-            // `panic = "abort"` makes `catch_unwind` a no-op.
-            // `is_finished` reads the std Packet `Arc` strong count
-            // (handle-independent); Drop CloseHandles the
-            // possibly-invalid handle silently.
-            while !j.is_finished() {
-                thread::sleep(Duration::from_millis(1));
-            }
-            drop(j);
-        }
-    }
-}
-
-/// Spawn the pre-warm thread for one `CreateDevice` call.
-///
-/// Each call spawns its own thread because each device gets a distinct
-/// `EncoderThread` whose `cache_ready` must be flipped via its own
-/// `PrewarmSender`. `MTLLibrary` handles compiled for one `MTLDevice` would
-/// not be valid on another, so per-device runs are also correct (no shared
-/// cross-device state).
+/// Every device owns its libraries and pipelines. The worker's result reaches
+/// the encoder before frames, and an unavailable worker disables cache writes.
 pub fn spawn(
     device_handle: MetalHandle<MTLDeviceKind>,
-    sender: PrewarmSender,
     shader_cache: bool,
-) -> PrewarmHandle {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = stop.clone();
-    let join = thread::Builder::new()
-        .name("mtld3d-shader-prewarm".into())
-        .spawn(move || run(device_handle, sender, &stop_for_thread, shader_cache))
-        .ok();
-    PrewarmHandle { stop, join }
+) -> (PrewarmHandle, Receiver<Option<WarmCache>>) {
+    PrewarmHandle::spawn(move |stop| run(device_handle, stop, shader_cache))
 }
 
 /// The pre-warm body; `shader_cache` is the interface's `shaderCache.enable`.
 fn run(
     device_handle: MetalHandle<MTLDeviceKind>,
-    sender: PrewarmSender,
     stop: &AtomicBool,
     shader_cache: bool,
-) {
+) -> Option<WarmCache> {
     if !shader_cache {
         info!(
             target: LOG_TARGET,
             "shader_cache: shaderCache.enable = false, skipping pre-warm"
         );
-        sender.send(WarmCache::empty());
-        return;
+        return Some(WarmCache::empty());
     }
     let started = Instant::now();
 
     let Some(path) = shader_cache_path() else {
-        sender.send(WarmCache::empty());
-        return;
+        return Some(WarmCache::empty());
     };
 
     let mut records = match shader_cache::load(&path) {
         Ok(CacheLoad::Missing) => {
-            sender.send(WarmCache::empty());
-            return;
+            return Some(WarmCache::empty());
         }
         Ok(CacheLoad::InvalidatedVersion(header)) => {
             info!(
@@ -133,16 +81,14 @@ fn run(
                 header.format_version,
                 header.shader_schema_version,
             );
-            sender.send(WarmCache::empty());
-            return;
+            return Some(WarmCache::empty());
         }
         Ok(CacheLoad::InvalidatedWrongMagic) => {
             info!(
                 target: LOG_TARGET,
                 "shader_cache: wrong magic in mtld3d_shaders.bin, wiped"
             );
-            sender.send(WarmCache::empty());
-            return;
+            return Some(WarmCache::empty());
         }
         Ok(CacheLoad::Current(records)) => records,
         Err(e) => {
@@ -150,8 +96,7 @@ fn run(
                 target: LOG_TARGET,
                 "shader_cache: read mtld3d_shaders.bin failed, cache disabled: {e}"
             );
-            sender.send_disabled();
-            return;
+            return None;
         }
     };
 
@@ -318,11 +263,11 @@ fn run(
         started.elapsed().as_secs_f64(),
         stop.load(Ordering::Acquire),
     );
-    sender.send(WarmCache {
+    Some(WarmCache {
         libraries: libraries.into_iter().collect(),
         pipelines: pipelines.into_iter().collect(),
         no_color_siblings,
-    });
+    })
 }
 
 /// Replace `path` with one Bundle containing the latest valid records.

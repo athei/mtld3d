@@ -456,7 +456,7 @@ pub struct DeviceInner {
     /// step — otherwise an in-flight prewarm `CompileShaderLibrary`
     /// thunk would race with `shutdown_cleanup`'s destroy thunks on
     /// the same `MTLDevice`.
-    prewarm: crate::shader_prewarm::PrewarmHandle,
+    prewarm: mtld3d_core::shader_prewarm::PrewarmHandle,
     current_frame: FrameData,
     /// Shared with the encoder thread and the unix completion handler.
     ///
@@ -2727,7 +2727,7 @@ pub struct DeviceCreateInfo {
     /// Resolved `render.scale`, already forced to identity where unusable.
     pub render_scale: mtld3d_core::render_scale::RenderScale,
     pub encoder: EncoderThread,
-    pub prewarm: crate::shader_prewarm::PrewarmHandle,
+    pub prewarm: mtld3d_core::shader_prewarm::PrewarmHandle,
     pub current_frame: FrameData,
     pub render_states: [u32; RENDER_STATE_COUNT],
     pub sampler_states: [[u32; SAMPLER_STATE_COUNT]; STAGE_COUNT],

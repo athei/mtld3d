@@ -9054,7 +9054,6 @@ impl FrameData {
 
 pub struct EncoderThread {
     sender: mpsc::SyncSender<EncoderMessage>,
-    prewarm_tx: mpsc::SyncSender<PrewarmPayload>,
     handle: Option<thread::JoinHandle<()>>,
     /// The device capabilities the encoder was spawned with.
     ///
@@ -9062,20 +9061,6 @@ pub struct EncoderThread {
     /// decision (which upload path a mip takes, and therefore which command
     /// buffer reads its staging) read the same values the encoder does.
     gpu_caps: GpuCaps,
-}
-
-/// Pre-warm completion payload.
-///
-/// Carried on a dedicated one-shot channel rather than wrapped in
-/// `EncoderMessage`, so the encoder thread can block specifically on
-/// the prewarm result *before* touching the `Frame` queue. Without this
-/// split the API thread could push a `Frame` into the (cap = 1)
-/// `EncoderMessage` channel ahead of the prewarm's completion message,
-/// causing the encoder to compile a shader from scratch that the
-/// prewarm is concurrently compiling from disk.
-struct PrewarmPayload {
-    warm: WarmCache,
-    writes_disabled: bool,
 }
 
 /// Device-local objects created from the persistent cache before frame intake.
@@ -9096,50 +9081,19 @@ impl WarmCache {
     }
 }
 
-/// One-shot sender used by the shader pre-warm thread.
-///
-/// Wraps the dedicated `PrewarmPayload` channel so callers outside this
-/// module never see the encoder-private type.
-pub struct PrewarmSender(mpsc::SyncSender<PrewarmPayload>);
-
-impl PrewarmSender {
-    /// Normal completion.
-    ///
-    /// Ship pre-warmed handles (empty vec for a cold start) and let the
-    /// encoder open the cache for append.
-    pub fn send(self, warm: WarmCache) {
-        let _ = self.0.send(PrewarmPayload {
-            warm,
-            writes_disabled: false,
-        });
-    }
-
-    /// The cache file is unusable for this session.
-    ///
-    /// Prewarm couldn't read it but the file exists, so the encoder must
-    /// not append (it would corrupt the existing content past the foreign
-    /// bytes). `cache_ready` still flips so the encoder progresses out of
-    /// its "prewarm not done" gate; `cache_disabled` latches so writes
-    /// stay off for the rest of the session.
-    pub fn send_disabled(self) {
-        let _ = self.0.send(PrewarmPayload {
-            warm: WarmCache::empty(),
-            writes_disabled: true,
-        });
-    }
-}
-
 impl EncoderThread {
-    pub fn spawn(gpu_caps: GpuCaps, config: Arc<Mtld3dConfig>) -> Self {
+    pub fn spawn(
+        gpu_caps: GpuCaps,
+        config: Arc<Mtld3dConfig>,
+        prewarm_rx: mpsc::Receiver<Option<WarmCache>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(1);
-        let (prewarm_tx, prewarm_rx) = mpsc::sync_channel::<PrewarmPayload>(1);
         let handle = thread::Builder::new()
             .name("mtld3d-encoder".into())
             .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps, config))
             .expect("mtld3d: failed to spawn encoder thread");
         Self {
             sender,
-            prewarm_tx,
             handle: Some(handle),
             gpu_caps,
         }
@@ -9221,17 +9175,6 @@ impl EncoderThread {
             done: done_tx,
         });
         let _ = done_rx.recv();
-    }
-
-    /// Detached sender used by the shader pre-warm thread to deliver its completion payload.
-    ///
-    /// The encoder thread blocks on this channel before processing any
-    /// `EncoderMessage`, so the prewarm always populates `lib_cache` first
-    /// and live miss-compiles never race duplicate disk-cached entries.
-    /// Empty payload is the "cold launch, file is fresh, you may start
-    /// writing" signal that flips `cache_ready`.
-    pub fn prewarm_sender(&self) -> PrewarmSender {
-        PrewarmSender(self.prewarm_tx.clone())
     }
 
     pub fn shutdown(&mut self) {
@@ -9394,7 +9337,7 @@ fn destroy_resources_bulk(kind: DestroyKind, handles: &[u64]) {
 
 fn encoder_thread_main(
     receiver: &mpsc::Receiver<EncoderMessage>,
-    prewarm_rx: &mpsc::Receiver<PrewarmPayload>,
+    prewarm_rx: &mpsc::Receiver<Option<WarmCache>>,
     gpu_caps: GpuCaps,
     config: Arc<Mtld3dConfig>,
 ) {
@@ -9427,17 +9370,12 @@ fn encoder_thread_main(
     // so at most one Frame is buffered ahead of prewarm completion — and
     // we never process it until `lib_cache` is populated. Live
     // miss-compiles can therefore never duplicate a shader the prewarm
-    // is about to deliver. The Err arm covers a prewarm-thread panic:
-    // drop the warm cache, leave writes enabled, fall through so
-    // subsequent `Shutdown` can still drain.
-    if let Ok(payload) = prewarm_rx.recv() {
-        enc.ingest_warm_cache(payload.warm, payload.writes_disabled);
+    // is about to deliver. Disconnection releases the barrier but cannot
+    // authorize writes: prewarm may never have validated the cache file.
+    if let Some(warm) = mtld3d_core::shader_prewarm::receive(prewarm_rx) {
+        enc.ingest_warm_cache(warm, false);
     } else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "shader_cache: pre-warm channel closed without payload → starting cold"
-        );
-        enc.ingest_warm_cache(WarmCache::empty(), false);
+        enc.ingest_warm_cache(WarmCache::empty(), true);
     }
 
     loop {
