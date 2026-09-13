@@ -40,7 +40,7 @@ mod cursor_bitmap;
 static ENVIRONMENT: RwLock<()> = RwLock::new(());
 
 /// The environment variable the layer reads its configuration overrides from.
-const CONFIG_VAR: &str = "MTLD3D_CONFIG";
+pub const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
 /// The display mode of the wineserver session, held by one fullscreen device at a time.
 ///
