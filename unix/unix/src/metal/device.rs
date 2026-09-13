@@ -15,7 +15,7 @@ use objc2_metal::{
 
 use super::{
     handle::{IntoRetained, ReleaseRetain},
-    macdrv::{detach_metal_layer, release_metal_view},
+    macdrv::{detach_metal_layer, retire_metal_view},
 };
 use crate::LOG_TARGET;
 
@@ -251,7 +251,8 @@ pub fn create_command_queue() -> Option<DeviceCaps> {
 
 /// Releases `MTLDevice` + `MTLCommandQueue` + backbuffer + pipeline.
 ///
-/// If `view_handle` is non-null, releases the macdrv metal view.
+/// If `view_handle` is non-null, retires the macdrv metal view: kept for the
+/// window's next device, see `macdrv::retire_metal_view`.
 pub fn destroy_command_queue(
     device_handle: MetalHandle<MTLDeviceKind>,
     queue_handle: MetalHandle<MTLCommandQueueKind>,
@@ -263,7 +264,7 @@ pub fn destroy_command_queue(
     // Drop the latched view, layer and window first: the main thread
     // reconciles them against the display it is told about, and this call is
     // about to release the view all three belong to.
-    detach_metal_layer(view_handle);
+    let record = detach_metal_layer(view_handle);
 
     // Force-drain any in-flight or recently-completed command buffers
     // before we drop the queue + device. The PE-side encoder already
@@ -305,7 +306,7 @@ pub fn destroy_command_queue(
     // SAFETY: as above.
     unsafe { device_handle.release_retain() };
     if !view_handle.is_null() {
-        release_metal_view(view_handle);
+        retire_metal_view(view_handle, record.as_deref());
     }
 }
 

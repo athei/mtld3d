@@ -253,16 +253,18 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
 /// `DetachMetalLayer`: retire one view's attachment record, then the view.
 ///
 /// The order is the one `DestroyCommandQueue` uses: the record goes out of
-/// the registry before the view it names is released, so the process-lifetime
-/// observers never walk a freed view. Sent by a `Reset` that retargets the
-/// device at another window, which attaches a fresh view straight after.
+/// the registry before the view it names is retired, so the process-lifetime
+/// observers never walk a view that is being released. Sent by a `Reset` that
+/// retargets the device at another window, which attaches a view there
+/// straight after; the retired view stays kept for a device that comes back
+/// to its window.
 pub extern "C" fn detach_metal_layer_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *const DetachMetalLayerParams.
     let Some(params) = (unsafe { InPtr::<DetachMetalLayerParams>::opt(args.cast()) }) else {
         return -1;
     };
-    metal::detach_metal_layer(params.view_handle);
-    metal::release_metal_view(params.view_handle);
+    let record = metal::detach_metal_layer(params.view_handle);
+    metal::retire_metal_view(params.view_handle, record.as_deref());
     info!(
         target: LOG_TARGET,
         "detached Metal layer (view {:#x})",

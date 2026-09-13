@@ -74,6 +74,10 @@ bitflags::bitflags! {
 
 /// What attach latched for a record, handed to [`register`].
 pub struct AttachLatches {
+    /// The guest window the view was attached to.
+    ///
+    /// Names the window the view is kept for once the device is gone.
+    pub hwnd: u64,
     pub flags: AttachFlags,
     /// `color.space` from `mtld3d.conf`.
     ///
@@ -101,6 +105,8 @@ pub struct Attachment {
     view: usize,
     /// Raw `CAMetalLayer*` of that view.
     layer: usize,
+    /// See [`AttachLatches::hwnd`].
+    hwnd: u64,
     /// See [`AttachLatches::backing_scale_sink`].
     backing_scale_sink: usize,
     /// See [`AttachLatches::cursor_kick_sink`].
@@ -183,6 +189,7 @@ impl Attachment {
         Self {
             view,
             layer,
+            hwnd: latches.hwnd,
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
             flags: latches.flags,
@@ -211,6 +218,12 @@ impl Attachment {
     #[must_use]
     pub const fn layer(&self) -> usize {
         self.layer
+    }
+
+    /// The guest window the view was attached to.
+    #[must_use]
+    pub const fn hwnd(&self) -> u64 {
+        self.hwnd
     }
 
     /// `color.hdr.enable` as the attach carried it.

@@ -3381,6 +3381,46 @@ fn a_second_device_renders_after_the_first_is_destroyed() {
 }
 
 #[test]
+fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
+    // Releasing a device keeps its window's metal view for the next device
+    // on that window, and Wine hands the kept view back to that device's
+    // attach, so the second device here presents through the first one's
+    // layer rather than through a layer of its own. Both present past the
+    // display-reconciliation interval and read back their own colour; the
+    // first device's reference goes while its window stays, and the second
+    // device is created on that window.
+    const PRESENTS: u32 = 40;
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    for _ in 0..PRESENTS {
+        first.render_once(RED, |_| {});
+    }
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "first device");
+    assert_eq!(
+        first.release_device(),
+        0,
+        "the first device is fully released"
+    );
+
+    let second = Harness::create(&HarnessConfig {
+        device_window: first.hwnd(),
+        ..HarnessConfig::default()
+    });
+    for _ in 0..PRESENTS {
+        second.render_once(BLUE, |_| {});
+    }
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        BLUE,
+        "second device on the first device's window",
+    );
+    // The window is the first harness's to destroy, after the device on it.
+    drop(second);
+}
+
+#[test]
 fn a_harness_with_its_own_configuration_leaves_the_environment_alone() {
     // The entries a harness carries are resolved by its own `Direct3DCreate9`
     // and never stay in `MTLD3D_CONFIG`, where every later interface in the

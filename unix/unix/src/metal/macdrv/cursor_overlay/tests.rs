@@ -290,6 +290,7 @@ fn attachment(view: usize) -> std::sync::Arc<super::Attachment> {
         view,
         view + 8,
         &super::attachment::AttachLatches {
+            hwnd: 0x40,
             flags: super::attachment::AttachFlags::empty(),
             color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
             pacing_bits: 0,

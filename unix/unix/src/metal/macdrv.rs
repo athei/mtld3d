@@ -28,24 +28,25 @@ pub use cursor_overlay::{poll_capture_from_present, set_cursor_overlay};
 
 /// Retire the attachment record `view_handle` names. **Device teardown only.**
 ///
-/// The teardown path releases that metal view, so the view, its layer and its
-/// window stop being valid the moment it runs. Unregistering the record
-/// before the release is what keeps the process-lifetime screen-parameter,
-/// occlusion and pointer observers from walking a freed view: every
-/// dereference they make goes through the registry, which either retains the
-/// object while the record is live or finds it gone. Everything the display
+/// The teardown path then retires that metal view, keeping it for the
+/// window's next device or releasing it ([`retire_metal_view`]), so the view,
+/// its layer and its window may not be reached through the record from the
+/// moment this runs. Unregistering the record first is what keeps the
+/// process-lifetime screen-parameter, occlusion and pointer observers from
+/// walking a view that is about to be released: every dereference they make
+/// goes through the registry, which either retains the object while the
+/// record is live or finds it gone. Everything the display
 /// decided for that window goes with the record, and the PE-side sinks it
 /// published into are never written again, since the device is about to drop
 /// them.
 ///
-/// Only the record of this view is retired. A device that never attached
-/// finds no record, and another device's record is untouched.
-pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
+/// Only the record of this view is retired, and it is handed back so the
+/// view's retirement knows the window it served. A device that never
+/// attached finds no record, and another device's record is untouched.
+pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<Attachment>> {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
-    let Some(att) = attachment::unregister(view_addr) else {
-        return;
-    };
+    let att = attachment::unregister(view_addr)?;
     cursor_overlay::detach(&att);
     debug!(
         target: LOG_TARGET,
@@ -53,6 +54,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) {
         att.view(),
         att.layer(),
     );
+    Some(att)
 }
 
 /// Tell macOS this process is doing continuous, latency-critical, user-interactive work.
@@ -702,6 +704,7 @@ type ReleaseWinDataFn = unsafe extern "C" fn(*mut MacdrvWinData);
 type CreateMetalViewFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type GetMetalLayerFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type ReleaseMetalViewFn = unsafe extern "C" fn(*mut c_void);
+type GetCocoaWindowFn = unsafe extern "C" fn(*mut c_void, i32) -> *mut c_void;
 
 unsafe extern "C" {
     /// libdispatch's main-queue singleton, exported by libSystem as `_dispatch_main_q`.
@@ -850,27 +853,133 @@ pub fn attach_metal_layer(
     }
 
     let funcs = MacdrvFuncs::load()?;
+    // A view kept from this window's previous device is taken as it is; only
+    // a window with none gets a view from Wine.
+    let kept = kept_metal_view(&funcs, hwnd);
+    let (view, layer) = match kept {
+        Some(kept) => kept,
+        None => create_metal_view(&funcs, hwnd, device_handle)?,
+    };
+    // AppKit owns the view's window and screen relationships on the main
+    // thread; the view is retained for as long as the device holds it.
+    let mut hint = None;
+    run_on_main_thread_sync(|| {
+        let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
+        hint = Some(view_display_caps(view, mtm));
+    });
+    let hint = hint.expect("synchronous display lookup completed");
+    if kept.is_some() {
+        info!(
+            target: LOG_TARGET,
+            "present: metal view {:#x} kept from the previous device on window {hwnd:#x} is \
+             attached again, layer and all",
+            view as usize,
+        );
+    }
+    // The cursor scale follows Wine's retina mode, which the layer
+    // carries as its contents scale, not the display's own factor: in
+    // non-retina mode macOS already doubles everything the game draws,
+    // its cursor included.
+    let backing_scale = backing_scale_from(layer_contents_scale(layer));
+    // Decide HDR vs SDR layer configuration from the panel's
+    // static potential + the user's `color.hdr.enable` setting. The
+    // result is the configuration the layer now carries; the user
+    // gate stays unix-side from here on.
+    let mode = resolve_layer_mode(
+        hint.edr_potential,
+        hint.screen_name.as_deref(),
+        hint.colorspace_flags.contains(ColorspaceFlags::IS_HDR),
+        hint.colorspace_flags
+            .contains(ColorspaceFlags::IS_WIDE_GAMUT),
+        hdr_enable,
+    );
+    // The record holds the layer and everything the display-follow
+    // path needs to reconfigure it for a screen that was not attached
+    // yet: the same gate and colorspace policy attach applied, the
+    // guest's vsync ask, the user's frame cap and the scale the PE
+    // side is already using.
+    let mut flags = AttachFlags::empty();
+    flags.set(AttachFlags::HDR_ENABLE_REQUESTED, hdr_enable);
+    flags.set(AttachFlags::HDR_ACTIVE, mode == LayerMode::Hdr);
+    let att = attachment::register(
+        view as usize,
+        layer as usize,
+        &AttachLatches {
+            hwnd,
+            flags,
+            color_space,
+            pacing_bits: pack_pacing(&pacing),
+            backing_scale,
+            backing_scale_sink: usize::try_from(backing_scale_sink_ptr)
+                .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
+                .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+        },
+    );
+    attachment::publish_backing_scale(&att, backing_scale);
+    // The software cursor rides the same decision: the overlay window
+    // is a compositing cost an EDR layer already pays.
+    let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
+    info!(
+        target: LOG_TARGET,
+        "cursor: software overlay {} (cursor.software = {software_cursor:?}, layer {mode:?})",
+        if software_cursor_active { "on" } else { "off" },
+    );
+    let min_present_duration = configure_metal_layer(
+        layer,
+        device_handle.raw(),
+        width,
+        height,
+        &pacing,
+        hint.panel_max_hz,
+        LayerColorConfig {
+            mode,
+            color_space,
+            native_colorspace: hint.native_colorspace,
+            screen_name: hint.screen_name,
+            screen_profile_name: hint.screen_profile_name,
+        },
+    );
+    att.set_min_present_duration(min_present_duration);
+    // Start occlusion tracking for this window so presents skip the
+    // `nextDrawable` timeout while it is fully covered/minimised.
+    install_occlusion_tracking(&att);
+    // SAFETY: the view is the one `macdrv_view_create_metal_view` handed
+    // out retained, either just now or for this window's previous device,
+    // kept since. The PE side holds the handle until the matching retire.
+    let view_handle = unsafe { MetalHandle::<NSViewKind>::new(view as u64) };
+    // SAFETY: as the comment above; Wine retains the `CAMetalLayer` for the
+    // view's lifetime.
+    let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(layer as u64) };
+    let caps = DisplayCaps {
+        backing_scale,
+        software_cursor_active,
+    };
+    Some((view_handle, layer_handle, caps))
+}
 
+/// Create a metal view and its layer on `hwnd`'s client view through Wine.
+///
+/// Wine creates a client surface for the window on every `get_win_data`,
+/// with a cocoa view the metal view is then created in, and makes that
+/// surface the one it shows. `None`, with the failure logged, when any step
+/// hands back null.
+fn create_metal_view(
+    funcs: &MacdrvFuncs,
+    hwnd: u64,
+    device_handle: MetalHandle<MTLDeviceKind>,
+) -> Option<(*mut c_void, *mut c_void)> {
     // SAFETY: `get_win_data` is the dlsym'd wine macdrv export resolved at
     // load; `hwnd` is the PE-supplied window handle (non-zero per the check
-    // above).
+    // in the caller).
     let win_data = unsafe { (funcs.get_win_data)(hwnd as *mut c_void) };
     if win_data.is_null() {
         error!(target: LOG_TARGET, "get_win_data returned null for hwnd 0x{hwnd:x}");
         return None;
     }
-
     // SAFETY: `win_data` is non-null per the check above and points to a
     // wine-macdrv `struct macdrv_win_data` valid until `release_win_data`.
     let client_view = unsafe { (*win_data).client_cocoa_view };
-    // The window-data lock keeps the view alive across the dispatch. AppKit
-    // owns its window and screen relationships on the main thread.
-    let mut hint = None;
-    run_on_main_thread_sync(|| {
-        let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
-        hint = Some(view_display_caps(client_view, mtm));
-    });
-    let hint = hint.expect("synchronous display lookup completed");
     // SAFETY: `macdrv_view_create_metal_view` is the dlsym'd wine export;
     // `client_view` is the Cocoa view we just read from `win_data`.
     let view = unsafe {
@@ -887,93 +996,66 @@ pub fn attach_metal_layer(
             error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
             None
         } else {
-            // The cursor scale follows Wine's retina mode, which the layer
-            // carries as its contents scale, not the display's own factor: in
-            // non-retina mode macOS already doubles everything the game draws,
-            // its cursor included.
-            let backing_scale = backing_scale_from(layer_contents_scale(layer));
-            // Decide HDR vs SDR layer configuration from the panel's
-            // static potential + the user's `color.hdr.enable` setting. The
-            // result is the configuration the layer now carries; the user
-            // gate stays unix-side from here on.
-            let mode = resolve_layer_mode(
-                hint.edr_potential,
-                hint.screen_name.as_deref(),
-                hint.colorspace_flags.contains(ColorspaceFlags::IS_HDR),
-                hint.colorspace_flags
-                    .contains(ColorspaceFlags::IS_WIDE_GAMUT),
-                hdr_enable,
-            );
-            // The record holds the layer and everything the display-follow
-            // path needs to reconfigure it for a screen that was not attached
-            // yet: the same gate and colorspace policy attach applied, the
-            // guest's vsync ask, the user's frame cap and the scale the PE
-            // side is already using.
-            let mut flags = AttachFlags::empty();
-            flags.set(AttachFlags::HDR_ENABLE_REQUESTED, hdr_enable);
-            flags.set(AttachFlags::HDR_ACTIVE, mode == LayerMode::Hdr);
-            let att = attachment::register(
-                view as usize,
-                layer as usize,
-                &AttachLatches {
-                    flags,
-                    color_space,
-                    pacing_bits: pack_pacing(&pacing),
-                    backing_scale,
-                    backing_scale_sink: usize::try_from(backing_scale_sink_ptr)
-                        .expect("PE wire pointer fits host address space (unix is 64-bit)"),
-                    cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
-                        .expect("PE wire pointer fits host address space (unix is 64-bit)"),
-                },
-            );
-            attachment::publish_backing_scale(&att, backing_scale);
-            // The software cursor rides the same decision: the overlay window
-            // is a compositing cost an EDR layer already pays.
-            let software_cursor_active = software_cursor.resolve(mode == LayerMode::Hdr);
-            info!(
-                target: LOG_TARGET,
-                "cursor: software overlay {} (cursor.software = {software_cursor:?}, layer {mode:?})",
-                if software_cursor_active { "on" } else { "off" },
-            );
-            let min_present_duration = configure_metal_layer(
-                layer,
-                device_handle.raw(),
-                width,
-                height,
-                &pacing,
-                hint.panel_max_hz,
-                LayerColorConfig {
-                    mode,
-                    color_space,
-                    native_colorspace: hint.native_colorspace,
-                    screen_name: hint.screen_name,
-                    screen_profile_name: hint.screen_profile_name,
-                },
-            );
-            att.set_min_present_duration(min_present_duration);
-            // Start occlusion tracking for this window so presents skip the
-            // `nextDrawable` timeout while it is fully covered/minimised.
-            install_occlusion_tracking(&att);
-            // SAFETY: macdrv just handed us the view + layer pointers
-            // with implicit retain ownership (Cocoa autorelease pool
-            // raised before this call). The PE side keeps these
-            // alive until matching destroy.
-            let view_handle = unsafe { MetalHandle::<NSViewKind>::new(view as u64) };
-            // SAFETY: as the comment above; macdrv handed us a retained
-            // `CAMetalLayer` pointer.
-            let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(layer as u64) };
-            let caps = DisplayCaps {
-                backing_scale,
-                software_cursor_active,
-            };
-            Some((view_handle, layer_handle, caps))
+            Some((view, layer))
         }
     };
-
     // SAFETY: `release_win_data` matches the `get_win_data` above; `win_data`
     // is the live pointer returned there.
     unsafe { (funcs.release_win_data)(win_data) };
     result
+}
+
+/// The metal view kept for `hwnd`'s previous device, if there is one and its window is still up.
+///
+/// Taking it goes through none of Wine's calls, so the client surface it
+/// sits in stays the one Wine shows for the window; one Wine hid for a later
+/// surface of the same window is shown again by the first `nextDrawable` of
+/// the kept layer, which Wine reports as that surface's present. A kept view
+/// whose window is gone (an orphan, or a window handle reused for a new
+/// window) is released here, and the caller creates a view.
+fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<(*mut c_void, *mut c_void)> {
+    let (view, layer) = PARKED_METAL_VIEW
+        .lock()
+        .expect("metal view park mutex poisoned")
+        .take_for(hwnd)?;
+    // The window the handle names now. A destroyed window whose handle a
+    // new window inherited answers with the new window, which is not the
+    // one the kept view sits in.
+    let cocoa_window = funcs.macdrv_get_cocoa_window.map_or(0, |get| {
+        // SAFETY: extern "C" Wine entry point; `hwnd` is the PE-supplied
+        // window handle, and the second argument says the window need not
+        // be on screen.
+        unsafe { get(hwnd as *mut c_void, 0) as usize }
+    });
+    let mut hosted = false;
+    if cocoa_window != 0 {
+        run_on_main_thread_sync(|| {
+            let mtm = MainThreadMarker::new().expect("kept view check runs on the main thread");
+            hosted = kept_view_is_in_window(view, cocoa_window, mtm);
+        });
+    }
+    if !hosted {
+        info!(
+            target: LOG_TARGET,
+            "present: metal view {view:#x} kept for window {hwnd:#x} is not in that window any \
+             more; released, and the window gets a view of its own",
+        );
+        release_metal_view(view);
+        return None;
+    }
+    Some((view as *mut c_void, layer as *mut c_void))
+}
+
+/// Whether the kept view sits in the Cocoa window at `cocoa_window`. **Main thread only.**
+fn kept_view_is_in_window(view: usize, cocoa_window: usize, _mtm: MainThreadMarker) -> bool {
+    // SAFETY: the park holds the retain `macdrv_view_create_metal_view`
+    // handed out for this view and nothing has released it, so the address
+    // names a live `NSView`; the retain taken here covers the property read.
+    let Some(view) = (unsafe { Retained::retain(view as *mut objc2_app_kit::NSView) }) else {
+        return false;
+    };
+    view.window()
+        .is_some_and(|window| Retained::as_ptr(&window) as usize == cocoa_window)
 }
 
 /// Apply a runtime change to the guest's vsync request.
@@ -1087,10 +1169,151 @@ mod bounded_cast {
     }
 }
 
-pub fn release_metal_view(view_handle: MetalHandle<NSViewKind>) {
+/// The metal views retired devices left on their windows, kept for the next device on each.
+///
+/// Wine creates a client surface, a cocoa view of its own, for every
+/// `get_win_data`, and a metal view in it for every
+/// `macdrv_view_create_metal_view`, so a device that goes through Wine gets a
+/// new `CAMetalLayer` every time. Keeping the retired view and handing it to
+/// the next device on that window, without going through Wine at all, is
+/// what keeps the layer. The layer matters for Metal's per-layer frame
+/// metrics, the GPU time the Metal HUD shows: a `CAMetalLayer` created later
+/// in the process reports no GPU time for its frames until it has presented
+/// more of them than any layer before it did, which at a game's frame rate
+/// is the rest of the session. Replacing the command queue behind an
+/// unchanged layer leaves the metric intact; the layer is the identity it
+/// follows.
+///
+/// [`KEPT_METAL_VIEWS`] views are kept, one per window, and parking past
+/// that releases the oldest, so what the parked layers hold, their drawable
+/// pools above all, is bounded. A device attaching to another window leaves
+/// a kept view for a device that comes back to its own; one attaching to a
+/// kept view's window handle while the view no longer sits in that window
+/// releases it and gets a view of its own.
+static PARKED_METAL_VIEW: Mutex<MetalViewPark> = Mutex::new(MetalViewPark::new());
+
+/// Retire a device's metal view: kept for its window's next device, see [`PARKED_METAL_VIEW`].
+///
+/// `record` is the attachment record the view served, which names the
+/// window; a view no record names is released instead. Runs on the API
+/// thread; the release of a displaced view hops to the main thread inside
+/// Wine.
+pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&Attachment>) {
     if view_handle.is_null() {
         return;
     }
+    let view =
+        usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
+    let Some(record) = record.filter(|att| att.hwnd() != 0 && att.view() == view) else {
+        release_metal_view(view);
+        return;
+    };
+    let displaced = PARKED_METAL_VIEW
+        .lock()
+        .expect("metal view park mutex poisoned")
+        .park(record.hwnd(), view, record.layer());
+    debug!(
+        target: LOG_TARGET,
+        "present: metal view {view:#x} kept for the next device on window {:#x}",
+        record.hwnd(),
+    );
+    if let Some(displaced) = displaced {
+        release_metal_view(displaced);
+    }
+}
+
+/// How many retired metal views are kept at once.
+///
+/// A game has its device window and at most one more that a `Reset`
+/// retargets it to; the end-to-end suite runs four devices at once, and a
+/// smaller park would hand its recreations new layers by accident of timing.
+/// Each kept view holds its layer's drawable pool at the window's size.
+const KEPT_METAL_VIEWS: usize = 4;
+
+/// One kept metal view: raw addresses and the window it served.
+struct KeptMetalView {
+    /// The `HWND` the view was attached to, `0` in an empty slot.
+    hwnd: u64,
+    /// Raw `WineMetalView*`, `0` in an empty slot.
+    view: usize,
+    /// Raw `CAMetalLayer*` of that view.
+    layer: usize,
+    /// When it was parked, for choosing the oldest to displace.
+    seq: u64,
+}
+
+impl KeptMetalView {
+    const EMPTY: Self = Self {
+        hwnd: 0,
+        view: 0,
+        layer: 0,
+        seq: 0,
+    };
+}
+
+/// The metal views kept across their devices' teardown, one per window, oldest displaced first.
+///
+/// Raw addresses and window handles; [`retire_metal_view`] and
+/// [`kept_metal_view`] do the retaining and releasing around it.
+struct MetalViewPark {
+    slots: [KeptMetalView; KEPT_METAL_VIEWS],
+    next_seq: u64,
+}
+
+impl MetalViewPark {
+    const fn new() -> Self {
+        Self {
+            slots: [KeptMetalView::EMPTY; KEPT_METAL_VIEWS],
+            next_seq: 1,
+        }
+    }
+
+    /// Keep `view` and its `layer` for the next device on `hwnd`, returning the view it displaces.
+    ///
+    /// A view already kept for `hwnd` is displaced by the new one; with every
+    /// slot taken, the oldest kept view is. `None` when nothing is displaced,
+    /// which includes `view` being the one kept for `hwnd` already.
+    fn park(&mut self, hwnd: u64, view: usize, layer: usize) -> Option<usize> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let kept = KeptMetalView {
+            hwnd,
+            view,
+            layer,
+            seq,
+        };
+        let slot = self
+            .slots
+            .iter()
+            .position(|slot| slot.view != 0 && slot.hwnd == hwnd)
+            .or_else(|| self.slots.iter().position(|slot| slot.view == 0))
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, slot)| slot.seq)
+                    .map(|(index, _)| index)
+            })
+            .expect("the park has at least one slot");
+        let displaced = self.slots[slot].view;
+        self.slots[slot] = kept;
+        (displaced != 0 && displaced != view).then_some(displaced)
+    }
+
+    /// Take the view and layer kept for a device attaching to `hwnd`, if there is one.
+    fn take_for(&mut self, hwnd: u64) -> Option<(usize, usize)> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.view != 0 && slot.hwnd == hwnd)?;
+        let kept = (slot.view, slot.layer);
+        *slot = KeptMetalView::EMPTY;
+        Some(kept)
+    }
+}
+
+/// Release a metal view through Wine, which removes it from its window on the main thread.
+fn release_metal_view(view: usize) {
     // Try struct-based lookup first (newer Wine), fall back to the
     // individual symbol (older Wine).
     //
@@ -1121,8 +1344,10 @@ pub fn release_metal_view(view_handle: MetalHandle<NSViewKind>) {
         },
     );
     if let Some(release) = release_fn {
-        // SAFETY: extern "C" Wine entry point; takes the view handle by value.
-        unsafe { release(view_handle.raw() as *mut c_void) };
+        // SAFETY: extern "C" Wine entry point; takes the view pointer by
+        // value, and `view` is the address `macdrv_view_create_metal_view`
+        // handed out, still retained because nothing released it before.
+        unsafe { release(view as *mut c_void) };
     }
 }
 
@@ -1156,6 +1381,12 @@ struct MacdrvFuncs {
     release_win_data: ReleaseWinDataFn,
     macdrv_view_create_metal_view: CreateMetalViewFn,
     macdrv_view_get_metal_layer: GetMetalLayerFn,
+    /// `macdrv_get_cocoa_window`, `None` on a Wine that does not export it.
+    ///
+    /// Answers which Cocoa window an `HWND` has right now, without the client
+    /// surface `get_win_data` creates; a kept view is only reused inside that
+    /// window.
+    macdrv_get_cocoa_window: Option<GetCocoaWindowFn>,
 }
 
 impl MacdrvFuncs {
@@ -1191,6 +1422,12 @@ impl MacdrvFuncs {
                         table.macdrv_view_get_metal_layer,
                     )
                 },
+                // SAFETY: as above; a null entry reads as `None`.
+                macdrv_get_cocoa_window: unsafe {
+                    core::mem::transmute::<*mut c_void, Option<GetCocoaWindowFn>>(
+                        table.macdrv_get_cocoa_window,
+                    )
+                },
             });
         }
 
@@ -1210,11 +1447,18 @@ impl MacdrvFuncs {
         // SAFETY: as above.
         let get_layer =
             unsafe { MACDRV_LIB.get::<GetMetalLayerFn>(b"macdrv_view_get_metal_layer\0") }.ok()?;
+        // SAFETY: as above; an older Wine may not export it, which only costs
+        // the kept-view reuse.
+        let get_cocoa_window =
+            unsafe { MACDRV_LIB.get::<GetCocoaWindowFn>(b"macdrv_get_cocoa_window\0") }
+                .ok()
+                .map(|sym| *sym);
         Some(Self {
             get_win_data: *get_win_data,
             release_win_data: *release_win_data,
             macdrv_view_create_metal_view: *create_view,
             macdrv_view_get_metal_layer: *get_layer,
+            macdrv_get_cocoa_window: get_cocoa_window,
         })
     }
 }

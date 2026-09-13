@@ -41,6 +41,7 @@ fn latches(
         )
     });
     AttachLatches {
+        hwnd: 0x40,
         flags,
         color_space: ColorSpacePolicy::Passthrough,
         pacing_bits: pack_pacing(&PresentPacing {
@@ -186,6 +187,7 @@ fn each_record_seeds_its_own_defaults() {
         VIEW,
         VIEW + 8,
         &AttachLatches {
+            hwnd: 0x40,
             flags: AttachFlags::HDR_ENABLE_REQUESTED | AttachFlags::HDR_ACTIVE,
             color_space: ColorSpacePolicy::Accurate,
             pacing_bits: pack_pacing(&pacing),
