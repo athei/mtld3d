@@ -18,7 +18,8 @@ mod vtbl;
 mod win32;
 
 pub use harness::{
-    CONFIG_VAR, DrawIndexedUpParams, Harness, HarnessConfig, config_var, render_scale_is_identity,
+    DrawIndexedUpParams, Harness, HarnessConfig, config_var, render_scale_is_identity,
+    set_child_config,
 };
 pub use in_flight::spawn_scoped;
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};

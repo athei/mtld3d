@@ -5,7 +5,9 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex};
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex, set_child_config,
+};
 use mtld3d_types::{
     D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE,
     D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
@@ -400,15 +402,21 @@ fn pipeline_cache_replays_after_process_restart() {
         if regenerate {
             stale_cache_emitter(&cache);
         }
-        let output = std::process::Command::new(&child)
+        let mut command = std::process::Command::new(&child);
+        command
             .args([
                 "--exact",
                 "shaders::pipeline_cache_replays_after_process_restart",
                 "--nocapture",
             ])
-            .env("RUST_LOG", "mtld3d=debug,mtld3d::dxso=trace")
-            .output()
-            .expect("run replay child");
+            .env("RUST_LOG", "mtld3d=debug,mtld3d::dxso=trace");
+        // Nothing of the child's configuration is its own: the workload's
+        // harness pins the two keys it needs on the interface it creates, and
+        // the rest is the suite's. What it must not run under is the merged
+        // window a harness on another thread of this process holds open while
+        // it creates an interface of its own.
+        set_child_config(&mut command, "");
+        let output = command.output().expect("run replay child");
         assert!(
             output.status.success(),
             "replay child failed: {}",

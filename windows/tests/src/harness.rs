@@ -40,7 +40,7 @@ mod cursor_bitmap;
 static ENVIRONMENT: RwLock<()> = RwLock::new(());
 
 /// The environment variable the layer reads its configuration overrides from.
-pub const CONFIG_VAR: &str = "MTLD3D_CONFIG";
+const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
 /// The display mode of the wineserver session, held by one fullscreen device at a time.
 ///
@@ -169,6 +169,31 @@ pub struct DrawIndexedUpParams {
 pub fn config_var() -> Option<String> {
     let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
     std::env::var(CONFIG_VAR).ok()
+}
+
+/// Give a child process the suite-wide `MTLD3D_CONFIG` plus `entries`.
+///
+/// A test that runs its workload in a private copy of the test executable
+/// spawns it from a thread of a running suite, and a `Command` copies the
+/// environment as it stands at the spawn, under no lock of ours. A harness
+/// creating an interface of its own holds its merged entries in the variable
+/// for the length of that call, so a child spawned inside that window would
+/// run its whole workload under another test's configuration. The value
+/// handed over here is read through [`config_var`], which takes the shared
+/// lock and so cannot see such a window, and it is fixed on the command
+/// rather than read again when the child starts.
+///
+/// `entries` are the child's own `key=value` entries, `;`-separated. They
+/// win over the suite-wide value, because the parser keeps the last entry
+/// for a key. Empty means the suite-wide configuration alone.
+pub fn set_child_config(command: &mut std::process::Command, entries: &str) {
+    let suite = config_var().unwrap_or_default();
+    let config = if entries.is_empty() {
+        suite
+    } else {
+        format!("{suite};{entries}")
+    };
+    command.env(CONFIG_VAR, config);
 }
 
 /// True when the suite rasterizes at the resolution D3D9 reports.

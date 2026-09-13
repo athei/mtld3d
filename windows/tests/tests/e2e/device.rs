@@ -14,9 +14,10 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    CONFIG_VAR, Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
-    cursor_mask_bits, destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
+    Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
+    cursor_mask_bits, destroy_window, enumerate_display_sizes, set_child_config, spawn_scoped,
+    window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -1025,29 +1026,20 @@ fn reset_flips_the_presentation_interval() {
     std::fs::create_dir(&dir).expect("create private pacing directory");
     let child = dir.join(PACING_CHILD_NAME);
     std::fs::copy(&exe, &child).expect("copy pacing workload executable");
+    let mut command = std::process::Command::new(&child);
+    command.args([
+        "--exact",
+        "device::reset_flips_the_presentation_interval",
+        "--nocapture",
+    ]);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
     // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
     // child that inherited it would write into that shared directory. So the
     // child is handed the private directory instead, always, and the run here
-    // takes the same path CI takes. The parser keeps the last entry for a key
-    // and everything after the entry's first `=`, so the appended path stands
-    // as long as it carries no `;`. The suite-wide value is read under the
-    // environment lock, which keeps the entries a harness publishes for an
-    // interface of its own out of the child's configuration.
-    let config = format!(
-        "{};log.dir={}",
-        config_var().unwrap_or_default(),
-        dir.display()
-    );
-    let output = std::process::Command::new(&child)
-        .args([
-            "--exact",
-            "device::reset_flips_the_presentation_interval",
-            "--nocapture",
-        ])
-        .env(CONFIG_VAR, config)
-        .output()
-        .expect("run pacing workload child");
+    // takes the same path CI takes. The parser keeps everything after the
+    // entry's first `=`, so the path stands as long as it carries no `;`.
+    set_child_config(&mut command, &format!("log.dir={}", dir.display()));
+    let output = command.output().expect("run pacing workload child");
     assert!(
         output.status.success(),
         "pacing workload child failed: {}",
