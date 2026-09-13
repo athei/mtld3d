@@ -1367,24 +1367,17 @@ impl MetalViewPark {
 
 /// Release a metal view through Wine, which removes it from its window on the main thread.
 fn release_metal_view(view: usize) {
-    // A process whose Wine publishes no table never created a view through
-    // one either, and `macdrv_functions` has already said so.
-    let Some(table) = macdrv_functions() else {
+    // A process whose Wine publishes no usable table never created a view
+    // through one either, and the load has already said what was wrong with
+    // it. The release entry itself is one of the entries that load checks,
+    // so the pointer below is a function.
+    let Some(funcs) = MacdrvFuncs::load() else {
         return;
     };
-    // SAFETY: `macdrv_view_release_metal_view` is a fn pointer stored as
-    // `*mut c_void` per Wine's C ABI; a null entry reads as `None`.
-    let release_fn = unsafe {
-        core::mem::transmute::<*mut c_void, Option<ReleaseMetalViewFn>>(
-            table.macdrv_view_release_metal_view,
-        )
-    };
-    if let Some(release) = release_fn {
-        // SAFETY: extern "C" Wine entry point; takes the view pointer by
-        // value, and `view` is the address `macdrv_view_create_metal_view`
-        // handed out, still retained because nothing released it before.
-        unsafe { release(view as *mut c_void) };
-    }
+    // SAFETY: extern "C" Wine entry point; takes the view pointer by
+    // value, and `view` is the address `macdrv_view_create_metal_view`
+    // handed out, still retained because nothing released it before.
+    unsafe { (funcs.macdrv_view_release_metal_view)(view as *mut c_void) };
 }
 
 /// The window data the table's `get_win_data` hands back, as far as we read it.
@@ -1424,6 +1417,7 @@ struct MacdrvFuncs {
     release_win_data: ReleaseWinDataFn,
     macdrv_view_create_metal_view: CreateMetalViewFn,
     macdrv_view_get_metal_layer: GetMetalLayerFn,
+    macdrv_view_release_metal_view: ReleaseMetalViewFn,
     /// `macdrv_get_cocoa_window`, `None` when the table's entry is null.
     ///
     /// Answers which Cocoa window an `HWND` has right now, without the client
@@ -1456,12 +1450,57 @@ fn macdrv_functions() -> Option<&'static MacdrvFunctionsTable> {
     Some(unsafe { &**table_sym })
 }
 
+/// The first entry the layer calls that `table` leaves null, by name.
+///
+/// A null entry among the ones the layer calls says the table is not the
+/// one this layer was written against, and nothing else in it can be
+/// trusted to be either, so the caller gives up rather than call four of
+/// the five. `macdrv_get_cocoa_window` is not among them: it answers which
+/// Cocoa window an `HWND` has now, and a kept view is simply not reused
+/// without that answer. `None` when every entry the layer calls is filled.
+fn first_null_required_entry(table: &MacdrvFunctionsTable) -> Option<&'static str> {
+    [
+        ("get_win_data", table.get_win_data),
+        ("release_win_data", table.release_win_data),
+        (
+            "macdrv_view_create_metal_view",
+            table.macdrv_view_create_metal_view,
+        ),
+        (
+            "macdrv_view_get_metal_layer",
+            table.macdrv_view_get_metal_layer,
+        ),
+        (
+            "macdrv_view_release_metal_view",
+            table.macdrv_view_release_metal_view,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, entry)| entry.is_null().then_some(name))
+}
+
 impl MacdrvFuncs {
+    /// The table's entries as typed function pointers, or `None` with the reason logged.
+    ///
+    /// This is where the table is checked, and the only place: every entry
+    /// the layer calls is read as a pointer and refused if it is null, so
+    /// what the rest of the file holds is typed pointers no caller can find
+    /// missing. `macdrv_get_cocoa_window` is the one entry a table may leave
+    /// null, and it alone stays an `Option`.
     fn load() -> Option<Self> {
         let table = macdrv_functions()?;
+        if let Some(entry) = first_null_required_entry(table) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: this Wine's macdrv_functions table leaves {entry} null; no window can \
+                 be given a Metal layer",
+            );
+            return None;
+        }
         Some(Self {
             // SAFETY: table entry is a fn pointer stored as `*mut c_void`
-            // per Wine's C ABI; transmute reinterprets to the typed fn.
+            // per Wine's C ABI, non-null per the check above; transmute
+            // reinterprets to the typed fn.
             get_win_data: unsafe {
                 core::mem::transmute::<*mut c_void, GetWinDataFn>(table.get_win_data)
             },
@@ -1481,7 +1520,14 @@ impl MacdrvFuncs {
                     table.macdrv_view_get_metal_layer,
                 )
             },
-            // SAFETY: as above; a null entry reads as `None`.
+            // SAFETY: as above.
+            macdrv_view_release_metal_view: unsafe {
+                core::mem::transmute::<*mut c_void, ReleaseMetalViewFn>(
+                    table.macdrv_view_release_metal_view,
+                )
+            },
+            // SAFETY: as above; this entry may be null, and a null one
+            // reads as `None`.
             macdrv_get_cocoa_window: unsafe {
                 core::mem::transmute::<*mut c_void, Option<GetCocoaWindowFn>>(
                     table.macdrv_get_cocoa_window,
