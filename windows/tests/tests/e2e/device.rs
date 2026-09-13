@@ -1061,7 +1061,12 @@ fn reset_flips_the_presentation_interval() {
 /// A Reset queues the new pacing, and the first Present after it is the one
 /// that carries it to the layer, which re-derives the present throttle off
 /// the panel's cadence. Nothing but that Present submits a frame here, so a
-/// pacing that rode the frame after it would leave the log short.
+/// pacing that rode the frame after it would leave the log short. A Reset
+/// that names the interval the device is already running on sends nothing at
+/// all, since the layer would be written the pacing it holds. That is pinned
+/// by what the log does *not* gain, which the flip at the end turns into an
+/// equality: the encoder writes the lines in frame order, so a line that
+/// Reset should not have produced would sit ahead of the flip's.
 fn presentation_interval_workload() {
     let h = Harness::new();
     assert_eq!(
@@ -1079,6 +1084,33 @@ fn presentation_interval_workload() {
     assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
     assert_eq!(h.present(), D3D_OK, "the present that carries ONE");
     await_pacing(&["off", "on"]);
+
+    // The layer holds ONE. A Reset that asks for it again is a Reset the
+    // pacing path has no work for, and the Present after it carries none.
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "Reset at the same interval"
+    );
+    assert_eq!(
+        h.present(),
+        D3D_OK,
+        "the present after the same-interval Reset"
+    );
+
+    // A real flip still goes out, and it is the only line the Reset above
+    // leaves room for.
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to IMMEDIATE again");
+    assert_eq!(
+        h.present(),
+        D3D_OK,
+        "the present that carries IMMEDIATE again"
+    );
+    await_pacing(&["off", "on", "off"]);
 }
 
 /// Wait until the process log carries exactly `expected`, oldest line first.

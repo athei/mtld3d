@@ -619,6 +619,14 @@ pub struct DeviceInner {
     /// via `recording_state_block()`; mutating through
     /// `recording_state_block_mut()` is how each setter records its op.
     recording_state_block: Option<Box<RecordingStateBlock>>,
+    /// The `displaySyncEnabled` this device has handed to its layer.
+    ///
+    /// Seeded with what `AttachMetalLayer` was called with, at device
+    /// creation and again at a retarget's fresh attach, and moved to a queued
+    /// value once `stamp_and_swap` puts that value on the frame carrying it.
+    /// A `Reset` compares its resolved interval against this, so one that
+    /// does not move the pacing sends no thunk.
+    layer_display_sync_enabled: bool,
     /// `Some(v)` if `IDirect3DDevice9::Reset` changed `PresentationInterval` since the last frame.
     ///
     /// Consumed by `stamp_and_swap` and applied by the encoder thread on the
@@ -1438,7 +1446,12 @@ impl DeviceInner {
         // leaves the device after it, which is this one: the encoder applies it
         // before the frame's own `nextDrawable`. Putting it on the replacement
         // instead would hold it back until the Present after the next one.
-        frame.set_apply_display_sync_enabled(self.pending_display_sync_enabled.take());
+        if let Some(enabled) = self.pending_display_sync_enabled.take() {
+            // Handing it over commits it: a later Reset can no longer take it
+            // back, and this is the pacing the next one compares against.
+            self.layer_display_sync_enabled = enabled;
+            frame.set_apply_display_sync_enabled(Some(enabled));
+        }
         // An F12 run ends with the frame the closing `Present` submits. A
         // mid-frame flush sends the marked frame out early, so its stop mark
         // moves onto the continuation; the start mark stays with the first
@@ -2396,13 +2409,18 @@ impl DeviceInner {
         self.backbuffer_height = height;
     }
 
-    /// Queue a `PresentationInterval` change for the next frame's first `nextDrawable`.
+    /// Queue a `PresentationInterval` change unless the layer paces that way already.
     ///
-    /// Drained by `stamp_and_swap` onto the frame it hands over, which is the
-    /// spec-compliant timing: a synchronous layer-property write from the API
-    /// thread races the encoder's in-flight submission.
+    /// A queued change is drained by `stamp_and_swap` onto the frame it hands
+    /// over, which is the spec-compliant timing: a synchronous layer-property
+    /// write from the API thread races the encoder's in-flight submission.
+    /// The comparison against `layer_display_sync_enabled` keeps a `Reset` at
+    /// the interval the device already runs on off that path entirely: the
+    /// thunk, the store on the attachment record and the main-thread walk it
+    /// queues would all write the pacing the layer holds.
     pub const fn queue_display_sync_change(&mut self, enabled: bool) {
-        self.pending_display_sync_enabled = Some(enabled);
+        self.pending_display_sync_enabled =
+            mtld3d_core::present::queued_display_sync(self.layer_display_sync_enabled, enabled);
     }
 
     /// Drive the encoder thread to run `reset_cleanup`.
@@ -2674,6 +2692,11 @@ pub struct DeviceCreateInfo {
     pub queue_handle: MetalHandle<MTLCommandQueueKind>,
     pub view_handle: MetalHandle<NSViewKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
+    /// The `displaySyncEnabled` that attach was called with.
+    ///
+    /// Seeds `DeviceInner::layer_display_sync_enabled`, so the first `Reset`
+    /// compares its interval against the pacing the attach put on the layer.
+    pub display_sync_enabled: bool,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of `backbuffer_handle`; see `DeviceInner`.
     pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
@@ -2832,6 +2855,7 @@ impl Direct3DDevice9 {
             vertex_texture_kinds: VsSamplerKinds::default(),
             last_sized_depth: None,
             recording_state_block: None,
+            layer_display_sync_enabled: info.display_sync_enabled,
             pending_display_sync_enabled: None,
             last_color_rt_binding: None,
             last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
@@ -4143,6 +4167,9 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     //    to a later frame's first `nextDrawable`. Mutating the attachment
     //    synchronously here races the encoder's in-flight submission. A
     //    retarget's fresh attach already latched these presentation params.
+    //    A Reset that leaves the interval where it was queues nothing: the
+    //    layer would be written the value it holds, and the write costs a
+    //    thunk, a store on the attachment record and a main-thread walk.
     if !retargeted && !dev.layer_handle.is_null() {
         dev.queue_display_sync_change(resolve_display_sync(pp.presentation_interval));
     }
@@ -4254,6 +4281,9 @@ fn retarget_device_window(
     }
     dev.view_handle = layer_params.view_handle;
     dev.layer_handle = layer_params.layer_handle;
+    // The attach above latched this Reset's pacing on the new layer, so that
+    // is the value a later Reset on this window compares against.
+    dev.layer_display_sync_enabled = layer_params.display_sync_enabled != 0;
     let (cursor_scale, _origin) =
         crate::direct3d9::resolve_cursor_scale(layer_params.backing_scale, config.cursor_scale);
     let dev_ptr = std::ptr::from_mut::<DeviceInner>(dev);
