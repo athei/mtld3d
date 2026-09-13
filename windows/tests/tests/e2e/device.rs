@@ -1032,6 +1032,11 @@ fn reset_flips_the_presentation_interval() {
         "device::reset_flips_the_presentation_interval",
         "--nocapture",
     ]);
+    // The pacing assertions consume unix-side info records even when the
+    // suite disables them. Wine inherits its Unix environment separately
+    // from the PE child's: its promotion prefix sets the native filter too.
+    let filter = "warn,mtld3d::unix=info";
+    command.envs([("RUST_LOG", filter), ("__CX_UNIX_RUST_LOG", filter)]);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
     // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
     // child that inherited it would write into that shared directory. So the
