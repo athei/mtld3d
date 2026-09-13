@@ -104,6 +104,46 @@ impl IntoRetainedLayer for MetalHandle<CAMetalLayerKind> {
     }
 }
 
+/// Borrow the object a buffer handle's canonical retain keeps alive.
+///
+/// The narrow companion to [`IntoRetained::into_retained`]: a binding
+/// call that needs the object only for its own duration reads through
+/// the canonical retain instead of taking and dropping one of its own.
+/// Defined for [`MTLBufferKind`] alone, the kind whose binding cost was
+/// measured; every other kind keeps converting through the retained
+/// path, which needs no lifetime argument from its caller.
+///
+/// # Safety
+///
+/// The canonical retain this handle stands for must stay live for the
+/// whole of the returned reference's lifetime. `MetalHandle<K>` is
+/// `Copy` and that lifetime is unconstrained, so the compiler can
+/// enforce neither; the call site names the ownership that holds the
+/// object up, the way the [`ReleaseRetain`] call sites name the
+/// ownership they consume.
+pub unsafe trait BorrowRetained {
+    /// The `MTLBuffer` this handle addresses, or `None` when it is null.
+    ///
+    /// # Safety
+    ///
+    /// As [`BorrowRetained`].
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLBuffer>>;
+}
+
+// SAFETY: trait contract delegates the invariant: each call site names the
+// ownership that keeps the buffer alive for the borrow it takes.
+unsafe impl BorrowRetained for MetalHandle<MTLBufferKind> {
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLBuffer>> {
+        if self.is_null() {
+            return None;
+        }
+        // SAFETY: type invariant. `MetalHandle::new` asserted at construction
+        // that `raw` is either 0 (filtered above) or a valid retained
+        // `id<MTLBuffer>`, and the caller asserted that retain outlives `'a`.
+        Some(unsafe { &*(self.raw() as *const ProtocolObject<dyn MTLBuffer>) })
+    }
+}
+
 /// Consume the canonical retain this handle stands for and release.
 ///
 /// Use at destroy sites — the PE side has agreed to drop its only copy
@@ -158,3 +198,6 @@ unsafe impl ReleaseRetain for MetalHandle<CAMetalLayerKind> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

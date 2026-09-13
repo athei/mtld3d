@@ -37,7 +37,12 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
     LOG_TARGET,
-    metal::{handle::IntoRetained, macdrv::attachment, null_texture, texture::mtl_pixel_format},
+    metal::{
+        handle::{BorrowRetained, IntoRetained},
+        macdrv::attachment,
+        null_texture,
+        texture::mtl_pixel_format,
+    },
 };
 
 pub mod diagnostics;
@@ -2734,16 +2739,24 @@ fn encode_pass(
                 }
                 Some(CommandType::SetVertexBuffer) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
-                    let Some(buffer) =
-                        (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) }).into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // buffer wrapper the PE side gives up is parked on
+                    // `pending_resource_retention` stamped with the submit seq
+                    // of the frame whose commands still name it, and
+                    // `drain_retired_resource_retention` pops an entry only
+                    // once `coherent_seq` has reached that seq. This frame's
+                    // seq reaches `coherent_seq` from the completion handler
+                    // registered below, which Metal cannot run before the
+                    // command buffer this replay encodes into is committed.
+                    let Some(buffer) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `buffer` is retained for
-                    // the duration of the binding (encoder retains).
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // buffer into the command buffer's resource set.
                     unsafe {
                         encoder.setVertexBuffer_offset_atIndex(
-                            Some(&buffer),
+                            Some(buffer),
                             to_usize(cmd.param_c),
                             cmd.param_a as usize,
                         );
@@ -2751,16 +2764,18 @@ fn encode_pass(
                 }
                 Some(CommandType::SetFragmentBuffer) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
-                    let Some(buffer) =
-                        (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) }).into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetVertexBuffer` above, the seq-gated
+                    // retention drain cannot free the wrapper before the
+                    // command buffer this replay encodes into has retired.
+                    let Some(buffer) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `buffer` is retained for
-                    // the duration of the binding (encoder retains).
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // buffer into the command buffer's resource set.
                     unsafe {
                         encoder.setFragmentBuffer_offset_atIndex(
-                            Some(&buffer),
+                            Some(buffer),
                             to_usize(cmd.param_c),
                             cmd.param_a as usize,
                         );
