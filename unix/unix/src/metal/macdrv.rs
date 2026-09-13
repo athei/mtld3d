@@ -1010,6 +1010,15 @@ pub fn set_display_sync_enabled(
         return;
     };
     att.set_pacing_bits(pack_pacing(pacing));
+    // The counterpart of the attach line, so a log says which present the
+    // guest's interval change reached the layer on. One line per Reset that
+    // changed the interval, off the encoder thread, not per frame.
+    info!(
+        target: LOG_TARGET,
+        "present: layer {layer_addr:#x} re-paced (vsync {}, maxFps {})",
+        if pacing.vsync_requested { "on" } else { "off" },
+        pacing.max_fps,
+    );
     if att.request_refresh() {
         run_on_main_thread_async(move || refresh_attachment_on_main(&att));
     }
