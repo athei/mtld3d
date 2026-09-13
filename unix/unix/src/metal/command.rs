@@ -1025,14 +1025,23 @@ const fn present_route(
 /// stands in: the draw filters differently from what the game asked, which
 /// is the state the creation failure already warned about, instead of
 /// running with an unbound argument.
-fn sampler_or_default(
+///
+/// # Safety
+///
+/// A non-zero `handle` is borrowed rather than retained, so the caller
+/// carries [`BorrowRetained`]'s obligation: the canonical retain the handle
+/// stands for must outlive `'a`. The default-sampler branch asserts nothing,
+/// its object living for the process.
+unsafe fn sampler_or_default<'a>(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     handle: u64,
-) -> Option<Retained<ProtocolObject<dyn MTLSamplerState>>> {
+) -> Option<&'a ProtocolObject<dyn MTLSamplerState>> {
     if handle != 0 {
         // SAFETY: a non-zero bind handle is a previously-retained
         // MTLSamplerState address.
-        return unsafe { MetalHandle::<MTLSamplerStateKind>::new(handle) }.into_retained();
+        let handle = unsafe { MetalHandle::<MTLSamplerStateKind>::new(handle) };
+        // SAFETY: the caller's assertion carries through unchanged.
+        return unsafe { handle.borrow_retained() };
     }
     mtld3d_shared::log_once_warn!(
         target: LOG_TARGET,
@@ -1842,13 +1851,22 @@ fn encode_leading_blits(
                 // call. Safe to interleave with open encoder commands;
                 // also safe outside any encoder.
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
-                let Some(buffer) =
-                    (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) }).into_retained()
-                else {
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: the canonical retain outlives this borrow. Every
+                // resource a blit of this prefix names is destroyed either
+                // through `pending_resource_retention`, stamped with the
+                // submit seq of the frame whose commands still name it and
+                // popped only once `coherent_seq` has reached that seq, or
+                // through `free_stage_upload_transients`, which gates on the
+                // lower of `coherent_seq` and `upload_coherent_seq`. Both
+                // counters advance from a command-buffer completion handler,
+                // and the prefix runs before this frame's buffers are even
+                // committed.
+                let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: notify buffer retain failed (handle={:#x})",
-                        cmd.src_handle,
+                        "encode_leading_blits: notify buffer handle is null",
                     );
                     continue;
                 };
@@ -1861,24 +1879,30 @@ fn encode_leading_blits(
             Some(BlitCommandType::CopyBufferToTexture) => {
                 let blit = blit.as_ref().expect("non-notify command requires encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
-                let Some(buffer) =
-                    (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) }).into_retained()
-                else {
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: as the notify arm above, the seq-gated destroy paths
+                // cannot free a resource this prefix names before the command
+                // buffer it encodes into has retired.
+                let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: buffer retain failed (handle={:#x})",
-                        cmd.src_handle,
+                        "encode_leading_blits: upload source buffer handle is null",
                     );
                     continue;
                 };
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
-                let Some(texture) =
-                    (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) }).into_retained()
-                else {
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the source buffer above, and as
+                // `SetFragmentTexture`: a texture leaves through the same
+                // seq-gated retention queue, and the implicit surfaces that
+                // skip it are destroyed behind a drain of the submit thread
+                // and a GPU-idle wait.
+                let Some(texture) = (unsafe { dst_texture_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: dst texture retain failed (handle={:#x})",
-                        cmd.dst_handle,
+                        "encode_leading_blits: upload destination texture handle is null",
                     );
                     continue;
                 };
@@ -1928,12 +1952,12 @@ fn encode_leading_blits(
                 // and `bytes_per_image == bytes_per_row * region_h`, exactly
                 // the values this call computed implicitly before the fields
                 // existed — so the 2D copy is byte-identical.
-                // SAFETY: objc2 typed binding; `buffer` and `texture` are
-                // retained Metal objects live for the call; the geometry
-                // cleared `copy_buffer_to_texture_reject` above.
+                // SAFETY: objc2 typed binding; the encoder retains `buffer`
+                // and `texture` into the command buffer's resource set; the
+                // geometry cleared `copy_buffer_to_texture_reject` above.
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        &buffer,
+                        buffer,
                         to_usize(cmd.src_offset),
                         to_usize(cmd.bytes_per_row),
                         cmd.bytes_per_image as usize,
@@ -1942,7 +1966,7 @@ fn encode_leading_blits(
                             height: cmd.region_h as usize,
                             depth: cmd.depth as usize,
                         },
-                        &texture,
+                        texture,
                         to_usize(cmd.dst_offset),
                         cmd.mip_level as usize,
                         MTLOrigin {
@@ -1956,24 +1980,25 @@ fn encode_leading_blits(
             Some(BlitCommandType::CopyTextureToTexture) => {
                 let blit = blit.as_ref().expect("non-notify command requires encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLTexture address.
-                let Some(src) =
-                    (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) }).into_retained()
-                else {
+                let src_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) };
+                // SAFETY: as the upload arm above, a texture this prefix names
+                // outlives the command buffer the copy is encoded into.
+                let Some(src) = (unsafe { src_texture_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: src texture retain failed (handle={:#x})",
-                        cmd.src_handle,
+                        "encode_leading_blits: copy source texture handle is null",
                     );
                     continue;
                 };
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
-                let Some(dst) =
-                    (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) }).into_retained()
-                else {
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy source above.
+                let Some(dst) = (unsafe { dst_texture_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: dst texture retain failed (handle={:#x})",
-                        cmd.dst_handle,
+                        "encode_leading_blits: copy destination texture handle is null",
                     );
                     continue;
                 };
@@ -2035,12 +2060,12 @@ fn encode_leading_blits(
                     site,
                     i,
                     &diagnostics::TextureCopy {
-                        texture: &src,
+                        texture: src,
                         endpoint: &src_endpoint,
                         slice: cmd.src_slice as usize,
                     },
                     &diagnostics::TextureCopy {
-                        texture: &dst,
+                        texture: dst,
                         endpoint: &dst_endpoint,
                         slice: cmd.dst_slice as usize,
                     },
@@ -2051,13 +2076,13 @@ fn encode_leading_blits(
                     },
                 );
                 mtld3d_shared::crumb!("blit:tex2tex", cmd.src_handle, cmd.dst_handle);
-                // SAFETY: objc2 typed binding; `src`/`dst` are retained Metal
-                // textures live for the call; the region fits both live mip
-                // extents, including depth, as checked above. Array slices
-                // come from the PE-side command's texture subresource.
+                // SAFETY: objc2 typed binding; the encoder retains `src`/`dst`
+                // into the command buffer's resource set; the region fits both
+                // live mip extents, including depth, as checked above. Array
+                // slices come from the PE-side command's texture subresource.
                 unsafe {
                     blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        &src,
+                        src,
                         cmd.src_slice as usize,
                         cmd.mip_level as usize,
                         MTLOrigin {
@@ -2070,7 +2095,7 @@ fn encode_leading_blits(
                             height: cmd.region_h as usize,
                             depth: region_depth as usize,
                         },
-                        &dst,
+                        dst,
                         cmd.dst_slice as usize,
                         cmd.dst_mip_level as usize,
                         MTLOrigin { x: dst_x, y: dst_y, z: 0 },
@@ -2080,35 +2105,36 @@ fn encode_leading_blits(
             Some(BlitCommandType::CopyBufferToBuffer) => {
                 let blit = blit.as_ref().expect("non-notify command requires encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
-                let Some(src) =
-                    (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) }).into_retained()
-                else {
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: as the notify arm above.
+                let Some(src) = (unsafe { src_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: src buffer retain failed (handle={:#x})",
-                        cmd.src_handle,
+                        "encode_leading_blits: copy source buffer handle is null",
                     );
                     continue;
                 };
                 // SAFETY: cmd.dst_handle is a previously-retained MTLBuffer address.
-                let Some(dst) =
-                    (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.dst_handle) }).into_retained()
-                else {
+                let dst_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy source above.
+                let Some(dst) = (unsafe { dst_buffer_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: dst buffer retain failed (handle={:#x})",
-                        cmd.dst_handle,
+                        "encode_leading_blits: copy destination buffer handle is null",
                     );
                     continue;
                 };
                 mtld3d_shared::crumb!("blit:buf2buf", cmd.src_handle, cmd.dst_handle);
-                // SAFETY: objc2 typed binding; `src`/`dst` are retained
-                // `MTLBuffer`s live for the call; sizes are PE-side bounded.
+                // SAFETY: objc2 typed binding; the encoder retains `src`/`dst`
+                // into the command buffer's resource set; sizes are PE-side
+                // bounded.
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                        &src,
+                        src,
                         to_usize(cmd.src_offset),
-                        &dst,
+                        dst,
                         to_usize(cmd.dst_offset),
                         to_usize(cmd.byte_size),
                     );
@@ -2117,13 +2143,13 @@ fn encode_leading_blits(
             Some(BlitCommandType::GenerateMipmaps) => {
                 let blit = blit.as_ref().expect("non-notify command requires encoder");
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
-                let Some(texture) =
-                    (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) }).into_retained()
-                else {
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy arms above.
+                let Some(texture) = (unsafe { dst_texture_handle.borrow_retained() }) else {
                     error!(
                         target: LOG_TARGET,
-                        "encode_leading_blits: mipgen texture retain failed (handle={:#x})",
-                        cmd.dst_handle,
+                        "encode_leading_blits: mipgen texture handle is null",
                     );
                     continue;
                 };
@@ -2140,7 +2166,7 @@ fn encode_leading_blits(
                     continue;
                 }
                 mtld3d_shared::crumb!("blit:mipgen", cmd.dst_handle);
-                blit.generateMipmapsForTexture(&texture);
+                blit.generateMipmapsForTexture(texture);
             }
             None => {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -2453,13 +2479,18 @@ fn encode_pass(
                 }
                 Some(CommandType::SetRenderPipelineState) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLRenderPipelineState address.
-                    let Some(pipeline) =
-                        (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(cmd.param_b) })
-                            .into_retained()
-                    else {
+                    let handle =
+                        unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // pipeline state is a PE-side `pipeline_cache` entry, and
+                    // that cache never evicts: the only destroy is the
+                    // encoder's shutdown, which drains the submit thread and
+                    // waits for GPU idle before it issues one, so no replay
+                    // naming a pipeline is encoding when it runs.
+                    let Some(pipeline) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    encoder.setRenderPipelineState(&pipeline);
+                    encoder.setRenderPipelineState(pipeline);
                 }
                 Some(CommandType::SetViewport) => {
                     let height =
@@ -2544,13 +2575,16 @@ fn encode_pass(
                 }
                 Some(CommandType::SetDepthStencilState) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLDepthStencilState address.
-                    let Some(state) =
-                        (unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(cmd.param_b) })
-                            .into_retained()
-                    else {
+                    let handle =
+                        unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetRenderPipelineState` above: the
+                    // `depth_stencil_cache` entry behind this handle is
+                    // destroyed only by the encoder's shutdown, behind the
+                    // submit-thread drain and the GPU-idle wait.
+                    let Some(state) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    encoder.setDepthStencilState(Some(&state));
+                    encoder.setDepthStencilState(Some(state));
                 }
                 Some(CommandType::SetCullMode) => {
                     let mode = match CullMode::from_repr(cmd.param_a) {
@@ -2579,49 +2613,73 @@ fn encode_pass(
                 }
                 Some(CommandType::SetFragmentTexture) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLTexture address.
-                    let Some(tex) = (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) })
-                        .into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // texture the PE side gives up is parked on
+                    // `pending_resource_retention` stamped with the submit seq
+                    // of the frame whose commands still name it, exactly as a
+                    // buffer is, and the drain pops it only once `coherent_seq`
+                    // has reached that seq. The implicit surfaces skip that
+                    // queue, and each is destroyed behind a
+                    // `flush_current_frame_blocking` plus the encoder `Reset`
+                    // that drains the submit thread and waits for GPU idle.
+                    // The one destroy without that wait takes the back
+                    // buffer's sRGB twin at device destroy, and that handle
+                    // serves only as a pass attachment, which is converted
+                    // through the retained path.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `tex` is retained for the
-                    // duration of the binding (encoder retains the texture).
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // texture into the command buffer's resource set.
                     unsafe {
-                        encoder.setFragmentTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                        encoder.setFragmentTexture_atIndex(Some(tex), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetVertexTexture) => {
                     // SAFETY: cmd.param_b is a previously-retained MTLTexture address.
-                    let Some(tex) = (unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) })
-                        .into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetFragmentTexture` above, the seq-gated
+                    // retention drain cannot free the texture before the
+                    // command buffer this replay encodes into has retired.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `tex` is retained for the
-                    // duration of the binding (encoder retains the texture).
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // texture into the command buffer's resource set.
                     unsafe {
-                        encoder.setVertexTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                        encoder.setVertexTexture_atIndex(Some(tex), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetVertexSamplerState) => {
-                    let Some(sampler) = sampler_or_default(cmd_buf, cmd.param_b) else {
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // sampler state lives in the PE side's `sampler_cache`,
+                    // which never evicts: the only destroy is the encoder's
+                    // shutdown, which drains the submit thread and waits for
+                    // GPU idle before it issues one.
+                    let Some(sampler) = (unsafe { sampler_or_default(cmd_buf, cmd.param_b) })
+                    else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `sampler` is retained for
-                    // the duration of the binding.
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // sampler into the command buffer's resource set.
                     unsafe {
-                        encoder.setVertexSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                        encoder.setVertexSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetFragmentSamplerState) => {
-                    let Some(sampler) = sampler_or_default(cmd_buf, cmd.param_b) else {
+                    // SAFETY: as `SetVertexSamplerState` above, the
+                    // `sampler_cache` entry behind a non-zero handle outlives
+                    // every replay that names it.
+                    let Some(sampler) = (unsafe { sampler_or_default(cmd_buf, cmd.param_b) })
+                    else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `sampler` is retained for
-                    // the duration of the binding.
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // sampler into the command buffer's resource set.
                     unsafe {
                         encoder
-                            .setFragmentSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                            .setFragmentSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetFragmentNullTexture) => {
@@ -2639,24 +2697,25 @@ fn encode_pass(
                     };
                     // SAFETY: the handle came from `null_texture::create`'s
                     // `Retained::into_raw`, alive for the process lifetime.
-                    let Some(tex) =
-                        (unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) })
-                            .into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) };
+                    // SAFETY: that retain is never taken back, so it outlives
+                    // the borrow: the set is cached in a `OnceLock` and leaks
+                    // for the process.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
                     let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; both are retained for the
-                    // binding's duration.
+                    // SAFETY: objc2 typed binding; the encoder retains both
+                    // into the command buffer's resource set.
                     unsafe {
-                        encoder.setFragmentTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                        encoder.setFragmentTexture_atIndex(Some(tex), cmd.param_a as usize);
                     }
-                    // SAFETY: objc2 typed binding; retained for the duration.
+                    // SAFETY: objc2 typed binding; as the texture above.
                     unsafe {
                         encoder
-                            .setFragmentSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                            .setFragmentSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetVertexNullTexture) => {
@@ -2674,23 +2733,23 @@ fn encode_pass(
                     };
                     // SAFETY: the handle came from `null_texture::create`'s
                     // `Retained::into_raw`, alive for the process lifetime.
-                    let Some(tex) =
-                        (unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) })
-                            .into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) };
+                    // SAFETY: as the fragment arm above, the null set leaks for
+                    // the process, so its retain outlives the borrow.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
                     let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; both are retained for the
-                    // binding's duration.
+                    // SAFETY: objc2 typed binding; the encoder retains both
+                    // into the command buffer's resource set.
                     unsafe {
-                        encoder.setVertexTexture_atIndex(Some(&tex), cmd.param_a as usize);
+                        encoder.setVertexTexture_atIndex(Some(tex), cmd.param_a as usize);
                     }
-                    // SAFETY: objc2 typed binding; retained for the duration.
+                    // SAFETY: objc2 typed binding; as the texture above.
                     unsafe {
-                        encoder.setVertexSamplerState_atIndex(Some(&sampler), cmd.param_a as usize);
+                        encoder.setVertexSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
                     }
                 }
                 Some(CommandType::SetVertexBytesAt) => {
@@ -2785,11 +2844,16 @@ fn encode_pass(
                     let prim_type =
                         mtl_primitive_type_or_fallback(cmd.param_a, "DrawIndexedPrimitives");
                     // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
-                    let Some(index_buffer) =
-                        (unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) }).into_retained()
-                    else {
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow, by the
+                    // argument `SetVertexBuffer` states. That the borrow spans
+                    // the draw rather than a bind changes nothing: the draw goes
+                    // into the command buffer this replay encodes, and nothing
+                    // advances `coherent_seq` to this frame's seq before that
+                    // buffer has been committed and has completed.
+                    let Some(index_buffer) = (unsafe { handle.borrow_retained() }) else {
                         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                            "DrawIndexedPrimitives: index buffer retain failed — draw skipped"
+                            "DrawIndexedPrimitives: null index buffer handle, draw skipped"
                         );
                         continue;
                     };
@@ -2814,15 +2878,16 @@ fn encode_pass(
                         u32::try_from(cmd.param_c & 0xFFFF_FFFF).expect("masked to 32 bits");
                     let base_vertex = isize::try_from(base_vertex_u32.cast_signed())
                         .expect("i32 fits isize on 64-bit unix");
-                    // SAFETY: objc2 typed binding; `index_buffer` is retained
-                    // for the call; the counts and offset come from the PE-side
-                    // packed `param_c`/`param_d` per the wire contract.
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // index buffer into the command buffer's resource set; the
+                    // counts and offset come from the PE-side packed
+                    // `param_c`/`param_d` per the wire contract.
                     unsafe {
                         encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
                             prim_type,
                             to_usize(u64::from(index_count)),
                             index_type,
-                            &index_buffer,
+                            index_buffer,
                             offset,
                             to_usize(u64::from(instance_count.max(1))),
                             base_vertex,

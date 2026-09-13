@@ -104,14 +104,15 @@ impl IntoRetainedLayer for MetalHandle<CAMetalLayerKind> {
     }
 }
 
-/// Borrow the object a buffer handle's canonical retain keeps alive.
+/// Borrow the object a handle's canonical retain keeps alive.
 ///
-/// The narrow companion to [`IntoRetained::into_retained`]: a binding
-/// call that needs the object only for its own duration reads through
-/// the canonical retain instead of taking and dropping one of its own.
-/// Defined for [`MTLBufferKind`] alone, the kind whose binding cost was
-/// measured; every other kind keeps converting through the retained
-/// path, which needs no lifetime argument from its caller.
+/// The narrow companion to [`IntoRetained::into_retained`]: a replay
+/// command that needs the object only for the call it is making reads
+/// through the canonical retain instead of taking and dropping one of
+/// its own. Implemented for the kinds whose destroy ordering against
+/// the replay has been established, and for no other: every remaining
+/// kind converts through the retained path, which needs no lifetime
+/// argument from its caller.
 ///
 /// # Safety
 ///
@@ -122,25 +123,95 @@ impl IntoRetainedLayer for MetalHandle<CAMetalLayerKind> {
 /// object up, the way the [`ReleaseRetain`] call sites name the
 /// ownership they consume.
 pub unsafe trait BorrowRetained {
-    /// The `MTLBuffer` this handle addresses, or `None` when it is null.
+    /// The Metal protocol the borrowed object conforms to.
+    type Object: ?Sized;
+
+    /// The object this handle addresses, or `None` when it is null.
     ///
     /// # Safety
     ///
     /// As [`BorrowRetained`].
-    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLBuffer>>;
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<Self::Object>>;
+}
+
+/// The object `handle` addresses, read through the canonical retain.
+///
+/// The one dereference every [`BorrowRetained`] implementation shares.
+///
+/// # Safety
+///
+/// As [`BorrowRetained`]: the canonical retain must outlive `'a`.
+const unsafe fn borrow_canonical<'a, K: ToMetalProtocol>(
+    handle: MetalHandle<K>,
+) -> Option<&'a ProtocolObject<K::Real>> {
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: type invariant. `MetalHandle::new` asserted at construction
+    // that `raw` is either 0 (filtered above) or a valid retained
+    // `id<K::Real>`, and the caller asserted that retain outlives `'a`.
+    Some(unsafe { &*(handle.raw() as *const ProtocolObject<K::Real>) })
 }
 
 // SAFETY: trait contract delegates the invariant: each call site names the
-// ownership that keeps the buffer alive for the borrow it takes.
+// ownership that keeps the buffer alive for the borrow it takes. A buffer
+// wrapper the PE side gives up is parked on the resource-retention queue
+// stamped with the submit seq of the frame whose commands still name it, and
+// freed only once that seq has retired on the GPU.
 unsafe impl BorrowRetained for MetalHandle<MTLBufferKind> {
+    type Object = dyn MTLBuffer;
+
     unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLBuffer>> {
-        if self.is_null() {
-            return None;
-        }
-        // SAFETY: type invariant. `MetalHandle::new` asserted at construction
-        // that `raw` is either 0 (filtered above) or a valid retained
-        // `id<MTLBuffer>`, and the caller asserted that retain outlives `'a`.
-        Some(unsafe { &*(self.raw() as *const ProtocolObject<dyn MTLBuffer>) })
+        // SAFETY: the caller's assertion carries through unchanged.
+        unsafe { borrow_canonical(self) }
+    }
+}
+
+// SAFETY: as the buffer impl; a texture leaves through the same seq-gated
+// retention queue. The implicit surfaces that skip it are destroyed behind a
+// drain of the submit thread and a GPU-idle wait, bar the back buffer's sRGB
+// twin at device destroy, which only ever serves as a pass attachment and so
+// is named by no command a replay reads.
+unsafe impl BorrowRetained for MetalHandle<MTLTextureKind> {
+    type Object = dyn MTLTexture;
+
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLTexture>> {
+        // SAFETY: the caller's assertion carries through unchanged.
+        unsafe { borrow_canonical(self) }
+    }
+}
+
+// SAFETY: as the buffer impl; a sampler state lives in a PE-side cache that
+// never evicts, and every entry is destroyed in the encoder's shutdown, behind
+// the same submit-thread drain and GPU-idle wait.
+unsafe impl BorrowRetained for MetalHandle<MTLSamplerStateKind> {
+    type Object = dyn MTLSamplerState;
+
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLSamplerState>> {
+        // SAFETY: the caller's assertion carries through unchanged.
+        unsafe { borrow_canonical(self) }
+    }
+}
+
+// SAFETY: as the sampler impl; the depth-stencil states share that cache's
+// shape and that destroy path.
+unsafe impl BorrowRetained for MetalHandle<MTLDepthStencilStateKind> {
+    type Object = dyn MTLDepthStencilState;
+
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLDepthStencilState>> {
+        // SAFETY: the caller's assertion carries through unchanged.
+        unsafe { borrow_canonical(self) }
+    }
+}
+
+// SAFETY: as the sampler impl; the render pipeline states share that cache's
+// shape and that destroy path.
+unsafe impl BorrowRetained for MetalHandle<MTLRenderPipelineStateKind> {
+    type Object = dyn MTLRenderPipelineState;
+
+    unsafe fn borrow_retained<'a>(self) -> Option<&'a ProtocolObject<dyn MTLRenderPipelineState>> {
+        // SAFETY: the caller's assertion carries through unchanged.
+        unsafe { borrow_canonical(self) }
     }
 }
 
