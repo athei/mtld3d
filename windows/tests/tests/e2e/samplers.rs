@@ -238,6 +238,111 @@ fn point_and_linear_filtering_differ() {
     );
 }
 
+/// A `D3DSAMP_MINFILTER` DWORD wider than the four bits the sampler key packs.
+///
+/// Its low nibble is `D3DTEXF_LINEAR`, so before the snapshot narrowed the
+/// state the key named LINEAR while the translation took its unmapped arm.
+const WIDE_FILTER: u32 = 0x12;
+
+/// A `D3DSAMP_ADDRESSU` DWORD wider than those four bits.
+///
+/// Low nibble `D3DTADDRESS_CLAMP`, the same shape as [`WIDE_FILTER`].
+const WIDE_ADDRESS: u32 = 0x13;
+
+#[test]
+fn a_filter_above_the_key_width_reads_the_d3d9_default() {
+    // `SetSamplerState` takes a DWORD and stores it, so the filter states are
+    // game input. A value no `D3DTEXF_*` names reads as the D3D9 default,
+    // POINT, however many samplers the device has already built: the state
+    // that shares its low nibble must not hand over its sampler.
+    let h = Harness::new();
+    let tex = rgbw_2x2(&h);
+    let quad = uv_quad(1.0);
+
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let point = h.read_pixel(320, 240); // dead centre — texel boundary
+
+    // Build the LINEAR sampler first. Its key is what a filter of 0x12 used
+    // to compute, so this is the draw whose object the next one would reuse.
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let linear = h.read_pixel(320, 240);
+    assert_ne!(point, linear, "POINT and LINEAR must differ here");
+
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, WIDE_FILTER);
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_MINFILTER),
+        WIDE_FILTER,
+        "MINFILTER round-trip"
+    );
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_MAGFILTER),
+        WIDE_FILTER,
+        "MAGFILTER round-trip"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+
+    assert_eq!(
+        h.read_pixel(320, 240),
+        point,
+        "a filter outside D3DTEXF_* samples as the default POINT"
+    );
+}
+
+#[test]
+fn an_address_mode_above_the_key_width_reads_the_d3d9_default() {
+    // Same contract on the addressing states: 0x13 names no D3DTADDRESS_*,
+    // so it reads as the default WRAP rather than as the CLAMP its low
+    // nibble spells and whose sampler the cache already holds.
+    let h = Harness::new();
+    let tex = rgbw_2x2(&h);
+    let quad = uv_quad(2.0);
+
+    arm_texture(&h, &tex, D3DTADDRESS_WRAP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let wrap = h.read_pixel(PROBE_X, PROBE_Y);
+
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let clamp = h.read_pixel(PROBE_X, PROBE_Y);
+    assert_ne!(
+        wrap, clamp,
+        "WRAP and CLAMP must differ past the unit square"
+    );
+
+    arm_texture(&h, &tex, WIDE_ADDRESS, D3DTEXF_POINT);
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_ADDRESSU),
+        WIDE_ADDRESS,
+        "ADDRESSU round-trip"
+    );
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_ADDRESSV),
+        WIDE_ADDRESS,
+        "ADDRESSV round-trip"
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+
+    assert_eq!(
+        h.read_pixel(PROBE_X, PROBE_Y),
+        wrap,
+        "an address mode outside D3DTADDRESS_* samples as the default WRAP"
+    );
+}
+
 /// `D3DSAMP_SRGBTEXTURE=1` decodes the sampled texel from sRGB to linear.
 ///
 /// A mid-gray 0x80 texel (0.502 sRGB-encoded) decodes to linear ~0.216

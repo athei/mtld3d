@@ -21,7 +21,9 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT,
+    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP,
+    D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT, SAMPLER_STATE_COUNT,
+    sampler_state_defaults,
 };
 
 use crate::{
@@ -63,6 +65,24 @@ const MAX_MIP_LEVEL: u8 = 15;
 /// `bias()` argument.
 const LOD_BIAS_LIMIT: f32 = 32.0;
 
+/// The D3D9 sampler enum bounds at the byte width the snapshot carries.
+///
+/// Narrow copies of the ABI constants, each pinned to its `mtld3d-types`
+/// definition by the asserts below, so [`enum_value`] can name a bound in `u8`
+/// without a truncating cast.
+const TEXF_LAST: u8 = 8;
+const TEXF_NONE: u8 = 0;
+const TEXF_POINT: u8 = 1;
+const TADDRESS_FIRST: u8 = 1;
+const TADDRESS_LAST: u8 = 5;
+
+const _: () = assert!(TEXF_NONE as u32 == D3DTEXF_NONE);
+const _: () = assert!(TEXF_POINT as u32 == D3DTEXF_POINT);
+const _: () = assert!(TEXF_LAST as u32 == D3DTEXF_CONVOLUTIONMONO);
+const _: () = assert!(TADDRESS_FIRST as u32 == D3DTADDRESS_WRAP);
+const _: () = assert!(TADDRESS_LAST as u32 == D3DTADDRESS_MIRRORONCE);
+const _: () = assert!(MAX_ANISOTROPY <= u8::MAX as u32);
+
 bitflags::bitflags! {
     /// Sampler cache-key booleans that aren't sourced from a D3DSAMP slot.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,31 +110,58 @@ bitflags::bitflags! {
 
 /// Input view of the D3DSAMP state that participates in pipeline/cache decisions.
 ///
-/// Raw D3D values (`u32`) preserve 1:1 fidelity with the game input;
-/// translation happens inside `key_from_snapshot` and `params_from_snapshot`
-/// so both consumers see identical translated values.
+/// [`snapshot_from_state`] narrows each state once on the way in: the enum
+/// ones to their D3D9 value space, the numeric ones to the range the sampler
+/// accepts. `key_from_snapshot` packs exactly the bytes `params_from_snapshot`
+/// translates, so a state can never be keyed as one thing and built as
+/// another, and the key's four-bit fields are exact without a mask.
 pub struct SamplerSnapshot {
-    pub min_filter: u32,
-    pub mag_filter: u32,
-    pub mip_filter: u32,
-    pub address_u: u32,
-    pub address_v: u32,
-    pub address_w: u32,
-    pub max_anisotropy: u32,
-    /// `D3DSAMP_MAXMIPLEVEL`.
+    /// `D3DSAMP_MINFILTER`, inside the `D3DTEXF_*` space.
+    pub min_filter: u8,
+    /// `D3DSAMP_MAGFILTER`, inside the `D3DTEXF_*` space.
+    pub mag_filter: u8,
+    /// `D3DSAMP_MIPFILTER`, inside the `D3DTEXF_*` space.
+    pub mip_filter: u8,
+    /// `D3DSAMP_ADDRESSU`, inside the `D3DTADDRESS_*` space.
+    pub address_u: u8,
+    /// `D3DSAMP_ADDRESSV`, inside the `D3DTADDRESS_*` space.
+    pub address_v: u8,
+    /// `D3DSAMP_ADDRESSW`, inside the `D3DTADDRESS_*` space.
+    pub address_w: u8,
+    /// `D3DSAMP_MAXANISOTROPY`, limited to the ceiling the caps advertise.
+    pub max_anisotropy: u8,
+    /// `D3DSAMP_MAXMIPLEVEL`, limited to the deepest level a D3D9 texture has.
     ///
     /// D3D9 spec: the *minimum* fine mip level the sampler may select
     /// (counterintuitive name). Maps to Metal's `setLodMinClamp`.
     /// Zero = default (no clamp).
-    pub max_mip_level: u32,
+    pub max_mip_level: u8,
     /// `D3DSAMP_BORDERCOLOR` as the game set it (a D3DCOLOR).
     ///
-    /// Reduced to a Metal border preset for the key and the wire params.
+    /// Kept full-width: the D3DCOLOR is a bit pattern, not an enum, and both
+    /// consumers reduce it through `border_color_preset`.
     pub border_color: u32,
     /// Cache-key booleans not sourced from a D3DSAMP slot value (`IS_COMPARE` / `SRGB_TEXTURE`).
     ///
     /// See [`SamplerFlags`].
     pub flags: SamplerFlags,
+}
+
+impl SamplerSnapshot {
+    /// Replace the filter state with unfiltered point sampling.
+    ///
+    /// A raw depth fetch takes this: Apple GPUs cannot filter `Depth32Float`,
+    /// and a linear sample of one returns garbage rather than depth. D3D9
+    /// games set LINEAR on everything, so the slot's sampler is forced to
+    /// point and the shader reads exact stored depths, which is what position
+    /// reconstruction wants anyway. Comparison samplers are left as
+    /// configured: linear there is hardware PCF, which Apple GPUs do support.
+    pub const fn force_point_filter(&mut self) {
+        self.min_filter = TEXF_POINT;
+        self.mag_filter = TEXF_POINT;
+        self.mip_filter = TEXF_NONE;
+        self.max_anisotropy = 1;
+    }
 }
 
 /// Cached fragment LOD-bias uniform derived from effective per-slot inputs.
@@ -178,6 +225,12 @@ impl Default for LodBiasTableCache {
 /// - 37     `is_compare` (depth-bound shadow sampler)
 /// - 38     `srgb_texture` (`D3DSAMP_SRGBTEXTURE` — picks linear vs sRGB texture-view at bind)
 /// - 39..40 border preset (`D3DSAMP_BORDERCOLOR` reduced to the Metal preset, not the raw colour)
+///
+/// Every field is packed from the narrowed snapshot value, so each one fits
+/// its width without a mask. A mask would make two states that differ only
+/// above a field's width share this key while translating to different Metal
+/// enums, and the second state to arrive would be served the first one's
+/// sampler.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SamplerKey(u64);
 
@@ -252,47 +305,78 @@ pub fn build_lod_bias_bytes(biases: &[f32; LOD_BIAS_SLOTS]) -> [u8; LOD_BIAS_BYT
 
 /// Build a `SamplerSnapshot` from the device's per-stage D3DSAMP array.
 ///
-/// `is_compare` is supplied separately by the caller (encoder) from the
-/// per-stage depth-sampler mask — it isn't a D3DSAMP_* slot.
+/// Every state is narrowed here and nowhere else, so the key and the wire
+/// params read one value. `is_compare` is supplied separately by the caller
+/// (encoder) from the per-stage depth-sampler mask — it isn't a D3DSAMP_*
+/// slot.
 #[must_use]
-pub const fn snapshot_from_state(
-    ss: &[u32; SAMPLER_STATE_COUNT],
-    is_compare: bool,
-) -> SamplerSnapshot {
-    // const fn: bitflags `.set()` isn't const, so build the bit pattern
-    // directly from the flag constants' `.bits()`.
-    let mut flag_bits = 0u8;
-    if is_compare {
-        flag_bits |= SamplerFlags::IS_COMPARE.bits();
-    }
-    if srgb_texture_enabled(ss) {
-        flag_bits |= SamplerFlags::SRGB_TEXTURE.bits();
-    }
+pub fn snapshot_from_state(ss: &[u32; SAMPLER_STATE_COUNT], is_compare: bool) -> SamplerSnapshot {
+    let mut flags = SamplerFlags::empty();
+    flags.set(SamplerFlags::IS_COMPARE, is_compare);
+    flags.set(SamplerFlags::SRGB_TEXTURE, srgb_texture_enabled(ss));
     SamplerSnapshot {
-        min_filter: ss[D3DSAMP_MINFILTER as usize],
-        mag_filter: ss[D3DSAMP_MAGFILTER as usize],
-        mip_filter: ss[D3DSAMP_MIPFILTER as usize],
-        address_u: ss[D3DSAMP_ADDRESSU as usize],
-        address_v: ss[D3DSAMP_ADDRESSV as usize],
-        address_w: ss[D3DSAMP_ADDRESSW as usize],
-        max_anisotropy: ss[D3DSAMP_MAXANISOTROPY as usize],
-        max_mip_level: ss[D3DSAMP_MAXMIPLEVEL as usize],
+        min_filter: enum_value(ss, D3DSAMP_MINFILTER),
+        mag_filter: enum_value(ss, D3DSAMP_MAGFILTER),
+        mip_filter: enum_value(ss, D3DSAMP_MIPFILTER),
+        address_u: enum_value(ss, D3DSAMP_ADDRESSU),
+        address_v: enum_value(ss, D3DSAMP_ADDRESSV),
+        address_w: enum_value(ss, D3DSAMP_ADDRESSW),
+        max_anisotropy: clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize]),
+        max_mip_level: clamped_max_mip_level(ss[D3DSAMP_MAXMIPLEVEL as usize]),
         border_color: ss[D3DSAMP_BORDERCOLOR as usize],
-        flags: SamplerFlags::from_bits_truncate(flag_bits),
+        flags,
     }
+}
+
+/// An enum-valued D3DSAMP state, narrowed to the byte a snapshot carries.
+///
+/// `SetSamplerState` stores whatever DWORD the game passed, so these are game
+/// input. A value outside the state's D3D9 enum space reads as that state's
+/// default from `sampler_state_defaults`, which is what a driver settles on
+/// for an enum it does not recognise, and surfaces once. Values the space
+/// names but `convert` does not map (`D3DTEXF_NONE` on a min/mag filter, the
+/// quad filters) still reach that translator's own logged fallback arm, so
+/// every in-space value produces exactly what it did before.
+fn enum_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
+    let value = ss[state as usize];
+    // Exact for every value the spaces below accept: both fit in a byte.
+    let byte = value.to_le_bytes()[0];
+    let (first, last) = match state {
+        D3DSAMP_MINFILTER | D3DSAMP_MAGFILTER | D3DSAMP_MIPFILTER => (TEXF_NONE, TEXF_LAST),
+        D3DSAMP_ADDRESSU | D3DSAMP_ADDRESSV | D3DSAMP_ADDRESSW => (TADDRESS_FIRST, TADDRESS_LAST),
+        other => {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: u64::from(other),
+                "D3DSAMP_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
+            );
+            return byte;
+        }
+    };
+    if u32::from(byte) == value && first <= byte && byte <= last {
+        return byte;
+    }
+    // Exact: no sampler-state default is wider than a byte.
+    let default = sampler_state_defaults()[state as usize].to_le_bytes()[0];
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(state),
+        "D3DSAMP_{state} = {value:#x} outside its {first}..={last} value space → reading the D3D9 default {default:#x}"
+    );
+    default
 }
 
 #[must_use]
 pub const fn key_from_snapshot(s: &SamplerSnapshot) -> SamplerKey {
     SamplerKey(
-        (s.min_filter as u64 & 0xF)
-            | ((s.mag_filter as u64 & 0xF) << 4)
-            | ((s.mip_filter as u64 & 0xF) << 8)
-            | ((s.address_u as u64 & 0xF) << 12)
-            | ((s.address_v as u64 & 0xF) << 16)
-            | ((s.address_w as u64 & 0xF) << 20)
-            | ((s.max_anisotropy as u64 & 0xFF) << 24)
-            | ((clamped_max_mip_level(s.max_mip_level) as u64) << 32)
+        (s.min_filter as u64)
+            | ((s.mag_filter as u64) << 4)
+            | ((s.mip_filter as u64) << 8)
+            | ((s.address_u as u64) << 12)
+            | ((s.address_v as u64) << 16)
+            | ((s.address_w as u64) << 20)
+            | ((s.max_anisotropy as u64) << 24)
+            | ((s.max_mip_level as u64) << 32)
             | ((s.flags.contains(SamplerFlags::IS_COMPARE) as u64) << 37)
             | ((s.flags.contains(SamplerFlags::SRGB_TEXTURE) as u64) << 38)
             | ((border_preset_for_key(s.border_color) as u64 & 0x3) << 39),
@@ -302,8 +386,8 @@ pub const fn key_from_snapshot(s: &SamplerSnapshot) -> SamplerKey {
 /// `D3DSAMP_MAXMIPLEVEL` at the width the key packs and the sampler takes.
 ///
 /// `SetSamplerState` stores whatever DWORD the game passed, so the state is
-/// game input; both consumers read it through here, and a value past the
-/// deepest level any D3D9 texture has reads as [`MAX_MIP_LEVEL`].
+/// game input, and a value past the deepest level any D3D9 texture has reads
+/// as [`MAX_MIP_LEVEL`].
 const fn clamped_max_mip_level(level: u32) -> u8 {
     if level > MAX_MIP_LEVEL as u32 {
         MAX_MIP_LEVEL
@@ -311,6 +395,23 @@ const fn clamped_max_mip_level(level: u32) -> u8 {
         // Exact: the branch above leaves nothing wider than a byte.
         level.to_le_bytes()[0]
     }
+}
+
+/// `D3DSAMP_MAXANISOTROPY` at the width the key packs and the sampler takes.
+///
+/// The state is a DWORD the game chose, D3D9's default is 1 and the caps
+/// advertise a ceiling of [`MAX_ANISOTROPY`], so the value is limited to that
+/// range here. Two DWORDs that limit alike then share one sampler rather than
+/// minting two keys for the one object the unix side builds.
+const fn clamped_max_anisotropy(value: u32) -> u8 {
+    if value == 0 {
+        return 1;
+    }
+    if value > MAX_ANISOTROPY {
+        // Exact: the const assert above pins MAX_ANISOTROPY inside a byte.
+        return MAX_ANISOTROPY.to_le_bytes()[0];
+    }
+    value.to_le_bytes()[0]
 }
 
 /// The border preset the key carries.
@@ -335,14 +436,14 @@ pub fn params_from_snapshot(
     CreateSamplerStateParams {
         device_handle,
         id: key.raw(),
-        min_filter: d3d_to_metal_min_mag_filter(s.min_filter),
-        mag_filter: d3d_to_metal_min_mag_filter(s.mag_filter),
-        mip_filter: d3d_to_metal_mip_filter(s.mip_filter),
-        address_u: d3d_to_metal_address_mode(s.address_u),
-        address_v: d3d_to_metal_address_mode(s.address_v),
-        address_w: d3d_to_metal_address_mode(s.address_w),
-        max_anisotropy: s.max_anisotropy.clamp(1, MAX_ANISOTROPY),
-        lod_min_clamp: f32::from(clamped_max_mip_level(s.max_mip_level)).to_bits(),
+        min_filter: d3d_to_metal_min_mag_filter(u32::from(s.min_filter)),
+        mag_filter: d3d_to_metal_min_mag_filter(u32::from(s.mag_filter)),
+        mip_filter: d3d_to_metal_mip_filter(u32::from(s.mip_filter)),
+        address_u: d3d_to_metal_address_mode(u32::from(s.address_u)),
+        address_v: d3d_to_metal_address_mode(u32::from(s.address_v)),
+        address_w: d3d_to_metal_address_mode(u32::from(s.address_w)),
+        max_anisotropy: u32::from(s.max_anisotropy),
+        lod_min_clamp: f32::from(s.max_mip_level).to_bits(),
         lod_max_clamp: LOD_MAX_CLAMP.to_bits(),
         is_compare: u32::from(s.flags.contains(SamplerFlags::IS_COMPARE)),
         border_color: d3d_border_color_to_metal(s.border_color),
