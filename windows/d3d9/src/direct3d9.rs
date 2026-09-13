@@ -1560,6 +1560,7 @@ extern "system" fn d3d9_create_device(
         queue_handle: cq_params.queue_handle,
         view_handle: layer_params.view_handle,
         layer_handle: layer_params.layer_handle,
+        display_sync_enabled: layer_params.display_sync_enabled != 0,
         backbuffer_handle: bb_params.texture_handle,
         backbuffer_srgb_handle: bb_params.srgb_texture_handle,
         backbuffer_msaa_handle: bb_params.msaa_texture_handle,

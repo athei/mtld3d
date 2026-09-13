@@ -43,6 +43,31 @@ fn enabled_polarity() {
 }
 
 #[test]
+fn a_reset_at_the_pacing_the_layer_holds_queues_nothing() {
+    use super::queued_display_sync;
+    assert_eq!(queued_display_sync(true, true), None);
+    assert_eq!(queued_display_sync(false, false), None);
+}
+
+#[test]
+fn a_reset_that_moves_the_pacing_queues_the_new_value() {
+    use super::queued_display_sync;
+    assert_eq!(queued_display_sync(true, false), Some(false));
+    assert_eq!(queued_display_sync(false, true), Some(true));
+}
+
+#[test]
+fn the_answer_is_the_whole_queue_not_a_delta() {
+    use super::queued_display_sync;
+    // Asked twice against a layer that has not moved, the second answer
+    // empties the queue the first filled rather than leaving it to be
+    // written back as the value the layer never left.
+    let held = true;
+    assert_eq!(queued_display_sync(held, false), Some(false));
+    assert_eq!(queued_display_sync(held, true), None);
+}
+
+#[test]
 fn capture_marks_bracket_the_run() {
     use super::capture_marks;
     assert_eq!(capture_marks(1, 3), (true, false));

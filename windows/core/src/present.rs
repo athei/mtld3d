@@ -40,6 +40,18 @@ pub const fn display_sync_for(interval: u32) -> DisplaySync {
     }
 }
 
+/// The pacing change a `Reset` leaves queued, given the pacing the layer holds.
+///
+/// `held` is the value the layer was last handed and `want` the value the
+/// `Reset` resolved to. The answer is the whole queue rather than a delta:
+/// `None` when the two agree, because the layer already paces the way the
+/// guest asked for, so nothing has to go out and anything still queued is
+/// dropped rather than written back as the value the layer never left.
+#[must_use]
+pub const fn queued_display_sync(held: bool, want: bool) -> Option<bool> {
+    if want == held { None } else { Some(want) }
+}
+
 /// Which capture marks frame `index` of a `total`-frame diagnostic run carries.
 ///
 /// Returns `(start, stop)`: the first frame of the run starts the GPU
