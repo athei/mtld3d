@@ -41,12 +41,23 @@
 //! process that is not Wine's. The table is the only door, so the load
 //! resolves nothing and the attach above it fails rather than reading a
 //! window record through a layout the process does not have.
+//!
+//! What that load does with a table it did get is pinned on tables built
+//! here: `first_null_required_entry` names the first entry the layer calls
+//! that a table leaves null, which is what turns a null entry into a warn
+//! and a clean failure instead of a transmuted null called as a function,
+//! and it passes a table whose only null is `macdrv_get_cocoa_window`,
+//! which the layer treats as optional. The layout the table is read
+//! through is pinned beside them, field offset by field offset, since
+//! nothing at run time compares it against the fork's.
+
+use core::ffi::c_void;
 
 use super::{
-    KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MetalViewPark, PresentPacing, ScreenParamsFilterStep,
-    backing_scale_change, backing_scale_from, layer_mode_change, layer_mode_for,
-    min_present_duration, min_present_duration_change, pack_pacing, screen_params_filter_step,
-    unpack_pacing,
+    KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MetalViewPark, PresentPacing,
+    ScreenParamsFilterStep, backing_scale_change, backing_scale_from, first_null_required_entry,
+    layer_mode_change, layer_mode_for, min_present_duration, min_present_duration_change,
+    pack_pacing, screen_params_filter_step, unpack_pacing,
 };
 
 #[test]
@@ -429,4 +440,128 @@ fn a_process_without_the_macdrv_table_loads_nothing() {
         MacdrvFuncs::load().is_none(),
         "a process with no macdrv_functions table resolves no macdrv entry point",
     );
+}
+
+/// A table with every entry the layer declares filled, as the fork publishes one.
+///
+/// The addresses are not functions and are never called: what reads them
+/// here reads them as pointers, and only asks whether one is null.
+fn filled_table() -> MacdrvFunctionsTable {
+    let entry = core::ptr::NonNull::<c_void>::dangling().as_ptr();
+    MacdrvFunctionsTable {
+        macdrv_init_display_devices: entry,
+        get_win_data: entry,
+        release_win_data: entry,
+        macdrv_get_cocoa_window: entry,
+        macdrv_create_metal_device: entry,
+        macdrv_release_metal_device: entry,
+        macdrv_view_create_metal_view: entry,
+        macdrv_view_get_metal_layer: entry,
+        macdrv_view_release_metal_view: entry,
+        on_main_thread: entry,
+    }
+}
+
+#[test]
+fn a_table_the_fork_filled_is_taken_as_it_is() {
+    assert_eq!(first_null_required_entry(&filled_table()), None);
+}
+
+#[test]
+fn the_first_null_entry_the_layer_calls_is_named() {
+    let mut table = filled_table();
+    table.get_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("get_win_data"));
+
+    let mut table = filled_table();
+    table.release_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("release_win_data"));
+
+    let mut table = filled_table();
+    table.macdrv_view_create_metal_view = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_create_metal_view")
+    );
+
+    let mut table = filled_table();
+    table.macdrv_view_get_metal_layer = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_get_metal_layer")
+    );
+
+    // The release path holds this entry as a typed pointer, so a table
+    // missing it is refused here rather than at a release that has a view
+    // in hand and nothing to release it with.
+    let mut table = filled_table();
+    table.macdrv_view_release_metal_view = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        Some("macdrv_view_release_metal_view")
+    );
+}
+
+#[test]
+fn a_null_cocoa_window_entry_leaves_the_table_usable() {
+    let mut table = filled_table();
+    table.macdrv_get_cocoa_window = core::ptr::null_mut();
+    assert_eq!(
+        first_null_required_entry(&table),
+        None,
+        "the entry is optional: without it a kept view is not reused",
+    );
+    // The entries that are not optional are unaffected by it.
+    table.get_win_data = core::ptr::null_mut();
+    assert_eq!(first_null_required_entry(&table), Some("get_win_data"));
+}
+
+#[test]
+fn the_table_is_read_through_the_layout_the_fork_publishes() {
+    // Wine's `struct macdrv_functions_t` is 24 function pointers, pinned
+    // there by a `C_ASSERT` that its size is 192 bytes. The layer declares
+    // the first ten of them and reads that prefix alone, so every entry it
+    // reads has to sit at the offset the fork's field order gives it, and
+    // the prefix has to be the ten pointers and nothing else. The table
+    // carries no version or size word, so nothing at run time can check
+    // this; the assertions below are the check, and they fail here rather
+    // than in a game if the declaration drifts.
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_init_display_devices),
+        0
+    );
+    assert_eq!(core::mem::offset_of!(MacdrvFunctionsTable, get_win_data), 8);
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, release_win_data),
+        16
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_get_cocoa_window),
+        24
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_create_metal_device),
+        32
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_release_metal_device),
+        40
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_create_metal_view),
+        48
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_get_metal_layer),
+        56
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, macdrv_view_release_metal_view),
+        64
+    );
+    assert_eq!(
+        core::mem::offset_of!(MacdrvFunctionsTable, on_main_thread),
+        72
+    );
+    assert_eq!(size_of::<MacdrvFunctionsTable>(), 80);
 }
