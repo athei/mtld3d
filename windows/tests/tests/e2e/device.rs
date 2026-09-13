@@ -14,8 +14,8 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
+    CONFIG_VAR, Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
     cursor_mask_bits, destroy_window, enumerate_display_sizes, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
@@ -1025,12 +1025,27 @@ fn reset_flips_the_presentation_interval() {
     std::fs::create_dir(&dir).expect("create private pacing directory");
     let child = dir.join(PACING_CHILD_NAME);
     std::fs::copy(&exe, &child).expect("copy pacing workload executable");
+    // A run that collects its logs from one directory (`LOG_DIR`, which every
+    // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
+    // child that inherited it would write into that shared directory. So the
+    // child is handed the private directory instead, always, and the run here
+    // takes the same path CI takes. The parser keeps the last entry for a key
+    // and everything after the entry's first `=`, so the appended path stands
+    // as long as it carries no `;`. The suite-wide value is read under the
+    // environment lock, which keeps the entries a harness publishes for an
+    // interface of its own out of the child's configuration.
+    let config = format!(
+        "{};log.dir={}",
+        config_var().unwrap_or_default(),
+        dir.display()
+    );
     let output = std::process::Command::new(&child)
         .args([
             "--exact",
             "device::reset_flips_the_presentation_interval",
             "--nocapture",
         ])
+        .env(CONFIG_VAR, config)
         .output()
         .expect("run pacing workload child");
     assert!(
@@ -1087,16 +1102,36 @@ fn await_pacing(expected: &[&str]) {
     }
 }
 
+/// The directory the layer writes this process's log into.
+///
+/// `log.dir` from this process's own configuration, resolved the way the
+/// layer resolves it: the last entry for the key, because that is the one the
+/// parser keeps, against the executable's directory, so an absolute path
+/// stands as it is. An absent or empty entry means `mtld3d-logs` beside the
+/// executable.
+fn log_directory() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("resolve test executable");
+    let configured = config_var()
+        .and_then(|config| {
+            config
+                .split(';')
+                .filter_map(|segment| segment.split_once('='))
+                .filter(|(key, _)| key.trim() == "log.dir")
+                .map(|(_, value)| value.trim().to_owned())
+                .next_back()
+        })
+        .filter(|value| !value.is_empty());
+    exe.parent()
+        .expect("the executable sits in a directory")
+        .join(configured.as_deref().unwrap_or("mtld3d-logs"))
+}
+
 /// The vsync state of every re-pacing this process has logged, oldest first.
 ///
-/// The log is the one the layer writes beside the executable, which for the
-/// workload child holds its device's lines and nobody else's.
+/// The log is the one the layer writes into this process's log directory,
+/// which for the workload child holds its device's lines and nobody else's.
 fn logged_pacing() -> Vec<String> {
-    let exe = std::env::current_exe().expect("resolve test executable");
-    let logs = exe
-        .parent()
-        .expect("the executable sits in a directory")
-        .join("mtld3d-logs");
+    let logs = log_directory();
     let Ok(entries) = std::fs::read_dir(&logs) else {
         // The directory appears with the first line the layer writes.
         return Vec::new();
