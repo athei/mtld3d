@@ -1187,11 +1187,12 @@ mod bounded_cast {
 /// follows.
 ///
 /// [`KEPT_METAL_VIEWS`] views are kept, one per window, and parking past
-/// that releases the oldest, so what the parked layers hold, their drawable
-/// pools above all, is bounded. A device attaching to another window leaves
-/// a kept view for a device that comes back to its own; one attaching to a
-/// kept view's window handle while the view no longer sits in that window
-/// releases it and gets a view of its own.
+/// that releases the oldest. Parking also drops the layer's drawable pool
+/// ([`shrink_parked_layer`]), so a kept layer holds the one surface it still
+/// displays rather than a pool at the window's size. A device attaching to
+/// another window leaves a kept view for a device that comes back to its
+/// own; one attaching to a kept view's window handle while the view no
+/// longer sits in that window releases it and gets a view of its own.
 static PARKED_METAL_VIEW: Mutex<MetalViewPark> = Mutex::new(MetalViewPark::new());
 
 /// Retire a device's metal view: kept for its window's next device, see [`PARKED_METAL_VIEW`].
@@ -1210,6 +1211,10 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
         release_metal_view(view);
         return;
     };
+    // Before the park publishes the view, not after: a device that took it
+    // back in between would present into the shrunk drawable until its own
+    // attach put the layer's geometry back.
+    shrink_parked_layer(record.layer());
     let displaced = PARKED_METAL_VIEW
         .lock()
         .expect("metal view park mutex poisoned")
@@ -1224,12 +1229,58 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
     }
 }
 
+/// Drop the drawable pool of a layer about to be parked, keeping the frame it shows.
+///
+/// A layer's pool is its window's size, `maximumDrawableCount` deep: at
+/// 3456x2234 `RGBA16Float` that is about 62 MB a drawable, held while no
+/// device presents through it. `CAMetalLayer` has no call that empties the
+/// pool, and neither lowering `maximumDrawableCount` nor releasing the last
+/// drawable releases anything of it; writing `drawableSize` does, which is
+/// why [`sync_drawable_size`] compares before it writes. So the park writes
+/// the smallest drawable Metal takes, and attach restores the layer's own
+/// geometry through [`configure_metal_layer`], as it does for a view Wine
+/// just created. What survives the write is the surface the layer
+/// displays, which is the frame the window shows until its next device
+/// presents.
+///
+/// Synchronous, because the caller is about to publish the view to the park:
+/// the write has to land before another device can take the view back.
+fn shrink_parked_layer(layer: usize) {
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("the parked layer is shrunk on the main thread");
+        shrink_layer_drawable(layer, mtm);
+    });
+}
+
+/// Write the smallest drawable size `layer` accepts. **Main thread only.**
+fn shrink_layer_drawable(layer: usize, _mtm: MainThreadMarker) {
+    use objc2_core_foundation::CGSize;
+    use objc2_quartz_core::CAMetalLayer;
+
+    /// The smallest drawable Metal accepts; a parked layer vends none of them.
+    const PARKED_DRAWABLE_SIZE: CGSize = CGSize {
+        width: 1.0,
+        height: 1.0,
+    };
+
+    // SAFETY: the layer address is the one the retiring device's attachment
+    // record held, and Wine retains the `CAMetalLayer` for its metal view's
+    // lifetime; the view is still retained here, since the caller has not
+    // parked or released it yet, so the address names a live layer and the
+    // retain taken here covers the write.
+    let Some(layer) = (unsafe { Retained::retain(layer as *mut CAMetalLayer) }) else {
+        return;
+    };
+    layer.setDrawableSize(PARKED_DRAWABLE_SIZE);
+}
+
 /// How many retired metal views are kept at once.
 ///
 /// A game has its device window and at most one more that a `Reset`
 /// retargets it to; the end-to-end suite runs four devices at once, and a
 /// smaller park would hand its recreations new layers by accident of timing.
-/// Each kept view holds its layer's drawable pool at the window's size.
+/// Each kept view holds the one surface its layer still displays; the pool
+/// behind it goes at the park ([`shrink_parked_layer`]).
 const KEPT_METAL_VIEWS: usize = 4;
 
 /// One kept metal view: raw addresses and the window it served.
