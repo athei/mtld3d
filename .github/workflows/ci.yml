@@ -70,7 +70,7 @@ env:
   # paravirtual device that made Metal abort inside explorer.exe, so no prefix
   # ever booted there.
   WINE_RELEASE: cx-26.3.0-5
-  RUST_STABLE: 1.97.1
+  RUST_STABLE: 1.98.1
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0
   NEXTEST_VERSION: 0.9.143

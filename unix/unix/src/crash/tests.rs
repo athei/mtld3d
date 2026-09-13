@@ -780,3 +780,42 @@ fn only_the_image_file_name_decides_whether_a_fault_is_ours() {
     );
     assert!(!names_ours(""));
 }
+
+/// A foreign image under a directory named for us still forwards its fault.
+///
+/// Re-executing with a foreign file name exercises the real dyld path and
+/// handler decision, including the disposition that receives the signal.
+#[test]
+fn foreign_image_under_our_directory_forwards_fault() {
+    if std::env::var_os(FOREIGN_SELFTEST_ENV).is_some() {
+        super::install();
+        let _ = deref_this(BAD_ADDR as *const u64);
+        unreachable!("the read above must fault");
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let dir = exe
+        .parent()
+        .expect("test binary directory")
+        .join(format!("mtld3d-foreign-image-{}", std::process::id()));
+    std::fs::create_dir(&dir).expect("unique image directory");
+    let foreign = dir.join("foreign-image");
+    // A distinct inode keeps dyld's image path independent of concurrent tests.
+    std::fs::copy(&exe, &foreign).expect("copy the test binary with a foreign name");
+    let out = std::process::Command::new(&foreign)
+        .args([
+            "--exact",
+            "crash::tests::foreign_image_under_our_directory_forwards_fault",
+            "--nocapture",
+        ])
+        .env(FOREIGN_SELFTEST_ENV, "1")
+        .output();
+    std::fs::remove_file(&foreign).expect("remove the test image");
+    std::fs::remove_dir(&dir).expect("remove the image directory");
+    let out = out.expect("re-exec the foreign image");
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{report}");
+    assert!(!report.contains("FATAL"), "{report}");
+    assert!(report.contains("fault outside mtld3d.so:"), "{report}");
+    assert!(report.contains("/foreign-image+0x"), "{report}");
+}

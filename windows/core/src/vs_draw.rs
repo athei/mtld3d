@@ -97,8 +97,8 @@ pub fn build_vs_draw_bytes(
         }
     }
     let mut out = [0u8; VS_DRAW_BYTES];
-    for (chunk, lane) in out.chunks_exact_mut(4).zip(lanes) {
-        chunk.copy_from_slice(&lane.to_le_bytes());
+    for (chunk, lane) in out.as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
+        *chunk = lane.to_le_bytes();
     }
     out
 }
