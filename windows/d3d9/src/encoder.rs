@@ -8209,17 +8209,7 @@ impl FrameEncoder {
         }
         let mut snapshot = sampler_state::snapshot_from_state(sampler_state, is_compare);
         if force_point {
-            // Raw depth fetch: Apple GPUs cannot filter Depth32Float, and a
-            // linear sample of it returns garbage rather than depth. D3D9
-            // games set LINEAR on everything, so the slot's sampler is forced
-            // to point; the shader reads exact stored depths, which is what
-            // position reconstruction wants anyway. Comparison samplers stay
-            // as configured: linear there is hardware PCF, which Apple GPUs
-            // do support.
-            snapshot.min_filter = mtld3d_types::D3DTEXF_POINT;
-            snapshot.mag_filter = mtld3d_types::D3DTEXF_POINT;
-            snapshot.mip_filter = mtld3d_types::D3DTEXF_NONE;
-            snapshot.max_anisotropy = 1;
+            snapshot.force_point_filter();
         }
         let key = sampler_state::key_from_snapshot(&snapshot);
         let lodbias_raw = sampler_state[D3DSAMP_MIPMAPLODBIAS as usize];

@@ -320,6 +320,9 @@ pub const D3DTEXF_NONE: u32 = 0;
 pub const D3DTEXF_POINT: u32 = 1;
 pub const D3DTEXF_LINEAR: u32 = 2;
 pub const D3DTEXF_ANISOTROPIC: u32 = 3;
+pub const D3DTEXF_PYRAMIDALQUAD: u32 = 6;
+pub const D3DTEXF_GAUSSIANQUAD: u32 = 7;
+pub const D3DTEXF_CONVOLUTIONMONO: u32 = 8;
 
 // ── D3D9 texture address modes ──
 
