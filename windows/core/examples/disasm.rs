@@ -29,8 +29,10 @@ fn main() {
         process::exit(2);
     }
     let tokens: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
 
     println!("== tokens ({n} words) ==", n = tokens.len());

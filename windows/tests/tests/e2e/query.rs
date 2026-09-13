@@ -9,8 +9,20 @@ use mtld3d_types::{
     D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, S_FALSE,
 };
 
-/// Frames a pending EVENT query is given to retire before the test fails.
-const EVENT_POLL_LIMIT: u32 = 16;
+/// Poll an EVENT query without other calls that could submit its work.
+fn wait_for_event(q: &Query<'_>, flags: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (hr, value) = q.data_u32(flags);
+        assert!(hr == 0 || hr == S_FALSE, "GetData reported {hr:#x}");
+        assert_eq!(value, u32::from(hr == 0), "BOOL disagrees with status");
+        if hr == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "EVENT did not retire");
+        std::thread::yield_now();
+    }
+}
 
 /// A full-frame quad in clip space at depth `z`, one solid colour.
 const fn full_frame_quad(z: f32) -> [PosColorVertex; 6] {
@@ -92,32 +104,11 @@ fn event_query_signals() {
         .expect("EVENT query is supported");
     assert_eq!(q.data_size(), 4, "EVENT result is a 4-byte BOOL");
 
-    // An EVENT query reports completion once the GPU has retired the work it
-    // was issued after, so the answer is polled rather than assumed: an
-    // implementation that reports completion on the first call is one that
-    // never waits, and an application recycling storage behind this fence
-    // would overwrite what a queued draw still reads.
-    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
-    let mut signalled = 0;
-    let mut hr = S_FALSE;
-    for _ in 0..EVENT_POLL_LIMIT {
-        let (poll_hr, value) = q.data_u32(D3DGETDATA_FLUSH);
-        hr = poll_hr;
-        signalled = value;
-        assert!(hr == 0 || hr == S_FALSE, "GetData reported {hr:#x}");
-        // The BOOL tracks the status: pending is FALSE, completed is TRUE.
-        assert_eq!(
-            u32::from(hr == 0),
-            signalled,
-            "the result disagrees with the status it was returned with",
-        );
-        if hr == 0 {
-            break;
-        }
-        h.render_once(0xFF00_0000, |_| {});
+    assert_eq!(q.status(0), 0, "a query never issued is complete");
+    for flags in [0, D3DGETDATA_FLUSH] {
+        assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+        wait_for_event(&q, flags);
     }
-    assert_eq!(hr, 0, "EVENT query never reported completion");
-    assert_eq!(signalled, 1, "a completed EVENT query reports signalled");
 }
 
 #[test]
@@ -605,7 +596,7 @@ fn occlusion_count_survives_a_reset_between_begin_and_end() {
 ///
 /// D3D9 copies the result into the caller's buffer at the caller's size, so a
 /// two-byte read takes the low half of the BOOL and leaves the rest of the
-/// buffer as the caller left it. Wine pins the same shape for occlusion.
+/// buffer as the caller left it.
 #[test]
 fn a_short_event_read_leaves_the_bytes_past_it_alone() {
     let h = Harness::new();
@@ -614,17 +605,7 @@ fn a_short_event_read_leaves_the_bytes_past_it_alone() {
         .expect("EVENT query is supported");
     assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
 
-    // Drive it to completion first, so the value under test is the TRUE the
-    // caller is owed rather than a pending FALSE.
-    let mut hr = S_FALSE;
-    for _ in 0..EVENT_POLL_LIMIT {
-        hr = q.data_bytes(&mut [0u8; 4], D3DGETDATA_FLUSH);
-        if hr == 0 {
-            break;
-        }
-        h.render_once(0xFF00_0000, |_| {});
-    }
-    assert_eq!(hr, 0, "EVENT query never reported completion");
+    wait_for_event(&q, D3DGETDATA_FLUSH);
 
     let mut buf = [0xFFu8; 4];
     assert_eq!(
@@ -652,8 +633,7 @@ fn a_short_event_read_leaves_the_bytes_past_it_alone() {
 /// pages the GPU reads directly, and the refill takes `D3DLOCK_NOOVERWRITE`,
 /// which writes in place. Answering the poll before the draw retires puts the
 /// second colour under the first draw.
-#[test]
-fn an_event_query_gates_reuse_of_a_buffer_a_draw_is_reading() {
+fn event_gates_buffer_reuse(flags: u32) {
     const DRAWN: u32 = 0xFF00_FF00;
     const REFILL: u32 = 0xFFFF_0000;
     const BACKGROUND: u32 = 0xFF00_00FF;
@@ -681,37 +661,75 @@ fn an_event_query_gates_reuse_of_a_buffer_a_draw_is_reading() {
     let q = h
         .create_query(D3DQUERYTYPE_EVENT)
         .expect("EVENT query is supported");
-    assert_eq!(h.begin_scene(), 0, "BeginScene");
-    assert_eq!(h.clear_target(BACKGROUND), 0, "Clear");
-    assert_eq!(
-        h.draw_primitive(D3DPT_TRIANGLELIST, 0, 2),
-        0,
-        "the draw whose vertices are about to be overwritten",
-    );
-    assert_eq!(h.end_scene(), 0, "EndScene");
-    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
-
-    // Poll without the flush flag, the way a title fencing its own reuse does.
-    // Bounded by wall clock rather than iterations, so a slow GPU cannot fail
-    // it for being slow.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if q.status(0) == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the EVENT query never reported completion",
+    for (drawn, refill) in [(DRAWN, REFILL), (REFILL, DRAWN)] {
+        assert_eq!(h.begin_scene(), 0, "BeginScene");
+        assert_eq!(h.clear_target(BACKGROUND), 0, "Clear");
+        assert_eq!(
+            h.draw_primitive(D3DPT_TRIANGLELIST, 0, 2),
+            0,
+            "the draw whose vertices are about to be overwritten",
         );
-        std::thread::yield_now();
+        assert_eq!(h.end_scene(), 0, "EndScene");
+        assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+
+        // Poll without another API call that could submit the pending draw.
+        // Bounded by wall clock rather than iterations, so a slow GPU cannot fail
+        // it for being slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if q.status(flags) == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the EVENT query never reported completion",
+            );
+            std::thread::yield_now();
+        }
+
+        // The fence said the GPU is done, so this range is the application's again.
+        vb.lock(0, 0, D3DLOCK_NOOVERWRITE).write(&quad(refill));
+
+        assert_eq!(
+            h.read_pixel(320, 240),
+            drawn,
+            "the refill landed under a draw the fence said had finished",
+        );
     }
+}
 
-    // The fence said the GPU is done, so this range is the application's again.
-    vb.lock(0, 0, D3DLOCK_NOOVERWRITE).write(&quad(REFILL));
+#[test]
+fn an_event_query_gates_reuse_of_a_buffer_a_draw_is_reading() {
+    event_gates_buffer_reuse(0);
+}
 
+#[test]
+fn an_event_query_flush_gates_buffer_reuse_without_present() {
+    event_gates_buffer_reuse(D3DGETDATA_FLUSH);
+}
+
+#[test]
+fn event_reissue_and_reset_keep_retirement_order() {
+    let h = Harness::new();
+    let q = h.create_query(D3DQUERYTYPE_EVENT).expect("EVENT supported");
+    assert_eq!(h.clear_target(0xFF00_FF00), 0);
+    assert_eq!(q.issue(D3DISSUE_END), 0);
+    wait_for_event(&q, 0);
+
+    assert_eq!(h.clear_target(0xFFFF_0000), 0);
     assert_eq!(
-        h.read_pixel(320, 240),
-        DRAWN,
-        "the refill landed under a draw the fence said had finished",
+        q.issue(D3DISSUE_END),
+        0,
+        "reissue replaces the completed fence"
     );
+    wait_for_event(&q, D3DGETDATA_FLUSH);
+    assert_eq!(h.read_pixel(320, 240), 0xFFFF_0000);
+
+    assert_eq!(h.clear_target(0xFF00_00FF), 0);
+    assert_eq!(q.issue(D3DISSUE_END), 0);
+    let (width, height) = h.dims();
+    assert_eq!(h.reset(width / 2, height / 2), 0);
+    assert_eq!(q.status(0), 0, "Reset retired the outstanding issue");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "issue after Reset");
+    wait_for_event(&q, 0);
 }

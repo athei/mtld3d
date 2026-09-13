@@ -2,7 +2,7 @@
 //!
 //! - `EVENT`: `Issue(D3DISSUE_END)` stamps the frame being recorded, and
 //!   `GetData` reports completion once the GPU has retired that frame,
-//!   submitting it first while the frame is still open. Applications fence
+//!   queueing it first while the frame is still open. Applications fence
 //!   their own storage reuse on this answer, so it comes from the GPU.
 //! - `TIMESTAMP`: stub — returns 0 ticks. Not implemented, logs once.
 //! - `OCCLUSION`: real Metal visibility-result query. `Issue(BEGIN/END)`
@@ -133,11 +133,10 @@ fn event_status(inner: &QueryInner) -> i32 {
         return D3D_OK;
     }
     if mtld3d_core::query_fence::event_needs_submit(end_seq, dev.current_seq()) {
-        // Bracketed like the occlusion flush below, so a title fencing once
-        // per frame shows its stall under `Query`/`Wait for GPU` rather than
-        // disappearing into the frame time.
+        // Only bounded channel admission can stall here. Encoding and
+        // submission continue independently of this readiness poll.
         let _wait = mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().query_wait_cycles_ptr());
-        dev.flush_current_frame_blocking();
+        dev.flush_current_frame_async();
         if mtld3d_core::query_fence::event_completed(
             end_seq,
             dev.coherent_seq_arc().load(Ordering::Acquire),

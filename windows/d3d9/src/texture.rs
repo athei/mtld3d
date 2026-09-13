@@ -2014,13 +2014,9 @@ impl TextureInner {
     pub fn detach_from_device(&mut self) {
         self.device_inner = 0;
         self.device_handle = MetalHandle::NULL;
-        for slot in &mut self.last_submit_seq {
-            *slot = 0;
-        }
+        self.last_submit_seq.fill(0);
         if let Some(cube) = self.cube.as_deref_mut() {
-            for slot in &mut cube.last_submit_seq {
-                *slot = 0;
-            }
+            cube.last_submit_seq.fill(0);
         }
         self.point_cached_surfaces_at(core::ptr::null_mut());
     }
@@ -2797,17 +2793,13 @@ impl TextureInner {
 
     /// Clear every mip's source dirty region — done after a successful copy.
     pub fn clear_all_update_dirty(&mut self) {
-        for d in &mut self.update_dirty {
-            *d = None;
-        }
+        self.update_dirty.fill(None);
     }
 
     /// Clear every cube face mip's source dirty region after `UpdateTexture`.
     pub fn clear_all_cube_update_dirty(&mut self) {
         if let Some(cube) = self.cube.as_deref_mut() {
-            for d in &mut cube.update_dirty {
-                *d = None;
-            }
+            cube.update_dirty.fill(None);
         }
     }
 

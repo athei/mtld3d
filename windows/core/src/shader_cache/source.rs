@@ -140,8 +140,10 @@ impl ShaderSource {
         let count = usize::try_from(reader.u32()?).ok()?;
         let bytes = reader.take(count.checked_mul(4)?)?;
         let tokens: Arc<[u32]> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte token")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect();
         let header = *tokens.first()?;
         let pixel = match header >> 16 {

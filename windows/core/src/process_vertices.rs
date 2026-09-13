@@ -117,7 +117,7 @@ pub fn dst_wants_shaded_output(dst_fvf: u32) -> bool {
         .any(|e| e.usage == D3DDECLUSAGE_COLOR || e.usage == D3DDECLUSAGE_TEXCOORD)
 }
 
-fn read_vec3(b: &[u8]) -> [f32; 3] {
+const fn read_vec3(b: &[u8]) -> [f32; 3] {
     [
         f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         f32::from_le_bytes([b[4], b[5], b[6], b[7]]),

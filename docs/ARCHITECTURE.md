@@ -46,6 +46,11 @@ A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) 
 
 A dedicated **submit thread** (one per device) executes the `SubmitFrame` thunk — the cross-boundary command replay, the `nextDrawable` wait, present, and commit — overlapping the encoder's build of the next frame. The frame crosses as an owned `FramePayload` holding every buffer the thunk aliases by raw pointer; two payloads ping-pong over a cap-1 work channel, so render-ahead is bounded at one frame. Rare synchronous submits (`Reset`, mid-frame flushes, GPU capture) first drain the submit thread to idle, then run the thunk inline on the encoder thread — the two paths never call `SubmitFrame` concurrently and present order is preserved.
 
+EVENT query polls queue an open frame through the same asynchronous path with
+Present suppressed, then observe `coherent_seq` for GPU completion. Queue admission
+retains the existing bounded backpressure; the poll does not wait for encoding or
+submission to finish. A later poll of the same issue queues no additional frame.
+
 Both device and swap-chain `Present` build their continuation frame after the
 input polls return. A poll can dispatch `WM_SIZE`, whose auto-resize drains the
 encoder and replaces the implicit textures. A frame built before that callback

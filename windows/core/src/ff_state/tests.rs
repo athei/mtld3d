@@ -913,16 +913,12 @@ unsafe fn read_section_rows(ptr: *mut u8, rows: usize) -> Vec<[f32; 4]> {
     // SAFETY: caller guarantees `rows * 16` initialized bytes at `ptr`.
     let bytes = unsafe { core::slice::from_raw_parts(ptr.cast_const(), byte_len) };
     bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|row| {
-            let lane = |k: usize| {
-                f32::from_le_bytes(
-                    row[k * 4..k * 4 + 4]
-                        .try_into()
-                        .expect("4-byte f32 lane slice"),
-                )
-            };
-            [lane(0), lane(1), lane(2), lane(3)]
+            let (lanes, _) = row.as_chunks::<4>();
+            core::array::from_fn(|k| f32::from_le_bytes(lanes[k]))
         })
         .collect()
 }
