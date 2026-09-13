@@ -26,15 +26,28 @@ use crate::{
     scan,
 };
 
-/// Per-subtest wall-clock budget.
+/// The per-subtest wall-clock budget a run has unless its caller sets another.
 ///
-/// A subtest that exceeds it is killed and reported as a crash rather than
-/// blocking the whole run forever — a real reimplementation bug can deadlock
-/// `d3d9_test.exe` (e.g. a refcount-forward edge that spins on a GPU wait).
-/// Overridable via `MTLD3D_CONFORMANCE_TIMEOUT_SECS`; the normal subtests
-/// finish in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 180;
+/// A subtest that exceeds it is sampled, killed and reported as a crash rather
+/// than blocking the whole run forever: a real reimplementation bug can
+/// deadlock `d3d9_test.exe` (e.g. a refcount-forward edge that spins on a GPU
+/// wait). The normal subtests finish in seconds. The caller reads
+/// `MTLD3D_CONFORMANCE_TIMEOUT_SECS` into [`Launch::timeout`], see
+/// [`timeout_from_env`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
+
+/// How long the sample of a timed-out process may take.
+///
+/// `sample` reads the process for [`SAMPLE_SECONDS`] and then symbolicates,
+/// which on a translated Wine process with a few dozen threads has taken ten
+/// seconds. A sampler still running past this is killed and the sample says
+/// so: the process it was meant to explain must not park the run a second
+/// time.
+const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long `sample` watches the process before symbolicating.
+const SAMPLE_SECONDS: &str = "2";
 
 /// The driver's codes for a hung GPU, as Metal prints them to stderr.
 ///
@@ -85,6 +98,12 @@ pub struct Launch {
     /// `None` keeps nothing. Set, it is made absolute, since the test process
     /// is handed the same directory as a Windows path.
     pub raw_dir: Option<PathBuf>,
+    /// The wall-clock budget of one subtest.
+    ///
+    /// A process still running at the end of it is sampled, then killed with
+    /// its group, and the subtest reads as a crash. [`DEFAULT_TIMEOUT`] unless
+    /// the caller has another: the spawn reads no environment.
+    pub timeout: Duration,
 }
 
 /// How many detail lines one validation message keeps.
@@ -117,13 +136,18 @@ pub const fn validation_gate_failed(errors: usize) -> bool {
     errors > MAX_VALIDATION_ERRORS
 }
 
-fn subtest_timeout() -> Duration {
-    let secs = std::env::var("MTLD3D_CONFORMANCE_TIMEOUT_SECS")
+/// The subtest budget the environment asks for, else [`DEFAULT_TIMEOUT`].
+///
+/// `MTLD3D_CONFORMANCE_TIMEOUT_SECS`, a positive number of seconds; anything
+/// else reads as unset. Read once by the caller and handed to every spawn
+/// through [`Launch::timeout`].
+#[must_use]
+pub fn timeout_from_env() -> Duration {
+    std::env::var("MTLD3D_CONFORMANCE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+        .map_or(DEFAULT_TIMEOUT, Duration::from_secs)
 }
 
 /// `wine --version`, or `"unknown"` if it can't be determined.
@@ -162,6 +186,11 @@ pub fn wine_version(wine: &Path) -> String {
 /// holding them, so a descendant cannot park the run past the kill. The
 /// wineserver the caller booted for the whole run is in the caller's group
 /// and is never touched.
+///
+/// A process still running at `launch.timeout` is sampled before its group is
+/// killed, and the sample is kept beside the raw output, or printed when
+/// nothing is kept. The raw log of a hang ends in its `TIMED OUT` line and
+/// says nothing about where the process was; the sample is that account.
 ///
 /// # Errors
 ///
@@ -216,22 +245,18 @@ pub fn run_subtest(
 
     // Drain stdout/stderr on their own threads so a full pipe buffer can't
     // wedge the child while we poll for the timeout.
-    let mut child_stdout = child.stdout.take().expect("stdout piped");
+    let out_reader = drain_on_thread(child.stdout.take().expect("stdout piped"));
     let child_stderr = child.stderr.take().expect("stderr piped");
-    let out_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_stdout.read_to_end(&mut buf);
-        buf
-    });
     let hung = Arc::new(AtomicBool::new(false));
     let err_reader = {
         let hung = Arc::clone(&hung);
         thread::spawn(move || drain_stderr(child_stderr, &hung))
     };
 
-    let timeout = subtest_timeout();
+    let timeout = launch.timeout;
     let start = Instant::now();
-    let mut timed_out = false;
+    // The sample of a process that ran out of budget, taken before its kill.
+    let mut timed_out: Option<String> = None;
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -246,8 +271,8 @@ pub fn run_subtest(
                 .map_err(|e| format!("reap of hung {} failed: {e}", launch.wine.display()))?;
         }
         if start.elapsed() >= timeout {
+            timed_out = Some(sample_process(child.id()));
             kill_group(&child);
-            timed_out = true;
             break child
                 .wait()
                 .map_err(|e| format!("reap of timed-out {} failed: {e}", launch.wine.display()))?;
@@ -267,18 +292,25 @@ pub fn run_subtest(
     let validation_errors =
         report_validation_errors(leg, subtest, &String::from_utf8_lossy(&stderr));
 
-    // A timeout is a hang — treat it like a fatal signal so it surfaces as a
+    // A timeout is a hang: treat it like a fatal signal so it surfaces as a
     // crash (and a regression vs a clean baseline) rather than a silent count.
     // A GPU hang is one too: the counts stop meaning anything at its line.
-    let signaled = timed_out || gpu_hang || status.signal().is_some();
+    let signaled = timed_out.is_some() || gpu_hang || status.signal().is_some();
     let mut combined = String::from_utf8_lossy(&stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&stderr));
-    if timed_out {
+    if let Some(sample) = &timed_out {
         let _ = write!(
             combined,
-            "\n[conformance] subtest TIMED OUT after {}s and was killed\n",
-            timeout.as_secs()
+            "\n[conformance] subtest TIMED OUT after {}s and was killed{}\n",
+            timeout.as_secs(),
+            raw.as_ref().map_or_else(String::new, |raw| {
+                format!(
+                    "; the sample taken before the kill is {}",
+                    raw.sample_file_name()
+                )
+            })
         );
+        report_timeout(leg, subtest, timeout, sample, raw.as_ref());
     } else {
         let _ = write!(combined, "\n{}\n", exit_trailer(status));
     }
@@ -310,6 +342,100 @@ pub fn run_subtest(
         validation_errors,
         gpu_hang,
     })
+}
+
+/// Read a pipe to its end on a thread of its own.
+///
+/// A pipe nobody reads fills, and the writer blocks on it: a child polled for
+/// its budget, or a sampler polled for its own, must never wait on the poller.
+fn drain_on_thread(mut reader: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// A `sample` of the process, taken while it still runs.
+///
+/// The kill that follows leaves a raw log ending in `TIMED OUT` and the
+/// process's own log silent on a thread parked in a syscall, so the sample is
+/// the one account of where a hang was. The tool's stderr and how it ended
+/// stay in the text when it fails, so a process it could not read is reported
+/// rather than dropped, and a sampler still running at [`SAMPLE_BUDGET`] is
+/// killed and the text says so.
+fn sample_process(pid: u32) -> String {
+    let pid = pid.to_string();
+    let mut child = match Command::new("sample")
+        .args([pid.as_str(), SAMPLE_SECONDS, "-mayDie"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return format!("[conformance] sample could not be started: {e}\n"),
+    };
+    let out_reader = drain_on_thread(child.stdout.take().expect("stdout piped"));
+    let err_reader = drain_on_thread(child.stderr.take().expect("stderr piped"));
+    let started = Instant::now();
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() < SAMPLE_BUDGET => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("was killed after {}s", SAMPLE_BUDGET.as_secs()));
+            }
+            Err(e) => break Err(format!("could not be waited for: {e}")),
+        }
+    };
+    let mut text = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
+    match ended {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let _ = write!(
+                text,
+                "\n[conformance] sample ended with {status}:\n{stderr}"
+            );
+        }
+        Err(how) => {
+            let _ = write!(text, "\n[conformance] sample {how}:\n{stderr}");
+        }
+    }
+    text
+}
+
+/// Say on stderr that the subtest ran out of budget, and keep its sample.
+///
+/// With a raw dir the sample is a file beside the raw log and the line names
+/// it. Without one nothing is kept, so the sample itself follows the line.
+fn report_timeout(
+    leg: Leg,
+    subtest: Subtest,
+    timeout: Duration,
+    sample: &str,
+    raw: Option<&RawTarget>,
+) {
+    let after = timeout.as_secs();
+    if let Some(raw) = raw {
+        raw.save_sample(sample);
+        eprintln!(
+            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process was sampled before the \
+             kill: {}",
+            raw.dir.join(raw.sample_file_name()).display()
+        );
+    } else {
+        eprintln!(
+            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process was sampled before the \
+             kill (set MTLD3D_CONFORMANCE_RAW_DIR to keep the sample as a file):"
+        );
+        eprint!("{sample}");
+    }
 }
 
 /// Drain stderr into a buffer, raising `hung` on the driver's GPU-hang line.
@@ -406,7 +532,7 @@ fn config_entries(leg: Leg, raw: Option<&RawTarget>) -> String {
 /// `<dir>/<leg>-<subtest>[-<attempt>].log` for the output and a directory of
 /// the same stem for the log file, one per process, so the layer's retention
 /// of ten files per directory never prunes one run's log to make room for
-/// another's.
+/// another's. A timed-out process's sample is `<stem>.sample.txt` beside them.
 struct RawTarget {
     dir: PathBuf,
     stem: String,
@@ -432,8 +558,22 @@ impl RawTarget {
         format!("Z:{}", self.dir.join(&self.stem).display())
     }
 
+    /// The file the sample of a timed-out process is kept as, beside the raw log.
+    fn sample_file_name(&self) -> String {
+        format!("{}.sample.txt", self.stem)
+    }
+
     /// Persist the raw output; a failure is reported and never fails the run.
     fn save(&self, combined: &str) {
+        self.write(&format!("{}.log", self.stem), combined);
+    }
+
+    /// Persist the sample of a timed-out process; a failure is reported and never fails the run.
+    fn save_sample(&self, sample: &str) {
+        self.write(&self.sample_file_name(), sample);
+    }
+
+    fn write(&self, file_name: &str, text: &str) {
         if let Err(e) = fs::create_dir_all(&self.dir) {
             eprintln!(
                 "  [conformance] could not create raw dir {}: {e}",
@@ -441,12 +581,9 @@ impl RawTarget {
             );
             return;
         }
-        let path = self.dir.join(format!("{}.log", self.stem));
-        if let Err(e) = fs::write(&path, combined) {
-            eprintln!(
-                "  [conformance] could not write raw log {}: {e}",
-                path.display()
-            );
+        let path = self.dir.join(file_name);
+        if let Err(e) = fs::write(&path, text) {
+            eprintln!("  [conformance] could not write {}: {e}", path.display());
         }
     }
 }

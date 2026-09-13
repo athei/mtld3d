@@ -864,7 +864,8 @@ CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --assets $(CURD
 # default is `off`: the counts are the measurement). With
 # MTLD3D_CONFORMANCE_RAW_DIR set, each process's log file lands in a directory
 # beside its raw output, so LOG=debug there keeps what the layer did before a
-# process ended without its summary.
+# process ended without its summary, and the sample the runner takes of a
+# process it kills at its budget lands beside them.
 define conformance_leg
 	$(MAKE) configure-test-prefix
 	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
