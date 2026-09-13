@@ -143,16 +143,19 @@ pub struct Mtld3dConfig {
     /// list. Default: empty. File key: `debug.skipShaders` —
     /// comma-separated hex u64s, optional `0x` prefix.
     pub skip_shaders: Vec<u64>,
-    /// Return `S_OK` immediately on `GetData(D3DGETDATA_FLUSH)` for a `Pending` occlusion query.
+    /// Answer a pending occlusion FLUSH poll immediately.
     ///
     /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted` and
     /// answers with the permissive count instead. Default: `false`, the
     /// spec-correct wait, because an engine that polls with FLUSH reads the
     /// count it gets back (a pixel-visibility fraction, an occlusion cull).
-    /// `true` is for a title that uses the poll loop only as a GPU fence and
-    /// never reads the number: the `wow` profile sets it, since both clients
-    /// fence every loading-screen upload batch that way and the wait costs
-    /// seconds per load. File key: `query.flushImmediate`.
+    /// `true` is only for a title verified to use the poll as a submission
+    /// throttle, without reading the count or gating reuse of CPU-writable
+    /// dynamic storage. Metal cannot track a CPU write through
+    /// `D3DLOCK_NOOVERWRITE` into pages a queued draw still reads. The `wow`
+    /// profile currently sets it because skipping its loading-screen waits was
+    /// measured to save seconds per load; that benefit does not establish the
+    /// absence of this hazard. File key: `query.flushImmediate`.
     pub query_flush_immediate: bool,
     /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
     ///

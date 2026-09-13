@@ -180,10 +180,14 @@ record. A knob, where one makes sense, is named with its default.
   partial lock after that release leaves the pixels outside its rect out of
   step with the GPU copy (warned once per texture). No knob.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
-  instead of waiting for the GPU. Off by default. A title that uses the poll
-  loop only as a GPU fence and never reads the count pays API-thread time for
-  nothing; the `wow` profile turns it on. Knob: `query.flushImmediate`,
-  default `false`.
+  instead of waiting for the GPU. Off by default. This saves API-thread time
+  only for a title verified to use the poll as a submission throttle, without
+  reading the count or gating reuse of CPU-writable dynamic storage. Metal
+  does not track a CPU write through `D3DLOCK_NOOVERWRITE` into pages a queued
+  draw still reads, so an immediate answer cannot safely fence that reuse. The
+  `wow` profile currently turns it on because skipping its loading-screen waits
+  was measured to save seconds per load; that benefit does not establish the
+  absence of this hazard. Knob: `query.flushImmediate`, default `false`.
 - EVENT query polls queue their open frame even without `D3DGETDATA_FLUSH`.
   D3D9 permits a poll without the flag to remain pending indefinitely. We
   make progress for callers that fence storage reuse before Present without
