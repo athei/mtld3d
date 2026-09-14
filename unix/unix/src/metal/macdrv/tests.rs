@@ -26,11 +26,14 @@
 //! beats Wine's application delegate from running unfiltered for its lifetime.
 //!
 //! `MetalViewPark` is the bookkeeping behind keeping a retired device's metal
-//! view for the next device on its window. The tests pin that a window's view
-//! is kept and taken back by that window alone, that a second view for the
-//! same window displaces the first, that views of several windows are kept
-//! beside each other up to the park's size, and that a full park displaces
-//! its oldest view.
+//! view for the next device on its window, or for the next window when that
+//! one is gone. The tests pin that a window's view is kept and taken back by
+//! that window alone, that a second view for the same window displaces the
+//! first, that views of several windows are kept beside each other up to the
+//! park's size, that a full park displaces its oldest view, that the kept
+//! views are listed newest first and one is taken only by the parking its
+//! taker saw, and that among them the newest whose window is gone is the one
+//! picked for a window with none of its own.
 //!
 //! The other half of that path, what a device's teardown retires and what
 //! it leaves alone for the devices still attached, is the attachment
@@ -62,7 +65,8 @@ use super::{
     KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
     PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
     first_null_required_entry, layer_mode_change, layer_mode_for, min_present_duration,
-    min_present_duration_change, pack_pacing, screen_params_filter_step, unpack_pacing,
+    min_present_duration_change, pack_pacing, pick_orphan, screen_params_filter_step,
+    unpack_pacing,
 };
 
 #[test]
@@ -437,6 +441,95 @@ fn a_full_park_displaces_the_oldest_view() {
         "the next oldest stays"
     );
     assert_eq!(park.take_for(0x99), Some((0x9000, 0x20)));
+}
+
+#[test]
+fn the_kept_views_are_listed_newest_first() {
+    let mut park = MetalViewPark::new();
+    assert!(
+        park.slots_newest_first().is_empty(),
+        "an empty park lists nothing"
+    );
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    let listed: Vec<(u64, usize)> = park
+        .slots_newest_first()
+        .iter()
+        .map(|kept| (kept.hwnd, kept.view))
+        .collect();
+    let mut expected = KEPT.to_vec();
+    expected.reverse();
+    assert_eq!(listed, expected, "the last parked comes first");
+}
+
+#[test]
+fn a_kept_view_is_taken_by_the_parking_it_was_seen_in() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    assert_eq!(park.park(2, 0x2000, 0x30), None);
+    let seen = park.slots_newest_first();
+    let first = seen
+        .iter()
+        .find(|kept| kept.view == 0x1000)
+        .expect("the first view is listed");
+    assert!(
+        park.take_kept(0x1000, first.seq + 1).is_none(),
+        "a parking the taker did not see is not taken"
+    );
+    let taken = park
+        .take_kept(0x1000, first.seq)
+        .expect("the parking the taker saw is taken");
+    assert_eq!((taken.hwnd, taken.view, taken.layer), (1, 0x1000, 0x20));
+    assert!(
+        park.take_kept(0x1000, first.seq).is_none(),
+        "taken once; the slot is empty again"
+    );
+    assert_eq!(
+        park.take_for(2),
+        Some((0x2000, 0x30)),
+        "the other window's view is untouched"
+    );
+}
+
+#[test]
+fn a_view_parked_again_is_not_taken_by_its_earlier_parking() {
+    let mut park = MetalViewPark::new();
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    let earlier = park.slots_newest_first()[0].seq;
+    assert_eq!(park.take_for(1), Some((0x1000, 0x20)));
+    assert_eq!(park.park(1, 0x1000, 0x20), None);
+    assert!(
+        park.take_kept(0x1000, earlier).is_none(),
+        "the earlier parking is over"
+    );
+    let later = park.slots_newest_first()[0].seq;
+    assert!(
+        park.take_kept(0x1000, later).is_some(),
+        "the parking that stands is taken"
+    );
+}
+
+#[test]
+fn the_newest_kept_view_whose_window_is_gone_is_picked() {
+    let mut park = MetalViewPark::new();
+    for (window, view) in KEPT {
+        assert_eq!(park.park(window, view, 0x20), None);
+    }
+    let newest_first = park.slots_newest_first();
+    assert!(
+        pick_orphan(&newest_first, |_| false).is_none(),
+        "every window still there: nothing is picked"
+    );
+    let picked = pick_orphan(&newest_first, |window| window != 4)
+        .expect("a view whose window is gone is picked");
+    assert_eq!(
+        (picked.hwnd, picked.view),
+        (3, 0x3000),
+        "the newest such view, not the newest kept"
+    );
+    let picked = pick_orphan(&newest_first, |_| true).expect("every window gone: one is picked");
+    assert_eq!(picked.hwnd, 4, "the newest kept");
 }
 
 #[test]

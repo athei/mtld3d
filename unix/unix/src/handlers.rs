@@ -229,9 +229,10 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
         params.metalfx_available = u32::from(metal::upscale_is_supported(params.device_handle));
         info!(
             target: LOG_TARGET,
-            "attached Metal layer {}x{} (vsync {}, maxFps {})",
+            "attached Metal layer {}x{} on window {:#x} (vsync {}, maxFps {})",
             params.width,
             params.height,
+            params.hwnd,
             if params.display_sync_enabled != 0 { "on" } else { "off" },
             params.max_fps
         );

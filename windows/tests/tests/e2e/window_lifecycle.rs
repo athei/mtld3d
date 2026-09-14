@@ -25,7 +25,9 @@ const ROUNDS: usize = 25;
 /// The device release keeps the layer's metal view for the window's next
 /// device, so the window's destruction takes the driver's own views and the
 /// window apart under a metal view that is still alive; the kept view is
-/// released, on the main thread, when a later device's view displaces it.
+/// then moved into the next window of any lane that attaches with no kept
+/// view of its own, or released, on the main thread, when a later device's
+/// view displaces it.
 #[test]
 fn devices_and_windows_come_and_go_on_several_threads_at_once() {
     std::thread::scope(|scope| {
