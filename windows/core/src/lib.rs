@@ -52,6 +52,7 @@ pub mod shader_cache;
 pub mod shader_compile_stats;
 pub mod shader_prewarm;
 pub mod staging_coverage;
+pub mod startup_work;
 pub mod state_trace;
 pub mod storage_policy;
 pub mod streams;

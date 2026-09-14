@@ -501,7 +501,14 @@ same wire layout without PERF but elides its initialization, writes, and reads.
 PERF callers initialize a zero fallback before crossing the boundary, so mixed
 PERF/native builds are safe.
 Collection and slow-event storage also compile out. The prewarm thread recreates
-the deduplicated shader libraries and recorded render pipelines. The encoder
+the deduplicated shader libraries and recorded render pipelines. Native creation
+uses device-local batches capped at eight callers, including the coordinator,
+and further limited by available CPUs and batch length. Regeneration and cache
+appends stay serial. The library batch completes before dependent PSOs are
+admitted, with one attempt per resolved PSO key in that startup. A failed worker
+spawn reduces concurrency without dropping jobs. Cancellation stops new job
+admission and waits for admitted calls before device cleanup; other devices keep
+their own workers and stop flags. The encoder
 installs their device-local handles and no-color sibling mappings before it
 accepts gameplay submissions. Only the prewarm worker owns the startup channel's
 sender. A failed thread spawn releases that barrier and starts the encoder cold
