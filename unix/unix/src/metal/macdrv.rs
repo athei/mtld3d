@@ -1105,11 +1105,11 @@ fn adopt_view_into_client(view: usize, client_view: usize, mtm: MainThreadMarker
 extern_class!(
     /// winemac's window class, told when a moved-in metal view gives it content.
     ///
-    /// Declared here because no binding crate carries Wine's classes. Only
-    /// the one member below is touched: what `newMetalViewWithDevice` sends
-    /// the window when it puts a new metal view in it, after which the
-    /// driver makes the window opaque. The class is looked up by name before
-    /// use, and a window that is not one of the driver's is left alone.
+    /// Declared here because no binding crate carries Wine's classes.
+    /// The content notification matches `newMetalViewWithDevice`, and
+    /// `closing` distinguishes a destroyed host from a live child window's
+    /// host. The class is looked up by name before use, and a window that
+    /// is not one of the driver's is left alone.
     #[unsafe(super(NSWindow))]
     #[thread_kind = MainThreadOnly]
     #[name = "WineWindow"]
@@ -1121,6 +1121,10 @@ impl WineWindow {
         #[unsafe(method(windowDidDrawContent))]
         #[unsafe(method_family = none)]
         fn window_did_draw_content(&self);
+
+        #[unsafe(method(closing))]
+        #[unsafe(method_family = none)]
+        fn closing(&self) -> bool;
     );
 }
 
@@ -1221,10 +1225,10 @@ enum KeptView {
 /// any more is moved in; a kept view whose handle still has a window is that
 /// window's, on screen or not, and stays.
 ///
-/// A slot is taken out of the park before its view is touched, since another
-/// device's retire can displace a slot and release its view at any time, and
-/// the park lock is never held across a Wine call or a main-thread hop. Runs
-/// on the API thread: `macdrv_get_cocoa_window` takes Wine's window-data
+/// A slot is taken or retained under the park lock before its view is touched,
+/// since another device's retire can displace a slot and release its view at
+/// any time. The park lock is never held across a Wine call or main-thread hop.
+/// Runs on the API thread: `macdrv_get_cocoa_window` takes Wine's window-data
 /// lock, which the driver holds across a synchronous main-thread request
 /// while it destroys a window, so it is never called from the main thread.
 fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<KeptView> {
@@ -1250,8 +1254,8 @@ fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<KeptView> {
         .lock()
         .expect("metal view park mutex poisoned")
         .slots_newest_first();
-    let orphan = pick_orphan(&newest_first, |kept_hwnd| {
-        cocoa_window_of(get_cocoa_window, kept_hwnd) == 0
+    let orphan = pick_orphan(&newest_first, |kept| {
+        cocoa_window_of(get_cocoa_window, kept.hwnd) == 0 && kept_view_host_gone(kept)
     })?;
     let taken = PARKED_METAL_VIEW
         .lock()
@@ -1266,14 +1270,54 @@ fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<KeptView> {
 
 /// The newest kept view whose own handle has no window any more, among `newest_first`.
 ///
-/// `window_gone` answers for a handle, Wine's `macdrv_get_cocoa_window`
-/// outside the tests. A kept view whose handle still has a window belongs to
-/// that window, on screen or not, and is not picked.
+/// `window_gone` checks both the handle and the view's host: a child handle
+/// has no Cocoa window of its own even while its view sits in a live parent.
+/// A view in a live host, on screen or not, is not picked.
 fn pick_orphan(
     newest_first: &[KeptMetalView],
-    window_gone: impl Fn(u64) -> bool,
+    window_gone: impl Fn(&KeptMetalView) -> bool,
 ) -> Option<&KeptMetalView> {
-    newest_first.iter().find(|kept| window_gone(kept.hwnd))
+    newest_first.iter().find(|kept| window_gone(kept))
+}
+
+/// Whether a still-parked view is detached or belongs to a closing Wine window.
+///
+/// A child HWND has no Cocoa window of its own, so the handle lookup alone
+/// cannot establish that its view is orphaned. Retain under the park lock
+/// on the main thread, then release the lock before walking `AppKit`. A slot
+/// taken or replaced since the snapshot is skipped without touching its
+/// address; `take_kept` checks it again before transferring ownership.
+fn kept_view_host_gone(kept: &KeptMetalView) -> bool {
+    let mut gone = false;
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("kept view host check runs on the main thread");
+        let view = {
+            let park = PARKED_METAL_VIEW
+                .lock()
+                .expect("metal view park mutex poisoned");
+            park.slots
+                .iter()
+                .find(|slot| slot.view == kept.view && slot.seq == kept.seq)
+                .and_then(|slot| retain_parked_view(slot.view, mtm))
+        };
+        let Some(view) = view else {
+            // Another attachment took or displaced this parking.
+            return;
+        };
+        let Some(window) = view.window() else {
+            gone = true;
+            return;
+        };
+        if *HAS_WINE_WINDOW && let Some(window) = window.downcast_ref::<WineWindow>() {
+            gone = window.closing();
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: a kept metal view has an unknown window class; left in its host",
+            );
+        }
+    });
+    gone
 }
 
 /// Whether the view kept for `hwnd` still sits in the Cocoa window that handle has now.
@@ -1315,8 +1359,8 @@ fn kept_view_is_in_window(view: usize, cocoa_window: usize, mtm: MainThreadMarke
 /// The one place a kept view is resurrected from the address the park held:
 /// the park holds the retain `macdrv_view_create_metal_view` handed out for
 /// the view and nothing releases it before the park's own release, and the
-/// caller has taken the slot, so the address names a live `NSView` for as
-/// long as the caller walks it.
+/// caller either owns the taken slot or holds the park lock while retaining
+/// a slot it verified is still current. The retain covers the caller's walk.
 fn retain_parked_view(view: usize, _mtm: MainThreadMarker) -> Option<Retained<NSView>> {
     // SAFETY: as the doc says; the retain taken here covers the caller's use.
     unsafe { Retained::retain(view as *mut NSView) }

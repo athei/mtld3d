@@ -3499,6 +3499,44 @@ fn a_device_on_a_new_window_presents_through_the_metal_view_a_destroyed_window_l
 /// The name the workload child of the kept-view move test below runs under.
 const KEPT_VIEW_CHILD_NAME: &str = "kept-view-move.exe";
 
+/// The private process that checks retention for a live child window.
+const LIVE_CHILD_VIEW_CHILD_NAME: &str = "kept-child-view.exe";
+
+#[test]
+fn a_live_child_window_keeps_its_metal_view() {
+    if !running_as(LIVE_CHILD_VIEW_CHILD_NAME) {
+        run_in_private_log_child(
+            LIVE_CHILD_VIEW_CHILD_NAME,
+            "device::a_live_child_window_keeps_its_metal_view",
+        );
+        return;
+    }
+
+    let parent = create_window(128, 128, false);
+    let child = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Child { parent },
+        ..HarnessConfig::default()
+    });
+    child.render_once(0xFFFF_0000, |_| {});
+    assert_eq!(
+        child.release_device(),
+        0,
+        "release the child window's device"
+    );
+
+    let other = Harness::new();
+    other.render_once(0xFF00_00FF, |_| {});
+    let attached = await_logged_lines("attached Metal layer", 2);
+    assert_eq!(attached.len(), 2, "both devices attached: {attached:?}");
+    assert!(
+        logged_lines("is moved into window").is_empty(),
+        "a child HWND without its own Cocoa window is still live"
+    );
+    drop(other);
+    drop(child);
+    destroy_window(parent);
+}
+
 #[test]
 fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
     if running_as(KEPT_VIEW_CHILD_NAME) {

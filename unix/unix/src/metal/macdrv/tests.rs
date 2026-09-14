@@ -521,7 +521,7 @@ fn the_newest_kept_view_whose_window_is_gone_is_picked() {
         pick_orphan(&newest_first, |_| false).is_none(),
         "every window still there: nothing is picked"
     );
-    let picked = pick_orphan(&newest_first, |window| window != 4)
+    let picked = pick_orphan(&newest_first, |kept| kept.hwnd != 4)
         .expect("a view whose window is gone is picked");
     assert_eq!(
         (picked.hwnd, picked.view),
