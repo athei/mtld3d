@@ -25,6 +25,7 @@ use mtld3d_core::{
     shader_cache::{self, CacheLoad, CachedKind, ShaderRecordRef},
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
     shader_prewarm::PrewarmHandle,
+    startup_work,
 };
 use mtld3d_shared::{
     MetalHandle,
@@ -32,11 +33,11 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
     perf::NanosSetTimer,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     LOG_TARGET,
-    encoder::{WarmCache, compile_stage_library, shader_cache_path},
+    encoder::{StageLibHandles, WarmCache, compile_stage_library, shader_cache_path},
     unix_call::unix_call,
 };
 
@@ -106,6 +107,7 @@ fn run(
     let mut duration_ns = [0u64; 4];
 
     let mut refreshed = 0u32;
+    let mut ready_shaders = Vec::with_capacity(records.shaders.len());
     for entry in &mut records.shaders {
         if stop.load(Ordering::Acquire) {
             break;
@@ -133,13 +135,21 @@ fn run(
                 continue;
             }
         }
-        let stage = stage_for_kind(entry.kind);
-        let entry_name = entry.kind.entry_name(entry.key);
-        let started = Instant::now();
-        let mut timings = mtld3d_shared::perf::ShaderTimings::new();
-        let handles =
-            compile_stage_library(device_handle, stage, &entry.msl, &entry_name, &mut timings);
-        let elapsed = started.elapsed();
+        ready_shaders.push(&*entry);
+    }
+
+    // Regeneration and persistence keep disk order. Native calls share only the
+    // device and immutable source; all admitted calls finish before PSO work.
+    let compiled = startup_work::map(&ready_shaders, stop, |entry| {
+        compile_library(device_handle, entry)
+    });
+    for (index, result) in compiled {
+        let entry = ready_shaders[index];
+        let LibraryCompilation {
+            handles,
+            timings,
+            elapsed_ns,
+        } = result;
         compilation.shader_parts(&timings, handles.is_some(), 0, || {
             mtld3d_core::perf::compilation::Identity::Prewarm {
                 device: device_handle.raw(),
@@ -152,7 +162,7 @@ fn run(
         };
         let idx = bucket_index(entry.kind.compile_bucket());
         counts[idx] += 1;
-        duration_ns[idx] += u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        duration_ns[idx] += elapsed_ns;
         libraries.insert(ShaderRecordRef::new(entry.kind, entry.key), handles);
     }
 
@@ -166,6 +176,8 @@ fn run(
         MetalHandle<MTLRenderPipelineStateKind>,
     > = FxHashMap::default();
     let mut primary_candidates = Vec::new();
+    let mut ready_pipelines = Vec::new();
+    let mut scheduled = FxHashSet::default();
 
     if !stop.load(Ordering::Acquire) {
         for recipe in &records.pipelines {
@@ -190,44 +202,44 @@ fn run(
             };
             let snapshot = recipe.resolve(vs.func, ps.func);
             let key = pipeline_state::key_from_snapshot(&snapshot);
-            if pipelines.contains_key(&key) {
-                continue;
+            // One attempt per resolved key in this startup, including failures.
+            // Retained recipes remain available for a later startup or live miss.
+            if scheduled.insert(key) {
+                ready_pipelines.push((recipe, snapshot));
             }
-            let mut total_ns = 0;
-            let timer = NanosSetTimer::start(&raw mut total_ns);
-            let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(&snapshot);
-            let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
-                snapshot: &snapshot,
-                vertex_attrs: recipe.vertex_attrs(),
-                vertex_layouts: &vertex_layouts,
-                device_handle,
-            });
-            let status = unix_call(&mut params);
-            let pipeline = params.pipeline_handle;
-            let timings = params.timings.into_inner();
-            drop(timer);
-            let success = status == 0 && !pipeline.is_null();
-            record_pipeline(
-                &mut compilation,
-                &PipelineMeasurement {
-                    device: device_handle,
-                    vs: recipe.vs(),
-                    ps: recipe.ps(),
-                    snapshot: &snapshot,
-                    total_ns,
-                    timings: &timings,
-                    success,
-                },
-            );
-            if !success {
-                error!(target: LOG_TARGET, "shader_cache: pipeline prewarm failed");
-                continue;
-            }
-            if snapshot.has_depth() && snapshot.writes_no_color() && snapshot.has_color_output() {
-                primary_candidates.push((snapshot.clone(), pipeline.raw()));
-            }
-            pipelines.insert(key, pipeline);
         }
+    }
+    let compiled = startup_work::map(&ready_pipelines, stop, |(recipe, snapshot)| {
+        compile_pipeline(device_handle, recipe, snapshot)
+    });
+    for (index, result) in compiled {
+        let (recipe, snapshot) = &ready_pipelines[index];
+        let PipelineCompilation {
+            pipeline,
+            timings,
+            total_ns,
+            success,
+        } = result;
+        record_pipeline(
+            &mut compilation,
+            &PipelineMeasurement {
+                device: device_handle,
+                vs: recipe.vs(),
+                ps: recipe.ps(),
+                snapshot,
+                total_ns,
+                timings: &timings,
+                success,
+            },
+        );
+        if !success {
+            error!(target: LOG_TARGET, "shader_cache: pipeline prewarm failed");
+            continue;
+        }
+        if snapshot.has_depth() && snapshot.writes_no_color() && snapshot.has_color_output() {
+            primary_candidates.push((snapshot.clone(), pipeline.raw()));
+        }
+        pipelines.insert(pipeline_state::key_from_snapshot(snapshot), pipeline);
     }
 
     let mut no_color_siblings = Vec::new();
@@ -268,6 +280,68 @@ fn run(
         pipelines: pipelines.into_iter().collect(),
         no_color_siblings,
     })
+}
+
+/// One native shader result, retained until the coordinator records it.
+struct LibraryCompilation {
+    handles: Option<StageLibHandles>,
+    timings: mtld3d_shared::perf::ShaderTimings,
+    elapsed_ns: u64,
+}
+
+fn compile_library(
+    device: MetalHandle<MTLDeviceKind>,
+    entry: &shader_cache::CacheEntry,
+) -> LibraryCompilation {
+    let entry_name = entry.kind.entry_name(entry.key);
+    let started = Instant::now();
+    let mut timings = mtld3d_shared::perf::ShaderTimings::new();
+    let handles = compile_stage_library(
+        device,
+        stage_for_kind(entry.kind),
+        &entry.msl,
+        &entry_name,
+        &mut timings,
+    );
+    LibraryCompilation {
+        handles,
+        timings,
+        elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    }
+}
+
+/// One native PSO result, retained until the coordinator records it.
+struct PipelineCompilation {
+    pipeline: MetalHandle<MTLRenderPipelineStateKind>,
+    timings: mtld3d_shared::perf::PipelineTimings,
+    total_ns: u64,
+    success: bool,
+}
+
+fn compile_pipeline(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    recipe: &shader_cache::PipelineRecipe,
+    snapshot: &pipeline_state::PipelineSnapshot,
+) -> PipelineCompilation {
+    let mut total_ns = 0;
+    let timer = NanosSetTimer::start(&raw mut total_ns);
+    let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
+    let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+        snapshot,
+        vertex_attrs: recipe.vertex_attrs(),
+        vertex_layouts: &vertex_layouts,
+        device_handle,
+    });
+    let status = unix_call(&mut params);
+    let pipeline = params.pipeline_handle;
+    let timings = params.timings.into_inner();
+    drop(timer);
+    PipelineCompilation {
+        pipeline,
+        timings,
+        total_ns,
+        success: status == 0 && !pipeline.is_null(),
+    }
 }
 
 /// Replace `path` with one Bundle containing the latest valid records.
