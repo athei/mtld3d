@@ -46,8 +46,8 @@ fn main() {
         extract_unix_lib(&llvm_ar, &archive.to_string_lossy(), object_arch, &out_dir);
     println!("cargo:rustc-link-arg-cdylib={unix_lib_path}");
 
-    // Wine's libntdll.a must be found before xwin's ntdll.lib for RtlFindExportedRoutineByName
-    println!("cargo:rustc-link-arg-cdylib=-L{lib_dir}");
+    // Preserve Wine's long DWARF section names without linker warnings.
+    println!("cargo:rustc-link-arg-cdylib=/ignore:longsections");
 
     println!("cargo:rerun-if-env-changed=WINE_SDK");
     println!("cargo:rerun-if-env-changed=LLVM_AR");
