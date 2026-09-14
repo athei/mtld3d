@@ -12,10 +12,11 @@ use mtld3d_shared::{
     mtl_handle::{CAMetalLayerKind, MTLDeviceKind, NSViewKind},
 };
 use objc2::{
-    MainThreadMarker,
+    MainThreadMarker, MainThreadOnly, extern_class, extern_methods,
     rc::{Retained, autoreleasepool},
-    runtime::{NSObjectProtocol, ProtocolObject},
+    runtime::{AnyClass, NSObjectProtocol, ProtocolObject},
 };
+use objc2_app_kit::{NSView, NSWindow};
 use objc2_core_graphics::{CGColor, CGColorSpace};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
@@ -28,8 +29,9 @@ pub use cursor_overlay::{poll_capture_from_present, set_cursor_overlay};
 
 /// Retire the attachment record `view_handle` names. **Device teardown only.**
 ///
-/// The teardown path then retires that metal view, keeping it for the
-/// window's next device or releasing it ([`retire_metal_view`]), so the view,
+/// The teardown path then retires that metal view, keeping it for the next
+/// device on that window or on one that replaces it, or releasing it
+/// ([`retire_metal_view`]), so the view,
 /// its layer and its window may not be reached through the record from the
 /// moment this runs. Unregistering the record first is what keeps the
 /// process-lifetime screen-parameter, occlusion and pointer observers from
@@ -391,9 +393,7 @@ fn install_occlusion_observer_once() {
     use std::sync::Once;
 
     use block2::RcBlock;
-    use objc2_app_kit::{
-        NSWindow, NSWindowDidChangeOcclusionStateNotification, NSWindowOcclusionState,
-    };
+    use objc2_app_kit::{NSWindowDidChangeOcclusionStateNotification, NSWindowOcclusionState};
     use objc2_foundation::{NSNotification, NSNotificationCenter};
 
     static INSTALLED: Once = Once::new();
@@ -855,11 +855,18 @@ pub fn attach_metal_layer(
     }
 
     let funcs = MacdrvFuncs::load()?;
-    // A view kept from this window's previous device is taken as it is; only
-    // a window with none gets a view from Wine.
+    // A view kept from this window's previous device is taken as it is; one
+    // kept from a window that is gone is moved in; only a window with
+    // neither gets a view from Wine.
     let kept = kept_metal_view(&funcs, hwnd);
+    let hosted = matches!(kept, Some(KeptView::Hosted { .. }));
     let (view, layer) = match kept {
-        Some(kept) => kept,
+        Some(KeptView::Hosted { view, layer }) => (view as *mut c_void, layer as *mut c_void),
+        Some(KeptView::Orphan {
+            view,
+            layer,
+            from_hwnd,
+        }) => adopt_metal_view(&funcs, hwnd, device_handle, view, layer, from_hwnd)?,
         None => create_metal_view(&funcs, hwnd, device_handle)?,
     };
     // AppKit owns the view's window and screen relationships on the main
@@ -870,7 +877,7 @@ pub fn attach_metal_layer(
         hint = Some(view_display_caps(view, mtm));
     });
     let hint = hint.expect("synchronous display lookup completed");
-    if kept.is_some() {
+    if hosted {
         info!(
             target: LOG_TARGET,
             "present: metal view {:#x} kept from the previous device on window {hwnd:#x} is \
@@ -971,6 +978,185 @@ fn create_metal_view(
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
 ) -> Option<(*mut c_void, *mut c_void)> {
+    let win_data = get_win_data(funcs, hwnd)?;
+    // SAFETY: `win_data` is the live record `get_win_data` handed back,
+    // valid until `release_win_data`.
+    let client_view = unsafe { (*win_data).client_cocoa_view };
+    let result = wine_metal_view(funcs, client_view, device_handle);
+    release_win_data(funcs, win_data);
+    result
+}
+
+/// Move a kept view, `layer` and all, into `hwnd`'s window for the device attaching there.
+///
+/// Wine creates the client surface for the window as it does for a new
+/// view, and the kept view takes the place in that surface's cocoa view a
+/// new one gets ([`adopt_view_into_client`]). The surface's own frame,
+/// superview and unhide requests sit on Wine's main-thread queue when
+/// `get_win_data` returns; that queue runs in order and Wine's synchronous
+/// calls ride it, so the `macdrv_view_get_metal_layer` round trip here
+/// returns after they have run, and is at the same time the check that the
+/// view still carries the parked layer. A view that does not, or a surface
+/// with no cocoa view, is released, and the window gets a view of its own
+/// as if nothing had been kept; only a window Wine has no record for fails
+/// the attach.
+fn adopt_metal_view(
+    funcs: &MacdrvFuncs,
+    hwnd: u64,
+    device_handle: MetalHandle<MTLDeviceKind>,
+    view: usize,
+    layer: usize,
+    from_hwnd: u64,
+) -> Option<(*mut c_void, *mut c_void)> {
+    let Some(win_data) = get_win_data(funcs, hwnd) else {
+        release_metal_view(view);
+        return None;
+    };
+    // SAFETY: `win_data` is the live record `get_win_data` handed back,
+    // valid until `release_win_data`.
+    let client_view = unsafe { (*win_data).client_cocoa_view };
+    // SAFETY: extern "C" Wine entry point; `view` is the kept view, which the
+    // park handed to this caller still retained.
+    let carried = unsafe { (funcs.macdrv_view_get_metal_layer)(view as *mut c_void) } as usize;
+    let mut moved = false;
+    if client_view.is_null() {
+        error!(
+            target: LOG_TARGET,
+            "present: Wine's client surface for window {hwnd:#x} has no cocoa view; the metal \
+             view {view:#x} kept from window {from_hwnd:#x} is released",
+        );
+    } else if carried != layer {
+        error!(
+            target: LOG_TARGET,
+            "present: metal view {view:#x} kept from window {from_hwnd:#x} carries layer \
+             {carried:#x}, not the kept layer {layer:#x}; released, and window {hwnd:#x} gets a \
+             view of its own",
+        );
+    } else {
+        run_on_main_thread_sync(|| {
+            let mtm = MainThreadMarker::new().expect("the kept view is moved on the main thread");
+            moved = adopt_view_into_client(view, client_view as usize, mtm);
+        });
+        if !moved {
+            error!(
+                target: LOG_TARGET,
+                "present: metal view {view:#x} kept from window {from_hwnd:#x} could not be \
+                 moved into window {hwnd:#x}; released, and the window gets a view of its own",
+            );
+        }
+    }
+    let result = if moved {
+        info!(
+            target: LOG_TARGET,
+            "present: metal view {view:#x} kept from window {from_hwnd:#x}, whose window is \
+             gone, is moved into window {hwnd:#x}, layer and all",
+        );
+        Some((view as *mut c_void, layer as *mut c_void))
+    } else {
+        release_metal_view(view);
+        if client_view.is_null() {
+            None
+        } else {
+            wine_metal_view(funcs, client_view, device_handle)
+        }
+    };
+    release_win_data(funcs, win_data);
+    result
+}
+
+/// Give a kept view the place in `client_view` a new metal view gets. **Main thread only.**
+///
+/// What `newMetalViewWithDevice` does for a view it creates: the client
+/// view's bounds as the frame, the client view resizing its subviews (off
+/// on one until then), the view below every other subview, and the window's
+/// `windowDidDrawContent`, after which Wine treats the window as having
+/// content. The view is taken out of whatever still holds it first: a window
+/// Wine has closed may keep its client view until a later request disposes
+/// it. `false` when either view is not there.
+fn adopt_view_into_client(view: usize, client_view: usize, mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::NSWindowOrderingMode;
+
+    let Some(view) = retain_parked_view(view, mtm) else {
+        return false;
+    };
+    // SAFETY: `client_view` is the cocoa view of the client surface Wine
+    // created for the attaching window, read from the `get_win_data` record
+    // the caller holds until its `release_win_data`; the retain taken here
+    // covers the calls below.
+    let Some(client) = (unsafe { Retained::retain(client_view as *mut NSView) }) else {
+        return false;
+    };
+    view.removeFromSuperview();
+    view.setFrame(client.bounds());
+    client.setAutoresizesSubviews(true);
+    client.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
+    if let Some(window) = client.window() {
+        window_did_draw_content(&window, mtm);
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: a kept metal view was moved into a client view that is in no window yet; \
+             the window is not told it has content",
+        );
+    }
+    true
+}
+
+extern_class!(
+    /// winemac's window class, told when a moved-in metal view gives it content.
+    ///
+    /// Declared here because no binding crate carries Wine's classes.
+    /// The content notification matches `newMetalViewWithDevice`, and
+    /// `closing` distinguishes a destroyed host from a live child window's
+    /// host. The class is looked up by name before use, and a window that
+    /// is not one of the driver's is left alone.
+    #[unsafe(super(NSWindow))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "WineWindow"]
+    struct WineWindow;
+);
+
+impl WineWindow {
+    extern_methods!(
+        #[unsafe(method(windowDidDrawContent))]
+        #[unsafe(method_family = none)]
+        fn window_did_draw_content(&self);
+
+        #[unsafe(method(closing))]
+        #[unsafe(method_family = none)]
+        fn closing(&self) -> bool;
+    );
+}
+
+/// Whether the running driver has a `WineWindow` class at all.
+static HAS_WINE_WINDOW: LazyLock<bool> = LazyLock::new(|| AnyClass::get(c"WineWindow").is_some());
+
+/// Tell a Wine window it has content, as a new metal view's creation does. **Main thread only.**
+fn window_did_draw_content(window: &NSWindow, _mtm: MainThreadMarker) {
+    if !*HAS_WINE_WINDOW {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: this driver has no WineWindow class; a window given a kept metal view is \
+             not told it has content",
+        );
+        return;
+    }
+    if let Some(window) = window.downcast_ref::<WineWindow>() {
+        window.window_did_draw_content();
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the window given a kept metal view is not a WineWindow; it is not told it \
+             has content",
+        );
+    }
+}
+
+/// Wine's record for `hwnd`, with a client surface created for the window on every call.
+///
+/// `None`, logged, when Wine has no record for the handle. Given back with
+/// [`release_win_data`].
+fn get_win_data(funcs: &MacdrvFuncs, hwnd: u64) -> Option<*mut MacdrvWinData> {
     // SAFETY: `get_win_data` is the table entry resolved at load; `hwnd` is
     // the PE-supplied window handle (non-zero per the check in the caller).
     let win_data = unsafe { (funcs.get_win_data)(hwnd as *mut c_void) };
@@ -978,86 +1164,206 @@ fn create_metal_view(
         error!(target: LOG_TARGET, "get_win_data returned null for hwnd 0x{hwnd:x}");
         return None;
     }
-    // SAFETY: `win_data` is non-null per the check above and points to the
-    // record the table's `get_win_data` returns, valid until
-    // `release_win_data`.
-    let client_view = unsafe { (*win_data).client_cocoa_view };
+    Some(win_data)
+}
+
+/// Give back the record [`get_win_data`] handed out.
+fn release_win_data(funcs: &MacdrvFuncs, win_data: *mut MacdrvWinData) {
+    // SAFETY: `release_win_data` matches the `get_win_data` that handed out
+    // `win_data`, the live pointer returned there.
+    unsafe { (funcs.release_win_data)(win_data) };
+}
+
+/// A metal view and its layer Wine creates in `client_view`, or `None` with the failure logged.
+fn wine_metal_view(
+    funcs: &MacdrvFuncs,
+    client_view: *mut c_void,
+    device_handle: MetalHandle<MTLDeviceKind>,
+) -> Option<(*mut c_void, *mut c_void)> {
     // SAFETY: `macdrv_view_create_metal_view` is the table entry resolved at
-    // load; `client_view` is the Cocoa view we just read from `win_data`.
+    // load; `client_view` is the Cocoa view read from a live `get_win_data`
+    // record.
     let view = unsafe {
         (funcs.macdrv_view_create_metal_view)(client_view, device_handle.raw() as *mut c_void)
     };
-    let result = if view.is_null() {
+    if view.is_null() {
         error!(target: LOG_TARGET, "macdrv_view_create_metal_view returned null");
-        None
-    } else {
-        // SAFETY: `macdrv_view_get_metal_layer` is the table entry resolved
-        // at load; `view` is non-null per the surrounding check.
-        let layer = unsafe { (funcs.macdrv_view_get_metal_layer)(view) };
-        if layer.is_null() {
-            error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
-            None
-        } else {
-            Some((view, layer))
-        }
-    };
-    // SAFETY: `release_win_data` matches the `get_win_data` above; `win_data`
-    // is the live pointer returned there.
-    unsafe { (funcs.release_win_data)(win_data) };
-    result
-}
-
-/// The metal view kept for `hwnd`'s previous device, if there is one and its window is still up.
-///
-/// Taking it goes through none of Wine's calls, so the client surface it
-/// sits in stays the one Wine shows for the window; one Wine hid for a later
-/// surface of the same window is shown again by the first `nextDrawable` of
-/// the kept layer, which Wine reports as that surface's present. A kept view
-/// whose window is gone (an orphan, or a window handle reused for a new
-/// window) is released here, and the caller creates a view.
-fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<(*mut c_void, *mut c_void)> {
-    let (view, layer) = PARKED_METAL_VIEW
-        .lock()
-        .expect("metal view park mutex poisoned")
-        .take_for(hwnd)?;
-    // The window the handle names now. A destroyed window whose handle a
-    // new window inherited answers with the new window, which is not the
-    // one the kept view sits in.
-    let cocoa_window = funcs.macdrv_get_cocoa_window.map_or(0, |get| {
-        // SAFETY: extern "C" Wine entry point; `hwnd` is the PE-supplied
-        // window handle, and the second argument says the window need not
-        // be on screen.
-        unsafe { get(hwnd as *mut c_void, 0) as usize }
-    });
-    let mut hosted = false;
-    if cocoa_window != 0 {
-        run_on_main_thread_sync(|| {
-            let mtm = MainThreadMarker::new().expect("kept view check runs on the main thread");
-            hosted = kept_view_is_in_window(view, cocoa_window, mtm);
-        });
-    }
-    if !hosted {
-        info!(
-            target: LOG_TARGET,
-            "present: metal view {view:#x} kept for window {hwnd:#x} is not in that window any \
-             more; released, and the window gets a view of its own",
-        );
-        release_metal_view(view);
         return None;
     }
-    Some((view as *mut c_void, layer as *mut c_void))
+    // SAFETY: `macdrv_view_get_metal_layer` is the table entry resolved at
+    // load; `view` is non-null per the check above.
+    let layer = unsafe { (funcs.macdrv_view_get_metal_layer)(view) };
+    if layer.is_null() {
+        error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
+        return None;
+    }
+    Some((view, layer))
+}
+
+/// What the park holds for a device attaching to a window, owned by the caller from here on.
+enum KeptView {
+    /// The view kept for the handle, still in that handle's window; reused as it is.
+    Hosted { view: usize, layer: usize },
+    /// A kept view whose own handle has no window any more; moved into the attaching one.
+    Orphan {
+        view: usize,
+        layer: usize,
+        from_hwnd: u64,
+    },
+}
+
+/// The kept view for a device attaching to `hwnd`, if the park holds one for it.
+///
+/// The view kept for `hwnd` itself comes first: still hosted by the handle's
+/// window it is reused, and taking it goes through none of Wine's calls, so
+/// the client surface it sits in stays the one Wine shows for the window
+/// (one Wine hid for a later surface of the same window is shown again by
+/// the first `nextDrawable` of the kept layer, which Wine reports as that
+/// surface's present). No longer hosted (the handle reused by a new window,
+/// or its window gone) it is moved into the window the handle has now. With
+/// none kept for `hwnd`, the newest kept view whose own handle has no window
+/// any more is moved in; a kept view whose handle still has a window is that
+/// window's, on screen or not, and stays.
+///
+/// A slot is taken or retained under the park lock before its view is touched,
+/// since another device's retire can displace a slot and release its view at
+/// any time. The park lock is never held across a Wine call or main-thread hop.
+/// Runs on the API thread: `macdrv_get_cocoa_window` takes Wine's window-data
+/// lock, which the driver holds across a synchronous main-thread request
+/// while it destroys a window, so it is never called from the main thread.
+fn kept_metal_view(funcs: &MacdrvFuncs, hwnd: u64) -> Option<KeptView> {
+    let own = PARKED_METAL_VIEW
+        .lock()
+        .expect("metal view park mutex poisoned")
+        .take_for(hwnd);
+    if let Some((view, layer)) = own {
+        return Some(if kept_view_hosted(funcs, hwnd, view) {
+            KeptView::Hosted { view, layer }
+        } else {
+            KeptView::Orphan {
+                view,
+                layer,
+                from_hwnd: hwnd,
+            }
+        });
+    }
+    // A Wine whose table cannot say whose window is gone (no
+    // `macdrv_get_cocoa_window`) gets no view moved between handles.
+    let get_cocoa_window = funcs.macdrv_get_cocoa_window?;
+    let newest_first = PARKED_METAL_VIEW
+        .lock()
+        .expect("metal view park mutex poisoned")
+        .slots_newest_first();
+    let orphan = pick_orphan(&newest_first, |kept| {
+        cocoa_window_of(get_cocoa_window, kept.hwnd) == 0 && kept_view_host_gone(kept)
+    })?;
+    let taken = PARKED_METAL_VIEW
+        .lock()
+        .expect("metal view park mutex poisoned")
+        .take_kept(orphan.view, orphan.seq)?;
+    Some(KeptView::Orphan {
+        view: taken.view,
+        layer: taken.layer,
+        from_hwnd: taken.hwnd,
+    })
+}
+
+/// The newest kept view whose own handle has no window any more, among `newest_first`.
+///
+/// `window_gone` checks both the handle and the view's host: a child handle
+/// has no Cocoa window of its own even while its view sits in a live parent.
+/// A view in a live host, on screen or not, is not picked.
+fn pick_orphan(
+    newest_first: &[KeptMetalView],
+    window_gone: impl Fn(&KeptMetalView) -> bool,
+) -> Option<&KeptMetalView> {
+    newest_first.iter().find(|kept| window_gone(kept))
+}
+
+/// Whether a still-parked view is detached or belongs to a closing Wine window.
+///
+/// A child HWND has no Cocoa window of its own, so the handle lookup alone
+/// cannot establish that its view is orphaned. Retain under the park lock
+/// on the main thread, then release the lock before walking `AppKit`. A slot
+/// taken or replaced since the snapshot is skipped without touching its
+/// address; `take_kept` checks it again before transferring ownership.
+fn kept_view_host_gone(kept: &KeptMetalView) -> bool {
+    let mut gone = false;
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("kept view host check runs on the main thread");
+        let view = {
+            let park = PARKED_METAL_VIEW
+                .lock()
+                .expect("metal view park mutex poisoned");
+            park.slots
+                .iter()
+                .find(|slot| slot.view == kept.view && slot.seq == kept.seq)
+                .and_then(|slot| retain_parked_view(slot.view, mtm))
+        };
+        let Some(view) = view else {
+            // Another attachment took or displaced this parking.
+            return;
+        };
+        let Some(window) = view.window() else {
+            gone = true;
+            return;
+        };
+        if *HAS_WINE_WINDOW && let Some(window) = window.downcast_ref::<WineWindow>() {
+            gone = window.closing();
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: a kept metal view has an unknown window class; left in its host",
+            );
+        }
+    });
+    gone
+}
+
+/// Whether the view kept for `hwnd` still sits in the Cocoa window that handle has now.
+///
+/// A destroyed handle has no window; one a new window inherited answers with
+/// that window, which is not the one the kept view sits in.
+fn kept_view_hosted(funcs: &MacdrvFuncs, hwnd: u64, view: usize) -> bool {
+    let cocoa_window = funcs
+        .macdrv_get_cocoa_window
+        .map_or(0, |get| cocoa_window_of(get, hwnd));
+    if cocoa_window == 0 {
+        return false;
+    }
+    let mut hosted = false;
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("kept view check runs on the main thread");
+        hosted = kept_view_is_in_window(view, cocoa_window, mtm);
+    });
+    hosted
+}
+
+/// The Cocoa window `hwnd` has now, `0` for a handle without one. API thread only.
+fn cocoa_window_of(get: GetCocoaWindowFn, hwnd: u64) -> usize {
+    // SAFETY: extern "C" Wine entry point; `hwnd` is a window handle the PE
+    // side supplied, and the second argument says the window need not be on
+    // screen.
+    unsafe { get(hwnd as *mut c_void, 0) as usize }
 }
 
 /// Whether the kept view sits in the Cocoa window at `cocoa_window`. **Main thread only.**
-fn kept_view_is_in_window(view: usize, cocoa_window: usize, _mtm: MainThreadMarker) -> bool {
-    // SAFETY: the park holds the retain `macdrv_view_create_metal_view`
-    // handed out for this view and nothing has released it, so the address
-    // names a live `NSView`; the retain taken here covers the property read.
-    let Some(view) = (unsafe { Retained::retain(view as *mut objc2_app_kit::NSView) }) else {
-        return false;
-    };
-    view.window()
+fn kept_view_is_in_window(view: usize, cocoa_window: usize, mtm: MainThreadMarker) -> bool {
+    retain_parked_view(view, mtm)
+        .and_then(|view| view.window())
         .is_some_and(|window| Retained::as_ptr(&window) as usize == cocoa_window)
+}
+
+/// Retain a park-owned view from its address. **Main thread only.**
+///
+/// The one place a kept view is resurrected from the address the park held:
+/// the park holds the retain `macdrv_view_create_metal_view` handed out for
+/// the view and nothing releases it before the park's own release, and the
+/// caller either owns the taken slot or holds the park lock while retaining
+/// a slot it verified is still current. The retain covers the caller's walk.
+fn retain_parked_view(view: usize, _mtm: MainThreadMarker) -> Option<Retained<NSView>> {
+    // SAFETY: as the doc says; the retain taken here covers the caller's use.
+    unsafe { Retained::retain(view as *mut NSView) }
 }
 
 /// Apply a runtime change to the guest's vsync request.
@@ -1191,8 +1497,11 @@ mod bounded_cast {
 /// ([`shrink_parked_layer`]), so a kept layer holds the one surface it still
 /// displays rather than a pool at the window's size. A device attaching to
 /// another window leaves a kept view for a device that comes back to its
-/// own; one attaching to a kept view's window handle while the view no
-/// longer sits in that window releases it and gets a view of its own.
+/// own, as long as that window is there. A kept view whose window is gone
+/// (an application that destroys its device window between two devices and
+/// creates a new one) is moved into the next window that attaches with none
+/// of its own ([`adopt_metal_view`]), so the layer follows the application
+/// across that as well.
 static PARKED_METAL_VIEW: Mutex<MetalViewPark> = Mutex::new(MetalViewPark::new());
 
 /// Retire a device's metal view: kept for its window's next device, see [`PARKED_METAL_VIEW`].
@@ -1277,10 +1586,12 @@ fn shrink_layer_drawable(layer: usize, _mtm: MainThreadMarker) {
 /// How many retired metal views are kept at once.
 ///
 /// A game has its device window and at most one more that a `Reset`
-/// retargets it to; the end-to-end suite runs four devices at once, and a
-/// smaller park would hand its recreations new layers by accident of timing.
-/// Each kept view holds the one surface its layer still displays; the pool
-/// behind it goes at the park ([`shrink_parked_layer`]).
+/// retargets it to, and one that destroys its device window between two
+/// devices leaves one kept view per switch, taken by the next window; the
+/// end-to-end suite runs four devices at once, and a smaller park would hand
+/// its recreations new layers by accident of timing. Each kept view holds
+/// the one surface its layer still displays; the pool behind it goes at the
+/// park ([`shrink_parked_layer`]).
 const KEPT_METAL_VIEWS: usize = 4;
 
 /// One kept metal view: raw addresses and the window it served.
@@ -1363,6 +1674,40 @@ impl MetalViewPark {
         *slot = KeptMetalView::EMPTY;
         Some(kept)
     }
+
+    /// The kept views, newest first, as copies for a caller that takes one by [`Self::take_kept`].
+    ///
+    /// Copies rather than the slots, since the caller looks at them with the
+    /// park unlocked; what it picks it takes by view and parking, so a slot
+    /// that changed under it is not taken.
+    fn slots_newest_first(&self) -> Vec<KeptMetalView> {
+        let mut kept: Vec<KeptMetalView> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.view != 0)
+            .map(|slot| KeptMetalView {
+                hwnd: slot.hwnd,
+                view: slot.view,
+                layer: slot.layer,
+                seq: slot.seq,
+            })
+            .collect();
+        kept.sort_by_key(|kept| core::cmp::Reverse(kept.seq));
+        kept
+    }
+
+    /// Take `view` out of the park if the slot still holds the parking `seq` names.
+    ///
+    /// A slot displaced and filled again since the caller looked carries a
+    /// later `seq`, and its view is then someone else's: `None`, and the
+    /// caller has nothing.
+    fn take_kept(&mut self, view: usize, seq: u64) -> Option<KeptMetalView> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.view != 0 && slot.view == view && slot.seq == seq)?;
+        Some(core::mem::replace(slot, KeptMetalView::EMPTY))
+    }
 }
 
 /// Release a metal view through Wine, which removes it from its window on the main thread.
@@ -1421,8 +1766,11 @@ struct MacdrvFuncs {
     /// `macdrv_get_cocoa_window`, `None` when the table's entry is null.
     ///
     /// Answers which Cocoa window an `HWND` has right now, without the client
-    /// surface `get_win_data` creates; a kept view is only reused inside that
-    /// window.
+    /// surface `get_win_data` creates, and none for a destroyed handle: a
+    /// kept view is reused inside that window, and moved to another handle's
+    /// window only once its own has none. Called on the API thread only,
+    /// since Wine holds its window-data lock across a synchronous main-thread
+    /// request while it destroys a window.
     macdrv_get_cocoa_window: Option<GetCocoaWindowFn>,
 }
 
@@ -1456,8 +1804,9 @@ fn macdrv_functions() -> Option<&'static MacdrvFunctionsTable> {
 /// one this layer was written against, and nothing else in it can be
 /// trusted to be either, so the caller gives up rather than call four of
 /// the five. `macdrv_get_cocoa_window` is not among them: it answers which
-/// Cocoa window an `HWND` has now, and a kept view is simply not reused
-/// without that answer. `None` when every entry the layer calls is filled.
+/// Cocoa window an `HWND` has now, and without that answer a kept view goes
+/// back into a client surface of its own handle's window and is never moved
+/// to another handle's. `None` when every entry the layer calls is filled.
 fn first_null_required_entry(table: &MacdrvFunctionsTable) -> Option<&'static str> {
     [
         ("get_win_data", table.get_win_data),
@@ -1548,7 +1897,7 @@ impl MacdrvFuncs {
 /// the layer's `colorspace` property — SDR uses it directly (identity = max
 /// vibrance per display), HDR classifies it into an extended-linear variant.
 fn view_display_caps(view: *mut c_void, mtm: objc2::MainThreadMarker) -> DisplayHint {
-    use objc2_app_kit::{NSScreen, NSView};
+    use objc2_app_kit::NSScreen;
 
     // Prefer the NSScreen attached to the view's window so
     // multi-monitor setups with mixed scales pick the right display;

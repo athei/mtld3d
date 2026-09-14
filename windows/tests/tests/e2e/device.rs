@@ -1002,39 +1002,54 @@ const PACING_CHILD_NAME: &str = "presentation-interval.exe";
 
 #[test]
 fn reset_flips_the_presentation_interval() {
-    let exe = std::env::current_exe().expect("resolve test executable");
-    if exe
-        .file_name()
-        .is_some_and(|name| name == PACING_CHILD_NAME)
-    {
+    if running_as(PACING_CHILD_NAME) {
         presentation_interval_workload();
         return;
     }
-    let _factory = Harness::factory_only();
     // Which Present carried the pacing is read out of the process log, and
     // every Reset of every test running beside this one writes a line of its
     // own into the suite's. The workload therefore runs in a process of its
     // own, alone in its log directory, so the lines there are its device's.
+    run_in_private_log_child(
+        PACING_CHILD_NAME,
+        "device::reset_flips_the_presentation_interval",
+    );
+}
+
+/// Whether this process is the copy of the test executable named `child_name`.
+fn running_as(child_name: &str) -> bool {
+    std::env::current_exe()
+        .expect("resolve test executable")
+        .file_name()
+        .is_some_and(|name| name == child_name)
+}
+
+/// Run `test` in a copy of this executable named `child_name`, alone in a log directory of its own.
+///
+/// The copy sees unix-side info records whatever the suite's filter is, and
+/// the layer writes its log into a directory only that process uses, so a
+/// test that reads its own process log reads its device's lines and nobody
+/// else's. Panics with the child's standard error when the child fails.
+fn run_in_private_log_child(child_name: &str, test: &str) {
+    let exe = std::env::current_exe().expect("resolve test executable");
+    let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock follows Unix epoch")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "presentation-interval-{}-{stamp}",
+        "{}-{}-{stamp}",
+        child_name.trim_end_matches(".exe"),
         std::process::id()
     ));
-    std::fs::create_dir(&dir).expect("create private pacing directory");
-    let child = dir.join(PACING_CHILD_NAME);
-    std::fs::copy(&exe, &child).expect("copy pacing workload executable");
+    std::fs::create_dir(&dir).expect("create the child's private directory");
+    let child = dir.join(child_name);
+    std::fs::copy(&exe, &child).expect("copy the workload executable");
     let mut command = std::process::Command::new(&child);
-    command.args([
-        "--exact",
-        "device::reset_flips_the_presentation_interval",
-        "--nocapture",
-    ]);
-    // The pacing assertions consume unix-side info records even when the
-    // suite disables them. Wine inherits its Unix environment separately
-    // from the PE child's: its promotion prefix sets the native filter too.
+    command.args(["--exact", test, "--nocapture"]);
+    // The workloads consume unix-side info records even when the suite
+    // disables them. Wine inherits its Unix environment separately from the
+    // PE child's: its promotion prefix sets the native filter too.
     let filter = "warn,mtld3d::unix=info";
     command.envs([("RUST_LOG", filter), ("__CX_UNIX_RUST_LOG", filter)]);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
@@ -1044,13 +1059,13 @@ fn reset_flips_the_presentation_interval() {
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
     let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
-        .expect("run pacing workload child");
+        .expect("run the workload child");
     assert!(
         output.status.success(),
-        "pacing workload child failed: {}",
+        "workload child {child_name} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    std::fs::remove_dir_all(&dir).expect("remove private pacing directory");
+    std::fs::remove_dir_all(&dir).expect("remove the child's private directory");
 }
 
 /// Flip `PresentationInterval` twice, one Present after each Reset.
@@ -1156,10 +1171,20 @@ fn log_directory() -> std::path::PathBuf {
 }
 
 /// The vsync state of every re-pacing this process has logged, oldest first.
+fn logged_pacing() -> Vec<String> {
+    logged_lines("re-paced (vsync ")
+        .iter()
+        .filter_map(|line| line.split_once("re-paced (vsync "))
+        .filter_map(|(_, rest)| rest.split(',').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The lines of this process's log that carry `needle`, oldest first.
 ///
 /// The log is the one the layer writes into this process's log directory,
-/// which for the workload child holds its device's lines and nobody else's.
-fn logged_pacing() -> Vec<String> {
+/// which for a workload child holds its device's lines and nobody else's.
+fn logged_lines(needle: &str) -> Vec<String> {
     let logs = log_directory();
     let Ok(entries) = std::fs::read_dir(&logs) else {
         // The directory appears with the first line the layer writes.
@@ -1178,10 +1203,29 @@ fn logged_pacing() -> Vec<String> {
     };
     let text = std::fs::read_to_string(&log).expect("read the process log");
     text.lines()
-        .filter_map(|line| line.split_once("re-paced (vsync "))
-        .filter_map(|(_, rest)| rest.split(',').next())
+        .filter(|line| line.contains(needle))
         .map(str::to_owned)
         .collect()
+}
+
+/// Wait until the process log carries `expected` lines with `needle`, and hand them all back.
+///
+/// The layer's log thread writes a line a moment after the call that
+/// produced it returns, so the lines are polled for, within a bound.
+fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logged = logged_lines(needle);
+        if logged.len() >= expected {
+            return logged;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} line(s) with {needle:?} logged, expected {expected}: {logged:?}",
+            logged.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A full-target quad whose texture coordinates address a cube's +X face.
@@ -3415,6 +3459,136 @@ fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
     );
     // The window is the first harness's to destroy, after the device on it.
     drop(second);
+}
+
+#[test]
+fn a_device_on_a_new_window_presents_through_the_metal_view_a_destroyed_window_left() {
+    // An application that destroys its device window between two devices:
+    // the device released, its window destroyed, a window created, a device
+    // created on it. The first device's release keeps its metal view and the
+    // window's destruction leaves that view without a window, so the second
+    // device's window, which has no kept view of its own, takes it, layer
+    // and all, and the second device presents through it and reads back its
+    // own colour. The window's destruction posts `WM_QUIT` to the thread
+    // that destroyed it, so the second device runs on a thread of its own.
+    const PRESENTS: u32 = 40;
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    for _ in 0..PRESENTS {
+        first.render_once(RED, |_| {});
+    }
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "first device");
+    drop(first);
+    std::thread::scope(|scope| {
+        spawn_scoped(scope, || {
+            let second = Harness::new();
+            for _ in 0..PRESENTS {
+                second.render_once(BLUE, |_| {});
+            }
+            assert_pixel_eq(
+                second.read_pixel(1, 1),
+                BLUE,
+                "second device on a window of its own",
+            );
+        });
+    });
+}
+
+/// The name the workload child of the kept-view move test below runs under.
+const KEPT_VIEW_CHILD_NAME: &str = "kept-view-move.exe";
+
+/// The private process that checks retention for a live child window.
+const LIVE_CHILD_VIEW_CHILD_NAME: &str = "kept-child-view.exe";
+
+#[test]
+fn a_live_child_window_keeps_its_metal_view() {
+    if !running_as(LIVE_CHILD_VIEW_CHILD_NAME) {
+        run_in_private_log_child(
+            LIVE_CHILD_VIEW_CHILD_NAME,
+            "device::a_live_child_window_keeps_its_metal_view",
+        );
+        return;
+    }
+
+    let parent = create_window(128, 128, false);
+    let child = Harness::create(&HarnessConfig {
+        window_style: WindowStyle::Child { parent },
+        ..HarnessConfig::default()
+    });
+    child.render_once(0xFFFF_0000, |_| {});
+    assert_eq!(
+        child.release_device(),
+        0,
+        "release the child window's device"
+    );
+
+    let other = Harness::new();
+    other.render_once(0xFF00_00FF, |_| {});
+    let attached = await_logged_lines("attached Metal layer", 2);
+    assert_eq!(attached.len(), 2, "both devices attached: {attached:?}");
+    assert!(
+        logged_lines("is moved into window").is_empty(),
+        "a child HWND without its own Cocoa window is still live"
+    );
+    drop(other);
+    drop(child);
+    destroy_window(parent);
+}
+
+#[test]
+fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
+    if running_as(KEPT_VIEW_CHILD_NAME) {
+        kept_view_move_workload();
+        return;
+    }
+    // Which window took which view is read out of the process log, and in
+    // the suite's process the kept view a window takes may be any test's.
+    // The workload therefore runs in a process of its own, where the only
+    // kept view is its first device's.
+    run_in_private_log_child(
+        KEPT_VIEW_CHILD_NAME,
+        "device::a_new_window_takes_the_metal_view_a_destroyed_window_left",
+    );
+}
+
+/// Release a device, destroy its window, create a window and a device on it, and read the log.
+///
+/// The one line the layer writes for the move names the destroyed window's
+/// handle and the new window's; it is pinned exactly once, since the process
+/// holds one kept view.
+fn kept_view_move_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    first.render_once(RED, |_| {});
+    let from = first.hwnd();
+    drop(first);
+    std::thread::scope(|scope| {
+        spawn_scoped(scope, || {
+            let second = Harness::new();
+            second.render_once(BLUE, |_| {});
+            assert_pixel_eq(
+                second.read_pixel(1, 1),
+                BLUE,
+                "second device on a window of its own",
+            );
+            let moved = await_logged_lines("is moved into window", 1);
+            assert_eq!(moved.len(), 1, "one kept view moved: {moved:?}");
+            assert!(
+                moved[0].contains(&format!("kept from window {from:#x},")),
+                "the move names the destroyed window: {}",
+                moved[0]
+            );
+            assert!(
+                moved[0].contains(&format!("moved into window {:#x},", second.hwnd())),
+                "the move names the new window: {}",
+                moved[0]
+            );
+        });
+    });
 }
 
 #[test]

@@ -166,6 +166,8 @@ pub enum WindowStyle {
     Borderless,
     /// An overlapped window, for window-management tests.
     Framed,
+    /// A child of an existing test window, with no Cocoa window of its own.
+    Child { parent: usize },
 }
 
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
@@ -239,12 +241,15 @@ pub fn create_styled_window(
     visible: bool,
     window_style: &WindowStyle,
 ) -> usize {
+    const WS_CHILD: u32 = 0x4000_0000;
+
     register_class();
     // SAFETY: Win32 thunk; null module name returns the current process handle.
     let instance = unsafe { GetModuleHandleA(core::ptr::null()) };
-    let (style, position) = match window_style {
-        WindowStyle::Borderless => (WS_POPUP, 0),
-        WindowStyle::Framed => (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT),
+    let (style, position, parent) = match window_style {
+        WindowStyle::Borderless => (WS_POPUP, 0, 0),
+        WindowStyle::Framed => (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0),
+        WindowStyle::Child { parent } => (WS_CHILD, 0, *parent),
     };
     let style = style | if visible { WS_VISIBLE } else { 0 };
     // SAFETY: Win32 thunk; the class atom is registered above, the c-strings are
@@ -259,7 +264,7 @@ pub fn create_styled_window(
             position,
             width,
             height,
-            0,
+            parent,
             0,
             instance,
             core::ptr::null(),
