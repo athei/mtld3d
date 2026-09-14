@@ -1724,7 +1724,7 @@ fn spawn_tsc_warmup() {
 fn spawn_encoder_and_prewarm(
     cq: &CreateCommandQueueParams,
     cfg: &Arc<Mtld3dConfig>,
-) -> (EncoderThread, crate::shader_prewarm::PrewarmHandle) {
+) -> (EncoderThread, mtld3d_core::shader_prewarm::PrewarmHandle) {
     // The only place the snapshot is built: the `intel.*` overrides fold in
     // here so the encoder and `DeviceInner::gpu_caps()` see one answer.
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
@@ -1733,12 +1733,9 @@ fn spawn_encoder_and_prewarm(
         device_caps: device_caps_flags(),
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
-    let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg));
-    let prewarm = crate::shader_prewarm::spawn(
-        cq.device_handle,
-        encoder.prewarm_sender(),
-        cfg.shader_cache_enable,
-    );
+    let (prewarm, prewarm_rx) =
+        crate::shader_prewarm::spawn(cq.device_handle, cfg.shader_cache_enable);
+    let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg), prewarm_rx);
     (encoder, prewarm)
 }
 

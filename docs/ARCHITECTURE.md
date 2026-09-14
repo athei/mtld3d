@@ -503,8 +503,11 @@ PERF/native builds are safe.
 Collection and slow-event storage also compile out. The prewarm thread recreates
 the deduplicated shader libraries and recorded render pipelines. The encoder
 installs their device-local handles and no-color sibling mappings before it
-accepts gameplay submissions. The prewarm thread logs startup
-compilation totals separately, plus elapsed startup time including cache I/O
+accepts gameplay submissions. Only the prewarm worker owns the startup channel's
+sender. A failed thread spawn releases that barrier and starts the encoder cold
+with persistent writes disabled, because the cache file was never validated.
+Device release cancels and waits for prewarm before encoder cleanup.
+The prewarm thread logs startup compilation totals separately, plus elapsed startup time including cache I/O
 and compaction. Shader identities and pipeline recipes share the translation
 schema, while the container format has its own version. Each shader record also
 carries a source-derived MSL emitter fingerprint. Programmable records retain
