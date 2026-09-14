@@ -66,7 +66,6 @@ unix/unix/src/metal/macdrv/cursor_overlay.rs WatchInstalled Clone,Copy
 unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
-unix/unix/src/metal/upscale.rs ScalerSlot Clone,Copy
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/buffer_backing.rs BackingClass Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_backing.rs BackingState Debug,Clone,Copy,PartialEq,Eq

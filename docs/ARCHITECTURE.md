@@ -117,6 +117,19 @@ A retired metal view is kept, not released (`retire_metal_view` in `metal/macdrv
 
 The MetalFX caches follow the same rule by another key: the scratch texture a readback resolve or an HDR present tone-maps into, and the `MTLFXSpatialScaler` that enlarges the frame, are both cached per command queue and geometry (`metal/upscale.rs`), the queue being the device identity every readback and every submit carries, and `DestroyCommandQueue` retires the queue's entries of both after its shutdown fence. Metal orders command buffers within one queue only, so a scratch shared by geometry alone let one device's resolve land between another's resolve and its blit, and each read the other's frame. A scaler is stateful on top of that, since its colour and output textures are properties the encode that follows reads, so a shared one let two devices presenting at one window size write each other's drawables; the cache lock is held across those property writes and the encode so that the separation does not rest on how many threads one device encodes from. Its bound (`MAX_CACHED_SCALERS`, sized for one window being resized) is per queue, and so is the deferred release of an eviction: a scaler evicted by one queue is released from a completed handler on a command buffer of that same queue, which is the only ordering Metal offers.
 
+A scaler entry also owns its optional Private output texture. Presentation
+uses the drawable directly only when its actual storage and usage satisfy the
+scaler. Otherwise MetalFX writes this intermediate at the drawable's exact
+extent and format, then a blit copies it into the drawable in the same command
+buffer. The intermediate follows its scaler through the per-queue eight-entry
+bound, eviction completion and shutdown retirement; it never enters the
+separate scratch cache. Preflight evictions are retired on fallback submissions
+too. Scaler texture bindings are cleared after encoding so idle cache entries
+do not hold drawables out of the layer's pool. SDR uses Perceptual mode; HDR
+still tone-maps at render size before scaling in HDR mode. A preparation or
+copy failure returns to the original source's SDR or HDR present shader.
+
+
 A Reset that flips `PresentationInterval` reaches the record through `SetDisplaySyncEnabled` on the encoder thread, which latches the new pacing on it and queues that same reconciliation, so the throttle is re-derived on the main thread for the panel under the window within one present and nothing on the encoder thread reads a screen.
 
 The process-lifetime observers walk the records rather than a latch: the occlusion observer marks every record whose window posted the notification, and a real screen-parameter change reconciles every live record against the screen its window is on now. What stays process-wide stays so on purpose: the screen-parameter filter and Wine's application delegate (a relationship with the one `NSApp`), the observer install latches, the cursor overlay (one system cursor, one overlay window), and the presented-cadence debug probe, into which two presenting devices interleave.

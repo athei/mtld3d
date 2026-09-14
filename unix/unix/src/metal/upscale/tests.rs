@@ -19,7 +19,7 @@ use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLCommandQueueKi
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
-    MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage,
+    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_metal_fx::{MTLFXSpatialScaler, MTLFXSpatialScalerColorProcessingMode};
 use rustc_hash::FxHashMap;
@@ -58,9 +58,10 @@ fn queue_handle(
 
 /// A slot standing for a scaler, never dereferenced and never released.
 fn slot(addr: usize) -> ScalerSlot {
-    ScalerSlot(core::ptr::without_provenance_mut::<
-        ProtocolObject<dyn MTLFXSpatialScaler>,
-    >(addr))
+    ScalerSlot {
+        scaler: core::ptr::without_provenance_mut::<ProtocolObject<dyn MTLFXSpatialScaler>>(addr),
+        output: core::ptr::null_mut(),
+    }
 }
 
 /// A key for `queue` at the geometry `size` names.
@@ -232,8 +233,8 @@ fn the_bound_the_eviction_list_and_a_retire_are_per_queue() {
     assert!(evicted.is_empty(), "queue 2 evicted nothing");
     evicted = take_evicted(&mut cache, 1);
     assert_eq!(
-        evicted.iter().map(|slot| slot.0).collect::<Vec<_>>(),
-        vec![slot(0x1000).0],
+        evicted.iter().map(|slot| slot.scaler).collect::<Vec<_>>(),
+        vec![slot(0x1000).scaler],
         "the eviction waits under the queue whose command buffers order it"
     );
 
@@ -305,7 +306,7 @@ fn two_queues_at_one_geometry_get_their_own_scaler() {
         )?;
         let cache = super::CACHE.get().and_then(Option::as_ref)?;
         let cache = cache.lock().ok()?;
-        cache.scalers.get(&key).map(|entry| entry.slot.0)
+        cache.scalers.get(&key).map(|entry| entry.slot.scaler)
     };
     if !super::can_scale(
         &device,
@@ -459,4 +460,487 @@ fn two_queues_get_their_own_scratch_and_a_retire_takes_only_its_own() {
     super::retire_scratch(first_handle);
     super::retire_scratch(second_handle);
     assert_eq!(scratch_entries_for(second_handle), 0);
+}
+
+/// GPU fixtures fail on unexpected allocation errors once `MetalFX` is supported.
+fn gpu() -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>> {
+    let device = MTLCreateSystemDefaultDevice()?;
+    if !super::is_available(&device) {
+        eprintln!("MetalFX unsupported, skipping GPU regression");
+        return None;
+    }
+    Some(device)
+}
+
+fn target(
+    device: &ProtocolObject<dyn MTLDevice>,
+    size: usize,
+    format: MTLPixelFormat,
+    storage: MTLStorageMode,
+    usage: MTLTextureUsage,
+) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+    // SAFETY: a small, single-level, square texture with a supported color format.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            format, size, size, false,
+        )
+    };
+    desc.setStorageMode(storage);
+    desc.setUsage(usage);
+    let texture = device
+        .newTextureWithDescriptor(&desc)
+        .expect("test texture");
+    objc2_metal::MTLResource::setLabel(
+        &*texture,
+        Some(&objc2_foundation::NSString::from_str("mtld3d-test-upscale")),
+    );
+    texture
+}
+
+fn fill(
+    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+    red: f64,
+) {
+    use objc2_metal::{MTLCommandEncoder, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
+    let pass = MTLRenderPassDescriptor::new();
+    // SAFETY: attachment zero exists on every render pass descriptor.
+    let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+    color.setTexture(Some(texture));
+    color.setLoadAction(MTLLoadAction::Clear);
+    color.setStoreAction(MTLStoreAction::Store);
+    color.setClearColor(objc2_metal::MTLClearColor {
+        red,
+        green: 0.25,
+        blue: 0.5,
+        alpha: 1.0,
+    });
+    let encoder = cmd
+        .renderCommandEncoderWithDescriptor(&pass)
+        .expect("clear encoder");
+    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-upscale-clear",
+    )));
+    encoder.endEncoding();
+}
+
+fn pixels(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+) -> Vec<u8> {
+    use objc2_metal::{
+        MTLBlitCommandEncoder, MTLBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+        MTLResourceOptions,
+    };
+    let bytes_per_pixel = if texture.pixelFormat() == MTLPixelFormat::RGBA16Float {
+        8
+    } else {
+        4
+    };
+    let stride = (texture.width() * bytes_per_pixel).next_multiple_of(256);
+    let length = stride * texture.height();
+    let buffer = queue
+        .device()
+        .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+        .expect("readback");
+    objc2_metal::MTLResource::setLabel(
+        &*buffer,
+        Some(&objc2_foundation::NSString::from_str(
+            "mtld3d-test-upscale-pixels",
+        )),
+    );
+    let cmd = queue.commandBuffer().expect("readback command buffer");
+    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-upscale-readback",
+    )));
+    let blit = cmd.blitCommandEncoder().expect("readback encoder");
+    blit.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-upscale-readback-copy",
+    )));
+    // SAFETY: the full texture fits the aligned buffer; both resources stay
+    // alive until the command buffer completes below.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            texture, 0, 0, objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            objc2_metal::MTLSize { width: texture.width(), height: texture.height(), depth: 1 },
+            &buffer, 0, stride, length,
+        );
+    }
+    blit.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert_eq!(
+        cmd.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cmd.error()
+    );
+    let mut pixels = Vec::with_capacity(texture.width() * texture.height() * bytes_per_pixel);
+    for row in 0..texture.height() {
+        // SAFETY: each row's pixels were initialized by the completed copy;
+        // padding is excluded and the buffer owns every addressed row.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                buffer
+                    .contents()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .wrapping_add(row * stride),
+                texture.width() * bytes_per_pixel,
+            )
+        };
+        pixels.extend_from_slice(bytes);
+    }
+    pixels
+}
+
+fn output_count(queue: MetalHandle<MTLCommandQueueKind>) -> usize {
+    super::CACHE
+        .get()
+        .and_then(Option::as_ref)
+        .expect("cache")
+        .lock()
+        .expect("cache lock")
+        .scalers
+        .iter()
+        .filter(|(key, entry)| key.queue == queue.raw() && !entry.slot.output.is_null())
+        .count()
+}
+
+/// The indirect route must produce exactly the same pixels as direct Private output.
+#[test]
+fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
+    use objc2_metal::{MTLCommandBufferStatus, MTLResource};
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let handle = queue_handle(&queue);
+    for (format, mode, red) in [
+        (
+            MTLPixelFormat::BGRA8Unorm,
+            MTLFXSpatialScalerColorProcessingMode::Perceptual,
+            0.75,
+        ),
+        (
+            MTLPixelFormat::RGBA16Float,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+            2.0,
+        ),
+    ] {
+        let src = target(
+            &device,
+            32,
+            format,
+            MTLStorageMode::Private,
+            MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
+        );
+        let direct = target(
+            &device,
+            64,
+            format,
+            MTLStorageMode::Private,
+            MTLTextureUsage::Unknown,
+        );
+        let copied = target(
+            &device,
+            64,
+            format,
+            MTLStorageMode::Managed,
+            MTLTextureUsage::Unknown,
+        );
+        assert_eq!(copied.storageMode(), MTLStorageMode::Managed);
+        let cmd = queue.commandBuffer().expect("command buffer");
+        cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+            "mtld3d-test-upscale-pair",
+        )));
+        fill(&cmd, &src, red);
+        assert!(super::encode(&cmd, &device, handle, &src, &direct, mode));
+        assert_eq!(
+            output_count(handle),
+            0,
+            "direct output allocates no intermediate"
+        );
+        assert!(super::can_scale(&device, handle, &src, &copied, mode));
+        assert_eq!(output_count(handle), 1);
+        assert!(super::encode(&cmd, &device, handle, &src, &copied, mode));
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        assert_eq!(
+            cmd.status(),
+            MTLCommandBufferStatus::Completed,
+            "{:?}",
+            cmd.error()
+        );
+        let actual = pixels(&queue, &copied);
+        assert_eq!(actual, pixels(&queue, &direct));
+        if format == MTLPixelFormat::RGBA16Float {
+            for pixel in actual.as_chunks::<8>().0 {
+                assert!(
+                    u16::from_le_bytes([pixel[0], pixel[1]]) > 0x3c00,
+                    "HDR red must exceed 1.0"
+                );
+            }
+        } else {
+            assert!(
+                actual
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[2] > 128 && pixel[3] == 255)
+            );
+        }
+        super::retire_scalers(handle);
+    }
+}
+
+#[test]
+fn unknown_usage_is_permissive_and_explicit_usage_must_cover_requirements() {
+    let required = MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+    assert!(super::usage_supports(MTLTextureUsage::Unknown, required));
+    assert!(super::usage_supports(
+        required | MTLTextureUsage::RenderTarget,
+        required
+    ));
+    assert!(!super::usage_supports(
+        MTLTextureUsage::ShaderRead,
+        required
+    ));
+}
+
+/// Failed preparation leaves no output, and a failed copy never reports presentation success.
+#[test]
+fn allocation_scaler_and_copy_failures_remain_recoverable() {
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let handle = queue_handle(&queue);
+    let src = target(
+        &device,
+        32,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
+    );
+    let dst = target(
+        &device,
+        64,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Managed,
+        MTLTextureUsage::Unknown,
+    );
+    let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
+    let key = super::scaler_key(handle.raw(), &src, &dst, mode).expect("key");
+    let mut cache = ScalerCache {
+        scalers: FxHashMap::default(),
+        tick: 0,
+        evicted: FxHashMap::default(),
+    };
+    assert!(super::scaler_in_with(&mut cache, &device, key, |_, _| None).is_none());
+    assert!(cache.scalers.is_empty());
+    let mut slot = super::build_scaler(&device, &key).expect("scaler");
+    assert!(
+        slot.prepare_with(&device, &src, &dst, |_, _, _| None)
+            .is_none()
+    );
+    assert!(slot.output.is_null());
+    assert!(slot.prepare(&device, &src, &dst).is_some());
+    slot.release();
+    let cmd = queue.commandBuffer().expect("command buffer");
+    fill(&cmd, &src, 0.75);
+    assert!(!super::encode_with(
+        &cmd,
+        &device,
+        handle,
+        &src,
+        &dst,
+        mode,
+        |_, _, _| false
+    ));
+    // A later attempt can still encode and cover the full destination.
+    assert!(super::encode(&cmd, &device, handle, &src, &dst, mode));
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    assert!(
+        pixels(&queue, &dst)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[2] > 128 && p[3] == 255)
+    );
+    super::retire_scalers(handle);
+}
+
+/// Resizing two live queues keeps each output private to its queue and bounded.
+#[test]
+fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
+    use objc2_metal::MTLCommandBufferStatus;
+    let Some(device) = gpu() else { return };
+    let queues = [
+        device.newCommandQueue().expect("first queue"),
+        device.newCommandQueue().expect("second queue"),
+    ];
+    let mut submitted = Vec::new();
+    for step in 0..(MAX_CACHED_SCALERS + 4) {
+        for (index, queue) in queues.iter().enumerate() {
+            let handle = queue_handle(queue);
+            let src = target(
+                &device,
+                16 + step,
+                MTLPixelFormat::BGRA8Unorm,
+                MTLStorageMode::Private,
+                MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget,
+            );
+            let dst = target(
+                &device,
+                32 + step * 2,
+                MTLPixelFormat::BGRA8Unorm,
+                MTLStorageMode::Managed,
+                MTLTextureUsage::Unknown,
+            );
+            let cmd = queue.commandBuffer().expect("command buffer");
+            cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+                "mtld3d-test-upscale-resize",
+            )));
+            fill(&cmd, &src, if index == 0 { 0.25 } else { 0.75 });
+            assert!(super::encode(
+                &cmd,
+                &device,
+                handle,
+                &src,
+                &dst,
+                MTLFXSpatialScalerColorProcessingMode::Perceptual
+            ));
+            cmd.commit();
+            submitted.push((index, cmd, dst));
+            assert!(output_count(handle) <= MAX_CACHED_SCALERS);
+        }
+    }
+    // No per-frame wait: older encoded resources must survive cache eviction.
+    for (index, cmd, dst) in submitted {
+        cmd.waitUntilCompleted();
+        assert_eq!(
+            cmd.status(),
+            MTLCommandBufferStatus::Completed,
+            "{:?}",
+            cmd.error()
+        );
+        let actual = pixels(&queues[index], &dst);
+        assert!(
+            actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| (p[2] > 128) == (index == 1) && p[3] == 255)
+        );
+    }
+    let first = queue_handle(&queues[0]);
+    let second = queue_handle(&queues[1]);
+    assert_eq!(output_count(first), MAX_CACHED_SCALERS);
+    assert_eq!(output_count(second), MAX_CACHED_SCALERS);
+    super::retire_scalers(first);
+    assert_eq!(output_count(first), 0);
+    assert_eq!(output_count(second), MAX_CACHED_SCALERS);
+    super::retire_scalers(second);
+    // Reusing a retired queue key must build a fresh cache entry.
+    let src = target(
+        &device,
+        32,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::ShaderRead,
+    );
+    let dst = target(
+        &device,
+        64,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Managed,
+        MTLTextureUsage::Unknown,
+    );
+    assert!(super::can_scale(
+        &device,
+        first,
+        &src,
+        &dst,
+        MTLFXSpatialScalerColorProcessingMode::Perceptual
+    ));
+    assert_eq!(output_count(first), 1);
+    super::retire_scalers(first);
+}
+
+/// A preflight eviction must retire even when no subsequent upscale is encoded.
+#[test]
+fn fallback_submission_drains_preflight_evictions() {
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let handle = queue_handle(&queue);
+    for step in 0..=MAX_CACHED_SCALERS {
+        let src = target(
+            &device,
+            16 + step,
+            MTLPixelFormat::BGRA8Unorm,
+            MTLStorageMode::Private,
+            MTLTextureUsage::ShaderRead,
+        );
+        let dst = target(
+            &device,
+            32 + step * 2,
+            MTLPixelFormat::BGRA8Unorm,
+            MTLStorageMode::Managed,
+            MTLTextureUsage::Unknown,
+        );
+        assert!(super::can_scale(
+            &device,
+            handle,
+            &src,
+            &dst,
+            MTLFXSpatialScalerColorProcessingMode::Perceptual
+        ));
+    }
+    assert_eq!(pending_release_count(handle), 1);
+    let cmd = queue.commandBuffer().expect("fallback command buffer");
+    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-upscale-fallback",
+    )));
+    super::retire_evicted(&cmd, handle);
+    assert_eq!(pending_release_count(handle), 0);
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    super::retire_scalers(handle);
+    assert_eq!(output_count(handle), 0);
+}
+
+/// Explicitly incompatible output usage requires an intermediate even on Private storage.
+#[test]
+fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let handle = queue_handle(&queue);
+    let src = target(
+        &device,
+        32,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::ShaderRead,
+    );
+    let dst = target(
+        &device,
+        64,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::ShaderRead,
+    );
+    let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
+    assert!(super::can_scale(&device, handle, &src, &dst, mode));
+    assert_eq!(
+        output_count(handle),
+        1,
+        "a shader-read-only output cannot serve the scaler's writes"
+    );
+    let invalid = target(
+        &device,
+        32,
+        MTLPixelFormat::BGRA8Unorm,
+        MTLStorageMode::Private,
+        MTLTextureUsage::RenderTarget,
+    );
+    assert!(!super::can_scale(&device, handle, &invalid, &dst, mode));
+    super::retire_scalers(handle);
 }

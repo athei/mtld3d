@@ -8,7 +8,8 @@
 //! `MTLFXSpatialScaler` is the good path for that resample. It is an
 //! edge-aware upscaler rather than a stretched bilinear sample, so a
 //! half-resolution frame comes back materially sharper than the compositor's
-//! own scaling would give. It writes the drawable directly.
+//! own scaling would give. Compatible drawables are written directly; other
+//! destinations receive a copy from a Private output.
 //!
 //! In SDR the scaler runs on the game's `BGRA8Unorm` back buffer in
 //! `Perceptual` colour-processing mode, which is what an sRGB-encoded 8-bit
@@ -50,9 +51,11 @@ use mtld3d_shared::{
     mtl::PixelFormat,
     mtl_handle::{MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLOrigin,
+    MTLPixelFormat, MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
 };
 use objc2_metal_fx::{
     MTLFXSpatialScaler, MTLFXSpatialScalerBase, MTLFXSpatialScalerColorProcessingMode,
@@ -123,16 +126,146 @@ struct ScalerEntry {
     last_used: u64,
 }
 
-/// An owned `MTLFXSpatialScaler`, kept as a raw pointer so the map is `Send`.
-#[derive(Clone, Copy)]
-struct ScalerSlot(*mut ProtocolObject<dyn MTLFXSpatialScaler>);
+/// A scaler and its optional Private output, owned until queue retirement.
+///
+/// Raw pointers keep the cache Send. Neither retain is copied: eviction moves
+/// the slot to a completion handler, and queue shutdown takes remaining slots.
+struct ScalerSlot {
+    scaler: *mut ProtocolObject<dyn MTLFXSpatialScaler>,
+    output: *mut ProtocolObject<dyn MTLTexture>,
+}
 
-// SAFETY: the slot is only ever dereferenced back into a borrowed
-// `&ProtocolObject` under the cache mutex, and `MTLFXSpatialScaler` is a Metal
-// object whose methods Apple documents as callable from any thread. The
-// pointer itself came from `Retained::into_raw` and is only turned back into a
-// `Retained` once, in the completion handler that releases it.
+// SAFETY: the pointers own canonical retains, accessed only under the cache
+// mutex. Metal encoding is serialized per queue; retirement moves the slot
+// to that queue's completion handler, which releases each retain exactly once.
 unsafe impl Send for ScalerSlot {}
+
+impl ScalerSlot {
+    /// Release both canonical retains after the owning queue's GPU work ends.
+    fn release(self) {
+        // SAFETY: this slot was removed from the cache and is consumed once,
+        // after GPU completion. The pointer owns the scaler's original retain.
+        drop(unsafe { Retained::from_raw(self.scaler) });
+        // SAFETY: output is null or owns the intermediate's original retain;
+        // no queued work can use it after the caller's retirement boundary.
+        drop(unsafe { Retained::from_raw(self.output) });
+    }
+
+    /// Prepare a compatible output without encoding any work.
+    fn prepare(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        src: &ProtocolObject<dyn MTLTexture>,
+        dst: &ProtocolObject<dyn MTLTexture>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        self.prepare_with(device, src, dst, create_output)
+    }
+
+    fn prepare_with(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        src: &ProtocolObject<dyn MTLTexture>,
+        dst: &ProtocolObject<dyn MTLTexture>,
+        create: impl FnOnce(
+            &ProtocolObject<dyn MTLDevice>,
+            &ProtocolObject<dyn MTLTexture>,
+            MTLTextureUsage,
+        ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+        // SAFETY: the cache mutex holds this slot's canonical scaler retain.
+        let scaler = unsafe { &*self.scaler };
+        // SAFETY: typed property read on the live cached scaler.
+        let input_usage = unsafe { scaler.colorTextureUsage() };
+        // SAFETY: typed property read on the live cached scaler.
+        let output_usage = unsafe { scaler.outputTextureUsage() };
+        if !usage_supports(src.usage(), input_usage) || src.isFramebufferOnly() {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "upscale: input usage {:?} cannot serve {:?}; present shader stretches instead",
+                src.usage(), input_usage);
+            return None;
+        }
+        if dst.isFramebufferOnly() {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "upscale: framebuffer-only destination cannot receive the upscale; present shader stretches instead");
+            return None;
+        }
+        if dst.storageMode() == MTLStorageMode::Private && usage_supports(dst.usage(), output_usage)
+        {
+            return Some(dst.retain());
+        }
+        if self.output.is_null() {
+            let output = create(device, dst, output_usage)?;
+            self.output = Retained::into_raw(output);
+        }
+        // SAFETY: the cache holds the intermediate's canonical retain, and
+        // the returned retain keeps this borrow independent of the cache lock.
+        unsafe { Retained::retain(self.output) }
+    }
+}
+
+/// Unknown usage permits all operations; explicit usage must contain every required bit.
+fn usage_supports(actual: MTLTextureUsage, required: MTLTextureUsage) -> bool {
+    actual == MTLTextureUsage::Unknown || actual.contains(required)
+}
+
+/// Create the scaler's Private output at the destination's exact extent and format.
+fn create_output(
+    device: &ProtocolObject<dyn MTLDevice>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    usage: MTLTextureUsage,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    // SAFETY: typed constructor; dimensions and format come from a live destination.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            dst.pixelFormat(),
+            dst.width(),
+            dst.height(),
+            false,
+        )
+    };
+    desc.setStorageMode(MTLStorageMode::Private);
+    desc.setUsage(usage);
+    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "upscale: Private output allocation failed for {}x{} {:?} usage {:?}; present shader stretches instead",
+            dst.width(), dst.height(), dst.pixelFormat(), usage);
+        return None;
+    };
+    texture.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-upscale-output",
+    )));
+    log::info!(target: LOG_TARGET,
+        "present: MetalFX Private output {}x{} {:?}, destination storage {:?} usage {:?}",
+        dst.width(), dst.height(), dst.pixelFormat(), dst.storageMode(), dst.usage());
+    Some(texture)
+}
+
+/// Copy a completed upscale without another resample or color conversion.
+fn copy_output(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+) -> bool {
+    let Some(blit) = cmd_buf.blitCommandEncoder() else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "upscale: output copy encoder unavailable; present shader stretches instead");
+        return false;
+    };
+    blit.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-upscale-copy",
+    )));
+    // SAFETY: prepare created src with dst's exact format and extent; both
+    // are non-framebuffer-only textures, retained by this command buffer.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+            src, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize { width: dst.width(), height: dst.height(), depth: 1 },
+            dst, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+    blit.endEncoding();
+    true
+}
 
 /// Encode a `MetalFX` spatial upscale of `src` into `dst`.
 ///
@@ -152,42 +285,82 @@ pub fn encode(
     dst: &ProtocolObject<dyn MTLTexture>,
     mode: MTLFXSpatialScalerColorProcessingMode,
 ) -> bool {
+    encode_with(cmd_buf, device, queue, src, dst, mode, copy_output)
+}
+
+fn encode_with(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    queue: MetalHandle<MTLCommandQueueKind>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    mode: MTLFXSpatialScalerColorProcessingMode,
+    copy: impl FnOnce(
+        &ProtocolObject<dyn MTLCommandBuffer>,
+        &ProtocolObject<dyn MTLTexture>,
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> bool,
+) -> bool {
     let Some(key) = scaler_key(queue.raw(), src, dst, mode) else {
         return false;
     };
     let Some(cache) = scaler_cache(device) else {
         return false;
     };
-    // The lock is held across the two property writes and the encode. The
-    // queue in the key already means no second device reaches this object; the
-    // lock is what keeps that from resting on how many threads one device
-    // encodes from, and it costs one uncontended acquire the lookup pays
-    // anyway.
+    // Keep texture binding and encode atomic with respect to other lookups.
     let Ok(mut cache) = cache.lock() else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "upscale: scaler cache lock poisoned; present shader stretches instead");
         return false;
     };
     let Some(slot) = scaler_in(&mut cache, device, key) else {
         return false;
     };
-    // SAFETY: `slot.0` came from `build_scaler`. It is released either from a
-    // completion handler on a command buffer of this queue committed after
-    // this one, or by `retire_scalers` after this queue's shutdown fence, so
-    // the pointee outlives this borrow and the work encoded from it.
-    let scaler = unsafe { &*slot.0 };
-
-    // SAFETY: objc2 typed binding; `src` is a live texture carrying the
-    // `ShaderRead` usage the scaler requires.
+    let Some(output) = slot.prepare(device, src, dst) else {
+        return false;
+    };
+    // SAFETY: the cache mutex holds the scaler's canonical retain through encode.
+    let scaler = unsafe { &*slot.scaler };
+    // SAFETY: prepare checked src against the scaler's required usage.
     unsafe { scaler.setColorTexture(Some(src)) };
-    // SAFETY: objc2 typed binding; `dst` is the drawable's texture (or an
-    // owned private target), both valid scaler outputs.
-    unsafe { scaler.setOutputTexture(Some(dst)) };
-    // SAFETY: objc2 typed binding; encoding opens no render pass of its own,
-    // and the caller guarantees no encoder is currently open on `cmd_buf`.
+    // SAFETY: prepare selected Private storage with the required output usage.
+    unsafe { scaler.setOutputTexture(Some(&output)) };
+    // SAFETY: no encoder is open; both textures match the scaler descriptor.
     unsafe { scaler.encodeToCommandBuffer(cmd_buf) };
+    // The command buffer retains encoded resources. Clear the scaler's bindings
+    // so an idle cached scaler cannot keep a drawable out of the layer's pool.
+    // SAFETY: nullable property write on the live scaler after encoding.
+    unsafe { scaler.setColorTexture(None) };
+    // SAFETY: nullable property write on the live scaler after encoding.
+    unsafe { scaler.setOutputTexture(None) };
+    let direct = core::ptr::eq(Retained::as_ptr(&output), core::ptr::from_ref(dst));
+    let encoded = direct || copy(cmd_buf, &output, dst);
+    log::debug!(target: "mtld3d::unix::present",
+        "MetalFX encoded={encoded} direct={direct} {}x{} -> {}x{} {:?}, destination storage {:?} usage {:?}",
+        src.width(), src.height(), dst.width(), dst.height(), mode, dst.storageMode(), dst.usage());
     let evicted = take_evicted(&mut cache, key.queue);
     drop(cache);
     release_when_retired(cmd_buf, evicted);
-    true
+    encoded
+}
+
+/// Schedule pending evictions even when presentation falls back after preflight.
+pub fn retire_evicted(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue: MetalHandle<MTLCommandQueueKind>,
+) {
+    let Some(cache) = CACHE.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let evicted = {
+        let Ok(mut cache) = cache.lock() else {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "upscale: poisoned cache leaves evictions pending until queue shutdown");
+            return;
+        };
+        take_evicted(&mut cache, queue.raw())
+    };
+    release_when_retired(cmd_buf, evicted);
 }
 
 /// Release `evicted` once `cmd_buf` retires.
@@ -210,14 +383,12 @@ fn release_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, evicted:
     let handler = RcBlock::new(
         move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             let Ok(mut evicted) = evicted.lock() else {
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                    "upscale: retirement lock poisoned; evicted resources remain allocated");
                 return;
             };
             for slot in evicted.drain(..) {
-                // SAFETY: the pointer came from `Retained::into_raw` in
-                // `build_scaler`, was removed from the cache before landing
-                // here, and is turned back into a `Retained` exactly once —
-                // `drain` cannot yield it twice.
-                drop(unsafe { Retained::from_raw(slot.0) });
+                slot.release();
             }
         },
     );
@@ -254,9 +425,13 @@ pub fn can_scale(
         return false;
     };
     let Ok(mut cache) = cache.lock() else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "upscale: scaler cache lock poisoned during preflight; present shader stretches instead");
         return false;
     };
-    scaler_in(&mut cache, device, key).is_some()
+    scaler_in(&mut cache, device, key)
+        .and_then(|slot| slot.prepare(device, src, dst))
+        .is_some()
 }
 
 /// The key this pair scales under, or `None` when `MetalFX` cannot serve it.
@@ -272,18 +447,8 @@ fn scaler_key(
     // 1.0 precisely so this cannot happen. Declining beats asking Metal to
     // build a scaler it will refuse.
     if in_w > out_w || in_h > out_h {
-        return None;
-    }
-    // The scaler writes only into `Private` storage. A drawable is `Private`
-    // on a unified-memory device and not on the others, and `supportsDevice:`
-    // says nothing about that, so the destination is checked here; the caller
-    // falls to the present shader's stretch.
-    if dst.storageMode() != MTLStorageMode::Private {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "upscale: the destination texture is not Private storage, which MetalFX \
-             requires of its output; the present shader stretches instead"
-        );
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "upscale: {in_w}x{in_h} cannot enlarge into {out_w}x{out_h}; present shader stretches instead");
         return None;
     }
     Some(ScalerKey {
@@ -304,32 +469,42 @@ fn scaler_cache(device: &ProtocolObject<dyn MTLDevice>) -> Option<&'static Mutex
 }
 
 /// Look up, or build and cache, the scaler for `key`.
-fn scaler_in(
-    cache: &mut ScalerCache,
+fn scaler_in<'a>(
+    cache: &'a mut ScalerCache,
     device: &ProtocolObject<dyn MTLDevice>,
     key: ScalerKey,
-) -> Option<ScalerSlot> {
+) -> Option<&'a mut ScalerSlot> {
+    scaler_in_with(cache, device, key, build_scaler)
+}
+
+fn scaler_in_with<'a>(
+    cache: &'a mut ScalerCache,
+    device: &ProtocolObject<dyn MTLDevice>,
+    key: ScalerKey,
+    build: impl FnOnce(&ProtocolObject<dyn MTLDevice>, &ScalerKey) -> Option<ScalerSlot>,
+) -> Option<&'a mut ScalerSlot> {
     cache.tick += 1;
     let tick = cache.tick;
-    if let Some(entry) = cache.scalers.get_mut(&key) {
-        entry.last_used = tick;
-        return Some(entry.slot);
+    if !cache.scalers.contains_key(&key) {
+        // Build before eviction so a declined scaler never displaces a usable one.
+        let slot = build(device, &key)?;
+        if live_for_queue(cache, key.queue) >= MAX_CACHED_SCALERS {
+            evict_least_recently_used(cache, key.queue);
+        }
+        cache.scalers.insert(
+            key,
+            ScalerEntry {
+                slot,
+                last_used: tick,
+            },
+        );
     }
-
-    // A miss builds, which is expensive enough that the settle gate in
-    // `command.rs` keeps transient geometry from ever reaching here.
-    let slot = build_scaler(device, &key)?;
-    if live_for_queue(cache, key.queue) >= MAX_CACHED_SCALERS {
-        evict_least_recently_used(cache, key.queue);
-    }
-    cache.scalers.insert(
-        key,
-        ScalerEntry {
-            slot,
-            last_used: tick,
-        },
-    );
-    Some(slot)
+    let entry = cache
+        .scalers
+        .get_mut(&key)
+        .expect("scaler was found or inserted above");
+    entry.last_used = tick;
+    Some(&mut entry.slot)
 }
 
 /// Scalers `queue` currently holds.
@@ -397,7 +572,7 @@ fn init_cache(device: &ProtocolObject<dyn MTLDevice>) -> Option<Mutex<ScalerCach
     if !supported {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "MetalFX spatial upscaling is unavailable on this GPU — render.scale \
+            "MetalFX spatial upscaling is unavailable on this GPU, render.scale \
              will be held at 1.0 so present stays a 1:1 copy"
         );
         return None;
@@ -444,20 +619,23 @@ fn build_scaler(device: &ProtocolObject<dyn MTLDevice>, key: &ScalerKey) -> Opti
     let Some(scaler) = scaler else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "MetalFX declined a spatial scaler for {}x{} → {}x{} — this frame presents unscaled",
+            "MetalFX declined a spatial scaler for {}x{} → {}x{}, this frame presents unscaled",
             key.input_width, key.input_height, key.output_width, key.output_height,
         );
         return None;
     };
     log::info!(
         target: LOG_TARGET,
-        "present: MetalFX spatial upscale {}x{} → {}x{}",
+        "present: configured MetalFX spatial scaler {}x{} -> {}x{}",
         key.input_width, key.input_height, key.output_width, key.output_height,
     );
     // The cache owns this retain from here: an eviction hands it to a
     // completion handler on a command buffer of the same queue, and
     // `retire_scalers` releases whatever the queue still holds.
-    Some(ScalerSlot(Retained::into_raw(scaler)))
+    Some(ScalerSlot {
+        scaler: Retained::into_raw(scaler),
+        output: core::ptr::null_mut(),
+    })
 }
 
 /// Release every scaler `queue` was served.
@@ -483,11 +661,7 @@ pub fn retire_scalers(queue: MetalHandle<MTLCommandQueueKind>) {
         take_queue_scalers(&mut cache, queue.raw())
     };
     for slot in retired {
-        // SAFETY: the pointer came from `Retained::into_raw` in
-        // `build_scaler` and `take_queue_scalers` removed it from the cache,
-        // so it is turned back into a `Retained` exactly once; the queue's
-        // shutdown fence has passed, so nothing on the GPU still reads it.
-        drop(unsafe { Retained::from_raw(slot.0) });
+        slot.release();
     }
 }
 
@@ -497,13 +671,12 @@ pub fn retire_scalers(queue: MetalHandle<MTLCommandQueueKind>) {
 /// entries a retire takes without a Metal object behind them.
 fn take_queue_scalers(cache: &mut ScalerCache, queue: u64) -> Vec<ScalerSlot> {
     let mut retired = take_evicted(cache, queue);
-    cache.scalers.retain(|key, entry| {
-        if key.queue == queue {
-            retired.push(entry.slot);
-            return false;
-        }
-        true
-    });
+    retired.extend(
+        cache
+            .scalers
+            .extract_if(|key, _| key.queue == queue)
+            .map(|(_, entry)| entry.slot),
+    );
     retired
 }
 
