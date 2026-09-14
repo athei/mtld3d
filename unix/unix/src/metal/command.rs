@@ -708,6 +708,8 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
         }
     }
 
+    super::upscale::retire_evicted(&cmd_buf, params.queue_handle);
+
     // Register an addCompletedHandler that bumps the PE-side
     // `coherent_seq` atomic when this frame retires on the GPU. The
     // block runs on a Metal-internal dispatch thread. `fetch_max` makes
@@ -1169,19 +1171,37 @@ fn clear_texture(
 /// is what makes this cheap: the ICtCp/PQ math runs over fewer pixels than it
 /// does at scale 1.0, and `MetalFX` replaces a full-resolution shader pass.
 ///
-/// Returns `false` when the scratch or the scaler is unavailable, which the
-/// caller answers by tone-mapping straight to the drawable — softer, but a
-/// frame. Every probe runs before the tone-map pass is encoded, because a
-/// decline afterwards would strand it: the present fallback blit is a 1:1 copy
-/// and cannot resample. The GPU-capability check comes first of all, so a
-/// machine without `MetalFX` never allocates the float scratch it could not
-/// consume.
+/// Preflight prepares the scaler and its output before the tone-map pass,
+/// avoiding that work when preparation fails. Any failure falls back to
+/// tone-mapping the original source directly onto the drawable. Returns
+/// `false` only when neither route could encode the frame. The capability
+/// check precedes scratch allocation so an unsupported GPU allocates none.
 fn encode_hdr_present_upscaled(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     queue_handle: MetalHandle<MTLCommandQueueKind>,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
+) -> bool {
+    encode_hdr_present_upscaled_with(cmd_buf, queue_handle, src, drawable, peak, |scratch| {
+        super::upscale::encode(
+            cmd_buf,
+            &cmd_buf.device(),
+            queue_handle,
+            scratch,
+            drawable,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+        )
+    })
+}
+
+fn encode_hdr_present_upscaled_with(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+    upscale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
 ) -> bool {
     let device = cmd_buf.device();
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
@@ -1209,9 +1229,6 @@ fn encode_hdr_present_upscaled(
             MTLFXSpatialScalerColorProcessingMode::HDR,
         )
     }) else {
-        // Unreachable in practice: `render.scale` is held at 1.0 whenever the
-        // GPU has no MetalFX (`AttachMetalLayerParams::metalfx_available`), so
-        // a scaled frame implies a working scaler.
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
@@ -1220,15 +1237,8 @@ fn encode_hdr_present_upscaled(
         return encode_hdr_present(cmd_buf, src, drawable, peak);
     };
 
-    encode_hdr_present(cmd_buf, src, &scratch, peak)
-        && super::upscale::encode(
-            cmd_buf,
-            &device,
-            queue_handle,
-            &scratch,
-            drawable,
-            MTLFXSpatialScalerColorProcessingMode::HDR,
-        )
+    (encode_hdr_present(cmd_buf, src, &scratch, peak) && upscale(&scratch))
+        || encode_hdr_present(cmd_buf, src, drawable, peak)
 }
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
@@ -1240,9 +1250,9 @@ fn encode_hdr_present_upscaled(
 /// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
 /// are `RGBA16Float`, which is what the present pipelines are built against.
 ///
-/// Returns `false` (with an error at the call site of `ensure_resources`)
-/// if pipeline creation failed; the caller falls back to the blit-present
-/// so the frame still surfaces.
+/// Returns `false` if the pipeline or render encoder is unavailable. If no
+/// HDR route succeeds, presentation clears the drawable; a raw blit from
+/// the differently formatted backbuffer would be invalid.
 fn encode_hdr_present(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
