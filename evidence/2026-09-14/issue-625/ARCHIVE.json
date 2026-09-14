@@ -1,0 +1,9 @@
+{
+  "archive": "issue-625.tar.xz",
+  "bytes": 222340,
+  "sha256": "a2c7b7ef8622c922ed31b9e3435e5ececcd7c6e2c0f3719a6544822f983bf480",
+  "chunks": [
+    "issue-625.tar.xz.part00"
+  ],
+  "payload_files": 574
+}

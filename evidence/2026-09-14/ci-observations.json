@@ -1,0 +1,1973 @@
+[
+  {
+    "observed_at": "2026-09-13T23:47:27.010935+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "in_progress",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-13T23:56:25.486138+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "queued",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:04:31.993773+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:04:31.993773+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 1,
+    "status": "in_progress",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103816356846,
+        "name": "build",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356846"
+      },
+      {
+        "id": 103816356958,
+        "name": "check",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356958"
+      },
+      {
+        "id": 103816357389,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357389"
+      },
+      {
+        "id": 103816357431,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357431"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:18:14.279793+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:18:14.279793+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 1,
+    "status": "queued",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103816356846,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356846"
+      },
+      {
+        "id": 103816356958,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356958"
+      },
+      {
+        "id": 103816357389,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357389"
+      },
+      {
+        "id": 103816357431,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357431"
+      },
+      {
+        "id": 103817437489,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437489"
+      },
+      {
+        "id": 103817437500,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437500"
+      },
+      {
+        "id": 103817437503,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437503"
+      },
+      {
+        "id": 103817437514,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437514"
+      },
+      {
+        "id": 103817437515,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437515"
+      },
+      {
+        "id": 103817437516,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437516"
+      },
+      {
+        "id": 103817437517,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437517"
+      },
+      {
+        "id": 103817437531,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437531"
+      },
+      {
+        "id": 103817437534,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437534"
+      },
+      {
+        "id": 103817437541,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437541"
+      },
+      {
+        "id": 103817437542,
+        "name": "conformance (macos-26, i686)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437542"
+      },
+      {
+        "id": 103817437567,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437567"
+      },
+      {
+        "id": 103817437569,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437569"
+      },
+      {
+        "id": 103817437581,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "queued",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437581"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:25:36.222948+00:00",
+    "issue": 625,
+    "pr": 676,
+    "merge_sha": "57467572dc51c0c64e69519d1f225936385d0d54",
+    "run_id": 34792629808,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34792629808",
+    "attempt": 1,
+    "status": "in_progress",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103819597010,
+        "name": "check",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597010"
+      },
+      {
+        "id": 103819597197,
+        "name": "build",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597197"
+      },
+      {
+        "id": 103819597612,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597612"
+      },
+      {
+        "id": 103819597656,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597656"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:25:36.222948+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:25:36.222948+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "jobs": [
+      {
+        "id": 103816356846,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356846"
+      },
+      {
+        "id": 103816356958,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356958"
+      },
+      {
+        "id": 103816357389,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357389"
+      },
+      {
+        "id": 103816357431,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357431"
+      },
+      {
+        "id": 103817437489,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437489"
+      },
+      {
+        "id": 103817437500,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437500"
+      },
+      {
+        "id": 103817437503,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437503"
+      },
+      {
+        "id": 103817437514,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437514"
+      },
+      {
+        "id": 103817437515,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437515"
+      },
+      {
+        "id": 103817437516,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437516"
+      },
+      {
+        "id": 103817437517,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437517"
+      },
+      {
+        "id": 103817437531,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437531"
+      },
+      {
+        "id": 103817437534,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437534"
+      },
+      {
+        "id": 103817437541,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437541"
+      },
+      {
+        "id": 103817437542,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437542"
+      },
+      {
+        "id": 103817437567,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437567"
+      },
+      {
+        "id": 103817437569,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "failure",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437569"
+      },
+      {
+        "id": 103817437581,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437581"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:27:48.693092+00:00",
+    "issue": 625,
+    "pr": 676,
+    "merge_sha": "57467572dc51c0c64e69519d1f225936385d0d54",
+    "run_id": 34792629808,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34792629808",
+    "attempt": 1,
+    "status": "in_progress",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103819597010,
+        "name": "check",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597010"
+      },
+      {
+        "id": 103819597197,
+        "name": "build",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597197"
+      },
+      {
+        "id": 103819597612,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597612"
+      },
+      {
+        "id": 103819597656,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597656"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:27:48.693092+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:27:48.693092+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "jobs": [
+      {
+        "id": 103816356846,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356846"
+      },
+      {
+        "id": 103816356958,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356958"
+      },
+      {
+        "id": 103816357389,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357389"
+      },
+      {
+        "id": 103816357431,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357431"
+      },
+      {
+        "id": 103817437489,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437489"
+      },
+      {
+        "id": 103817437500,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437500"
+      },
+      {
+        "id": 103817437503,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437503"
+      },
+      {
+        "id": 103817437514,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437514"
+      },
+      {
+        "id": 103817437515,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437515"
+      },
+      {
+        "id": 103817437516,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437516"
+      },
+      {
+        "id": 103817437517,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437517"
+      },
+      {
+        "id": 103817437531,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437531"
+      },
+      {
+        "id": 103817437534,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437534"
+      },
+      {
+        "id": 103817437541,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437541"
+      },
+      {
+        "id": 103817437542,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437542"
+      },
+      {
+        "id": 103817437567,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437567"
+      },
+      {
+        "id": 103817437569,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "failure",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437569"
+      },
+      {
+        "id": 103817437581,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437581"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T00:27:48.693092+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 2,
+    "status": "in_progress",
+    "conclusion": null,
+    "jobs": [
+      {
+        "id": 103819974005,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "in_progress",
+        "conclusion": null,
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974005"
+      },
+      {
+        "id": 103819974041,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974041"
+      },
+      {
+        "id": 103819974168,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974168"
+      },
+      {
+        "id": 103819974412,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974412"
+      },
+      {
+        "id": 103819974419,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974419"
+      },
+      {
+        "id": 103819974450,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974450"
+      },
+      {
+        "id": 103819974462,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974462"
+      },
+      {
+        "id": 103819974471,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974471"
+      },
+      {
+        "id": 103819974498,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974498"
+      },
+      {
+        "id": 103819974515,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974515"
+      },
+      {
+        "id": 103819985699,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819985699"
+      },
+      {
+        "id": 103819986358,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819986358"
+      },
+      {
+        "id": 103819987033,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819987033"
+      },
+      {
+        "id": 103819989659,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819989659"
+      },
+      {
+        "id": 103819990630,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819990630"
+      },
+      {
+        "id": 103819992214,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819992214"
+      },
+      {
+        "id": 103819992986,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819992986"
+      },
+      {
+        "id": 103819994763,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819994763"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T03:17:27.732569+00:00",
+    "issue": 625,
+    "pr": 676,
+    "merge_sha": "57467572dc51c0c64e69519d1f225936385d0d54",
+    "run_id": 34792629808,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34792629808",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103819597010,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597010"
+      },
+      {
+        "id": 103819597197,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597197"
+      },
+      {
+        "id": 103819597612,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597612"
+      },
+      {
+        "id": 103819597656,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103819597656"
+      },
+      {
+        "id": 103820610705,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610705"
+      },
+      {
+        "id": 103820610715,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610715"
+      },
+      {
+        "id": 103820610719,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610719"
+      },
+      {
+        "id": 103820610727,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610727"
+      },
+      {
+        "id": 103820610733,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610733"
+      },
+      {
+        "id": 103820610738,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610738"
+      },
+      {
+        "id": 103820610743,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610743"
+      },
+      {
+        "id": 103820610750,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610750"
+      },
+      {
+        "id": 103820610755,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610755"
+      },
+      {
+        "id": 103820610769,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610769"
+      },
+      {
+        "id": 103820610774,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610774"
+      },
+      {
+        "id": 103820610798,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610798"
+      },
+      {
+        "id": 103820610824,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610824"
+      },
+      {
+        "id": 103820610848,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34792629808/job/103820610848"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T03:17:27.732569+00:00",
+    "issue": 638,
+    "pr": 674,
+    "merge_sha": "1809d4a0ba65b743b2b85a617234af1021e02b0c",
+    "run_id": 34790677658,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34790677658",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103814178478,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178478"
+      },
+      {
+        "id": 103814178663,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814178663"
+      },
+      {
+        "id": 103814179092,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179092"
+      },
+      {
+        "id": 103814179148,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814179148"
+      },
+      {
+        "id": 103814674191,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674191"
+      },
+      {
+        "id": 103814674195,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674195"
+      },
+      {
+        "id": 103814674198,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674198"
+      },
+      {
+        "id": 103814674199,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674199"
+      },
+      {
+        "id": 103814674201,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674201"
+      },
+      {
+        "id": 103814674204,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674204"
+      },
+      {
+        "id": 103814674212,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674212"
+      },
+      {
+        "id": 103814674222,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674222"
+      },
+      {
+        "id": 103814674224,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674224"
+      },
+      {
+        "id": 103814674227,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674227"
+      },
+      {
+        "id": 103814674228,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674228"
+      },
+      {
+        "id": 103814674229,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674229"
+      },
+      {
+        "id": 103814674231,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674231"
+      },
+      {
+        "id": 103814674238,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34790677658/job/103814674238"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T03:17:27.732569+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "jobs": [
+      {
+        "id": 103816356846,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356846"
+      },
+      {
+        "id": 103816356958,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816356958"
+      },
+      {
+        "id": 103816357389,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357389"
+      },
+      {
+        "id": 103816357431,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103816357431"
+      },
+      {
+        "id": 103817437489,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437489"
+      },
+      {
+        "id": 103817437500,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437500"
+      },
+      {
+        "id": 103817437503,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437503"
+      },
+      {
+        "id": 103817437514,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437514"
+      },
+      {
+        "id": 103817437515,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437515"
+      },
+      {
+        "id": 103817437516,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437516"
+      },
+      {
+        "id": 103817437517,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437517"
+      },
+      {
+        "id": 103817437531,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437531"
+      },
+      {
+        "id": 103817437534,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437534"
+      },
+      {
+        "id": 103817437541,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437541"
+      },
+      {
+        "id": 103817437542,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437542"
+      },
+      {
+        "id": 103817437567,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437567"
+      },
+      {
+        "id": 103817437569,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "failure",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437569"
+      },
+      {
+        "id": 103817437581,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103817437581"
+      }
+    ]
+  },
+  {
+    "observed_at": "2026-09-14T03:17:27.732569+00:00",
+    "issue": 673,
+    "pr": 675,
+    "merge_sha": "3f0f1fbb8ceeb7cf1a1a49980aa0ce3fb3bb1a32",
+    "run_id": 34791459053,
+    "url": "https://github.com/athei/mtld3d/actions/runs/34791459053",
+    "attempt": 2,
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 103819974005,
+        "name": "conformance (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974005"
+      },
+      {
+        "id": 103819974041,
+        "name": "conformance (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974041"
+      },
+      {
+        "id": 103819974168,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974168"
+      },
+      {
+        "id": 103819974412,
+        "name": "conformance (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974412"
+      },
+      {
+        "id": 103819974419,
+        "name": "conformance (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974419"
+      },
+      {
+        "id": 103819974450,
+        "name": "conformance (macos-26, i686, scale)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974450"
+      },
+      {
+        "id": 103819974462,
+        "name": "e2e (macos-15-intel, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974462"
+      },
+      {
+        "id": 103819974471,
+        "name": "e2e (macos-15-intel, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974471"
+      },
+      {
+        "id": 103819974498,
+        "name": "conformance (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974498"
+      },
+      {
+        "id": 103819974515,
+        "name": "e2e (macos-26, i686, scale 0.75)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819974515"
+      },
+      {
+        "id": 103819985699,
+        "name": "probe-metal",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819985699"
+      },
+      {
+        "id": 103819986358,
+        "name": "e2e (macos-15, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819986358"
+      },
+      {
+        "id": 103819987033,
+        "name": "e2e (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819987033"
+      },
+      {
+        "id": 103819989659,
+        "name": "e2e (macos-15, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819989659"
+      },
+      {
+        "id": 103819990630,
+        "name": "conformance (macos-26, x86_64)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819990630"
+      },
+      {
+        "id": 103819992214,
+        "name": "release",
+        "status": "completed",
+        "conclusion": "skipped",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819992214"
+      },
+      {
+        "id": 103819992986,
+        "name": "check",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819992986"
+      },
+      {
+        "id": 103819994763,
+        "name": "e2e (macos-26, i686)",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/athei/mtld3d/actions/runs/34791459053/job/103819994763"
+      }
+    ]
+  }
+]

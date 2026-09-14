@@ -1,0 +1,14 @@
+[
+  {
+    "path": "processes-after.txt",
+    "bytes": 137723,
+    "sha256": "97ba2f6308f54e81c29aa7d52b36b165aa8774a748d5b3cedbfc2ea7b8efe18f",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "processes-before.txt",
+    "bytes": 137561,
+    "sha256": "cd129e8701630d14bb758b9c97ca9d8fc5d70abce5f21a8fb4caf2beeb18e54d",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  }
+]

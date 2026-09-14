@@ -1,0 +1,9 @@
+{
+  "archive": "issue-673.tar.xz",
+  "bytes": 99948,
+  "sha256": "db4331b79256133dbb00f46b68867d7c7a5a05b433125f10520c15166aea9789",
+  "chunks": [
+    "issue-673.tar.xz.part00"
+  ],
+  "payload_files": 33
+}

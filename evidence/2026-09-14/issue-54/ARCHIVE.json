@@ -1,0 +1,17 @@
+{
+  "archive": "issue-54.tar.xz",
+  "bytes": 278123520,
+  "sha256": "4db1167e9e248be2387205cc2a2820e5db5cc94ea17043b15dd1b8bd1361c24a",
+  "chunks": [
+    "issue-54.tar.xz.part00",
+    "issue-54.tar.xz.part01",
+    "issue-54.tar.xz.part02",
+    "issue-54.tar.xz.part03",
+    "issue-54.tar.xz.part04",
+    "issue-54.tar.xz.part05",
+    "issue-54.tar.xz.part06",
+    "issue-54.tar.xz.part07",
+    "issue-54.tar.xz.part08"
+  ],
+  "payload_files": 352
+}

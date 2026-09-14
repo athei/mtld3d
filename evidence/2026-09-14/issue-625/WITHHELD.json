@@ -1,0 +1,1598 @@
+[
+  {
+    "path": "baseline-binaries/d3d9.dll",
+    "bytes": 2559488,
+    "sha256": "37398e10a0c3542058f2500d457c9aeb2e90d8a1f5a5b5d6da4f6377d264253f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "baseline-binaries/installed-d3d9.dll",
+    "bytes": 2559488,
+    "sha256": "9e498e0043ada2390570dbb09c6468d6fd9dc58c65231f2455b1a308a2e85aef",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "baseline-binaries/installed-mtld3d.dll",
+    "bytes": 174592,
+    "sha256": "91ace1e593e69699aa930d63d9a97c71097cd5e29c9e18da205c97ca9d6c86ca",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "baseline-binaries/installed-mtld3d.so",
+    "bytes": 1118736,
+    "sha256": "dc6ec82e86978ebed304a91bfc58ffebb0d019112853b5291432cf8edadf0f75",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "baseline-binaries/mtld3d.dll",
+    "bytes": 174592,
+    "sha256": "91ace1e593e69699aa930d63d9a97c71097cd5e29c9e18da205c97ca9d6c86ca",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "baseline-binaries/mtld3d.so",
+    "bytes": 1118736,
+    "sha256": "dc6ec82e86978ebed304a91bfc58ffebb0d019112853b5291432cf8edadf0f75",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "candidate-binaries/installed-d3d9.dll",
+    "bytes": 2578432,
+    "sha256": "44a94e6e54cdd65c41756f42c48ff76d638f4886b5adfe45a3cf7fdc847d4401",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "candidate-binaries/installed-mtld3d.dll",
+    "bytes": 174592,
+    "sha256": "8d8ddd19ea3e3ee5746010f26b4ac1bc59f207df70997c607ebaf48a92192e7f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "candidate-binaries/installed-mtld3d.so",
+    "bytes": 1118736,
+    "sha256": "dd1e112c7994e274f0b8ba7c093de58570eb848566ce27eebd60d9f3081fe9fd",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "harness-source/Cargo.lock",
+    "bytes": 16280,
+    "sha256": "7e4eed8af9023ca8cf49c7f72636643c991aebf37ee143c26873cd03a0da6fb8",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "inputs/gtaiv.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "inputs/hl2.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "inputs/wow.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "matrix-20260914-073423/env-3.txt",
+    "bytes": 218380,
+    "sha256": "49185766fbffad36335c0920bc174ab868423fed091a0f6fb06dedbb9e4872dd",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "matrix-20260914-073503/env-3.txt",
+    "bytes": 218471,
+    "sha256": "3adb28ce87bc6a19885c514cfc35e4d60bafff2e23a6c30ab2f284177c08b3d2",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "matrix-20260914-073503/post-processes.txt",
+    "bytes": 218684,
+    "sha256": "2e7aecf44ecadabae2ea1a27543d6746791a198d7fb67afa9959ab0444338241",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "novel-20260914-073819/env-3.txt",
+    "bytes": 218683,
+    "sha256": "643402508f45309af83f3ee0ea3e8727475b1e955a5f7948e7cf0780b31548af",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "novel-20260914-073819/post-processes.txt",
+    "bytes": 219935,
+    "sha256": "e373a83e165b6b73e5be425f5598c697f3ee9afe24a253210467f31f1f512626",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-baseline/input.bin",
+    "bytes": 760934,
+    "sha256": "dd73612d111e67b57f1778c8cb8c02f8244819366e69827c1b0c9968475ec729",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-baseline/mtld3d_shaders.bin",
+    "bytes": 67719,
+    "sha256": "0e3ef44200d820a8e21b0bb008447303e875950e15865d1b048b6d5b5690ade8",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-candidate/input.bin",
+    "bytes": 760974,
+    "sha256": "bfe19ae9e90daea77767004759ac1e656959eb31b6bb3e60a46978472f0c5141",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-candidate/mtld3d_shaders.bin",
+    "bytes": 67703,
+    "sha256": "a579b0cd4cfab1c8e522f3a3e528f3760e2dec45afd7f92e62736b6fe8b86e54",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-gtaiv-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-baseline/input.bin",
+    "bytes": 174830,
+    "sha256": "f07a7927474bd25fa566d47ba2e6cb477e95bdbb72b5decfe58124a9c193c6e5",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-baseline/mtld3d_shaders.bin",
+    "bytes": 25161,
+    "sha256": "a0ddad718c9a10a4878cd85525eeed75014047e6da892a1372632ee73ce20541",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-candidate/input.bin",
+    "bytes": 174831,
+    "sha256": "5f19a83dcffca7a3e285de24bea79733b3131fc1e569597388e6fc8a5f658e1d",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-candidate/mtld3d_shaders.bin",
+    "bytes": 25096,
+    "sha256": "12fe14ef40ed2058910daf2740e584a4b4decd99a70eb40ceac527211f51cd0a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-hl2-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-baseline/input.bin",
+    "bytes": 159803,
+    "sha256": "e73f252722815ee0ca203845be94c33cac9ef0dea67738424d6136d1d91b78fe",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-baseline/mtld3d_shaders.bin",
+    "bytes": 15231,
+    "sha256": "55c11de049431ed027388901f69a66fb512c55ce68eaddfcb0cc1a2de0d1f230",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-candidate/input.bin",
+    "bytes": 159840,
+    "sha256": "2f94939b40177096f05f4d0d71acbd9dd94bca2a7ea0965501569f49d2f1e596",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-candidate/mtld3d_shaders.bin",
+    "bytes": 15202,
+    "sha256": "96f906851bb1bccd0437c949440de5bac2066a76a4f4f484534c199d48fba22c",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/0-wow-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-baseline/input.bin",
+    "bytes": 760980,
+    "sha256": "b8a408e0490867669a7b9b5d5cc40b221a0a63c94ffb8a903b225335aceb8d66",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-baseline/mtld3d_shaders.bin",
+    "bytes": 67687,
+    "sha256": "0f113793b9d44b815d4a90962498e6be2c78632c3e286f33275cad0796425ac6",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-candidate/input.bin",
+    "bytes": 760968,
+    "sha256": "d721c442dc6d85b8c1347535ba97e65111cc694bb269d19359d0888795bd3317",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-candidate/mtld3d_shaders.bin",
+    "bytes": 67710,
+    "sha256": "c80108321f89de5f33ef1d26d03105be48d3b88b3d91139c9816762c2d99bec9",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-gtaiv-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-baseline/input.bin",
+    "bytes": 174776,
+    "sha256": "b1b19aaa38775206aacc02e695d5fa0d0a970cee1fe4c48e6a06300971666ce9",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-baseline/mtld3d_shaders.bin",
+    "bytes": 25110,
+    "sha256": "610afda497525b5537ce7b44a07ef87142695a5266c8841e4b1260baf28e1f13",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-candidate/input.bin",
+    "bytes": 174871,
+    "sha256": "ea59c6e54938ade5926fbf0b528b99d03ada9823ed0aa6470a172730eb22381c",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-candidate/mtld3d_shaders.bin",
+    "bytes": 25125,
+    "sha256": "78c83b437453230be17ccb8903dbaea898b4337d5e7494bd0b3506b716a3c789",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-hl2-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-baseline/input.bin",
+    "bytes": 159826,
+    "sha256": "0c6cae8a4744884b281c900917eeb0c6f9d4f0361af1d4f5d5b38acc20bdc32a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-baseline/mtld3d_shaders.bin",
+    "bytes": 15220,
+    "sha256": "f006031c91846f11836b1cf95a264db90b868722256d1c52dc9db08ee4b03a17",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-candidate/input.bin",
+    "bytes": 159837,
+    "sha256": "18397159f6f10bfcd35793ecde477f5b70a9ec06097cef42e9a46da153a54f0c",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-candidate/mtld3d_shaders.bin",
+    "bytes": 15208,
+    "sha256": "d4b764d5a03781f14eb6da377cd44b98cd764cecd720e9f3e29a4a07e83fc6a3",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/1-wow-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-baseline/input.bin",
+    "bytes": 760953,
+    "sha256": "4a79be7399c7aec0bb69e9c9b8b788523e1a2cfe856bc560c6394c52e6f02442",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-baseline/mtld3d_shaders.bin",
+    "bytes": 67848,
+    "sha256": "59d284c39264c32edb5557fcf79997f875cb1cc302c83c44ec3cdedfa64e06a0",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-candidate/input.bin",
+    "bytes": 760970,
+    "sha256": "80474680c36d7137e82a80bb5ad1180bbc8a0a8dbef18ed15805c1d8bb3dcf18",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-candidate/mtld3d_shaders.bin",
+    "bytes": 67753,
+    "sha256": "93f03ef99eecb225eb2cab2bf4aac740a5df8796bd21a5cb4c77940ab7da9fa7",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-gtaiv-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-baseline/input.bin",
+    "bytes": 174797,
+    "sha256": "a0e564f892c0313d74f8144a6f8b50967be5bd3be172a4e05cfc603c4592c6f2",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-baseline/mtld3d_shaders.bin",
+    "bytes": 25129,
+    "sha256": "f9162b1525ab7d4331c2e2c46ceca7ae112a936f09411157e20384e389c50164",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-candidate/input.bin",
+    "bytes": 174802,
+    "sha256": "6f2f0f8d409d702679ee8a1b9396ab8c49737546954dcb7e254c6a1ef6d8420f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-candidate/mtld3d_shaders.bin",
+    "bytes": 25106,
+    "sha256": "1cc2e3b9e729d360f6374570bb7a03d200c0402c14fe95db3cabd0309e4e6063",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-hl2-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-baseline/input.bin",
+    "bytes": 159844,
+    "sha256": "30133ecebee5d0acb5e9cf744e3553195ca444455a088ae3280da091d8ab6969",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-baseline/mtld3d_shaders.bin",
+    "bytes": 15233,
+    "sha256": "3b8a57829a148083dc973ccde8330431b2afe1104013dc497cb12a93a49c9031",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-candidate/input.bin",
+    "bytes": 159856,
+    "sha256": "127fc6fa676dfec5b2cf94efe644de677ad3a3b5c0423a1bca5ade821037937e",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-candidate/mtld3d_shaders.bin",
+    "bytes": 15215,
+    "sha256": "4184cc12eea44956a6629fabcb02d9f174863ff74f4a814696915e10d89688f3",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/2-wow-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-baseline/input.bin",
+    "bytes": 760951,
+    "sha256": "0aaad86e6b960f424a1a7549beb2a78a70a8727cf02aca5d4030ad5b118517ab",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-baseline/mtld3d_shaders.bin",
+    "bytes": 67649,
+    "sha256": "e84b6b3e178f9ae853aa7e5b344e730fa6c3802c3335e3b01b4a5b9fef583bb3",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-candidate/input.bin",
+    "bytes": 760913,
+    "sha256": "00d5359b2ad841419ed1e5b1a4bcbba7b58799b07ab415b2215c29c1b8a23a79",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-candidate/mtld3d_shaders.bin",
+    "bytes": 67835,
+    "sha256": "61bf668a1f0d6fa500ae60555d74fc9069743aab0bc2b1cef221f7d224ea278f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-gtaiv-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-baseline/input.bin",
+    "bytes": 174898,
+    "sha256": "f3e77760b1d1881a503d904a90ac081c913f81d130b06b431a016cad95ab3b6a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-baseline/mtld3d_shaders.bin",
+    "bytes": 25113,
+    "sha256": "a939dadcbd9109ca38dc27d701301eafdafb59ed93462b21fac67c6b56b295e7",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-candidate/input.bin",
+    "bytes": 174891,
+    "sha256": "2e4c949adfb15f6fc33b7e1c0d3fc34bc395bdb2a8af0c84b923c0a7f09229b6",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-candidate/mtld3d_shaders.bin",
+    "bytes": 25114,
+    "sha256": "956534989a7a934e1ac35213ca45f26cded2ac0100d78e989736ea5b1ad5b5ef",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-hl2-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-baseline/input.bin",
+    "bytes": 159776,
+    "sha256": "388afc5113ec95398d2a7ce148c55ff9d4e4d5c9c6c0a16d9726ec44095c082f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-baseline/mtld3d_shaders.bin",
+    "bytes": 15219,
+    "sha256": "db511420e684cae776e4a8a04d9da5e733d567b375ee73861dc52c7808a91294",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-candidate/input.bin",
+    "bytes": 159833,
+    "sha256": "ea75d266e05c6eb3c4e6fd8ad45d730c6e659195a0d4ca14b127b7db926b29c9",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-candidate/mtld3d_shaders.bin",
+    "bytes": 15206,
+    "sha256": "da4d8d7871b3e3440758bdc8c385b253109d5b877544652e66321d5ad407815f",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/alternating/3-wow-candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-0/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-0/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-1/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-1/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-2/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-2/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-gtaiv-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-0/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-0/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-1/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-1/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-2/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-2/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-hl2-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-0/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-0/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-1/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-1/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-2/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-2/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/exact-wow-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-0/input.bin",
+    "bytes": 760959,
+    "sha256": "d239258e68fdef861d834afb7dab341078f1f45823d389702357e71fad179c2d",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-0/mtld3d_shaders.bin",
+    "bytes": 67839,
+    "sha256": "1dce3ec93dc093846b379c2d6f8b8b6308166aface4800511dde94da3a30e475",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-1/input.bin",
+    "bytes": 760953,
+    "sha256": "a92dba51ac680c4cc830092b2f90b973daff1fbc7475078ce5ab406478ef18c2",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-1/mtld3d_shaders.bin",
+    "bytes": 67782,
+    "sha256": "5621559daf4dccebcd20f019ca738a6d4713283e8d3d433aa75e42e92e827839",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-2/input.bin",
+    "bytes": 760929,
+    "sha256": "6aacc19fee40c7935a7fd6ffaad5e8daa6ac91b6f19c5420dd2f98e8b230ed69",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-2/mtld3d_shaders.bin",
+    "bytes": 67794,
+    "sha256": "cef80c1720a675d8a15ad68927edfbc9f3805efc26e5aabba2e12e58e999f441",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-gtaiv-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-0/input.bin",
+    "bytes": 174859,
+    "sha256": "499ef4919dbd6ffe9fc65277646e3fc5b97226ccd61cc2196e3f8d78bc43efeb",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-0/mtld3d_shaders.bin",
+    "bytes": 25115,
+    "sha256": "f787cf0ba166cd8685809a637a1ef33caba2c966c356f0f8c9d77b41ca7eec90",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-1/input.bin",
+    "bytes": 174855,
+    "sha256": "540ed9e9fe7bce0e9c0efde50de61a61e63b5fc209f84219de201d3f79aa21fe",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-1/mtld3d_shaders.bin",
+    "bytes": 25118,
+    "sha256": "95904ed41ec6debd6157090f178569e7b88c381f48d3d99a21a03aea5c618fea",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-2/input.bin",
+    "bytes": 174870,
+    "sha256": "c2949f1996de499412b5e7ff9c247e9f49aed1ec26d4d8bc28dd67353c53c226",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-2/mtld3d_shaders.bin",
+    "bytes": 25130,
+    "sha256": "f2b2da406cae698c77f662e42684f3abc03d45e74a6c5c2840eeacdd54892eb1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-hl2-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-0/input.bin",
+    "bytes": 159845,
+    "sha256": "4dffcef2aaa9e2f44eb3f13634b90605bd85d270d0288f899221f7e665383817",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-0/mtld3d_shaders.bin",
+    "bytes": 15267,
+    "sha256": "836235a8581e5ec7973ea8189330d310c382998a82f37eadadff7a23a59f6d64",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-1/input.bin",
+    "bytes": 159862,
+    "sha256": "f57b7ec2406b18f50e575b47c1e9d400eecd98722e59fd075d67ae32992387ff",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-1/mtld3d_shaders.bin",
+    "bytes": 15234,
+    "sha256": "b194d051e53243a1e14ce817dbe524af84fe9e1ea77a10f71f75c39b5a6a6daf",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-2/input.bin",
+    "bytes": 159850,
+    "sha256": "bcaa85ba4e16ad6a993bd619db04817c47f2e52a16554d1624817d811eb43e12",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-2/mtld3d_shaders.bin",
+    "bytes": 15223,
+    "sha256": "e979797eabaee723c383e968f004930978d79dc3bcb6701cf4dce30cfdf70837",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/baseline/novel-wow-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-0/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-0/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-1/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-1/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-2/input.bin",
+    "bytes": 1279458,
+    "sha256": "d8c35a3b5f8e8f3ad58fb56b504463fbc94fed71df75905dad15af53743520f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-2/mtld3d_shaders.bin",
+    "bytes": 124609,
+    "sha256": "8339d21a3aa5e1732478301d5c69de1a3557d68499d7955d6a0044cc6c9109ac",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-gtaiv-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-0/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-0/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-1/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-1/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-2/input.bin",
+    "bytes": 87567,
+    "sha256": "f460e49781db344a87bc4aa294390679942db5e5e40b639ab2ff73e0bb77e005",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-2/mtld3d_shaders.bin",
+    "bytes": 44311,
+    "sha256": "3fdfd073b478fa925d30d02fd2dcd29a19ddfe974a589605b1a805a0fc78f802",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-hl2-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-0/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-0/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-1/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-1/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-2/input.bin",
+    "bytes": 34510,
+    "sha256": "2bd0eca1e49e36d1377dd954a7669db392899cdf7ff08c4b43213e666c19a45b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-2/mtld3d_shaders.bin",
+    "bytes": 20716,
+    "sha256": "8e5368129700eda11fc34b358bdaf0da3695e9d575fc4e79dedc2d1e3cc9439a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/exact-wow-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-0/input.bin",
+    "bytes": 760933,
+    "sha256": "0d320d834b08a84e1ed6e53d7e4dd9d2c52d6a9294b5f0e9cebb0f4a5739029b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-0/mtld3d_shaders.bin",
+    "bytes": 67794,
+    "sha256": "8d7f6d84f13e0f686c14c92d62a929241c04193de57d71fa5d99835f30e3016e",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-1/input.bin",
+    "bytes": 760957,
+    "sha256": "1e5ea685c1c378f772baf619cef0e647723cae3f4c0a7442ce0a336ca3277f14",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-1/mtld3d_shaders.bin",
+    "bytes": 67794,
+    "sha256": "a00e3bb7aa656e70df8145dfb56471a69b50123c7d0207d8ce232ae76f2767e6",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-2/input.bin",
+    "bytes": 760989,
+    "sha256": "4ca95c579b66e8d09853d06422ee98249cf00fd11e43ac7edab91977ca68fd98",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-2/mtld3d_shaders.bin",
+    "bytes": 67853,
+    "sha256": "88dea15e0b42d93e0cc046a3149d2878709451c34ebe52b097e2a7479609050a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-gtaiv-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-0/input.bin",
+    "bytes": 174781,
+    "sha256": "80f67a77f8f36604bd865c20424514b202737415d7cfed50f21736a03b685017",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-0/mtld3d_shaders.bin",
+    "bytes": 25092,
+    "sha256": "34165eaf68c0b3b5929d4326cb8b476f4bd5621a26d4fda56380747ecbf831d2",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-1/input.bin",
+    "bytes": 174824,
+    "sha256": "37d87d466b511b0c22d36a08a6c54439a06dd946a18ea20a18918ea4c35349c7",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-1/mtld3d_shaders.bin",
+    "bytes": 25095,
+    "sha256": "b5538f4f2344b262fa3a85a5a2fb33981e496817a1b8be61dd42678fa14695ad",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-2/input.bin",
+    "bytes": 174917,
+    "sha256": "af594837fbea15d0808e04618b05023b889b95118cc1412825f183544d344767",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-2/mtld3d_shaders.bin",
+    "bytes": 25092,
+    "sha256": "ad337c297db429bdc90473955bc85c5b35f83b512d6ac47d93f5e6be82a66e4a",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-hl2-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-0/input.bin",
+    "bytes": 159830,
+    "sha256": "ce0564c460301c24c7c06e6e31127cb7ef5960af80fa3546da955f15ca07f2e0",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-0/mtld3d_shaders.bin",
+    "bytes": 15231,
+    "sha256": "04473fd566507d90fb05c19e1ad6e51a60374fca732c74670f26b013f8dcad0c",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-0/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-0/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-1/input.bin",
+    "bytes": 159817,
+    "sha256": "cce08c7364f7040bf717d4fade941cc7cadd2f2b3f428e05f1bea5f50eb085f0",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-1/mtld3d_shaders.bin",
+    "bytes": 15216,
+    "sha256": "3947975c352f83fc0b0645833e6f0532006315e329ca5e7f7dbe8cde983c67fc",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-1/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-1/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-2/input.bin",
+    "bytes": 159847,
+    "sha256": "414241e4b99a8b9ff3f9cbd9cc551334220ff23713695d18f09b4106e9abaabb",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-2/mtld3d_shaders.bin",
+    "bytes": 15273,
+    "sha256": "a7f9a7ddadcf2761d16eb4c2c7210bf6ec27be39deaa7308c4263c4fd8e32d80",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-2/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/candidate/novel-wow-2/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/baseline/input.bin",
+    "bytes": 158754,
+    "sha256": "6c16b9b3dc2b19ccfa7669734c59a6b7c9a1cb1eb0ce30e8f0e80ef4ca164534",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/baseline/mtld3d_shaders.bin",
+    "bytes": 15163,
+    "sha256": "f487124ddf89390f46b9fa77954a51822922a6b3ba77bb3fb343654844d72f7b",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/baseline/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/baseline/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/candidate/input.bin",
+    "bytes": 158725,
+    "sha256": "0919964fe0547bc3c04d6b3c9814a8deacf3e64cfce7dc7d5ad0aee909b353f1",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/candidate/mtld3d_shaders.bin",
+    "bytes": 15186,
+    "sha256": "5acb84ee0d9ef1e9e0cbb510a9c3367a44c17facbbc2a7159b86fdb9b439c154",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/candidate/mtld3d_shaders.bin.lock",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  },
+  {
+    "path": "production/failure/candidate/prewarm-probe.exe",
+    "bytes": 175104,
+    "sha256": "41173bbba0f7c0c6d2d1640e6cdd8f98f89f104839a9f6f78fd73f63cbe74044",
+    "reason": "Copied game cache/shader input, generated derivative, or rebuildable executable; retained locally, not redistributed."
+  }
+]

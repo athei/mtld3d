@@ -1,0 +1,8 @@
+[
+  {
+    "path": "process-status.txt",
+    "bytes": 878,
+    "sha256": "a44f9d9417e3c778e70dc6c996bc363f41c30cfb737a65a37cd89ced62cd536b",
+    "reason": "Unrelated local process inventory; not needed to reproduce results."
+  }
+]
