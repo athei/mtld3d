@@ -55,7 +55,34 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
         presenter_cv: Condvar::new(),
         present_retired: AtomicU64::new(0),
         thread: Mutex::new(None),
+        queue_retain: MetalHandle::<MTLCommandQueueKind>::NULL,
     })
+}
+
+/// The record's retain outlives the caller's, so the thread starts on a live queue.
+///
+/// The caller drops its retain the moment `register` returns, before the
+/// thread has necessarily run; the thread then retains the queue itself and
+/// finds the record's retain holding it. Without that retain this is a
+/// use after free that a loaded machine turns into a crash at thread start.
+#[test]
+fn a_record_keeps_the_queue_alive_for_its_thread() {
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue = device
+        .newCommandQueue()
+        .expect("a queue on the default device");
+    // SAFETY: the raw address carries this retain until it is released below.
+    let handle =
+        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
+    assert!(register(handle, None), "the record and its thread start");
+    // SAFETY: this was the caller's only retain; the record holds one of its
+    // own, and the copy passed below is only a registry key.
+    unsafe { handle.release_retain() };
+    unregister_and_join(handle);
 }
 
 #[test]
