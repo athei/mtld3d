@@ -48,10 +48,10 @@ use objc2_metal::{
 
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
-    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
+    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error, commit_registered,
     copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
-    first_pending, geometry_settled, present_route, readback_completed, submit_frame,
-    submit_frame_with, submit_upload_cmd_buf, wait_for_gpu_retire,
+    encode_upload_cmd_buf, first_pending, geometry_settled, present_route, readback_completed,
+    submit_frame, submit_frame_with, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -775,12 +775,14 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let mut committed_upload = None;
     let success = submit_frame_with(&mut params, |params| {
         if upload_committed {
-            assert!(submit_upload_cmd_buf(
-                &queue,
-                &[],
-                core::slice::from_ref(&upload_pass),
-                params
-            ));
+            let upload_cb =
+                encode_upload_cmd_buf(&queue, &[], core::slice::from_ref(&upload_pass), params)
+                    .expect("an upload buffer");
+            commit_registered(
+                &upload_cb,
+                params.upload_coherent_seq_ptr,
+                params.submit_seq,
+            );
             // The upload at seq 2 is parked behind its own gate. Register
             // a draw at the same seq to prove the counter identities do not collide.
             PENDING_CMDBUFS
@@ -864,6 +866,9 @@ fn test_submit_params(
         failed_submit_seq_ptr: atomic_address(failed),
         drawable_wait_ns: 0,
         present_view: MetalHandle::NULL,
+        present_wait_ns: 0,
+        snapshot_taken: 0,
+        pad0: 0,
     }
 }
 
@@ -931,7 +936,12 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
     let upload = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
     let params = test_submit_params(&queue, &coherent, &upload, &failed);
-    assert!(submit_upload_cmd_buf(&queue, &[], &[pass], &params));
+    let upload_cb = encode_upload_cmd_buf(&queue, &[], &[pass], &params).expect("an upload buffer");
+    commit_registered(
+        &upload_cb,
+        params.upload_coherent_seq_ptr,
+        params.submit_seq,
+    );
     wait_for_gpu_retire(
         params.submit_seq,
         atomic_address(&upload),

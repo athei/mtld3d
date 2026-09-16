@@ -10,8 +10,9 @@ use mtld3d_shared::{
     DestroyResourcesBulkParams, DetachMetalLayerParams, EnsureBlitPipelineParams,
     EnsureClearQuadPipelineParams, GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut,
     MetalHandle, OpenLogParams, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
-    StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WaitForGpuRetireParams, WriteLogParams, identity,
+    SetPresentWaitPolicyParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
+    VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams, WaitForPresentIdleParams,
+    WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -195,13 +196,13 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
                 params.gate_file_len as usize,
             )
         };
-        match core::str::from_utf8(bytes) {
-            Ok(path) => Some(std::path::PathBuf::from(path)),
-            Err(_) => {
+        core::str::from_utf8(bytes).map_or_else(
+            |_| {
                 warn!(target: LOG_TARGET, "CreateCommandQueue: the gate path is not UTF-8, no gate");
                 None
-            }
-        }
+            },
+            |path| Some(std::path::PathBuf::from(path)),
+        )
     };
     if let Some(caps) = metal::create_command_queue(gate) {
         params.device_handle = caps.device_handle;
@@ -368,6 +369,24 @@ pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {
         params.coherent_seq_ptr,
         params.failed_submit_seq_ptr,
     );
+    STATUS_SUCCESS
+}
+
+pub extern "C" fn set_present_wait_policy_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const SetPresentWaitPolicyParams.
+    let Some(params) = (unsafe { InPtr::<SetPresentWaitPolicyParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    metal::set_wait_policy(params.queue_handle, params.policy);
+    STATUS_SUCCESS
+}
+
+pub extern "C" fn wait_for_present_idle_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const WaitForPresentIdleParams.
+    let Some(params) = (unsafe { InPtr::<WaitForPresentIdleParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    metal::wait_for_present_idle(params.queue_handle);
     STATUS_SUCCESS
 }
 

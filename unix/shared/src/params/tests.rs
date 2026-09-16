@@ -94,6 +94,17 @@ fn wait_for_gpu_retire_layout() {
 }
 
 #[test]
+fn present_sync_param_layouts_match_wow64() {
+    use super::{SetPresentWaitPolicyParams, WaitForPresentIdleParams};
+    // 8 queue_handle + 4 policy + 4 pad0 = 16
+    assert_eq!(core::mem::align_of::<SetPresentWaitPolicyParams>(), 8);
+    assert_eq!(core::mem::size_of::<SetPresentWaitPolicyParams>(), 16);
+    // 8 queue_handle
+    assert_eq!(core::mem::align_of::<WaitForPresentIdleParams>(), 8);
+    assert_eq!(core::mem::size_of::<WaitForPresentIdleParams>(), 8);
+}
+
+#[test]
 fn create_command_queue_layout_matches_wow64() {
     use super::CreateCommandQueueParams;
     // 8 device_handle + 8 queue_handle + 4 unified_memory
@@ -128,13 +139,22 @@ fn frame_param_layouts_match_wow64() {
     //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
     //   + 8 failed_submit_seq_ptr
     //   + 8 drawable_wait_ns + 8 present_view
-    //   = 104
-    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 104);
+    //   + 8 present_wait_ns + 4 snapshot_taken + 4 pad0
+    //   = 120
+    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 120);
     assert_eq!(
         core::mem::offset_of!(SubmitFrameParams, upload_pass_count),
         36
     );
     assert_eq!(core::mem::offset_of!(SubmitFrameParams, present_layer), 40);
+    assert_eq!(
+        core::mem::offset_of!(SubmitFrameParams, present_wait_ns),
+        104
+    );
+    assert_eq!(
+        core::mem::offset_of!(SubmitFrameParams, snapshot_taken),
+        112
+    );
 
     // CreateTexturesBatchParams:
     //   8 device_handle + 8 queue_handle + 4 count + 4 _pad0 + 8 descs_ptr

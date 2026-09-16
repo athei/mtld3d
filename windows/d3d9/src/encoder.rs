@@ -57,12 +57,13 @@ use mtld3d_shared::{
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
-    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, WaitForGpuRetireParams,
+    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SetPresentWaitPolicyParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
+    WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
-        PixelFormat, PrimitiveType, QuadPipelineKind, StageTag, StorageMode, StoreAction, Swizzle,
-        TextureCreateFlags, TextureUsage, VisibilityResultMode,
+        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, StageTag, StorageMode,
+        StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -717,34 +718,49 @@ struct SubmitPacket {
     frame: Box<FrameData>,
 }
 
+/// What one `SubmitFrame` thunk reported back.
+///
+/// The durations are nanoseconds because the two sides do not share a cycle
+/// counter; they become our cycles via `ns_to_cycles` when folded into perf.
+struct SubmitOutcome {
+    status: i32,
+    /// The last present's `nextDrawable` wait, as the presenter measured it.
+    ///
+    /// The presenter runs on its own thread, so the submit that hands over
+    /// the next frame reports the wait of the one before: lagged by one
+    /// present, like every submit-side figure under async.
+    drawable_wait_ns: u64,
+    /// How long the submit waited for the previous present to commit.
+    ///
+    /// The display's cadence as the submit thread sees it: part of
+    /// `submit_exec`, and what `Encode+commit` subtracts.
+    present_wait_ns: u64,
+    /// Whether the submit copied the pending present's frame into a slot.
+    snapshot_taken: bool,
+}
+
 /// A finished frame coming back from the submit thread.
 ///
-/// The payload (for recycling) plus the unix-side status and the
-/// drawable-wait time the `SubmitFrame` thunk measured.
+/// The payload (for recycling) plus what the thunk reported.
 struct ReturnedPayload {
     payload: FramePayload,
-    status: i32,
-    /// `nextDrawable` wait in nanoseconds, as the unix side measured it.
-    ///
-    /// Nanoseconds because the two sides do not share a cycle counter; it
-    /// becomes our cycles via `ns_to_cycles` when folded into perf.
-    drawable_wait_ns: u64,
+    outcome: SubmitOutcome,
     /// Total submit-thread CPU for `execute_submit`.
     ///
-    /// Covers the unix command-walk, present, and commit — including the
-    /// `drawable_wait_ns` portion. Folded into perf so the summary can
-    /// show the submit thread's own cost; `submit_exec - drawable_wait` is
-    /// the encode+commit CPU.
+    /// Covers the unix command-walk, the wait for the previous present and
+    /// the commit. Folded into perf so the summary can show the submit
+    /// thread's own cost; `submit_exec - present_wait` is the encode+commit
+    /// CPU.
     submit_exec_tsc: u64,
 }
 
 /// The dedicated submit thread.
 ///
 /// Drains `SubmitFrame` work items, issues the thunk (the unix
-/// command-walk + `nextDrawable` + present + commit — the part that would
-/// otherwise block the encoder thread), and returns each payload for
-/// recycling. Exits when the encoder drops the work channel at teardown
-/// (`recv` returns `Err`).
+/// command-walk, the wait for the previous present, and the commit: the
+/// part that would otherwise block the encoder thread), and returns each
+/// payload for recycling. Exits when the encoder drops the work channel at
+/// teardown (`recv` returns `Err`).
 fn submit_thread_main(
     work_rx: &mpsc::Receiver<SubmitPacket>,
     return_tx: &mpsc::Sender<ReturnedPayload>,
@@ -758,7 +774,7 @@ fn submit_thread_main(
             frame,
         } = packet;
         let mut submit_exec_tsc: u64 = 0;
-        let (payload, status, drawable_wait_ns) = {
+        let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
             execute_submit(params, payload)
         };
@@ -768,8 +784,7 @@ fn submit_thread_main(
         if return_tx
             .send(ReturnedPayload {
                 payload,
-                status,
-                drawable_wait_ns,
+                outcome,
                 submit_exec_tsc,
             })
             .is_err()
@@ -2574,26 +2589,37 @@ impl FrameEncoder {
 
     /// Fold one returned frame back in.
     ///
-    /// Decrement the in-flight count, latch its status + drawable-wait
-    /// for the next `Async` summary, log on failure, and recycle the
-    /// payload's buffers.
+    /// Decrement the in-flight count, latch what the thunk reported for the
+    /// next `Async` summary, log on failure, and recycle the payload's
+    /// buffers.
     fn reclaim_returned(&mut self, returned: ReturnedPayload) {
         self.submit_in_flight = self.submit_in_flight.saturating_sub(1);
-        self.last_submit_status = returned.status;
-        // The unix side measures this one in nanoseconds (its counter is not
-        // ours), so it converts to our cycles here, where every other perf
-        // bucket is denominated.
-        self.perf
-            .set_drawable_wait_cycles(ns_to_cycles(returned.drawable_wait_ns));
+        self.fold_submit_outcome(&returned.outcome);
         self.perf.set_submit_exec_cycles(returned.submit_exec_tsc);
-        if returned.status != 0 {
+        if returned.outcome.status != 0 {
             error!(
                 target: LOG_TARGET,
                 "encoder: SubmitFrame failed (status={:#x})",
-                returned.status,
+                returned.outcome.status,
             );
         }
         reclaim_payload(self, returned.payload);
+    }
+
+    /// Latch a thunk's status and fold its timings into the perf counters.
+    ///
+    /// The unix side measures its durations in nanoseconds (its counter is
+    /// not ours), so they convert to our cycles here, where every other perf
+    /// bucket is denominated.
+    fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome) {
+        self.last_submit_status = outcome.status;
+        self.perf
+            .set_drawable_wait_cycles(ns_to_cycles(outcome.drawable_wait_ns));
+        self.perf
+            .set_present_wait_cycles(ns_to_cycles(outcome.present_wait_ns));
+        if outcome.snapshot_taken {
+            self.perf.bump_snapshot();
+        }
     }
 
     /// Hand a finalized packet to the submit thread (`Async` mode).
@@ -2613,9 +2639,21 @@ impl FrameEncoder {
     /// Barrier: block until every in-flight async submit has been issued and its payload returned.
     ///
     /// Recycles each. After this, no `SubmitFrame` runs on the submit
-    /// thread, so a synchronous submit / GPU wait / capture / reset can
-    /// proceed with correct ordering.
+    /// thread and every frame handed to it has committed, so a synchronous
+    /// submit / GPU wait / capture / reset can proceed with correct ordering.
+    ///
+    /// The barrier must not wait on the display: its caller may be the
+    /// read-back a parked presenter is holding the frame for. So while it
+    /// waits, a submit that would wait for the previous present to commit
+    /// copies that present's frame into a slot and commits at once; the
+    /// policy is a level, set around the whole wait, since up to two submits
+    /// can be in flight behind one barrier.
     fn drain_submit_thread(&mut self) {
+        self.drain_returned_payloads();
+        if self.submit_in_flight == 0 {
+            return;
+        }
+        self.set_present_wait_policy(PresentWaitPolicy::SnapshotPending);
         while self.submit_in_flight > 0 {
             let returned = self
                 .submit_return_rx
@@ -2623,6 +2661,37 @@ impl FrameEncoder {
                 .expect("submit thread alive while frames are in flight");
             self.reclaim_returned(returned);
         }
+        self.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+    }
+
+    /// Tell the queue's presenter how a submit treats a present still waiting for its drawable.
+    fn set_present_wait_policy(&self, policy: PresentWaitPolicy) {
+        if self.queue_handle.is_null() {
+            return;
+        }
+        let mut params = SetPresentWaitPolicyParams {
+            queue_handle: self.queue_handle,
+            policy,
+            pad0: 0,
+        };
+        let _ = unix_call(&mut params);
+    }
+
+    /// Wait until every present queued so far has committed and the last one retired.
+    ///
+    /// After [`Self::drain_submit_thread`], so no frame is queued meanwhile.
+    /// What a `Reset` needs before it replaces the back buffer or the layer
+    /// a present may still read, what shutdown needs before it destroys
+    /// them, and what the GPU capture needs so the present buffers of the
+    /// frames it brackets are inside the trace and no earlier frame's is.
+    fn drain_presentation(&self) {
+        if self.queue_handle.is_null() {
+            return;
+        }
+        let mut params = WaitForPresentIdleParams {
+            queue_handle: self.queue_handle,
+        };
+        let _ = unix_call(&mut params);
     }
 
     /// Tag the current pass with "this draw wants to write color".
@@ -8613,8 +8682,9 @@ bitflags::bitflags! {
         ///
         /// The triggers are `LockRect` on the backbuffer and
         /// `GetRenderTargetData`. `submit()` honours the flag by zeroing the
-        /// present-layer fields in `SubmitFrameParams` so the Metal side skips
-        /// `nextDrawable` and the backbuffer→drawable blit. The command buffer
+        /// present-layer fields in `SubmitFrameParams` so the Metal side
+        /// queues no present for it; a present still waiting for its drawable
+        /// is copied into a slot rather than waited for. The command buffer
         /// still commits, so in-order queue execution makes the backbuffer
         /// texture safe to read from the subsequent readback-blit command
         /// buffer.
@@ -9453,19 +9523,23 @@ fn encoder_thread_main(
                 ack,
             }) => {
                 mtld3d_shared::crumb!("phase:RecvReset");
-                // Commit every in-flight async frame before the reset tears
-                // down / recreates the backbuffer + depth they reference.
+                // Commit every in-flight async frame, and present every
+                // frame already queued, before the reset tears down /
+                // recreates the backbuffer + depth they reference.
                 enc.drain_submit_thread();
+                enc.drain_presentation();
                 enc.reset_cleanup(&retired_textures);
                 let _ = ack.send(());
             }
             Ok(EncoderMessage::Shutdown) | Err(_) => {
                 mtld3d_shared::crumb!("phase:RecvSd");
-                // Commit every in-flight async frame before destroying
-                // resources the submit thread may still be reading. The
-                // thread itself exits when `enc` (and its work-channel
+                // Commit every in-flight async frame, and present every
+                // frame already queued, before destroying resources the
+                // submit thread or the presenter may still be reading. The
+                // submit thread itself exits when `enc` (and its work-channel
                 // sender) drops on return from this function.
                 enc.drain_submit_thread();
+                enc.drain_presentation();
                 enc.shutdown_cleanup();
                 break;
             }
@@ -9476,16 +9550,20 @@ fn encoder_thread_main(
 /// Run one frame inside the F12 GPU-capture bracket when it carries the marks.
 ///
 /// The capture must wrap the actual `SubmitFrame` thunk, which `Async`
-/// runs on the submit thread. On `GPU_CAPTURE_START` the submit thread is
-/// drained so prior frames are committed, the capture starts, and every
-/// frame until `GPU_CAPTURE_STOP` runs `Sync` so its inline execute on this
-/// thread sits between the two capture thunks. A mid-frame flush of a
-/// marked frame arrives through the `MidFrameSubmit*` arms, which is why
-/// all three frame arms go through here.
+/// runs on the submit thread, and the present buffer the presenter commits
+/// for the frame afterwards. On `GPU_CAPTURE_START` the submit thread is
+/// drained and presentation waited idle so prior frames and their presents
+/// are committed, the capture starts, and every frame until
+/// `GPU_CAPTURE_STOP` runs `Sync` so its inline execute on this thread sits
+/// between the two capture thunks; the stop waits for presentation again so
+/// the last frame's present is in the trace. A mid-frame flush of a marked
+/// frame arrives through the `MidFrameSubmit*` arms, which is why all three
+/// frame arms go through here.
 fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, mode: SubmitMode) {
     let marks = frame.gpu_capture_marks();
     if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
         enc.drain_submit_thread();
+        enc.drain_presentation();
         let mut p = mtld3d_shared::StartGpuCaptureParams {
             device_handle: enc.device_handle,
         };
@@ -9499,6 +9577,7 @@ fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, m
     };
     run_frame(enc, frame, fc, mode);
     if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
+        enc.drain_presentation();
         let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
         let _ = unix_call(&mut p);
         enc.flags.remove(FrameEncoderFlags::GPU_CAPTURING);
@@ -9641,12 +9720,13 @@ const fn frame_summary_ctx(frame: &FrameData) -> FrameSummaryContext {
 /// Async Present path.
 ///
 /// Finalize the frame on the encoder thread, emit the per-frame summary
-/// from the still-live payload (status / drawable-wait are the most recent
-/// submit's — lagged ≤1 frame), then hand the payload to the submit thread
-/// and return so the next frame's build overlaps the `SubmitFrame` thunk.
-/// The `submit_cycles` timer captures only the encoder-side finalize (plus
-/// any backpressure wait inside `acquire_clean_payload`); the unix
-/// command-walk + present is no longer on this thread.
+/// from the still-live payload (status / present-wait / drawable-wait are
+/// the most recent submit's — lagged ≤1 frame), then hand the payload to
+/// the submit thread and return so the next frame's build overlaps the
+/// `SubmitFrame` thunk. The `submit_cycles` timer captures only the
+/// encoder-side finalize (plus any backpressure wait inside
+/// `acquire_clean_payload`); the unix command-walk and commit are on the
+/// submit thread, the present on the presenter.
 fn submit_async(enc: &mut FrameEncoder, frame: Box<FrameData>) {
     let (params, payload) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
@@ -9676,12 +9756,10 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
     let (payload, status) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         let (params, payload) = finalize_submit(enc, &frame);
-        let (payload, status, drawable_wait_ns) = execute_submit(params, payload);
-        enc.perf
-            .set_drawable_wait_cycles(ns_to_cycles(drawable_wait_ns));
-        (payload, status)
+        let (payload, outcome) = execute_submit(params, payload);
+        enc.fold_submit_outcome(&outcome);
+        (payload, outcome.status)
     };
-    enc.last_submit_status = status;
     if status != 0 {
         error!(
             target: LOG_TARGET,
@@ -9829,6 +9907,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         } else {
             frame.view_handle
         },
+        present_wait_ns: 0,
+        snapshot_taken: 0,
+        pad0: 0,
     };
 
     // Retention bookkeeping is keyed by `submit_seq` and only needs the
@@ -9846,15 +9927,21 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
 ///
 /// `params` carries raw pointers aliasing into `payload`; both are taken
 /// by value so the payload stays alive for the whole thunk, then handed
-/// back for recycling along with the unix status and the drawable-wait
-/// nanoseconds the thunk writes into `params`. This is the only part of submit
-/// that runs on the dedicated submit thread in `Async` mode.
+/// back for recycling along with what the thunk reported through `params`.
+/// This is the only part of submit that runs on the dedicated submit thread
+/// in `Async` mode.
 fn execute_submit(
     mut params: SubmitFrameParams,
     payload: FramePayload,
-) -> (FramePayload, i32, u64) {
+) -> (FramePayload, SubmitOutcome) {
     let status = unix_call(&mut params);
-    (payload, status, params.drawable_wait_ns)
+    let outcome = SubmitOutcome {
+        status,
+        drawable_wait_ns: params.drawable_wait_ns,
+        present_wait_ns: params.present_wait_ns,
+        snapshot_taken: params.snapshot_taken != 0,
+    };
+    (payload, outcome)
 }
 
 /// Recycle a finished payload.

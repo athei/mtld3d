@@ -34,6 +34,7 @@ unix/shared/src/mtl.rs LoadAction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MinMagFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs MipFilter Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PixelFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
+unix/shared/src/mtl.rs PresentWaitPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs PrimitiveType Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs QuadPipelineKind Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs SoftwareCursorPolicy Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
@@ -65,6 +66,7 @@ unix/unix/src/metal/macdrv/cursor_overlay.rs VisibilityInputs Clone,Copy,Debug,D
 unix/unix/src/metal/macdrv/cursor_overlay.rs WatchInstalled Clone,Copy
 unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
+unix/unix/src/metal/presenter.rs PresenterFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/buffer_backing.rs BackingClass Debug,Clone,Copy,PartialEq,Eq

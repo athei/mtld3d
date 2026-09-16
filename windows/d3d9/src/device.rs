@@ -3560,9 +3560,12 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // queue, issuing the matching destroy thunks. The wait must run
         // before the encoder thread exits — `coherent_seq`'s
         // `Arc<AtomicU64>` lives inside `DeviceInner` and drops at the
-        // following `drop(device_inner)`. By the time `shutdown` returns
-        // here every MTLBuffer wrapping a `PageBox` the game ever
-        // Locked has been released.
+        // following `drop(device_inner)`. The same arm first waits for the
+        // presenter to consume every queued frame and for its last present
+        // to retire, so no present buffer reads the back buffer or the
+        // layer once they go. By the time `shutdown` returns here every
+        // MTLBuffer wrapping a `PageBox` the game ever Locked has been
+        // released.
         device_inner.shutdown();
 
         if !implicit_handles.is_empty() {

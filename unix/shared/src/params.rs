@@ -4,8 +4,8 @@ use super::{
         AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
         ColorSpacePolicy, ColorWriteMask, CompareFunc, CursorOverlayFlags, DepthResolveFilter,
         DestroyKind, DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        SoftwareCursorPolicy, StageTag, StencilOp, StorageMode, StoreAction, Swizzle, TextureUsage,
-        VertexFormat, VertexStepFunction,
+        PresentWaitPolicy, SoftwareCursorPolicy, StageTag, StencilOp, StorageMode, StoreAction,
+        Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -56,7 +56,7 @@ const _: () = {
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
-    assert!(core::mem::size_of::<SubmitFrameParams>() == 104);
+    assert!(core::mem::size_of::<SubmitFrameParams>() == 120);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
     assert!(core::mem::size_of::<PassDescriptor>() == 216);
 };
@@ -358,7 +358,10 @@ impl Thunk for SetDisplaySyncEnabledParams {
 ///
 /// Used by `wait_for_gpu_idle` (Reset / OOM recovery / shutdown) and by the
 /// occlusion-query FLUSH path to convert spin loops into a kernel sleep on
-/// Metal's `MTLCommandBuffer::waitUntilCompleted`.
+/// Metal's `MTLCommandBuffer::waitUntilCompleted`. The unix side also waits
+/// through the same function on its presentation counter, with no
+/// failed-submit sink, so a present the GPU killed is logged and never marks
+/// the frame's uploads failed.
 #[repr(C, align(8))]
 pub struct WaitForGpuRetireParams {
     pub target_seq: u64,       // in
@@ -374,6 +377,38 @@ pub struct WaitForGpuRetireParams {
 
 impl Thunk for WaitForGpuRetireParams {
     const CODE: u32 = Thunks::WaitForGpuRetire as u32;
+}
+
+/// Set how a present-bearing submit on `queue_handle` treats a pending present.
+///
+/// The PE-side barrier that waits for its in-flight submits sets
+/// `SnapshotPending` first and `WaitForCommit` after, so no submit it waits
+/// for can itself wait on the display. See `PresentWaitPolicy`.
+#[repr(C, align(8))]
+pub struct SetPresentWaitPolicyParams {
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub policy: PresentWaitPolicy,                      // in
+    pub pad0: u32,
+}
+
+impl Thunk for SetPresentWaitPolicyParams {
+    const CODE: u32 = Thunks::SetPresentWaitPolicy as u32;
+}
+
+/// Block until every present queued on `queue_handle` has committed and the last one retired.
+///
+/// The caller has drained its submit thread first, so no present is queued
+/// meanwhile and the wait ends. Runs before a Reset destroys or replaces the
+/// back buffer or the layer, before shutdown, and around a GPU capture, so
+/// no present buffer is in flight where the trace or the teardown does not
+/// expect one.
+#[repr(C, align(8))]
+pub struct WaitForPresentIdleParams {
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+}
+
+impl Thunk for WaitForPresentIdleParams {
+    const CODE: u32 = Thunks::WaitForPresentIdle as u32;
 }
 
 /// Begin a Metal GPU frame capture writing a `.gputrace` document to disk.
@@ -967,6 +1002,20 @@ pub struct SubmitFrameParams {
     /// streak). NULL when no layer was attached, which is also when
     /// `present_layer` is NULL and nothing is presented.
     pub present_view: MetalHandle<NSViewKind>, // in
+    /// Nanoseconds the submit waited for the previous present to commit.
+    ///
+    /// The wait a present-bearing submit pays under `WaitForCommit` before
+    /// its render buffer commits: the display's cadence seen from the submit
+    /// thread. Same unit and reason as `drawable_wait_ns`; 0 outside a
+    /// `PERF=1` build.
+    pub present_wait_ns: u64, // out
+    /// Non-zero when this submit copied the pending present's frame into a slot.
+    ///
+    /// A no-present submit finding a present still waiting for its drawable,
+    /// or a present-bearing one under `SnapshotPending`. The PE side counts
+    /// them: none in steady state, one per read-back.
+    pub snapshot_taken: u32, // out
+    pub pad0: u32,
 }
 
 impl Thunk for SubmitFrameParams {

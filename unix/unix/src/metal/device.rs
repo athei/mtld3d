@@ -229,7 +229,9 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     // and the handle is used only as the record's key until then.
     let queue_key =
         unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::as_ptr(&queue) as u64) };
-    super::presenter::register(queue_key, gate);
+    if !super::presenter::register(queue_key, gate) {
+        return None;
+    }
     let unified_memory = device.hasUnifiedMemory();
     let min_linear_texture_align = u32::try_from(
         device.minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::BGRA8Unorm),
@@ -268,7 +270,11 @@ pub fn destroy_command_queue(
     pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>,
     depth_texture_handle: MetalHandle<MTLTextureKind>,
 ) {
-    super::presenter::unregister(queue_handle);
+    // The presenter first: it may still be inside `nextDrawable` on the
+    // layer this call retires, and its last present must be committed before
+    // the fence below can order it. The PE side has already drained its
+    // submit thread and waited for presentation to go idle.
+    super::presenter::unregister_and_join(queue_handle);
     // Drop the latched view, layer and window first: the main thread
     // reconciles them against the display it is told about, and this call is
     // about to release the view all three belong to.

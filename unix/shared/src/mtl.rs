@@ -887,5 +887,21 @@ pub enum QuadPipelineKind {
     TextureUpload = 1,
 }
 
+/// What a present-bearing submit does about a present still waiting for its drawable.
+///
+/// Set through `SetPresentWaitPolicyParams` for one queue. `WaitForCommit`
+/// is the steady state: the submit waits for the previous present to commit,
+/// which is the cadence the display sets and costs no copy. A barrier that
+/// must not wait on the display sets `SnapshotPending` around its wait for
+/// the submits in flight: a submit parked in its wait wakes and copies the
+/// pending present's frame into a slot, and one that reaches the decision
+/// meanwhile copies too. A no-present submit copies whatever the policy.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum PresentWaitPolicy {
+    WaitForCommit = 0,
+    SnapshotPending = 1,
+}
+
 #[cfg(test)]
 mod tests;

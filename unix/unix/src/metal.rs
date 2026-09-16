@@ -28,6 +28,7 @@ pub use macdrv::{
 };
 pub use mtld3d_shared::perf::init_tracking_enabled;
 pub use pipeline::{create_render_pipeline, destroy_render_pipeline};
+pub use presenter::{set_wait_policy, wait_for_present_idle};
 pub use sampler::{create_sampler_state, destroy_sampler_state};
 pub use shader::{compile_shader_library, destroy_function, destroy_library};
 pub use texture::{

@@ -286,6 +286,8 @@ fn buffer_role(label: Option<&str>) -> &'static str {
     match label {
         Some(label) if label.starts_with("mtld3d-frame-") => "frame",
         Some(label) if label.starts_with("mtld3d-upload-") => "upload",
+        Some(label) if label.starts_with("mtld3d-present-") => "present",
+        Some(label) if label.starts_with("mtld3d-snapshot-") => "snapshot",
         Some("mtld3d-readback") => "readback",
         Some("mtld3d-init-clear") => "initialization",
         // Labels belong to the constructors; do not guess an unknown buffer's role.
