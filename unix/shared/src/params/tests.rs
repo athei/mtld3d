@@ -94,6 +94,20 @@ fn wait_for_gpu_retire_layout() {
 }
 
 #[test]
+fn create_command_queue_layout_matches_wow64() {
+    use super::CreateCommandQueueParams;
+    // 8 device_handle + 8 queue_handle + 4 unified_memory
+    // + 4 min_linear_texture_align + 8 gate_file_ptr + 4 gate_file_len
+    // + 4 pad0 = 40
+    assert_eq!(core::mem::align_of::<CreateCommandQueueParams>(), 8);
+    assert_eq!(core::mem::size_of::<CreateCommandQueueParams>(), 40);
+    assert_eq!(
+        core::mem::offset_of!(CreateCommandQueueParams, gate_file_ptr),
+        24
+    );
+}
+
+#[test]
 fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::align_of::<PassDescriptor>(), 8);
     assert_eq!(core::mem::align_of::<SubmitFrameParams>(), 8);

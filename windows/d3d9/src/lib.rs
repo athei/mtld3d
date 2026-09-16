@@ -33,6 +33,7 @@ mod unix_call;
 mod vertex_buffer;
 mod vertex_decl;
 mod vertex_shader;
+mod wine_path;
 
 use core::{
     ffi::c_void,

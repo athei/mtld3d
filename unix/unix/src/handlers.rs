@@ -184,7 +184,26 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
     };
     let params: &mut CreateCommandQueueParams = &mut params;
 
-    if let Some(caps) = metal::create_command_queue() {
+    let gate = if params.gate_file_ptr == 0 || params.gate_file_len == 0 {
+        None
+    } else {
+        // SAFETY: PE supplied `gate_file_ptr`/`gate_file_len` as a byte slice
+        // valid for the call duration; the pointer is non-zero per the check.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                params.gate_file_ptr as *const u8,
+                params.gate_file_len as usize,
+            )
+        };
+        match core::str::from_utf8(bytes) {
+            Ok(path) => Some(std::path::PathBuf::from(path)),
+            Err(_) => {
+                warn!(target: LOG_TARGET, "CreateCommandQueue: the gate path is not UTF-8, no gate");
+                None
+            }
+        }
+    };
+    if let Some(caps) = metal::create_command_queue(gate) {
         params.device_handle = caps.device_handle;
         params.queue_handle = caps.queue_handle;
         params.unified_memory = u32::from(caps.unified_memory);

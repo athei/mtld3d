@@ -506,6 +506,12 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
                  presenting as not occluded, headroom 1.0, unthrottled, stretch route",
             );
         }
+        // The gate sits ahead of the occlusion check: a window the harness
+        // never shows is occluded from attach on, and the seam has to hold
+        // presentation for that window too.
+        if let Some(state) = super::presenter::find(params.queue_handle) {
+            super::presenter::hold_at_gate(&state);
+        }
         let occluded = attachment.as_ref().is_some_and(|att| att.window_occluded());
         let drawable_opt = if occluded {
             // Window fully occluded: the compositor isn't recycling drawables,

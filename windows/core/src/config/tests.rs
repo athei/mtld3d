@@ -35,6 +35,7 @@ fn defaults_match_documented_values() {
     assert!(d.log_dir.is_empty());
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
+    assert!(d.present_gate_file.is_empty());
     assert!(!d.query_flush_immediate);
     assert!(!d.buffer_ignore_lock_bounds);
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
@@ -403,6 +404,23 @@ fn log_dir_is_a_plain_string() {
     assert_eq!(cfg.log_dir, "logs\\mtld3d");
     let cfg = parse(None, "", Some("log.dir=C:\\mtld3d-logs"));
     assert_eq!(cfg.log_dir, "C:\\mtld3d-logs");
+}
+
+#[test]
+fn present_gate_file_is_a_plain_string() {
+    let cfg = parse(
+        None,
+        "debug.presentGateFile = C:\\users\\x\\Temp\\gate\n",
+        None,
+    );
+    assert_eq!(cfg.present_gate_file, "C:\\users\\x\\Temp\\gate");
+    let cfg = parse(None, "", Some("debug.presentGateFile=gate.txt"));
+    assert_eq!(
+        cfg.present_gate_file, "gate.txt",
+        "the env override reaches the key"
+    );
+    let cfg = parse(None, "debug.presentGateFile =\n", None);
+    assert!(cfg.present_gate_file.is_empty(), "empty disables the gate");
 }
 
 #[test]

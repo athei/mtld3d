@@ -24,6 +24,7 @@ mod multi_device;
 mod multithreaded;
 mod non_uma;
 mod points;
+mod present_split;
 mod query;
 mod render_scale;
 mod render_states;

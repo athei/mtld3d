@@ -51,7 +51,7 @@ const _: () = {
     // Device create / render / destroy structs: align must be 8 and size
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
-    assert!(core::mem::size_of::<CreateCommandQueueParams>() == 24);
+    assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
@@ -161,6 +161,14 @@ pub struct CreateCommandQueueParams {
     /// floor. The PE side may raise it to the Mac2 value through
     /// `intel.linearAlign256`.
     pub min_linear_texture_align: u32, // out
+    /// `debug.presentGateFile` as a unix path, `0` = no gate.
+    ///
+    /// While the named file exists, the queue's presenter parks before
+    /// acquiring a drawable. The bytes are valid for the call; the unix
+    /// side copies them into the presenter state it creates for this queue.
+    pub gate_file_ptr: u64, // in: *const u8
+    pub gate_file_len: u32,                        // in: byte count
+    pub pad0: u32,
 }
 
 impl Thunk for CreateCommandQueueParams {

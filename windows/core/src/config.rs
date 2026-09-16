@@ -143,6 +143,14 @@ pub struct Mtld3dConfig {
     /// list. Default: empty. File key: `debug.skipShaders` —
     /// comma-separated hex u64s, optional `0x` prefix.
     pub skip_shaders: Vec<u64>,
+    /// Park the presenter before each drawable while this file exists.
+    ///
+    /// A seam for the test suite: with the file present a frame's render
+    /// work commits and a read-back completes while nothing reaches the
+    /// screen. Relative to the executable's directory, an absolute path
+    /// stands; resolved to a unix path once per device at queue creation.
+    /// Empty = no gate. Default: `""`. File key: `debug.presentGateFile`.
+    pub present_gate_file: String,
     /// Answer a pending occlusion FLUSH poll immediately.
     ///
     /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted` and
@@ -338,6 +346,7 @@ impl Default for Mtld3dConfig {
             log_dir: String::new(),
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
+            present_gate_file: String::new(),
             query_flush_immediate: false,
             depth_alias_same_size: false,
             buffer_ignore_lock_bounds: false,
@@ -486,6 +495,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: debug.presentGateFile = {:?}", cfg.present_gate_file
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: query.flushImmediate = {}", cfg.query_flush_immediate
     );
     info!(
@@ -574,6 +587,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "log.dir" => value.clone_into(&mut cfg.log_dir),
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
+        "debug.presentGateFile" => value.clone_into(&mut cfg.present_gate_file),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "buffer.ignoreLockBounds" => {
