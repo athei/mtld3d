@@ -383,7 +383,9 @@ impl Thunk for WaitForGpuRetireParams {
 ///
 /// The PE-side barrier that waits for its in-flight submits sets
 /// `SnapshotPending` first and `WaitForCommit` after, so no submit it waits
-/// for can itself wait on the display. See `PresentWaitPolicy`.
+/// for can itself wait on the display; a synchronous flush sets it from the
+/// API thread before it queues behind the encoder, and the encoder's flush
+/// arm puts it back. See `PresentWaitPolicy`.
 #[repr(C, align(8))]
 pub struct SetPresentWaitPolicyParams {
     pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in

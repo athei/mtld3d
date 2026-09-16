@@ -9463,6 +9463,9 @@ fn encoder_thread_main(
                 // be committed first.
                 enc.drain_submit_thread();
                 run_frame_bracketed(&mut enc, frame, frame_counter, SubmitMode::Sync);
+                // The API thread set the hurry ahead of this flush; its
+                // submission has committed, so the next frame waits again.
+                enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                 let _ = done.send(());
             }
             Ok(EncoderMessage::MidFrameSubmitForRetention { frame, done }) => {
@@ -9470,6 +9473,7 @@ fn encoder_thread_main(
                 mtld3d_shared::crumb!("phase:RecvMidRet");
                 enc.drain_submit_thread();
                 run_frame_bracketed(&mut enc, frame, frame_counter, SubmitMode::Sync);
+                enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                 // Wait for our just-submitted seq to retire on the GPU
                 // so `coherent_seq` covers it; then drain so the freed
                 // bytes are back in the global allocator before the

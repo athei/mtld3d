@@ -41,7 +41,7 @@ fn empty_inner() -> Inner {
         pending: VecDeque::new(),
         committed_present_seq: 0,
         flags: PresenterFlags::empty(),
-        slots: [None, None],
+        slots: [None, None, None],
         last_drawable_wait_ns: 0,
         gate: None,
     }
@@ -113,8 +113,14 @@ fn slots_prefer_free_then_the_oldest_reader() {
     inner.slots[1] = Some(slot(6));
     assert_eq!(
         choose_slot(&inner),
+        SlotChoice::Free(2),
+        "slots 0 and 1 busy, slot 2 unallocated"
+    );
+    inner.slots[2] = Some(slot(7));
+    assert_eq!(
+        choose_slot(&inner),
         SlotChoice::Busy(0),
-        "both busy: the older reader"
+        "all busy: the oldest reader"
     );
     inner.committed_present_seq = 5;
     assert_eq!(
@@ -122,7 +128,7 @@ fn slots_prefer_free_then_the_oldest_reader() {
         SlotChoice::Free(0),
         "reader 5 committed frees slot 0"
     );
-    inner.committed_present_seq = 6;
+    inner.committed_present_seq = 7;
     assert_eq!(
         choose_slot(&inner),
         SlotChoice::Free(0),
@@ -144,6 +150,7 @@ fn a_dropped_packet_retires_its_sequence_and_frees_its_slot() {
     let state = state_with(empty_inner());
     let mut inner = state.lock();
     inner.slots[1] = Some(slot(7));
+    inner.slots[2] = Some(slot(8));
     assert_eq!(choose_slot(&inner), SlotChoice::Free(0));
     inner.slots[0] = Some(slot(6));
     assert_eq!(choose_slot(&inner), SlotChoice::Busy(0));
@@ -153,7 +160,7 @@ fn a_dropped_packet_retires_its_sequence_and_frees_its_slot() {
     assert_eq!(
         choose_slot(&inner),
         SlotChoice::Free(0),
-        "both readers are at or below the committed sequence"
+        "readers 6 and 7 are at or below the committed sequence"
     );
 }
 
