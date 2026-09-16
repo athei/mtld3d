@@ -147,10 +147,8 @@ balances each successful COM lock with an unlock and preserves the previous
 cursor on rejected input.
 
 An identical accepted request preserves pending retries but does not dispatch
-another apply once that state has completed. Native input and display observers
-continue reconciling it. Hidden or inactive periods suspend the capture watchdog
-before querying the pointer or Wine controller; reactivation starts a fresh
-silence interval.
+another apply once that state has completed. The pre-commit observer and the
+display observers continue reconciling it.
 The overlay still reconciles its layer configuration while hidden or inactive,
 but defers window and pointer geometry queries until it can show a sprite. The
 show resolves current geometry before presenting pixels and position together.
@@ -160,7 +158,12 @@ has been accepted, hardware takeover retains the apply needed to clear previous
 software content, including failed work.
 
 The Unix cursor mutex publishes the attachment's `Arc` identity, mode, sprite,
-visibility and request revision together. Admission resolves the attachment
+visibility and request revision together. The sprite store, the overlay's
+textures and completed images, the PE side's uploaded set and its HCURSOR cache
+are all bounded to `CURSOR_SPRITE_CACHE_ENTRIES` least-recently-used entries: a
+hash-only request for an evicted sprite is rejected and the PE side sends the
+pixels again, and an evicted HCURSOR is destroyed once it is neither the realized
+nor the thread cursor. Admission resolves the attachment
 registry while holding that mutex. Unregister releases the registry lock before
 detaching cursor state, and detach compares `Arc` identities, so an old device
 cannot clear a new owner even if its view address was reused. Hardware takeover
@@ -178,16 +181,14 @@ frame when that screen changes; pointer motion changes the sprite layer position
 Moving the window itself per event would make AppKit resolve the cursor again and
 replace the game's blank cursor with an arrow.
 
-Input is observed by both the local `NSEvent` monitor and the existing main-run-loop
-observer at before-waiting and exit, before Core Animation commits. Wine can consume
-captured mouse events before forwarding to AppKit's `sendEvent`, bypassing the local
-monitor even without `ClipCursor`. Wine's dequeue still updates `currentEvent`, so
-the run-loop observer consumes previously unseen mouse events there. The last event
-is retained and compared by identity: an idle `currentEvent` never refreshes the
-watchdog. Winemac's warp time supplies the moves that generate no event. Input,
-warps, clipping and external-capture decisions all run on main; presents only
-request a coalesced check. An old submit-thread decision cannot relatch capture
-after a new event recovered it.
+The main-run-loop observer at before-waiting and exit, ahead of Core Animation's
+commit, is the one place the cursor is reconciled. It reads the pointer position
+and returns unless that moved or an apply was requested: the thunk, a detach, a
+GPU completion, a present, an activation change and a headroom refresh each
+request one. No event monitor is involved: Wine can consume captured mouse events
+before AppKit's `sendEvent`, and a warp the game makes through winemac delivers
+no event at all, but both run on the main thread and move the pointer, which the
+next observer pass reads. Presents only request a coalesced check.
 
 Before the first native mouse event, Wine may have accepted a Win32 cursor
 without delivering it to macdrv: the server has not yet associated the stationary
@@ -204,28 +205,33 @@ when the software overlay is visible or Win32 requests a native hide, only over
 the active, unobscured game client area and outside external captures. It compares
 the current native cursor by identity so an unchanged blank needs no setter call,
 while an AppKit replacement is repaired at the next reconciliation. This does not
-move the pointer, synthesize input, or change cursor hide counts. A Win32 show
-restores the displaced native image only while our blank remains current, leaving
-a newer Wine cursor untouched. Device release
+move the pointer, synthesize input, or change cursor hide counts. The image the
+blank displaced is never put back: Wine selects its own cursor again on every
+handle change, and what was displaced may be the arrow AppKit resolved for the
+pointer rather than Wine's cursor. Device release
 replaces an owned hidden blank HCURSOR with null before freeing it; visible
 cursors still restore the window's class cursor.
 
-The pointer watch serves both cursor modes. While the cursor is shown and the
-application active, pointer motion without new events for 60 ms indicates an
-external capture such as the screenshot tool. Clipping and fresh Wine warps count
-as legitimate movement. Hide transitions are remembered even across a coalesced
-hide/show burst. New input clears external capture and requests the existing
-null-then-set kick through live attachment sinks, restoring Wine's native cursor
-after the external tool releases it. The callback that asks for this kick uses
-the attachment registry's lifetime checks.
+The hit test serves both cursor modes. While the cursor is shown or natively
+hidden and the application active, the window a click at the pointer would land
+on is read: the game window means the pointer is over the game, a window of this
+process over it (a dialog) hides the sprite and needs nothing else, and a window
+of another process inside the client rectangle is an external capture, such as
+the screenshot tool, whose own window takes the hit the moment it appears. The
+return of the hit test to the game window requests the existing null-then-set
+kick through live attachment sinks, restoring Wine's native cursor after the tool
+left the system one behind. The callback that asks for this kick uses the
+attachment registry's lifetime checks.
 
 Changed sprites are rendered offscreen with the cursor tone-map pipeline. GPU
 completion wakes the existing observer; it never waits for scheduling or execution
 on main. The completed, CPU-visible texture is copied to an immutable CGImage.
 Managed textures receive a synchronization blit before that completion. The image
 and current pointer position are assigned in one Core Animation transaction. A
-cached transparent image represents hidden content, and hide/show reuses the last
-completed sprite without another GPU submission.
+cached transparent image represents hidden content, completed images are kept
+per sprite hash, so hide/show and a return to an earlier sprite reuse them
+without another GPU submission, and while a changed sprite renders the sprite on
+screen keeps following the pointer with its own geometry.
 
 The cursor's CAMetalLayer hosts images for its macOS 15-compatible HDR controls;
 it never acquires or presents a drawable. This leaves the game as the only drawable
@@ -243,8 +249,7 @@ cannot settle a newer request, and failures do not start immediate retry loops.
 
 The cursor log targets record rejected uploads, visibility blockers, input routes
 (at trace level), layer configuration, submitted generations, completion and failure
-stages. `scripts/cursor_appkit_probe.swift` verifies the event-routing assumption.
-`scripts/cursor_transaction_probe.swift <output-directory>` captures native window
+stages. `scripts/cursor_transaction_probe.swift <output-directory>` captures native window
 pixels and asserts the final visibility after coalesced clear/show bursts; the
 output directory must already exist and screen recording access must be available.
 `scripts/cursor_startup_probe.swift <app> <output-directory> <x> <y>` starts a

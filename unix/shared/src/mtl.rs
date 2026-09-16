@@ -805,6 +805,14 @@ impl SoftwareCursorPolicy {
     }
 }
 
+/// Entries each cursor cache keeps, on both sides of the boundary.
+///
+/// The PE side's uploaded set mirrors the unix side's sprite store, and the
+/// HCURSOR cache holds the same identities in hardware mode. One bound for all
+/// of them keeps a stale mirror entry to one rejected hash-only request, which
+/// the PE side answers by sending the pixels again.
+pub const CURSOR_SPRITE_CACHE_ENTRIES: usize = 64;
+
 bitflags! {
     /// Wanted state carried by `SetCursorOverlayParams`.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

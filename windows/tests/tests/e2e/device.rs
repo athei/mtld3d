@@ -3088,6 +3088,8 @@ fn device_release_destroys_the_cursors_it_built() {
     const WM_MOUSEMOVE_LP: isize = 0x0200;
     const HTCLIENT: isize = 1;
     const SIDE: usize = 32;
+    /// One more distinct bitmap than the HCURSOR cache keeps.
+    const BITMAPS: u32 = 65;
     let h = Harness::new();
     let lp_client_move = (WM_MOUSEMOVE_LP << 16) | HTCLIENT;
 
@@ -3097,8 +3099,10 @@ fn device_release_destroys_the_cursors_it_built() {
     let class_arrow = h.thread_cursor();
     assert_ne!(class_arrow, 0, "the window class carries a cursor");
 
+    // One more distinct bitmap than the cache keeps: the first handle is
+    // destroyed when the last one is built, while the current one stays live.
     let mut built = Vec::new();
-    for fill in [0xFF00_0000_u32, 0xFFFF_0000, 0xFF00_FF00] {
+    for fill in (0..BITMAPS).map(|n| 0xFF00_0000_u32 | (n * 0x0004_0201)) {
         let bitmap = h.create_offscreen_plain_surface(
             u32::try_from(SIDE).expect("cursor side fits u32"),
             u32::try_from(SIDE).expect("cursor side fits u32"),
@@ -3131,6 +3135,18 @@ fn device_release_destroys_the_cursors_it_built() {
         );
         built.push(handle);
     }
+    assert!(
+        !cursor_is_live(built[0]),
+        "the least recently built cursor is destroyed once the cache is full",
+    );
+    assert!(
+        cursor_is_live(built[built.len() - 1]),
+        "the current cursor survives the eviction of the first",
+    );
+    assert!(
+        cursor_is_live(built[1]),
+        "only one cursor is evicted per bitmap past the bound",
+    );
     assert_eq!(
         h.release_device(),
         0,
@@ -3352,6 +3368,8 @@ fn software_cursor_presents_with_the_sprite_shown() {
     // main-thread window creation, a sprite render, and show/hide/show across
     // device and swap-chain presents. Nothing may disturb the frame, and a cursor change
     // (second bitmap) ships a second sprite.
+    /// One more distinct sprite than the unix side keeps.
+    const SPRITES: u32 = 65;
     let h = software_cursor_harness();
 
     let first = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
@@ -3376,6 +3394,30 @@ fn software_cursor_presents_with_the_sprite_shown() {
         assert_eq!(h.clear(D3DCLEAR_TARGET, 0xFF40_C020, 1.0, 0), D3D_OK);
         assert_eq!(h.present_swapchain(), D3D_OK);
     }
+    assert_eq!(
+        h.read_pixel(5, 5) & 0x00FF_FFFF,
+        0x0040_C020,
+        "frame unaffected"
+    );
+
+    // One more distinct sprite than the unix side keeps, then the first
+    // again: its hash-only request is refused and the pixels are sent anew.
+    let many = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+    for fill in (0..SPRITES).map(|n| 0xFF00_0000_u32 | (n * 0x0004_0201)) {
+        many.lock_rect(0).write_u32_rect(32, 32, &[fill; 32 * 32]);
+        assert_eq!(h.set_cursor_properties_hr(0, 0, &many), D3D_OK);
+        assert_eq!(h.clear(D3DCLEAR_TARGET, 0xFF40_C020, 1.0, 0), D3D_OK);
+        assert_eq!(h.present(), D3D_OK);
+    }
+    many.lock_rect(0)
+        .write_u32_rect(32, 32, &[0xFF00_0000; 32 * 32]);
+    assert_eq!(
+        h.set_cursor_properties_hr(0, 0, &many),
+        D3D_OK,
+        "an evicted sprite is accepted again with its pixels"
+    );
+    assert_eq!(h.show_cursor(true), 1);
+    assert_eq!(h.present(), D3D_OK);
     assert_eq!(
         h.read_pixel(5, 5) & 0x00FF_FFFF,
         0x0040_C020,

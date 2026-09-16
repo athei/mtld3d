@@ -33,13 +33,16 @@ use mtld3d_core::{
     perf::DeviceSubCategory,
 };
 use mtld3d_shared::{
-    InPtr, MetalHandle, SetCursorOverlayParams, mtl::CursorOverlayFlags, mtl_handle::NSViewKind,
+    InPtr, MetalHandle, SetCursorOverlayParams,
+    bounded_cache::BoundedCache,
+    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, CursorOverlayFlags},
+    mtl_handle::NSViewKind,
 };
 use mtld3d_types::{
     CURSOR_SHOWING, CURSORINFO, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO,
     IDirect3DSurface9Vtbl, POINT,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
@@ -495,12 +498,22 @@ pub struct CursorState {
     handle: *mut c_void,
     flags: CursorFlags,
     hash: u64,
-    cache: FxHashMap<u64, *mut c_void>,
-    /// Sprite hashes the unix overlay already holds (software mode).
+    /// The HCURSORs built from the game's bitmaps (hardware mode), by content hash.
+    ///
+    /// Bounded: the least recently realized handle is destroyed when a new
+    /// bitmap arrives at capacity, unless it is still in use, in which case
+    /// it waits in `retired`.
+    cache: BoundedCache<u64, *mut c_void>,
+    /// Evicted handles that were the realized or thread cursor at eviction time.
+    ///
+    /// Destroyed by the next eviction that finds them out of use, or at release.
+    retired: Vec<*mut c_void>,
+    /// Sprite hashes the unix overlay is expected to hold (software mode).
     ///
     /// Mirrors `cache` for the other mode: a hash in here goes out with no
-    /// pixels attached. Never evicted, like the HCURSOR cache.
-    uploaded: FxHashSet<u64>,
+    /// pixels attached. Bounded alike; a stale entry costs one rejected
+    /// hash-only call, which is answered by sending the pixels.
+    uploaded: BoundedCache<u64, ()>,
     probe: HitchProbe,
     /// Nearest-neighbor upscale factor applied to the cursor bitmap.
     ///
@@ -564,8 +577,9 @@ impl CursorState {
             handle: null_mut(),
             flags,
             hash: 0,
-            cache: FxHashMap::default(),
-            uploaded: FxHashSet::default(),
+            cache: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
+            retired: Vec::new(),
+            uploaded: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
             probe: HitchProbe::new(),
             scale: scale.clamp(1, 8),
             source: None,
@@ -662,7 +676,7 @@ impl CursorState {
             send_overlay_state(self.view_handle, hash, flags, sprite.as_ref())
         });
         if accepted {
-            self.uploaded.insert(hash);
+            self.uploaded.insert(hash, ());
         } else {
             self.uploaded.remove(&hash);
         }
@@ -763,7 +777,7 @@ impl CursorState {
             pitch,
             self.scale,
         );
-        let handle = if let Some(&h) = self.cache.get(&hash) {
+        let handle = if let Some(h) = self.cache.get(&hash).copied() {
             Some(h)
         } else {
             let built = build_hcursor(
@@ -776,7 +790,7 @@ impl CursorState {
                 self.scale,
             );
             if let Some(h) = built {
-                self.cache.insert(hash, h);
+                self.remember_handle(hash, h);
             }
             built
         };
@@ -795,6 +809,31 @@ impl CursorState {
             let us = timed_set_cursor(handle);
             self.charge_call_us(us);
         }
+    }
+
+    /// Keep a built HCURSOR under its hash, destroying what the bound pushes out.
+    ///
+    /// An evicted handle that is the realized cursor or the thread's current
+    /// cursor is not freed under it (user32 frees a cursor even while it is
+    /// current, leaving the thread pointing at a freed handle); it waits in
+    /// `retired` for a later eviction or the release path.
+    fn remember_handle(&mut self, hash: u64, handle: *mut c_void) {
+        if let Some((_, evicted)) = self.cache.insert(hash, handle) {
+            self.retired.push(evicted);
+        }
+        let in_use = [self.handle, get_cursor()];
+        self.retired.retain(|&retired| {
+            if in_use.contains(&retired) {
+                return true;
+            }
+            if !destroy_cursor(retired) {
+                error!(
+                    target: LOG_TARGET,
+                    "remember_handle: DestroyCursor({retired:p}) failed for an evicted cursor",
+                );
+            }
+            false
+        });
     }
 
     /// Fold one `Present` into the hitch probe; see `HitchProbe`.
@@ -978,7 +1017,12 @@ impl CursorState {
     /// Once the replacement has happened every refused `DestroyCursor` is a
     /// real failure, and is reported as one.
     pub fn destroy_handles(&mut self) {
-        let mut handles: Vec<*mut c_void> = self.cache.drain().map(|(_, h)| h).collect();
+        let mut handles: Vec<*mut c_void> = self
+            .cache
+            .drain()
+            .map(|(_, h)| h)
+            .chain(self.retired.drain(..))
+            .collect();
         let current = core::mem::replace(&mut self.handle, null_mut());
         if !current.is_null() && !handles.contains(&current) {
             handles.push(current);
@@ -1182,7 +1226,7 @@ pub extern "system" fn device_set_cursor_properties(
         (blank, outcome)
     } else if hash == prev_hash {
         (cur.handle, "unchanged")
-    } else if let Some(&h) = cur.cache.get(&hash) {
+    } else if let Some(h) = cur.cache.get(&hash).copied() {
         (h, "cache-hit")
     } else {
         let Some(h) = build_hcursor(width, height, pitch, src, x_hotspot, y_hotspot, cur.scale)
@@ -1197,7 +1241,7 @@ pub extern "system" fn device_set_cursor_properties(
             unsafe { (surf_vtbl.unlock_rect)(cursor_bitmap) };
             return D3DERR_INVALIDCALL;
         };
-        cur.cache.insert(hash, h);
+        cur.remember_handle(hash, h);
         (h, "built-fresh")
     };
 
