@@ -438,8 +438,14 @@ jobs:
       # and refs/tags/<tag> to refs/tags/<tag>"), which failed every tag run
       # since the macos-26 image.
       - uses: actions/checkout@v5
-      # First, before a toolchain is fetched: a tag that disagrees with the
-      # manifests is answered in seconds instead of after a bundle build.
+      # The toolchain first, since every make target needs the WINE_SDK the
+      # prepare action sets; then the version check, so a tag that disagrees
+      # with the manifests is answered before the wait for main's run and the
+      # bundle build below.
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine-release: ${{ env.WINE_RELEASE }}
       - name: version-check
         env:
           TAG: ${{ github.ref_name }}
@@ -480,10 +486,6 @@ jobs:
           done
           echo "::error::main's ci run for $GITHUB_SHA had not finished after 45 minutes; re-run this job once it has"
           exit 1
-      - uses: ./.github/actions/prepare
-        with:
-          pe: 'true'
-          wine-release: ${{ env.WINE_RELEASE }}
       # PROD=1 is this target's default, so the archives carry the production
       # profile, and the target verifies that every binary in them is stamped
       # with the tag before it writes either one.
