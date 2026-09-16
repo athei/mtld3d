@@ -1048,13 +1048,6 @@ struct EncoderFrameCounters {
     /// The wait is on the display, the thing a snapshot exists to avoid, so
     /// this is the tripwire for the ring's size. Sticky like `snapshots`.
     slot_waits: u32,
-    /// Presents the presenter made without the throttle: stale after a read-back.
-    ///
-    /// Frames a barrier hurried past the display, superseded within a
-    /// refresh so the newest reaches the screen at once. None in steady
-    /// state; a game that flushes every frame must read 0 here too, since
-    /// one frame behind keeps the throttle. Sticky like `snapshots`.
-    unthrottled: u32,
     /// Retired VB/IB `PageBox`es the retention drain parked in the recycle pool.
     ///
     /// Counts accepted parks only; rejects (pool off, oversize, cap)
@@ -1097,7 +1090,6 @@ impl EncoderFrameCounters {
             present_wait_cycles: 0,
             snapshots: 0,
             slot_waits: 0,
-            unthrottled: 0,
             pagebox_pool_recycled: 0,
             pagebox_pool_recycled_bytes: 0,
         }
@@ -1851,11 +1843,9 @@ impl EncoderPerfState {
         // the barriers between the last summary and this reset.
         let snapshots = self.enc.snapshots;
         let slot_waits = self.enc.slot_waits;
-        let unthrottled = self.enc.unthrottled;
         self.enc = EncoderFrameCounters::default();
         self.enc.snapshots = snapshots;
         self.enc.slot_waits = slot_waits;
-        self.enc.unthrottled = unthrottled;
         self.per_pair_stats.clear();
     }
 
@@ -1935,11 +1925,6 @@ impl EncoderPerfState {
     /// Bumped once per snapshot that first waited for a slot to free.
     pub const fn bump_slot_wait(&mut self) {
         self.enc.slot_waits = self.enc.slot_waits.saturating_add(1);
-    }
-
-    /// Adds the presents made without the throttle that a submit reported.
-    pub const fn add_unthrottled_presents(&mut self, count: u32) {
-        self.enc.unthrottled = self.enc.unthrottled.saturating_add(count);
     }
 
     /// Bumped when the retention drain destroys an `MTLBuffer` wrapper.
@@ -2161,7 +2146,6 @@ impl EncoderPerfState {
         // Sampled: the barriers that bump them run before the next reset.
         self.enc.snapshots = 0;
         self.enc.slot_waits = 0;
-        self.enc.unthrottled = 0;
         self.compilation.finish_frame(
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
@@ -2350,8 +2334,6 @@ impl EncoderPerfState {
     pub const fn bump_snapshot(&mut self) {}
     #[inline]
     pub const fn bump_slot_wait(&mut self) {}
-    #[inline]
-    pub const fn add_unthrottled_presents(&mut self, _count: u32) {}
     #[inline]
     pub const fn bump_buffer_destroy(&mut self) {}
     #[inline]
@@ -2586,8 +2568,6 @@ struct PerfWindow {
     snapshots: Stat,
     /// Window total of copies that first waited for a slot (sum only).
     slot_waits: Stat,
-    /// Window total of presents made without the throttle (sum only).
-    unthrottled: Stat,
     /// Per-`ApiCategory` bucket: window sum + per-frame peak.
     ///
     /// The peak surfaces a category that spikes (Device, Texture, …) on a
@@ -2800,7 +2780,6 @@ impl PerfWindow {
         self.present_wait.add(s.enc.present_wait_cycles);
         self.snapshots.add(u64::from(s.enc.snapshots));
         self.slot_waits.add(u64::from(s.enc.slot_waits));
-        self.unthrottled.add(u64::from(s.enc.unthrottled));
         for i in 0..ApiCategory::COUNT {
             self.api_by[i].add(s.counters.api_cycles_by_category[i]);
             self.calls_by[i].add(u64::from(s.counters.api_call_counts_by_category[i]));
@@ -4153,10 +4132,8 @@ impl<'a> Summary<'a> {
     /// a copy of the back buffer because a read-back or a barrier could not
     /// wait for them: none in steady state, one per read-back. `Slot waits`
     /// counts the copies that first waited for a slot, a wait on the display
-    /// and the tripwire for the ring's size: 0 is the goal. `Unthrottled`
-    /// counts the stale presents the presenter sent past the throttle to
-    /// catch up after a read-back. All come back with the next payload,
-    /// lagged one present.
+    /// and the tripwire for the ring's size: 0 is the goal. All come back
+    /// with the next payload, lagged one present.
     fn write_present_thread(&self, out: &mut String, dw_ms: f64) {
         let w = self.w;
         let s = &self.s;
@@ -4201,23 +4178,11 @@ impl<'a> Summary<'a> {
             out,
             s,
             &Row {
-                label: "├─ Slot waits",
+                label: "└─ Slot waits",
                 bold_label: false,
                 ms: None,
                 aux: Some(format!("({:>10})", w.slot_waits.sum)),
                 desc: Some("copy waited for a present"),
-                peak: None,
-            },
-        );
-        write_row(
-            out,
-            s,
-            &Row {
-                label: "└─ Unthrottled",
-                bold_label: false,
-                ms: None,
-                aux: Some(format!("({:>10})", w.unthrottled.sum)),
-                desc: Some("stale, sent past the throttle"),
                 peak: None,
             },
         );

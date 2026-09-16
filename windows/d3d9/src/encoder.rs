@@ -737,8 +737,6 @@ struct SubmitOutcome {
     present_wait_ns: u64,
     /// Whether the submit copied the pending present's frame into a slot, and waited for one.
     snapshot: SnapshotFlags,
-    /// Presents the presenter made without the throttle since the previous submit.
-    unthrottled_presents: u32,
 }
 
 /// A finished frame coming back from the submit thread.
@@ -2625,8 +2623,6 @@ impl FrameEncoder {
         if outcome.snapshot.contains(SnapshotFlags::SLOT_WAITED) {
             self.perf.bump_slot_wait();
         }
-        self.perf
-            .add_unthrottled_presents(outcome.unthrottled_presents);
     }
 
     /// Hand a finalized packet to the submit thread (`Async` mode).
@@ -9920,7 +9916,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         },
         present_wait_ns: 0,
         snapshot_flags: SnapshotFlags::empty(),
-        unthrottled_presents: 0,
+        pad0: 0,
     };
 
     // Retention bookkeeping is keyed by `submit_seq` and only needs the
@@ -9951,7 +9947,6 @@ fn execute_submit(
         drawable_wait_ns: params.drawable_wait_ns,
         present_wait_ns: params.present_wait_ns,
         snapshot: params.snapshot_flags,
-        unthrottled_presents: params.unthrottled_presents,
     };
     (payload, outcome)
 }

@@ -43,7 +43,6 @@ fn empty_inner() -> Inner {
         flags: PresenterFlags::empty(),
         slots: [const { None }; SNAPSHOT_SLOTS],
         last_drawable_wait_ns: 0,
-        unthrottled: 0,
         gate: None,
     }
 }
@@ -106,36 +105,6 @@ fn a_submit_waits_for_the_newest_pending_present() {
     inner.pending.push_back(packet(6, None));
     assert_eq!(decide(&inner, true), Decision::Wait(6));
     assert_eq!(decide(&inner, false), Decision::Snapshot(6));
-}
-
-#[test]
-fn two_stale_frames_send_the_backlog_past_the_throttle() {
-    let mut inner = empty_inner();
-    inner.pending.push_back(packet(5, Some(0)));
-    inner.pending.push_back(packet(6, Some(1)));
-    assert!(
-        throttle_front(&mut inner),
-        "one frame behind is the pipeline's depth"
-    );
-    assert!(!inner.flags.contains(PresenterFlags::CATCH_UP));
-    inner.pending.push_back(packet(7, None));
-    assert!(
-        !throttle_front(&mut inner),
-        "two behind: the front goes out at once"
-    );
-    assert!(inner.flags.contains(PresenterFlags::CATCH_UP));
-    inner.pending.pop_front();
-    assert!(
-        !throttle_front(&mut inner),
-        "still catching up while one is behind"
-    );
-    inner.pending.pop_front();
-    assert!(throttle_front(&mut inner), "the newest keeps the throttle");
-    assert!(!inner.flags.contains(PresenterFlags::CATCH_UP));
-    assert_eq!(
-        inner.unthrottled, 2,
-        "two presents went out past the throttle"
-    );
 }
 
 #[test]
