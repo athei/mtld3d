@@ -431,9 +431,13 @@ jobs:
       contents: write
       actions: read
     steps:
+      # No fetch-tags here: a tag run's checkout creates the tag's ref from
+      # the commit it fetches, which is the one tag `git describe` needs for
+      # the stamp, and asking for every tag on top makes git 2.48 and later
+      # refuse to fetch one ref from two sources ("Cannot fetch both <sha>
+      # and refs/tags/<tag> to refs/tags/<tag>"), which failed every tag run
+      # since the macos-26 image.
       - uses: actions/checkout@v5
-        with:
-          fetch-tags: true
       # First, before a toolchain is fetched: a tag that disagrees with the
       # manifests is answered in seconds instead of after a bundle build.
       - name: version-check
