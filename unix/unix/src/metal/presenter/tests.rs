@@ -41,7 +41,7 @@ fn empty_inner() -> Inner {
         pending: VecDeque::new(),
         committed_present_seq: 0,
         flags: PresenterFlags::empty(),
-        slots: [None, None, None],
+        slots: [None, None, None, None],
         last_drawable_wait_ns: 0,
         gate: None,
     }
@@ -119,6 +119,12 @@ fn slots_prefer_free_then_the_oldest_reader() {
     inner.slots[2] = Some(slot(7));
     assert_eq!(
         choose_slot(&inner),
+        SlotChoice::Free(3),
+        "slots 0 to 2 busy, slot 3 unallocated"
+    );
+    inner.slots[3] = Some(slot(8));
+    assert_eq!(
+        choose_slot(&inner),
         SlotChoice::Busy(0),
         "all busy: the oldest reader"
     );
@@ -128,7 +134,7 @@ fn slots_prefer_free_then_the_oldest_reader() {
         SlotChoice::Free(0),
         "reader 5 committed frees slot 0"
     );
-    inner.committed_present_seq = 7;
+    inner.committed_present_seq = 8;
     assert_eq!(
         choose_slot(&inner),
         SlotChoice::Free(0),
@@ -151,6 +157,7 @@ fn a_dropped_packet_retires_its_sequence_and_frees_its_slot() {
     let mut inner = state.lock();
     inner.slots[1] = Some(slot(7));
     inner.slots[2] = Some(slot(8));
+    inner.slots[3] = Some(slot(9));
     assert_eq!(choose_slot(&inner), SlotChoice::Free(0));
     inner.slots[0] = Some(slot(6));
     assert_eq!(choose_slot(&inner), SlotChoice::Busy(0));

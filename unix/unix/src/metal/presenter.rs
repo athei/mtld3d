@@ -67,12 +67,13 @@ use crate::LOG_TARGET;
 ///
 /// A read-back's flush can find two submits in flight behind the barrier
 /// that hurries them, each of which copies the present ahead of it, and then
-/// needs a copy of its own; three slots let all of that happen while the
-/// presenter still waits for its first drawable. Beyond that a snapshot waits
-/// for the oldest present to commit, the drawable dependency the split exists
-/// to remove, which only a stalled compositor under a read-back every frame
-/// reaches.
-pub const SNAPSHOT_SLOTS: usize = 3;
+/// needs a copy of its own: three slots for one flush while the presenter
+/// still waits for its first drawable. A second flush on the next frame, the
+/// shape of a portrait read back at two sizes, needs one more before the
+/// first has commit. Beyond that a snapshot waits for the oldest present to
+/// commit, the drawable dependency the split exists to remove, and the perf
+/// grid's `Slot waits` counts it.
+pub const SNAPSHOT_SLOTS: usize = 4;
 
 /// How often a parked presenter looks for the gate file to be gone.
 const GATE_POLL: Duration = Duration::from_millis(1);
@@ -302,7 +303,7 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             pending: VecDeque::new(),
             committed_present_seq: 0,
             flags: PresenterFlags::empty(),
-            slots: [None, None, None],
+            slots: [None, None, None, None],
             last_drawable_wait_ns: 0,
             gate,
         }),
