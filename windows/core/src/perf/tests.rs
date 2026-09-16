@@ -103,11 +103,13 @@ fn snapshots_survive_begin_frame_until_sampled() {
     let mut state = EncoderPerfState::new();
     state.bump_snapshot();
     state.bump_snapshot();
+    state.bump_slot_wait();
     state.begin_frame(&FramePerfPayload::default());
     assert_eq!(
         state.enc.snapshots, 2,
         "the barrier's bumps outlive the reset"
     );
+    assert_eq!(state.enc.slot_waits, 1, "and so does the wait it counted");
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
@@ -347,7 +349,8 @@ fn summary_golden_layout() {
         "\n",
         "Present thread          6.00 ms                                             peak  6.00 ms\n",
         "├─ Drawable wait        6.00 ms                       nextDrawable GPU+comp peak  6.00 ms\n",
-        "└─ Snapshots                      (         1)        presented from a copy\n",
+        "├─ Snapshots                      (         1)        presented from a copy\n",
+        "└─ Slot waits                     (         0)        copy waited for a present\n",
         "\n",
         "Frame total            10.00 ms                                             peak 10.00 ms\n",
         "submit_status=0x0   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait))\n",
@@ -441,7 +444,8 @@ fn summary_contains_expected_sections() {
         "└─ Present wait",
         "Present thread",
         "├─ Drawable wait",
-        "└─ Snapshots",
+        "├─ Snapshots",
+        "└─ Slot waits",
         "Frame total",
         "submit_status=0x0",
         "Resources (VB/IB)",
@@ -649,8 +653,10 @@ fn sample_window() -> PerfWindow {
             // 0.2M backpressure stall → Finalize 0.10M, stall 0.20M.
             submit_stall_cycles: 200_000,
             present_wait_cycles: 6_000_000,
-            // One read-back in the window presented its frame from a copy.
+            // One read-back in the window presented its frame from a copy,
+            // and no copy waited for a slot.
             snapshots: 1,
+            slot_waits: 0,
         },
         passes: 4,
         commands: 140,

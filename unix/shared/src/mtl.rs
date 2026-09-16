@@ -903,5 +903,20 @@ pub enum PresentWaitPolicy {
     SnapshotPending = 1,
 }
 
+bitflags::bitflags! {
+    /// What `SubmitFrame` did about a present still waiting for its drawable.
+    ///
+    /// Out-flags on `SubmitFrameParams`. `TAKEN`: the submit copied the
+    /// pending present's frame into a slot. `SLOT_WAITED`: every slot was
+    /// held by a present not yet committed, so the copy first waited for the
+    /// oldest one, which is a wait on the display; the PE side counts both,
+    /// the second being the tripwire for the ring's size.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct SnapshotFlags: u32 {
+        const TAKEN = 1 << 0;
+        const SLOT_WAITED = 1 << 1;
+    }
+}
+
 #[cfg(test)]
 mod tests;

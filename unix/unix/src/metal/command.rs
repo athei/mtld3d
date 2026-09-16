@@ -396,7 +396,7 @@ pub fn advance_counter(pointer: u64, seq: u64) {
 fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     params.drawable_wait_ns = 0;
     params.present_wait_ns = 0;
-    params.snapshot_taken = 0;
+    params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
     mtld3d_shared::crumb!("submit:enter", params.queue_handle.raw(), params.pass_count);
     mtld3d_shared::crumb!("submit:queueret", params.queue_handle.raw());
     let Some(queue) = params.queue_handle.into_retained() else {

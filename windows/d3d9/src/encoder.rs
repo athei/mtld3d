@@ -62,8 +62,8 @@ use mtld3d_shared::{
     WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
-        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, StageTag, StorageMode,
-        StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
+        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
+        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -735,8 +735,8 @@ struct SubmitOutcome {
     /// The display's cadence as the submit thread sees it: part of
     /// `submit_exec`, and what `Encode+commit` subtracts.
     present_wait_ns: u64,
-    /// Whether the submit copied the pending present's frame into a slot.
-    snapshot_taken: bool,
+    /// Whether the submit copied the pending present's frame into a slot, and waited for one.
+    snapshot: SnapshotFlags,
 }
 
 /// A finished frame coming back from the submit thread.
@@ -2617,8 +2617,11 @@ impl FrameEncoder {
             .set_drawable_wait_cycles(ns_to_cycles(outcome.drawable_wait_ns));
         self.perf
             .set_present_wait_cycles(ns_to_cycles(outcome.present_wait_ns));
-        if outcome.snapshot_taken {
+        if outcome.snapshot.contains(SnapshotFlags::TAKEN) {
             self.perf.bump_snapshot();
+        }
+        if outcome.snapshot.contains(SnapshotFlags::SLOT_WAITED) {
+            self.perf.bump_slot_wait();
         }
     }
 
@@ -9912,7 +9915,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
             frame.view_handle
         },
         present_wait_ns: 0,
-        snapshot_taken: 0,
+        snapshot_flags: SnapshotFlags::empty(),
         pad0: 0,
     };
 
@@ -9943,7 +9946,7 @@ fn execute_submit(
         status,
         drawable_wait_ns: params.drawable_wait_ns,
         present_wait_ns: params.present_wait_ns,
-        snapshot_taken: params.snapshot_taken != 0,
+        snapshot: params.snapshot_flags,
     };
     (payload, outcome)
 }

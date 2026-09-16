@@ -139,7 +139,7 @@ fn frame_param_layouts_match_wow64() {
     //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
     //   + 8 failed_submit_seq_ptr
     //   + 8 drawable_wait_ns + 8 present_view
-    //   + 8 present_wait_ns + 4 snapshot_taken + 4 pad0
+    //   + 8 present_wait_ns + 4 snapshot_flags + 4 pad0
     //   = 120
     assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 120);
     assert_eq!(
@@ -152,7 +152,7 @@ fn frame_param_layouts_match_wow64() {
         104
     );
     assert_eq!(
-        core::mem::offset_of!(SubmitFrameParams, snapshot_taken),
+        core::mem::offset_of!(SubmitFrameParams, snapshot_flags),
         112
     );
 

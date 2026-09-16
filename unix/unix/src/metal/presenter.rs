@@ -43,7 +43,7 @@ use std::{
 use block2::RcBlock;
 use mtld3d_shared::{
     SubmitFrameParams,
-    mtl::PresentWaitPolicy,
+    mtl::{PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
     perf::NanosSetTimer,
 };
@@ -462,7 +462,8 @@ pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
 /// Called after the frame's buffers are encoded and before they commit.
 /// Waits for the pending present to commit, or copies its source into a slot
 /// and retargets it, as the module doc says; `params.present_wait_ns` takes
-/// the wait and `params.snapshot_taken` says whether a copy was made.
+/// the wait and `params.snapshot_flags` says whether a copy was made and
+/// whether it had to wait for a slot.
 pub fn resolve_present_conflict(
     state: &PresentState,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
@@ -489,6 +490,7 @@ pub fn resolve_present_conflict(
             Decision::Snapshot(seq) => match choose_slot(&inner) {
                 SlotChoice::Busy(index) => {
                     let reader = inner.slots[index].as_ref().map_or(0, |slot| slot.reader);
+                    params.snapshot_flags.insert(SnapshotFlags::SLOT_WAITED);
                     mtld3d_shared::log_once_warn!(
                         target: LOG_TARGET,
                         "presenter: every snapshot slot holds a present still waiting for its \
@@ -504,7 +506,7 @@ pub fn resolve_present_conflict(
                 }
                 SlotChoice::Free(index) => {
                     if snapshot_into(&mut inner, index, seq, queue) {
-                        params.snapshot_taken = 1;
+                        params.snapshot_flags.insert(SnapshotFlags::TAKEN);
                         break;
                     }
                     mtld3d_shared::log_once_warn!(

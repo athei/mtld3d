@@ -4,8 +4,8 @@ use super::{
         AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
         ColorSpacePolicy, ColorWriteMask, CompareFunc, CursorOverlayFlags, DepthResolveFilter,
         DestroyKind, DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat,
-        PresentWaitPolicy, SoftwareCursorPolicy, StageTag, StencilOp, StorageMode, StoreAction,
-        Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
+        PresentWaitPolicy, SnapshotFlags, SoftwareCursorPolicy, StageTag, StencilOp, StorageMode,
+        StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -1011,12 +1011,13 @@ pub struct SubmitFrameParams {
     /// thread. Same unit and reason as `drawable_wait_ns`; 0 outside a
     /// `PERF=1` build.
     pub present_wait_ns: u64, // out
-    /// Non-zero when this submit copied the pending present's frame into a slot.
+    /// What this submit did about a present still waiting for its drawable.
     ///
-    /// A no-present submit finding a present still waiting for its drawable,
-    /// or a present-bearing one under `SnapshotPending`. The PE side counts
-    /// them: none in steady state, one per read-back.
-    pub snapshot_taken: u32, // out
+    /// `TAKEN` for a no-present submit finding one, or a present-bearing one
+    /// under `SnapshotPending`; `SLOT_WAITED` when the copy had to wait for a
+    /// slot. The PE side counts both: no copies in steady state, one per
+    /// read-back, and no waits unless the ring is too small for the workload.
+    pub snapshot_flags: SnapshotFlags, // out
     pub pad0: u32,
 }
 

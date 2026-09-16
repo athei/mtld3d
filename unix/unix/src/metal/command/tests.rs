@@ -867,7 +867,7 @@ fn test_submit_params(
         drawable_wait_ns: 0,
         present_view: MetalHandle::NULL,
         present_wait_ns: 0,
-        snapshot_taken: 0,
+        snapshot_flags: mtld3d_shared::mtl::SnapshotFlags::empty(),
         pad0: 0,
     }
 }
