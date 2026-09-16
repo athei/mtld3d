@@ -11,12 +11,14 @@ use objc2_metal::MTLDevice;
 use super::{DeviceCaps, create_command_queue, default_device_info};
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
 
-/// Drops the retains one `DeviceCaps` handed out, as the destroy thunk does.
+/// Retires the presenter and drops the retains of one `DeviceCaps`, as the destroy thunk does.
 ///
 /// The caller must be done with both handles, and no copy of either may be
 /// used afterwards.
 fn release(caps: &DeviceCaps) {
-    // SAFETY: this stands in for `destroy_command_queue`. The queue handle
+    crate::metal::presenter::unregister_and_join(caps.queue_handle);
+    // SAFETY: this stands in for `destroy_command_queue`, whose presenter
+    // retirement above dropped the record's retain; the queue handle now
     // carries the only retain on a queue nothing else names.
     unsafe { caps.queue_handle.release_retain() };
     // SAFETY: the device handle carries the retain `create_command_queue`

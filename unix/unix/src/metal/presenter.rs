@@ -122,6 +122,23 @@ pub struct PresentState {
     /// sequence.
     present_retired: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// One retain on the queue, held from registration until the record drops.
+    ///
+    /// The thread retains the queue again when it starts, and this retain
+    /// is what makes that a live object whenever the thread gets to run:
+    /// the caller may drop its own handle the moment `register` returns.
+    /// Released by `Drop`, which runs after the thread was joined, since the
+    /// thread holds an `Arc` of the record while it runs.
+    queue_retain: MetalHandle<MTLCommandQueueKind>,
+}
+
+impl Drop for PresentState {
+    fn drop(&mut self) {
+        // SAFETY: the handle holds the retain `register` took and no other
+        // copy of it is used; the thread that would use the queue has ended,
+        // since it held an `Arc` of this record.
+        unsafe { self.queue_retain.release_retain() };
+    }
 }
 
 struct Inner {
@@ -303,10 +320,14 @@ fn choose_slot(inner: &Inner) -> SlotChoice {
 
 /// Create the record and the presenter thread for `queue`.
 ///
-/// `false` when the thread cannot start, which leaves the queue unable to
-/// present; the caller fails the device rather than run one that renders
-/// into nothing. A record already registered under the address is replaced
-/// with a warning: the address belongs to one live queue at a time.
+/// `false` when the queue cannot be retained or the thread cannot start,
+/// which leaves the queue unable to present; the caller fails the device
+/// rather than run one that renders into nothing. The record takes its
+/// retain on the queue here, before the thread exists, so the thread's own
+/// retain at start lands on a live object whatever the caller does with its
+/// handle once this returns. A record already registered under the address
+/// is replaced with a warning: the address belongs to one live queue at a
+/// time.
 pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> bool {
     if let Some(path) = &gate {
         log::info!(
@@ -315,6 +336,18 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             path.display(),
         );
     }
+    let Some(owned) = queue.into_retained() else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "presenter: queue {:#x} could not be retained; the device is refused",
+            queue.raw(),
+        );
+        return false;
+    };
+    // SAFETY: `Retained::into_raw` transfers the retain into the raw address;
+    // the record's `Drop` releases it.
+    let queue_retain =
+        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(owned) as u64) };
     let state = Arc::new(PresentState {
         inner: Mutex::new(Inner {
             queue,
@@ -330,6 +363,7 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
         presenter_cv: Condvar::new(),
         present_retired: AtomicU64::new(0),
         thread: Mutex::new(None),
+        queue_retain,
     });
     let worker = Arc::clone(&state);
     let spawned = thread::Builder::new()
