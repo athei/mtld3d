@@ -99,6 +99,17 @@ bitflags::bitflags! {
         const HURRY = 1 << 0;
         /// The queue is going away: drop every packet, wake every waiter.
         const STOP = 1 << 1;
+        /// The presenter is behind by more than the pipeline's depth.
+        ///
+        /// Set when the front of the queue has two or more packets behind
+        /// it, cleared when the newest one is presented. While set, every
+        /// packet but the newest is presented without the minimum duration,
+        /// so the compositor supersedes it within one refresh and the newest
+        /// reaches the screen at the next one instead of that many refreshes
+        /// later. One packet behind is the frame the pipeline always has in
+        /// flight and keeps the throttle, so a game that flushes every frame
+        /// still shows every frame.
+        const CATCH_UP = 1 << 2;
     }
 }
 
@@ -128,6 +139,8 @@ struct Inner {
     slots: [Option<Slot>; SNAPSHOT_SLOTS],
     /// The last present's `nextDrawable` wait, handed back to the next submit.
     last_drawable_wait_ns: u64,
+    /// Presents made without the throttle since the last submit collected them.
+    unthrottled: u32,
     /// The gate file `debug.presentGateFile` named, `None` = no gate.
     gate: Option<PathBuf>,
 }
@@ -244,27 +257,52 @@ impl PresentState {
 
 /// Decide for one submit, given what is pending.
 ///
-/// The pending packet still reading the back buffer is at most one and always
-/// the last pushed, since every submit either waits for it or retargets it
-/// before pushing its own. `STOP` means every packet is about to be dropped,
-/// so nothing will read the back buffer.
+/// A present-bearing submit waits for every pending present to commit,
+/// whether the newest reads the back buffer or a copy: that is the pacing
+/// the display sets, and it keeps the queue one deep except behind a
+/// barrier. A submit that must not wait, a no-present partial frame or one
+/// a barrier hurried, copies the newest pending present's frame if it still
+/// reads the back buffer, and proceeds if it does not. The pending packet
+/// reading the back buffer is at most one and always the last pushed, since
+/// every submit waits for it or retargets it before pushing its own. `STOP`
+/// means every packet is about to be dropped, so nothing will read the back
+/// buffer.
 fn decide(inner: &Inner, present_bearing: bool) -> Decision {
     if inner.flags.contains(PresenterFlags::STOP) {
         return Decision::Proceed;
     }
-    let Some(seq) = inner
-        .pending
-        .iter()
-        .find(|packet| packet.slot.is_none())
-        .map(|packet| packet.seq)
-    else {
+    let Some(newest) = inner.pending.back() else {
         return Decision::Proceed;
     };
-    if !present_bearing || inner.flags.contains(PresenterFlags::HURRY) {
-        Decision::Snapshot(seq)
+    if present_bearing && !inner.flags.contains(PresenterFlags::HURRY) {
+        Decision::Wait(newest.seq)
+    } else if newest.slot.is_none() {
+        Decision::Snapshot(newest.seq)
     } else {
-        Decision::Wait(seq)
+        Decision::Proceed
     }
+}
+
+/// Whether the front packet keeps the throttle, updating the catch-up state.
+///
+/// Two or more packets behind the front means a barrier hurried submits past
+/// the display; presenting each of them for a refresh would hold the screen
+/// that many refreshes behind the game, so they go out without the minimum
+/// duration until the newest is reached, which keeps it.
+fn throttle_front(inner: &mut Inner) -> bool {
+    let behind = inner.pending.len().saturating_sub(1);
+    if behind >= 2 {
+        inner.flags.insert(PresenterFlags::CATCH_UP);
+    }
+    if behind == 0 {
+        inner.flags.remove(PresenterFlags::CATCH_UP);
+        return true;
+    }
+    if inner.flags.contains(PresenterFlags::CATCH_UP) {
+        inner.unthrottled = inner.unthrottled.saturating_add(1);
+        return false;
+    }
+    true
 }
 
 /// The first free slot, else the one whose reader is oldest.
@@ -306,6 +344,7 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             flags: PresenterFlags::empty(),
             slots: [const { None }; SNAPSHOT_SLOTS],
             last_drawable_wait_ns: 0,
+            unthrottled: 0,
             gate,
         }),
         submit_cv: Condvar::new(),
@@ -440,11 +479,12 @@ pub fn wait_for_present_idle(queue: MetalHandle<MTLCommandQueueKind>) {
     command::wait_for_gpu_retire(committed, state.present_retired_ptr(), 0);
 }
 
-/// Hand a frame's presentation to the presenter; returns the last drawable wait.
+/// Hand a frame's presentation to the presenter.
 ///
-/// The wait is the previous present's, which is what the perf grid reports
-/// for the submit that hands the next one over.
-pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
+/// Returns the last present's drawable wait and the presents made without
+/// the throttle since the previous submit took them, which is what the perf
+/// grid reports for the submit that hands the next frame over.
+pub fn push(state: &PresentState, packet: PresentPacket) -> (u64, u32) {
     let mut inner = state.lock();
     if inner.flags.contains(PresenterFlags::STOP) {
         mtld3d_shared::log_once_warn!(
@@ -452,11 +492,12 @@ pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
             "presenter: a frame was pushed after the queue's presenter stopped; it is not presented",
         );
         drop_packet(&mut inner, state, packet);
-        return inner.last_drawable_wait_ns;
+    } else {
+        inner.pending.push_back(packet);
+        state.presenter_cv.notify_one();
     }
-    inner.pending.push_back(packet);
-    state.presenter_cv.notify_one();
-    inner.last_drawable_wait_ns
+    let unthrottled = core::mem::take(&mut inner.unthrottled);
+    (inner.last_drawable_wait_ns, unthrottled)
 }
 
 /// Make the pending present and this submit's render work compatible.
@@ -747,6 +788,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
     };
 
     let mut inner = state.lock();
+    let throttle = throttle_front(&mut inner);
     let Some(front) = inner.pending.front() else {
         return true;
     };
@@ -784,6 +826,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
             source_raw: source_handle.raw(),
             seq,
             drawable_wait_ns,
+            throttle,
         },
     );
     super::upscale::retire_evicted(&cb, inner.queue);

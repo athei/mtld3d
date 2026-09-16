@@ -43,6 +43,7 @@ fn empty_inner() -> Inner {
         flags: PresenterFlags::empty(),
         slots: [const { None }; SNAPSHOT_SLOTS],
         last_drawable_wait_ns: 0,
+        unthrottled: 0,
         gate: None,
     }
 }
@@ -72,15 +73,68 @@ fn a_no_present_submit_snapshots_instead_of_waiting() {
 }
 
 #[test]
-fn a_retargeted_packet_is_no_conflict() {
+fn a_retargeted_packet_still_paces_a_present_bearing_submit() {
     let mut inner = empty_inner();
     inner.pending.push_back(packet(5, Some(0)));
-    assert_eq!(decide(&inner, true), Decision::Proceed);
-    assert_eq!(decide(&inner, false), Decision::Proceed);
+    assert_eq!(
+        decide(&inner, true),
+        Decision::Wait(5),
+        "the queue stays one deep whatever the pending present reads"
+    );
+    assert_eq!(
+        decide(&inner, false),
+        Decision::Proceed,
+        "a partial frame conflicts with nothing once the present reads a copy"
+    );
+    inner.flags.insert(PresenterFlags::HURRY);
+    assert_eq!(
+        decide(&inner, true),
+        Decision::Proceed,
+        "nor does a hurried one"
+    );
     assert_eq!(
         decide(&empty_inner(), true),
         Decision::Proceed,
         "nothing pending"
+    );
+}
+
+#[test]
+fn a_submit_waits_for_the_newest_pending_present() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, Some(0)));
+    inner.pending.push_back(packet(6, None));
+    assert_eq!(decide(&inner, true), Decision::Wait(6));
+    assert_eq!(decide(&inner, false), Decision::Snapshot(6));
+}
+
+#[test]
+fn two_stale_frames_send_the_backlog_past_the_throttle() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, Some(0)));
+    inner.pending.push_back(packet(6, Some(1)));
+    assert!(
+        throttle_front(&mut inner),
+        "one frame behind is the pipeline's depth"
+    );
+    assert!(!inner.flags.contains(PresenterFlags::CATCH_UP));
+    inner.pending.push_back(packet(7, None));
+    assert!(
+        !throttle_front(&mut inner),
+        "two behind: the front goes out at once"
+    );
+    assert!(inner.flags.contains(PresenterFlags::CATCH_UP));
+    inner.pending.pop_front();
+    assert!(
+        !throttle_front(&mut inner),
+        "still catching up while one is behind"
+    );
+    inner.pending.pop_front();
+    assert!(throttle_front(&mut inner), "the newest keeps the throttle");
+    assert!(!inner.flags.contains(PresenterFlags::CATCH_UP));
+    assert_eq!(
+        inner.unthrottled, 2,
+        "two presents went out past the throttle"
     );
 }
 

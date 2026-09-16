@@ -104,12 +104,14 @@ fn snapshots_survive_begin_frame_until_sampled() {
     state.bump_snapshot();
     state.bump_snapshot();
     state.bump_slot_wait();
+    state.add_unthrottled_presents(3);
     state.begin_frame(&FramePerfPayload::default());
     assert_eq!(
         state.enc.snapshots, 2,
         "the barrier's bumps outlive the reset"
     );
     assert_eq!(state.enc.slot_waits, 1, "and so does the wait it counted");
+    assert_eq!(state.enc.unthrottled, 3, "and the catch-up it reported");
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
@@ -350,7 +352,8 @@ fn summary_golden_layout() {
         "Present thread          6.00 ms                                             peak  6.00 ms\n",
         "├─ Drawable wait        6.00 ms                       nextDrawable GPU+comp peak  6.00 ms\n",
         "├─ Snapshots                      (         1)        presented from a copy\n",
-        "└─ Slot waits                     (         0)        copy waited for a present\n",
+        "├─ Slot waits                     (         0)        copy waited for a present\n",
+        "└─ Unthrottled                    (         2)        stale, sent past the throttle\n",
         "\n",
         "Frame total            10.00 ms                                             peak 10.00 ms\n",
         "submit_status=0x0   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait))\n",
@@ -445,7 +448,8 @@ fn summary_contains_expected_sections() {
         "Present thread",
         "├─ Drawable wait",
         "├─ Snapshots",
-        "└─ Slot waits",
+        "├─ Slot waits",
+        "└─ Unthrottled",
         "Frame total",
         "submit_status=0x0",
         "Resources (VB/IB)",
@@ -657,6 +661,8 @@ fn sample_window() -> PerfWindow {
             // and no copy waited for a slot.
             snapshots: 1,
             slot_waits: 0,
+            // Two stale frames went out without the throttle behind it.
+            unthrottled: 2,
         },
         passes: 4,
         commands: 140,

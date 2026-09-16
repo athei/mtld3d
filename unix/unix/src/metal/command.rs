@@ -397,6 +397,7 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     params.drawable_wait_ns = 0;
     params.present_wait_ns = 0;
     params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
+    params.unthrottled_presents = 0;
     mtld3d_shared::crumb!("submit:enter", params.queue_handle.raw(), params.pass_count);
     mtld3d_shared::crumb!("submit:queueret", params.queue_handle.raw());
     let Some(queue) = params.queue_handle.into_retained() else {
@@ -601,7 +602,9 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     commit_registered(&cmd_buf, params.coherent_seq_ptr, params.submit_seq);
     if let (Some(state), Some(packet)) = (presenter, packet) {
         mtld3d_shared::crumb!("submit:push", params.submit_seq);
-        params.drawable_wait_ns = super::presenter::push(&state, packet);
+        let (drawable_wait_ns, unthrottled) = super::presenter::push(&state, packet);
+        params.drawable_wait_ns = drawable_wait_ns;
+        params.unthrottled_presents = unthrottled;
     }
     mtld3d_shared::crumb!("submit:done");
     true
@@ -621,6 +624,11 @@ pub struct PresentEncode<'a> {
     pub seq: u64,
     /// The `nextDrawable` wait of this present, for the cadence probe.
     pub drawable_wait_ns: u64,
+    /// Whether the record's minimum present duration applies.
+    ///
+    /// False for a frame the presenter is catching up past: it goes out at
+    /// once so the compositor can supersede it within the refresh.
+    pub throttle: bool,
 }
 
 /// Encode the present of `args.source` into `drawable` and queue its presentation.
@@ -775,7 +783,11 @@ pub fn encode_present(
     // production rates display at their actual rate. `0.0` means
     // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
     let drawable_obj = ProtocolObject::from_ref(drawable);
-    let min_duration = attachment.map_or(0.0, |att| att.min_present_duration_sec());
+    let min_duration = if args.throttle {
+        attachment.map_or(0.0, |att| att.min_present_duration_sec())
+    } else {
+        0.0
+    };
     if min_duration > 0.0 {
         cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
     } else {

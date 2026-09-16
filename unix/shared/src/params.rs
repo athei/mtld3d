@@ -1018,7 +1018,12 @@ pub struct SubmitFrameParams {
     /// slot. The PE side counts both: no copies in steady state, one per
     /// read-back, and no waits unless the ring is too small for the workload.
     pub snapshot_flags: SnapshotFlags, // out
-    pub pad0: u32,
+    /// Presents the presenter made without the throttle since the last submit.
+    ///
+    /// Frames a barrier hurried past the display, presented at once so the
+    /// compositor supersedes them within a refresh; none unless a read-back
+    /// left the presenter two or more frames behind.
+    pub unthrottled_presents: u32, // out
 }
 
 impl Thunk for SubmitFrameParams {
