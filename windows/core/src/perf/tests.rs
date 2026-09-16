@@ -70,7 +70,7 @@ fn perf_window_enc_work_independent_of_drawable_wait() {
 }
 
 /// A sample with the submit thread's execute and its wait for the previous present.
-fn sample_submit(enc_cyc: u64, submit_exec: u64, present_wait: u64) -> FrameSample {
+const fn sample_submit(enc_cyc: u64, submit_exec: u64, present_wait: u64) -> FrameSample {
     let mut s = sample(enc_cyc, 0);
     s.enc.submit_exec_cycles = submit_exec;
     s.enc.present_wait_cycles = present_wait;
