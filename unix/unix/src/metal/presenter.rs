@@ -58,22 +58,23 @@ use rustc_hash::FxHashMap;
 use super::{
     command::{self, PresentEncode, diagnostics},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
-    macdrv::attachment,
+    macdrv::{DRAWABLE_POOL_DEPTH, attachment},
     texture,
 };
 use crate::LOG_TARGET;
 
 /// Slots a snapshot can copy into, per queue.
 ///
-/// A read-back's flush can find two submits in flight behind the barrier
-/// that hurries them, each of which copies the present ahead of it, and then
-/// needs a copy of its own: three slots for one flush while the presenter
-/// still waits for its first drawable. A second flush on the next frame, the
-/// shape of a portrait read back at two sizes, needs one more before the
-/// first has commit. Beyond that a snapshot waits for the oldest present to
-/// commit, the drawable dependency the split exists to remove, and the perf
-/// grid's `Slot waits` counts it.
-pub const SNAPSHOT_SLOTS: usize = 4;
+/// A slot frees when the present reading it commits, which takes a
+/// drawable, and the layer hands out [`DRAWABLE_POOL_DEPTH`] of those before
+/// one has to come back from the display. Presents queued up to that depth
+/// are the ones a copy can put ahead of the display at all; one more covers
+/// the flush that arrives before the presenter has committed anything, the
+/// frame after a flush hurried both submits in flight. Beyond that a
+/// snapshot waits for the oldest present to commit, which is the display's
+/// own pacing, and the perf grid's `Slot waits` counts it. Textures are
+/// allocated only when a copy needs the slot.
+pub const SNAPSHOT_SLOTS: usize = DRAWABLE_POOL_DEPTH + 1;
 
 /// How often a parked presenter looks for the gate file to be gone.
 const GATE_POLL: Duration = Duration::from_millis(1);
@@ -303,7 +304,7 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             pending: VecDeque::new(),
             committed_present_seq: 0,
             flags: PresenterFlags::empty(),
-            slots: [None, None, None, None],
+            slots: [const { None }; SNAPSHOT_SLOTS],
             last_drawable_wait_ns: 0,
             gate,
         }),

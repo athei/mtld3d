@@ -41,7 +41,7 @@ fn empty_inner() -> Inner {
         pending: VecDeque::new(),
         committed_present_seq: 0,
         flags: PresenterFlags::empty(),
-        slots: [None, None, None, None],
+        slots: [const { None }; SNAPSHOT_SLOTS],
         last_drawable_wait_ns: 0,
         gate: None,
     }
