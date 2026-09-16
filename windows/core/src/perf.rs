@@ -1012,15 +1012,16 @@ struct EncoderFrameCounters {
     /// Finalize (close passes, build descriptors, swap buffers, hand off)
     /// plus any backpressure stall waiting for the submit thread.
     submit_cycles: u64,
-    /// Submit-thread `nextDrawable` (GPU + compositor) wait.
+    /// Presenter-thread `nextDrawable` (GPU + compositor) wait.
     ///
-    /// Measured on the unix side and folded back when the payload
-    /// returns. Lagged ≤1 frame under async.
+    /// Measured on the unix side for the last present that completed and
+    /// folded back when the next payload returns. Lagged one present.
     drawable_wait_cycles: u64,
     /// Submit-thread total for `execute_submit`, folded back on payload return.
     ///
-    /// Command-walk + present + commit, incl. `drawable_wait_cycles`.
-    /// `submit_exec - drawable_wait` is the encode+commit CPU.
+    /// Command-walk + the wait for the previous present + commit, incl.
+    /// `present_wait_cycles`. `submit_exec - present_wait` is the
+    /// encode+commit CPU.
     submit_exec_cycles: u64,
     /// Encoder backpressure stall.
     ///
@@ -1028,6 +1029,25 @@ struct EncoderFrameCounters {
     /// submit thread to return a payload. Part of the encoder thread's
     /// wall time but NOT encoder CPU.
     submit_stall_cycles: u64,
+    /// Submit-thread wait for the previous present to commit.
+    ///
+    /// The display's cadence seen from the submit thread: a present-bearing
+    /// submit holds its render buffer until the present before it has a
+    /// drawable and commits. Measured on the unix side, folded back with the
+    /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`.
+    present_wait_cycles: u64,
+    /// Presents that went out from a copy of the back buffer.
+    ///
+    /// A barrier hurried a submit past its wait, or a mid-frame flush found
+    /// a present still waiting for its drawable. Sticky until sampled: the
+    /// barriers that produce them run between `log_frame_summary` and the
+    /// next `begin_frame`, so a per-frame reset would never show one.
+    snapshots: u32,
+    /// Snapshots that first waited for a slot: every slot held an uncommitted present.
+    ///
+    /// The wait is on the display, the thing a snapshot exists to avoid, so
+    /// this is the tripwire for the ring's size. Sticky like `snapshots`.
+    slot_waits: u32,
     /// Retired VB/IB `PageBox`es the retention drain parked in the recycle pool.
     ///
     /// Counts accepted parks only; rejects (pool off, oversize, cap)
@@ -1067,6 +1087,9 @@ impl EncoderFrameCounters {
             drawable_wait_cycles: 0,
             submit_exec_cycles: 0,
             submit_stall_cycles: 0,
+            present_wait_cycles: 0,
+            snapshots: 0,
+            slot_waits: 0,
             pagebox_pool_recycled: 0,
             pagebox_pool_recycled_bytes: 0,
         }
@@ -1816,7 +1839,13 @@ impl EncoderPerfState {
         // folded back from the submit thread when a payload returns (after
         // this reset, in `drain_returned_payloads`); zeroing them here means a
         // frame with nothing returned yet reports 0 rather than stale data.
+        // `snapshots` is the one counter that carries over: it is bumped by
+        // the barriers between the last summary and this reset.
+        let snapshots = self.enc.snapshots;
+        let slot_waits = self.enc.slot_waits;
         self.enc = EncoderFrameCounters::default();
+        self.enc.snapshots = snapshots;
+        self.enc.slot_waits = slot_waits;
         self.per_pair_stats.clear();
     }
 
@@ -1882,6 +1911,20 @@ impl EncoderPerfState {
 
     pub const fn add_submit_stall_cycles(&mut self, cycles: u64) {
         self.enc.submit_stall_cycles = self.enc.submit_stall_cycles.saturating_add(cycles);
+    }
+
+    pub const fn set_present_wait_cycles(&mut self, cycles: u64) {
+        self.enc.present_wait_cycles = cycles;
+    }
+
+    /// Bumped once per submit that copied the pending present's frame into a slot.
+    pub const fn bump_snapshot(&mut self) {
+        self.enc.snapshots = self.enc.snapshots.saturating_add(1);
+    }
+
+    /// Bumped once per snapshot that first waited for a slot to free.
+    pub const fn bump_slot_wait(&mut self) {
+        self.enc.slot_waits = self.enc.slot_waits.saturating_add(1);
     }
 
     /// Bumped when the retention drain destroys an `MTLBuffer` wrapper.
@@ -2100,6 +2143,9 @@ impl EncoderPerfState {
             enc_cyc: enc_cycles,
             submit_status,
         };
+        // Sampled: the barriers that bump them run before the next reset.
+        self.enc.snapshots = 0;
+        self.enc.slot_waits = 0;
         self.compilation.finish_frame(
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
@@ -2282,6 +2328,12 @@ impl EncoderPerfState {
     pub const fn set_submit_exec_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn add_submit_stall_cycles(&mut self, _cycles: u64) {}
+    #[inline]
+    pub const fn set_present_wait_cycles(&mut self, _cycles: u64) {}
+    #[inline]
+    pub const fn bump_snapshot(&mut self) {}
+    #[inline]
+    pub const fn bump_slot_wait(&mut self) {}
     #[inline]
     pub const fn bump_buffer_destroy(&mut self) {}
     #[inline]
@@ -2511,6 +2563,11 @@ struct PerfWindow {
     drawable_wait: Stat,
     submit_exec: Stat,
     submit_stall: Stat,
+    present_wait: Stat,
+    /// Window total of presents that went out from a copy (sum only).
+    snapshots: Stat,
+    /// Window total of copies that first waited for a slot (sum only).
+    slot_waits: Stat,
     /// Per-`ApiCategory` bucket: window sum + per-frame peak.
     ///
     /// The peak surfaces a category that spikes (Device, Texture, …) on a
@@ -2645,9 +2702,9 @@ struct PerfWindow {
     binds_leftover: Stat,
     /// Peak only: `submit_cyc − submit_stall` (the finalize CPU).
     finalize: Stat,
-    /// Peak only: `submit_exec − drawable_wait`.
+    /// Peak only: `submit_exec − present_wait`.
     ///
-    /// Encode+commit CPU, excluding the `nextDrawable` GPU wait.
+    /// Encode+commit CPU, excluding the wait for the previous present.
     encode_commit: Stat,
     /// Peak only: `vb_rename + ib_rename` on any single frame.
     vbib_rename: Stat,
@@ -2720,6 +2777,9 @@ impl PerfWindow {
         self.submit_stall.add(s.enc.submit_stall_cycles);
         self.drawable_wait.add(s.enc.drawable_wait_cycles);
         self.submit_exec.add(s.enc.submit_exec_cycles);
+        self.present_wait.add(s.enc.present_wait_cycles);
+        self.snapshots.add(u64::from(s.enc.snapshots));
+        self.slot_waits.add(u64::from(s.enc.slot_waits));
         for i in 0..ApiCategory::COUNT {
             self.api_by[i].add(s.counters.api_cycles_by_category[i]);
             self.calls_by[i].add(u64::from(s.counters.api_call_counts_by_category[i]));
@@ -2855,7 +2915,7 @@ impl PerfWindow {
         self.encode_commit.peak(
             s.enc
                 .submit_exec_cycles
-                .saturating_sub(s.enc.drawable_wait_cycles),
+                .saturating_sub(s.enc.present_wait_cycles),
         );
         self.vbib_rename
             .peak(u64::from(s.counters.vb_rename) + u64::from(s.counters.ib_rename));
@@ -3258,10 +3318,12 @@ impl<'a> Summary<'a> {
         // shown as its own encoder-thread row, not encoder work).
         let finalize_ms = cycles_to_ms(w.submit_cyc.sum.saturating_sub(w.submit_stall.sum) / f);
         let dw_ms = cycles_to_ms(w.drawable_wait.sum / f);
+        let pw_ms = cycles_to_ms(w.present_wait.sum / f);
         let submit_exec_ms = cycles_to_ms(w.submit_exec.sum / f);
         let enc_work_ms = cycles_to_ms(w.enc_work.sum / f);
-        // Submit-thread CPU = total execute minus the GPU/compositor wait.
-        let encode_commit_ms = (submit_exec_ms - dw_ms).max(0.0);
+        // Submit-thread CPU = total execute minus the wait for the previous
+        // present; the drawable wait is the presenter's.
+        let encode_commit_ms = (submit_exec_ms - pw_ms).max(0.0);
 
         let bn = Bottleneck::classify(
             frame_total_ms,
@@ -3291,7 +3353,8 @@ impl<'a> Summary<'a> {
             outside_ms,
         );
         self.write_encoder_thread(&mut out, enc_cyc_ms, op_ms, finalize_ms, stall_ms);
-        self.write_submit_thread(&mut out, submit_exec_ms, encode_commit_ms, dw_ms);
+        self.write_submit_thread(&mut out, submit_exec_ms, encode_commit_ms, pw_ms);
+        self.write_present_thread(&mut out, dw_ms);
         self.write_frame_total(&mut out, frame_total_ms);
         self.write_resources_vbib(&mut out);
         self.write_resources_textures(&mut out);
@@ -4009,16 +4072,16 @@ impl<'a> Summary<'a> {
     /// The dedicated submit thread.
     ///
     /// Issues the `SubmitFrame` thunk (the unix command-walk → Metal calls,
-    /// then present + commit) off the encoder thread. `Drawable wait` (GPU +
-    /// compositor) is part of the execute and is broken out; `Encode+commit`
-    /// is the submit thread's own CPU. Reported lagged ≤1 frame (folded back
-    /// when a payload returns).
+    /// the wait for the previous present, then commit) off the encoder
+    /// thread. `Present wait` is the display's cadence as the submit thread
+    /// sees it and is broken out; `Encode+commit` is the submit thread's own
+    /// CPU. Reported lagged ≤1 frame (folded back when a payload returns).
     fn write_submit_thread(
         &self,
         out: &mut String,
         submit_exec_ms: f64,
         encode_commit_ms: f64,
-        dw_ms: f64,
+        pw_ms: f64,
     ) {
         let w = self.w;
         let s = &self.s;
@@ -4051,12 +4114,76 @@ impl<'a> Summary<'a> {
             out,
             s,
             &Row {
-                label: "└─ Drawable wait",
+                label: "└─ Present wait",
+                bold_label: false,
+                ms: Some(pw_ms),
+                aux: None,
+                desc: Some("prior present commit"),
+                peak: Some(cycles_to_ms(w.present_wait.max)),
+            },
+        );
+    }
+
+    /// The presenter thread.
+    ///
+    /// Acquires the drawable and commits the present buffer once a frame's
+    /// render work has committed. `Drawable wait` (GPU + compositor) is the
+    /// `gpu_wait` bucket; `Snapshots` counts the presents that went out from
+    /// a copy of the back buffer because a read-back or a barrier could not
+    /// wait for them: none in steady state, one per read-back. `Slot waits`
+    /// counts the copies that first waited for a slot, a wait on the display
+    /// and the tripwire for the ring's size: 0 is the goal. All come back
+    /// with the next payload, lagged one present.
+    fn write_present_thread(&self, out: &mut String, dw_ms: f64) {
+        let w = self.w;
+        let s = &self.s;
+        let _ = writeln!(out);
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "Present thread",
+                bold_label: true,
+                ms: Some(dw_ms),
+                aux: None,
+                desc: None,
+                peak: Some(cycles_to_ms(w.drawable_wait.max)),
+            },
+        );
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "├─ Drawable wait",
                 bold_label: false,
                 ms: Some(dw_ms),
                 aux: None,
                 desc: Some("nextDrawable GPU+comp"),
                 peak: Some(cycles_to_ms(w.drawable_wait.max)),
+            },
+        );
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "├─ Snapshots",
+                bold_label: false,
+                ms: None,
+                aux: Some(format!("({:>10})", w.snapshots.sum)),
+                desc: Some("presented from a copy"),
+                peak: None,
+            },
+        );
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "└─ Slot waits",
+                bold_label: false,
+                ms: None,
+                aux: Some(format!("({:>10})", w.slot_waits.sum)),
+                desc: Some("copy waited for a present"),
+                peak: None,
             },
         );
     }
@@ -4079,7 +4206,7 @@ impl<'a> Summary<'a> {
         );
         let _ = writeln!(
             out,
-            "{d}submit_status={status:#x}   (API, Encoder, Submit run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + gpu_wait)){r}",
+            "{d}submit_status={status:#x}   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait)){r}",
             d = s.dim,
             r = s.reset,
             status = w.last_submit_status,

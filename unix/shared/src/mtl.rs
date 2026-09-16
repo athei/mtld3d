@@ -588,6 +588,20 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
 
+/// Presents that can be pending on one queue at once.
+///
+/// A present is pending from its frame's commit until the presenter commits
+/// the present buffer, and while it is pending a later submit may have to
+/// copy the frame it shows into a snapshot slot. What bounds the count is
+/// the PE pipeline: the present-bearing frames it can hold ahead of the
+/// frame the API thread records, which a read-back's barrier hurries past
+/// the presenter all at once. One frame sits in the channel to the encoder,
+/// one on the encoder while it waits for a payload, one in each payload the
+/// submit stage owns, and the pacing rule leaves one present pending while
+/// the next submit waits for it. The encoder asserts the sum against its
+/// caps at compile time; the presenter sizes its slot array with it.
+pub const PRESENT_PIPELINE_DEPTH: usize = 5;
+
 /// Fragment-stage buffer slot of the runtime integer constant table (`ps_i`).
 ///
 /// The fragment uniforms count down from 15 (`ps_c`, alpha ref, fog, bump
@@ -885,6 +899,37 @@ pub enum QuadPipelineKind {
     StretchBlit = 0,
     /// Texture upload: decodes packed staging bytes read out of an `MTLBuffer`.
     TextureUpload = 1,
+}
+
+/// What a present-bearing submit does about a present still waiting for its drawable.
+///
+/// Set through `SetPresentWaitPolicyParams` for one queue. `WaitForCommit`
+/// is the steady state: the submit waits for the previous present to commit,
+/// which is the cadence the display sets and costs no copy. A barrier that
+/// must not wait on the display sets `SnapshotPending` around its wait for
+/// the submits in flight: a submit parked in its wait wakes and copies the
+/// pending present's frame into a slot, and one that reaches the decision
+/// meanwhile copies too. A no-present submit copies whatever the policy.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
+pub enum PresentWaitPolicy {
+    WaitForCommit = 0,
+    SnapshotPending = 1,
+}
+
+bitflags::bitflags! {
+    /// What `SubmitFrame` did about a present still waiting for its drawable.
+    ///
+    /// Out-flags on `SubmitFrameParams`. `TAKEN`: the submit copied the
+    /// pending present's frame into a slot. `SLOT_WAITED`: every slot was
+    /// held by a present not yet committed, so the copy first waited for the
+    /// oldest one, which is a wait on the display; the PE side counts both,
+    /// the second being the tripwire for the ring's size.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct SnapshotFlags: u32 {
+        const TAKEN = 1 << 0;
+        const SLOT_WAITED = 1 << 1;
+    }
 }
 
 #[cfg(test)]

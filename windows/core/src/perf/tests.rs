@@ -69,6 +69,50 @@ fn perf_window_enc_work_independent_of_drawable_wait() {
     assert_eq!(w.drawable_wait.sum, 5000);
 }
 
+/// A sample with the submit thread's execute and its wait for the previous present.
+const fn sample_submit(enc_cyc: u64, submit_exec: u64, present_wait: u64) -> FrameSample {
+    let mut s = sample(enc_cyc, 0);
+    s.enc.submit_exec_cycles = submit_exec;
+    s.enc.present_wait_cycles = present_wait;
+    s
+}
+
+/// The wait for the previous present is submit-thread time, never encoder CPU.
+#[test]
+fn perf_window_enc_work_independent_of_present_wait() {
+    let mut w = PerfWindow::new();
+    w.accumulate(&sample_submit(100, 6000, 5000));
+    assert_eq!(w.enc_work.sum, 100);
+    assert_eq!(w.present_wait.sum, 5000);
+    assert_eq!(w.submit_exec.sum, 6000);
+}
+
+/// `Encode+commit`'s peak is the execute less the present wait, on any one frame.
+#[test]
+fn perf_window_encode_commit_excludes_present_wait() {
+    let mut w = PerfWindow::new();
+    w.accumulate(&sample_submit(0, 1000, 400));
+    w.accumulate(&sample_submit(0, 900, 100));
+    assert_eq!(w.encode_commit.max, 800);
+    assert_eq!(w.submit_exec.sum, 1900);
+}
+
+/// Snapshots carry across the per-frame reset and clear once sampled.
+#[test]
+fn snapshots_survive_begin_frame_until_sampled() {
+    let mut state = EncoderPerfState::new();
+    state.bump_snapshot();
+    state.bump_snapshot();
+    state.bump_slot_wait();
+    state.begin_frame(&FramePerfPayload::default());
+    assert_eq!(
+        state.enc.snapshots, 2,
+        "the barrier's bumps outlive the reset"
+    );
+    assert_eq!(state.enc.slot_waits, 1, "and so does the wait it counted");
+    assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
+}
+
 /// `ApiPerfState::drain_into_payload` moves counters to the payload and zeroes the source.
 ///
 /// First-frame `frame_total` must be 0 (no predecessor TSC yet);
@@ -301,10 +345,15 @@ fn summary_golden_layout() {
         "\n",
         "Submit thread           6.10 ms                                             peak  6.10 ms\n",
         "├─ Encode+commit        0.10 ms                       command-walk → Metal  peak  0.10 ms\n",
-        "└─ Drawable wait        6.00 ms                       nextDrawable GPU+comp peak  6.00 ms\n",
+        "└─ Present wait         6.00 ms                       prior present commit  peak  6.00 ms\n",
+        "\n",
+        "Present thread          6.00 ms                                             peak  6.00 ms\n",
+        "├─ Drawable wait        6.00 ms                       nextDrawable GPU+comp peak  6.00 ms\n",
+        "├─ Snapshots                      (         1)        presented from a copy\n",
+        "└─ Slot waits                     (         0)        copy waited for a present\n",
         "\n",
         "Frame total            10.00 ms                                             peak 10.00 ms\n",
-        "submit_status=0x0   (API, Encoder, Submit run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + gpu_wait))\n",
+        "submit_status=0x0   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait))\n",
         "\n",
         "Resources (VB/IB)  — window totals; depth/retention averaged\n",
         "rename      VB=12     IB=3          peak/frame VB=12  IB=3      API: PageBox alloc on contended Lock(DISCARD) or whole-buffer Lock\n",
@@ -392,7 +441,11 @@ fn summary_contains_expected_sections() {
         "└─ Submit stall",
         "Submit thread",
         "├─ Encode+commit",
-        "└─ Drawable wait",
+        "└─ Present wait",
+        "Present thread",
+        "├─ Drawable wait",
+        "├─ Snapshots",
+        "└─ Slot waits",
         "Frame total",
         "submit_status=0x0",
         "Resources (VB/IB)",
@@ -592,12 +645,18 @@ fn sample_window() -> PerfWindow {
             fan_generated: 0,
             pipeline_memo_calls: 100,
             submit_cycles: 300_000,
-            // Submit thread: total execute 6.1M = encode+commit 0.1M +
-            // drawable wait 6.0M.
+            // Presenter: the last present waited 6.0M for its drawable.
             drawable_wait_cycles: 6_000_000,
+            // Submit thread: total execute 6.1M = encode+commit 0.1M +
+            // present wait 6.0M.
             submit_exec_cycles: 6_100_000,
             // 0.2M backpressure stall → Finalize 0.10M, stall 0.20M.
             submit_stall_cycles: 200_000,
+            present_wait_cycles: 6_000_000,
+            // One read-back in the window presented its frame from a copy,
+            // and no copy waited for a slot.
+            snapshots: 1,
+            slot_waits: 0,
         },
         passes: 4,
         commands: 140,

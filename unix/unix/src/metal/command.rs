@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::{
     collections::BTreeMap,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -20,9 +20,8 @@ use mtld3d_shared::{
         MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
         MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
     },
-    perf::NanosSetTimer,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSRange};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
@@ -293,7 +292,7 @@ fn record_failed_submit(
 }
 
 /// Preserve the driver description shared by frame and readback failure diagnostics.
-fn command_buffer_error(error: Option<&NSError>) -> (u64, String) {
+pub fn command_buffer_error(error: Option<&NSError>) -> (u64, String) {
     error.map_or_else(
         || (0, String::new()),
         |e| {
@@ -333,11 +332,12 @@ impl core::fmt::Display for BlitSite {
     }
 }
 
-/// Processes a frame into one `MTLCommandBuffer`.
+/// Processes a frame into its command buffers and commits them.
 ///
 /// Encodes each `PassDescriptor` as a distinct `MTLRenderCommandEncoder`
-/// with its own attachments and load actions, optionally blits the
-/// backbuffer to the drawable, and commits.
+/// with its own attachments and load actions, settles the pending present
+/// against this frame's writes, commits, and hands the presenter what it
+/// needs to show the frame once a drawable is available.
 pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
     submit_frame_with(params, encode_frame)
 }
@@ -384,7 +384,7 @@ fn retire_failed_submit(params: &SubmitFrameParams) {
 }
 
 /// Publish a sequence into one of the stable PE-side retirement counters.
-fn advance_counter(pointer: u64, seq: u64) {
+pub fn advance_counter(pointer: u64, seq: u64) {
     if pointer != 0 {
         // SAFETY: SubmitFrame carries stable PE AtomicU64 pointers kept live
         // through this call and every registered command buffer's completion.
@@ -395,6 +395,8 @@ fn advance_counter(pointer: u64, seq: u64) {
 
 fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     params.drawable_wait_ns = 0;
+    params.present_wait_ns = 0;
+    params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
     mtld3d_shared::crumb!("submit:enter", params.queue_handle.raw(), params.pass_count);
     mtld3d_shared::crumb!("submit:queueret", params.queue_handle.raw());
     let Some(queue) = params.queue_handle.into_retained() else {
@@ -445,11 +447,15 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
         }
     };
     let upload_pass_count = params.upload_pass_count as usize;
+    let mut upload_cb = None;
     let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
-        if (!blits.is_empty() || upload_pass_count != 0)
-            && !submit_upload_cmd_buf(&queue, blits, &passes[..upload_pass_count], params)
-        {
-            return false;
+        if !blits.is_empty() || upload_pass_count != 0 {
+            let Some(cb) =
+                encode_upload_cmd_buf(&queue, blits, &passes[..upload_pass_count], params)
+            else {
+                return false;
+            };
+            upload_cb = Some(cb);
         }
         upload_pass_count
     } else {
@@ -471,241 +477,49 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
         }
     }
 
-    // Present: blit backbuffer → drawable
-    if !params.present_layer.is_null() {
-        // The layer is retained from its raw address without the registry's
-        // liveness check because the view that owns it is retired only by
-        // `retire_metal_view`, from `DestroyCommandQueue` and
-        // `DetachMetalLayer`, and both of their PE callers first drain the
-        // submit thread and wait for GPU idle, so no present is in flight
-        // while the address goes stale. The registry check exists for the
-        // main-thread observers, which nobody drains.
+    // Presentation: what the presenter needs once this frame's render work
+    // has committed. The layer and the back buffer are retained here from the
+    // addresses the PE side keeps valid until it has drained the submit thread
+    // and waited for presentation to go idle, which every path that retires
+    // them does first; the packet owns the retains from here on.
+    let mut packet = if params.present_layer.is_null() {
+        None
+    } else {
         mtld3d_shared::crumb!("submit:layerret", params.present_layer.raw());
-        let Some(layer) =
-            crate::metal::handle::IntoRetainedLayer::into_retained(params.present_layer)
-        else {
-            cmd_buf.commit();
-            return true;
-        };
+        let layer = crate::metal::handle::IntoRetainedLayer::into_retained(params.present_layer);
         mtld3d_shared::crumb!("submit:texret", params.present_texture.raw());
-        let Some(present_texture) = params.present_texture.into_retained() else {
-            cmd_buf.commit();
-            return true;
-        };
-
-        // The record attach created for this device's window carries the
-        // display state the present reads; a layer with no record presents
-        // with the defaults a session on no display would use.
-        let present_view = usize::try_from(params.present_view.raw())
-            .expect("a 64-bit host addresses every view pointer");
-        let attachment = attachment::find(present_view);
-        if attachment.is_none() {
+        let texture = params.present_texture.into_retained();
+        if let (Some(layer), Some(texture)) = (layer, texture) {
+            let view = usize::try_from(params.present_view.raw())
+                .expect("a 64-bit host addresses every view pointer");
+            Some(super::presenter::PresentPacket::new(
+                params.submit_seq,
+                texture,
+                layer,
+                view,
+            ))
+        } else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "submit_frame: present view {present_view:#x} has no attachment record; \
-                 presenting as not occluded, headroom 1.0, unthrottled, stretch route",
+                "submit_frame: the layer or the back buffer could not be retained; the \
+                 frame is not presented",
             );
-        }
-        let occluded = attachment.as_ref().is_some_and(|att| att.window_occluded());
-        let drawable_opt = if occluded {
-            // Window fully occluded: the compositor isn't recycling drawables,
-            // so `nextDrawable` would block its full timeout for nothing that
-            // reaches the screen. Skip the acquire entirely — the command
-            // buffer still commits below (the frame's render work executes and
-            // the coherent sequence advances), so the pipeline never
-            // back-pressures and the guest's render loop keeps running.
-            mtld3d_shared::crumb!("submit:occluded-skip", params.present_layer.raw());
             None
-        } else {
-            // Re-point the drawable at the layer's backing store before
-            // acquiring one. A window resize changes the layer under us and
-            // `drawableSize` does not follow on its own, so without this the
-            // frames between the resize and the guest's own reaction would
-            // be composited at the old size, which means rescaled.
-            super::macdrv::sync_drawable_size(&layer);
-            mtld3d_shared::crumb!("submit:nextdraw", params.present_layer.raw());
-            let drawable = {
-                let _wait = NanosSetTimer::start(&raw mut params.drawable_wait_ns);
-                layer.nextDrawable()
-            };
-            if drawable.is_none() {
-                // Visible, yet no drawable within the timeout — a rare
-                // compositor stall, or an occlusion signal that hasn't
-                // propagated yet. The frame is dropped (committed below without
-                // a present); surface the otherwise-silent ~1s stall.
-                mtld3d_shared::crumb!(
-                    "submit:nodrawable",
-                    params.present_layer.raw(),
-                    params.drawable_wait_ns,
-                );
-            }
-            // A nil drawable means `nextDrawable` exhausted its timeout;
-            // self-dump the ring on the onset and on recovery so an
-            // intermittent stall is captured in the log without manual timing.
-            mtld3d_shared::crumb::dump_on_stall_edge(drawable.is_none());
-            drawable
-        };
-        if let Some(drawable) = drawable_opt {
-            let drawable_texture = drawable.texture();
-
-            // HDR present: when the layer is configured for EDR
-            // (RGBA16Float + an extended-linear colorspace + wantsEDR),
-            // the drawable expects *linear* float values — a raw blit
-            // copy of the game's gamma-encoded BGRA8 backbuffer into
-            // an RGBA16Float drawable reinterprets the bytes and
-            // produces magenta noise. So once we're on the HDR layer
-            // we're committed to running the present shader.
-            //
-            // Feed the *live* dynamic headroom directly into the
-            // shader, with no bootstrap and no latch. When `current >
-            // 1.0` the panel is in EDR mode and the BT.2446 curve
-            // boosts the midtones to fill that range. When `current ==
-            // 1.0` the panel has no EDR headroom right now — either
-            // macOS hasn't promoted the screen yet (early frames) or
-            // brightness/thermal state physically rules it out for the
-            // session. In that case the shader short-circuits to a
-            // sRGB→linear pass-through (see `hdr_present.rs`), which
-            // writes correct SDR-equivalent values into the
-            // ExtendedLinear layer instead of crushing the image with
-            // an over-headroom BT.2446 boost. macOS global-scales
-            // content that exceeds the current EDR ceiling
-            // (multiplies every pixel by `current_max /
-            // requested_peak`), so any peak > current is a guaranteed
-            // visible regression — the OS clamps and dims the entire
-            // image. Following the live ceiling avoids that entirely.
-            // The back buffer is the grid we rasterized on; the drawable is
-            // the layer's own surface. Whatever the two sizes are, present
-            // resolves them here — nothing downstream can, since the
-            // compositor sees only a finished drawable.
-            let device = cmd_buf.device();
-            let geometry = PresentGeometry {
-                src: (present_texture.width(), present_texture.height()),
-                dst: (drawable_texture.width(), drawable_texture.height()),
-            };
-            // An enlargement the geometry has not settled on yet takes the
-            // shader rather than building a scaler for a size that is about
-            // to change again. See `SETTLED_PRESENTS`. The streak is the
-            // record's, so two devices at different geometries settle apart.
-            let settled = attachment
-                .as_ref()
-                .is_some_and(|att| att.present_settled(geometry));
-            let route = match present_route(
-                geometry.src,
-                geometry.dst,
-                super::upscale::is_available(&device),
-            ) {
-                PresentRoute::Upscale if !settled => PresentRoute::Stretch,
-                route => route,
-            };
-            // Reads what the main thread last published and queues the next
-            // refresh when due. Deriving it here would mean walking
-            // NSView.window on this thread, which is what crashes inside
-            // AppKit while the main thread rebuilds window and screen state.
-            // Polled every present, not only under HDR: the refresh it queues
-            // is also what reconciles the layer with the display the window is
-            // on, and a session that started SDR has to notice a panel with
-            // headroom appearing under it.
-            let current = attachment
-                .as_ref()
-                .map_or(1.0, attachment::current_headroom);
-            // The pointer check rides the present cadence so a system tool
-            // taking the pointer is noticed without a wakeup of its own.
-            super::macdrv::poll_from_present();
-            // The layer follows that display, so its pixel format can change
-            // between two presents. Take the route from the drawable we are
-            // about to write rather than from a latch read a moment earlier: a
-            // float drawable must run the HDR pass whatever the latch says,
-            // and a BGRA8 drawable must not, because the HDR pipelines declare
-            // a float colour attachment.
-            let hdr = drawable_texture.pixelFormat() == MTLPixelFormat::RGBA16Float;
-
-            let presented = if hdr {
-                match route {
-                    PresentRoute::Upscale => encode_hdr_present_upscaled(
-                        &cmd_buf,
-                        params.queue_handle,
-                        &present_texture,
-                        &drawable_texture,
-                        current,
-                    ),
-                    // The tone-map pass samples through `filter::linear`, so
-                    // one encode covers both an exact present and a
-                    // minification.
-                    PresentRoute::Copy | PresentRoute::Stretch => {
-                        encode_hdr_present(&cmd_buf, &present_texture, &drawable_texture, current)
-                    }
-                }
-            } else {
-                match route {
-                    // Extents match: the blit below is exact and cheaper than
-                    // a render pass.
-                    PresentRoute::Copy => false,
-                    // A scaler Metal declines after `is_available` said yes
-                    // still has to write every drawable pixel, so it falls
-                    // through to the stretch rather than to the blit.
-                    PresentRoute::Upscale => {
-                        super::upscale::encode(
-                            &cmd_buf,
-                            &device,
-                            params.queue_handle,
-                            &present_texture,
-                            &drawable_texture,
-                            MTLFXSpatialScalerColorProcessingMode::Perceptual,
-                        ) || encode_present_copy(&cmd_buf, &present_texture, &drawable_texture)
-                    }
-                    PresentRoute::Stretch => {
-                        encode_present_copy(&cmd_buf, &present_texture, &drawable_texture)
-                    }
-                }
-            };
-            if !presented {
-                if hdr {
-                    // No blit fallback on the HDR layer: a `copyFromTexture`
-                    // from the BGRA8 backbuffer into an RGBA16Float drawable
-                    // is invalid API use, so Metal kills the command buffer
-                    // and the drawable is presented with nothing written,
-                    // which reads as magenta noise. A defined black frame is
-                    // the only correct fallback here.
-                    mtld3d_shared::log_once_warn!(
-                        target: LOG_TARGET,
-                        "present: HDR present pass failed to encode {}x{} → {}x{}; \
-                         presenting a cleared drawable instead",
-                        geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
-                    );
-                    clear_drawable(&cmd_buf, &drawable_texture);
-                } else {
-                    encode_present_blit(
-                        &cmd_buf,
-                        &present_texture,
-                        &drawable_texture,
-                        route,
-                        params.present_texture.raw(),
-                    );
-                }
-            }
-
-            mtld3d_shared::crumb!("submit:present", params.drawable_wait_ns);
-            // Throttle presents to `1/panel_max_hz` when the guest asked
-            // for vsync (PE-side `D3DPRESENT_INTERVAL_*` mapping). On a
-            // ProMotion panel the system adapts the panel rate to whatever
-            // sub-max cadence we sustain under the cap, so fractional
-            // production rates display at their actual rate. `0.0` means
-            // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
-            let drawable_obj = ProtocolObject::from_ref(&*drawable);
-            let min_duration = attachment
-                .as_ref()
-                .map_or(0.0, |att| att.min_present_duration_sec());
-            if min_duration > 0.0 {
-                cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
-            } else {
-                cmd_buf.presentDrawable(drawable_obj);
-            }
-            // Debug and trace output only, so the per-frame block allocation
-            // and handler registration are skipped when the target is off.
-            if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
-                register_presented_probe(&drawable, params.submit_seq, params.drawable_wait_ns);
-            }
         }
+    };
+    let presenter = super::presenter::find(params.queue_handle);
+    if packet.is_some() && presenter.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "submit_frame: queue {:#x} has no presenter; the frame is not presented",
+            params.queue_handle.raw(),
+        );
+        packet = None;
+    }
+    // Everything is encoded and nothing has committed: settle what the
+    // pending present reads before this frame's render work can overwrite it.
+    if let Some(state) = &presenter {
+        super::presenter::resolve_present_conflict(state, &queue, params, packet.is_some());
     }
 
     super::upscale::retire_evicted(&cmd_buf, params.queue_handle);
@@ -763,30 +577,251 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
                 let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
                 atomic.fetch_max(seq, Ordering::Release);
                 mtld3d_shared::crumb!("submit:retire", seq);
-                let _ = PENDING_CMDBUFS.lock().unwrap().remove(&(device, seq));
+                unregister_pending(device, seq);
             },
         );
         // SAFETY: objc2 typed binding; `handler` is kept alive on the stack
-        // until `commit()` below, at which point Metal has retained the block.
+        // until the commit below, at which point Metal has retained the block.
         unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
-
-        // Register the cmdbuf for `wait_for_gpu_retire` lookups before
-        // committing. Cloning a `Retained` is a refcount bump.
-        PENDING_CMDBUFS
-            .lock()
-            .unwrap()
-            .insert((device, seq), PendingCmdBuf(cmd_buf.clone()));
     }
 
+    // The upload buffer goes first on the queue, so the render work that
+    // samples its uploads runs after them; both register for the retirement
+    // waits at their commit, never before, so a submission that fails midway
+    // leaves nothing registered that never commits.
+    if let Some(upload_cb) = upload_cb {
+        mtld3d_shared::crumb!("submit:upcommit");
+        commit_registered(
+            &upload_cb,
+            params.upload_coherent_seq_ptr,
+            params.submit_seq,
+        );
+    }
     mtld3d_shared::crumb!("submit:commit");
-    cmd_buf.commit();
+    commit_registered(&cmd_buf, params.coherent_seq_ptr, params.submit_seq);
+    if let (Some(state), Some(packet)) = (presenter, packet) {
+        mtld3d_shared::crumb!("submit:push", params.submit_seq);
+        params.drawable_wait_ns = super::presenter::push(&state, packet);
+    }
     mtld3d_shared::crumb!("submit:done");
     true
 }
 
+/// A frame's present as the presenter encodes it.
+///
+/// Everything the route selection reads besides the command buffer and the
+/// drawable: the queue the upscale caches are keyed by, the device's
+/// attachment record, the texture to present and the frame's identity.
+pub struct PresentEncode<'a> {
+    pub queue: MetalHandle<MTLCommandQueueKind>,
+    pub attachment: Option<&'a Arc<attachment::Attachment>>,
+    pub source: &'a ProtocolObject<dyn MTLTexture>,
+    /// The wire handle of `source`, for the blit fallback's log line.
+    pub source_raw: u64,
+    pub seq: u64,
+    /// The `nextDrawable` wait of this present, for the cadence probe.
+    pub drawable_wait_ns: u64,
+}
+
+/// Encode the present of `args.source` into `drawable` and queue its presentation.
+///
+/// One of three routes (`present_route`) with their fallbacks, then the
+/// throttled `presentDrawable`. Runs on the presenter thread under its
+/// state's lock; reads the attachment record's atomics and touches no
+/// `AppKit` object.
+pub fn encode_present(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    args: &PresentEncode<'_>,
+) {
+    let attachment = args.attachment;
+    let drawable_texture = drawable.texture();
+
+    // HDR present: when the layer is configured for EDR
+    // (RGBA16Float + an extended-linear colorspace + wantsEDR),
+    // the drawable expects *linear* float values — a raw blit
+    // copy of the game's gamma-encoded BGRA8 backbuffer into
+    // an RGBA16Float drawable reinterprets the bytes and
+    // produces magenta noise. So once we're on the HDR layer
+    // we're committed to running the present shader.
+    //
+    // Feed the *live* dynamic headroom directly into the
+    // shader, with no bootstrap and no latch. When `current >
+    // 1.0` the panel is in EDR mode and the BT.2446 curve
+    // boosts the midtones to fill that range. When `current ==
+    // 1.0` the panel has no EDR headroom right now — either
+    // macOS hasn't promoted the screen yet (early frames) or
+    // brightness/thermal state physically rules it out for the
+    // session. In that case the shader short-circuits to a
+    // sRGB→linear pass-through (see `hdr_present.rs`), which
+    // writes correct SDR-equivalent values into the
+    // ExtendedLinear layer instead of crushing the image with
+    // an over-headroom BT.2446 boost. macOS global-scales
+    // content that exceeds the current EDR ceiling
+    // (multiplies every pixel by `current_max /
+    // requested_peak`), so any peak > current is a guaranteed
+    // visible regression — the OS clamps and dims the entire
+    // image. Following the live ceiling avoids that entirely.
+    // The back buffer is the grid we rasterized on; the drawable is
+    // the layer's own surface. Whatever the two sizes are, present
+    // resolves them here — nothing downstream can, since the
+    // compositor sees only a finished drawable.
+    let device = cmd_buf.device();
+    let geometry = PresentGeometry {
+        src: (args.source.width(), args.source.height()),
+        dst: (drawable_texture.width(), drawable_texture.height()),
+    };
+    // An enlargement the geometry has not settled on yet takes the
+    // shader rather than building a scaler for a size that is about
+    // to change again. See `SETTLED_PRESENTS`. The streak is the
+    // record's, so two devices at different geometries settle apart.
+    let settled = attachment.is_some_and(|att| att.present_settled(geometry));
+    let route = match present_route(
+        geometry.src,
+        geometry.dst,
+        super::upscale::is_available(&device),
+    ) {
+        PresentRoute::Upscale if !settled => PresentRoute::Stretch,
+        route => route,
+    };
+    // Reads what the main thread last published and queues the next
+    // refresh when due. Deriving it here would mean walking
+    // NSView.window on this thread, which is what crashes inside
+    // AppKit while the main thread rebuilds window and screen state.
+    // Polled every present, not only under HDR: the refresh it queues
+    // is also what reconciles the layer with the display the window is
+    // on, and a session that started SDR has to notice a panel with
+    // headroom appearing under it.
+    let current = attachment.map_or(1.0, attachment::current_headroom);
+    // The pointer check rides the present cadence so a system tool
+    // taking the pointer is noticed without a wakeup of its own.
+    super::macdrv::poll_from_present();
+    // The layer follows that display, so its pixel format can change
+    // between two presents. Take the route from the drawable we are
+    // about to write rather than from a latch read a moment earlier: a
+    // float drawable must run the HDR pass whatever the latch says,
+    // and a BGRA8 drawable must not, because the HDR pipelines declare
+    // a float colour attachment.
+    let hdr = drawable_texture.pixelFormat() == MTLPixelFormat::RGBA16Float;
+
+    let presented = if hdr {
+        match route {
+            PresentRoute::Upscale => encode_hdr_present_upscaled(
+                cmd_buf,
+                args.queue,
+                args.source,
+                &drawable_texture,
+                current,
+            ),
+            // The tone-map pass samples through `filter::linear`, so
+            // one encode covers both an exact present and a
+            // minification.
+            PresentRoute::Copy | PresentRoute::Stretch => {
+                encode_hdr_present(cmd_buf, args.source, &drawable_texture, current)
+            }
+        }
+    } else {
+        match route {
+            // Extents match: the blit below is exact and cheaper than
+            // a render pass.
+            PresentRoute::Copy => false,
+            // A scaler Metal declines after `is_available` said yes
+            // still has to write every drawable pixel, so it falls
+            // through to the stretch rather than to the blit.
+            PresentRoute::Upscale => {
+                super::upscale::encode(
+                    cmd_buf,
+                    &device,
+                    args.queue,
+                    args.source,
+                    &drawable_texture,
+                    MTLFXSpatialScalerColorProcessingMode::Perceptual,
+                ) || encode_present_copy(cmd_buf, args.source, &drawable_texture)
+            }
+            PresentRoute::Stretch => encode_present_copy(cmd_buf, args.source, &drawable_texture),
+        }
+    };
+    if !presented {
+        if hdr {
+            // No blit fallback on the HDR layer: a `copyFromTexture`
+            // from the BGRA8 backbuffer into an RGBA16Float drawable
+            // is invalid API use, so Metal kills the command buffer
+            // and the drawable is presented with nothing written,
+            // which reads as magenta noise. A defined black frame is
+            // the only correct fallback here.
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "present: HDR present pass failed to encode {}x{} → {}x{}; \
+                 presenting a cleared drawable instead",
+                geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
+            );
+            clear_drawable(cmd_buf, &drawable_texture);
+        } else {
+            encode_present_blit(
+                cmd_buf,
+                args.source,
+                &drawable_texture,
+                route,
+                args.source_raw,
+            );
+        }
+    }
+
+    mtld3d_shared::crumb!("submit:present", args.drawable_wait_ns);
+    // Throttle presents to `1/panel_max_hz` when the guest asked
+    // for vsync (PE-side `D3DPRESENT_INTERVAL_*` mapping). On a
+    // ProMotion panel the system adapts the panel rate to whatever
+    // sub-max cadence we sustain under the cap, so fractional
+    // production rates display at their actual rate. `0.0` means
+    // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
+    let drawable_obj = ProtocolObject::from_ref(drawable);
+    let min_duration = attachment.map_or(0.0, |att| att.min_present_duration_sec());
+    if min_duration > 0.0 {
+        cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
+    } else {
+        cmd_buf.presentDrawable(drawable_obj);
+    }
+    // Debug and trace output only, so the per-frame block allocation
+    // and handler registration are skipped when the target is off.
+    if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
+        register_presented_probe(drawable, args.seq, args.drawable_wait_ns);
+    }
+}
+
+/// Register `cb` for the retirement waits under `counter`, then commit it.
+///
+/// Registration and commit are one step so that nothing registered ever
+/// stays uncommitted, which would hang a wait on it. A zero counter or
+/// sequence (a frame stamped before its counters were wired) commits
+/// without registering, as its completion handler was not installed either.
+pub fn commit_registered(cb: &ProtocolObject<dyn MTLCommandBuffer>, counter: u64, seq: u64) {
+    if counter != 0 && seq > 0 {
+        register_pending(counter, seq, cb.retain());
+    }
+    cb.commit();
+}
+
+/// Put `cb` into the in-flight map under `(counter, seq)`.
+///
+/// The retain is what keeps the buffer addressable for a wait after
+/// `commit()` hands ownership to Metal.
+fn register_pending(counter: u64, seq: u64, cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
+    PENDING_CMDBUFS
+        .lock()
+        .unwrap()
+        .insert((counter, seq), PendingCmdBuf(cb));
+}
+
+/// Take `(counter, seq)` out of the in-flight map, if it is there.
+pub fn unregister_pending(counter: u64, seq: u64) {
+    let _ = PENDING_CMDBUFS.lock().unwrap().remove(&(counter, seq));
+}
+
 /// Encode the frame-leading (texture-upload) blits into a dedicated command buffer.
 ///
-/// It is committed *before* the draw CB. Its completion handler
+/// Handed back uncommitted: the caller commits it ahead of the draw CB once
+/// the pending present is settled, through `commit_registered`, which is
+/// also where it enters the retirement map. Its completion handler
 /// `fetch_max`es `submit_seq` into the PE-side `upload_coherent_seq`
 /// atomic, so the next frame's contended texture `LockRect` can observe
 /// the upload as retired and write in place instead of renaming +
@@ -799,19 +834,19 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
 /// committed without a draw buffer, and must wait for it and its handler
 /// before releasing the PE backing or either callback sink.
 /// Render uploads and their interleaved blits share this buffer, so its
-/// retirement covers every staging read. Returns `false` on creation or encoding failure.
-fn submit_upload_cmd_buf(
+/// retirement covers every staging read. `None` on creation or encoding failure.
+fn encode_upload_cmd_buf(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     blits: &[BlitCommand],
     passes: &[PassDescriptor],
     params: &SubmitFrameParams,
-) -> bool {
+) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let submit_seq = params.submit_seq;
     let upload_coherent_seq_ptr = params.upload_coherent_seq_ptr;
     mtld3d_shared::crumb!("submit:upcmdbuf");
     let Some(upload_cb) = diagnostics::command_buffer(queue) else {
         error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
-        return false;
+        return None;
     };
     {
         let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
@@ -825,11 +860,11 @@ fn submit_upload_cmd_buf(
             BlitSite::FrameLeading,
         )
     {
-        return false;
+        return None;
     }
     for (pass_idx, pass) in passes.iter().enumerate() {
         if !encode_pass(&upload_cb, pass, pass_idx) {
-            return false;
+            return None;
         }
     }
     if submit_seq > 0 {
@@ -871,23 +906,14 @@ fn submit_upload_cmd_buf(
                 let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
                 atomic.fetch_max(seq, Ordering::Release);
                 mtld3d_shared::crumb!("submit:upretire", seq);
-                let _ = PENDING_CMDBUFS
-                    .lock()
-                    .unwrap()
-                    .remove(&(upload_coherent_seq_ptr, seq));
+                unregister_pending(upload_coherent_seq_ptr, seq);
             },
         );
         // SAFETY: objc2 typed binding; Metal copies the block on
         // `addCompletedHandler`, so the local `handler` may drop after.
         unsafe { upload_cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
-        PENDING_CMDBUFS.lock().unwrap().insert(
-            (upload_coherent_seq_ptr, seq),
-            PendingCmdBuf(upload_cb.clone()),
-        );
     }
-    mtld3d_shared::crumb!("submit:upcommit");
-    upload_cb.commit();
-    true
+    Some(upload_cb)
 }
 
 /// How present resolves the back buffer onto the drawable.
@@ -923,8 +949,9 @@ pub struct PresentGeometry {
 ///
 /// The state behind [`geometry_settled`], owned by the attachment record so
 /// that two devices presenting at different geometries each settle on their
-/// own. Only `submit_frame` advances it, from the thread that submits that
-/// device's frames; the mutex is for the shared record, not for contention.
+/// own. Only the presenter advances it, from the one thread that presents
+/// that device's frames; the mutex is for the shared record, not for
+/// contention.
 pub struct GeometryStreak(Mutex<Option<(PresentGeometry, u32)>>);
 
 impl GeometryStreak {

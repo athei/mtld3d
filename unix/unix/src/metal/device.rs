@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{path::PathBuf, sync::LazyLock};
 
 use mtld3d_shared::{
     MetalHandle,
@@ -218,11 +218,20 @@ pub struct DeviceCaps {
 /// Snapshots the device caps the PE side needs at creation time. Every D3D
 /// device is handed the same `MTLDevice`, so the process-wide Metal caches and
 /// the command buffers that bind from them always name one device.
-pub fn create_command_queue() -> Option<DeviceCaps> {
+pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     let device = pinned_device()?;
     let queue = device.newCommandQueue()?;
     let queue_label = objc2_foundation::NSString::from_str("mtld3d");
     queue.setLabel(Some(&queue_label));
+    // The presentation record is keyed by the address the handle below
+    // carries, so it is registered on the still-retained queue.
+    // SAFETY: `Retained::as_ptr` is the address `into_raw` hands out below,
+    // and the handle is used only as the record's key until then.
+    let queue_key =
+        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::as_ptr(&queue) as u64) };
+    if !super::presenter::register(queue_key, gate) {
+        return None;
+    }
     let unified_memory = device.hasUnifiedMemory();
     let min_linear_texture_align = u32::try_from(
         device.minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::BGRA8Unorm),
@@ -261,6 +270,11 @@ pub fn destroy_command_queue(
     pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>,
     depth_texture_handle: MetalHandle<MTLTextureKind>,
 ) {
+    // The presenter first: it may still be inside `nextDrawable` on the
+    // layer this call retires, and its last present must be committed before
+    // the fence below can order it. The PE side has already drained its
+    // submit thread and waited for presentation to go idle.
+    super::presenter::unregister_and_join(queue_handle);
     // Drop the latched view, layer and window first: the main thread
     // reconciles them against the display it is told about, and this call is
     // about to release the view all three belong to.

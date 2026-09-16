@@ -1594,6 +1594,13 @@ fn shrink_layer_drawable(layer: usize, _mtm: MainThreadMarker) {
 /// park ([`shrink_parked_layer`]).
 const KEPT_METAL_VIEWS: usize = 4;
 
+/// Drawables the layer hands out before one has to come back from the display.
+///
+/// Three explicit drawables; two starves at 120 Hz under jitter. The
+/// presenter's snapshot ring is sized from it: a present queued deeper than
+/// this reaches the screen no sooner for a slot of its own.
+pub const DRAWABLE_POOL_DEPTH: usize = 3;
+
 /// One kept metal view: raw addresses and the window it served.
 struct KeptMetalView {
     /// The `HWND` the view was attached to, `0` in an empty slot.
@@ -2278,8 +2285,7 @@ fn configure_metal_layer_inner(
     // IMMEDIATE free-run. The duration itself is derived by the caller and
     // kept on the attachment record.
     layer.setDisplaySyncEnabled(false);
-    // 3 explicit drawables; 2 starves at 120 Hz under jitter.
-    layer.setMaximumDrawableCount(3);
+    layer.setMaximumDrawableCount(DRAWABLE_POOL_DEPTH);
     // Default true; surface stalls surface as errors, not hangs.
     layer.setAllowsNextDrawableTimeout(true);
     // Default false; no AppKit surface sync needed.

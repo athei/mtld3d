@@ -1,5 +1,8 @@
 use core::ffi::c_void;
-use std::sync::{Arc, LazyLock};
+use std::{
+    path::Path,
+    sync::{Arc, LazyLock},
+};
 
 use log::{error, info, trace, warn};
 use mtld3d_core::{
@@ -1360,11 +1363,17 @@ extern "system" fn d3d9_create_device(
     }
 
     // Create Metal device + command queue
+    let gate = present_gate_unix_path(cfg);
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
         queue_handle: MetalHandle::NULL,
         unified_memory: 0,
         min_linear_texture_align: 0,
+        gate_file_ptr: gate.as_ref().map_or(0, |path| path.as_ptr() as u64),
+        gate_file_len: gate.as_ref().map_or(0, |path| {
+            u32::try_from(path.len()).expect("a gate path fits u32")
+        }),
+        pad0: 0,
     };
     let status = unix_call(&mut cq_params);
     if status != 0 {
@@ -1787,6 +1796,33 @@ pub const fn resolve_cursor_scale(
 /// `MetalFX` is the only thing that can resample a frame at present time, so a
 /// GPU without it has to render at exactly the presented size. Say so once
 /// rather than quietly ignoring the user's setting.
+/// The unix path of `debug.presentGateFile`, or `None` when there is no gate.
+///
+/// Relative paths join the executable's directory, as the log directory
+/// does; a path Wine cannot map disables the gate with a warning, since a
+/// presenter that never parks is the safe failure of a test seam.
+fn present_gate_unix_path(cfg: &Mtld3dConfig) -> Option<String> {
+    if cfg.present_gate_file.is_empty() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let dos = exe_dir.join(&cfg.present_gate_file);
+    let Some(unix) = crate::wine_path::unix_path(&dos) else {
+        warn!(
+            target: LOG_TARGET,
+            "debug.presentGateFile = {}: no unix path, the presenter is not gated",
+            dos.display(),
+        );
+        return None;
+    };
+    info!(
+        target: LOG_TARGET,
+        "present gate: {unix} (the presenter parks before each drawable while it exists)"
+    );
+    Some(unix)
+}
+
 fn resolve_render_scale(
     metalfx_available: bool,
     render_scale_percent: u32,

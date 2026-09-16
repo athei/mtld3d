@@ -38,7 +38,9 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     BlitTextureToBufferParams, CreateColorTargetParams, CreateDepthTextureParams,
-    DestroyCommandQueueParams, InPtr, InPtrMut, MetalHandle, OutPtr, ValueIn, VtableThis,
+    DestroyCommandQueueParams, InPtr, InPtrMut, MetalHandle, OutPtr, SetPresentWaitPolicyParams,
+    ValueIn, VtableThis,
+    mtl::PresentWaitPolicy,
     mtl_handle::{
         CAMetalLayerKind, MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind, NSViewKind,
     },
@@ -1541,9 +1543,32 @@ impl DeviceInner {
     /// backbuffer. Present is suppressed for this submission so the drawable
     /// is not consumed.
     pub fn flush_current_frame_blocking(&mut self) {
+        self.hurry_presentation();
         let fresh = self.fresh_frame();
         let (frame, _) = self.stamp_and_swap(fresh, true);
         self.encoder.mid_frame_submit(frame);
+    }
+
+    /// Let the submits in flight copy the present they wait for, ahead of a flush.
+    ///
+    /// A flush queues behind the encoder, and the encoder may be blocked on a
+    /// payload the submit thread holds while it waits for the previous
+    /// present to commit, which is a wait on the display. Setting the policy
+    /// here, before the flush is sent, wakes that submit into a copy so the
+    /// encoder, and then the flush, go on at once; the encoder's flush arm
+    /// puts the policy back once its own submission has committed. The one
+    /// thunk this side issues off the device lifecycle, and only on a path
+    /// that is already a synchronous read-back.
+    fn hurry_presentation(&self) {
+        if self.queue_handle.is_null() {
+            return;
+        }
+        let mut params = SetPresentWaitPolicyParams {
+            queue_handle: self.queue_handle,
+            policy: PresentWaitPolicy::SnapshotPending,
+            pad0: 0,
+        };
+        unix_call(&mut params);
     }
 
     /// Queue the current frame without presenting or waiting for its submission to finish.
@@ -1776,6 +1801,7 @@ impl DeviceInner {
     /// include same-frame retentions which `drain_retention_now` couldn't
     /// release.
     pub fn mid_frame_submit_for_retention(&mut self) {
+        self.hurry_presentation();
         let fresh = self.fresh_frame();
         let (frame, _) = self.stamp_and_swap(fresh, true);
         self.encoder.mid_frame_submit_for_retention(frame);
@@ -3560,9 +3586,12 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // queue, issuing the matching destroy thunks. The wait must run
         // before the encoder thread exits — `coherent_seq`'s
         // `Arc<AtomicU64>` lives inside `DeviceInner` and drops at the
-        // following `drop(device_inner)`. By the time `shutdown` returns
-        // here every MTLBuffer wrapping a `PageBox` the game ever
-        // Locked has been released.
+        // following `drop(device_inner)`. The same arm first waits for the
+        // presenter to consume every queued frame and for its last present
+        // to retire, so no present buffer reads the back buffer or the
+        // layer once they go. By the time `shutdown` returns here every
+        // MTLBuffer wrapping a `PageBox` the game ever Locked has been
+        // released.
         device_inner.shutdown();
 
         if !implicit_handles.is_empty() {

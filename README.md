@@ -149,9 +149,10 @@ game.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 `d3d9.dll` implements the API and holds every piece of D3D9 knowledge,
 `mtld3d.dll` is the PE shim that owns Wine's unix-call globals, and
 `mtld3d.so` is a pure Metal abstraction layer on the host. A frame flows
-through three threads: the game's API thread snapshots state, an encoder
-thread translates it into Metal commands, and a submit thread replays,
-presents and commits. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the
+through four threads: the game's API thread snapshots state, an encoder
+thread translates it into Metal commands, a submit thread replays and
+commits, and a presenter thread per device acquires the drawable and
+presents. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the
 boundary contract, the threading model, the workspace layout and the
 debugging toolkits.
 

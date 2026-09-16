@@ -33,11 +33,11 @@ fn release(caps: &DeviceCaps) {
 /// live after both handed-out retains are dropped.
 #[test]
 fn create_command_queue_hands_out_the_pinned_device() {
-    let Some(first) = create_command_queue() else {
+    let Some(first) = create_command_queue(None) else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
     };
-    let second = create_command_queue().expect("a second queue on the pinned device");
+    let second = create_command_queue(None).expect("a second queue on the pinned device");
     assert_eq!(
         first.device_handle.raw(),
         second.device_handle.raw(),
@@ -64,7 +64,7 @@ fn create_command_queue_hands_out_the_pinned_device() {
     release(&first);
     release(&second);
 
-    let third = create_command_queue().expect("a queue after both devices were destroyed");
+    let third = create_command_queue(None).expect("a queue after both devices were destroyed");
     let device = third
         .device_handle
         .into_retained()
