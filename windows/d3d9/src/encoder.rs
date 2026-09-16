@@ -62,8 +62,9 @@ use mtld3d_shared::{
     WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
-        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
-        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, VisibilityResultMode,
+        PRESENT_PIPELINE_DEPTH, PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind,
+        SnapshotFlags, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
+        TextureUsage, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -131,6 +132,19 @@ type EncoderFn = Box<dyn FnOnce(&mut FrameEncoder) + Send>;
 /// to ≤1 frame (the encoder can be at most one finalize ahead of the
 /// submit stage) and caps the pooled buffer memory at two payload sets.
 const SUBMIT_PAYLOAD_CAP: u32 = 2;
+
+/// Frames the API thread can queue for the encoder before `Present` blocks.
+const API_FRAME_CHANNEL_CAP: usize = 1;
+
+// The presenter's snapshot slots cover every present-bearing frame the
+// pipeline can hold ahead of a partial submit: the frame channel, the frame
+// the encoder holds while it waits for a payload, one frame per payload (on
+// the submit thread or in the work channel ahead of it), and the one present
+// the pacing rule leaves pending.
+const _: () = assert!(
+    PRESENT_PIPELINE_DEPTH == API_FRAME_CHANNEL_CAP + 1 + SUBMIT_PAYLOAD_CAP as usize + 1,
+    "the shared pipeline depth no longer matches the encoder's caps"
+);
 
 /// `u16` view of [`CONSTANT_ROWS`] for the populated-rows watermark arithmetic.
 ///
@@ -9160,7 +9174,7 @@ impl EncoderThread {
         config: Arc<Mtld3dConfig>,
         prewarm_rx: mpsc::Receiver<Option<WarmCache>>,
     ) -> Self {
-        let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(1);
+        let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(API_FRAME_CHANNEL_CAP);
         let handle = thread::Builder::new()
             .name("mtld3d-encoder".into())
             .spawn(move || encoder_thread_main(&receiver, &prewarm_rx, gpu_caps, config))

@@ -40,6 +40,7 @@ fn empty_inner() -> Inner {
         queue: MetalHandle::<MTLCommandQueueKind>::NULL,
         pending: VecDeque::new(),
         committed_present_seq: 0,
+        presented_seq: 0,
         flags: PresenterFlags::empty(),
         slots: [const { None }; SNAPSHOT_SLOTS],
         last_drawable_wait_ns: 0,
@@ -148,6 +149,12 @@ fn slots_prefer_free_then_the_oldest_reader() {
     inner.slots[3] = Some(slot(8));
     assert_eq!(
         choose_slot(&inner),
+        SlotChoice::Free(4),
+        "slots 0 to 3 busy, slot 4 unallocated"
+    );
+    inner.slots[4] = Some(slot(9));
+    assert_eq!(
+        choose_slot(&inner),
         SlotChoice::Busy(0),
         "all busy: the oldest reader"
     );
@@ -175,22 +182,51 @@ fn a_slot_at_another_geometry_is_replaced() {
 }
 
 #[test]
-fn a_dropped_packet_retires_its_sequence_and_frees_its_slot() {
+fn a_dropped_packet_frees_its_slot_and_leaves_retirement_alone() {
     let state = state_with(empty_inner());
     let mut inner = state.lock();
     inner.slots[1] = Some(slot(7));
     inner.slots[2] = Some(slot(8));
     inner.slots[3] = Some(slot(9));
+    inner.slots[4] = Some(slot(10));
     assert_eq!(choose_slot(&inner), SlotChoice::Free(0));
     inner.slots[0] = Some(slot(6));
     assert_eq!(choose_slot(&inner), SlotChoice::Busy(0));
-    drop_packet(&mut inner, &state, packet(7, Some(1)));
-    assert_eq!(inner.committed_present_seq, 7);
-    assert_eq!(state.present_retired.load(Ordering::Acquire), 7);
+    drop_packet(&mut inner, packet(7, Some(1)));
+    assert_eq!(inner.committed_present_seq, 7, "consumed like a commit");
+    assert_eq!(inner.presented_seq, 0, "nothing was committed to the GPU");
+    assert_eq!(
+        state.present_retired.load(Ordering::Acquire),
+        0,
+        "no present buffer carries a dropped sequence"
+    );
     assert_eq!(
         choose_slot(&inner),
         SlotChoice::Free(0),
         "readers 6 and 7 are at or below the committed sequence"
+    );
+}
+
+#[test]
+fn a_drop_behind_a_committed_present_keeps_its_retirement_pending() {
+    let mut inner = empty_inner();
+    // Present 5 committed and is still on the GPU; the counter is behind it.
+    inner.committed_present_seq = 5;
+    inner.presented_seq = 5;
+    inner.pending.push_back(packet(6, None));
+    let state = state_with(inner);
+    state.present_retired.store(4, Ordering::Release);
+    drop_front(&state, 6);
+    let inner = state.lock();
+    assert_eq!(inner.committed_present_seq, 6, "the drop is consumed");
+    assert_eq!(
+        inner.presented_seq, 5,
+        "an idle wait retires the last committed present"
+    );
+    assert_eq!(
+        state.present_retired.load(Ordering::Acquire),
+        4,
+        "only present 5's completion handler moves the counter"
     );
 }
 
@@ -267,11 +303,15 @@ fn an_idle_wait_returns_once_the_presenter_pops_the_last_packet() {
                 !inner.pending.is_empty() && !inner.flags.contains(PresenterFlags::STOP)
             })
             .unwrap_or_else(PoisonError::into_inner);
-        inner.committed_present_seq
+        (inner.committed_present_seq, inner.presented_seq)
     });
     thread::sleep(Duration::from_millis(20));
     drop_front(&state, 3);
-    assert_eq!(worker.join().expect("the waiter returned"), 3);
+    assert_eq!(
+        worker.join().expect("the waiter returned"),
+        (3, 0),
+        "the dropped packet is consumed and leaves nothing to retire"
+    );
 }
 
 #[test]

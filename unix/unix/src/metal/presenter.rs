@@ -43,7 +43,7 @@ use std::{
 use block2::RcBlock;
 use mtld3d_shared::{
     SubmitFrameParams,
-    mtl::{PresentWaitPolicy, SnapshotFlags},
+    mtl::{PRESENT_PIPELINE_DEPTH, PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
     perf::NanosSetTimer,
 };
@@ -58,23 +58,25 @@ use rustc_hash::FxHashMap;
 use super::{
     command::{self, PresentEncode, diagnostics},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
-    macdrv::{DRAWABLE_POOL_DEPTH, attachment},
+    macdrv::attachment,
     texture,
 };
 use crate::LOG_TARGET;
 
 /// Slots a snapshot can copy into, per queue.
 ///
-/// A slot frees when the present reading it commits, which takes a
-/// drawable, and the layer hands out [`DRAWABLE_POOL_DEPTH`] of those before
-/// one has to come back from the display. Presents queued up to that depth
-/// are the ones a copy can put ahead of the display at all; one more covers
-/// the flush that arrives before the presenter has committed anything, the
-/// frame after a flush hurried both submits in flight. Beyond that a
-/// snapshot waits for the oldest present to commit, which is the display's
-/// own pacing, and the perf grid's `Slot waits` counts it. Textures are
-/// allocated only when a copy needs the slot.
-pub const SNAPSHOT_SLOTS: usize = DRAWABLE_POOL_DEPTH + 1;
+/// A slot is busy from the copy until the present reading it commits, and
+/// the presents that can be pending at once are as many as the PE pipeline
+/// holds ahead of a partial submit, which is what [`PRESENT_PIPELINE_DEPTH`]
+/// counts. A read-back behind a full pipeline hurries every one of those
+/// frames past the presenter and copies each frame's image once, so this
+/// many slots keep one read-back off the display whatever the pipeline
+/// holds; one fewer and the last copy would wait for the oldest present to
+/// commit, which is the display's pacing again. Read-backs on consecutive
+/// frames that outrun the display still meet a busy ring, and the perf
+/// grid's `Slot waits` counts that. Textures are allocated only when a copy
+/// needs the slot.
+pub const SNAPSHOT_SLOTS: usize = PRESENT_PIPELINE_DEPTH;
 
 /// How often a parked presenter looks for the gate file to be gone.
 const GATE_POLL: Duration = Duration::from_millis(1);
@@ -109,11 +111,15 @@ pub struct PresentState {
     submit_cv: Condvar,
     /// Woken when a packet is pushed or `STOP` is set.
     presenter_cv: Condvar,
-    /// Highest presented sequence whose present buffer retired, or was dropped.
+    /// Highest sequence whose present buffer retired.
     ///
     /// The counter the present buffers register under in the in-flight map,
     /// so the retirement wait serves presentation as it serves rendering. It
     /// lives here rather than on the PE side because nothing there reads it.
+    /// Only a present buffer's completion handler advances it: a packet the
+    /// presenter drops has no buffer, and the idle wait targets the last
+    /// buffer that was committed (`Inner::presented_seq`), never a dropped
+    /// sequence.
     present_retired: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -123,7 +129,15 @@ struct Inner {
     /// Packets in presentation order; the front is the one being presented.
     pending: VecDeque<PresentPacket>,
     /// Sequence of the last packet the presenter committed or dropped.
+    ///
+    /// What a submit waits for and what frees a slot: a dropped packet
+    /// consumed its sequence like a committed one.
     committed_present_seq: u64,
+    /// Sequence of the last present buffer the presenter committed.
+    ///
+    /// What an idle wait retires. A dropped packet leaves it alone, since no
+    /// buffer carries the dropped sequence and none will retire it.
+    presented_seq: u64,
     flags: PresenterFlags,
     slots: [Option<Slot>; SNAPSHOT_SLOTS],
     /// The last present's `nextDrawable` wait, handed back to the next submit.
@@ -306,6 +320,7 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             queue,
             pending: VecDeque::new(),
             committed_present_seq: 0,
+            presented_seq: 0,
             flags: PresenterFlags::empty(),
             slots: [const { None }; SNAPSHOT_SLOTS],
             last_drawable_wait_ns: 0,
@@ -420,7 +435,11 @@ pub fn set_wait_policy(queue: MetalHandle<MTLCommandQueueKind>, policy: PresentW
 /// meanwhile and the wait ends. The retirement wait runs outside the lock,
 /// against the present counter and with no failed-submit sink: a present the
 /// GPU killed is logged by its completion handler and never marks the frame's
-/// uploads as failed.
+/// uploads as failed. It targets the last present buffer the presenter
+/// committed, not the last packet it consumed: a dropped packet has no
+/// buffer, so its sequence never retires and must not be waited for, and a
+/// drop behind a committed present must not stand in for that present's
+/// retirement either.
 pub fn wait_for_present_idle(queue: MetalHandle<MTLCommandQueueKind>) {
     let Some(state) = find(queue) else {
         mtld3d_shared::log_once_warn!(
@@ -430,7 +449,7 @@ pub fn wait_for_present_idle(queue: MetalHandle<MTLCommandQueueKind>) {
         );
         return;
     };
-    let committed = {
+    let presented = {
         let inner = state.lock();
         let inner = state
             .submit_cv
@@ -438,9 +457,9 @@ pub fn wait_for_present_idle(queue: MetalHandle<MTLCommandQueueKind>) {
                 !inner.pending.is_empty() && !inner.flags.contains(PresenterFlags::STOP)
             })
             .unwrap_or_else(PoisonError::into_inner);
-        inner.committed_present_seq
+        inner.presented_seq
     };
-    command::wait_for_gpu_retire(committed, state.present_retired_ptr(), 0);
+    command::wait_for_gpu_retire(presented, state.present_retired_ptr(), 0);
 }
 
 /// Hand a frame's presentation to the presenter; returns the last drawable wait.
@@ -454,7 +473,7 @@ pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
             target: LOG_TARGET,
             "presenter: a frame was pushed after the queue's presenter stopped; it is not presented",
         );
-        drop_packet(&mut inner, state, packet);
+        drop_packet(&mut inner, packet);
         return inner.last_drawable_wait_ns;
     }
     inner.pending.push_back(packet);
@@ -635,12 +654,11 @@ fn snapshot_into(
 
 /// Consume a packet that presents nothing.
 ///
-/// Advances the retirement counter for its sequence, since no present buffer
-/// will, and marks it committed so a submit waiting for it goes on.
-fn drop_packet(inner: &mut Inner, state: &PresentState, packet: PresentPacket) {
-    state
-        .present_retired
-        .fetch_max(packet.seq, Ordering::Release);
+/// Marks it committed so a submit waiting for it goes on and a slot it read
+/// frees. The retirement counter stays where it is: no present buffer
+/// carries this sequence, and advancing the counter past a committed
+/// present still on the GPU would end an idle wait early.
+fn drop_packet(inner: &mut Inner, packet: PresentPacket) {
     inner.committed_present_seq = inner.committed_present_seq.max(packet.seq);
     drop(packet);
 }
@@ -651,7 +669,7 @@ fn drop_front(state: &PresentState, seq: u64) {
         let mut inner = state.lock();
         if let Some(packet) = inner.pending.pop_front() {
             debug_assert_eq!(packet.seq, seq, "only the presenter pops");
-            drop_packet(&mut inner, state, packet);
+            drop_packet(&mut inner, packet);
         }
     }
     state.submit_cv.notify_all();
@@ -687,7 +705,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
                 );
             }
             while let Some(packet) = inner.pending.pop_front() {
-                drop_packet(&mut inner, state, packet);
+                drop_packet(&mut inner, packet);
             }
             state.submit_cv.notify_all();
             return false;
@@ -821,6 +839,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
     command::commit_registered(&cb, present_ptr, seq);
     let packet = inner.pending.pop_front();
     inner.committed_present_seq = inner.committed_present_seq.max(seq);
+    inner.presented_seq = seq;
     inner.last_drawable_wait_ns = drawable_wait_ns;
     drop(inner);
     state.submit_cv.notify_all();
@@ -831,7 +850,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
 /// Pop the front packet under the caller's lock and consume it unpresented.
 fn pop_and_drop(inner: &mut MutexGuard<'_, Inner>, state: &PresentState) {
     if let Some(packet) = inner.pending.pop_front() {
-        drop_packet(inner, state, packet);
+        drop_packet(inner, packet);
     }
     state.submit_cv.notify_all();
 }

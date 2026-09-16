@@ -11,7 +11,9 @@
 //! gate inside the one thunk that replays, acquires and commits, the flush
 //! behind the read-back drains a submit thread parked there, the read-back
 //! never returns, and the harness reports the test as a timeout rather than
-//! as a wrong pixel.
+//! as a wrong pixel. The same seam holds a read-back behind a full pipeline:
+//! every stage ahead of the presenter filled with a present, which is the
+//! most copies one read-back can need and what the slot array is sized for.
 
 use std::{
     path::PathBuf,
@@ -43,9 +45,8 @@ fn gate_file(tag: &str) -> (PathBuf, &'static str) {
 
 /// A read-back of the frame in progress completes while the presenter is parked.
 ///
-/// One present while the gate is held, never two: a second present-bearing
-/// submit waits inside its thunk for the first present to commit, and the
-/// flush behind the read-back can hurry only the submit it drains.
+/// One present while the gate is held: the one copy the read-back's flush
+/// takes is of the frame the parked presenter holds.
 #[test]
 fn a_readback_completes_while_the_presenter_is_parked() {
     const FIRST: u32 = 0xFFFF_0000;
@@ -88,6 +89,56 @@ fn a_readback_completes_while_the_presenter_is_parked() {
     assert_pixel_eq(h.read_pixel(1, 1), SECOND, "after the gate was lifted");
     // The drop waits for the presenter to go idle and its last present to
     // retire.
+}
+
+/// A read-back behind a full pipeline completes while the presenter is parked.
+///
+/// Five presents fill every stage ahead of the presenter without blocking
+/// the API thread: the present the presenter holds at the gate, the submit
+/// parked in its wait for it, the payload in the work channel, the frame the
+/// encoder holds while it waits for a payload, and the frame in the channel
+/// to the encoder. The read-back's flush hurries all of them, and each copies
+/// the image of the present ahead of it into a slot before the partial frame
+/// copies the last; the slot array is sized for exactly this. One slot short,
+/// the last copy waits for the oldest present to commit, which the gate
+/// holds, and the harness reports a timeout.
+#[test]
+fn a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked() {
+    const STAGES: u32 = 5;
+    const LAST: u32 = 0xFFFF_00FF;
+    let (gate, entry) = gate_file("pipeline");
+    let h = Harness::with_config(entry);
+    for stage in 1..=STAGES {
+        assert_eq!(
+            h.clear_target(0xFF00_0000 | (stage * 0x0020_2020)),
+            D3D_OK,
+            "clear a frame that is presented"
+        );
+        assert_eq!(h.present(), D3D_OK, "present into a filling pipeline");
+    }
+    assert_eq!(
+        h.clear_target(LAST),
+        D3D_OK,
+        "clear the frame that is not presented"
+    );
+    {
+        let backbuffer = h.back_buffer(0);
+        let locked = backbuffer.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.as_u32(1)[0],
+            LAST,
+            "the read-back shows the clear behind five unpresented frames"
+        );
+        assert!(
+            gate.exists(),
+            "nothing on the read-back path lifted the gate"
+        );
+    }
+    std::fs::remove_file(&gate).expect("remove the gate file");
+    for _ in 0..2 {
+        h.render_once(LAST, |_| {});
+    }
+    assert_pixel_eq(h.read_pixel(1, 1), LAST, "after the gate was lifted");
 }
 
 /// One device's parked presenter leaves another device presenting and reading back.
