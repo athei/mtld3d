@@ -20,12 +20,16 @@
 //!
 //! Threads. The thunk runs on the API thread and only writes [`SHARED`] and
 //! queues one main-thread wakeup, coalesced through [`APPLY_PENDING`]. The
-//! pre-commit run-loop observer applies the latest state once per transaction.
-//! Everything that touches `AppKit`, Core Animation or the overlay's Metal objects
-//! runs on the main thread: input observations, activation notifications, and
-//! the observer that reconciles position, visibility, layer mode and EDR headroom.
-//! Those objects live in a main-thread `thread_local`, which makes the split
-//! sound without a lock around `Retained` handles.
+//! pre-commit run-loop observer reconciles the latest state once per
+//! transaction, and only when the pointer moved or an apply was requested
+//! ([`RECONCILE_REQUESTED`]): the thunk, a detach, a GPU completion, a present,
+//! an activation change and a headroom refresh each request one, so an
+//! iteration of Wine's busy main loop that changed nothing costs one pointer
+//! read. Everything that touches `AppKit`, Core Animation or the overlay's
+//! Metal objects runs on the main thread: the observer, the activation
+//! notifications and the reconciliation of position, visibility, layer mode
+//! and EDR headroom. Those objects live in a main-thread `thread_local`, which
+//! makes the split sound without a lock around `Retained` handles.
 //!
 //! Nothing about the game window is latched: the game `NSWindow`, its level,
 //! its client rectangle and its screen are read when the sprite can be shown,
@@ -38,43 +42,31 @@
 //! game means.
 //!
 //! The sprite's position and its pixels reach the compositor together. The
-//! completed image is assigned in the Core Animation transaction, so a hide and the move
-//! made with it land in one frame and the old sprite is never seen at a new
-//! place. That matters because the apply and the game's own pointer warps
-//! reach the main thread through different queues (ours the dispatch main
-//! queue, winemac's its request source) and a game warps right after showing
-//! or hiding its cursor: the two have no order. A warp delivers no event
-//! either, so a run-loop observer ahead of Core Animation's commit reads
-//! winemac's last warp time and repositions the sprite in the same iteration,
-//! whichever of the warp and the apply ran first.
+//! completed image is assigned in the Core Animation transaction, so a hide
+//! and the move made with it land in one frame and the old sprite is never
+//! seen at a new place. The observer reads the pointer's position at every
+//! pass, so a warp the game makes through winemac, which runs on this thread
+//! and delivers no event, is followed in the same transaction as the hide or
+//! show beside it. While a changed sprite renders, the sprite already on
+//! screen keeps following the pointer with its own geometry.
 //!
-//! Two things the pointer can do without telling this process, both handled
-//! here. A system tool that takes the pointer (the interactive screenshot
-//! crosshair) delivers no mouse events to the application while the pointer
-//! keeps moving; every present notices the pointer moving away from its last
-//! legitimate position with no event since by requesting a main-thread check.
-//! The sprite stays hidden until actual input resumes. Wine can consume captured
-//! input before `AppKit`'s local monitor, so the run-loop observer also observes
-//! unseen mouse events through `NSApplication.currentEvent`. Retaining the last
-//! event prevents idle history and recycled addresses from counting as new input.
-//! The check is asked only while the game shows its cursor, the
-//! application is active and winemac is not clipping the cursor, since in
-//! every other state the events stay away from the application by design
-//! (an inactive application gets none, mouselook clips the cursor for the
-//! drag), and a warp the game made through winemac counts as a legitimate
-//! move. And when such a tool ends, the window server shows
-//! the standard arrow rather than the cursor Wine set, which Wine never
-//! re-applies because its handle did not change; the first event after a
-//! capture asks the PE side for its null-then-set kick, which makes Wine
-//! re-apply through a handle change. That pointer watch serves the hardware
-//! cursor too, so it is installed at attach for every device, overlay or not.
+//! Another process can take the pointer without telling this one: the
+//! interactive screenshot crosshair. Its window is what a click at the pointer
+//! would hit, so the hit test that decides whether the pointer is over the
+//! game answers that window, the sprite hides, and the native cursor is left
+//! to the tool. When the hit test answers the game window again, the PE side
+//! is asked for its null-then-set kick, which makes Wine re-apply the cursor
+//! the tool replaced. A window of this process over the game (a dialog) hides
+//! the sprite the same way but needs no kick: Wine re-applies its cursor when
+//! the pointer re-enters the game window. The kick serves the hardware cursor
+//! too, so the observer is installed at attach for every device, overlay or
+//! not.
 
 use core::{
     cell::{Cell, RefCell},
     ptr::NonNull,
 };
 use std::{
-    collections::hash_map::Entry,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -84,16 +76,20 @@ use std::{
 
 use block2::RcBlock;
 use log::{debug, info};
-use mtld3d_shared::{SetCursorOverlayParams, mtl::CursorOverlayFlags};
+use mtld3d_shared::{
+    SetCursorOverlayParams,
+    bounded_cache::BoundedCache,
+    mtl::{CURSOR_SPRITE_CACHE_ENTRIES, CursorOverlayFlags},
+};
 use objc2::{
-    AnyThread, MainThreadMarker, MainThreadOnly, Message, extern_class, extern_methods,
+    AnyThread, MainThreadMarker, MainThreadOnly,
     rc::{Retained, autoreleasepool},
-    runtime::{AnyClass, NSObject, ProtocolObject},
+    runtime::ProtocolObject,
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
     NSApplicationDidResignActiveNotification, NSBackingStoreType, NSBitmapImageRep, NSColor,
-    NSCursor, NSDeviceRGBColorSpace, NSEvent, NSEventMask, NSImage, NSScreen, NSView, NSWindow,
+    NSCursor, NSDeviceRGBColorSpace, NSEvent, NSImage, NSScreen, NSView, NSWindow,
     NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
@@ -110,7 +106,6 @@ use objc2_metal::{
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::{CAAction, CALayer, CAMetalLayer};
-use rustc_hash::FxHashMap;
 
 use super::{
     LayerMode,
@@ -145,181 +140,26 @@ enum Content {
     },
 }
 
-/// How long without a mouse event before a moved pointer counts as captured.
-///
-/// A moving pointer delivers an event every few milliseconds, so a gap this
-/// long with the pointer elsewhere than the last event put it means someone
-/// else is receiving the events. Checked on existing input, run-loop and
-/// present opportunities, without a timer or an immediate retry loop.
-const CAPTURE_SILENCE_MS: u128 = 60;
-
-extern_class!(
-    /// winemac's application controller, read for its cursor-clipping state.
-    ///
-    /// Declared here because no binding crate carries Wine's classes. Only
-    /// the two members below are touched, both part of the driver's own
-    /// header for as long as it has clipped the cursor; the class is looked
-    /// up by name before use so a driver without it reads as never clipping.
-    #[unsafe(super(NSObject))]
-    #[name = "WineApplicationController"]
-    struct WineApplicationController;
-);
-
-impl WineApplicationController {
-    extern_methods!(
-        #[unsafe(method(sharedController))]
-        #[unsafe(method_family = none)]
-        fn shared_controller() -> Option<Retained<Self>>;
-
-        #[unsafe(method(clippingCursor))]
-        #[unsafe(method_family = none)]
-        fn clipping_cursor(&self) -> bool;
-
-        #[unsafe(method(lastSetCursorPositionTime))]
-        #[unsafe(method_family = none)]
-        fn last_set_cursor_position_time(&self) -> f64;
-    );
-}
-
-/// Whether the running driver has a `WineApplicationController` class at all.
-static HAS_WINE_CONTROLLER: LazyLock<bool> =
-    LazyLock::new(|| AnyClass::get(c"WineApplicationController").is_some());
-
-/// Whether winemac is clipping the cursor. Main thread only.
-///
-/// Clipping disassociates the pointer from the mouse, so its position is not
-/// evidence of external capture while the game constrains it.
-fn wine_clips_cursor(_mtm: MainThreadMarker) -> bool {
-    *HAS_WINE_CONTROLLER
-        && WineApplicationController::shared_controller()
-            .is_some_and(|controller| controller.clipping_cursor())
-}
-
-/// The uptime of winemac's last `SetCursorPos` warp, `0.0` when none is outstanding.
-///
-/// The game moving the pointer through Wine is the one pointer move that
-/// neither comes from the mouse nor from another process; winemac records
-/// its time so its own mouse handling can discard the events the warp
-/// crosses, and the capture check reads the same record.
-fn wine_last_warp_uptime(_mtm: MainThreadMarker) -> f64 {
-    if !*HAS_WINE_CONTROLLER {
-        return 0.0;
-    }
-    WineApplicationController::shared_controller()
-        .map_or(0.0, |controller| controller.last_set_cursor_position_time())
-}
-
-/// Clock shared by main-thread input observations and queued-apply diagnostics.
+/// Clock for the queued-apply latency diagnostic.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Input history owned entirely by the main thread.
-///
-/// Event identity is retained by `PointerWatch`, so an address cannot be reused
-/// while it is the deduplication key. A repeated `currentEvent` is idle history,
-/// never evidence that new input reached Wine.
-#[derive(Default)]
-struct InputState {
-    event: usize,
-    at_ns: Option<u64>,
-    position: CGPoint,
-    warp: f64,
-    capture_epoch: u64,
-    captured: bool,
-}
-
-impl InputState {
-    const fn suspend(&mut self) -> bool {
-        // No silence interval spans a hidden or inactive period. The first
-        // active observation establishes a fresh position without native
-        // pointer or Wine-controller queries while the watch is suspended.
-        self.at_ns = None;
-        core::mem::replace(&mut self.captured, false)
-    }
-
-    const fn note_position(&mut self, position: CGPoint, now: u64) {
-        self.position = position;
-        self.at_ns = Some(now);
-    }
-
-    const fn observe(&mut self, event: usize, position: CGPoint, now: u64) -> Option<bool> {
-        if self.event == event {
-            // The local monitor and the run-loop observer can see the same event.
-            return None;
-        }
-        self.event = event;
-        self.note_position(position, now);
-        Some(core::mem::replace(&mut self.captured, false))
-    }
-
-    fn reconcile(&mut self, observation: &PointerObservation) {
-        if self.capture_epoch != observation.capture_epoch {
-            self.capture_epoch = observation.capture_epoch;
-            self.captured = false;
-            self.note_position(observation.position, observation.now);
-        }
-        if warp_since(self.warp, observation.warp) {
-            self.warp = observation.warp;
-            self.note_position(observation.position, observation.now);
-        }
-        if !observation
-            .flags
-            .contains(PointerFlags::SHOWN | PointerFlags::ACTIVE)
-        {
-            self.captured = false;
-            return;
-        }
-        if observation.flags.contains(PointerFlags::CLIPPED) {
-            // A clipped move is legitimate, including after a capture was suspected.
-            self.captured = false;
-            self.note_position(observation.position, observation.now);
-            return;
-        }
-        let Some(at) = self.at_ns else {
-            // Establish a baseline before attempting a silence measurement.
-            self.note_position(observation.position, observation.now);
-            return;
-        };
-        let silence = u128::from(observation.now.saturating_sub(at)) / 1_000_000;
-        let moved = (observation.position.x - self.position.x).abs() > 0.5
-            || (observation.position.y - self.position.y).abs() > 0.5;
-        self.captured |= pointer_captured(silence, moved);
-    }
-}
-
-bitflags::bitflags! {
-    /// Main-thread inputs to the external-capture decision.
-    struct PointerFlags: u8 {
-        const SHOWN = 1 << 0;
-        const ACTIVE = 1 << 1;
-        const CLIPPED = 1 << 2;
-    }
-}
-
-struct PointerObservation {
-    position: CGPoint,
-    now: u64,
-    warp: f64,
-    capture_epoch: u64,
-    flags: PointerFlags,
-}
-
+/// Main-thread state that outlives any one apply.
 #[derive(Default)]
 struct PointerWatch {
-    event: Option<Retained<NSEvent>>,
-    input: InputState,
-    /// Native cursor ownership changes on activation, independently of mouse input.
-    activation: u64,
     /// Shared native blank, also used when the game never supplies a D3D cursor image.
     native_cursor: Option<Retained<NSCursor>>,
-    /// Image displaced by our blank, restored only while that blank is still current.
-    native_restore: Option<Retained<NSCursor>>,
+    /// A window of another process was frontmost at the pointer, inside the client rect.
+    captured: bool,
+    /// The pointer position the observer last reconciled against.
+    last_location: CGPoint,
 }
 
-/// Request one coalesced main-thread check from the submit thread.
+/// Request one coalesced main-thread reconciliation from the submit thread.
 ///
-/// Wine's controller fields and `NSApplication.currentEvent` are main-thread
-/// state. No decision taken on the submit thread can race a recovering event.
-pub fn poll_capture_from_present() {
+/// A present is the one regular wakeup while the pointer is still: it is what
+/// notices a tool's window appearing over the pointer, and a native hide or
+/// show the PE side found on the same present.
+pub fn poll_from_present() {
     let check = {
         let shared = lock_shared();
         shared.pending
@@ -333,21 +173,15 @@ pub fn poll_capture_from_present() {
     }
 }
 
-fn now_ns() -> u64 {
-    u64::try_from(EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Whether the pointer moved away from its last legitimate position with no event since.
+/// Whether another process's window has the pointer over the game's client area.
 ///
-/// A system tool that takes the pointer (the screenshot crosshair) leaves the
-/// application eventless while the pointer keeps moving. The last legitimate
-/// position is where the last mouse event or the last winemac warp put the
-/// pointer, so a `SetCursorPos` by the game counts as the game's own move
-/// rather than another process's. Only asked while the game shows its cursor
-/// and Wine is not clipping it; either way otherwise the game owns the
-/// pointer and the events legitimately stay away from the application.
-const fn pointer_captured(silence_ms: u128, moved: bool) -> bool {
-    moved && silence_ms >= CAPTURE_SILENCE_MS
+/// Inside the client rectangle, the hit test answers the game window unless
+/// something sits over it there. A window of this process (a Wine dialog) is
+/// what Wine re-applies its cursor for on re-entry; a foreign window, the
+/// screenshot crosshair being the one that matters, is a capture, and the
+/// return from it asks the PE side for a cursor kick.
+const fn pointer_captured(inside_client: bool, hit_is_game: bool, hit_is_ours: bool) -> bool {
+    inside_client && !hit_is_game && !hit_is_ours
 }
 
 /// `developerHUDProperties` mode that keeps the Metal performance HUD off this layer.
@@ -369,19 +203,32 @@ struct Sprite {
 }
 
 /// State written by the thunk on the API thread and read by the main thread.
-#[derive(Default)]
 struct Shared {
-    /// Content-addressed uploads remain available to every device's acknowledged set.
-    sprites: FxHashMap<u64, Arc<Sprite>>,
+    /// Content-addressed uploads, shared by every device, bounded.
+    ///
+    /// A hash-only request for an evicted sprite is rejected, and the PE side
+    /// answers that by sending the pixels again.
+    sprites: BoundedCache<u64, Arc<Sprite>>,
     /// Identity, mode, sprite and visibility are published under this one mutex.
     owner: Option<Arc<Attachment>>,
     hash: u64,
     flags: CursorOverlayFlags,
     revision: u64,
-    /// Remembers hides even when a later show coalesces into the same apply.
-    capture_epoch: u64,
     /// Native work to complete; hardware-only state has no overlay to apply.
     pending: bool,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            sprites: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
+            owner: None,
+            hash: 0,
+            flags: CursorOverlayFlags::empty(),
+            revision: 0,
+            pending: false,
+        }
+    }
 }
 
 impl Shared {
@@ -400,9 +247,11 @@ impl Shared {
             return false;
         };
         let hardware = params.flags.contains(CursorOverlayFlags::HARDWARE);
-        if !hardware && pixels.is_none() && !self.sprites.contains_key(&params.hash) {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET, "SetCursorOverlay: unknown sprite {:#018x}; pixels required",
+        if !hardware && pixels.is_none() && !self.sprites.contains(&params.hash) {
+            // The designed miss: never uploaded, or evicted since. The PE side
+            // sends the pixels on this answer.
+            debug!(
+                target: LOG_TARGET, "SetCursorOverlay: sprite {:#018x} not held; pixels required",
                 params.hash,
             );
             return false;
@@ -417,13 +266,12 @@ impl Shared {
             // main again after the same state has successfully completed.
             return true;
         }
-        if !same_owner(self.owner.as_ref(), Some(&owner))
-            || !params.flags.contains(CursorOverlayFlags::VISIBLE)
+        if !hardware
+            && let Some(pixels) = pixels
+            && !self.sprites.contains(&params.hash)
         {
-            self.capture_epoch += 1;
-        }
-        if !hardware && let Some(pixels) = pixels {
-            self.sprites.entry(params.hash).or_insert_with(|| {
+            self.sprites.insert(
+                params.hash,
                 Arc::new(Sprite {
                     width: params.width,
                     height: params.height,
@@ -431,8 +279,8 @@ impl Shared {
                     y_hotspot: params.y_hotspot,
                     scale: params.scale,
                     pixels: pixels.into(),
-                })
-            });
+                }),
+            );
         }
         let native_was_hidden = self.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN);
         self.owner = Some(owner);
@@ -459,19 +307,18 @@ impl Shared {
         self.hash = 0;
         self.flags = CursorOverlayFlags::empty();
         self.revision += 1;
-        self.capture_epoch += 1;
         self.pending = true;
         true
     }
 
-    fn snapshot(&self) -> WantedSnapshot {
+    /// The wanted state, counting the current sprite as used.
+    fn snapshot(&mut self) -> WantedSnapshot {
         WantedSnapshot {
             owner: self.owner.as_ref().map(Arc::clone),
             sprite: self.sprites.get(&self.hash).map(Arc::clone),
             hash: self.hash,
             flags: self.flags,
             revision: self.revision,
-            capture_epoch: self.capture_epoch,
         }
     }
 
@@ -497,6 +344,14 @@ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::def
 /// Bounds the main queue to one outstanding apply however fast the API thread
 /// toggles the cursor; the apply reads the latest wanted state when it runs.
 static APPLY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Whether something other than pointer motion wants the next observer pass to reconcile.
+///
+/// Set by every `queue_apply`, taken by the pre-commit observer. Without it
+/// the observer, which runs on every iteration of the main run loop, would
+/// walk the game window and ask the window server what is under the pointer
+/// on iterations where nothing changed.
+static RECONCILE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// When the pending apply was queued, nanoseconds since [`EPOCH`].
 ///
@@ -556,8 +411,6 @@ bitflags::bitflags! {
         const OCCLUDED = 1 << 3;
         /// The game window sits in the Dock.
         const MINIATURIZED = 1 << 4;
-        /// A system tool has the pointer: it moves while no events reach us.
-        const CAPTURED = 1 << 5;
     }
 }
 
@@ -565,11 +418,7 @@ bitflags::bitflags! {
 const fn overlay_visible(inputs: VisibilityInputs) -> bool {
     inputs.contains(VisibilityInputs::WANTED.union(VisibilityInputs::APP_ACTIVE))
         && inputs.contains(VisibilityInputs::POINTER_INSIDE)
-        && !inputs.intersects(
-            VisibilityInputs::OCCLUDED
-                .union(VisibilityInputs::MINIATURIZED)
-                .union(VisibilityInputs::CAPTURED),
-        )
+        && !inputs.intersects(VisibilityInputs::OCCLUDED.union(VisibilityInputs::MINIATURIZED))
 }
 
 /// The sprite layer's origin that puts the sprite's hotspot under the pointer.
@@ -627,12 +476,11 @@ pub fn set_cursor_overlay(params: &SetCursorOverlayParams, pixels: Option<&[u8]>
 /// The device that attached `view` is going away: stop following it.
 ///
 /// Only the device the overlay follows changes anything on screen: its sprite
-/// is hidden and the cursor is no longer shown, so the capture checks stop.
-/// Another device's teardown leaves the overlay where it is. The uploaded
-/// sprites stay: they are content-addressed, so a second device's uploaded
-/// set may name an entry the first one sent, and its next call would name a
-/// sprite the unix side no longer held. The window and its observers stay
-/// for the process lifetime like the other `AppKit` observers.
+/// is hidden and the cursor is no longer shown. Another device's teardown
+/// leaves the overlay where it is. The uploaded sprites stay: they are
+/// content-addressed, so a second device's uploaded set may name an entry the
+/// first one sent. The window and its observers stay for the process lifetime
+/// like the other `AppKit` observers.
 pub fn detach(retired: &Arc<Attachment>) {
     let changed = lock_shared().detach(retired);
     if changed {
@@ -640,11 +488,11 @@ pub fn detach(retired: &Arc<Attachment>) {
     }
 }
 
-/// Observe input now; reconcile pixels and position at the run-loop commit. Main thread only.
+/// Make sure the observer is installed and ask it to reconcile at its next pass. Main thread only.
 pub fn reconcile_on_main() {
     let mtm = MainThreadMarker::new().expect("reconcile_on_main runs on the main thread");
     install_pointer_watch(mtm);
-    observe_current_event(mtm);
+    RECONCILE_REQUESTED.store(true, Ordering::Release);
 }
 
 fn lock_shared() -> MutexGuard<'static, Shared> {
@@ -652,6 +500,7 @@ fn lock_shared() -> MutexGuard<'static, Shared> {
 }
 
 fn queue_apply() {
+    RECONCILE_REQUESTED.store(true, Ordering::Release);
     if APPLY_PENDING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -662,7 +511,7 @@ fn queue_apply() {
     }
 }
 
-/// Wake the input watch; the pre-commit observer applies the latest state. Main thread only.
+/// Wake the main thread; the pre-commit observer applies the latest state. Main thread only.
 fn apply_on_main() {
     APPLY_PENDING.store(false, Ordering::Release);
     let queued_ns = APPLY_QUEUED_NS.load(Ordering::Relaxed);
@@ -672,7 +521,8 @@ fn apply_on_main() {
         .saturating_sub(u128::from(queued_ns))
         / 1_000;
     debug!(target: LOG_TARGET, "cursor: apply ran {waited_us} us after it was queued");
-    reconcile_on_main();
+    let mtm = MainThreadMarker::new().expect("apply_on_main runs on the main thread");
+    install_pointer_watch(mtm);
 }
 
 /// One owned snapshot used throughout a native reconciliation.
@@ -682,16 +532,14 @@ struct WantedSnapshot {
     hash: u64,
     flags: CursorOverlayFlags,
     revision: u64,
-    capture_epoch: u64,
 }
 
 bitflags::bitflags! {
     /// Installed observer components; failed components are retried at existing opportunities.
     #[derive(Clone, Copy)]
     struct WatchInstalled: u8 {
-        const MONITOR = 1 << 0;
-        const RUN_LOOP = 1 << 1;
-        const ACTIVATION = 1 << 2;
+        const RUN_LOOP = 1 << 0;
+        const ACTIVATION = 1 << 1;
     }
 }
 
@@ -704,14 +552,25 @@ thread_local! {
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
 }
 
+/// Whether the pre-commit pass has anything to reconcile: pointer motion or a request.
+fn reconcile_due() -> bool {
+    let requested = RECONCILE_REQUESTED.swap(false, Ordering::AcqRel);
+    let location = NSEvent::mouseLocation();
+    let moved = POINTER_WATCH.with_borrow_mut(|watch| {
+        let moved = watch.last_location != location;
+        watch.last_location = location;
+        moved
+    });
+    moved || requested
+}
+
 /// Reconcile cursor content and position before each Core Animation commit.
 ///
 /// Input, activation and GPU completion requests converge here so image and
 /// visibility updates share the latest pointer state.
-fn apply_on_main_inner() {
-    let mtm = MainThreadMarker::new().expect("apply_on_main_inner runs on the main thread");
+fn apply_on_main_inner(mtm: MainThreadMarker) {
     let wanted = {
-        let shared = lock_shared();
+        let mut shared = lock_shared();
         if shared.owner.is_none() && !shared.pending {
             // No device has a D3D cursor and no detach or failed draw remains to apply.
             return;
@@ -719,9 +578,10 @@ fn apply_on_main_inner() {
         shared.snapshot()
     };
     install_pointer_watch(mtm);
-    observe_current_event(mtm);
-    let captured = reconcile_pointer(mtm, &wanted);
-    reconcile_native_cursor(mtm, &wanted, captured);
+    let active = NSApplication::sharedApplication(mtm).isActive();
+    let hit = pointer_hit(mtm, &wanted, active);
+    note_capture(hit.as_ref());
+    reconcile_native_cursor(mtm, &wanted, hit.as_ref());
     OVERLAY.with(|cell| {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             mtld3d_shared::log_once_warn!(
@@ -739,73 +599,74 @@ fn apply_on_main_inner() {
             *slot = Overlay::create(mtm, &wanted);
         }
         if let Some(overlay) = slot.as_mut() {
-            let completed = overlay.apply(mtm, &wanted, captured);
+            let completed = overlay.apply(mtm, &wanted, active, hit.as_ref());
             lock_shared().applied(wanted.revision, completed);
         }
     });
 }
 
-fn observe_mouse_event(event: &NSEvent, route: &str, _mtm: MainThreadMarker) {
-    let mask = NSEventMask(
-        1u64.checked_shl(u32::try_from(event.r#type().0).unwrap_or(64))
-            .unwrap_or(0),
-    );
-    if !mouse_mask().intersects(mask) {
-        // currentEvent may still be a key, scroll, or application event.
-        return;
-    }
-    let recovered = POINTER_WATCH.with_borrow_mut(|watch| {
-        let recovered = watch.input.observe(
-            core::ptr::from_ref(event) as usize,
-            NSEvent::mouseLocation(),
-            now_ns(),
-        )?;
-        watch.event = Some(event.retain());
-        Some(recovered)
-    });
-    if recovered.is_some() {
-        log::trace!(target: LOG_TARGET, "cursor: input route={route} type={:?} event={}", event.r#type(), event.eventNumber());
-    }
-    if recovered == Some(true) {
-        debug!(target: LOG_TARGET, "cursor: input resumed after external capture; requesting cursor kick");
-        attachment::request_cursor_kick_all();
-    }
+/// Where the pointer is relative to the followed game window, from one hit test.
+struct PointerHit {
+    /// The game window, retained for the level and screen reads that follow.
+    window: Retained<NSWindow>,
+    /// The pointer in screen coordinates, as read for this pass.
+    mouse: CGPoint,
+    /// Inside the client rectangle with the game window frontmost there.
+    over_game: bool,
+    /// Inside the client rectangle with a window of another process frontmost there.
+    captured: bool,
+    /// The game window sits in the Dock.
+    miniaturized: bool,
 }
 
-fn observe_current_event(mtm: MainThreadMarker) {
-    if let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() {
-        observe_mouse_event(&event, "currentEvent", mtm);
-    }
-}
-
-fn reconcile_pointer(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> bool {
-    if !wanted
-        .flags
-        .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN)
-        || !NSApplication::sharedApplication(mtm).isActive()
+/// Hit-test the pointer against the followed window, when a decision needs it.
+///
+/// `None` while the cursor is neither shown nor natively hidden, while the
+/// application is inactive (macOS gives the pointer to the frontmost
+/// application), and when the followed view is gone.
+fn pointer_hit(mtm: MainThreadMarker, wanted: &WantedSnapshot, active: bool) -> Option<PointerHit> {
+    if !active
+        || !wanted
+            .flags
+            .intersects(CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN)
     {
-        if POINTER_WATCH.with_borrow_mut(|watch| watch.input.suspend()) {
-            debug!(target: LOG_TARGET, "cursor: external capture=false (watch suspended)");
-        }
-        return false;
+        return None;
     }
-    let mut flags = PointerFlags::SHOWN | PointerFlags::ACTIVE;
-    flags.set(PointerFlags::CLIPPED, wine_clips_cursor(mtm));
-    let observation = PointerObservation {
-        position: NSEvent::mouseLocation(),
-        now: now_ns(),
-        warp: wine_last_warp_uptime(mtm),
-        capture_epoch: wanted.capture_epoch,
-        flags,
-    };
-    POINTER_WATCH.with_borrow_mut(|watch| {
-        let previous = watch.input.captured;
-        watch.input.reconcile(&observation);
-        if previous != watch.input.captured {
-            debug!(target: LOG_TARGET, "cursor: external capture={}", watch.input.captured);
-        }
-        watch.input.captured
+    let view = attachment::retain_view(wanted.owner.as_ref()?, mtm)?;
+    let window = view.window()?;
+    let mouse = NSEvent::mouseLocation();
+    let client = window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
+    let inside = rect_contains(client, mouse);
+    let hit = window_under_pointer(mouse, mtm);
+    let hit_is_game = hit == window.windowNumber();
+    let hit_is_ours = hit_is_game
+        || NSApplication::sharedApplication(mtm)
+            .windowWithWindowNumber(hit)
+            .is_some();
+    Some(PointerHit {
+        miniaturized: window.isMiniaturized(),
+        window,
+        mouse,
+        over_game: inside && hit_is_game,
+        captured: pointer_captured(inside, hit_is_game, hit_is_ours),
     })
+}
+
+/// Track external capture; its end asks the PE side to re-apply Wine's cursor.
+fn note_capture(hit: Option<&PointerHit>) {
+    let captured = hit.is_some_and(|hit| hit.captured);
+    POINTER_WATCH.with_borrow_mut(|watch| {
+        if watch.captured == captured {
+            return;
+        }
+        watch.captured = captured;
+        debug!(target: LOG_TARGET, "cursor: external capture={captured}");
+        if !captured {
+            // The tool leaves the system cursor behind and Wine re-applies its
+            // own only on a handle change; the kick is that change.
+            attachment::request_cursor_kick_all();
+        }
+    });
 }
 
 /// Actual layer inputs; HDR/SDR mode alone cannot identify a color configuration.
@@ -879,14 +740,16 @@ struct Overlay {
     /// The sprite: a sublayer of the window's content layer, moved per event.
     layer: Retained<CAMetalLayer>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// One `MTLTexture` per sprite hash, uploaded on first render.
-    textures: FxHashMap<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// One `MTLTexture` per sprite hash, uploaded on first render, bounded.
+    textures: BoundedCache<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
     /// What has been submitted or published for the current request.
     content: ContentState,
     /// Offscreen output owned until the corresponding GPU completion is observed.
     pending: Option<CursorDraw>,
-    /// Last completed sprite, reused across hide/show without another GPU submission.
-    image: Option<(Content, CFRetained<CGImage>)>,
+    /// Completed images by sprite hash, so a sprite seen before shows again without GPU work.
+    images: BoundedCache<u64, (Content, CFRetained<CGImage>)>,
+    /// What the layer shows now; a pending render moves this with its own geometry.
+    published: Option<Content>,
     /// A transparent image keeps a composited surface present while hidden.
     transparent: CFRetained<CGImage>,
     /// Identity of the last reconciled attachment, never just its recyclable address.
@@ -952,7 +815,7 @@ impl Overlay {
         // SAFETY: objc2 typed binding; the dictionary is copied by the layer.
         unsafe { layer.setDeveloperHUDProperties(Some(&hud)) };
 
-        let frame = overlay_frame(mtm, wanted.owner.as_ref());
+        let frame = screen_frame(game_screen(mtm, wanted.owner.as_ref()));
         // SAFETY: standard NSWindow initialiser on a fresh allocation; the
         // borderless mask and buffered backing are the documented values for
         // an overlay, and `defer = false` gives the window its server-side
@@ -1009,10 +872,11 @@ impl Overlay {
             window,
             layer,
             queue,
-            textures: FxHashMap::default(),
+            textures: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
             content: ContentState::default(),
             pending: None,
-            image: None,
+            images: BoundedCache::new(CURSOR_SPRITE_CACHE_ENTRIES),
+            published: None,
             transparent,
             owner: None,
             mode: None,
@@ -1021,7 +885,13 @@ impl Overlay {
     }
 
     /// Reconcile one owner and request throughout all native work.
-    fn apply(&mut self, mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) -> bool {
+    fn apply(
+        &mut self,
+        mtm: MainThreadMarker,
+        wanted: &WantedSnapshot,
+        active: bool,
+        hit: Option<&PointerHit>,
+    ) -> bool {
         if !same_owner(self.owner.as_ref(), wanted.owner.as_ref()) {
             self.content.invalidate();
             self.pending = None;
@@ -1038,7 +908,7 @@ impl Overlay {
                 return false;
             }
         }
-        self.sync_position(mtm, wanted, captured);
+        self.sync_position(mtm, wanted, active, hit);
         self.content.completed()
     }
 
@@ -1059,7 +929,7 @@ impl Overlay {
             self.textures.clear();
             self.content.invalidate();
             self.pending = None;
-            self.image = None;
+            self.images.clear();
         }
         let mode = if att.hdr_active() {
             LayerMode::Hdr
@@ -1086,7 +956,7 @@ impl Overlay {
             self.mode = Some(mode);
             self.content.invalidate();
             self.pending = None;
-            self.image = None;
+            self.images.clear();
             info!(target: LOG_TARGET, "cursor: layer configured {mode:?} pixelFormat={:?} colorspace={colorspace:?} EDR={}",
                 game.pixelFormat(), game.wantsExtendedDynamicRangeContent());
         }
@@ -1094,6 +964,10 @@ impl Overlay {
     }
 
     /// Publish completed pixels and defer GPU work without blocking the main run loop.
+    ///
+    /// `true` once the layer shows `wanted`; `false` while its render is in
+    /// flight or could not be started, in which case the layer keeps what it
+    /// showed before.
     fn ensure_content(&mut self, wanted: Content, sprite: Option<&Sprite>) -> bool {
         let Self {
             layer,
@@ -1101,7 +975,8 @@ impl Overlay {
             textures,
             content,
             pending,
-            image,
+            images,
+            published,
             transparent,
             ..
         } = self;
@@ -1109,11 +984,14 @@ impl Overlay {
             *pending = None;
             let cached = match requested {
                 Content::Transparent => Some(&**transparent),
-                Content::Sprite { .. } => image.as_ref()
-                    .filter(|(key, _)| key == requested).map(|(_, pixels)| &**pixels),
+                Content::Sprite { hash, .. } => images
+                    .get(hash)
+                    .filter(|(key, _)| key == requested)
+                    .map(|(_, pixels)| &**pixels),
             };
             if let Some(pixels) = cached {
                 apply_image(layer, pixels, requested);
+                *published = Some(requested.clone());
                 result.store(COMPLETED, Ordering::Release);
                 return true;
             }
@@ -1138,7 +1016,10 @@ impl Overlay {
             };
             let requested = content.current().expect("completed content exists");
             apply_image(layer, &pixels, requested);
-            *image = Some((requested.clone(), pixels));
+            *published = Some(requested.clone());
+            if let Content::Sprite { hash, .. } = requested {
+                images.insert(*hash, (requested.clone(), pixels));
+            }
         }
         true
     }
@@ -1150,7 +1031,7 @@ impl Overlay {
     fn render(
         layer: &CAMetalLayer,
         queue: &ProtocolObject<dyn MTLCommandQueue>,
-        textures: &mut FxHashMap<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
+        textures: &mut BoundedCache<u64, Retained<ProtocolObject<dyn MTLTexture>>>,
         sprite: &Sprite,
         content: &Content,
     ) -> Option<CursorDraw> {
@@ -1165,10 +1046,12 @@ impl Overlay {
             return None;
         };
         let device = queue.device();
-        let texture = match textures.entry(*hash) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(upload_sprite_texture(&device, *hash, sprite)?),
-        };
+        if !textures.contains(hash) {
+            textures.insert(*hash, upload_sprite_texture(&device, *hash, sprite)?);
+        }
+        let texture = textures
+            .get(hash)
+            .expect("the sprite texture was just kept");
         let descriptor = MTLTextureDescriptor::new();
         descriptor.setTextureType(MTLTextureType::Type2D);
         descriptor.setPixelFormat(layer.pixelFormat());
@@ -1216,7 +1099,13 @@ impl Overlay {
     }
 
     /// Level, position and content against the pointer and the game window as they are now.
-    fn sync_position(&mut self, mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) {
+    fn sync_position(
+        &mut self,
+        mtm: MainThreadMarker,
+        wanted: &WantedSnapshot,
+        active: bool,
+        hit: Option<&PointerHit>,
+    ) {
         let Some(att) = wanted.owner.as_ref() else {
             self.ensure_content(Content::Transparent, None);
             return;
@@ -1226,11 +1115,7 @@ impl Overlay {
             VisibilityInputs::WANTED,
             wanted.flags.contains(CursorOverlayFlags::VISIBLE) && wanted.sprite.is_some(),
         );
-        inputs.set(
-            VisibilityInputs::APP_ACTIVE,
-            NSApplication::sharedApplication(mtm).isActive(),
-        );
-        inputs.set(VisibilityInputs::CAPTURED, captured);
+        inputs.set(VisibilityInputs::APP_ACTIVE, active);
         if !inputs.contains(VisibilityInputs::WANTED | VisibilityInputs::APP_ACTIVE) {
             // Transparent content has no position to follow. Avoid window,
             // screen and pointer queries until a sprite can be shown again;
@@ -1239,22 +1124,21 @@ impl Overlay {
             self.ensure_content(Content::Transparent, None);
             return;
         }
-        let game = attachment::retain_view(att, mtm)
-            .and_then(|view| view.window().map(|window| (view, window)));
-        let Some((view, game_window)) = game else {
+        let Some(hit) = hit else {
+            // The followed view retired between the snapshot and this pass.
             self.ensure_content(Content::Transparent, None);
             return;
         };
         // Wine re-levels its windows across fullscreen transitions; stay one
         // above whatever the game window is at right now.
-        let level = game_window.level() + 1;
+        let level = hit.window.level() + 1;
         if self.window.level() != level {
             self.window.setLevel(level);
         }
         // Follow the game window onto another screen. A window frame change
         // costs one cursor re-resolution by AppKit, which is why it is done
         // only here and never per event.
-        let frame = overlay_frame(mtm, Some(att));
+        let frame = screen_frame(hit.window.screen().or_else(|| NSScreen::mainScreen(mtm)));
         if self.window.frame() != frame {
             self.window.setFrame_display(frame, false);
             info!(
@@ -1263,15 +1147,9 @@ impl Overlay {
                 frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
             );
         }
-        let mouse = NSEvent::mouseLocation();
-        let client = game_window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
-        inputs.set(
-            VisibilityInputs::POINTER_INSIDE,
-            rect_contains(client, mouse)
-                && window_under_pointer(mouse, mtm) == game_window.windowNumber(),
-        );
+        inputs.set(VisibilityInputs::POINTER_INSIDE, hit.over_game);
         inputs.set(VisibilityInputs::OCCLUDED, att.window_occluded());
-        inputs.set(VisibilityInputs::MINIATURIZED, game_window.isMiniaturized());
+        inputs.set(VisibilityInputs::MINIATURIZED, hit.miniaturized);
         self.update_visibility(inputs, mtm);
         let shown = overlay_visible(inputs);
         let Some(sprite) = wanted.sprite.as_deref() else {
@@ -1280,8 +1158,7 @@ impl Overlay {
         };
         let hash = wanted.hash;
         let geometry = SpriteGeometry::of(sprite, att.backing_scale());
-        let local = self.window.convertPointFromScreen(mouse);
-        let (origin_x, origin_y) = sprite_origin((local.x, local.y), &geometry);
+        let local = self.window.convertPointFromScreen(hit.mouse);
         let content = if shown {
             let mode = self.mode.unwrap_or(LayerMode::Sdr);
             let peak = att.headroom();
@@ -1300,17 +1177,28 @@ impl Overlay {
                 hash,
                 mode,
                 peak,
-                geometry,
+                geometry: geometry.clone(),
             }
         } else {
             Content::Transparent
         };
         // Publish a completed image before its position, in the same Core
-        // Animation transaction. A pending shape keeps its old pixels and
-        // position until completion; a hide uses the cached transparent image.
-        if self.ensure_content(content, Some(sprite))
-            && inputs.contains(VisibilityInputs::POINTER_INSIDE)
-        {
+        // Animation transaction. While a changed sprite renders, the sprite
+        // on screen keeps following the pointer with its own geometry; a hide
+        // uses the cached transparent image and lands at once.
+        let positioned = self.ensure_content(content, Some(sprite));
+        if !inputs.contains(VisibilityInputs::POINTER_INSIDE) {
+            return;
+        }
+        let geometry = if positioned {
+            Some(&geometry)
+        } else if let Some(Content::Sprite { geometry, .. }) = self.published.as_ref() {
+            Some(geometry)
+        } else {
+            None
+        };
+        if let Some(geometry) = geometry {
+            let (origin_x, origin_y) = sprite_origin((local.x, local.y), geometry);
             self.layer.setPosition(CGPoint {
                 x: origin_x,
                 y: origin_y,
@@ -1330,43 +1218,30 @@ impl Overlay {
 }
 
 /// Honor Win32's native hide only over the active device's unobscured client area.
-fn reconcile_native_cursor(mtm: MainThreadMarker, wanted: &WantedSnapshot, captured: bool) {
-    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
-        && (wanted.flags.contains(CursorOverlayFlags::HARDWARE)
-            || !wanted.flags.contains(CursorOverlayFlags::VISIBLE))
-        && wanted.owner.is_some()
-    {
-        restore_native_cursor(mtm);
-    }
-    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
-        || captured
-        || !NSApplication::sharedApplication(mtm).isActive()
-    {
-        // Wine and the foreground application own visible or externally captured cursors.
+fn reconcile_native_cursor(
+    mtm: MainThreadMarker,
+    wanted: &WantedSnapshot,
+    hit: Option<&PointerHit>,
+) {
+    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN) {
+        // Wine and the foreground application own visible cursors.
         return;
     }
-    let Some(att) = wanted.owner.as_ref() else {
-        // A detached device cannot own the native cursor.
+    let (Some(att), Some(hit)) = (wanted.owner.as_ref(), hit) else {
+        // Detached, inactive, or the view retired before the queued apply reached main.
         return;
     };
-    let Some((view, window)) = attachment::retain_view(att, mtm)
-        .and_then(|view| view.window().map(|window| (view, window)))
-    else {
-        // Native teardown can retire the view before the queued apply reaches main.
-        return;
-    };
-    let mouse = NSEvent::mouseLocation();
-    let client = window.convertRectToScreen(view.convertRect_toView(view.bounds(), None));
-    if !att.window_occluded()
-        && !window.isMiniaturized()
-        && rect_contains(client, mouse)
-        && window_under_pointer(mouse, mtm) == window.windowNumber()
-    {
+    if hit.over_game && !hit.miniaturized && !att.window_occluded() {
         select_native_blank(mtm);
     }
 }
 
-/// Reassert the native image if `AppKit` replaced it while Win32 still requests a hide.
+/// Select the native blank unless it is already the current image.
+///
+/// The blank stays until Wine selects a cursor of its own, which it does on
+/// every handle change. What it displaced is never put back: that image may be
+/// the arrow `AppKit` resolved for the pointer rather than Wine's cursor, and
+/// putting it back showed the system arrow during a mouselook.
 fn select_native_blank(mtm: MainThreadMarker) {
     POINTER_WATCH.with_borrow_mut(|watch| {
         if watch.native_cursor.is_none() {
@@ -1376,24 +1251,8 @@ fn select_native_blank(mtm: MainThreadMarker) {
         if let Some(cursor) = watch.native_cursor.as_ref()
             && !core::ptr::eq(&raw const *current, &raw const **cursor)
         {
-            watch.native_restore = Some(current);
             cursor.set();
-            debug!(target: LOG_TARGET, "cursor: native blank applied for activation={}", watch.activation);
-        }
-    });
-}
-
-/// Give back the image we displaced without overwriting a newer Wine cursor.
-fn restore_native_cursor(mtm: MainThreadMarker) {
-    POINTER_WATCH.with_borrow_mut(|watch| {
-        if let Some(previous) = watch.native_restore.take()
-            && NSApplication::sharedApplication(mtm).isActive()
-            && watch.native_cursor.as_ref().is_some_and(|blank| {
-                core::ptr::eq(&raw const *NSCursor::currentCursor(), &raw const **blank)
-            })
-        {
-            previous.set();
-            debug!(target: LOG_TARGET, "cursor: native image restored after Win32 show");
+            debug!(target: LOG_TARGET, "cursor: native blank applied");
         }
     });
 }
@@ -1510,23 +1369,18 @@ fn no_actions() -> Retained<NSDictionary<NSString, ProtocolObject<dyn CAAction>>
     )
 }
 
-/// Whether winemac warped the pointer since the last warp the observer acted on.
-///
-/// winemac reports `0` once an event newer than its warp arrived, which the
-/// pointer watch handled as that event; only a fresh warp time is a move
-/// nothing else told us about. Compared bit for bit: `followed` is a copy of
-/// an earlier `now`, never a computed value.
-const fn warp_since(followed: f64, now: f64) -> bool {
-    now != 0.0 && now.to_bits() != followed.to_bits()
-}
-
-/// Observe Wine-consumed input and warps before Core Animation commits the transaction.
-extern "C-unwind" fn follow_warp(
+/// Reconcile before Core Animation commits the transaction, when there is something to do.
+extern "C-unwind" fn before_commit(
     _observer: *mut CFRunLoopObserver,
     _activity: CFRunLoopActivity,
     _info: *mut core::ffi::c_void,
 ) {
-    autoreleasepool(|_| apply_on_main_inner());
+    autoreleasepool(|_| {
+        let mtm = MainThreadMarker::new().expect("before_commit runs on the main thread");
+        if reconcile_due() {
+            apply_on_main_inner(mtm);
+        }
+    });
 }
 
 /// The number of the window a click at `point` would land on, in any application.
@@ -1551,10 +1405,10 @@ fn game_screen(
 
 /// The frame the overlay window covers: the screen the game window is on.
 ///
-/// The main screen when the game window is not on any (mid-move between
-/// displays) or no attachment is followed; the window follows on the next event.
-fn overlay_frame(mtm: MainThreadMarker, owner: Option<&Arc<Attachment>>) -> CGRect {
-    game_screen(mtm, owner).map_or(
+/// A unit rectangle when there is no screen at all; the window follows on the
+/// next pass that finds one.
+fn screen_frame(screen: Option<Retained<NSScreen>>) -> CGRect {
+    screen.map_or(
         CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize {
@@ -1623,48 +1477,13 @@ fn upload_sprite_texture(
     Some(texture)
 }
 
-/// Mouse moves and button transitions used by both observation routes.
-fn mouse_mask() -> NSEventMask {
-    NSEventMask::MouseMoved
-        | NSEventMask::LeftMouseDragged
-        | NSEventMask::RightMouseDragged
-        | NSEventMask::OtherMouseDragged
-        | NSEventMask::LeftMouseDown
-        | NSEventMask::LeftMouseUp
-        | NSEventMask::RightMouseDown
-        | NSEventMask::RightMouseUp
-        | NSEventMask::OtherMouseDown
-        | NSEventMask::OtherMouseUp
-}
-
-/// Install process-lifetime monitors; retry only components whose creation failed.
+/// Install the process-lifetime observers; retry only components whose creation failed.
 ///
-/// Wine can consume captured events before calling `AppKit`'s `sendEvent`, bypassing
-/// the local monitor. The existing run-loop observer also reads currentEvent,
-/// which Wine's dequeue already updates. Both routes share one deduplicator.
+/// The run-loop observer is the one place the cursor is reconciled; the
+/// activation observers only ask it for a pass, since which application is
+/// frontmost is a visibility input that no pointer motion announces.
 pub fn install_pointer_watch(mtm: MainThreadMarker) {
     let mut installed = POINTER_WATCH_INSTALLED.get();
-    if !installed.contains(WatchInstalled::MONITOR) {
-        let monitor = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
-            autoreleasepool(|_| {
-                let mtm =
-                    MainThreadMarker::new().expect("cursor local monitor runs on the main thread");
-                // SAFETY: AppKit passes the live event for this monitor invocation.
-                observe_mouse_event(unsafe { event.as_ref() }, "local", mtm);
-                event.as_ptr()
-            })
-        });
-        // SAFETY: AppKit copies this block; the token is retained for process lifetime.
-        let token = unsafe {
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(mouse_mask(), &monitor)
-        };
-        if let Some(token) = token {
-            core::mem::forget(token);
-            installed.insert(WatchInstalled::MONITOR);
-        } else {
-            mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: local monitor installation failed");
-        }
-    }
     if !installed.contains(WatchInstalled::RUN_LOOP) {
         // Order 0 runs before Core Animation's commit observer (order 2 000 000).
         let activities = CFRunLoopActivity::BeforeWaiting | CFRunLoopActivity::Exit;
@@ -1675,7 +1494,7 @@ pub fn install_pointer_watch(mtm: MainThreadMarker) {
                 activities.0,
                 true,
                 0,
-                Some(follow_warp),
+                Some(before_commit),
                 core::ptr::null_mut(),
             )
         };
@@ -1707,23 +1526,7 @@ fn install_activation_watch(_mtm: MainThreadMarker) {
     };
     for name in names {
         let block = RcBlock::new(|_: NonNull<NSNotification>| {
-            autoreleasepool(|_| {
-                let mtm = MainThreadMarker::new()
-                    .expect("cursor activation observer runs on the main thread");
-                let active = NSApplication::sharedApplication(mtm).isActive();
-                let recovered = POINTER_WATCH.with_borrow_mut(|watch| {
-                    if active {
-                        watch.activation = watch.activation.wrapping_add(1);
-                    }
-                    watch
-                        .input
-                        .note_position(NSEvent::mouseLocation(), now_ns());
-                    core::mem::replace(&mut watch.input.captured, false)
-                });
-                if recovered {
-                    attachment::request_cursor_kick_all();
-                }
-            });
+            queue_apply();
         });
         // SAFETY: the notification center copies the block; the token is kept for life.
         let token = unsafe {

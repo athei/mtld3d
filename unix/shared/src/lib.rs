@@ -1,6 +1,7 @@
 use strum::{EnumCount, VariantArray};
 
 pub mod blit_geometry;
+pub mod bounded_cache;
 mod commands;
 pub mod crumb;
 pub mod fatal;
