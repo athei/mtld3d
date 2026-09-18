@@ -9,8 +9,8 @@
 //! `VirtualAlloc(MEM_COMMIT)` and `VirtualFree(MEM_DECOMMIT)`.
 //!
 //! This has to run on a PE target: the POSIX PAL never returns pages, so
-//! the host-side twin in `mtld3d-core/tests/snmalloc_drift.rs` can only
-//! check the pow2 rounding half.
+//! the host-side twin in `mtld3d-core/tests/snmalloc_drift.rs` checks
+//! the same power-of-two rounding assertions as this binary.
 //!
 //! The test binary links its own snmalloc rather than reaching into
 //! `d3d9.dll`, but it is built for the same target with the same features,
@@ -31,6 +31,9 @@ use std::alloc::{Layout, alloc, dealloc};
 
 use mtld3d_core::page_box::{PAGE_SIZE, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache};
 use snmalloc_rs::SnMalloc;
+
+#[path = "../../core/tests/snmalloc_drift/shape.rs"]
+mod shape;
 
 #[global_allocator]
 static ALLOCATOR: SnMalloc = SnMalloc;
@@ -77,13 +80,13 @@ fn region_state(addr: *const u8) -> u32 {
     let written = unsafe { VirtualQuery(addr.cast(), &raw mut info, size) };
     assert_eq!(
         written, size,
-        "VirtualQuery wrote {written} bytes, expected {size} — probe is broken, not the allocator"
+        "VirtualQuery wrote {written} bytes, expected {size}: probe is broken, not the allocator"
     );
     info.state
 }
 
 #[test]
-fn free_past_the_local_cache_budget_decommits() {
+fn allocator_shape_and_cache_budget_match_model() {
     // 4 MiB: over 1 MiB, so it rounds to a chunk at or past the budget and
     // takes the forward-to-parent path on both the alloc and the free.
     let size = 4 * 1024 * 1024;
@@ -120,4 +123,10 @@ fn free_past_the_local_cache_budget_decommits() {
          LocalCacheSizeBits has moved, so SNMALLOC_LOCAL_CACHE_BYTES and the \
          uncached-alloc counter built on it are now wrong"
     );
+
+    // Keep these allocations in the same test: another test could reuse the
+    // just-freed address before VirtualQuery observes its decommitted state.
+    shape::chunk_size_model_matches_the_allocator();
+    shape::cutoff_agrees_with_observed_chunks();
+    shape::large_byte_allocations_round_to_chunks();
 }

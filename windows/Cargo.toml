@@ -24,7 +24,7 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary"] }
 rustc-hash = "2"
-snmalloc-rs = { version = "0.7", features = ["build_cc"] }
+snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f94f3ec1c10c0a29f910e17c1f30978", features = ["build_cc"] }
 strum = { version = "0.28", default-features = false }
 xbr = { version = "0.2", default-features = false }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
