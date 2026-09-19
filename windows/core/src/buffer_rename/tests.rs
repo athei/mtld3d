@@ -536,3 +536,49 @@ fn read_only_and_no_dirty_update_together_suppress_only_on_managed() {
         assert!(records_dirty_range(BOTH, pool), "pool={pool}");
     }
 }
+
+#[test]
+fn staged_rename_preserves_partial_and_padded_allocations() {
+    for len in [16_384, 32_768, 1_048_576, u64::from(u32::MAX)] {
+        let size = u32::try_from(len).expect("test size fits upload");
+        assert!(!stage_upload_needs_preserve(len, 0, size));
+        assert!(stage_upload_needs_preserve(len, 0, size - 1));
+        assert!(stage_upload_needs_preserve(len, 1, size - 1));
+        assert!(stage_upload_needs_preserve(len, 0, 0));
+        assert!(stage_upload_needs_preserve(len, 1, size));
+    }
+    // A PE32 upload cannot cover an allocation whose padding reached 4 GiB.
+    assert!(stage_upload_needs_preserve(1_u64 << 32, 0, u32::MAX));
+}
+
+#[test]
+fn staged_rename_chain_preserves_old_draws_and_unwritten_sentinels() {
+    const LEN: usize = 16_384;
+    let mut expected = vec![0x19; LEN];
+    let mut generations = vec![expected.clone()];
+    let mut snapshots = vec![expected.clone()];
+    // Full, partial, nonzero offset, and a logical fill with a padded tail.
+    for (offset, size, byte) in [
+        (0, LEN, 0x37),
+        (0, 48, 0x51),
+        (64, 64, 0x73),
+        (0, LEN - 4, 0x95),
+    ] {
+        let previous = generations.last().expect("initial generation");
+        let mut fresh = vec![0xcd; LEN];
+        if stage_upload_needs_preserve(
+            LEN as u64,
+            u32::try_from(offset).expect("offset fits"),
+            u32::try_from(size).expect("size fits"),
+        ) {
+            fresh.copy_from_slice(previous);
+        }
+        fresh[offset..offset + size].fill(byte);
+        expected[offset..offset + size].fill(byte);
+        assert_eq!(fresh, expected);
+        generations.push(fresh);
+        snapshots.push(expected.clone());
+        // Prior draws retain their original generation through later writes.
+        assert_eq!(generations, snapshots);
+    }
+}

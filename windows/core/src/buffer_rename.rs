@@ -271,5 +271,15 @@ pub const fn records_dirty_range(flags: u32, pool: u32) -> bool {
     !(flags & D3DLOCK_READONLY != 0 && pool == D3DPOOL_MANAGED)
 }
 
+/// Whether an overlapping staged upload leaves bytes to preserve on rename.
+///
+/// `device_len` is the allocated, padded device-buffer length, not the
+/// logical length exposed to the application. Only an exact full upload
+/// replaces every byte; a partial upload must carry the old complement.
+#[must_use]
+pub const fn stage_upload_needs_preserve(device_len: u64, offset: u32, size: u32) -> bool {
+    offset != 0 || size as u64 != device_len
+}
+
 #[cfg(test)]
 mod tests;

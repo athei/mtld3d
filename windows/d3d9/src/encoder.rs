@@ -12,7 +12,7 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
-    buffer_rename::BufferMapMode,
+    buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
@@ -2025,9 +2025,9 @@ impl FrameEncoder {
     /// device buffer would corrupt that earlier draw (they share one
     /// buffer — and the blit lands frame-head, before every pass). Instead
     /// we allocate a FRESH device buffer,
-    /// preserve the old contents into it (full device→device copy), write
+    /// preserve any bytes the upload leaves untouched, write
     /// the upload there, and rebind it for later draws — the earlier draws
-    /// keep the old buffer (per-draw snapshot). All three blits land in
+    /// keep the old buffer (per-draw snapshot). These blits land in
     /// the leading phase precisely because the fresh buffer is read by no
     /// earlier draw, so NO render-pass split is needed: the TBDR-correct
     /// equivalent of a `D3DLOCK_DISCARD` buffer rename. Overlaps are rare (measured
@@ -2139,19 +2139,21 @@ impl FrameEncoder {
 
         let dst_handle = if overlap {
             if let Some(fresh) = self.alloc_fresh_device_buffer(buffer_id, length) {
-                // Preserve the old contents into the fresh buffer (full
-                // device→device copy), then rebind it for later draws and
-                // retire the old buffer once this frame's GPU read retires.
-                self.frame_blit_commands
-                    .push(BlitCommand::copy_buffer_to_buffer(
-                        &CopyBufferToBufferInfo {
-                            src_buffer: device_handle,
-                            dst_buffer: fresh.raw(),
-                            src_offset: 0,
-                            dst_offset: 0,
-                            byte_size: length,
-                        },
-                    ));
+                // Preserve the complement unless the upload replaces the
+                // entire allocation, including any padded tail. Earlier
+                // draws still read the old buffer, so retain it either way.
+                if stage_upload_needs_preserve(length, dst_offset, size) {
+                    self.frame_blit_commands
+                        .push(BlitCommand::copy_buffer_to_buffer(
+                            &CopyBufferToBufferInfo {
+                                src_buffer: device_handle,
+                                dst_buffer: fresh.raw(),
+                                src_offset: 0,
+                                dst_offset: 0,
+                                byte_size: length,
+                            },
+                        ));
+                }
                 if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
                     s.device_buffer = fresh;
                 }

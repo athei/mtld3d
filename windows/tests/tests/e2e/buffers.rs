@@ -606,3 +606,66 @@ fn reset_after_a_released_backing_leaves_buffer_draws_working() {
         "a buffer created after the Reset fills and draws"
     );
 }
+
+#[test]
+fn staged_full_allocation_overlap_preserves_draw_generations() {
+    check_staged_overlap_refill(16_384, false);
+}
+
+#[test]
+fn staged_partial_overlap_preserves_draw_generations() {
+    check_staged_overlap_refill(16_384, true);
+}
+
+#[test]
+fn staged_padded_overlap_preserves_draw_generations() {
+    check_staged_overlap_refill(16_368, false);
+}
+
+/// An overlapping refill keeps prior draws on their original device buffer.
+///
+/// Partial refills also retain a second, untouched triangle after the rename.
+fn check_staged_overlap_refill(length: u32, partial: bool) {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(length, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    let mut vertices: Vec<Vertex> = (0..length / stride())
+        .map(|i| solid_triangle(MAGENTA)[i as usize % 3])
+        .collect();
+    vertices[..3].copy_from_slice(&solid_triangle(RED));
+    vb.lock(0, 0, 0).write(&vertices);
+    arm_diffuse(&h);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride()), D3D_OK);
+    h.render_once(BLUE, |d| {
+        let viewport = |x| mtld3d_types::D3DVIEWPORT9 {
+            x,
+            y: 0,
+            width: 200,
+            height: 480,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        assert_eq!(d.set_viewport(&viewport(0)), D3D_OK);
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), D3D_OK);
+        vertices[..3].copy_from_slice(&solid_triangle(GREEN));
+        if partial {
+            vb.lock(0, 3 * stride(), 0).write(&vertices[..3]);
+        } else {
+            vb.lock(0, 0, 0).write(&vertices);
+        }
+        assert_eq!(d.set_viewport(&viewport(220)), D3D_OK);
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), D3D_OK);
+        assert_eq!(d.set_viewport(&viewport(440)), D3D_OK);
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 3, 1), D3D_OK);
+    });
+    assert_eq!(
+        h.read_pixel(100, 280),
+        RED,
+        "prior draw keeps its generation"
+    );
+    assert_eq!(h.read_pixel(320, 280), GREEN, "refill reaches later draws");
+    assert_eq!(
+        h.read_pixel(540, 280),
+        MAGENTA,
+        "untouched triangle survives"
+    );
+}
