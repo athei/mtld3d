@@ -1172,3 +1172,29 @@ mod inverse {
         assert!(FfState::inverse(&D3DMATRIX { m: [0.0; 16] }).is_none());
     }
 }
+
+#[test]
+fn range_fog_keys_only_computed_vertex_fog() {
+    use mtld3d_types::{D3DFOG_EXP2, D3DRS_RANGEFOGENABLE};
+
+    use crate::dxso::FfVsFlags;
+
+    let ff = FfState::new();
+    for mode in [0, D3DFOG_EXP, D3DFOG_EXP2, D3DFOG_LINEAR] {
+        for (enabled, table, rhw) in [(1, 0, false), (0, 0, false), (1, 3, false), (1, 0, true)] {
+            let mut states = rs();
+            states[D3DRS_FOGENABLE as usize] = enabled;
+            states[D3DRS_FOGVERTEXMODE as usize] = mode;
+            states[D3DRS_FOGTABLEMODE as usize] = table;
+            let mut layout = FfVsLayout::default();
+            layout.flags.set(FfVsLayoutFlags::HAS_RHW, rhw);
+            let ordinary = ff.build_vs_key(&states, layout, 0);
+            states[D3DRS_RANGEFOGENABLE as usize] = 1;
+            let mut range = ff.build_vs_key(&states, layout, 0);
+            let active = mode != 0 && enabled != 0 && table == 0 && !rhw;
+            assert_eq!(range.flags.contains(FfVsFlags::RANGE_FOG), active);
+            range.flags.remove(FfVsFlags::RANGE_FOG);
+            assert_eq!(ordinary, range, "range fog changes only its active key bit");
+        }
+    }
+}

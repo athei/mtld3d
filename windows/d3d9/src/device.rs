@@ -13450,6 +13450,7 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_TEXTUREFACTOR
         | D3DRS_FOGENABLE
         | D3DRS_FOGVERTEXMODE
+        | D3DRS_RANGEFOGENABLE
         | D3DRS_FOGCOLOR
         | D3DRS_FOGSTART
         | D3DRS_FOGEND
@@ -13535,7 +13536,6 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
 
         // Bucket B — not yet implemented → port-target candidates.
         D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
-        D3DRS_RANGEFOGENABLE => RsClass::PortCandidate("range fog"),
         // Bucket D — obsolete / no Metal analog. Info-level (not warn)
         // because the no-op IS the correct behaviour on every modern
         // driver.
