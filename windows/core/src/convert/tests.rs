@@ -1114,3 +1114,14 @@ fn splat_pattern_leaves_the_slice_alone_for_an_empty_pattern() {
     splat_pixel_pattern(&mut dst, &[]);
     assert_eq!(dst, [7, 7, 7]);
 }
+
+#[test]
+fn fill_mode_preserves_triangles_and_maps_only_wireframe_to_lines() {
+    assert_eq!(d3d_to_metal_fill(D3DFILL_SOLID), TriangleFillMode::Fill);
+    assert_eq!(
+        d3d_to_metal_fill(D3DFILL_WIREFRAME),
+        TriangleFillMode::Lines
+    );
+    assert_eq!(d3d_to_metal_fill(D3DFILL_POINT), TriangleFillMode::Fill);
+    assert_eq!(d3d_to_metal_fill(u32::MAX), TriangleFillMode::Fill);
+}

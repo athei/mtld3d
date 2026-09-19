@@ -11139,6 +11139,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             depth_scissor,
             depth_stencil_state,
             cull_mode: enum_rs(D3DRS_CULLMODE),
+            fill_mode: enum_rs(D3DRS_FILLMODE),
             scissor_rect,
             blend_factor: rs[D3DRS_BLENDFACTOR as usize],
             depth_bias: rs[D3DRS_DEPTHBIAS as usize],
@@ -13413,6 +13414,7 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_COLORWRITEENABLE2
         | D3DRS_COLORWRITEENABLE3
         | D3DRS_CULLMODE
+        | D3DRS_FILLMODE
         | D3DRS_SCISSORTESTENABLE
         | D3DRS_LIGHTING
         | D3DRS_ALPHATESTENABLE
@@ -13508,9 +13510,6 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         // Bucket B — not yet implemented → port-target candidates.
         D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
         D3DRS_RANGEFOGENABLE => RsClass::PortCandidate("range fog"),
-        D3DRS_FILLMODE => {
-            RsClass::PortCandidate("non-solid fill mode (Metal has no native wireframe)")
-        }
         // Bucket D — obsolete / no Metal analog. Info-level (not warn)
         // because the no-op IS the correct behaviour on every modern
         // driver.

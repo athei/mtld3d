@@ -64,7 +64,7 @@ use mtld3d_shared::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
         PRESENT_PIPELINE_DEPTH, PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind,
         SnapshotFlags, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
-        TextureUsage, VisibilityResultMode,
+        TextureUsage, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
@@ -4515,8 +4515,8 @@ impl FrameEncoder {
 
         // Bind the destination as the colour RT with no depth attachment, then
         // open a Load pass scoped to the destination rect via the viewport.
-        // `set_color_render_target` / `set_depth_stencil_attachment` end the
-        // current pass for us, so the quad never draws on a stale encoder.
+        // Changing attachments ends the current pass. A destination already
+        // bound without depth can reuse the current encoder.
         // `dst_dims` and `dst_rect` are already in the destination texture's own
         // space (the caller converted them), so this binding declares the
         // identity rather than converting a second time.
@@ -4545,14 +4545,21 @@ impl FrameEncoder {
             dst_format,
             "blit-quad pipeline format must equal the pass's attachment format"
         );
+        let passes_before = self.pass_state.passes().len();
         self.pass_state.ensure_pass_open();
+        self.reset_last_bound_if_pass_opened(passes_before);
         // The destination's content survives the readback that drives the
         // conformance check (and any real `GetRenderTargetData`).
         self.pass_state.note_color_read_back(dst_tex);
-        // A fresh Metal encoder always opens here (the colour RT changed, which
-        // ends any prior pass), so flush the per-draw dedup so every binding
-        // below is actually emitted (the clear-quad cross-pass rule).
-        self.reset_last_bound_for_fresh_encoder();
+        // A reused encoder can still carry the preceding draw's raster state.
+        // Fresh encoders already default to no culling and Fill.
+        if self.pass_state.passes().len() == passes_before
+            && self.last_bound.cull_mode_changed(CullMode::None)
+        {
+            self.pass_state
+                .emit_command(Command::set_cull_mode(CullMode::None));
+        }
+        self.emit_triangle_fill_mode(TriangleFillMode::Fill);
 
         let depth_state = self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert(), false);
         if self.last_bound.pipeline_changed(pipeline) {
@@ -4846,6 +4853,7 @@ impl FrameEncoder {
             self.pass_state
                 .emit_command(Command::set_cull_mode(CullMode::None));
         }
+        self.emit_triangle_fill_mode(TriangleFillMode::Fill);
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
         // Inline slot-0 bind clobbers the real Metal vertex-buffer binding;
@@ -4882,6 +4890,9 @@ impl FrameEncoder {
         // attachment is gone (the clear-quad pipeline declares a
         // color output and would otherwise fail Metal's pipeline-vs-RP
         // format validation against the depth-only descriptor).
+        // Keep this state change outside the removable block: a later solid
+        // draw can reuse it even when Rule H drops the color clear itself.
+        self.emit_triangle_fill_mode(TriangleFillMode::Fill);
         let block_start = self.pass_state.open_color_clear_quad_block();
         // A color clear-quad must declare a depth attachment ONLY when the live
         // pass has one. On a no-depth pass (an explicit
@@ -5120,6 +5131,14 @@ impl FrameEncoder {
     /// constants in any profile we ship.
     pub const fn vs_constants_populated_rows(&self) -> u16 {
         self.vs_constants_populated_rows
+    }
+
+    /// Change the native triangle fill state without adding a pipeline variant.
+    pub fn emit_triangle_fill_mode(&mut self, mode: TriangleFillMode) {
+        if self.last_bound.triangle_fill_mode_changed(mode) {
+            self.pass_state
+                .emit_command(Command::set_triangle_fill_mode(mode));
+        }
     }
 
     /// Ensure a pass is live for the next draw.

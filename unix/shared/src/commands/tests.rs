@@ -352,3 +352,16 @@ fn volume_mip_copy_carries_depth_separately_from_array_slices() {
     assert_eq!((cmd.src_slice, cmd.dst_slice), (0, 0));
     assert_eq!((cmd.origin_x, cmd.origin_y, cmd.dst_offset), (0, 0, 0));
 }
+
+#[test]
+fn triangle_fill_mode_round_trips_through_the_wire_command() {
+    for mode in [TriangleFillMode::Fill, TriangleFillMode::Lines] {
+        let command = Command::set_triangle_fill_mode(mode);
+        assert_eq!(
+            CommandType::from_repr(command.cmd),
+            Some(CommandType::SetTriangleFillMode)
+        );
+        assert_eq!(TriangleFillMode::from_repr(command.param_a), Some(mode));
+        assert!(!command.is_draw());
+    }
+}

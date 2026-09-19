@@ -21,7 +21,7 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   full two-sided stencil test, and GPU-only plain depth textures for RESZ
   destinations.
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
-  separate alpha blend, blend factor, write masks.
+  separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
   alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`.
@@ -40,8 +40,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 
 Each fails cleanly, with an absent cap bit or a documented error return.
 
-- Non-solid fill modes: Metal has no wireframe, so the state is warned once
-  and drawn solid.
+- Point polygon fill: Metal has no point-fill mode, so the state is warned
+  once and drawn solid.
 - Dynamic depth textures: packed depth uploads have no conversion path.
   Depth textures also have no vertex sampling. Automatic mip-generation
   requests use the single-level `D3DOK_NOAUTOGEN` fallback.
