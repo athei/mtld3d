@@ -906,13 +906,23 @@ impl Surface<'_> {
     /// Lock the whole surface. The returned guard unlocks on drop.
     #[must_use]
     pub fn lock_rect(&self, flags: u32) -> LockedRect<'_> {
+        self.lock_rect_inner(None, flags)
+    }
+
+    /// Lock a surface rectangle. The returned guard unlocks on drop.
+    #[must_use]
+    pub fn lock_rect_partial(&self, rect: &[i32; 4], flags: u32) -> LockedRect<'_> {
+        self.lock_rect_inner(Some(rect), flags)
+    }
+
+    fn lock_rect_inner(&self, rect: Option<&[i32; 4]>, flags: u32) -> LockedRect<'_> {
+        let rect = rect.map_or(core::ptr::null(), |r| core::ptr::from_ref(r).cast());
         let mut locked = D3DLOCKED_RECT {
             pitch: 0,
             bits: core::ptr::null_mut(),
         };
-        // SAFETY: vtable thunk; `self.ptr` is live and `&mut locked` is writable.
-        let hr =
-            unsafe { (self.vtbl().lock_rect)(self.ptr, &raw mut locked, core::ptr::null(), flags) };
+        // SAFETY: live surface, writable output, and a null or live input rect.
+        let hr = unsafe { (self.vtbl().lock_rect)(self.ptr, &raw mut locked, rect, flags) };
         expect_ok(hr, "Surface LockRect");
         LockedRect {
             owner: LockOwner::Surface { this: self.ptr },

@@ -1372,8 +1372,7 @@ impl TextureInner {
     /// render-quad conversion needs a render-target destination. And an
     /// `UpdateSurface` / `UpdateTexture` whose endpoints differ in format,
     /// which D3D9 accepts and converts. Returns false for a pair the codec
-    /// does not cover (the `StretchRect` caller falls back to a best-effort
-    /// no-op, the `Update*` callers reject the pair up front) and for a region
+    /// does not cover (callers reject unsupported pairs up front) and for a region
     /// no part of which lies in both levels. Same-size only (`src_rect` extent
     /// equals the destination extent), the caller rejects scaling upstream. The
     /// region is clipped to the source and the destination level, so a caller
@@ -1442,7 +1441,20 @@ impl TextureInner {
             return false;
         }
         self.ensure_staging(dst_level);
-        self.prepare_volume_staging_write(dst_level);
+        if !self.flags.contains(TextureFlags::VOLUME_TEXTURE)
+            && self.staging[dst_level].has_readers()
+        {
+            // Earlier uploads and their retries retain these bytes. A whole
+            // conversion replaces them all; a partial one preserves the rest.
+            let preserve = if whole {
+                PreserveKind::None
+            } else {
+                PreserveKind::Cpu
+            };
+            self.rename_staging(dst_level, preserve);
+        } else {
+            self.prepare_volume_staging_write(dst_level);
+        }
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -4213,6 +4225,16 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
 /// DeviceInner` from `ti.device_inner` when a parent caller (e.g.
 /// `snapshot_stage_bindings`) already holds one.
 pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32, rect: DirtyRect) {
+    schedule_upload_with_order::<false>(ti, dev, level, rect);
+}
+
+/// Schedule an upload, specializing its placement for CPU `StretchRect` writes.
+fn schedule_upload_with_order<const ORDERED: bool>(
+    ti: &mut TextureInner,
+    dev: &mut DeviceInner,
+    level: u32,
+    rect: DirtyRect,
+) {
     let level_u = level as usize;
     if ti.dropped_staging & (1u32 << level_u) != 0 {
         // Nothing to upload from: the level's bytes live on the GPU only. A
@@ -4276,7 +4298,11 @@ pub fn schedule_upload(ti: &mut TextureInner, dev: &mut DeviceInner, level: u32,
         rect.h
     );
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_texture_upload(job);
+        if ORDERED {
+            enc.run_ordered_texture_upload(job);
+        } else {
+            enc.run_texture_upload(job);
+        }
         if regen_mipmaps {
             enc.run_generate_mipmaps(texture_id);
         }
@@ -4586,7 +4612,14 @@ pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
     if ti.dirty_mask == 0 {
         return;
     }
-    flush_dirty_mips_slow(ti, dev);
+    flush_dirty_mips_slow::<false>(ti, dev);
+}
+
+/// Publish a CPU `StretchRect` conversion after earlier ordered texture writes.
+pub fn flush_converted_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
+    if ti.dirty_mask != 0 {
+        flush_dirty_mips_slow::<true>(ti, dev);
+    }
 }
 
 /// Upload tail of [`flush_dirty_mips`], reached only when some mip is dirty.
@@ -4595,7 +4628,7 @@ pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
 /// mask-is-zero gate above.
 #[cold]
 #[inline(never)]
-fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
+fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut DeviceInner) {
     if ti.is_cpu_only() {
         // No `MTLTexture` to upload into yet. The bits stay set, so the
         // promotion a sampling bind performs uploads every level the
@@ -4656,7 +4689,7 @@ fn flush_dirty_mips_slow(ti: &mut TextureInner, dev: &mut DeviceInner) {
             .get_mut(level_u)
             .and_then(Option::take)
             .unwrap_or_else(|| DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u]));
-        schedule_upload(ti, dev, level, rect);
+        schedule_upload_with_order::<ORDERED>(ti, dev, level, rect);
         dirty_count += 1;
     }
     let texture_id = ti.texture_id;

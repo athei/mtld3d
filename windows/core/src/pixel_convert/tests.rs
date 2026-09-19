@@ -426,3 +426,125 @@ fn an_unconvertible_pair_writes_nothing() {
     ));
     assert!(dst.iter().all(|b| *b == 0));
 }
+
+#[test]
+fn wide_sources_quantize_only_into_bgra8() {
+    for source in [
+        mtld3d_types::D3DFMT_A16B16G16R16,
+        mtld3d_types::D3DFMT_A32B32G32R32F,
+    ] {
+        assert!(can_convert(source, D3DFMT_A8R8G8B8));
+        assert!(!can_convert_update(source, D3DFMT_A8R8G8B8));
+        for destination in [source, D3DFMT_R5G6B5, D3DFMT_L8, D3DFMT_X8R8G8B8] {
+            let mut destination_bytes = [0x5a; 16];
+            assert!(!convert_region(
+                &mut destination_bytes,
+                destination,
+                &[0xff; 16],
+                source,
+                &whole(1, 1, 16, 16)
+            ));
+            assert_eq!(destination_bytes, [0x5a; 16]);
+        }
+    }
+}
+
+#[test]
+fn unorm16_quantization_covers_every_channel_value() {
+    for value in 0..=u16::MAX {
+        let source: Vec<_> = [value, value, value, value]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let actual = into_argb(mtld3d_types::D3DFMT_A16B16G16R16, &source);
+        // Nearest member of the destination's exact normalized grid: consecutive
+        // 8-bit values are 257 source units apart, with no integer halfway tie.
+        let expected = u32::from((value / 257) + u16::from(value % 257 > 128));
+        assert_eq!(actual, expected * 0x0101_0101, "source {value}");
+    }
+}
+
+#[test]
+fn float32_quantization_preserves_source_precision_and_clamps() {
+    for (channels, expected) in [
+        (
+            [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0],
+            0x0000_ff00,
+        ),
+        (
+            [0.5 / 255.0, 1.5 / 255.0, 2.5 / 255.0, 127.5 / 255.0],
+            0x8001_0203,
+        ),
+        (
+            [126.5 / 255.0, 128.5 / 255.0, 253.5 / 255.0, 254.5 / 255.0],
+            0xfe7f_80fd,
+        ),
+        (
+            [0.499 / 255.0, 0.501 / 255.0, 2.499 / 255.0, 2.501 / 255.0],
+            0x0300_0102,
+        ),
+        ([-0.25, 1.25, 0.5, 1.0], 0xff00_ff80),
+    ] {
+        let source: Vec<_> = channels.into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(
+            into_argb(mtld3d_types::D3DFMT_A32B32G32R32F, &source),
+            expected
+        );
+    }
+}
+
+#[test]
+fn wide_regions_preserve_padding_origins_and_other_slices() {
+    for (format, pixel) in [
+        (
+            mtld3d_types::D3DFMT_A16B16G16R16,
+            [0x3333_u16, 0x6666, 0x9999, 0xcccc]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            mtld3d_types::D3DFMT_A32B32G32R32F,
+            [0.2_f32, 0.4, 0.6, 0.8]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        ),
+    ] {
+        let bpp = pixel.len();
+        let src_pitch = 3 * bpp + 7;
+        let src_slice_pitch = src_pitch * 3 + 9;
+        let mut src = vec![0; src_slice_pitch * 2];
+        let mut dst = vec![0x5a; 136];
+        let mut expected = dst.clone();
+        for z in 0..2 {
+            for y in 1..3 {
+                let off = z * src_slice_pitch + y * src_pitch + bpp;
+                src[off..off + bpp].copy_from_slice(&pixel);
+                let out = z * 68 + (y - 1) * 20 + 8;
+                expected[out..out + 4].copy_from_slice(&0xcc33_6699_u32.to_le_bytes());
+            }
+        }
+        let region = ConvertRegion {
+            src_x: 1,
+            src_y: 1,
+            dst_x: 2,
+            dst_y: 0,
+            width: 1,
+            height: 2,
+            src_pitch,
+            dst_pitch: 20,
+            src_slice_pitch,
+            dst_slice_pitch: 68,
+            depth: 2,
+        };
+        assert!(convert_region(
+            &mut dst,
+            D3DFMT_A8R8G8B8,
+            &src,
+            format,
+            &region
+        ));
+        assert_eq!(dst, expected);
+    }
+}
