@@ -219,6 +219,77 @@ impl VolumeTexture<'_> {
         self.write_texels(level, None, texels);
     }
 
+    /// Fill an eight-byte signed four-lane mip, honoring row and slice pitches.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or the slice does not fill the mip.
+    pub fn write_i16x4(&self, level: u32, texels: &[[i16; 4]]) {
+        self.write_texels(level, None, texels);
+    }
+
+    /// Read an eight-byte signed four-lane mip and return its reported pitches.
+    ///
+    /// # Panics
+    /// Panics if the format, description or lock is invalid.
+    #[must_use]
+    pub fn read_i16x4(&self, level: u32) -> (i32, i32, Vec<[i16; 4]>) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "VolumeTexture GetLevelDesc");
+        assert_eq!(desc.format, mtld3d_types::D3DFMT_Q16W16V16U16);
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: the live volume owns the level, the output is writable,
+        // and a null box requests the complete level.
+        expect_ok(
+            unsafe {
+                (self.vtbl().lock_box)(
+                    self.ptr,
+                    level,
+                    &raw mut locked,
+                    core::ptr::null(),
+                    mtld3d_types::D3DLOCK_READONLY,
+                )
+            },
+            "VolumeTexture LockBox",
+        );
+        assert!(!locked.bits.is_null());
+        let row = usize::try_from(locked.row_pitch).expect("positive row pitch");
+        let slice = usize::try_from(locked.slice_pitch).expect("positive slice pitch");
+        let width = desc.width as usize;
+        let height = desc.height as usize;
+        let depth = desc.depth as usize;
+        assert!(row >= width * 8 && slice >= row * height);
+        let mut texels = Vec::with_capacity(width * height * depth);
+        for z in 0..depth {
+            for y in 0..height {
+                for x in 0..width {
+                    // SAFETY: the format has eight-byte texels and the
+                    // validated row/slice bounds keep this read in the locked
+                    // level. All i16 bit patterns are valid; no alignment is
+                    // assumed and the copied value outlives the lock.
+                    let texel =
+                        unsafe { locked.bits.cast::<u8>().add(z * slice + y * row + x * 8) };
+                    // SAFETY: `texel` points to one validated eight-byte texel
+                    // in the live lock; read_unaligned copies all four lanes.
+                    texels.push(unsafe { texel.cast::<[i16; 4]>().read_unaligned() });
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
+        (locked.row_pitch, locked.slice_pitch, texels)
+    }
+
+    /// Fill a signed four-lane box, preserving texels outside it.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or the slice does not fill the box.
+    pub fn write_box_i16x4(&self, level: u32, region: &D3DBOX, texels: &[[i16; 4]]) {
+        self.write_texels(level, Some(region), texels);
+    }
+
     /// Fill a box of a 32-bit-per-texel volume, preserving texels outside it.
     ///
     /// # Panics
