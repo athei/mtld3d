@@ -4914,6 +4914,15 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
+    if mtld3d_core::format::uses_strict_dynamic_pool_validation(format)
+        && usage & D3DUSAGE_DYNAMIC != 0
+        && pool == D3DPOOL_MANAGED
+    {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateTexture(V16U16, DYNAMIC, MANAGED) → INVALIDCALL");
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     // A create's usage has to agree with the answer `CheckDeviceFormat` gives
     // for the same format, so a format that is not colour-renderable cannot
     // carry D3DUSAGE_RENDERTARGET; this rejects the caller that skipped the
@@ -4976,11 +4985,16 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // Metal's `generateMipmaps` can't regenerate block-compressed levels, so
     // compressed autogen textures get a single backing level (the GPU mip-gen op
     // is format-guarded on the unix side) while uncompressed ones get a full chain
-    // to downsample.
-    let autogen_mipmap = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
+    // to downsample. V16U16 retains public usage but uses one level without
+    // the internal generation flag, matching its NOAUTOGEN query answer.
+    let autogen_requested = usage & D3DUSAGE_AUTOGENMIPMAP != 0;
+    let noautogen = autogen_requested && mtld3d_core::format::uses_noautogen_fallback(format);
+    let autogen_mipmap = autogen_requested && !noautogen;
     let autogen_full_chain = autogen_mipmap && !fmt.is_compressed();
     let natural_levels = compute_mip_count(width, height);
-    let actual_levels = if autogen_full_chain {
+    let actual_levels = if noautogen {
+        1
+    } else if autogen_full_chain {
         natural_levels
     } else {
         resolve_create_levels("CreateTexture", levels, natural_levels)
@@ -5542,6 +5556,15 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
+    if mtld3d_core::format::uses_strict_dynamic_pool_validation(format)
+        && usage & D3DUSAGE_DYNAMIC != 0
+        && pool == D3DPOOL_MANAGED
+    {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateCubeTexture(V16U16, DYNAMIC, MANAGED) → INVALIDCALL");
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     // DXTn cube faces must be block-aligned; edge_length
     // is both width and height of a face.
     if is_dxt_format(format) && !edge_length.is_multiple_of(fmt.block_width()) {
@@ -5571,10 +5594,14 @@ extern "system" fn device_create_cube_texture(
     let bpp = fmt.bytes_per_pixel().max(1);
     // `levels == 0` means the full chain. Staging is face-major so the cube
     // sidecar can address `face * levels + level` without another allocation.
-    let autogen_mipmap = usage & D3DUSAGE_AUTOGENMIPMAP != 0;
+    let autogen_requested = usage & D3DUSAGE_AUTOGENMIPMAP != 0;
+    let noautogen = autogen_requested && mtld3d_core::format::uses_noautogen_fallback(format);
+    let autogen_mipmap = autogen_requested && !noautogen;
     let autogen_full_chain = autogen_mipmap && !fmt.is_compressed();
     let natural_levels = compute_mip_count(edge_length, edge_length);
-    let actual_levels = if autogen_full_chain {
+    let actual_levels = if noautogen {
+        1
+    } else if autogen_full_chain {
         natural_levels
     } else {
         resolve_create_levels("CreateCubeTexture", levels, natural_levels)

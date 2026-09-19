@@ -189,3 +189,9 @@ It starts with Win32 `ShowCursor(FALSE)`, restores the native arrow, hides with
 `SetCursor(NULL)`, then restores the arrow again. Capture the stationary pointer
 and focus returns during both hidden phases; no native arrow should appear there.
 Both visible phases must show the native arrow. No overlay window is created.
+
+V16U16 texture tests cover signed endpoints, missing blue/alpha, native lock
+bytes, explicit mips, partial UpdateSurface, managed/systemmem UpdateTexture,
+cube faces and volume slices. The query/creation matrix checks unavailable
+render/sRGB usages and the one-level AUTOGEN fallback, including retained
+usage, filter state, invalid levels/pools and top-level publication.

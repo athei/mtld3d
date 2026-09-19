@@ -742,6 +742,26 @@ impl CubeTexture<'_> {
         unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(self.ptr) }
     }
 
+    /// `SetAutoGenFilterType` for this cube texture.
+    #[must_use]
+    pub fn set_auto_gen_filter_type(&self, filter: u32) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().set_auto_gen_filter_type)(self.ptr, filter) }
+    }
+
+    /// `GetAutoGenFilterType` for this cube texture.
+    #[must_use]
+    pub fn auto_gen_filter_type(&self) -> u32 {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().get_auto_gen_filter_type)(self.ptr) }
+    }
+
+    /// Request mip generation for this cube texture.
+    pub fn generate_mip_sub_levels(&self) {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().generate_mip_sub_levels)(self.ptr) };
+    }
+
     /// Lock one cube face and mip level.
     ///
     /// # Panics

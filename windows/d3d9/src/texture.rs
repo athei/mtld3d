@@ -3566,7 +3566,7 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     let ti = obj.inner_mut();
     if !ti.autogen_mipmap() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "GenerateMipSubLevels on non-AUTOGENMIPMAP texture → no-op"
+            "GenerateMipSubLevels without a generated mip chain → no-op"
         );
         return;
     }

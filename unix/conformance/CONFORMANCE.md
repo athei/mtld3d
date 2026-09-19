@@ -1310,3 +1310,12 @@ capability guards. Its individual cases still check TextureOpCaps. Raw
 D3DTSS_CONSTANT defaults remain zero, as device.c:7746 asserts. ALL and
 recorded stateblocks retain the value; this feature preserves the existing
 PIXEL preset exclusion rather than changing capture policy.
+
+### visual.c/volume_v16u16_test and test_signed_formats
+
+V16U16 textures use native RG16Snorm storage, with missing blue and alpha
+set to one. The signed-format and volume tests run through the same native
+byte uploads as other mapped formats. 2D and cube AUTOGEN requests answer
+D3DOK_NOAUTOGEN and create one actual level with the public usage retained;
+no mip-generation work is submitted. Render-target and sRGB queries remain
+unavailable. Other signed formats remain separate capabilities.

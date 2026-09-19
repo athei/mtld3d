@@ -87,6 +87,8 @@ pub enum PixelFormat {
     Bgr5A1Unorm = 43,
     /// 32-bit two-channel unorm. D3D9 `D3DFMT_G16R16`.
     Rg16Unorm = 60,
+    /// Signed normalized 16-bit U/V. D3D9 `D3DFMT_V16U16`.
+    Rg16Snorm = 62,
     /// 32-bit single-channel float. D3D9 `D3DFMT_R32F`.
     R32Float = 55,
     /// 16-bit two-channel float. D3D9 `D3DFMT_G16R16F`.
@@ -192,6 +194,7 @@ impl PixelFormat {
             | Self::Bgr5A1Unorm => BlockLayout::pixel(2),
             Self::R32Float
             | Self::Rg16Unorm
+            | Self::Rg16Snorm
             | Self::Rg16Float
             | Self::Rgba8Unorm
             | Self::Rgba8UnormSrgb
