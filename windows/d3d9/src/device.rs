@@ -6234,7 +6234,7 @@ fn copy_systemmem_to_default(
     // a pair outside it (block-compressed, depth, YUV destinations) has no
     // conversion to run, so it is the one mismatch still rejected.
     let (src_fmt, dst_fmt) = (src_tex.d3d_format(), dst_tex.d3d_format());
-    if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert(src_fmt, dst_fmt) {
+    if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert_update(src_fmt, dst_fmt) {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "reject Update*: no conversion for src=0x{src_fmt:x} into dst=0x{dst_fmt:x} → INVALIDCALL"
@@ -6357,7 +6357,7 @@ extern "system" fn device_update_surface(
         // outside it has no conversion to run, so it is the one mismatch still
         // rejected.
         let dst_fmt = tex.d3d_format();
-        if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert(src_fmt, dst_fmt) {
+        if src_fmt != dst_fmt && !mtld3d_core::pixel_convert::can_convert_update(src_fmt, dst_fmt) {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "reject UpdateSurface: no conversion for src=0x{src_fmt:x} into dst=0x{dst_fmt:x} → INVALIDCALL"
@@ -7347,15 +7347,13 @@ fn claim_dst_subresource_for_gpu(
 
 /// CPU-side cross-format `StretchRect` into an offscreen-plain destination.
 ///
-/// Neither GPU path serves it — the 1:1 blit
-/// can't convert formats and the render-quad conversion needs a render-target
-/// destination — so decode each source pixel and re-encode it into the
+/// The 1:1 blit cannot convert formats, and the render-quad conversion needs a
+/// render-target destination. Decode each source pixel and re-encode it into the
 /// destination texture's staging, then schedule the staging→texture upload
 /// (`flush_dirty_mips`) so a later sample sees the converted pixels; a later
 /// `LockRect` reads the same converted staging. Both surfaces are offscreen-
-/// plain here, so both are texture-backed. Best-effort: an unsupported format
-/// pair logs and leaves the destination untouched — the HR still succeeds,
-/// matching D3D9's converting-blit contract (the test asserts only the HR).
+/// plain here, so both are texture-backed. Unsupported pairs are rejected
+/// before this path schedules an upload or changes destination contents.
 fn convert_stretch_dst_staging(
     obj: &Direct3DDevice9,
     src_surf: *mut crate::surface::Direct3DSurface9,
@@ -7366,13 +7364,13 @@ fn convert_stretch_dst_staging(
     dst_region: mtld3d_core::stretch_rect::StretchRegion,
 ) -> i32 {
     if src_surf.is_null() || dst_surf.is_null() {
-        return D3D_OK;
+        return D3DERR_INVALIDCALL;
     }
     if !mtld3d_core::pixel_convert::can_convert(src_info.format, dst_info.format) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "StretchRect: cross-format offscreen pair (src=0x{:x}, dst=0x{:x}) not CPU-convertible → skipped (HR OK)",
+            "StretchRect: cross-format offscreen pair (src=0x{:x}, dst=0x{:x}) not CPU-convertible → INVALIDCALL",
             src_info.format, dst_info.format);
-        return D3D_OK;
+        return D3DERR_INVALIDCALL;
     }
     // SAFETY: caller-supplied live `Direct3DSurface9*` from the StretchRect
     // thunk (non-null checked above).
@@ -7382,9 +7380,9 @@ fn convert_stretch_dst_staging(
     if src_parent.is_null() || dst_parent.is_null() || src_parent == dst_parent {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "StretchRect: cross-format offscreen dst has no distinct texture backing → skipped (HR OK)"
+            "StretchRect: cross-format offscreen dst has no distinct texture backing → INVALIDCALL"
         );
-        return D3D_OK;
+        return D3DERR_INVALIDCALL;
     }
     // SAFETY: non-null (checked), distinct from `dst_parent`, and a live
     // `Direct3DTexture9` kept alive by the source surface's reference.
@@ -7422,7 +7420,7 @@ fn convert_stretch_dst_staging(
     }
     // Upload the converted staging to the destination's Metal texture, mirroring
     // the GPU blit the same-format offscreen path emits.
-    crate::texture::flush_dirty_mips(dst_tex.inner_mut(), obj.inner());
+    crate::texture::flush_converted_mips(dst_tex.inner_mut(), obj.inner());
     D3D_OK
 }
 
@@ -7482,15 +7480,16 @@ fn check_stretch_rect_formats(
     // render target — needs a render-target destination) or, into an
     // offscreen-plain destination (which can't be rendered into), via the CPU
     // converter in `device_stretch_rect` (the offscreen→offscreen cross-format
-    // path). Unmappable formats are always
-    // rejected.
+    // path). An offscreen pair needs an available CPU codec before either
+    // endpoint schedules an upload. Unmappable formats are always rejected.
     let convertible = src_mtl.is_some()
         && dst_mtl.is_some()
         && (src_mtl == dst_mtl
             || dst.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET)
-            || dst
+            || (dst
                 .flags
-                .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT));
+                .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
+                && mtld3d_core::pixel_convert::can_convert(src.format, dst.format)));
     if !convertible {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,

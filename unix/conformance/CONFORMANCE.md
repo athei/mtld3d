@@ -1236,3 +1236,24 @@ failure under Wine (formerly site 5184, classified expected). Every test then
 fails to create its Ex device and skips, which is not a failure, so the suite
 reports none. D3D9Ex itself remains out of scope; only the entry point
 resolves.
+
+### Wide-format offscreen conversion
+
+Same-size DEFAULT offscreen `StretchRect` converts A16B16G16R16 and
+A32B32G32R32F directly into A8R8G8B8. UNORM16 channels round to the nearest
+8-bit normalized value; float channels clamp to [0, 1] and round only at the
+final destination, with NaN mapping to zero. Partial rectangles preserve the
+pixels outside them through the existing staging ownership path. Contended
+conversion staging is renamed so queued uploads and retries retain their
+source bytes. A destination upload following an ordered GPU copy uses the
+ordered blit stream instead of running ahead of that copy at the frame head.
+Ordinary GPU copies and draws keep their existing routes.
+
+The format gate rejects other cross-Metal-format offscreen pairs without a
+CPU codec before scheduling uploads. This is an implementation limitation,
+not a native format restriction; render-target destinations retain their GPU
+conversion path. Wide-to-wide, other wide destinations and offscreen scaling
+remain unsupported. Adding these two codecs does not broaden the separately
+validated UpdateSurface/UpdateTexture format set. The existing device.c
+StretchRect matrix covers A8R8G8B8, X8R8G8B8 and R5G6B5, so these corrections
+are pinned by end-to-end pixel regressions rather than a baseline reduction.

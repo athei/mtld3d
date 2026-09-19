@@ -43,5 +43,6 @@ mod texture_stages;
 mod textures;
 mod transforms_ff;
 mod vertex_decl;
+mod wide_stretch;
 mod window_lifecycle;
 mod wireframe;

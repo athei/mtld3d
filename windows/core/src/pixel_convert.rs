@@ -9,13 +9,16 @@
 //! The codec covers every uncompressed colour format whose channels are
 //! unsigned normalised and at most 8 bits wide, in both directions, plus the
 //! packed 4:2:2 YUV formats as a source. RGBA8 is the intermediate, so it
-//! carries those formats without loss. [`can_convert`] answers for a pair up
+//! carries those formats without loss. A16B16G16R16 and A32B32G32R32F also
+//! convert directly into A8R8G8B8, quantizing only to the final destination.
+//! [`can_convert`] answers for a pair up
 //! front, so a caller can reject the pairs no codec covers instead of writing
 //! reinterpreted bytes.
 
 use mtld3d_types::{
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
-    D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_A16B16G16R16, D3DFMT_A32B32G32R32F, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
+    D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
 };
 
 use crate::stretch_rect::{decode_packed_yuv, is_packed_yuv};
@@ -41,12 +44,24 @@ pub struct ConvertRegion {
 
 /// Whether [`convert_region`] re-encodes this source format into this destination format.
 ///
-/// Destinations are the uncompressed 8-bit-or-narrower unsigned normalised
-/// colour formats; sources are those plus the packed 4:2:2 YUV pair. Anything
-/// else (block-compressed, depth, palettised, signed, and the 16-bit-per-
-/// channel and floating-point colour formats) has no codec here.
+/// The narrow normalized and packed-YUV codecs also serve the Update APIs.
+/// Wide RGBA sources have a direct BGRA8 destination codec for offscreen
+/// `StretchRect`; they do not pass through an RGBA8 intermediate on their way
+/// to another format.
 #[must_use]
 pub const fn can_convert(src_format: u32, dst_format: u32) -> bool {
+    can_convert_update(src_format, dst_format)
+        || (dst_format == D3DFMT_A8R8G8B8
+            && matches!(src_format, D3DFMT_A16B16G16R16 | D3DFMT_A32B32G32R32F))
+}
+
+/// Format conversion accepted by `UpdateSurface` and `UpdateTexture`.
+///
+/// Keep API acceptance independent of codecs added for other entry points.
+/// These APIs support the existing narrow normalized and packed-YUV sources;
+/// the wide offscreen `StretchRect` codecs do not expand their contract.
+#[must_use]
+pub const fn can_convert_update(src_format: u32, dst_format: u32) -> bool {
     (is_convertible_rgb(src_format) || is_packed_yuv(src_format)) && is_convertible_rgb(dst_format)
 }
 
@@ -66,6 +81,25 @@ pub fn convert_region(
 ) -> bool {
     if !can_convert(src_format, dst_format) {
         return false;
+    }
+    match src_format {
+        D3DFMT_A16B16G16R16 => {
+            return convert_wide_region(dst, src, region, |channel: [u8; 2]| {
+                let value = u32::from(u16::from_le_bytes(channel));
+                ((value * 255 + 32767) / 65535).to_le_bytes()[0]
+            });
+        }
+        D3DFMT_A32B32G32R32F => {
+            return convert_wide_region(dst, src, region, |channel: [u8; 4]| {
+                // Widen before multiplying: f32 multiplication can turn a
+                // below-half source value into a tie and round it up wrongly.
+                // Clamp infinities to the endpoints. ftol avoids x87 integer
+                // conversion on i686; its NaN sentinel maps to zero.
+                let value = f64::from(f32::from_le_bytes(channel)).clamp(0.0, 1.0);
+                u8::try_from(mtld3d_shared::ftol::ftol((value * 255.0).round())).unwrap_or(0)
+            });
+        }
+        _ => {}
     }
     let yuv_src = is_packed_yuv(src_format);
     let src_bpp = rgb_bpp(src_format);
@@ -103,6 +137,42 @@ pub fn convert_region(
                     return false;
                 };
                 encode_rgb_pixel(dst_format, rgba, out);
+            }
+        }
+    }
+    true
+}
+
+/// Direct wide RGBA to BGRA8 conversion.
+///
+/// The channel decoder and byte width specialize once per region, leaving no
+/// format branch in the pixel loop.
+fn convert_wide_region<const N: usize>(
+    dst: &mut [u8],
+    src: &[u8],
+    region: &ConvertRegion,
+    quantize: impl Fn([u8; N]) -> u8,
+) -> bool {
+    for z in 0..region.depth {
+        for row in 0..region.height {
+            let src_row =
+                z * region.src_slice_pitch + (region.src_y + row) as usize * region.src_pitch;
+            let dst_row =
+                z * region.dst_slice_pitch + (region.dst_y + row) as usize * region.dst_pitch;
+            for col in 0..region.width {
+                let src_offset = src_row + (region.src_x + col) as usize * 4 * N;
+                let dst_offset = dst_row + (region.dst_x + col) as usize * 4;
+                let (Some(pixel), Some(output)) = (
+                    src.get(src_offset..src_offset + 4 * N),
+                    dst.get_mut(dst_offset..dst_offset + 4),
+                ) else {
+                    return false;
+                };
+                for (source_channel, destination_channel) in [2, 1, 0, 3].into_iter().enumerate() {
+                    let mut channel = [0; N];
+                    channel.copy_from_slice(&pixel[source_channel * N..(source_channel + 1) * N]);
+                    output[destination_channel] = quantize(channel);
+                }
             }
         }
     }

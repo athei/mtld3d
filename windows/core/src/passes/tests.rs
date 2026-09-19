@@ -5413,6 +5413,8 @@ fn upload_prefix_preserves_order_through_pass_optimization() {
         s.emit_command(dummy_draw());
     }
     assert_eq!(s.upload_pass_count(), 2);
+    assert!(!s.texture_written_by_blit_this_frame(old));
+    assert!(!s.texture_written_by_blit_this_frame(fresh_texture));
     assert_eq!(s.passes()[2].commands().as_ptr(), application_commands);
     assert_eq!(s.passes()[2].commands().len(), 4);
     let prefix_commands: Vec<_> = s.passes()[..2]
@@ -5582,4 +5584,49 @@ fn released_sampling_alias_preserves_stores_and_clear_coalescing() {
             assert!(!s.texture_view_to_base.contains_key(&sample));
         }
     }
+}
+
+#[test]
+fn ordered_upload_keeps_application_passes_and_blits_in_sequence() {
+    let mut s = fresh();
+    let destination = tex(0x9100);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("before conversion");
+    s.push_pending_leading_blit(copy_blit(backbuffer(), destination));
+    let leading = s.take_pending_leading_blits();
+    s.push_upload_pass_with_order::<true>(
+        &UploadPassTarget {
+            texture: destination,
+            subresource: (0, 0),
+            size: (6, 2),
+            format: BB_FORMAT,
+            rect: (2, 1, 2, 1),
+        },
+        &[dummy_draw()],
+        leading,
+    );
+    s.emit_command(Command::set_fragment_texture(destination.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("after conversion");
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.cull_dead_clear_only_passes();
+    assert_eq!(
+        s.upload_pass_count(),
+        0,
+        "the conversion is not a frame prefix"
+    );
+    assert_eq!(s.passes().len(), 3);
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+    let conversion = &s.passes()[1];
+    assert_eq!(conversion.color_texture(), destination);
+    assert!(s.texture_written_by_blit_this_frame(destination));
+    assert_eq!(conversion.color_load(), ColorLoad::Load);
+    assert_eq!(conversion.color_store(), StoreAction::Store);
+    assert_eq!(conversion.leading_blits().len(), 1);
+    assert_eq!(conversion.leading_blits()[0].src_handle, backbuffer().raw());
+    assert_eq!(conversion.leading_blits()[0].dst_handle, destination.raw());
+    assert_eq!(s.passes()[2].color_texture(), backbuffer());
 }

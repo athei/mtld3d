@@ -2851,6 +2851,19 @@ impl PassState {
         commands: &[Command],
         leading_blits: Vec<BlitCommand>,
     ) {
+        self.push_upload_pass_with_order::<false>(target, commands, leading_blits);
+    }
+
+    /// Build an upload pass at the frame head or in application order.
+    ///
+    /// Ordered callers first close the application pass and supply its pending
+    /// blits, so an upload follows every earlier read and write of its texture.
+    pub fn push_upload_pass_with_order<const ORDERED: bool>(
+        &mut self,
+        target: &UploadPassTarget,
+        commands: &[Command],
+        leading_blits: Vec<BlitCommand>,
+    ) {
         let (x, y, w, h) = target.rect;
         let covers = x == 0 && y == 0 && w == target.size.0 && h == target.size.1;
         let color_load = if ENABLE_FIRST_USE_DONTCARE && covers {
@@ -2900,19 +2913,30 @@ impl PassState {
             color_clear_quad_ranges: Vec::new(),
             extra_color: [PassColorAttachment::NONE; 3],
         };
-        self.passes.insert(self.upload_pass_end, pass);
-        self.upload_pass_end += 1;
+        let pass_index = if ORDERED {
+            self.passes.len()
+        } else {
+            self.upload_pass_end
+        };
+        if ORDERED {
+            self.passes.push(pass);
+        } else {
+            self.passes.insert(self.upload_pass_end, pass);
+            self.upload_pass_end += 1;
+        }
         self.seen_color_rts.insert((target.texture, subresource));
         self.seen_color_rts_segment
             .insert((target.texture, subresource));
-        self.blit_written_rts.insert(target.texture);
+        if ORDERED {
+            self.blit_written_rts.insert(target.texture);
+        }
         self.seen_sampled_textures.insert(target.texture);
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
                 "upload-pass idx={} color={:#x} slice={slice} level={level} \
                  size={}x{} rect={x},{y}+{w}x{h} load={color_load:?}",
-                self.upload_pass_end - 1,
+                pass_index,
                 target.texture,
                 target.size.0,
                 target.size.1,

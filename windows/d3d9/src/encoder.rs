@@ -6910,7 +6910,7 @@ impl FrameEncoder {
         if job.depth > 1 {
             self.run_volume_upload_blit(job, handle)
         } else {
-            self.run_texture_upload_blit(job, handle)
+            self.run_texture_upload_blit::<false>(job, handle)
         }
     }
 
@@ -7168,6 +7168,16 @@ impl FrameEncoder {
     /// `replaceRegion` path, which would race a texture referenced by an
     /// in-flight frame.
     pub fn run_texture_upload(&mut self, job: TextureUploadJob) {
+        self.run_texture_upload_with_order::<false>(job);
+    }
+
+    /// Upload a CPU `StretchRect` result after prior ordered destination writes.
+    pub fn run_ordered_texture_upload(&mut self, job: TextureUploadJob) {
+        self.run_texture_upload_with_order::<true>(job);
+    }
+
+    /// Common upload lifetime, with placement selected before entering its loop.
+    fn run_texture_upload_with_order<const ORDERED: bool>(&mut self, job: TextureUploadJob) {
         let mut handle = self.get_or_create_texture(&job.info);
         if handle == 0 {
             mtld3d_shared::log_once_warn_by!(
@@ -7191,8 +7201,22 @@ impl FrameEncoder {
         let sampled = self
             .pass_state
             .texture_sampled_this_frame(unsafe { MetalHandle::new(handle) });
-        if sampled {
-            handle = self.rename_sampled_texture(&job, handle);
+        // Only uploads already requiring a version check the ordered-write
+        // set. Prefix upload passes do not belong to that set. Color writes
+        // after an ordered conversion stay on the same handle: closing the
+        // application pass orders earlier readers before this upload without
+        // a new allocation or preservation copy. Packed depth keeps its
+        // existing RESZ version policy.
+        let ordered = ORDERED
+            || (sampled
+                && self.pass_state.texture_written_by_blit_this_frame(
+                    // SAFETY: handle is the live texture resolved above.
+                    unsafe { MetalHandle::new(handle) },
+                ));
+        let ordered_color = ordered
+            && mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format).is_none();
+        if !ORDERED && sampled && !ordered_color {
+            handle = self.rename_sampled_texture(&job, handle, ordered);
             if handle == 0 {
                 decline_texture_upload(&job, "the sampled-texture rename found no destination");
                 return;
@@ -7202,10 +7226,17 @@ impl FrameEncoder {
         // keep the original hot-path blit untouched.
         let emitted = if job.depth > 1 {
             self.run_volume_upload_blit(&job, handle)
+        } else if ordered {
+            self.run_texture_upload_blit::<true>(&job, handle)
         } else {
-            self.run_texture_upload_blit(&job, handle)
+            self.run_texture_upload_blit::<false>(&job, handle)
         };
         if emitted {
+            if ordered_color {
+                // SAFETY: handle is the live destination resolved above.
+                self.pass_state
+                    .note_ordered_texture_write(unsafe { MetalHandle::new(handle) });
+            }
             // The subresource reached the command stream, so its decline
             // record (if it had one) has served its purpose and its retry
             // budget goes back, and a level that was holding its staging for
@@ -7240,7 +7271,12 @@ impl FrameEncoder {
     /// (mirrors the buffer rename's fallback: one draw may glitch this
     /// frame, but dropping the upload would persist stale content), or
     /// 0 only if the caller should abort.
-    fn rename_sampled_texture(&mut self, job: &TextureUploadJob, old_handle: u64) -> u64 {
+    fn rename_sampled_texture(
+        &mut self,
+        job: &TextureUploadJob,
+        old_handle: u64,
+        ordered: bool,
+    ) -> u64 {
         let info = &job.info;
         let desc = self.texture_desc_from_info(info);
         let mut views = TextureViews::EMPTY;
@@ -7288,17 +7324,11 @@ impl FrameEncoder {
         } else {
             1
         };
-        // Dynamic RESZ writes live between application passes. Preserving a
-        // different mip at the frame head would copy its pre-RESZ contents.
-        // Keep both preservation and subsequent depth uploads in that order.
-        let ordered_depth = mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format)
-            .is_some()
-            && self.pass_state.texture_written_by_blit_this_frame(
-                // SAFETY: old_handle is the live texture being renamed.
-                unsafe { MetalHandle::new(old_handle) },
-            );
-        if ordered_depth {
-            self.end_current_pass("dynamic_depth_preserve");
+        // A write ordered among application passes must complete before its
+        // untouched pixels are preserved. The caller places the following
+        // upload in this same stream, including for a full overwrite.
+        if ordered {
+            self.end_current_pass("ordered_texture_preserve");
         }
         for slice in 0..slices {
             for level in 0..info.levels {
@@ -7327,14 +7357,14 @@ impl FrameEncoder {
                 };
                 preserve.src_slice = slice;
                 preserve.dst_slice = slice;
-                if ordered_depth {
+                if ordered {
                     self.pass_state.push_pending_leading_blit(preserve);
                 } else {
                     self.frame_blit_commands.push(preserve);
                 }
             }
         }
-        if !ordered_depth {
+        if !ordered {
             self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
 
@@ -7399,14 +7429,19 @@ impl FrameEncoder {
     /// reuse the per-mip staging `MTLBuffer` (wrapping the game's staging
     /// `PageBox`) and emit a `BlitCopyBufferToTexture` against the frame's
     /// leading blit pass.
-    fn run_texture_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
+    fn run_texture_upload_blit<const ORDERED: bool>(
+        &mut self,
+        job: &TextureUploadJob,
+        texture_handle: u64,
+    ) -> bool {
         if let Some(format) = mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format)
         {
             return self.run_depth_upload_blit(job, texture_handle, &format);
         }
-        if let Some(outcome) = self.try_texture_upload_pass(job, texture_handle) {
+        if let Some(outcome) = self.try_texture_upload_pass::<ORDERED>(job, texture_handle) {
             return outcome;
         }
+        let notify_start = self.frame_blit_commands.len();
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.staging.backing().len() as u64;
         if backing_length == 0 {
@@ -7544,9 +7579,19 @@ impl FrameEncoder {
             ),
             ..info
         };
-        self.frame_blit_commands
-            .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        let command = BlitCommand::copy_buffer_to_texture(&info);
+        // CPU conversions obey API order relative to earlier reads and writes.
+        // Ordinary uploads retain the frame-leading path.
+        if ORDERED {
+            self.end_current_pass("stretch_conversion_upload");
+            for notify in self.frame_blit_commands.drain(notify_start..) {
+                self.pass_state.push_pending_leading_blit(notify);
+            }
+            self.pass_state.push_pending_leading_blit(command);
+        } else {
+            self.frame_blit_commands.push(command);
+            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        }
         // Counts every successful blit-path upload (padded subset
         // included) — the total texture uploads per frame.
         self.perf.bump_texture_blit_upload();
@@ -7582,7 +7627,7 @@ impl FrameEncoder {
     /// being contiguous makes this a single `region_rows * depth` repack),
     /// and `bytes_per_image` widens to `padded_pitch * region_rows`.
     fn run_volume_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
-        if let Some(outcome) = self.try_texture_upload_pass(job, texture_handle) {
+        if let Some(outcome) = self.try_texture_upload_pass::<false>(job, texture_handle) {
             return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
@@ -7675,13 +7720,13 @@ impl FrameEncoder {
     /// failure) and the blit's CPU repack can still write it. `Some` is the
     /// result the caller returns; a declined expansion is `Some(false)`,
     /// because no blit can widen those texels.
-    fn try_texture_upload_pass(
+    fn try_texture_upload_pass<const ORDERED: bool>(
         &mut self,
         job: &TextureUploadJob,
         texture_handle: u64,
     ) -> Option<bool> {
         let decode = self.upload_pass_decode(job)?;
-        if self.run_texture_upload_pass(job, texture_handle, decode) {
+        if self.run_texture_upload_pass::<ORDERED>(job, texture_handle, decode) {
             return Some(true);
         }
         if mtld3d_core::upload_pass::is_expansion(decode) {
@@ -7715,7 +7760,7 @@ impl FrameEncoder {
     /// `MTLBuffer` the blit path uses. Handles the 2D dirty-rect shape and
     /// a cube face in one pass, and the volume whole-box shape
     /// (`job.depth > 1`) in one pass per slice.
-    fn run_texture_upload_pass(
+    fn run_texture_upload_pass<const ORDERED: bool>(
         &mut self,
         job: &TextureUploadJob,
         texture_handle: u64,
@@ -7740,6 +7785,7 @@ impl FrameEncoder {
         }
         // Non-UMA: the game wrote these pages on the CPU. The notify rides
         // the leading blits of the upload pass that reads these pages.
+        let notify_start = self.frame_blit_commands.len();
         self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
 
         let mip_w = (job.info.width.max(1) >> job.level).max(1);
@@ -7760,11 +7806,12 @@ impl FrameEncoder {
             // Volumes re-upload the whole box on Unlock and their slices are
             // contiguous in it, so slice `s` starts `s * slice_pitch` in.
             for slice in 0..depth {
-                self.emit_upload_pass(
+                self.emit_upload_pass::<ORDERED>(
                     &emit,
                     slice,
                     (0, 0, mip_w, mip_h),
                     slice.saturating_mul(job.slice_pitch),
+                    notify_start,
                 );
             }
         } else {
@@ -7772,11 +7819,12 @@ impl FrameEncoder {
             // on the unix side the way the scissor is.
             let w = job.region_w.min(mip_w.saturating_sub(job.origin_x));
             let h = job.region_h.min(mip_h.saturating_sub(job.origin_y));
-            self.emit_upload_pass(
+            self.emit_upload_pass::<ORDERED>(
                 &emit,
                 job.destination_slice,
                 (job.origin_x, job.origin_y, w, h),
                 0,
+                notify_start,
             );
         }
 
@@ -7803,12 +7851,13 @@ impl FrameEncoder {
     /// the fragment function derives its source address from the destination
     /// position alone and `base_offset` is zero; a volume slice carries its
     /// own base.
-    fn emit_upload_pass(
+    fn emit_upload_pass<const ORDERED: bool>(
         &mut self,
         emit: &UploadPassInputs,
         slice: u32,
         rect: (u32, u32, u32, u32),
         base_offset: u32,
+        notify_start: usize,
     ) {
         let (x, y, w, h) = rect;
         if w == 0 || h == 0 {
@@ -7848,12 +7897,21 @@ impl FrameEncoder {
             format: emit.format,
             rect,
         };
-        self.pass_state.push_upload_pass(
-            &target,
-            &cmds,
-            core::mem::take(&mut self.frame_blit_commands),
-        );
-        self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        if ORDERED {
+            self.end_current_pass("stretch_conversion_upload_pass");
+        }
+        let leading_blits = if ORDERED {
+            let mut blits = self.pass_state.take_pending_leading_blits();
+            blits.extend(self.frame_blit_commands.drain(notify_start..));
+            blits
+        } else {
+            core::mem::take(&mut self.frame_blit_commands)
+        };
+        self.pass_state
+            .push_upload_pass_with_order::<ORDERED>(&target, &cmds, leading_blits);
+        if !ORDERED {
+            self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        }
         self.upload_pass_commands = cmds;
     }
 
