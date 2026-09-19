@@ -1356,3 +1356,64 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
         }
     }
 }
+
+#[test]
+fn dotproduct3_supplies_the_whole_stage_result() {
+    use mtld3d_types::{D3DTA_COMPLEMENT, D3DTA_TFACTOR, D3DTOP_DOTPRODUCT3};
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        ..FfStage::default()
+    };
+    let expected = "    current = float4(saturate(4.0 * dot(((1.0 - in.color0.aaaa)).rgb - 0.5, (ps_c[0]).rgb - 0.5)));";
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
+    // The separate alpha operation cannot affect a DOTPRODUCT3 color stage.
+    ps.stages[0].alpha_op = narrow(D3DTOP_MODULATE);
+    ps.stages[0].alpha_arg1 = narrow(D3DTA_TFACTOR);
+    assert_eq!(msl, emit_ps_ff(&ps, VariantKey::default()));
+}
+
+#[test]
+fn modulate_keeps_separate_color_and_alpha_arguments() {
+    use mtld3d_types::D3DTA_TFACTOR;
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TFACTOR),
+        has_texture: true,
+        ..FfStage::default()
+    };
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    let expected = "    current = float4(((t0 * in.color0)).rgb, (ps_c[0]).a);";
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
+}
+
+#[test]
+fn dotproduct3_unbound_color_keeps_independent_alpha() {
+    use mtld3d_types::{D3DTA_TFACTOR, D3DTOP_DOTPRODUCT3};
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TFACTOR),
+        ..FfStage::default()
+    };
+    let fallback = emit_ps_ff(&ps, VariantKey::default());
+    ps.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
+    ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
+    assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
+    assert!(fallback.contains("current = float4((current).rgb, (ps_c[0]).a);"));
+}

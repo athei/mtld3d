@@ -196,7 +196,8 @@ fn texture_op_caps_exclude_premultiplied_blend() {
         | TexOpCaps::BLENDDIFFUSEALPHA
         | TexOpCaps::BLENDTEXTUREALPHA
         | TexOpCaps::BLENDFACTORALPHA
-        | TexOpCaps::BLENDCURRENTALPHA;
+        | TexOpCaps::BLENDCURRENTALPHA
+        | TexOpCaps::DOTPRODUCT3;
     assert_eq!(filled().texture_op_caps, expected.bits());
     assert_eq!(
         filled().texture_op_caps & TexOpCaps::BLENDTEXTUREALPHAPM.bits(),
