@@ -5035,9 +5035,8 @@ extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) 
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // Same contract as `texture_add_dirty_rect`: a hint that the CPU bytes
-    // changed, consumed by the next UpdateTexture from this volume. It never
-    // schedules a GPU upload (the staging may not carry Lock-written bytes).
+    // Volume dirty boxes update source metadata for the next UpdateTexture.
+    // They do not schedule GPU uploads; staging may not carry Lock-written bytes.
     // Volumes track the whole level, so the box itself is not recorded.
     obj.inner_mut().mark_update_dirty(0, None);
     D3D_OK
